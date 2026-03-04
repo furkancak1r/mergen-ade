@@ -29,6 +29,11 @@ const TERMINAL_EVENT_BUDGET: usize = 4096;
 const TERMINAL_RETRY_MS: u64 = 8;
 const TERMINAL_FALLBACK_REFRESH_MS: u64 = 16;
 const TERMINAL_OUTPUT_BG: Color32 = Color32::from_rgb(0, 0, 0);
+const TERMINAL_HEADER_HEIGHT: f32 = 38.0;
+const TERMINAL_HEADER_GAP: f32 = 6.0;
+const TERMINAL_TILE_GAP_X: f32 = 0.0;
+const TERMINAL_TILE_GAP_Y: f32 = 0.0;
+const TERMINAL_PANE_INNER_MARGIN: f32 = 2.0;
 const APP_BG: Color32 = Color32::from_rgb(14, 18, 24);
 const SURFACE_BG: Color32 = Color32::from_rgb(22, 28, 38);
 const SURFACE_BG_SOFT: Color32 = Color32::from_rgb(28, 35, 47);
@@ -984,7 +989,7 @@ impl AdeApp {
 
             let available = ui.available_size();
             let grid = layout::compute_tile_grid(visible_ids.len(), available.x, available.y);
-            let spacing = Vec2::new(10.0, 10.0);
+            let spacing = Vec2::new(TERMINAL_TILE_GAP_X, TERMINAL_TILE_GAP_Y);
 
             let pane_width = ((available.x - spacing.x * (grid.cols.saturating_sub(1) as f32))
                 / grid.cols as f32)
@@ -1005,7 +1010,7 @@ impl AdeApp {
                                     .fill(SURFACE_BG)
                                     .stroke(Stroke::new(1.0, BORDER_COLOR))
                                     .rounding(10.0)
-                                    .inner_margin(egui::Margin::same(8.0))
+                                    .inner_margin(egui::Margin::same(TERMINAL_PANE_INNER_MARGIN))
                                     .show(ui, |ui| {
                                         self.draw_terminal_pane(ui, *terminal_id, size);
                                     });
@@ -1048,23 +1053,39 @@ impl AdeApp {
             } else {
                 Color32::from_rgb(24, 34, 48)
             };
+            let pane_available = ui.available_size_before_wrap();
+            let pane_width = pane_available.x.max((pane_size.x - 10.0).max(120.0));
+            let pane_height = pane_available.y.max((pane_size.y - 10.0).max(120.0));
 
-            egui::Frame::none()
-                .fill(header_fill)
-                .stroke(Stroke::new(1.0, BORDER_COLOR))
-                .rounding(8.0)
-                .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-                .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
+            let header_size = Vec2::new(pane_width, TERMINAL_HEADER_HEIGHT);
+            ui.allocate_ui_with_layout(header_size, Layout::left_to_right(Align::Center), |ui| {
+                ui.set_min_size(header_size);
+                egui::Frame::none()
+                    .fill(header_fill)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .rounding(8.0)
+                    .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.set_min_height(TERMINAL_HEADER_HEIGHT - 12.0);
+
                         let indicator = if is_active { "●" } else { "○" };
                         let title = format!("{indicator} {} {}", icons::TERMINAL, terminal.title);
-                        if ui.selectable_label(is_active, title).clicked() {
+                        let title_response = ui.add(
+                            egui::Label::new(RichText::new(title).color(TEXT_PRIMARY))
+                                .truncate()
+                                .sense(Sense::click()),
+                        );
+                        if title_response.clicked() {
                             pane_clicked = true;
                         }
+
                         ui.separator();
-                        ui.label(
-                            RichText::new(format!("{} {}", icons::FOLDER, project_name))
-                                .color(TEXT_MUTED),
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("{} {}", icons::FOLDER, project_name))
+                                    .color(TEXT_MUTED),
+                            )
+                            .truncate(),
                         );
                         ui.separator();
                         egui::Frame::none()
@@ -1081,11 +1102,14 @@ impl AdeApp {
                         if terminal.exited {
                             ui.colored_label(Color32::LIGHT_RED, "Exited");
                         }
-                        if ui.small_button(format!("{} Close", icons::X)).clicked() {
-                            close_requested = true;
-                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.small_button(format!("{} Close", icons::X)).clicked() {
+                                close_requested = true;
+                            }
+                        });
                     });
-                });
+            });
+            ui.add_space(TERMINAL_HEADER_GAP);
 
             let monospace = egui::TextStyle::Monospace;
             let font_id = monospace.resolve(ui.style());
@@ -1094,12 +1118,8 @@ impl AdeApp {
                 .max(CELL_WIDTH_PX);
             let line_height = ui.text_style_height(&monospace).max(CELL_HEIGHT_PX);
 
-            let pane_available = ui.available_size_before_wrap();
-            let pane_width = pane_available.x.max((pane_size.x - 10.0).max(120.0));
-            let pane_height = pane_available.y.max((pane_size.y - 10.0).max(120.0));
-
-            let header_height = line_height + 10.0;
-            let output_height = (pane_height - header_height - 8.0).max(line_height * 3.0);
+            let output_height =
+                (pane_height - TERMINAL_HEADER_HEIGHT - TERMINAL_HEADER_GAP).max(line_height * 3.0);
             let output_size = Vec2::new(pane_width, output_height);
 
             let cols = ((output_size.x / char_width).floor() as u16).max(20);
