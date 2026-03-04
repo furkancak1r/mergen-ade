@@ -84,7 +84,6 @@ Persisted data includes:
 
 - Global default shell
 - Projects (id, name, path)
-- Optional per-project shell override
 - Per-project saved messages
 - UI state:
   - Project explorer visibility

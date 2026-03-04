@@ -160,7 +160,6 @@ impl AdeApp {
             id: self.next_project_id,
             name,
             path,
-            shell_override: None,
             saved_messages: Vec::new(),
         };
 
@@ -169,11 +168,6 @@ impl AdeApp {
         self.next_project_id += 1;
         self.bump_layout_epoch();
         self.persist_config();
-    }
-
-    fn selected_project_shell(&self, project_id: u64) -> Option<ShellKind> {
-        let project = self.projects.get(&project_id)?;
-        Some(project.shell_override.unwrap_or(self.config.default_shell))
     }
 
     fn spawn_terminal_for_project(
@@ -186,9 +180,7 @@ impl AdeApp {
             return;
         };
 
-        let Some(shell) = self.selected_project_shell(project_id) else {
-            return;
-        };
+        let shell = self.config.default_shell;
 
         let terminal_id = self.next_terminal_id;
         self.next_terminal_id += 1;
@@ -787,7 +779,6 @@ impl AdeApp {
                                 continue;
                             };
 
-                            let mut next_shell_override = project_snapshot.shell_override;
                             let mut add_message: Option<String> = None;
                             let mut remove_message_index: Option<usize> = None;
                             let mut requested_persist = false;
@@ -814,70 +805,6 @@ impl AdeApp {
                                                 TerminalKind::Background,
                                             );
                                         }
-                                    });
-
-                                    ui.horizontal(|ui| {
-                                        ui.label(RichText::new("Shell Override").color(TEXT_MUTED));
-                                        let mut current = project_snapshot
-                                            .shell_override
-                                            .unwrap_or(self.config.default_shell);
-                                        egui::ComboBox::from_id_salt(format!(
-                                            "shell-override-{project_id}"
-                                        ))
-                                        .selected_text(
-                                            project_snapshot
-                                                .shell_override
-                                                .map(|shell| shell.label().to_owned())
-                                                .unwrap_or_else(|| {
-                                                    format!(
-                                                        "Global ({})",
-                                                        self.config.default_shell.label()
-                                                    )
-                                                }),
-                                        )
-                                        .show_ui(
-                                            ui,
-                                            |ui| {
-                                                if ui
-                                                    .selectable_label(
-                                                        project_snapshot.shell_override.is_none(),
-                                                        format!(
-                                                            "Global ({})",
-                                                            self.config.default_shell.label()
-                                                        ),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    next_shell_override = None;
-                                                    requested_persist = true;
-                                                }
-
-                                                if ui
-                                                    .selectable_value(
-                                                        &mut current,
-                                                        ShellKind::PowerShell,
-                                                        ShellKind::PowerShell.label(),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    next_shell_override =
-                                                        Some(ShellKind::PowerShell);
-                                                    requested_persist = true;
-                                                }
-
-                                                if ui
-                                                    .selectable_value(
-                                                        &mut current,
-                                                        ShellKind::Cmd,
-                                                        ShellKind::Cmd.label(),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    next_shell_override = Some(ShellKind::Cmd);
-                                                    requested_persist = true;
-                                                }
-                                            },
-                                        );
                                     });
 
                                     ui.separator();
@@ -958,7 +885,6 @@ impl AdeApp {
                             });
 
                             if let Some(project) = self.projects.get_mut(&project_id) {
-                                project.shell_override = next_shell_override;
                                 if let Some(message) = add_message {
                                     project.saved_messages.push(message);
                                     requested_persist = true;

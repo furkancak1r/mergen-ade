@@ -3,8 +3,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
+use serde::Deserialize;
 
-use crate::models::AppConfig;
+use crate::models::{AppConfig, ProjectRecord, ShellKind, UiConfig};
 
 const QUALIFIER: &str = "com";
 const ORGANIZATION: &str = "Mergen";
@@ -26,10 +27,14 @@ pub fn load_config(path: &Path) -> io::Result<AppConfig> {
     }
 
     let text = fs::read_to_string(path)?;
-    let parsed = toml::from_str::<AppConfig>(&text)
+    if let Ok(parsed) = toml::from_str::<AppConfig>(&text) {
+        return Ok(parsed);
+    }
+
+    let legacy = toml::from_str::<LegacyAppConfig>(&text)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
 
-    Ok(parsed)
+    Ok(legacy.into())
 }
 
 pub fn save_config(path: &Path, config: &AppConfig) -> io::Result<()> {
@@ -49,4 +54,46 @@ pub fn save_config(path: &Path, config: &AppConfig) -> io::Result<()> {
 
     fs::rename(tmp_path, path)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyProjectRecord {
+    id: u64,
+    name: String,
+    path: PathBuf,
+    shell_override: Option<ShellKind>,
+    saved_messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyAppConfig {
+    version: u32,
+    default_shell: ShellKind,
+    ui: UiConfig,
+    projects: Vec<LegacyProjectRecord>,
+}
+
+impl From<LegacyAppConfig> for AppConfig {
+    fn from(value: LegacyAppConfig) -> Self {
+        let projects = value
+            .projects
+            .into_iter()
+            .map(|project| {
+                let _ = project.shell_override;
+                ProjectRecord {
+                    id: project.id,
+                    name: project.name,
+                    path: project.path,
+                    saved_messages: project.saved_messages,
+                }
+            })
+            .collect();
+
+        AppConfig {
+            version: value.version,
+            default_shell: value.default_shell,
+            ui: value.ui,
+            projects,
+        }
+    }
 }
