@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crossbeam_channel::{Receiver, Sender};
-use eframe::egui::{self, Align, Color32, Key, Layout, RichText, Sense, TextWrapMode, Ui, Vec2};
+use eframe::egui::{self, Align, Color32, Key, Layout, RichText, TextWrapMode, Ui, Vec2};
 
 use crate::config;
 use crate::layout;
@@ -704,7 +704,6 @@ impl AdeApp {
                         if let Some(terminal_id) = visible_ids.get(index) {
                             ui.allocate_ui_with_layout(size, Layout::top_down(Align::Min), |ui| {
                                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                                    ui.set_min_size(size);
                                     self.draw_terminal_pane(ui, *terminal_id, size);
                                 });
                             });
@@ -758,11 +757,15 @@ impl AdeApp {
                 .max(CELL_WIDTH_PX);
             let line_height = ui.text_style_height(&monospace).max(CELL_HEIGHT_PX);
 
-            let header_height = line_height + 12.0;
-            let input_height = line_height + 14.0;
+            let pane_available = ui.available_size_before_wrap();
+            let pane_width = pane_available.x.max((pane_size.x - 10.0).max(120.0));
+            let pane_height = pane_available.y.max((pane_size.y - 10.0).max(120.0));
+
+            let header_height = line_height + 10.0;
+            let input_height = line_height + 12.0;
             let output_height =
-                (pane_size.y - header_height - input_height - 18.0).max(line_height * 3.0);
-            let output_size = Vec2::new((pane_size.x - 10.0).max(120.0), output_height);
+                (pane_height - header_height - input_height - 12.0).max(line_height * 3.0);
+            let output_size = Vec2::new(pane_width, output_height);
 
             let cols = ((output_size.x / char_width).floor() as u16).max(20);
             let lines = ((output_size.y / line_height).floor() as u16).max(6);
@@ -788,17 +791,21 @@ impl AdeApp {
                     .show(ui, |ui| {
                         ui.add(
                             egui::Label::new(RichText::new(terminal.render_cache.clone()).monospace())
-                                .wrap_mode(TextWrapMode::Extend)
-                                .sense(Sense::click()),
+                                .wrap_mode(TextWrapMode::Extend),
                         );
                     });
                 });
 
-            let response = ui.add(
+            let response = ui.add_sized(
+                [pane_width, input_height],
                 egui::TextEdit::singleline(&mut terminal.input_buffer)
-                    .desired_width(f32::INFINITY)
+                    .desired_width(pane_width)
                     .hint_text("Type command and press Enter"),
             );
+
+            if is_active && !response.has_focus() {
+                response.request_focus();
+            }
 
             (
                 response.clicked(),
