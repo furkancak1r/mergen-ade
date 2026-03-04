@@ -11,6 +11,7 @@ use eframe::egui::{
     self, Align, Color32, Event, FontId, Key, Layout, RichText, Sense, Stroke, TextWrapMode, Ui,
     Vec2,
 };
+use egui_phosphor::{regular as icons, Variant};
 
 use crate::config;
 use crate::layout;
@@ -28,6 +29,13 @@ const TERMINAL_EVENT_BUDGET: usize = 4096;
 const TERMINAL_RETRY_MS: u64 = 8;
 const TERMINAL_FALLBACK_REFRESH_MS: u64 = 16;
 const TERMINAL_OUTPUT_BG: Color32 = Color32::from_rgb(0, 0, 0);
+const APP_BG: Color32 = Color32::from_rgb(14, 18, 24);
+const SURFACE_BG: Color32 = Color32::from_rgb(22, 28, 38);
+const SURFACE_BG_SOFT: Color32 = Color32::from_rgb(28, 35, 47);
+const BORDER_COLOR: Color32 = Color32::from_rgb(46, 60, 78);
+const ACCENT: Color32 = Color32::from_rgb(26, 179, 255);
+const TEXT_PRIMARY: Color32 = Color32::from_rgb(225, 233, 245);
+const TEXT_MUTED: Color32 = Color32::from_rgb(148, 167, 191);
 
 pub struct AdeApp {
     config_path: PathBuf,
@@ -47,6 +55,7 @@ pub struct AdeApp {
     layout_epoch: u64,
     repaint_pump_started: bool,
     repaint_pump_flag: Arc<AtomicBool>,
+    theme_initialized: bool,
 }
 
 struct TerminalEntry {
@@ -102,6 +111,7 @@ impl AdeApp {
             layout_epoch: 0,
             repaint_pump_started: false,
             repaint_pump_flag: Arc::new(AtomicBool::new(true)),
+            theme_initialized: false,
         }
     }
 
@@ -449,6 +459,58 @@ impl AdeApp {
         });
     }
 
+    fn ensure_theme_initialized(&mut self, ctx: &egui::Context) {
+        if self.theme_initialized {
+            return;
+        }
+
+        let mut fonts = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut fonts, Variant::Regular);
+        ctx.set_fonts(fonts);
+
+        let mut style = (*ctx.style()).clone();
+        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+        style.spacing.button_padding = egui::vec2(12.0, 7.0);
+        style.spacing.window_margin = egui::Margin::symmetric(12.0, 10.0);
+        style.visuals.window_rounding = 10.0.into();
+        style.visuals.menu_rounding = 8.0.into();
+        style.visuals.widgets.noninteractive.rounding = 7.0.into();
+        style.visuals.widgets.inactive.rounding = 7.0.into();
+        style.visuals.widgets.hovered.rounding = 7.0.into();
+        style.visuals.widgets.active.rounding = 7.0.into();
+        style.visuals.widgets.open.rounding = 7.0.into();
+
+        let mut visuals = egui::Visuals::dark();
+        visuals.override_text_color = Some(TEXT_PRIMARY);
+        visuals.panel_fill = APP_BG;
+        visuals.window_fill = SURFACE_BG;
+        visuals.faint_bg_color = SURFACE_BG_SOFT;
+        visuals.extreme_bg_color = Color32::from_rgb(9, 12, 16);
+        visuals.code_bg_color = Color32::from_rgb(12, 16, 22);
+        visuals.hyperlink_color = ACCENT;
+        visuals.window_stroke = Stroke::new(1.0, BORDER_COLOR);
+        visuals.widgets.noninteractive.bg_fill = SURFACE_BG;
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER_COLOR);
+        visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_MUTED);
+        visuals.widgets.inactive.bg_fill = SURFACE_BG_SOFT;
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER_COLOR);
+        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(34, 45, 62);
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT);
+        visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::from_rgb(240, 247, 255));
+        visuals.widgets.active.bg_fill = Color32::from_rgb(22, 53, 78);
+        visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
+        visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::from_rgb(244, 251, 255));
+        visuals.widgets.open.bg_fill = Color32::from_rgb(30, 41, 56);
+        visuals.widgets.open.bg_stroke = Stroke::new(1.0, BORDER_COLOR);
+        visuals.selection.bg_fill = Color32::from_rgb(18, 93, 136);
+        visuals.selection.stroke = Stroke::new(1.0, ACCENT);
+
+        style.visuals = visuals;
+        ctx.set_style(style);
+        self.theme_initialized = true;
+    }
+
     fn append_pending_line(pending: &mut String, text: &str) {
         for ch in text.chars() {
             if ch == '\r' || ch == '\n' {
@@ -538,36 +600,68 @@ impl AdeApp {
     }
 
     fn draw_top_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Add Project").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        self.add_project(path);
+        egui::TopBottomPanel::top("top_bar")
+            .exact_height(54.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(SURFACE_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .inner_margin(egui::Margin::symmetric(10.0, 8.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!("{}  Mergen ADE", icons::TERMINAL_WINDOW))
+                            .strong()
+                            .size(16.0),
+                    );
+                    ui.separator();
+
+                    if ui
+                        .button(format!("{} Add Project", icons::FOLDER_PLUS))
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            self.add_project(path);
+                        }
                     }
-                }
 
-                if ui.button("New Terminal").clicked() {
-                    if let Some(project_id) = self.selected_project {
-                        self.spawn_terminal_for_project(ctx, project_id, TerminalKind::Foreground);
+                    if ui
+                        .button(format!("{} New Terminal", icons::TERMINAL))
+                        .clicked()
+                    {
+                        if let Some(project_id) = self.selected_project {
+                            self.spawn_terminal_for_project(
+                                ctx,
+                                project_id,
+                                TerminalKind::Foreground,
+                            );
+                        }
                     }
-                }
 
-                if ui.button("Auto Tile").clicked() {
-                    self.apply_auto_tile(self.config.ui.auto_tile_scope);
-                }
+                    if ui.button(format!("{} Auto Tile", icons::LAYOUT)).clicked() {
+                        self.apply_auto_tile(self.config.ui.auto_tile_scope);
+                    }
 
-                if ui.button("Saved Messages").clicked() {
-                    self.show_saved_messages_picker = true;
-                }
+                    if ui
+                        .button(format!("{} Saved Messages", icons::CHAT_TEXT))
+                        .clicked()
+                    {
+                        self.show_saved_messages_picker = true;
+                    }
 
-                if ui.button("Settings").clicked() {
-                    self.show_settings_popup = true;
-                }
+                    if ui.button(format!("{} Settings", icons::GEAR)).clicked() {
+                        self.show_settings_popup = true;
+                    }
 
-                ui.separator();
-                ui.label(format!("Status: {}", self.status_line));
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!("{} {}", icons::LIST, self.status_line))
+                            .color(TEXT_MUTED)
+                            .size(13.0),
+                    );
+                });
             });
-        });
     }
 
     fn draw_project_explorer(&mut self, ctx: &egui::Context) {
@@ -577,231 +671,311 @@ impl AdeApp {
 
         egui::SidePanel::left("project_explorer")
             .resizable(true)
-            .default_width(240.0)
+            .default_width(250.0)
             .show(ctx, |ui| {
-                ui.heading("Projects");
-                ui.separator();
+                egui::Frame::none()
+                    .fill(SURFACE_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .rounding(8.0)
+                    .inner_margin(egui::Margin::same(10.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(format!("{}  Projects", icons::TREE_VIEW))
+                                .strong()
+                                .size(15.0),
+                        );
+                        ui.separator();
 
-                let project_rows = self
-                    .projects
-                    .values()
-                    .map(|project| {
-                        (
-                            project.id,
-                            project.name.clone(),
-                            project.path.display().to_string(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
+                        let project_rows = self
+                            .projects
+                            .values()
+                            .map(|project| {
+                                (
+                                    project.id,
+                                    project.name.clone(),
+                                    project.path.display().to_string(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
 
-                for (project_id, project_name, project_path) in project_rows {
-                    let selected = self.selected_project == Some(project_id);
-                    let response = ui.selectable_label(selected, &project_name);
-                    if response.clicked() {
-                        let previous_selected = self.selected_project;
-                        self.selected_project = Some(project_id);
-                        if self.config.ui.project_filter_mode
-                            && previous_selected != self.selected_project
-                        {
-                            self.bump_layout_epoch();
+                        for (project_id, project_name, project_path) in project_rows {
+                            let selected = self.selected_project == Some(project_id);
+                            let project_label = if selected {
+                                format!("{}  {}", icons::FOLDER_OPEN, project_name)
+                            } else {
+                                format!("{}  {}", icons::FOLDER, project_name)
+                            };
+
+                            let response = ui.selectable_label(selected, project_label);
+                            if response.clicked() {
+                                let previous_selected = self.selected_project;
+                                self.selected_project = Some(project_id);
+                                if self.config.ui.project_filter_mode
+                                    && previous_selected != self.selected_project
+                                {
+                                    self.bump_layout_epoch();
+                                }
+                                self.persist_config();
+                            }
+                            response.context_menu(|ui| {
+                                if ui
+                                    .button(format!("{} Copy Project Path", icons::COPY))
+                                    .clicked()
+                                {
+                                    ui.ctx().copy_text(project_path.clone());
+                                    self.status_line =
+                                        format!("Copied path for project '{}'", project_name);
+                                    ui.close_menu();
+                                }
+                            });
                         }
-                        self.persist_config();
-                    }
-                    response.context_menu(|ui| {
-                        if ui.button("Copy Project Path").clicked() {
-                            ui.ctx().copy_text(project_path.clone());
-                            self.status_line =
-                                format!("Copied path for project '{}'", project_name);
-                            ui.close_menu();
+
+                        ui.separator();
+
+                        if let Some(project_id) = self.selected_project {
+                            if let Some(project) = self.projects.get(&project_id) {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{}  Project Explorer",
+                                        icons::FOLDER_OPEN
+                                    ))
+                                    .color(TEXT_MUTED)
+                                    .strong(),
+                                );
+
+                                draw_folder_tree(ui, &project.path, 0, 8);
+                            }
+                        } else {
+                            ui.label(RichText::new("No project selected").color(TEXT_MUTED));
                         }
                     });
-                }
-
-                ui.separator();
-
-                if let Some(project_id) = self.selected_project {
-                    if let Some(project) = self.projects.get(&project_id) {
-                        ui.label("Project Explorer");
-
-                        draw_folder_tree(ui, &project.path, 0, 8);
-                    }
-                } else {
-                    ui.label("No project selected");
-                }
             });
     }
 
     fn draw_terminal_manager(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("terminal_manager")
             .resizable(true)
-            .default_width(280.0)
+            .default_width(300.0)
             .show(ctx, |ui| {
-                ui.heading("Terminal Manager");
-                ui.separator();
+                egui::Frame::none()
+                    .fill(SURFACE_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .rounding(8.0)
+                    .inner_margin(egui::Margin::same(10.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(format!("{}  Terminal Manager", icons::TERMINAL_WINDOW))
+                                .strong()
+                                .size(15.0),
+                        );
+                        ui.separator();
 
-                let mut project_ids = self.projects.keys().copied().collect::<Vec<_>>();
-                project_ids.sort_unstable();
+                        let mut project_ids = self.projects.keys().copied().collect::<Vec<_>>();
+                        project_ids.sort_unstable();
 
-                for project_id in project_ids {
-                    if self.config.ui.project_filter_mode
-                        && self
-                            .selected_project
-                            .is_some_and(|selected| selected != project_id)
-                    {
-                        continue;
-                    }
+                        for project_id in project_ids {
+                            if self.config.ui.project_filter_mode
+                                && self
+                                    .selected_project
+                                    .is_some_and(|selected| selected != project_id)
+                            {
+                                continue;
+                            }
 
-                    let Some(project_snapshot) = self.projects.get(&project_id).cloned() else {
-                        continue;
-                    };
+                            let Some(project_snapshot) = self.projects.get(&project_id).cloned()
+                            else {
+                                continue;
+                            };
 
-                    let mut next_shell_override = project_snapshot.shell_override;
-                    let mut add_message: Option<String> = None;
-                    let mut remove_message_index: Option<usize> = None;
-                    let mut requested_persist = false;
-                    let project_path = project_snapshot.path.display().to_string();
+                            let mut next_shell_override = project_snapshot.shell_override;
+                            let mut add_message: Option<String> = None;
+                            let mut remove_message_index: Option<usize> = None;
+                            let mut requested_persist = false;
+                            let project_path = project_snapshot.path.display().to_string();
 
-                    let header = egui::CollapsingHeader::new(project_snapshot.name.clone())
-                        .id_salt(format!("project-group-{project_id}"))
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                if ui.button("New FG").clicked() {
-                                    self.spawn_terminal_for_project(
-                                        ctx,
+                            let header_label =
+                                format!("{}  {}", icons::FOLDER_OPEN, project_snapshot.name);
+                            let header = egui::CollapsingHeader::new(header_label)
+                                .id_salt(format!("project-group-{project_id}"))
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        if ui.button(format!("{} New FG", icons::PLUS)).clicked() {
+                                            self.spawn_terminal_for_project(
+                                                ctx,
+                                                project_id,
+                                                TerminalKind::Foreground,
+                                            );
+                                        }
+                                        if ui.button(format!("{} New BG", icons::PLUS)).clicked() {
+                                            self.spawn_terminal_for_project(
+                                                ctx,
+                                                project_id,
+                                                TerminalKind::Background,
+                                            );
+                                        }
+                                    });
+
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("Shell Override").color(TEXT_MUTED));
+                                        let mut current = project_snapshot
+                                            .shell_override
+                                            .unwrap_or(self.config.default_shell);
+                                        egui::ComboBox::from_id_salt(format!(
+                                            "shell-override-{project_id}"
+                                        ))
+                                        .selected_text(
+                                            project_snapshot
+                                                .shell_override
+                                                .map(|shell| shell.label().to_owned())
+                                                .unwrap_or_else(|| {
+                                                    format!(
+                                                        "Global ({})",
+                                                        self.config.default_shell.label()
+                                                    )
+                                                }),
+                                        )
+                                        .show_ui(
+                                            ui,
+                                            |ui| {
+                                                if ui
+                                                    .selectable_label(
+                                                        project_snapshot.shell_override.is_none(),
+                                                        format!(
+                                                            "Global ({})",
+                                                            self.config.default_shell.label()
+                                                        ),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    next_shell_override = None;
+                                                    requested_persist = true;
+                                                }
+
+                                                if ui
+                                                    .selectable_value(
+                                                        &mut current,
+                                                        ShellKind::PowerShell,
+                                                        ShellKind::PowerShell.label(),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    next_shell_override =
+                                                        Some(ShellKind::PowerShell);
+                                                    requested_persist = true;
+                                                }
+
+                                                if ui
+                                                    .selectable_value(
+                                                        &mut current,
+                                                        ShellKind::Cmd,
+                                                        ShellKind::Cmd.label(),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    next_shell_override = Some(ShellKind::Cmd);
+                                                    requested_persist = true;
+                                                }
+                                            },
+                                        );
+                                    });
+
+                                    ui.separator();
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} Foreground terminals",
+                                            icons::TERMINAL
+                                        ))
+                                        .strong(),
+                                    );
+                                    self.draw_terminal_rows(
+                                        ui,
                                         project_id,
                                         TerminalKind::Foreground,
                                     );
-                                }
-                                if ui.button("New BG").clicked() {
-                                    self.spawn_terminal_for_project(
-                                        ctx,
+
+                                    ui.separator();
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} Background terminals",
+                                            icons::LIST
+                                        ))
+                                        .strong()
+                                        .color(TEXT_MUTED),
+                                    );
+                                    self.draw_terminal_rows(
+                                        ui,
                                         project_id,
                                         TerminalKind::Background,
                                     );
+
+                                    ui.separator();
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} Saved messages",
+                                            icons::CHAT_TEXT
+                                        ))
+                                        .strong(),
+                                    );
+                                    for (index, message) in
+                                        project_snapshot.saved_messages.iter().enumerate()
+                                    {
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(message).monospace().small());
+                                            if ui
+                                                .small_button(format!("{} Remove", icons::TRASH))
+                                                .clicked()
+                                            {
+                                                remove_message_index = Some(index);
+                                            }
+                                        });
+                                    }
+
+                                    ui.horizontal(|ui| {
+                                        ui.text_edit_singleline(&mut self.new_saved_message);
+                                        if ui.button(format!("{} Add", icons::PLUS)).clicked() {
+                                            let text = self.new_saved_message.trim();
+                                            if !text.is_empty() {
+                                                add_message = Some(text.to_owned());
+                                                self.new_saved_message.clear();
+                                            }
+                                        }
+                                    });
+                                });
+
+                            header.header_response.context_menu(|ui| {
+                                if ui
+                                    .button(format!("{} Copy Project Path", icons::COPY))
+                                    .clicked()
+                                {
+                                    ui.ctx().copy_text(project_path.clone());
+                                    self.status_line = format!(
+                                        "Copied path for project '{}'",
+                                        project_snapshot.name
+                                    );
+                                    ui.close_menu();
                                 }
                             });
 
-                            ui.horizontal(|ui| {
-                                ui.label("Shell Override:");
-                                let mut current = project_snapshot
-                                    .shell_override
-                                    .unwrap_or(self.config.default_shell);
-                                egui::ComboBox::from_id_salt(format!(
-                                    "shell-override-{project_id}"
-                                ))
-                                .selected_text(
-                                    project_snapshot
-                                        .shell_override
-                                        .map(|shell| shell.label().to_owned())
-                                        .unwrap_or_else(|| {
-                                            format!(
-                                                "Global ({})",
-                                                self.config.default_shell.label()
-                                            )
-                                        }),
-                                )
-                                .show_ui(ui, |ui| {
-                                    if ui
-                                        .selectable_label(
-                                            project_snapshot.shell_override.is_none(),
-                                            format!(
-                                                "Global ({})",
-                                                self.config.default_shell.label()
-                                            ),
-                                        )
-                                        .clicked()
-                                    {
-                                        next_shell_override = None;
+                            if let Some(project) = self.projects.get_mut(&project_id) {
+                                project.shell_override = next_shell_override;
+                                if let Some(message) = add_message {
+                                    project.saved_messages.push(message);
+                                    requested_persist = true;
+                                }
+                                if let Some(index) = remove_message_index {
+                                    if index < project.saved_messages.len() {
+                                        project.saved_messages.remove(index);
                                         requested_persist = true;
                                     }
-
-                                    if ui
-                                        .selectable_value(
-                                            &mut current,
-                                            ShellKind::PowerShell,
-                                            ShellKind::PowerShell.label(),
-                                        )
-                                        .clicked()
-                                    {
-                                        next_shell_override = Some(ShellKind::PowerShell);
-                                        requested_persist = true;
-                                    }
-
-                                    if ui
-                                        .selectable_value(
-                                            &mut current,
-                                            ShellKind::Cmd,
-                                            ShellKind::Cmd.label(),
-                                        )
-                                        .clicked()
-                                    {
-                                        next_shell_override = Some(ShellKind::Cmd);
-                                        requested_persist = true;
-                                    }
-                                });
-                            });
-
-                            ui.separator();
-                            ui.label(RichText::new("Foreground terminals").strong());
-                            self.draw_terminal_rows(ui, project_id, TerminalKind::Foreground);
-
-                            ui.separator();
-                            ui.colored_label(Color32::LIGHT_BLUE, "Background terminals");
-                            self.draw_terminal_rows(ui, project_id, TerminalKind::Background);
-
-                            ui.separator();
-                            ui.label("Saved messages");
-                            for (index, message) in
-                                project_snapshot.saved_messages.iter().enumerate()
-                            {
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new(message).monospace().small());
-                                    if ui.small_button("Remove").clicked() {
-                                        remove_message_index = Some(index);
-                                    }
-                                });
+                                }
                             }
 
-                            ui.horizontal(|ui| {
-                                ui.text_edit_singleline(&mut self.new_saved_message);
-                                if ui.button("Add").clicked() {
-                                    let text = self.new_saved_message.trim();
-                                    if !text.is_empty() {
-                                        add_message = Some(text.to_owned());
-                                        self.new_saved_message.clear();
-                                    }
-                                }
-                            });
-                        });
-
-                    header.header_response.context_menu(|ui| {
-                        if ui.button("Copy Project Path").clicked() {
-                            ui.ctx().copy_text(project_path.clone());
-                            self.status_line =
-                                format!("Copied path for project '{}'", project_snapshot.name);
-                            ui.close_menu();
+                            if requested_persist {
+                                self.persist_config();
+                            }
                         }
                     });
-
-                    if let Some(project) = self.projects.get_mut(&project_id) {
-                        project.shell_override = next_shell_override;
-                        if let Some(message) = add_message {
-                            project.saved_messages.push(message);
-                            requested_persist = true;
-                        }
-                        if let Some(index) = remove_message_index {
-                            if index < project.saved_messages.len() {
-                                project.saved_messages.remove(index);
-                                requested_persist = true;
-                            }
-                        }
-                    }
-
-                    if requested_persist {
-                        self.persist_config();
-                    }
-                }
             });
     }
 
@@ -826,19 +1000,25 @@ impl AdeApp {
             ui.horizontal(|ui| {
                 let active = current_active == Some(terminal_entry_id);
                 let label = if terminal.exited {
-                    format!("{} (Exited)", terminal.title)
+                    format!("{} {} (Exited)", icons::TERMINAL, terminal.title)
                 } else {
-                    terminal.title.clone()
+                    format!("{} {}", icons::TERMINAL, terminal.title)
                 };
 
                 if ui.selectable_label(active, label).clicked() {
                     set_active = true;
                 }
 
-                if ui.checkbox(&mut terminal.in_main_view, "Show").changed() {
+                if ui
+                    .checkbox(
+                        &mut terminal.in_main_view,
+                        RichText::new("Show").color(TEXT_MUTED),
+                    )
+                    .changed()
+                {
                     visibility_changed = true;
                 }
-                if ui.small_button("Close").clicked() {
+                if ui.small_button(format!("{} Close", icons::X)).clicked() {
                     close_terminal = true;
                 }
             });
@@ -861,14 +1041,24 @@ impl AdeApp {
 
             if visible_ids.is_empty() {
                 ui.centered_and_justified(|ui| {
-                    ui.label("No visible terminals. Use 'New Terminal' and Auto Tile.");
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            RichText::new(format!("{}  No visible terminals", icons::TERMINAL))
+                                .size(20.0)
+                                .strong(),
+                        );
+                        ui.label(
+                            RichText::new("Use New Terminal and Auto Tile to start.")
+                                .color(TEXT_MUTED),
+                        );
+                    });
                 });
                 return;
             }
 
             let available = ui.available_size();
             let grid = layout::compute_tile_grid(visible_ids.len(), available.x, available.y);
-            let spacing = Vec2::new(8.0, 8.0);
+            let spacing = Vec2::new(10.0, 10.0);
 
             let pane_width = ((available.x - spacing.x * (grid.cols.saturating_sub(1) as f32))
                 / grid.cols as f32)
@@ -885,9 +1075,14 @@ impl AdeApp {
                         let size = Vec2::new(pane_width, pane_height);
                         if let Some(terminal_id) = visible_ids.get(index) {
                             ui.allocate_ui_with_layout(size, Layout::top_down(Align::Min), |ui| {
-                                egui::Frame::group(ui.style()).show(ui, |ui| {
-                                    self.draw_terminal_pane(ui, *terminal_id, size);
-                                });
+                                egui::Frame::none()
+                                    .fill(SURFACE_BG)
+                                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                                    .rounding(10.0)
+                                    .inner_margin(egui::Margin::same(8.0))
+                                    .show(ui, |ui| {
+                                        self.draw_terminal_pane(ui, *terminal_id, size);
+                                    });
                             });
                         } else {
                             ui.allocate_space(size);
@@ -918,22 +1113,53 @@ impl AdeApp {
 
             let mut close_requested = false;
             let mut pane_clicked = false;
-            ui.horizontal_wrapped(|ui| {
-                let title = format!("{} {}", if is_active { "*" } else { "." }, terminal.title);
-                if ui.selectable_label(is_active, title).clicked() {
-                    pane_clicked = true;
-                }
-                ui.separator();
-                ui.label(project_name);
-                ui.separator();
-                ui.label(terminal.kind.label());
-                if terminal.exited {
-                    ui.colored_label(Color32::LIGHT_RED, "Exited");
-                }
-                if ui.small_button("Close").clicked() {
-                    close_requested = true;
-                }
-            });
+            let kind_fill = match terminal.kind {
+                TerminalKind::Foreground => Color32::from_rgb(14, 78, 117),
+                TerminalKind::Background => Color32::from_rgb(76, 54, 17),
+            };
+            let header_fill = if is_active {
+                Color32::from_rgb(30, 44, 62)
+            } else {
+                Color32::from_rgb(24, 34, 48)
+            };
+
+            egui::Frame::none()
+                .fill(header_fill)
+                .stroke(Stroke::new(1.0, BORDER_COLOR))
+                .rounding(8.0)
+                .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let indicator = if is_active { "●" } else { "○" };
+                        let title = format!("{indicator} {} {}", icons::TERMINAL, terminal.title);
+                        if ui.selectable_label(is_active, title).clicked() {
+                            pane_clicked = true;
+                        }
+                        ui.separator();
+                        ui.label(
+                            RichText::new(format!("{} {}", icons::FOLDER, project_name))
+                                .color(TEXT_MUTED),
+                        );
+                        ui.separator();
+                        egui::Frame::none()
+                            .fill(kind_fill)
+                            .rounding(6.0)
+                            .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(terminal.kind.label())
+                                        .small()
+                                        .color(Color32::from_rgb(225, 243, 255)),
+                                );
+                            });
+                        if terminal.exited {
+                            ui.colored_label(Color32::LIGHT_RED, "Exited");
+                        }
+                        if ui.small_button(format!("{} Close", icons::X)).clicked() {
+                            close_requested = true;
+                        }
+                    });
+                });
 
             let monospace = egui::TextStyle::Monospace;
             let font_id = monospace.resolve(ui.style());
@@ -1029,12 +1255,16 @@ impl AdeApp {
         let mut keep_open = self.show_settings_popup;
         let mut should_persist = false;
 
-        egui::Window::new("Settings")
+        egui::Window::new(format!("{} Settings", icons::GEAR))
             .open(&mut keep_open)
             .resizable(false)
             .collapsible(false)
             .show(ctx, |ui| {
-                ui.label("Application Settings");
+                ui.label(
+                    RichText::new("Application Settings")
+                        .strong()
+                        .color(TEXT_PRIMARY),
+                );
                 ui.separator();
 
                 let mut show_explorer = self.config.ui.show_project_explorer;
@@ -1120,12 +1350,14 @@ impl AdeApp {
 
         let mut keep_open = self.show_saved_messages_picker;
         let mut should_close = false;
-        egui::Window::new("Saved Messages")
+        egui::Window::new(format!("{} Saved Messages", icons::CHAT_TEXT))
             .open(&mut keep_open)
             .resizable(true)
             .collapsible(false)
             .show(ctx, |ui| {
-                ui.label(format!("Project: {}", project.name));
+                ui.label(
+                    RichText::new(format!("{} Project: {}", icons::FOLDER, project.name)).strong(),
+                );
                 ui.label("Pick a message to insert into the active terminal.");
                 ui.separator();
 
@@ -1162,6 +1394,7 @@ impl AdeApp {
 
 impl eframe::App for AdeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ensure_theme_initialized(ctx);
         self.ensure_repaint_pump(ctx);
         self.process_terminal_events(ctx);
         self.schedule_terminal_refresh(ctx);
