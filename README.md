@@ -66,17 +66,12 @@ git push origin v0.1.0
 - **Sidebar A (leftmost):** Project list + project explorer tree (toggleable)
 - **Sidebar B:** Terminal Manager grouped by project, with separate Foreground/Background sections
 - **Main area:** Embedded, tiled terminal panes
+- **Terminal input model:** Type directly into the active terminal pane (no separate message input bar)
 
 ## Key bindings
 
-- `Ctrl+B`: Toggle Project Explorer
-- `Ctrl+Shift+F`: Toggle Project Filter Mode
-- `Ctrl+Shift+T`: New terminal for selected project
-- `Ctrl+Shift+G`: Auto Tile (all visible)
-- `Ctrl+Alt+G`: Auto Tile (selected project only)
-- `Ctrl+Tab`: Next active terminal
-- `Ctrl+Shift+Tab`: Previous active terminal
-- `Ctrl+Shift+P`: Open saved messages picker
+- No app-level keyboard shortcuts are bound in this build.
+- Standard terminal control combinations (for example `Ctrl+C`, `Ctrl+V`, arrows, `Tab`, `Backspace`) are sent directly to the active terminal.
 
 ## Configuration and storage
 

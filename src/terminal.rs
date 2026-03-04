@@ -159,12 +159,6 @@ impl TerminalRuntime {
         let _ = self.sender.send(Msg::Input(Cow::Owned(bytes)));
     }
 
-    pub fn send_line(&self, line: &str) {
-        let mut payload = line.as_bytes().to_vec();
-        payload.push(b'\n');
-        self.send_bytes(payload);
-    }
-
     pub fn resize(&mut self, dimensions: TerminalDimensions) {
         if dimensions.cols == 0 || dimensions.lines == 0 {
             return;

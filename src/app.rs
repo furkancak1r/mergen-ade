@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crossbeam_channel::{Receiver, Sender};
-use eframe::egui::{self, Align, Color32, Key, Layout, RichText, TextWrapMode, Ui, Vec2};
+use eframe::egui::{self, Align, Color32, Event, Key, Layout, RichText, Sense, TextWrapMode, Ui, Vec2};
 
 use crate::config;
 use crate::layout;
@@ -38,7 +38,7 @@ struct TerminalEntry {
     project_id: u64,
     kind: TerminalKind,
     title: String,
-    input_buffer: String,
+    pending_line_for_title: String,
     in_main_view: bool,
     dirty: bool,
     render_cache: String,
@@ -180,7 +180,7 @@ impl AdeApp {
             project_id,
             kind,
             title: fallback_title,
-            input_buffer: String::new(),
+            pending_line_for_title: String::new(),
             in_main_view: true,
             dirty: true,
             render_cache: String::new(),
@@ -231,105 +231,7 @@ impl AdeApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let mut do_toggle_explorer = false;
-        let mut do_toggle_filter = false;
-        let mut do_new_terminal = false;
-        let mut do_auto_tile_all = false;
-        let mut do_auto_tile_selected = false;
-        let mut do_saved_picker = false;
-        let mut do_next_terminal = false;
-        let mut do_prev_terminal = false;
-
-        ctx.input(|input| {
-            let command = input.modifiers.ctrl;
-            if command && input.key_pressed(Key::B) {
-                do_toggle_explorer = true;
-            }
-            if command && input.modifiers.shift && input.key_pressed(Key::F) {
-                do_toggle_filter = true;
-            }
-            if command && input.modifiers.shift && input.key_pressed(Key::T) {
-                do_new_terminal = true;
-            }
-            if command && input.modifiers.shift && input.key_pressed(Key::G) {
-                do_auto_tile_all = true;
-            }
-            if command && input.modifiers.alt && input.key_pressed(Key::G) {
-                do_auto_tile_selected = true;
-            }
-            if command && input.modifiers.shift && input.key_pressed(Key::P) {
-                do_saved_picker = true;
-            }
-            if command && input.key_pressed(Key::Tab) {
-                if input.modifiers.shift {
-                    do_prev_terminal = true;
-                } else {
-                    do_next_terminal = true;
-                }
-            }
-        });
-
-        if do_toggle_explorer {
-            self.config.ui.show_project_explorer = !self.config.ui.show_project_explorer;
-            self.persist_config();
-        }
-
-        if do_toggle_filter {
-            self.config.ui.project_filter_mode = !self.config.ui.project_filter_mode;
-            self.bump_layout_epoch();
-            self.persist_config();
-        }
-
-        if do_new_terminal {
-            if let Some(project_id) = self.selected_project {
-                self.spawn_terminal_for_project(project_id, TerminalKind::Foreground);
-            }
-        }
-
-        if do_auto_tile_all {
-            self.apply_auto_tile(AutoTileScope::AllVisible);
-        }
-
-        if do_auto_tile_selected {
-            self.apply_auto_tile(AutoTileScope::SelectedProjectOnly);
-        }
-
-        if do_saved_picker {
-            self.show_saved_messages_picker = true;
-        }
-
-        if do_next_terminal {
-            self.cycle_active_terminal(true);
-        }
-
-        if do_prev_terminal {
-            self.cycle_active_terminal(false);
-        }
-    }
-
-    fn cycle_active_terminal(&mut self, forward: bool) {
-        let mut ids = self.terminals.keys().copied().collect::<Vec<_>>();
-        if ids.is_empty() {
-            self.active_terminal = None;
-            return;
-        }
-
-        ids.sort_unstable();
-
-        let current_index = self
-            .active_terminal
-            .and_then(|active| ids.iter().position(|id| *id == active))
-            .unwrap_or(0);
-
-        let next_index = if forward {
-            (current_index + 1) % ids.len()
-        } else if current_index == 0 {
-            ids.len() - 1
-        } else {
-            current_index - 1
-        };
-
-        self.active_terminal = ids.get(next_index).copied();
+        let _ = ctx;
     }
 
     fn apply_auto_tile(&mut self, scope: AutoTileScope) {
@@ -362,16 +264,157 @@ impl AdeApp {
         ids
     }
 
-    fn submit_terminal_line(&mut self, terminal_id: u64) {
-        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+    fn route_active_terminal_input(&mut self, ctx: &egui::Context) {
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+
+        let Some(active_terminal_id) = self.active_terminal else {
             return;
         };
 
-        let line = std::mem::take(&mut terminal.input_buffer);
-        terminal.runtime.send_line(&line);
+        let can_receive_input = self
+            .terminals
+            .get(&active_terminal_id)
+            .is_some_and(|terminal| self.terminal_visible_in_main(terminal) && !terminal.exited);
+        if !can_receive_input {
+            return;
+        }
 
-        terminal.title = update_terminal_title(&line, terminal.id as usize, TITLE_MAX_LEN);
-        terminal.dirty = true;
+        let events = ctx.input(|input| input.events.clone());
+        if events.is_empty() {
+            return;
+        }
+
+        let Some(terminal) = self.terminals.get_mut(&active_terminal_id) else {
+            return;
+        };
+
+        let mut outbound = Vec::new();
+
+        for event in events {
+            match event {
+                Event::Copy => {
+                    outbound.push(0x03);
+                },
+                Event::Text(text) => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    outbound.extend_from_slice(text.as_bytes());
+                    Self::append_pending_line(&mut terminal.pending_line_for_title, &text);
+                },
+                Event::Paste(text) => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    outbound.extend_from_slice(text.as_bytes());
+                    Self::append_pending_line(&mut terminal.pending_line_for_title, &text);
+                },
+                Event::Key {
+                    key,
+                    pressed,
+                    modifiers,
+                    ..
+                } if pressed => {
+                    if key == Key::Enter {
+                        outbound.push(b'\r');
+                        let line = std::mem::take(&mut terminal.pending_line_for_title);
+                        terminal.title =
+                            update_terminal_title(&line, terminal.id as usize, TITLE_MAX_LEN);
+                        terminal.dirty = true;
+                        continue;
+                    }
+
+                    if key == Key::Backspace {
+                        terminal.pending_line_for_title.pop();
+                    }
+
+                    if let Some(bytes) = Self::key_to_terminal_bytes(key, modifiers) {
+                        outbound.extend_from_slice(&bytes);
+                    }
+                },
+                _ => {},
+            }
+        }
+
+        if !outbound.is_empty() {
+            terminal.runtime.send_bytes(outbound);
+        }
+    }
+
+    fn append_pending_line(pending: &mut String, text: &str) {
+        for ch in text.chars() {
+            if ch == '\r' || ch == '\n' {
+                pending.clear();
+                continue;
+            }
+            pending.push(ch);
+        }
+    }
+
+    fn key_to_terminal_bytes(key: Key, modifiers: egui::Modifiers) -> Option<Vec<u8>> {
+        if modifiers.ctrl && !modifiers.alt {
+            if let Some(ctrl) = Self::ctrl_key_to_byte(key) {
+                return Some(vec![ctrl]);
+            }
+        }
+
+        if modifiers.ctrl || modifiers.alt || modifiers.command {
+            return None;
+        }
+
+        let sequence = match (key, modifiers.shift) {
+            (Key::Backspace, _) => b"\x08".as_slice(),
+            (Key::Tab, true) => b"\x1b[Z".as_slice(),
+            (Key::Tab, false) => b"\t".as_slice(),
+            (Key::Escape, _) => b"\x1b".as_slice(),
+            (Key::ArrowUp, _) => b"\x1b[A".as_slice(),
+            (Key::ArrowDown, _) => b"\x1b[B".as_slice(),
+            (Key::ArrowRight, _) => b"\x1b[C".as_slice(),
+            (Key::ArrowLeft, _) => b"\x1b[D".as_slice(),
+            (Key::Home, _) => b"\x1b[H".as_slice(),
+            (Key::End, _) => b"\x1b[F".as_slice(),
+            (Key::PageUp, _) => b"\x1b[5~".as_slice(),
+            (Key::PageDown, _) => b"\x1b[6~".as_slice(),
+            (Key::Delete, _) => b"\x1b[3~".as_slice(),
+            (Key::Insert, _) => b"\x1b[2~".as_slice(),
+            _ => return None,
+        };
+
+        Some(sequence.to_vec())
+    }
+
+    fn ctrl_key_to_byte(key: Key) -> Option<u8> {
+        match key {
+            Key::A => Some(0x01),
+            Key::B => Some(0x02),
+            Key::C => Some(0x03),
+            Key::D => Some(0x04),
+            Key::E => Some(0x05),
+            Key::F => Some(0x06),
+            Key::G => Some(0x07),
+            Key::H => Some(0x08),
+            Key::I => Some(0x09),
+            Key::J => Some(0x0A),
+            Key::K => Some(0x0B),
+            Key::L => Some(0x0C),
+            Key::M => Some(0x0D),
+            Key::N => Some(0x0E),
+            Key::O => Some(0x0F),
+            Key::P => Some(0x10),
+            Key::Q => Some(0x11),
+            Key::R => Some(0x12),
+            Key::S => Some(0x13),
+            Key::T => Some(0x14),
+            Key::U => Some(0x15),
+            Key::V => Some(0x16),
+            Key::W => Some(0x17),
+            Key::X => Some(0x18),
+            Key::Y => Some(0x19),
+            Key::Z => Some(0x1A),
+            _ => None,
+        }
     }
 
     fn close_terminal(&mut self, terminal_id: u64) {
@@ -729,15 +772,18 @@ impl AdeApp {
             .unwrap_or_else(|| "Unknown Project".to_owned());
         let is_active = self.active_terminal == Some(terminal_id);
 
-        let (clicked, enter_pressed, close_requested) = {
+        let (clicked, close_requested) = {
             let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
                 return;
             };
 
             let mut close_requested = false;
+            let mut pane_clicked = false;
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(if is_active { "*" } else { "." }).strong());
-                ui.label(RichText::new(terminal.title.clone()).strong());
+                let title = format!("{} {}", if is_active { "*" } else { "." }, terminal.title);
+                if ui.selectable_label(is_active, title).clicked() {
+                    pane_clicked = true;
+                }
                 ui.separator();
                 ui.label(project_name);
                 ui.separator();
@@ -762,9 +808,7 @@ impl AdeApp {
             let pane_height = pane_available.y.max((pane_size.y - 10.0).max(120.0));
 
             let header_height = line_height + 10.0;
-            let input_height = line_height + 12.0;
-            let output_height =
-                (pane_height - header_height - input_height - 12.0).max(line_height * 3.0);
+            let output_height = (pane_height - header_height - 8.0).max(line_height * 3.0);
             let output_size = Vec2::new(pane_width, output_height);
 
             let cols = ((output_size.x / char_width).floor() as u16).max(20);
@@ -789,29 +833,18 @@ impl AdeApp {
                     .auto_shrink([false, false])
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
-                        ui.add(
+                        let response = ui.add(
                             egui::Label::new(RichText::new(terminal.render_cache.clone()).monospace())
-                                .wrap_mode(TextWrapMode::Extend),
+                                .wrap_mode(TextWrapMode::Extend)
+                                .sense(Sense::click()),
                         );
+                        if response.clicked() {
+                            pane_clicked = true;
+                        }
                     });
                 });
 
-            let response = ui.add_sized(
-                [pane_width, input_height],
-                egui::TextEdit::singleline(&mut terminal.input_buffer)
-                    .desired_width(pane_width)
-                    .hint_text("Type command and press Enter"),
-            );
-
-            if is_active && !response.has_focus() {
-                response.request_focus();
-            }
-
-            (
-                response.clicked(),
-                response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter)),
-                close_requested,
-            )
+            (pane_clicked, close_requested)
         };
 
         if close_requested {
@@ -821,9 +854,6 @@ impl AdeApp {
 
         if clicked {
             self.active_terminal = Some(terminal_id);
-        }
-        if enter_pressed {
-            self.submit_terminal_line(terminal_id);
         }
     }
 
@@ -926,14 +956,18 @@ impl AdeApp {
             .collapsible(false)
             .show(ctx, |ui| {
                 ui.label(format!("Project: {}", project.name));
-                ui.label("Pick a message to insert into active terminal input buffer.");
+                ui.label("Pick a message to insert into the active terminal.");
                 ui.separator();
 
                 for message in &project.saved_messages {
                     if ui.button(message).clicked() {
                         if let Some(active_terminal_id) = self.active_terminal {
                             if let Some(active_terminal) = self.terminals.get_mut(&active_terminal_id) {
-                                active_terminal.input_buffer.push_str(message);
+                                active_terminal.runtime.send_bytes(message.as_bytes().to_vec());
+                                Self::append_pending_line(
+                                    &mut active_terminal.pending_line_for_title,
+                                    message,
+                                );
                             }
                         }
                         should_close = true;
@@ -963,6 +997,8 @@ impl eframe::App for AdeApp {
         self.draw_main_area(ctx);
         self.draw_settings_popup(ctx);
         self.draw_saved_messages_picker(ctx);
+
+        self.route_active_terminal_input(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -1003,5 +1039,44 @@ fn draw_folder_tree(ui: &mut Ui, path: &Path, depth: usize, max_depth: usize) {
         } else {
             ui.label(name);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AdeApp;
+    use eframe::egui::{Key, Modifiers};
+
+    #[test]
+    fn maps_navigation_keys_to_escape_sequences() {
+        let up = AdeApp::key_to_terminal_bytes(Key::ArrowUp, Modifiers::default());
+        let delete = AdeApp::key_to_terminal_bytes(Key::Delete, Modifiers::default());
+
+        assert_eq!(up, Some(b"\x1b[A".to_vec()));
+        assert_eq!(delete, Some(b"\x1b[3~".to_vec()));
+    }
+
+    #[test]
+    fn maps_ctrl_letters_to_control_bytes() {
+        let modifiers = Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        };
+
+        let ctrl_c = AdeApp::key_to_terminal_bytes(Key::C, modifiers);
+        let ctrl_z = AdeApp::key_to_terminal_bytes(Key::Z, modifiers);
+
+        assert_eq!(ctrl_c, Some(vec![0x03]));
+        assert_eq!(ctrl_z, Some(vec![0x1a]));
+    }
+
+    #[test]
+    fn pending_line_keeps_last_logical_line() {
+        let mut pending = String::new();
+
+        AdeApp::append_pending_line(&mut pending, "echo first");
+        AdeApp::append_pending_line(&mut pending, "\nnext");
+
+        assert_eq!(pending, "next");
     }
 }
