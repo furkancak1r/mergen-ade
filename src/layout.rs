@@ -12,7 +12,10 @@ pub fn compute_tile_grid(count: usize, viewport_width: f32, viewport_height: f32
     let safe_width = viewport_width.max(1.0);
     let safe_height = viewport_height.max(1.0);
 
-    let mut best = TileGrid { rows: count, cols: 1 };
+    let mut best = TileGrid {
+        rows: count,
+        cols: 1,
+    };
     let mut best_score = f32::MAX;
 
     for cols in 1..=count {

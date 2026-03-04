@@ -7,7 +7,7 @@ It is **not an IDE** and does not include an editor, LSP, or debugging UI.
 ## Goals in this prototype
 
 - Native Rust desktop app (no Electron)
-- Terminal emulation via `alacritty_terminal`
+- Terminal emulation via `tattoy-wezterm-term`
 - ConPTY-backed terminal process integration on Windows
 - Two left sidebars + tiled main terminal area
 - Very small persisted state in local TOML config
@@ -56,10 +56,11 @@ git push origin v0.1.0
 
 ## How ConPTY is used
 
-- Each terminal session is created through `alacritty_terminal::tty::new(...)`.
-- On Windows, `alacritty_terminal` uses its internal ConPTY backend (`tty::windows::conpty`) to create pseudoterminal pipes and child process wiring.
-- Terminal emulation/parsing and PTY I/O run through `alacritty_terminal::event_loop::EventLoop` on a background thread.
-- The UI thread receives wake/title/exit notifications through a channel and renders terminal snapshots incrementally.
+- Each terminal session is created through `portable-pty` using `native_pty_system()` (Windows resolves to ConPTY).
+- The app opens a PTY pair with `openpty(...)`, spawns the shell process via `spawn_command(...)`, and keeps PTY master handles for resize and IO.
+- Terminal emulation/parsing is handled by `tattoy-wezterm-term::Terminal`, fed incrementally from a dedicated PTY reader thread.
+- Input writes and resize requests are sent over channels to a dedicated IO thread so the UI thread remains responsive.
+- The UI thread consumes wake/exit notifications via channel and renders snapshots from the in-memory terminal model.
 
 ## UI Overview
 

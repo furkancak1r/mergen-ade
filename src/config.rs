@@ -11,8 +11,9 @@ const ORGANIZATION: &str = "Mergen";
 const APPLICATION: &str = "MergenADE";
 
 pub fn config_path() -> io::Result<PathBuf> {
-    let dirs = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "App data directory not available"))?;
+    let dirs = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "App data directory not available")
+    })?;
 
     let config_dir = dirs.config_dir();
     fs::create_dir_all(config_dir)?;

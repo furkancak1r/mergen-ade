@@ -1,19 +1,33 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
-use eframe::egui::{self, Align, Color32, Event, Key, Layout, RichText, Sense, TextWrapMode, Ui, Vec2};
+use eframe::egui::text::{LayoutJob, TextFormat};
+use eframe::egui::{
+    self, Align, Color32, Event, FontId, Key, Layout, RichText, Sense, Stroke, TextWrapMode, Ui,
+    Vec2,
+};
 
 use crate::config;
 use crate::layout;
 use crate::models::{AppConfig, AutoTileScope, ProjectRecord, ShellKind, TerminalKind};
-use crate::terminal::{terminal_snapshot_text, TerminalDimensions, TerminalRuntime, TerminalUiEvent, TerminalUiEventKind};
+use crate::terminal::{
+    try_terminal_snapshot, TerminalColor, TerminalDimensions, TerminalRuntime, TerminalSnapshot,
+    TerminalUiEvent, TerminalUiEventKind,
+};
 use crate::title::update_terminal_title;
 
 const CELL_WIDTH_PX: f32 = 8.0;
 const CELL_HEIGHT_PX: f32 = 16.0;
 const TITLE_MAX_LEN: usize = 40;
+const TERMINAL_EVENT_BUDGET: usize = 4096;
+const TERMINAL_RETRY_MS: u64 = 8;
+const TERMINAL_FALLBACK_REFRESH_MS: u64 = 16;
+const TERMINAL_OUTPUT_BG: Color32 = Color32::from_rgb(0, 0, 0);
 
 pub struct AdeApp {
     config_path: PathBuf,
@@ -31,6 +45,8 @@ pub struct AdeApp {
     new_saved_message: String,
     status_line: String,
     layout_epoch: u64,
+    repaint_pump_started: bool,
+    repaint_pump_flag: Arc<AtomicBool>,
 }
 
 struct TerminalEntry {
@@ -41,7 +57,8 @@ struct TerminalEntry {
     pending_line_for_title: String,
     in_main_view: bool,
     dirty: bool,
-    render_cache: String,
+    last_seqno: usize,
+    render_cache: TerminalSnapshot,
     exited: bool,
     runtime: TerminalRuntime,
 }
@@ -83,6 +100,8 @@ impl AdeApp {
             new_saved_message: String::new(),
             status_line: "Ready".to_owned(),
             layout_epoch: 0,
+            repaint_pump_started: false,
+            repaint_pump_flag: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -147,7 +166,12 @@ impl AdeApp {
         Some(project.shell_override.unwrap_or(self.config.default_shell))
     }
 
-    fn spawn_terminal_for_project(&mut self, project_id: u64, kind: TerminalKind) {
+    fn spawn_terminal_for_project(
+        &mut self,
+        ctx: &egui::Context,
+        project_id: u64,
+        kind: TerminalKind,
+    ) {
         let Some(project) = self.projects.get(&project_id).cloned() else {
             return;
         };
@@ -165,13 +189,14 @@ impl AdeApp {
             shell,
             project.path.clone(),
             self.terminal_events_tx.clone(),
+            ctx.clone(),
             dimensions,
         ) {
             Ok(runtime) => runtime,
             Err(err) => {
                 self.status_line = format!("Failed to create terminal: {err}");
                 return;
-            },
+            }
         };
 
         let fallback_title = format!("Terminal {terminal_id}");
@@ -183,7 +208,8 @@ impl AdeApp {
             pending_line_for_title: String::new(),
             in_main_view: true,
             dirty: true,
-            render_cache: String::new(),
+            last_seqno: runtime.latest_seqno(),
+            render_cache: TerminalSnapshot::default(),
             exited: false,
             runtime,
         };
@@ -201,32 +227,83 @@ impl AdeApp {
     }
 
     fn process_terminal_events(&mut self, ctx: &egui::Context) {
-        while let Ok(event) = self.terminal_events_rx.try_recv() {
-            let Some(entry) = self.terminals.get_mut(&event.terminal_id) else {
-                continue;
+        let mut dirty_ids = BTreeSet::new();
+        let mut exited_ids = BTreeSet::new();
+        let mut title_updates: BTreeMap<u64, Option<String>> = BTreeMap::new();
+        let mut pty_writes: Vec<(u64, String)> = Vec::new();
+        let mut processed = 0usize;
+
+        while processed < TERMINAL_EVENT_BUDGET {
+            let Ok(event) = self.terminal_events_rx.try_recv() else {
+                break;
             };
+            processed += 1;
 
             match event.kind {
                 TerminalUiEventKind::Wakeup => {
-                    entry.dirty = true;
-                    ctx.request_repaint();
-                },
+                    dirty_ids.insert(event.terminal_id);
+                }
                 TerminalUiEventKind::Title(title) => {
                     if !title.trim().is_empty() {
-                        entry.title = title;
+                        title_updates.insert(event.terminal_id, Some(title));
                     }
-                },
+                }
                 TerminalUiEventKind::ResetTitle => {
-                    entry.title = format!("Terminal {}", entry.id);
-                },
+                    title_updates.insert(event.terminal_id, None);
+                }
                 TerminalUiEventKind::PtyWrite(payload) => {
-                    entry.runtime.send_bytes(payload.into_bytes());
-                },
+                    pty_writes.push((event.terminal_id, payload));
+                }
                 TerminalUiEventKind::ChildExit | TerminalUiEventKind::Exit => {
-                    entry.exited = true;
-                    entry.dirty = true;
-                },
+                    exited_ids.insert(event.terminal_id);
+                    dirty_ids.insert(event.terminal_id);
+                }
             }
+        }
+
+        let mut changed = false;
+
+        for (terminal_id, payload) in pty_writes {
+            let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+                continue;
+            };
+            entry.runtime.send_bytes(payload.into_bytes());
+        }
+
+        for terminal_id in dirty_ids {
+            let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+                continue;
+            };
+            entry.dirty = true;
+            changed = true;
+        }
+
+        for (terminal_id, update) in title_updates {
+            let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+                continue;
+            };
+            entry.title = match update {
+                Some(title) => title,
+                None => format!("Terminal {}", entry.id),
+            };
+            changed = true;
+        }
+
+        for terminal_id in exited_ids {
+            let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+                continue;
+            };
+            entry.exited = true;
+            entry.dirty = true;
+            changed = true;
+        }
+
+        if changed {
+            ctx.request_repaint();
+        }
+
+        if !self.terminal_events_rx.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(1));
         }
     }
 
@@ -240,9 +317,9 @@ impl AdeApp {
         for terminal in self.terminals.values_mut() {
             terminal.in_main_view = match scope {
                 AutoTileScope::AllVisible => true,
-                AutoTileScope::SelectedProjectOnly => {
-                    self.selected_project.is_some_and(|project_id| project_id == terminal.project_id)
-                },
+                AutoTileScope::SelectedProjectOnly => self
+                    .selected_project
+                    .is_some_and(|project_id| project_id == terminal.project_id),
             };
         }
 
@@ -255,9 +332,7 @@ impl AdeApp {
         let mut ids = self
             .terminals
             .iter()
-            .filter_map(|(id, terminal)| {
-                self.terminal_visible_in_main(terminal).then_some(*id)
-            })
+            .filter_map(|(id, terminal)| self.terminal_visible_in_main(terminal).then_some(*id))
             .collect::<Vec<_>>();
 
         ids.sort_unstable();
@@ -265,7 +340,9 @@ impl AdeApp {
     }
 
     fn route_active_terminal_input(&mut self, ctx: &egui::Context) {
-        if ctx.wants_keyboard_input() {
+        if (self.show_settings_popup || self.show_saved_messages_picker)
+            && ctx.wants_keyboard_input()
+        {
             return;
         }
 
@@ -296,21 +373,21 @@ impl AdeApp {
             match event {
                 Event::Copy => {
                     outbound.push(0x03);
-                },
+                }
                 Event::Text(text) => {
                     if text.is_empty() {
                         continue;
                     }
                     outbound.extend_from_slice(text.as_bytes());
                     Self::append_pending_line(&mut terminal.pending_line_for_title, &text);
-                },
+                }
                 Event::Paste(text) => {
                     if text.is_empty() {
                         continue;
                     }
                     outbound.extend_from_slice(text.as_bytes());
                     Self::append_pending_line(&mut terminal.pending_line_for_title, &text);
-                },
+                }
                 Event::Key {
                     key,
                     pressed,
@@ -333,14 +410,43 @@ impl AdeApp {
                     if let Some(bytes) = Self::key_to_terminal_bytes(key, modifiers) {
                         outbound.extend_from_slice(&bytes);
                     }
-                },
-                _ => {},
+                }
+                _ => {}
             }
         }
 
         if !outbound.is_empty() {
             terminal.runtime.send_bytes(outbound);
+            terminal.dirty = true;
+            ctx.request_repaint();
         }
+    }
+
+    fn has_live_terminals(&self) -> bool {
+        self.terminals.values().any(|terminal| !terminal.exited)
+    }
+
+    fn schedule_terminal_refresh(&self, ctx: &egui::Context) {
+        if self.has_live_terminals() {
+            ctx.request_repaint_after(Duration::from_millis(TERMINAL_FALLBACK_REFRESH_MS));
+        }
+    }
+
+    fn ensure_repaint_pump(&mut self, ctx: &egui::Context) {
+        if self.repaint_pump_started {
+            return;
+        }
+
+        self.repaint_pump_started = true;
+        let repaint_ctx = ctx.clone();
+        let running = self.repaint_pump_flag.clone();
+
+        std::thread::spawn(move || {
+            while running.load(Ordering::Relaxed) {
+                repaint_ctx.request_repaint();
+                std::thread::sleep(Duration::from_millis(TERMINAL_FALLBACK_REFRESH_MS));
+            }
+        });
     }
 
     fn append_pending_line(pending: &mut String, text: &str) {
@@ -442,7 +548,7 @@ impl AdeApp {
 
                 if ui.button("New Terminal").clicked() {
                     if let Some(project_id) = self.selected_project {
-                        self.spawn_terminal_for_project(project_id, TerminalKind::Foreground);
+                        self.spawn_terminal_for_project(ctx, project_id, TerminalKind::Foreground);
                     }
                 }
 
@@ -494,7 +600,9 @@ impl AdeApp {
                     if response.clicked() {
                         let previous_selected = self.selected_project;
                         self.selected_project = Some(project_id);
-                        if self.config.ui.project_filter_mode && previous_selected != self.selected_project {
+                        if self.config.ui.project_filter_mode
+                            && previous_selected != self.selected_project
+                        {
                             self.bump_layout_epoch();
                         }
                         self.persist_config();
@@ -536,7 +644,9 @@ impl AdeApp {
 
                 for project_id in project_ids {
                     if self.config.ui.project_filter_mode
-                        && self.selected_project.is_some_and(|selected| selected != project_id)
+                        && self
+                            .selected_project
+                            .is_some_and(|selected| selected != project_id)
                     {
                         continue;
                     }
@@ -557,52 +667,79 @@ impl AdeApp {
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 if ui.button("New FG").clicked() {
-                                    self.spawn_terminal_for_project(project_id, TerminalKind::Foreground);
+                                    self.spawn_terminal_for_project(
+                                        ctx,
+                                        project_id,
+                                        TerminalKind::Foreground,
+                                    );
                                 }
                                 if ui.button("New BG").clicked() {
-                                    self.spawn_terminal_for_project(project_id, TerminalKind::Background);
+                                    self.spawn_terminal_for_project(
+                                        ctx,
+                                        project_id,
+                                        TerminalKind::Background,
+                                    );
                                 }
                             });
 
                             ui.horizontal(|ui| {
                                 ui.label("Shell Override:");
-                                let mut current =
-                                    project_snapshot.shell_override.unwrap_or(self.config.default_shell);
-                                egui::ComboBox::from_id_salt(format!("shell-override-{project_id}"))
-                                    .selected_text(
-                                        project_snapshot
-                                            .shell_override
-                                            .map(|shell| shell.label().to_owned())
-                                            .unwrap_or_else(|| format!("Global ({})", self.config.default_shell.label())),
-                                    )
-                                    .show_ui(ui, |ui| {
-                                        if ui
-                                            .selectable_label(
-                                                project_snapshot.shell_override.is_none(),
-                                                format!("Global ({})", self.config.default_shell.label()),
+                                let mut current = project_snapshot
+                                    .shell_override
+                                    .unwrap_or(self.config.default_shell);
+                                egui::ComboBox::from_id_salt(format!(
+                                    "shell-override-{project_id}"
+                                ))
+                                .selected_text(
+                                    project_snapshot
+                                        .shell_override
+                                        .map(|shell| shell.label().to_owned())
+                                        .unwrap_or_else(|| {
+                                            format!(
+                                                "Global ({})",
+                                                self.config.default_shell.label()
                                             )
-                                            .clicked()
-                                        {
-                                            next_shell_override = None;
-                                            requested_persist = true;
-                                        }
+                                        }),
+                                )
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(
+                                            project_snapshot.shell_override.is_none(),
+                                            format!(
+                                                "Global ({})",
+                                                self.config.default_shell.label()
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        next_shell_override = None;
+                                        requested_persist = true;
+                                    }
 
-                                        if ui
-                                            .selectable_value(&mut current, ShellKind::PowerShell, ShellKind::PowerShell.label())
-                                            .clicked()
-                                        {
-                                            next_shell_override = Some(ShellKind::PowerShell);
-                                            requested_persist = true;
-                                        }
+                                    if ui
+                                        .selectable_value(
+                                            &mut current,
+                                            ShellKind::PowerShell,
+                                            ShellKind::PowerShell.label(),
+                                        )
+                                        .clicked()
+                                    {
+                                        next_shell_override = Some(ShellKind::PowerShell);
+                                        requested_persist = true;
+                                    }
 
-                                        if ui
-                                            .selectable_value(&mut current, ShellKind::Cmd, ShellKind::Cmd.label())
-                                            .clicked()
-                                        {
-                                            next_shell_override = Some(ShellKind::Cmd);
-                                            requested_persist = true;
-                                        }
-                                    });
+                                    if ui
+                                        .selectable_value(
+                                            &mut current,
+                                            ShellKind::Cmd,
+                                            ShellKind::Cmd.label(),
+                                        )
+                                        .clicked()
+                                    {
+                                        next_shell_override = Some(ShellKind::Cmd);
+                                        requested_persist = true;
+                                    }
+                                });
                             });
 
                             ui.separator();
@@ -615,7 +752,9 @@ impl AdeApp {
 
                             ui.separator();
                             ui.label("Saved messages");
-                            for (index, message) in project_snapshot.saved_messages.iter().enumerate() {
+                            for (index, message) in
+                                project_snapshot.saved_messages.iter().enumerate()
+                            {
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(message).monospace().small());
                                     if ui.small_button("Remove").clicked() {
@@ -813,36 +952,61 @@ impl AdeApp {
 
             let cols = ((output_size.x / char_width).floor() as u16).max(20);
             let lines = ((output_size.y / line_height).floor() as u16).max(6);
-            terminal.runtime.resize(TerminalDimensions {
+            let resize_applied = terminal.runtime.resize(TerminalDimensions {
                 cols,
                 lines,
                 cell_width: char_width as u16,
                 cell_height: line_height as u16,
             });
+            if !resize_applied {
+                ui.ctx()
+                    .request_repaint_after(Duration::from_millis(TERMINAL_RETRY_MS));
+            }
 
-            if terminal.dirty {
-                terminal.render_cache = terminal_snapshot_text(&terminal.runtime);
-                terminal.dirty = false;
+            let latest_seqno = terminal.runtime.latest_seqno();
+            if latest_seqno > terminal.last_seqno {
+                terminal.last_seqno = latest_seqno;
+                terminal.dirty = true;
+            }
+
+            if terminal.dirty || terminal.render_cache.lines.is_empty() {
+                if let Some(snapshot) = try_terminal_snapshot(&terminal.runtime) {
+                    terminal.render_cache = snapshot;
+                    terminal.dirty = false;
+                } else {
+                    ui.ctx()
+                        .request_repaint_after(Duration::from_millis(TERMINAL_RETRY_MS));
+                }
             }
 
             ui.allocate_ui_with_layout(output_size, Layout::top_down(Align::Min), |ui| {
-                ui.set_min_size(output_size);
-                egui::ScrollArea::vertical()
-                    .id_salt(format!("term-output-{terminal_id}-{layout_epoch}"))
-                    .max_height(output_height)
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
+                egui::Frame::none()
+                    .fill(TERMINAL_OUTPUT_BG)
+                    .stroke(Stroke::NONE)
+                    .rounding(0.0)
+                    .inner_margin(egui::Margin::same(0.0))
+                    .outer_margin(egui::Margin::same(0.0))
                     .show(ui, |ui| {
-                        let response = ui.add(
-                            egui::Label::new(RichText::new(terminal.render_cache.clone()).monospace())
-                                .wrap_mode(TextWrapMode::Extend)
-                                .sense(Sense::click()),
-                        );
-                        if response.clicked() {
-                            pane_clicked = true;
-                        }
+                        ui.set_min_size(output_size);
+                        egui::ScrollArea::vertical()
+                            .id_salt(format!("term-output-{terminal_id}-{layout_epoch}"))
+                            .max_height(output_height)
+                            .auto_shrink([false, false])
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                let render_job =
+                                    build_terminal_layout_job(&terminal.render_cache, &font_id);
+                                let response = ui.add(
+                                    egui::Label::new(render_job)
+                                        .wrap_mode(TextWrapMode::Extend)
+                                        .sense(Sense::click()),
+                                );
+                                if response.clicked() {
+                                    pane_clicked = true;
+                                }
+                            });
                     });
-                });
+            });
 
             (pane_clicked, close_requested)
         };
@@ -874,13 +1038,19 @@ impl AdeApp {
                 ui.separator();
 
                 let mut show_explorer = self.config.ui.show_project_explorer;
-                if ui.checkbox(&mut show_explorer, "Show Project Explorer").changed() {
+                if ui
+                    .checkbox(&mut show_explorer, "Show Project Explorer")
+                    .changed()
+                {
                     self.config.ui.show_project_explorer = show_explorer;
                     should_persist = true;
                 }
 
                 let mut filter_mode = self.config.ui.project_filter_mode;
-                if ui.checkbox(&mut filter_mode, "Project Filter Mode").changed() {
+                if ui
+                    .checkbox(&mut filter_mode, "Project Filter Mode")
+                    .changed()
+                {
                     self.config.ui.project_filter_mode = filter_mode;
                     self.bump_layout_epoch();
                     should_persist = true;
@@ -962,8 +1132,12 @@ impl AdeApp {
                 for message in &project.saved_messages {
                     if ui.button(message).clicked() {
                         if let Some(active_terminal_id) = self.active_terminal {
-                            if let Some(active_terminal) = self.terminals.get_mut(&active_terminal_id) {
-                                active_terminal.runtime.send_bytes(message.as_bytes().to_vec());
+                            if let Some(active_terminal) =
+                                self.terminals.get_mut(&active_terminal_id)
+                            {
+                                active_terminal
+                                    .runtime
+                                    .send_bytes(message.as_bytes().to_vec());
                                 Self::append_pending_line(
                                     &mut active_terminal.pending_line_for_title,
                                     message,
@@ -988,7 +1162,9 @@ impl AdeApp {
 
 impl eframe::App for AdeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ensure_repaint_pump(ctx);
         self.process_terminal_events(ctx);
+        self.schedule_terminal_refresh(ctx);
         self.handle_shortcuts(ctx);
 
         self.draw_top_bar(ctx);
@@ -1002,6 +1178,7 @@ impl eframe::App for AdeApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.repaint_pump_flag.store(false, Ordering::Relaxed);
         for terminal in self.terminals.values() {
             terminal.runtime.shutdown();
         }
@@ -1040,6 +1217,50 @@ fn draw_folder_tree(ui: &mut Ui, path: &Path, depth: usize, max_depth: usize) {
             ui.label(name);
         }
     }
+}
+
+fn build_terminal_layout_job(snapshot: &TerminalSnapshot, font_id: &FontId) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = f32::INFINITY;
+
+    for (line_index, line) in snapshot.lines.iter().enumerate() {
+        for run in &line.runs {
+            let fg = to_egui_color(run.style.fg);
+            let mut format = TextFormat {
+                font_id: font_id.clone(),
+                color: fg,
+                background: to_egui_color(run.style.bg),
+                italics: run.style.italic,
+                ..TextFormat::default()
+            };
+
+            if run.style.underline {
+                format.underline = Stroke::new(1.0, fg);
+            }
+            if run.style.strike {
+                format.strikethrough = Stroke::new(1.0, fg);
+            }
+
+            job.append(&run.text, 0.0, format);
+        }
+
+        if line_index + 1 < snapshot.lines.len() {
+            job.append(
+                "\n",
+                0.0,
+                TextFormat {
+                    font_id: font_id.clone(),
+                    ..TextFormat::default()
+                },
+            );
+        }
+    }
+
+    job
+}
+
+fn to_egui_color(color: TerminalColor) -> Color32 {
+    Color32::from_rgb(color.r, color.g, color.b)
 }
 
 #[cfg(test)]

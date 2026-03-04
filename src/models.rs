@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-use alacritty_terminal::tty;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -19,10 +18,10 @@ impl ShellKind {
         }
     }
 
-    pub fn to_shell(self) -> tty::Shell {
+    pub fn command(self) -> (&'static str, &'static [&'static str]) {
         match self {
-            Self::PowerShell => tty::Shell::new("powershell".to_owned(), vec!["-NoLogo".to_owned()]),
-            Self::Cmd => tty::Shell::new("cmd".to_owned(), Vec::new()),
+            Self::PowerShell => ("powershell.exe", &["-NoLogo"]),
+            Self::Cmd => ("cmd.exe", &[]),
         }
     }
 }
