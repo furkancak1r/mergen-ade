@@ -620,6 +620,16 @@ impl AdeApp {
         style.spacing.item_spacing = egui::vec2(10.0, 8.0);
         style.spacing.button_padding = egui::vec2(12.0, 7.0);
         style.spacing.window_margin = egui::Margin::symmetric(12.0, 10.0);
+        let mut scroll_style = egui::style::ScrollStyle::floating();
+        // Keep scrollbars thin and low-contrast, even while hovered.
+        scroll_style.bar_width = 3.2;
+        scroll_style.floating_width = 1.2;
+        scroll_style.handle_min_length = 16.0;
+        scroll_style.active_background_opacity = 0.04;
+        scroll_style.interact_background_opacity = 0.10;
+        scroll_style.active_handle_opacity = 0.22;
+        scroll_style.interact_handle_opacity = 0.38;
+        style.spacing.scroll = scroll_style;
         style.visuals.window_rounding = 10.0.into();
         style.visuals.menu_rounding = 8.0.into();
         style.visuals.widgets.noninteractive.rounding = 7.0.into();
@@ -799,13 +809,6 @@ impl AdeApp {
                     ) {
                         self.show_settings_popup = true;
                     }
-
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(format!("{} {}", icons::CHECK_CIRCLE, self.status_line))
-                            .color(TEXT_MUTED)
-                            .size(13.0),
-                    );
                 });
             });
     }
@@ -845,14 +848,16 @@ impl AdeApp {
                             ) {
                                 self.config.ui.left_sidebar_tab = LeftSidebarTab::SourceControl;
                             }
-                            if styled_icon_button(
-                                ui,
-                                icons::FOLDER_PLUS,
-                                BTN_TEAL,
-                                BTN_TEAL_HOVER,
-                                BTN_ICON_ACTIVE,
-                                "Add Project",
-                            ) {
+                            if self.config.ui.left_sidebar_tab == LeftSidebarTab::Directory
+                                && styled_icon_button(
+                                    ui,
+                                    icons::FOLDER_PLUS,
+                                    BTN_TEAL,
+                                    BTN_TEAL_HOVER,
+                                    BTN_ICON_ACTIVE,
+                                    "Add Project",
+                                )
+                            {
                                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                                     self.add_project(path);
                                 }
@@ -921,23 +926,26 @@ impl AdeApp {
                                         .cloned()
                                     {
                                         ui.horizontal(|ui| {
-                                            if ui
-                                                .button(format!("{} Copy Path", icons::COPY))
-                                                .clicked()
-                                            {
+                                            if styled_pill_button(
+                                                ui,
+                                                icons::COPY,
+                                                "Copy Path",
+                                                BTN_SUBTLE,
+                                                BTN_SUBTLE_HOVER,
+                                            ) {
                                                 ui.ctx().copy_text(project_path_text.clone());
                                                 self.status_line = format!(
                                                     "Copied path for project '{}'",
                                                     project_name
                                                 );
                                             }
-                                            if ui
-                                                .button(format!(
-                                                    "{} Open in Folder",
-                                                    icons::FOLDER_OPEN
-                                                ))
-                                                .clicked()
-                                            {
+                                            if styled_pill_button(
+                                                ui,
+                                                icons::FOLDER_OPEN,
+                                                "Open in Folder",
+                                                BTN_SUBTLE,
+                                                BTN_SUBTLE_HOVER,
+                                            ) {
                                                 match open_in_file_explorer(&project_path, false) {
                                                     Ok(()) => {
                                                         self.status_line = format!(
@@ -957,22 +965,87 @@ impl AdeApp {
 
                                 ui.separator();
 
-                                if let Some(project_id) = self.selected_project {
-                                    if let Some(project) = self.projects.get(&project_id) {
-                                        ui.label(
-                                            RichText::new(format!("{} Files", icons::FOLDER_OPEN))
-                                                .color(TEXT_MUTED)
-                                                .strong(),
-                                        );
-                                        draw_folder_tree(ui, &project.path, 0, 8);
-                                    }
-                                } else {
-                                    ui.label(
-                                        RichText::new("No project selected").color(TEXT_MUTED),
-                                    );
-                                }
+                                egui::ScrollArea::vertical()
+                                    .id_salt("directory-tree-scroll")
+                                    .max_height(ui.available_height())
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        if let Some(project_id) = self.selected_project {
+                                            if let Some(project) = self.projects.get(&project_id) {
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "{} Files",
+                                                        icons::FOLDER_OPEN
+                                                    ))
+                                                    .color(TEXT_MUTED)
+                                                    .strong(),
+                                                );
+                                                draw_folder_tree(ui, &project.path, 0, 8);
+                                            }
+                                        } else {
+                                            ui.label(
+                                                RichText::new("No project selected")
+                                                    .color(TEXT_MUTED),
+                                            );
+                                        }
+                                    });
                             }
                             LeftSidebarTab::SourceControl => {
+                                let project_rows = self
+                                    .projects
+                                    .iter()
+                                    .map(|(project_id, project)| {
+                                        (*project_id, project.name.clone())
+                                    })
+                                    .collect::<Vec<_>>();
+
+                                if project_rows.is_empty() {
+                                    ui.label(RichText::new("No projects added").color(TEXT_MUTED));
+                                    return;
+                                }
+
+                                let mut should_persist_selection = false;
+                                if self.selected_project.is_some_and(|selected_id| {
+                                    !project_rows
+                                        .iter()
+                                        .any(|(project_id, _)| *project_id == selected_id)
+                                }) {
+                                    self.selected_project = None;
+                                    should_persist_selection = true;
+                                }
+
+                                let selected_project_label = self
+                                    .selected_project
+                                    .and_then(|selected_id| {
+                                        project_rows
+                                            .iter()
+                                            .find(|(project_id, _)| *project_id == selected_id)
+                                            .map(|(_, project_name)| {
+                                                format!("{} {}", icons::FOLDER_OPEN, project_name)
+                                            })
+                                    })
+                                    .unwrap_or_else(|| "No project selected".to_owned());
+
+                                let previous_selected_project = self.selected_project;
+                                egui::ComboBox::from_label("Project")
+                                    .selected_text(selected_project_label)
+                                    .width(220.0)
+                                    .show_ui(ui, |ui| {
+                                        for (project_id, project_name) in &project_rows {
+                                            ui.selectable_value(
+                                                &mut self.selected_project,
+                                                Some(*project_id),
+                                                format!("{} {}", icons::FOLDER, project_name),
+                                            );
+                                        }
+                                    });
+                                if self.selected_project != previous_selected_project {
+                                    should_persist_selection = true;
+                                }
+                                if should_persist_selection {
+                                    self.persist_config();
+                                }
+
                                 let Some(project_id) = self.selected_project else {
                                     ui.label(
                                         RichText::new("No project selected").color(TEXT_MUTED),
@@ -989,14 +1062,6 @@ impl AdeApp {
                                 }
 
                                 ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{} {}",
-                                            icons::GIT_BRANCH,
-                                            project.name
-                                        ))
-                                        .strong(),
-                                    );
                                     if styled_icon_button(
                                         ui,
                                         icons::ARROW_CLOCKWISE,
@@ -1039,98 +1104,110 @@ impl AdeApp {
                                 });
                                 ui.separator();
 
-                                let snapshot = self
-                                    .source_control_state
-                                    .entry(project_id)
-                                    .or_insert_with(SourceControlSnapshot::default)
-                                    .clone();
+                                egui::ScrollArea::vertical()
+                                    .id_salt("source-control-scroll")
+                                    .max_height(ui.available_height())
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        let snapshot = self
+                                            .source_control_state
+                                            .entry(project_id)
+                                            .or_insert_with(SourceControlSnapshot::default)
+                                            .clone();
 
-                                if snapshot.loading {
-                                    ui.label(
-                                        RichText::new("Refreshing source control...")
-                                            .color(TEXT_MUTED),
-                                    );
-                                }
-                                if let Some(error) = &snapshot.last_error {
-                                    ui.colored_label(Color32::LIGHT_RED, error);
-                                } else {
-                                    let mut branch_line =
-                                        format!("{} {}", icons::GIT_BRANCH, snapshot.branch);
-                                    if snapshot.ahead > 0 || snapshot.behind > 0 {
-                                        branch_line.push_str(&format!(
-                                            "  ahead:{} behind:{}",
-                                            snapshot.ahead, snapshot.behind
-                                        ));
-                                    }
-                                    ui.label(RichText::new(branch_line).color(TEXT_MUTED));
-                                }
-
-                                ui.separator();
-                                if snapshot.files.is_empty()
-                                    && snapshot.last_error.is_none()
-                                    && !snapshot.loading
-                                {
-                                    ui.label(
-                                        RichText::new("Working tree is clean").color(TEXT_MUTED),
-                                    );
-                                }
-
-                                for file in snapshot.files {
-                                    let absolute = project.path.join(&file.path);
-                                    ui.horizontal(|ui| {
-                                        let status_icon = if file.staged {
-                                            icons::CHECK_CIRCLE
+                                        if snapshot.loading {
+                                            ui.label(
+                                                RichText::new("Refreshing source control...")
+                                                    .color(TEXT_MUTED),
+                                            );
+                                        }
+                                        if let Some(error) = &snapshot.last_error {
+                                            ui.colored_label(Color32::LIGHT_RED, error);
                                         } else {
-                                            icons::CLOCK
-                                        };
-                                        ui.label(
-                                            RichText::new(format!("{status_icon}"))
-                                                .color(TEXT_MUTED),
-                                        );
-                                        ui.label(
-                                            RichText::new(format!("{} {}", file.status, file.path))
-                                                .monospace()
-                                                .small(),
-                                        )
-                                        .context_menu(
-                                            |ui| {
-                                                if ui
-                                                    .button(format!(
-                                                        "{} Open in Folder",
-                                                        icons::FOLDER_OPEN
+                                            let mut branch_line = format!(
+                                                "{} {}",
+                                                icons::GIT_BRANCH,
+                                                snapshot.branch
+                                            );
+                                            if snapshot.ahead > 0 || snapshot.behind > 0 {
+                                                branch_line.push_str(&format!(
+                                                    "  ahead:{} behind:{}",
+                                                    snapshot.ahead, snapshot.behind
+                                                ));
+                                            }
+                                            ui.label(RichText::new(branch_line).color(TEXT_MUTED));
+                                        }
+
+                                        ui.separator();
+                                        if snapshot.files.is_empty()
+                                            && snapshot.last_error.is_none()
+                                            && !snapshot.loading
+                                        {
+                                            ui.label(
+                                                RichText::new("Working tree is clean")
+                                                    .color(TEXT_MUTED),
+                                            );
+                                        }
+
+                                        for file in snapshot.files {
+                                            let absolute = project.path.join(&file.path);
+                                            ui.horizontal(|ui| {
+                                                let status_icon = if file.staged {
+                                                    icons::CHECK_CIRCLE
+                                                } else {
+                                                    icons::CLOCK
+                                                };
+                                                ui.label(
+                                                    RichText::new(status_icon.to_string())
+                                                        .color(TEXT_MUTED),
+                                                );
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "{} {}",
+                                                        file.status, file.path
                                                     ))
-                                                    .clicked()
-                                                {
-                                                    match open_in_file_explorer(&absolute, true) {
-                                                        Ok(()) => {
-                                                            self.status_line =
-                                                                "Opened containing folder"
-                                                                    .to_owned();
+                                                    .monospace()
+                                                    .small(),
+                                                )
+                                                .context_menu(|ui| {
+                                                    if ui
+                                                        .button(format!(
+                                                            "{} Open in Folder",
+                                                            icons::FOLDER_OPEN
+                                                        ))
+                                                        .clicked()
+                                                    {
+                                                        match open_in_file_explorer(&absolute, true)
+                                                        {
+                                                            Ok(()) => {
+                                                                self.status_line =
+                                                                    "Opened containing folder"
+                                                                        .to_owned();
+                                                            }
+                                                            Err(err) => {
+                                                                self.status_line = format!(
+                                                                    "Open folder failed: {err}"
+                                                                );
+                                                            }
                                                         }
-                                                        Err(err) => {
-                                                            self.status_line = format!(
-                                                                "Open folder failed: {err}"
-                                                            );
-                                                        }
+                                                        ui.close_menu();
                                                     }
-                                                    ui.close_menu();
-                                                }
-                                                if ui
-                                                    .button(format!(
-                                                        "{} Copy Relative Path",
-                                                        icons::COPY
-                                                    ))
-                                                    .clicked()
-                                                {
-                                                    ui.ctx().copy_text(file.path.clone());
-                                                    self.status_line =
-                                                        "Copied relative path".to_owned();
-                                                    ui.close_menu();
-                                                }
-                                            },
-                                        );
+                                                    if ui
+                                                        .button(format!(
+                                                            "{} Copy Relative Path",
+                                                            icons::COPY
+                                                        ))
+                                                        .clicked()
+                                                    {
+                                                        ui.ctx().copy_text(file.path.clone());
+                                                        self.status_line =
+                                                            "Copied relative path".to_owned();
+                                                        ui.close_menu();
+                                                    }
+                                                });
+                                            });
+                                        }
                                     });
-                                }
                             }
                         }
                     });
@@ -1326,21 +1403,23 @@ impl AdeApp {
                     });
                     message_menu.response.on_hover_text("Send saved message");
 
-                    if ui
-                        .checkbox(
-                            &mut terminal.in_main_view,
-                            RichText::new(format!("{}", icons::EYE)).color(TEXT_MUTED),
-                        )
-                        .on_hover_text("Show in main area")
-                        .changed()
-                    {
+                    if styled_icon_toggle(
+                        ui,
+                        terminal.in_main_view,
+                        icons::EYE,
+                        "Show in main area",
+                    ) {
+                        terminal.in_main_view = !terminal.in_main_view;
                         visibility_changed = true;
                     }
-                    if ui
-                        .small_button(format!("{}", icons::X))
-                        .on_hover_text("Close")
-                        .clicked()
-                    {
+                    if styled_icon_button(
+                        ui,
+                        icons::X,
+                        BTN_RED,
+                        BTN_RED_HOVER,
+                        Color32::from_rgb(186, 58, 58),
+                        "Close",
+                    ) {
                         close_terminal = true;
                     }
                 });
@@ -1499,8 +1578,10 @@ impl AdeApp {
                     .show(ui, |ui| {
                         ui.set_min_height(TERMINAL_HEADER_HEIGHT - 12.0);
 
-                        let indicator = if is_active { "*" } else { "o" };
-                        let title = format!("{indicator} {} {}", icons::TERMINAL, terminal.title);
+                        let indicator = if is_active { "●" } else { "○" };
+                        let indicator_color = if is_active { ACCENT } else { TEXT_MUTED };
+                        ui.label(RichText::new(indicator).color(indicator_color).size(10.0));
+                        let title = format!("{} {}", icons::TERMINAL, terminal.title);
                         let title_response = ui.add(
                             egui::Label::new(RichText::new(title).color(TEXT_PRIMARY))
                                 .truncate()
@@ -1510,7 +1591,9 @@ impl AdeApp {
                             pane_clicked = true;
                         }
 
-                        ui.separator();
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("│").color(BORDER_COLOR).size(12.0));
+                        ui.add_space(4.0);
                         ui.add(
                             egui::Label::new(
                                 RichText::new(format!("{} {}", icons::FOLDER, project_name))
@@ -1518,7 +1601,9 @@ impl AdeApp {
                             )
                             .truncate(),
                         );
-                        ui.separator();
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("│").color(BORDER_COLOR).size(12.0));
+                        ui.add_space(4.0);
                         egui::Frame::none()
                             .fill(kind_fill)
                             .rounding(6.0)
