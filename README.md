@@ -23,17 +23,22 @@ It is **not an IDE** and does not include an editor, LSP, or debugging UI.
 
 ## Build (Windows)
 
-1. Install Rust stable (`x86_64-pc-windows-msvc`) from https://rustup.rs
-2. Build:
+Preferred one-command build:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
+```
+
+This script:
+
+1. Uses bundled local llvm-mingw linker at `.toolchain/.../x86_64-w64-mingw32-clang.exe` when available
+2. Falls back to MSVC (`link.exe`) if local linker is missing
+3. Produces `target\release\mergen-ade.exe`
+
+Manual build (if toolchain already configured):
 
 ```powershell
 cargo build --release
-```
-
-3. Run:
-
-```powershell
-cargo run --release
 ```
 
 ## Automatic GitHub Release (Windows)
@@ -64,10 +69,15 @@ git push origin v0.1.0
 
 ## UI Overview
 
-- **Sidebar A (leftmost):** Project list + project explorer tree (toggleable)
+- **Sidebar A (leftmost):** `Directory` / `Source Control` tabs
+  - `Directory`: project list + folder tree
+  - `Source Control`: selected project git status list (`modified`, `added`, `deleted`, `untracked`) with Refresh / Fetch buttons
 - **Sidebar B:** Terminal Manager grouped by project, with separate Foreground/Background sections
 - **Main area:** Embedded, tiled terminal panes
 - **Terminal input model:** Type directly into the active terminal pane (no separate message input bar)
+- **Terminal visibility mode:** configurable in Settings
+  - `Global`: project switch does not hide visible terminals
+  - `Selected project only`: main area shows only selected project's terminals
 
 ## Key bindings
 
@@ -87,8 +97,10 @@ Persisted data includes:
 - Per-project saved messages
 - UI state:
   - Project explorer visibility
+  - Left sidebar active tab (`Directory` / `Source Control`)
   - Last selected project
   - Project filter mode
+  - Main terminal visibility mode
   - Auto tile scope
 
 Not persisted:
@@ -142,3 +154,10 @@ Get-Process mergen-ade | Select-Object Name, Id, WorkingSet64, PM, CPU
 - Built-in code editor
 - LSP/debugging IDE workflows
 - Telemetry/sign-in/network account features
+
+## Build Troubleshooting
+
+- `link.exe not found`
+  - Install MSVC Build Tools with `scripts\setup-msvc-build-tools.ps1` guidance.
+- `x86_64-w64-mingw32-clang not found`
+  - Ensure bundled `.toolchain\llvm-mingw-20260224-ucrt-x86_64\bin` exists, or install an LLVM-MinGW toolchain and set linker accordingly.

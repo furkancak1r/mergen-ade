@@ -60,12 +60,40 @@ impl AutoTileScope {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MainVisibilityMode {
+    #[default]
+    Global,
+    SelectedProject,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LeftSidebarTab {
+    #[default]
+    Directory,
+    SourceControl,
+}
+
+impl LeftSidebarTab {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Directory => "Directory",
+            Self::SourceControl => "Source Control",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UiConfig {
     pub show_project_explorer: bool,
     pub last_selected_project_id: Option<u64>,
     pub project_filter_mode: bool,
     pub auto_tile_scope: AutoTileScope,
+    pub main_visibility_mode: MainVisibilityMode,
+    pub left_sidebar_tab: LeftSidebarTab,
 }
 
 impl Default for UiConfig {
@@ -73,8 +101,10 @@ impl Default for UiConfig {
         Self {
             show_project_explorer: true,
             last_selected_project_id: None,
-            project_filter_mode: true,
+            project_filter_mode: false,
             auto_tile_scope: AutoTileScope::AllVisible,
+            main_visibility_mode: MainVisibilityMode::Global,
+            left_sidebar_tab: LeftSidebarTab::Directory,
         }
     }
 }
@@ -88,6 +118,7 @@ pub struct ProjectRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
     pub version: u32,
     pub default_shell: ShellKind,

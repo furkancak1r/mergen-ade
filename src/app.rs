@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +18,10 @@ use egui_phosphor::{regular as icons, Variant};
 
 use crate::config;
 use crate::layout;
-use crate::models::{AppConfig, AutoTileScope, ProjectRecord, ShellKind, TerminalKind};
+use crate::models::{
+    AppConfig, AutoTileScope, LeftSidebarTab, MainVisibilityMode, ProjectRecord, ShellKind,
+    TerminalKind,
+};
 use crate::terminal::{
     try_terminal_snapshot, TerminalColor, TerminalDimensions, TerminalRuntime, TerminalSnapshot,
     TerminalUiEvent, TerminalUiEventKind,
@@ -28,7 +34,7 @@ const TITLE_MAX_LEN: usize = 40;
 const TERMINAL_EVENT_BUDGET: usize = 4096;
 const TERMINAL_RETRY_MS: u64 = 8;
 const TERMINAL_FALLBACK_REFRESH_MS: u64 = 16;
-const TERMINAL_OUTPUT_BG: Color32 = Color32::from_rgb(0, 0, 0);
+const TERMINAL_OUTPUT_BG: Color32 = Color32::from_rgb(26, 30, 36);
 const TERMINAL_HEADER_HEIGHT: f32 = 38.0;
 const TERMINAL_HEADER_GAP: f32 = 6.0;
 const TERMINAL_TILE_GAP_X: f32 = 0.0;
@@ -41,6 +47,8 @@ const BORDER_COLOR: Color32 = Color32::from_rgb(46, 60, 78);
 const ACCENT: Color32 = Color32::from_rgb(26, 179, 255);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(225, 233, 245);
 const TEXT_MUTED: Color32 = Color32::from_rgb(148, 167, 191);
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 pub struct AdeApp {
     config_path: PathBuf,
@@ -61,6 +69,9 @@ pub struct AdeApp {
     repaint_pump_started: bool,
     repaint_pump_flag: Arc<AtomicBool>,
     theme_initialized: bool,
+    source_control_events_tx: Sender<SourceControlEvent>,
+    source_control_events_rx: Receiver<SourceControlEvent>,
+    source_control_state: BTreeMap<u64, SourceControlSnapshot>,
 }
 
 struct TerminalEntry {
@@ -77,10 +88,35 @@ struct TerminalEntry {
     runtime: TerminalRuntime,
 }
 
+#[derive(Debug, Clone, Default)]
+struct SourceControlSnapshot {
+    branch: String,
+    ahead: usize,
+    behind: usize,
+    files: Vec<SourceControlFile>,
+    loading: bool,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SourceControlFile {
+    path: String,
+    status: &'static str,
+    staged: bool,
+}
+
+#[derive(Debug)]
+struct SourceControlEvent {
+    project_id: u64,
+    snapshot: SourceControlSnapshot,
+}
+
 impl AdeApp {
     pub fn bootstrap() -> Self {
         let config_path = config::config_path().unwrap_or_else(|_| PathBuf::from("config.toml"));
-        let config = config::load_config(&config_path).unwrap_or_default();
+        let mut config = config::load_config(&config_path).unwrap_or_default();
+        config.ui.main_visibility_mode = MainVisibilityMode::Global;
+        config.ui.project_filter_mode = false;
 
         let projects = config
             .projects
@@ -97,6 +133,7 @@ impl AdeApp {
             .or_else(|| projects.keys().next().copied());
 
         let (terminal_events_tx, terminal_events_rx) = crossbeam_channel::unbounded();
+        let (source_control_events_tx, source_control_events_rx) = crossbeam_channel::unbounded();
 
         Self {
             config_path,
@@ -117,6 +154,9 @@ impl AdeApp {
             repaint_pump_started: false,
             repaint_pump_flag: Arc::new(AtomicBool::new(true)),
             theme_initialized: false,
+            source_control_events_tx,
+            source_control_events_rx,
+            source_control_state: BTreeMap::new(),
         }
     }
 
@@ -134,19 +174,7 @@ impl AdeApp {
     }
 
     fn terminal_visible_in_main(&self, terminal: &TerminalEntry) -> bool {
-        if !terminal.in_main_view {
-            return false;
-        }
-
-        if self.config.ui.project_filter_mode
-            && self
-                .selected_project
-                .is_some_and(|selected_project| selected_project != terminal.project_id)
-        {
-            return false;
-        }
-
-        true
+        terminal.in_main_view
     }
 
     fn add_project(&mut self, path: PathBuf) {
@@ -224,11 +252,6 @@ impl AdeApp {
         self.active_terminal = Some(terminal_id);
         self.terminals.insert(terminal_id, entry);
         self.bump_layout_epoch();
-
-        if self.config.ui.project_filter_mode {
-            self.selected_project = Some(project_id);
-            self.bump_layout_epoch();
-        }
 
         self.status_line = "Terminal created".to_owned();
     }
@@ -312,6 +335,44 @@ impl AdeApp {
         if !self.terminal_events_rx.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(1));
         }
+    }
+
+    fn process_source_control_events(&mut self, ctx: &egui::Context) {
+        let mut changed = false;
+        while let Ok(event) = self.source_control_events_rx.try_recv() {
+            self.source_control_state
+                .insert(event.project_id, event.snapshot);
+            changed = true;
+        }
+        if changed {
+            ctx.request_repaint();
+        }
+    }
+
+    fn request_source_control_refresh(&mut self, project_id: u64, run_fetch: bool) {
+        let Some(project) = self.projects.get(&project_id).cloned() else {
+            return;
+        };
+
+        self.source_control_state
+            .entry(project_id)
+            .and_modify(|snapshot| {
+                snapshot.loading = true;
+                snapshot.last_error = None;
+            })
+            .or_insert_with(|| SourceControlSnapshot {
+                loading: true,
+                ..SourceControlSnapshot::default()
+            });
+
+        let tx = self.source_control_events_tx.clone();
+        std::thread::spawn(move || {
+            let snapshot = collect_source_control_snapshot(&project.path, run_fetch);
+            let _ = tx.send(SourceControlEvent {
+                project_id,
+                snapshot,
+            });
+        });
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -486,19 +547,19 @@ impl AdeApp {
         visuals.code_bg_color = Color32::from_rgb(12, 16, 22);
         visuals.hyperlink_color = ACCENT;
         visuals.window_stroke = Stroke::new(1.0, BORDER_COLOR);
-        visuals.widgets.noninteractive.bg_fill = SURFACE_BG;
-        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER_COLOR);
+        visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(24, 33, 46);
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(45, 63, 84));
         visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_MUTED);
-        visuals.widgets.inactive.bg_fill = SURFACE_BG_SOFT;
-        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER_COLOR);
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(30, 43, 58);
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(58, 79, 103));
         visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(34, 45, 62);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(39, 62, 84);
         visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT);
         visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::from_rgb(240, 247, 255));
-        visuals.widgets.active.bg_fill = Color32::from_rgb(22, 53, 78);
+        visuals.widgets.active.bg_fill = Color32::from_rgb(20, 95, 140);
         visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
         visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::from_rgb(244, 251, 255));
-        visuals.widgets.open.bg_fill = Color32::from_rgb(30, 41, 56);
+        visuals.widgets.open.bg_fill = Color32::from_rgb(34, 50, 69);
         visuals.widgets.open.bg_stroke = Stroke::new(1.0, BORDER_COLOR);
         visuals.selection.bg_fill = Color32::from_rgb(18, 93, 136);
         visuals.selection.stroke = Stroke::new(1.0, ACCENT);
@@ -606,16 +667,15 @@ impl AdeApp {
                     .inner_margin(egui::Margin::symmetric(10.0, 8.0)),
             )
             .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
+                ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(format!("{}  Mergen ADE", icons::TERMINAL_WINDOW))
-                            .strong()
-                            .size(16.0),
+                        RichText::new(format!("{}  Mergen ADE", icons::TERMINAL_WINDOW)).strong(),
                     );
                     ui.separator();
 
                     if ui
-                        .button(format!("{} Add Project", icons::FOLDER_PLUS))
+                        .button(icons::FOLDER_PLUS)
+                        .on_hover_text("Add Project")
                         .clicked()
                     {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
@@ -624,7 +684,8 @@ impl AdeApp {
                     }
 
                     if ui
-                        .button(format!("{} New Terminal", icons::TERMINAL))
+                        .button(icons::TERMINAL)
+                        .on_hover_text("New Foreground Terminal")
                         .clicked()
                     {
                         if let Some(project_id) = self.selected_project {
@@ -636,24 +697,29 @@ impl AdeApp {
                         }
                     }
 
-                    if ui.button(format!("{} Auto Tile", icons::LAYOUT)).clicked() {
+                    if ui
+                        .button(icons::LAYOUT)
+                        .on_hover_text("Auto Tile Visible Terminals")
+                        .clicked()
+                    {
                         self.apply_auto_tile(self.config.ui.auto_tile_scope);
                     }
 
                     if ui
-                        .button(format!("{} Saved Messages", icons::CHAT_TEXT))
+                        .button(icons::CHAT_TEXT)
+                        .on_hover_text("Saved Messages")
                         .clicked()
                     {
                         self.show_saved_messages_picker = true;
                     }
 
-                    if ui.button(format!("{} Settings", icons::GEAR)).clicked() {
+                    if ui.button(icons::GEAR).on_hover_text("Settings").clicked() {
                         self.show_settings_popup = true;
                     }
 
                     ui.separator();
                     ui.label(
-                        RichText::new(format!("{} {}", icons::LIST, self.status_line))
+                        RichText::new(format!("{} {}", icons::CHECK_CIRCLE, self.status_line))
                             .color(TEXT_MUTED)
                             .size(13.0),
                     );
@@ -668,6 +734,8 @@ impl AdeApp {
 
         egui::SidePanel::left("project_explorer")
             .resizable(true)
+            .min_width(220.0)
+            .max_width(540.0)
             .default_width(250.0)
             .show(ctx, |ui| {
                 egui::Frame::none()
@@ -676,74 +744,270 @@ impl AdeApp {
                     .rounding(8.0)
                     .inner_margin(egui::Margin::same(10.0))
                     .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(format!("{}  Projects", icons::TREE_VIEW))
-                                .strong()
-                                .size(15.0),
-                        );
-                        ui.separator();
-
-                        let project_rows = self
-                            .projects
-                            .values()
-                            .map(|project| {
-                                (
-                                    project.id,
-                                    project.name.clone(),
-                                    project.path.display().to_string(),
-                                )
-                            })
-                            .collect::<Vec<_>>();
-
-                        for (project_id, project_name, project_path) in project_rows {
-                            let selected = self.selected_project == Some(project_id);
-                            let project_label = if selected {
-                                format!("{}  {}", icons::FOLDER_OPEN, project_name)
-                            } else {
-                                format!("{}  {}", icons::FOLDER, project_name)
-                            };
-
-                            let response = ui.selectable_label(selected, project_label);
-                            if response.clicked() {
-                                let previous_selected = self.selected_project;
-                                self.selected_project = Some(project_id);
-                                if self.config.ui.project_filter_mode
-                                    && previous_selected != self.selected_project
-                                {
-                                    self.bump_layout_epoch();
+                        let previous_tab = self.config.ui.left_sidebar_tab;
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(
+                                &mut self.config.ui.left_sidebar_tab,
+                                LeftSidebarTab::Directory,
+                                format!(
+                                    "{} {}",
+                                    icons::TREE_VIEW,
+                                    LeftSidebarTab::Directory.label()
+                                ),
+                            );
+                            ui.selectable_value(
+                                &mut self.config.ui.left_sidebar_tab,
+                                LeftSidebarTab::SourceControl,
+                                format!(
+                                    "{} {}",
+                                    icons::GIT_BRANCH,
+                                    LeftSidebarTab::SourceControl.label()
+                                ),
+                            );
+                            if ui
+                                .button(icons::FOLDER_PLUS)
+                                .on_hover_text("Add Project")
+                                .clicked()
+                            {
+                                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                    self.add_project(path);
                                 }
-                                self.persist_config();
                             }
-                            response.context_menu(|ui| {
-                                if ui
-                                    .button(format!("{} Copy Project Path", icons::COPY))
-                                    .clicked()
-                                {
-                                    ui.ctx().copy_text(project_path.clone());
-                                    self.status_line =
-                                        format!("Copied path for project '{}'", project_name);
-                                    ui.close_menu();
-                                }
-                            });
+                        });
+                        if previous_tab != self.config.ui.left_sidebar_tab {
+                            self.persist_config();
                         }
-
                         ui.separator();
 
-                        if let Some(project_id) = self.selected_project {
-                            if let Some(project) = self.projects.get(&project_id) {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{}  Project Explorer",
-                                        icons::FOLDER_OPEN
-                                    ))
-                                    .color(TEXT_MUTED)
-                                    .strong(),
-                                );
+                        match self.config.ui.left_sidebar_tab {
+                            LeftSidebarTab::Directory => {
+                                let project_rows = self
+                                    .projects
+                                    .values()
+                                    .map(|project| {
+                                        (
+                                            project.id,
+                                            project.name.clone(),
+                                            project.path.clone(),
+                                            project.path.display().to_string(),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
 
-                                draw_folder_tree(ui, &project.path, 0, 8);
+                                for (project_id, project_name, project_path, project_path_text) in
+                                    project_rows
+                                {
+                                    let selected = self.selected_project == Some(project_id);
+                                    let project_label = if selected {
+                                        format!("{} {}", icons::FOLDER_OPEN, project_name)
+                                    } else {
+                                        format!("{} {}", icons::FOLDER, project_name)
+                                    };
+
+                                    let response = ui.selectable_label(selected, project_label);
+                                    if response.clicked() {
+                                        self.selected_project = Some(project_id);
+                                        self.persist_config();
+                                    }
+                                    response.context_menu(|ui| {
+                                        if ui.button(format!("{} Copy Path", icons::COPY)).clicked()
+                                        {
+                                            ui.ctx().copy_text(project_path_text.clone());
+                                            self.status_line = format!(
+                                                "Copied path for project '{}'",
+                                                project_name
+                                            );
+                                            ui.close_menu();
+                                        }
+                                        if ui
+                                            .button(format!(
+                                                "{} Open in Folder",
+                                                icons::FOLDER_OPEN
+                                            ))
+                                            .clicked()
+                                        {
+                                            match open_in_file_explorer(&project_path, false) {
+                                                Ok(()) => {
+                                                    self.status_line = format!(
+                                                        "Opened project '{}' in Explorer",
+                                                        project_name
+                                                    );
+                                                }
+                                                Err(err) => {
+                                                    self.status_line =
+                                                        format!("Open folder failed: {err}");
+                                                }
+                                            }
+                                            ui.close_menu();
+                                        }
+                                    });
+                                }
+
+                                ui.separator();
+
+                                if let Some(project_id) = self.selected_project {
+                                    if let Some(project) = self.projects.get(&project_id) {
+                                        ui.label(
+                                            RichText::new(format!("{} Files", icons::FOLDER_OPEN))
+                                                .color(TEXT_MUTED)
+                                                .strong(),
+                                        );
+                                        draw_folder_tree(ui, &project.path, 0, 8);
+                                    }
+                                } else {
+                                    ui.label(
+                                        RichText::new("No project selected").color(TEXT_MUTED),
+                                    );
+                                }
                             }
-                        } else {
-                            ui.label(RichText::new("No project selected").color(TEXT_MUTED));
+                            LeftSidebarTab::SourceControl => {
+                                let Some(project_id) = self.selected_project else {
+                                    ui.label(
+                                        RichText::new("No project selected").color(TEXT_MUTED),
+                                    );
+                                    return;
+                                };
+                                let Some(project) = self.projects.get(&project_id).cloned() else {
+                                    ui.label(RichText::new("Project not found").color(TEXT_MUTED));
+                                    return;
+                                };
+
+                                if !self.source_control_state.contains_key(&project_id) {
+                                    self.request_source_control_refresh(project_id, false);
+                                }
+
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} {}",
+                                            icons::GIT_BRANCH,
+                                            project.name
+                                        ))
+                                        .strong(),
+                                    );
+                                    if ui
+                                        .button(icons::ARROW_CLOCKWISE)
+                                        .on_hover_text("Refresh Status")
+                                        .clicked()
+                                    {
+                                        self.request_source_control_refresh(project_id, false);
+                                    }
+                                    if ui
+                                        .button(icons::DOWNLOAD)
+                                        .on_hover_text("Fetch and Refresh")
+                                        .clicked()
+                                    {
+                                        self.request_source_control_refresh(project_id, true);
+                                    }
+                                    if ui
+                                        .button(icons::FOLDER_OPEN)
+                                        .on_hover_text("Open Project Folder")
+                                        .clicked()
+                                    {
+                                        match open_in_file_explorer(&project.path, false) {
+                                            Ok(()) => {
+                                                self.status_line =
+                                                    "Opened project folder".to_owned();
+                                            }
+                                            Err(err) => {
+                                                self.status_line =
+                                                    format!("Open folder failed: {err}");
+                                            }
+                                        }
+                                    }
+                                });
+                                ui.separator();
+
+                                let snapshot = self
+                                    .source_control_state
+                                    .entry(project_id)
+                                    .or_insert_with(SourceControlSnapshot::default)
+                                    .clone();
+
+                                if snapshot.loading {
+                                    ui.label(
+                                        RichText::new("Refreshing source control...")
+                                            .color(TEXT_MUTED),
+                                    );
+                                }
+                                if let Some(error) = &snapshot.last_error {
+                                    ui.colored_label(Color32::LIGHT_RED, error);
+                                } else {
+                                    let mut branch_line =
+                                        format!("{} {}", icons::GIT_BRANCH, snapshot.branch);
+                                    if snapshot.ahead > 0 || snapshot.behind > 0 {
+                                        branch_line.push_str(&format!(
+                                            "  ahead:{} behind:{}",
+                                            snapshot.ahead, snapshot.behind
+                                        ));
+                                    }
+                                    ui.label(RichText::new(branch_line).color(TEXT_MUTED));
+                                }
+
+                                ui.separator();
+                                if snapshot.files.is_empty()
+                                    && snapshot.last_error.is_none()
+                                    && !snapshot.loading
+                                {
+                                    ui.label(
+                                        RichText::new("Working tree is clean").color(TEXT_MUTED),
+                                    );
+                                }
+
+                                for file in snapshot.files {
+                                    let absolute = project.path.join(&file.path);
+                                    ui.horizontal(|ui| {
+                                        let status_icon = if file.staged {
+                                            icons::CHECK_CIRCLE
+                                        } else {
+                                            icons::CLOCK
+                                        };
+                                        ui.label(RichText::new(status_icon).color(TEXT_MUTED));
+                                        ui.label(
+                                            RichText::new(format!("{} {}", file.status, file.path))
+                                                .monospace()
+                                                .small(),
+                                        )
+                                        .context_menu(
+                                            |ui| {
+                                                if ui
+                                                    .button(format!(
+                                                        "{} Open in Folder",
+                                                        icons::FOLDER_OPEN
+                                                    ))
+                                                    .clicked()
+                                                {
+                                                    match open_in_file_explorer(&absolute, true) {
+                                                        Ok(()) => {
+                                                            self.status_line =
+                                                                "Opened containing folder"
+                                                                    .to_owned();
+                                                        }
+                                                        Err(err) => {
+                                                            self.status_line = format!(
+                                                                "Open folder failed: {err}"
+                                                            );
+                                                        }
+                                                    }
+                                                    ui.close_menu();
+                                                }
+                                                if ui
+                                                    .button(format!(
+                                                        "{} Copy Relative Path",
+                                                        icons::COPY
+                                                    ))
+                                                    .clicked()
+                                                {
+                                                    ui.ctx().copy_text(file.path.clone());
+                                                    self.status_line =
+                                                        "Copied relative path".to_owned();
+                                                    ui.close_menu();
+                                                }
+                                            },
+                                        );
+                                    });
+                                }
+                            }
                         }
                     });
             });
@@ -752,7 +1016,9 @@ impl AdeApp {
     fn draw_terminal_manager(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("terminal_manager")
             .resizable(true)
-            .default_width(300.0)
+            .min_width(180.0)
+            .max_width(620.0)
+            .default_width(280.0)
             .show(ctx, |ui| {
                 egui::Frame::none()
                     .fill(SURFACE_BG)
@@ -761,7 +1027,7 @@ impl AdeApp {
                     .inner_margin(egui::Margin::same(10.0))
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new(format!("{}  Terminal Manager", icons::TERMINAL_WINDOW))
+                            RichText::new(format!("{} Terminal Manager", icons::TERMINAL_WINDOW))
                                 .strong()
                                 .size(15.0),
                         );
@@ -790,20 +1056,28 @@ impl AdeApp {
                             let project_path = project_snapshot.path.display().to_string();
 
                             let header_label =
-                                format!("{}  {}", icons::FOLDER_OPEN, project_snapshot.name);
+                                format!("{} {}", icons::FOLDER_OPEN, project_snapshot.name);
                             let header = egui::CollapsingHeader::new(header_label)
                                 .id_salt(format!("project-group-{project_id}"))
                                 .default_open(true)
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
-                                        if ui.button(format!("{} New FG", icons::PLUS)).clicked() {
+                                        if ui
+                                            .button(format!("{} {}", icons::TERMINAL, icons::PLUS))
+                                            .on_hover_text("Create Foreground Terminal")
+                                            .clicked()
+                                        {
                                             self.spawn_terminal_for_project(
                                                 ctx,
                                                 project_id,
                                                 TerminalKind::Foreground,
                                             );
                                         }
-                                        if ui.button(format!("{} New BG", icons::PLUS)).clicked() {
+                                        if ui
+                                            .button(format!("{} {}", icons::LIST, icons::PLUS))
+                                            .on_hover_text("Create Background Terminal")
+                                            .clicked()
+                                        {
                                             self.spawn_terminal_for_project(
                                                 ctx,
                                                 project_id,
@@ -814,11 +1088,8 @@ impl AdeApp {
 
                                     ui.separator();
                                     ui.label(
-                                        RichText::new(format!(
-                                            "{} Foreground terminals",
-                                            icons::TERMINAL
-                                        ))
-                                        .strong(),
+                                        RichText::new(format!("{} Foreground", icons::TERMINAL))
+                                            .strong(),
                                     );
                                     self.draw_terminal_rows(
                                         ui,
@@ -828,12 +1099,9 @@ impl AdeApp {
 
                                     ui.separator();
                                     ui.label(
-                                        RichText::new(format!(
-                                            "{} Background terminals",
-                                            icons::LIST
-                                        ))
-                                        .strong()
-                                        .color(TEXT_MUTED),
+                                        RichText::new(format!("{} Background", icons::LIST))
+                                            .strong()
+                                            .color(TEXT_MUTED),
                                     );
                                     self.draw_terminal_rows(
                                         ui,
@@ -855,7 +1123,8 @@ impl AdeApp {
                                         ui.horizontal(|ui| {
                                             ui.label(RichText::new(message).monospace().small());
                                             if ui
-                                                .small_button(format!("{} Remove", icons::TRASH))
+                                                .small_button(icons::TRASH)
+                                                .on_hover_text("Remove message")
                                                 .clicked()
                                             {
                                                 remove_message_index = Some(index);
@@ -865,7 +1134,11 @@ impl AdeApp {
 
                                     ui.horizontal(|ui| {
                                         ui.text_edit_singleline(&mut self.new_saved_message);
-                                        if ui.button(format!("{} Add", icons::PLUS)).clicked() {
+                                        if ui
+                                            .button(icons::PLUS)
+                                            .on_hover_text("Add message")
+                                            .clicked()
+                                        {
                                             let text = self.new_saved_message.trim();
                                             if !text.is_empty() {
                                                 add_message = Some(text.to_owned());
@@ -876,15 +1149,29 @@ impl AdeApp {
                                 });
 
                             header.header_response.context_menu(|ui| {
-                                if ui
-                                    .button(format!("{} Copy Project Path", icons::COPY))
-                                    .clicked()
-                                {
+                                if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
                                     ui.ctx().copy_text(project_path.clone());
                                     self.status_line = format!(
                                         "Copied path for project '{}'",
                                         project_snapshot.name
                                     );
+                                    ui.close_menu();
+                                }
+                                if ui
+                                    .button(format!("{} Open in Folder", icons::FOLDER_OPEN))
+                                    .clicked()
+                                {
+                                    match open_in_file_explorer(&project_snapshot.path, false) {
+                                        Ok(()) => {
+                                            self.status_line = format!(
+                                                "Opened project '{}' in Explorer",
+                                                project_snapshot.name
+                                            );
+                                        }
+                                        Err(err) => {
+                                            self.status_line = format!("Open folder failed: {err}");
+                                        }
+                                    }
                                     ui.close_menu();
                                 }
                             });
@@ -943,13 +1230,14 @@ impl AdeApp {
                 if ui
                     .checkbox(
                         &mut terminal.in_main_view,
-                        RichText::new("Show").color(TEXT_MUTED),
+                        RichText::new(icons::EYE).color(TEXT_MUTED),
                     )
+                    .on_hover_text("Show in main area")
                     .changed()
                 {
                     visibility_changed = true;
                 }
-                if ui.small_button(format!("{} Close", icons::X)).clicked() {
+                if ui.small_button(icons::X).on_hover_text("Close").clicked() {
                     close_terminal = true;
                 }
             });
@@ -988,15 +1276,23 @@ impl AdeApp {
             }
 
             let available = ui.available_size();
+            if available.x < 160.0 || available.y < 120.0 {
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        RichText::new("Expand the window to render terminals").color(TEXT_MUTED),
+                    );
+                });
+                return;
+            }
             let grid = layout::compute_tile_grid(visible_ids.len(), available.x, available.y);
             let spacing = Vec2::new(TERMINAL_TILE_GAP_X, TERMINAL_TILE_GAP_Y);
 
             let pane_width = ((available.x - spacing.x * (grid.cols.saturating_sub(1) as f32))
                 / grid.cols as f32)
-                .max(140.0);
+                .max(72.0);
             let pane_height = ((available.y - spacing.y * (grid.rows.saturating_sub(1) as f32))
                 / grid.rows as f32)
-                .max(120.0);
+                .max(80.0);
 
             for row in 0..grid.rows {
                 ui.horizontal(|ui| {
@@ -1028,7 +1324,6 @@ impl AdeApp {
     }
 
     fn draw_terminal_pane(&mut self, ui: &mut Ui, terminal_id: u64, pane_size: Vec2) {
-        let layout_epoch = self.layout_epoch;
         let project_name = self
             .terminals
             .get(&terminal_id)
@@ -1053,9 +1348,8 @@ impl AdeApp {
             } else {
                 Color32::from_rgb(24, 34, 48)
             };
-            let pane_available = ui.available_size_before_wrap();
-            let pane_width = pane_available.x.max((pane_size.x - 10.0).max(120.0));
-            let pane_height = pane_available.y.max((pane_size.y - 10.0).max(120.0));
+            let pane_width = pane_size.x.max(96.0);
+            let pane_height = pane_size.y.max(124.0);
 
             let header_size = Vec2::new(pane_width, TERMINAL_HEADER_HEIGHT);
             ui.allocate_ui_with_layout(header_size, Layout::left_to_right(Align::Center), |ui| {
@@ -1068,7 +1362,7 @@ impl AdeApp {
                     .show(ui, |ui| {
                         ui.set_min_height(TERMINAL_HEADER_HEIGHT - 12.0);
 
-                        let indicator = if is_active { "●" } else { "○" };
+                        let indicator = if is_active { "*" } else { "o" };
                         let title = format!("{indicator} {} {}", icons::TERMINAL, terminal.title);
                         let title_response = ui.add(
                             egui::Label::new(RichText::new(title).color(TEXT_PRIMARY))
@@ -1119,20 +1413,22 @@ impl AdeApp {
             let line_height = ui.text_style_height(&monospace).max(CELL_HEIGHT_PX);
 
             let output_height =
-                (pane_height - TERMINAL_HEADER_HEIGHT - TERMINAL_HEADER_GAP).max(line_height * 3.0);
+                (pane_height - TERMINAL_HEADER_HEIGHT - TERMINAL_HEADER_GAP).max(line_height * 2.0);
             let output_size = Vec2::new(pane_width, output_height);
 
-            let cols = ((output_size.x / char_width).floor() as u16).max(20);
-            let lines = ((output_size.y / line_height).floor() as u16).max(6);
-            let resize_applied = terminal.runtime.resize(TerminalDimensions {
-                cols,
-                lines,
-                cell_width: char_width as u16,
-                cell_height: line_height as u16,
-            });
-            if !resize_applied {
-                ui.ctx()
-                    .request_repaint_after(Duration::from_millis(TERMINAL_RETRY_MS));
+            let cols = ((output_size.x / char_width).floor() as u16).max(8);
+            let lines = ((output_size.y / line_height).floor() as u16).max(3);
+            if output_size.x >= char_width * 8.0 && output_size.y >= line_height * 3.0 {
+                let resize_applied = terminal.runtime.resize(TerminalDimensions {
+                    cols,
+                    lines,
+                    cell_width: char_width as u16,
+                    cell_height: line_height as u16,
+                });
+                if !resize_applied {
+                    ui.ctx()
+                        .request_repaint_after(Duration::from_millis(TERMINAL_RETRY_MS));
+                }
             }
 
             let latest_seqno = terminal.runtime.latest_seqno();
@@ -1161,20 +1457,33 @@ impl AdeApp {
                     .show(ui, |ui| {
                         ui.set_min_size(output_size);
                         egui::ScrollArea::vertical()
-                            .id_salt(format!("term-output-{terminal_id}-{layout_epoch}"))
+                            .id_salt(format!("term-output-{terminal_id}"))
                             .max_height(output_height)
                             .auto_shrink([false, false])
                             .stick_to_bottom(true)
                             .show(ui, |ui| {
-                                let render_job =
-                                    build_terminal_layout_job(&terminal.render_cache, &font_id);
-                                let response = ui.add(
-                                    egui::Label::new(render_job)
-                                        .wrap_mode(TextWrapMode::Extend)
+                                if terminal.render_cache.lines.is_empty() {
+                                    let response = ui.add(
+                                        egui::Label::new(
+                                            RichText::new("Terminal is resizing...")
+                                                .color(TEXT_MUTED),
+                                        )
                                         .sense(Sense::click()),
-                                );
-                                if response.clicked() {
-                                    pane_clicked = true;
+                                    );
+                                    if response.clicked() {
+                                        pane_clicked = true;
+                                    }
+                                } else {
+                                    let render_job =
+                                        build_terminal_layout_job(&terminal.render_cache, &font_id);
+                                    let response = ui.add(
+                                        egui::Label::new(render_job)
+                                            .wrap_mode(TextWrapMode::Extend)
+                                            .sense(Sense::click()),
+                                    );
+                                    if response.clicked() {
+                                        pane_clicked = true;
+                                    }
                                 }
                             });
                     });
@@ -1215,7 +1524,7 @@ impl AdeApp {
 
                 let mut show_explorer = self.config.ui.show_project_explorer;
                 if ui
-                    .checkbox(&mut show_explorer, "Show Project Explorer")
+                    .checkbox(&mut show_explorer, "Show Left Sidebar")
                     .changed()
                 {
                     self.config.ui.show_project_explorer = show_explorer;
@@ -1224,15 +1533,19 @@ impl AdeApp {
 
                 let mut filter_mode = self.config.ui.project_filter_mode;
                 if ui
-                    .checkbox(&mut filter_mode, "Project Filter Mode")
+                    .checkbox(
+                        &mut filter_mode,
+                        "Filter Terminal Manager by Selected Project",
+                    )
                     .changed()
                 {
                     self.config.ui.project_filter_mode = filter_mode;
-                    self.bump_layout_epoch();
                     should_persist = true;
                 }
 
                 ui.separator();
+
+                self.config.ui.main_visibility_mode = MainVisibilityMode::Global;
 
                 let previous_scope = self.config.ui.auto_tile_scope;
                 egui::ComboBox::from_label("Auto Tile Scope")
@@ -1343,6 +1656,7 @@ impl eframe::App for AdeApp {
         self.ensure_theme_initialized(ctx);
         self.ensure_repaint_pump(ctx);
         self.process_terminal_events(ctx);
+        self.process_source_control_events(ctx);
         self.schedule_terminal_refresh(ctx);
         self.handle_shortcuts(ctx);
 
@@ -1363,6 +1677,164 @@ impl eframe::App for AdeApp {
         }
 
         self.persist_config();
+    }
+}
+
+fn collect_source_control_snapshot(project_path: &Path, run_fetch: bool) -> SourceControlSnapshot {
+    let mut snapshot = SourceControlSnapshot {
+        loading: false,
+        ..SourceControlSnapshot::default()
+    };
+
+    if run_fetch {
+        match run_git_command(project_path, &["fetch", "--all", "--prune"]) {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                snapshot.last_error = Some(if stderr.is_empty() {
+                    "git fetch failed".to_owned()
+                } else {
+                    format!("Fetch failed: {stderr}")
+                });
+                return snapshot;
+            }
+            Err(err) => {
+                snapshot.last_error = Some(format!("Fetch failed: {err}"));
+                return snapshot;
+            }
+        }
+    }
+
+    let output = match run_git_command(project_path, &["status", "--porcelain", "--branch"]) {
+        Ok(output) => output,
+        Err(err) => {
+            snapshot.last_error = Some(format!("Status failed: {err}"));
+            return snapshot;
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        snapshot.last_error = Some(if stderr.is_empty() {
+            "Not a git repository".to_owned()
+        } else {
+            stderr
+        });
+        return snapshot;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(header) = line.strip_prefix("## ") {
+            let (branch, ahead, behind) = parse_branch_header(header);
+            snapshot.branch = branch;
+            snapshot.ahead = ahead;
+            snapshot.behind = behind;
+            continue;
+        }
+
+        if line.len() < 3 {
+            continue;
+        }
+
+        let code = &line[..2];
+        let Some(path_part) = line.get(3..) else {
+            continue;
+        };
+        let mut path = path_part.trim().to_owned();
+        if let Some((_, new_path)) = path.split_once(" -> ") {
+            path = new_path.trim().to_owned();
+        }
+
+        let bytes = code.as_bytes();
+        if bytes.len() < 2 {
+            continue;
+        }
+        let x = bytes[0] as char;
+        let y = bytes[1] as char;
+        let status_char = if x != ' ' && x != '?' { x } else { y };
+
+        let status = match status_char {
+            'M' => "Modified",
+            'A' => "Added",
+            'D' => "Deleted",
+            'R' => "Renamed",
+            'C' => "Copied",
+            'U' => "Conflicted",
+            '?' => "Untracked",
+            '!' => "Ignored",
+            _ => "Changed",
+        };
+
+        snapshot.files.push(SourceControlFile {
+            path,
+            status,
+            staged: x != ' ' && x != '?',
+        });
+    }
+
+    if snapshot.branch.is_empty() {
+        snapshot.branch = "detached".to_owned();
+    }
+
+    snapshot
+        .files
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    snapshot
+}
+
+fn run_git_command(project_path: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(project_path).args(args);
+    #[cfg(target_os = "windows")]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command.output()
+}
+
+fn parse_branch_header(header: &str) -> (String, usize, usize) {
+    let (branch_part, tracking_part) = match header.split_once("...") {
+        Some((branch, tail)) => (branch.trim().to_owned(), Some(tail)),
+        None => {
+            let branch = header.split_whitespace().next().unwrap_or("detached");
+            (branch.to_owned(), None)
+        }
+    };
+
+    let mut ahead = 0usize;
+    let mut behind = 0usize;
+
+    if let Some(tail) = tracking_part {
+        if let Some(start) = tail.find('[') {
+            if let Some(end) = tail[start..].find(']') {
+                let flags = &tail[start + 1..start + end];
+                for part in flags.split(',') {
+                    let piece = part.trim();
+                    if let Some(value) = piece.strip_prefix("ahead ") {
+                        ahead = value.parse().unwrap_or(0);
+                    } else if let Some(value) = piece.strip_prefix("behind ") {
+                        behind = value.parse().unwrap_or(0);
+                    }
+                }
+            }
+        }
+    }
+
+    (branch_part, ahead, behind)
+}
+
+fn open_in_file_explorer(path: &Path, select_file: bool) -> Result<(), String> {
+    let mut command = Command::new("explorer.exe");
+    if select_file {
+        command.arg("/select,").arg(path);
+    } else {
+        command.arg(path);
+    }
+
+    match command.spawn() {
+        Ok(_) => Ok(()),
+        Err(err) => Err(err.to_string()),
     }
 }
 
@@ -1408,7 +1880,7 @@ fn build_terminal_layout_job(snapshot: &TerminalSnapshot, font_id: &FontId) -> L
             let mut format = TextFormat {
                 font_id: font_id.clone(),
                 color: fg,
-                background: to_egui_color(run.style.bg),
+                background: normalize_terminal_background(run.style.bg),
                 italics: run.style.italic,
                 ..TextFormat::default()
             };
@@ -1442,9 +1914,19 @@ fn to_egui_color(color: TerminalColor) -> Color32 {
     Color32::from_rgb(color.r, color.g, color.b)
 }
 
+fn normalize_terminal_background(color: TerminalColor) -> Color32 {
+    let mapped = to_egui_color(color);
+    if color.r <= 6 && color.g <= 6 && color.b <= 6 {
+        TERMINAL_OUTPUT_BG
+    } else {
+        mapped
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::AdeApp;
+    use super::{normalize_terminal_background, parse_branch_header, AdeApp, TERMINAL_OUTPUT_BG};
+    use crate::terminal::TerminalColor;
     use eframe::egui::{Key, Modifiers};
 
     #[test]
@@ -1478,5 +1960,31 @@ mod tests {
         AdeApp::append_pending_line(&mut pending, "\nnext");
 
         assert_eq!(pending, "next");
+    }
+
+    #[test]
+    fn parse_branch_header_extracts_ahead_behind_counts() {
+        let (branch, ahead, behind) = parse_branch_header("main...origin/main [ahead 2, behind 1]");
+        assert_eq!(branch, "main");
+        assert_eq!(ahead, 2);
+        assert_eq!(behind, 1);
+    }
+
+    #[test]
+    fn normalizes_near_black_terminal_background() {
+        let normalized = normalize_terminal_background(TerminalColor { r: 0, g: 0, b: 0 });
+        assert_eq!(normalized, TERMINAL_OUTPUT_BG);
+    }
+
+    #[test]
+    fn keeps_non_black_terminal_background() {
+        let normalized = normalize_terminal_background(TerminalColor {
+            r: 32,
+            g: 80,
+            b: 120,
+        });
+        assert_eq!(normalized.r(), 32);
+        assert_eq!(normalized.g(), 80);
+        assert_eq!(normalized.b(), 120);
     }
 }
