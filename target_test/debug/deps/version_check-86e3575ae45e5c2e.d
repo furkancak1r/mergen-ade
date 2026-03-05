@@ -1,0 +1,10 @@
+C:\Users\furkan.cakir\Desktop\FurkanPRS\Kodlar\Projeler\test\Mergen-ADE\target_test\debug\deps\version_check-86e3575ae45e5c2e.d: C:\Users\furkan.cakir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\version_check-0.9.5\src\lib.rs C:\Users\furkan.cakir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\version_check-0.9.5\src\version.rs C:\Users\furkan.cakir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\version_check-0.9.5\src\channel.rs C:\Users\furkan.cakir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\version_check-0.9.5\src\date.rs
+
+C:\Users\furkan.cakir\Desktop\FurkanPRS\Kodlar\Projeler\test\Mergen-ADE\target_test\debug\deps\libversion_check-86e3575ae45e5c2e.rlib: C:\Users\furkan.cakir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\version_check-0.9.5\src\lib.rs C:\Users\furkan.cakir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\version_check-0.9.5\src\version.rs C:\Users\furkan.cakir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\version_check-0.9.5\src\channel.rs C:\Users\furkan.cakir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\version_check-0.9.5\src\date.rs
+
+C:\Users\furkan.cakir\Desktop\FurkanPRS\Kodlar\Projeler\test\Mergen-ADE\target_test\debug\deps\libversion_check-86e3575ae45e5c2e.rmeta: C:\Users\furkan.cakir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\version_check-0.9.5\src\lib.rs C:\Users\furkan.cakir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\version_check-0.9.5\src\version.rs C:\Users\furkan.cakir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\version_check-0.9.5\src\channel.rs C:\Users\furkan.cakir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\version_check-0.9.5\src\date.rs
+
+C:\Users\furkan.cakir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\version_check-0.9.5\src\lib.rs:
+C:\Users\furkan.cakir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\version_check-0.9.5\src\version.rs:
+C:\Users\furkan.cakir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\version_check-0.9.5\src\channel.rs:
+C:\Users\furkan.cakir\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\version_check-0.9.5\src\date.rs:

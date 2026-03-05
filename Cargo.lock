@@ -1024,15 +1024,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "egui-phosphor"
-version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74744068685d20e004d1a4326c48403b6759e325c7fce8c5eeeab93f0a9f67ca"
-dependencies = [
- "egui",
-]
-
-[[package]]
 name = "egui-winit"
 version = "0.29.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1650,6 +1641,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "iconflow"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bdea0c209457d8685cf6f1aae4eabc71d69f3c6ee6bb1fab0861a52251763936"
+
+[[package]]
 name = "icu_collections"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2095,8 +2092,8 @@ dependencies = [
  "crossbeam-channel",
  "directories",
  "eframe",
- "egui-phosphor",
  "env_logger",
+ "iconflow",
  "log",
  "portable-pty",
  "rfd",

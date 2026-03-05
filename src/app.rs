@@ -1,20 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{
-    self, Align, Color32, Event, FontId, Key, Layout, RichText, Sense, Stroke, TextWrapMode, Ui,
-    Vec2,
+    self, Align, Color32, Event, FontData, FontFamily, FontId, Key, Layout, RichText, Sense,
+    Stroke, TextWrapMode, Ui, Vec2,
 };
-use egui_phosphor::{regular as icons, Variant};
+use iconflow::{fonts as icon_fonts, try_icon, Pack, Size, Style};
 
 use crate::config;
 use crate::layout;
@@ -42,7 +42,7 @@ const TERMINAL_TILE_GAP_Y: f32 = 0.0;
 const TERMINAL_PANE_INNER_MARGIN: f32 = 2.0;
 const APP_BG: Color32 = Color32::from_rgb(14, 18, 24);
 const SURFACE_BG: Color32 = Color32::from_rgb(22, 28, 38);
-const SURFACE_BG_SOFT: Color32 = Color32::from_rgb(28, 35, 47);
+const SURFACE_BG_SOFT: Color32 = Color32::from_rgb(24, 38, 52);
 const BORDER_COLOR: Color32 = Color32::from_rgb(46, 60, 78);
 const ACCENT: Color32 = Color32::from_rgb(26, 179, 255);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(225, 233, 245);
@@ -57,8 +57,134 @@ const BTN_SUBTLE: Color32 = Color32::from_rgb(20, 63, 92);
 const BTN_SUBTLE_HOVER: Color32 = Color32::from_rgb(28, 85, 122);
 const BTN_RED: Color32 = Color32::from_rgb(120, 30, 30);
 const BTN_RED_HOVER: Color32 = Color32::from_rgb(160, 40, 40);
+const BTN_ICON: Color32 = Color32::from_rgb(24, 70, 103);
+const BTN_ICON_HOVER: Color32 = Color32::from_rgb(31, 98, 144);
+const BTN_ICON_ACTIVE: Color32 = Color32::from_rgb(24, 118, 172);
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum AppIcon {
+    ArrowClockwise,
+    ChatText,
+    CheckCircle,
+    Clock,
+    Copy,
+    Download,
+    Eye,
+    Folder,
+    FolderOpen,
+    FolderPlus,
+    Gear,
+    GitBranch,
+    List,
+    Plus,
+    Terminal,
+    TerminalWindow,
+    Trash,
+    TreeView,
+    X,
+}
+
+impl AppIcon {
+    const ALL: [Self; 19] = [
+        Self::ArrowClockwise,
+        Self::ChatText,
+        Self::CheckCircle,
+        Self::Clock,
+        Self::Copy,
+        Self::Download,
+        Self::Eye,
+        Self::Folder,
+        Self::FolderOpen,
+        Self::FolderPlus,
+        Self::Gear,
+        Self::GitBranch,
+        Self::List,
+        Self::Plus,
+        Self::Terminal,
+        Self::TerminalWindow,
+        Self::Trash,
+        Self::TreeView,
+        Self::X,
+    ];
+
+    const fn lucide_name(self) -> &'static str {
+        match self {
+            Self::ArrowClockwise => "refresh-ccw",
+            Self::ChatText => "message-square-text",
+            Self::CheckCircle => "circle-check",
+            Self::Clock => "clock",
+            Self::Copy => "copy",
+            Self::Download => "download",
+            Self::Eye => "eye",
+            Self::Folder => "folder",
+            Self::FolderOpen => "folder-open",
+            Self::FolderPlus => "folder-plus",
+            Self::Gear => "settings",
+            Self::GitBranch => "git-branch",
+            Self::List => "list",
+            Self::Plus => "plus",
+            Self::Terminal => "terminal",
+            Self::TerminalWindow => "app-window",
+            Self::Trash => "trash-2",
+            Self::TreeView => "folder-tree",
+            Self::X => "x",
+        }
+    }
+}
+
+impl fmt::Display for AppIcon {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(icon_glyph(*self))
+    }
+}
+
+fn icon_glyph(icon: AppIcon) -> &'static str {
+    static GLYPH_CACHE: OnceLock<BTreeMap<AppIcon, String>> = OnceLock::new();
+    let cache = GLYPH_CACHE.get_or_init(|| {
+        let mut map = BTreeMap::new();
+        for item in AppIcon::ALL {
+            let glyph = try_icon(
+                Pack::Lucide,
+                item.lucide_name(),
+                Style::Regular,
+                Size::Regular,
+            )
+            .ok()
+            .and_then(|entry| char::from_u32(entry.codepoint))
+            .map(|ch| ch.to_string())
+            .unwrap_or_else(|| "?".to_owned());
+            map.insert(item, glyph);
+        }
+        map
+    });
+    cache.get(&icon).map(String::as_str).unwrap_or("?")
+}
+
+mod icons {
+    use super::AppIcon;
+
+    pub const ARROW_CLOCKWISE: AppIcon = AppIcon::ArrowClockwise;
+    pub const CHAT_TEXT: AppIcon = AppIcon::ChatText;
+    pub const CHECK_CIRCLE: AppIcon = AppIcon::CheckCircle;
+    pub const CLOCK: AppIcon = AppIcon::Clock;
+    pub const COPY: AppIcon = AppIcon::Copy;
+    pub const DOWNLOAD: AppIcon = AppIcon::Download;
+    pub const EYE: AppIcon = AppIcon::Eye;
+    pub const FOLDER: AppIcon = AppIcon::Folder;
+    pub const FOLDER_OPEN: AppIcon = AppIcon::FolderOpen;
+    pub const FOLDER_PLUS: AppIcon = AppIcon::FolderPlus;
+    pub const GEAR: AppIcon = AppIcon::Gear;
+    pub const GIT_BRANCH: AppIcon = AppIcon::GitBranch;
+    pub const LIST: AppIcon = AppIcon::List;
+    pub const PLUS: AppIcon = AppIcon::Plus;
+    pub const TERMINAL: AppIcon = AppIcon::Terminal;
+    pub const TERMINAL_WINDOW: AppIcon = AppIcon::TerminalWindow;
+    pub const TRASH: AppIcon = AppIcon::Trash;
+    pub const TREE_VIEW: AppIcon = AppIcon::TreeView;
+    pub const X: AppIcon = AppIcon::X;
+}
 
 pub struct AdeApp {
     config_path: PathBuf,
@@ -75,8 +201,6 @@ pub struct AdeApp {
     saved_message_drafts: BTreeMap<u64, String>,
     status_line: String,
     layout_epoch: u64,
-    repaint_pump_started: bool,
-    repaint_pump_flag: Arc<AtomicBool>,
     theme_initialized: bool,
     source_control_events_tx: Sender<SourceControlEvent>,
     source_control_events_rx: Receiver<SourceControlEvent>,
@@ -159,8 +283,6 @@ impl AdeApp {
             saved_message_drafts: BTreeMap::new(),
             status_line: "Ready".to_owned(),
             layout_epoch: 0,
-            repaint_pump_started: false,
-            repaint_pump_flag: Arc::new(AtomicBool::new(true)),
             theme_initialized: false,
             source_control_events_tx,
             source_control_events_rx,
@@ -458,30 +580,40 @@ impl AdeApp {
         }
     }
 
-    fn ensure_repaint_pump(&mut self, ctx: &egui::Context) {
-        if self.repaint_pump_started {
-            return;
-        }
-
-        self.repaint_pump_started = true;
-        let repaint_ctx = ctx.clone();
-        let running = self.repaint_pump_flag.clone();
-
-        std::thread::spawn(move || {
-            while running.load(Ordering::Relaxed) {
-                repaint_ctx.request_repaint();
-                std::thread::sleep(Duration::from_millis(TERMINAL_FALLBACK_REFRESH_MS));
-            }
-        });
-    }
-
     fn ensure_theme_initialized(&mut self, ctx: &egui::Context) {
         if self.theme_initialized {
             return;
         }
 
         let mut fonts = egui::FontDefinitions::default();
-        egui_phosphor::add_to_fonts(&mut fonts, Variant::Regular);
+        let fallback_fonts = fonts.font_data.keys().cloned().collect::<Vec<_>>();
+        let icon_families = icon_fonts()
+            .iter()
+            .map(|asset| asset.family.to_owned())
+            .collect::<Vec<_>>();
+        for asset in icon_fonts() {
+            fonts
+                .font_data
+                .insert(asset.family.to_owned(), FontData::from_static(asset.bytes));
+            let family = fonts
+                .families
+                .entry(FontFamily::Name(asset.family.into()))
+                .or_default();
+            family.insert(0, asset.family.to_owned());
+            for fallback in &fallback_fonts {
+                if fallback != asset.family {
+                    family.push(fallback.clone());
+                }
+            }
+        }
+        for ui_family in [FontFamily::Proportional, FontFamily::Monospace] {
+            let family = fonts.families.entry(ui_family).or_default();
+            for icon_family in icon_families.iter().rev() {
+                if !family.iter().any(|name| name == icon_family) {
+                    family.insert(0, icon_family.clone());
+                }
+            }
+        }
         ctx.set_fonts(fonts);
 
         let mut style = (*ctx.style()).clone();
@@ -501,24 +633,30 @@ impl AdeApp {
         visuals.panel_fill = APP_BG;
         visuals.window_fill = SURFACE_BG;
         visuals.faint_bg_color = SURFACE_BG_SOFT;
-        visuals.extreme_bg_color = Color32::from_rgb(9, 12, 16);
+        visuals.extreme_bg_color = Color32::from_rgb(18, 30, 44);
         visuals.code_bg_color = Color32::from_rgb(12, 16, 22);
         visuals.hyperlink_color = ACCENT;
         visuals.window_stroke = Stroke::new(1.0, BORDER_COLOR);
-        visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(24, 33, 46);
-        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(45, 63, 84));
+        visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(24, 45, 66);
+        visuals.widgets.noninteractive.weak_bg_fill = Color32::from_rgb(22, 38, 56);
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(55, 95, 128));
         visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_MUTED);
-        visuals.widgets.inactive.bg_fill = Color32::from_rgb(24, 54, 79);
-        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(66, 104, 138));
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(26, 66, 98);
+        visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(23, 55, 83);
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(76, 122, 162));
         visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(39, 62, 84);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(33, 86, 128);
+        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(30, 76, 113);
         visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT);
         visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::from_rgb(240, 247, 255));
-        visuals.widgets.active.bg_fill = Color32::from_rgb(20, 95, 140);
+        visuals.widgets.active.bg_fill = Color32::from_rgb(20, 112, 166);
+        visuals.widgets.active.weak_bg_fill = Color32::from_rgb(18, 96, 145);
         visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
         visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::from_rgb(244, 251, 255));
-        visuals.widgets.open.bg_fill = Color32::from_rgb(26, 57, 84);
-        visuals.widgets.open.bg_stroke = Stroke::new(1.0, Color32::from_rgb(56, 95, 132));
+        visuals.widgets.open.bg_fill = Color32::from_rgb(28, 78, 118);
+        visuals.widgets.open.weak_bg_fill = Color32::from_rgb(24, 64, 98);
+        visuals.widgets.open.bg_stroke = Stroke::new(1.0, Color32::from_rgb(74, 126, 168));
+        visuals.widgets.open.fg_stroke = Stroke::new(1.0, Color32::from_rgb(235, 245, 255));
         visuals.selection.bg_fill = Color32::from_rgb(18, 93, 136);
         visuals.selection.stroke = Stroke::new(1.0, ACCENT);
 
@@ -651,8 +789,14 @@ impl AdeApp {
                     );
                     ui.add_space(6.0);
 
-                    if styled_pill_button(ui, icons::GEAR, "Settings", BTN_SUBTLE, BTN_SUBTLE_HOVER)
-                    {
+                    if styled_icon_button(
+                        ui,
+                        icons::GEAR,
+                        BTN_SUBTLE,
+                        BTN_SUBTLE_HOVER,
+                        BTN_ICON_ACTIVE,
+                        "Settings",
+                    ) {
                         self.show_settings_popup = true;
                     }
 
@@ -685,29 +829,30 @@ impl AdeApp {
                     .show(ui, |ui| {
                         let previous_tab = self.config.ui.left_sidebar_tab;
                         ui.horizontal(|ui| {
-                            ui.selectable_value(
-                                &mut self.config.ui.left_sidebar_tab,
-                                LeftSidebarTab::Directory,
-                                format!(
-                                    "{} {}",
-                                    icons::TREE_VIEW,
-                                    LeftSidebarTab::Directory.label()
-                                ),
-                            );
-                            ui.selectable_value(
-                                &mut self.config.ui.left_sidebar_tab,
-                                LeftSidebarTab::SourceControl,
-                                format!(
-                                    "{} {}",
-                                    icons::GIT_BRANCH,
-                                    LeftSidebarTab::SourceControl.label()
-                                ),
-                            );
-                            if ui
-                                .button(icons::FOLDER_PLUS)
-                                .on_hover_text("Add Project")
-                                .clicked()
-                            {
+                            if styled_icon_toggle(
+                                ui,
+                                self.config.ui.left_sidebar_tab == LeftSidebarTab::Directory,
+                                icons::TREE_VIEW,
+                                LeftSidebarTab::Directory.label(),
+                            ) {
+                                self.config.ui.left_sidebar_tab = LeftSidebarTab::Directory;
+                            }
+                            if styled_icon_toggle(
+                                ui,
+                                self.config.ui.left_sidebar_tab == LeftSidebarTab::SourceControl,
+                                icons::GIT_BRANCH,
+                                LeftSidebarTab::SourceControl.label(),
+                            ) {
+                                self.config.ui.left_sidebar_tab = LeftSidebarTab::SourceControl;
+                            }
+                            if styled_icon_button(
+                                ui,
+                                icons::FOLDER_PLUS,
+                                BTN_TEAL,
+                                BTN_TEAL_HOVER,
+                                BTN_ICON_ACTIVE,
+                                "Add Project",
+                            ) {
                                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                                     self.add_project(path);
                                 }
@@ -722,10 +867,10 @@ impl AdeApp {
                             LeftSidebarTab::Directory => {
                                 let project_rows = self
                                     .projects
-                                    .values()
-                                    .map(|project| {
+                                    .iter()
+                                    .map(|(project_id, project)| {
                                         (
-                                            project.id,
+                                            *project_id,
                                             project.name.clone(),
                                             project.path.clone(),
                                             project.path.display().to_string(),
@@ -733,53 +878,81 @@ impl AdeApp {
                                     })
                                     .collect::<Vec<_>>();
 
-                                for (project_id, project_name, project_path, project_path_text) in
-                                    project_rows
-                                {
-                                    let selected = self.selected_project == Some(project_id);
-                                    let project_label = if selected {
-                                        format!("{} {}", icons::FOLDER_OPEN, project_name)
-                                    } else {
-                                        format!("{} {}", icons::FOLDER, project_name)
-                                    };
+                                let selected_project_label = self
+                                    .selected_project
+                                    .and_then(|selected_id| {
+                                        project_rows
+                                            .iter()
+                                            .find(|(project_id, _, _, _)| {
+                                                *project_id == selected_id
+                                            })
+                                            .map(|(_, project_name, _, _)| {
+                                                format!("{} {}", icons::FOLDER_OPEN, project_name)
+                                            })
+                                    })
+                                    .unwrap_or_else(|| "No project selected".to_owned());
 
-                                    let response = ui.selectable_label(selected, project_label);
-                                    if response.clicked() {
-                                        self.selected_project = Some(project_id);
-                                        self.persist_config();
-                                    }
-                                    response.context_menu(|ui| {
-                                        if ui.button(format!("{} Copy Path", icons::COPY)).clicked()
-                                        {
-                                            ui.ctx().copy_text(project_path_text.clone());
-                                            self.status_line = format!(
-                                                "Copied path for project '{}'",
-                                                project_name
+                                let previous_selected_project = self.selected_project;
+                                egui::ComboBox::from_label("Project")
+                                    .selected_text(selected_project_label)
+                                    .width(220.0)
+                                    .show_ui(ui, |ui| {
+                                        for (project_id, project_name, _, _) in &project_rows {
+                                            ui.selectable_value(
+                                                &mut self.selected_project,
+                                                Some(*project_id),
+                                                format!("{} {}", icons::FOLDER, project_name),
                                             );
-                                            ui.close_menu();
-                                        }
-                                        if ui
-                                            .button(format!(
-                                                "{} Open in Folder",
-                                                icons::FOLDER_OPEN
-                                            ))
-                                            .clicked()
-                                        {
-                                            match open_in_file_explorer(&project_path, false) {
-                                                Ok(()) => {
-                                                    self.status_line = format!(
-                                                        "Opened project '{}' in Explorer",
-                                                        project_name
-                                                    );
-                                                }
-                                                Err(err) => {
-                                                    self.status_line =
-                                                        format!("Open folder failed: {err}");
-                                                }
-                                            }
-                                            ui.close_menu();
                                         }
                                     });
+                                if self.selected_project != previous_selected_project {
+                                    self.persist_config();
+                                }
+
+                                if let Some(selected_id) = self.selected_project {
+                                    if let Some((
+                                        _,
+                                        project_name,
+                                        project_path,
+                                        project_path_text,
+                                    )) = project_rows
+                                        .iter()
+                                        .find(|(project_id, _, _, _)| *project_id == selected_id)
+                                        .cloned()
+                                    {
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .button(format!("{} Copy Path", icons::COPY))
+                                                .clicked()
+                                            {
+                                                ui.ctx().copy_text(project_path_text.clone());
+                                                self.status_line = format!(
+                                                    "Copied path for project '{}'",
+                                                    project_name
+                                                );
+                                            }
+                                            if ui
+                                                .button(format!(
+                                                    "{} Open in Folder",
+                                                    icons::FOLDER_OPEN
+                                                ))
+                                                .clicked()
+                                            {
+                                                match open_in_file_explorer(&project_path, false) {
+                                                    Ok(()) => {
+                                                        self.status_line = format!(
+                                                            "Opened project '{}' in Explorer",
+                                                            project_name
+                                                        );
+                                                    }
+                                                    Err(err) => {
+                                                        self.status_line =
+                                                            format!("Open folder failed: {err}");
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
                                 }
 
                                 ui.separator();
@@ -824,25 +997,34 @@ impl AdeApp {
                                         ))
                                         .strong(),
                                     );
-                                    if ui
-                                        .button(icons::ARROW_CLOCKWISE)
-                                        .on_hover_text("Refresh Status")
-                                        .clicked()
-                                    {
+                                    if styled_icon_button(
+                                        ui,
+                                        icons::ARROW_CLOCKWISE,
+                                        BTN_ICON,
+                                        BTN_ICON_HOVER,
+                                        BTN_ICON_ACTIVE,
+                                        "Refresh Status",
+                                    ) {
                                         self.request_source_control_refresh(project_id, false);
                                     }
-                                    if ui
-                                        .button(icons::DOWNLOAD)
-                                        .on_hover_text("Fetch and Refresh")
-                                        .clicked()
-                                    {
+                                    if styled_icon_button(
+                                        ui,
+                                        icons::DOWNLOAD,
+                                        BTN_ICON,
+                                        BTN_ICON_HOVER,
+                                        BTN_ICON_ACTIVE,
+                                        "Fetch and Refresh",
+                                    ) {
                                         self.request_source_control_refresh(project_id, true);
                                     }
-                                    if ui
-                                        .button(icons::FOLDER_OPEN)
-                                        .on_hover_text("Open Project Folder")
-                                        .clicked()
-                                    {
+                                    if styled_icon_button(
+                                        ui,
+                                        icons::FOLDER_OPEN,
+                                        BTN_ICON,
+                                        BTN_ICON_HOVER,
+                                        BTN_ICON_ACTIVE,
+                                        "Open Project Folder",
+                                    ) {
                                         match open_in_file_explorer(&project.path, false) {
                                             Ok(()) => {
                                                 self.status_line =
@@ -901,7 +1083,10 @@ impl AdeApp {
                                         } else {
                                             icons::CLOCK
                                         };
-                                        ui.label(RichText::new(status_icon).color(TEXT_MUTED));
+                                        ui.label(
+                                            RichText::new(format!("{status_icon}"))
+                                                .color(TEXT_MUTED),
+                                        );
                                         ui.label(
                                             RichText::new(format!("{} {}", file.status, file.path))
                                                 .monospace()
@@ -1002,12 +1187,13 @@ impl AdeApp {
                                 .default_open(true)
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
-                                        if styled_pill_button(
+                                        if styled_icon_button(
                                             ui,
                                             icons::TERMINAL,
-                                            "New FG",
                                             BTN_BLUE,
                                             BTN_BLUE_HOVER,
+                                            BTN_ICON_ACTIVE,
+                                            "New Foreground Terminal",
                                         ) {
                                             self.spawn_terminal_for_project(
                                                 ctx,
@@ -1015,12 +1201,13 @@ impl AdeApp {
                                                 TerminalKind::Foreground,
                                             );
                                         }
-                                        if styled_pill_button(
+                                        if styled_icon_button(
                                             ui,
                                             icons::LIST,
-                                            "New BG",
                                             BTN_TEAL,
                                             BTN_TEAL_HOVER,
+                                            BTN_ICON_ACTIVE,
+                                            "New Background Terminal",
                                         ) {
                                             self.spawn_terminal_for_project(
                                                 ctx,
@@ -1123,7 +1310,7 @@ impl AdeApp {
                         set_active = true;
                     }
 
-                    let message_menu = ui.menu_button(format!("{} Msg", icons::CHAT_TEXT), |ui| {
+                    let message_menu = ui.menu_button(format!("{}", icons::CHAT_TEXT), |ui| {
                         if saved_messages.is_empty() {
                             ui.label(RichText::new("No saved messages").color(TEXT_MUTED));
                             return;
@@ -1141,14 +1328,18 @@ impl AdeApp {
                     if ui
                         .checkbox(
                             &mut terminal.in_main_view,
-                            RichText::new(icons::EYE).color(TEXT_MUTED),
+                            RichText::new(format!("{}", icons::EYE)).color(TEXT_MUTED),
                         )
                         .on_hover_text("Show in main area")
                         .changed()
                     {
                         visibility_changed = true;
                     }
-                    if ui.small_button(icons::X).on_hover_text("Close").clicked() {
+                    if ui
+                        .small_button(format!("{}", icons::X))
+                        .on_hover_text("Close")
+                        .clicked()
+                    {
                         close_terminal = true;
                     }
                 });
@@ -1604,11 +1795,14 @@ impl AdeApp {
                         for (index, message) in project_snapshot.saved_messages.iter().enumerate() {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(message).monospace().small());
-                                if ui
-                                    .small_button(icons::TRASH)
-                                    .on_hover_text("Remove message")
-                                    .clicked()
-                                {
+                                if styled_icon_button(
+                                    ui,
+                                    icons::TRASH,
+                                    BTN_RED,
+                                    BTN_RED_HOVER,
+                                    Color32::from_rgb(186, 58, 58),
+                                    "Remove message",
+                                ) {
                                     remove_message_index = Some(index);
                                 }
                             });
@@ -1617,11 +1811,14 @@ impl AdeApp {
                         ui.horizontal(|ui| {
                             let draft = self.saved_message_drafts.entry(project_id).or_default();
                             ui.text_edit_singleline(draft);
-                            if ui
-                                .button(icons::PLUS)
-                                .on_hover_text("Add message")
-                                .clicked()
-                            {
+                            if styled_icon_button(
+                                ui,
+                                icons::PLUS,
+                                BTN_BLUE,
+                                BTN_BLUE_HOVER,
+                                BTN_ICON_ACTIVE,
+                                "Add message",
+                            ) {
                                 let text = draft.trim();
                                 if !text.is_empty() {
                                     add_message = Some(text.to_owned());
@@ -1662,7 +1859,6 @@ impl AdeApp {
 impl eframe::App for AdeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ensure_theme_initialized(ctx);
-        self.ensure_repaint_pump(ctx);
         self.process_terminal_events(ctx);
         self.process_source_control_events(ctx);
         self.schedule_terminal_refresh(ctx);
@@ -1678,7 +1874,6 @@ impl eframe::App for AdeApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.repaint_pump_flag.store(false, Ordering::Relaxed);
         for terminal in self.terminals.values() {
             terminal.runtime.shutdown();
         }
@@ -1879,7 +2074,7 @@ fn draw_folder_tree(ui: &mut Ui, path: &Path, depth: usize, max_depth: usize) {
 
 fn styled_pill_button(
     ui: &mut Ui,
-    icon: &str,
+    icon: AppIcon,
     label: &str,
     bg: Color32,
     hover_bg: Color32,
@@ -1919,6 +2114,66 @@ fn styled_pill_button(
     }
 
     label_response.clicked()
+}
+
+fn styled_icon_button(
+    ui: &mut Ui,
+    icon: AppIcon,
+    bg: Color32,
+    hover_bg: Color32,
+    active_bg: Color32,
+    tooltip: &str,
+) -> bool {
+    let button = egui::Button::new(
+        RichText::new(format!("{icon}"))
+            .size(15.0)
+            .color(Color32::from_rgb(230, 240, 255)),
+    )
+    .fill(bg)
+    .stroke(Stroke::new(1.0, BORDER_COLOR))
+    .rounding(8.0)
+    .min_size(egui::vec2(30.0, 28.0));
+    let response = ui.add(button).on_hover_text(tooltip);
+
+    if response.hovered() {
+        ui.painter().rect_filled(response.rect, 8.0, hover_bg);
+        ui.painter().text(
+            response.rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{icon}"),
+            egui::FontId::proportional(15.0),
+            Color32::from_rgb(230, 240, 255),
+        );
+    } else if response.is_pointer_button_down_on() {
+        ui.painter().rect_filled(response.rect, 8.0, active_bg);
+        ui.painter().text(
+            response.rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{icon}"),
+            egui::FontId::proportional(15.0),
+            Color32::from_rgb(230, 240, 255),
+        );
+    }
+
+    response.clicked()
+}
+
+fn styled_icon_toggle(ui: &mut Ui, selected: bool, icon: AppIcon, tooltip: &str) -> bool {
+    let (fill, stroke) = if selected {
+        (Color32::from_rgb(28, 108, 158), Stroke::new(1.0, ACCENT))
+    } else {
+        (BTN_ICON, Stroke::new(1.0, Color32::from_rgb(64, 104, 138)))
+    };
+    let button = egui::Button::new(
+        RichText::new(format!("{icon}"))
+            .size(14.0)
+            .color(Color32::from_rgb(236, 244, 255)),
+    )
+    .fill(fill)
+    .stroke(stroke)
+    .rounding(8.0)
+    .min_size(egui::vec2(30.0, 28.0));
+    ui.add(button).on_hover_text(tooltip).clicked()
 }
 
 fn build_terminal_layout_job(snapshot: &TerminalSnapshot, font_id: &FontId) -> LayoutJob {
