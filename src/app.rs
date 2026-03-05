@@ -980,7 +980,13 @@ impl AdeApp {
                                                     .color(TEXT_MUTED)
                                                     .strong(),
                                                 );
-                                                draw_folder_tree(ui, &project.path, 0, 8);
+                                                draw_folder_tree(
+                                                    ui,
+                                                    &project.path,
+                                                    0,
+                                                    8,
+                                                    &mut self.status_line,
+                                                );
                                             }
                                         } else {
                                             ui.label(
@@ -2126,7 +2132,13 @@ fn open_in_file_explorer(path: &Path, select_file: bool) -> Result<(), String> {
     }
 }
 
-fn draw_folder_tree(ui: &mut Ui, path: &Path, depth: usize, max_depth: usize) {
+fn draw_folder_tree(
+    ui: &mut Ui,
+    path: &Path,
+    depth: usize,
+    max_depth: usize,
+    status_line: &mut String,
+) {
     if depth > max_depth {
         return;
     }
@@ -2147,13 +2159,29 @@ fn draw_folder_tree(ui: &mut Ui, path: &Path, depth: usize, max_depth: usize) {
             .file_name()
             .map(|segment| segment.to_string_lossy().to_string())
             .unwrap_or_else(|| item.display().to_string());
+        let item_path_text = item.display().to_string();
 
         if item.is_dir() {
-            egui::CollapsingHeader::new(name)
+            let header = egui::CollapsingHeader::new(name)
                 .id_salt(item.display().to_string())
-                .show(ui, |ui| draw_folder_tree(ui, &item, depth + 1, max_depth));
+                .show(ui, |ui| {
+                    draw_folder_tree(ui, &item, depth + 1, max_depth, status_line)
+                });
+            header.header_response.context_menu(|ui| {
+                if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
+                    ui.ctx().copy_text(item_path_text.clone());
+                    *status_line = format!("Copied path: {}", item_path_text);
+                    ui.close_menu();
+                }
+            });
         } else {
-            ui.label(name);
+            ui.label(name).context_menu(|ui| {
+                if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
+                    ui.ctx().copy_text(item_path_text.clone());
+                    *status_line = format!("Copied path: {}", item_path_text);
+                    ui.close_menu();
+                }
+            });
         }
     }
 }
