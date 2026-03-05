@@ -11,13 +11,24 @@
 - Build artifacts are in `target/` (do not commit).
 
 ## Build, Test, and Development Commands
-- `cargo build --release`: production build (`target/release/mergen-ade.exe`).
+- `cargo build --release`: production build (`target/x86_64-pc-windows-gnullvm/release/mergen-ade.exe`).
 - `cargo run --release`: run optimized build locally.
 - `cargo test`: run unit tests (layout, title, terminal helpers).
 - `cargo fmt`: format Rust sources before commit.
 
 If `cargo` is not on PATH in PowerShell, use:
 `$env:USERPROFILE\.cargo\bin\cargo.exe <command>`.
+
+## Mandatory EXE Refresh After Every Change
+- After any code update, always regenerate the release EXE before handing off work.
+- Canonical EXE path: `target/x86_64-pc-windows-gnullvm/release/mergen-ade.exe`.
+- Required runtime DLL for local launch: `target/x86_64-pc-windows-gnullvm/release/libunwind.dll`.
+- Update steps (PowerShell):
+  1. `cargo clean` (optional but recommended for suspicious stale outputs).
+  2. `cargo build --release`.
+  3. Copy runtime DLL if missing: `Copy-Item .\\.toolchain\\llvm-mingw-20260224-ucrt-x86_64\\x86_64-w64-mingw32\\bin\\libunwind.dll .\\target\\x86_64-pc-windows-gnullvm\\release\\libunwind.dll -Force`.
+  4. Verify timestamps: `Get-Item .\\target\\x86_64-pc-windows-gnullvm\\release\\mergen-ade.exe, .\\target\\x86_64-pc-windows-gnullvm\\release\\libunwind.dll`.
+  5. Launch and smoke-test: `Start-Process .\\target\\x86_64-pc-windows-gnullvm\\release\\mergen-ade.exe`.
 
 ## Coding Style & Naming Conventions
 - Rust 2021, 4-space indentation, UTF-8, LF/CRLF handled by Git.

@@ -47,6 +47,16 @@ const BORDER_COLOR: Color32 = Color32::from_rgb(46, 60, 78);
 const ACCENT: Color32 = Color32::from_rgb(26, 179, 255);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(225, 233, 245);
 const TEXT_MUTED: Color32 = Color32::from_rgb(148, 167, 191);
+
+// Pill button palette
+const BTN_BLUE: Color32 = Color32::from_rgb(16, 64, 112);
+const BTN_BLUE_HOVER: Color32 = Color32::from_rgb(22, 88, 150);
+const BTN_TEAL: Color32 = Color32::from_rgb(14, 68, 82);
+const BTN_TEAL_HOVER: Color32 = Color32::from_rgb(20, 92, 110);
+const BTN_SUBTLE: Color32 = Color32::from_rgb(34, 44, 58);
+const BTN_SUBTLE_HOVER: Color32 = Color32::from_rgb(44, 58, 78);
+const BTN_RED: Color32 = Color32::from_rgb(120, 30, 30);
+const BTN_RED_HOVER: Color32 = Color32::from_rgb(160, 40, 40);
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -259,8 +269,6 @@ impl AdeApp {
     fn process_terminal_events(&mut self, ctx: &egui::Context) {
         let mut dirty_ids = BTreeSet::new();
         let mut exited_ids = BTreeSet::new();
-        let mut title_updates: BTreeMap<u64, Option<String>> = BTreeMap::new();
-        let mut pty_writes: Vec<(u64, String)> = Vec::new();
         let mut processed = 0usize;
 
         while processed < TERMINAL_EVENT_BUDGET {
@@ -273,17 +281,6 @@ impl AdeApp {
                 TerminalUiEventKind::Wakeup => {
                     dirty_ids.insert(event.terminal_id);
                 }
-                TerminalUiEventKind::Title(title) => {
-                    if !title.trim().is_empty() {
-                        title_updates.insert(event.terminal_id, Some(title));
-                    }
-                }
-                TerminalUiEventKind::ResetTitle => {
-                    title_updates.insert(event.terminal_id, None);
-                }
-                TerminalUiEventKind::PtyWrite(payload) => {
-                    pty_writes.push((event.terminal_id, payload));
-                }
                 TerminalUiEventKind::ChildExit | TerminalUiEventKind::Exit => {
                     exited_ids.insert(event.terminal_id);
                     dirty_ids.insert(event.terminal_id);
@@ -293,29 +290,11 @@ impl AdeApp {
 
         let mut changed = false;
 
-        for (terminal_id, payload) in pty_writes {
-            let Some(entry) = self.terminals.get_mut(&terminal_id) else {
-                continue;
-            };
-            entry.runtime.send_bytes(payload.into_bytes());
-        }
-
         for terminal_id in dirty_ids {
             let Some(entry) = self.terminals.get_mut(&terminal_id) else {
                 continue;
             };
             entry.dirty = true;
-            changed = true;
-        }
-
-        for (terminal_id, update) in title_updates {
-            let Some(entry) = self.terminals.get_mut(&terminal_id) else {
-                continue;
-            };
-            entry.title = match update {
-                Some(title) => title,
-                None => format!("Terminal {}", entry.id),
-            };
             changed = true;
         }
 
@@ -377,23 +356,6 @@ impl AdeApp {
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let _ = ctx;
-    }
-
-    fn apply_auto_tile(&mut self, scope: AutoTileScope) {
-        self.config.ui.auto_tile_scope = scope;
-
-        for terminal in self.terminals.values_mut() {
-            terminal.in_main_view = match scope {
-                AutoTileScope::AllVisible => true,
-                AutoTileScope::SelectedProjectOnly => self
-                    .selected_project
-                    .is_some_and(|project_id| project_id == terminal.project_id),
-            };
-        }
-
-        self.bump_layout_epoch();
-        self.status_line = format!("Auto Tile: {}", scope.label());
-        self.persist_config();
     }
 
     fn visible_terminal_ids_for_main(&self) -> Vec<u64> {
@@ -669,55 +631,19 @@ impl AdeApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(format!("{}  Mergen ADE", icons::TERMINAL_WINDOW)).strong(),
+                        RichText::new(format!("{}  Mergen ADE", icons::TERMINAL_WINDOW))
+                            .strong()
+                            .size(15.0)
+                            .color(ACCENT),
                     );
-                    ui.separator();
+                    ui.add_space(6.0);
 
-                    if ui
-                        .button(icons::FOLDER_PLUS)
-                        .on_hover_text("Add Project")
-                        .clicked()
+                    if styled_pill_button(ui, icons::GEAR, "Settings", BTN_SUBTLE, BTN_SUBTLE_HOVER)
                     {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.add_project(path);
-                        }
-                    }
-
-                    if ui
-                        .button(icons::TERMINAL)
-                        .on_hover_text("New Foreground Terminal")
-                        .clicked()
-                    {
-                        if let Some(project_id) = self.selected_project {
-                            self.spawn_terminal_for_project(
-                                ctx,
-                                project_id,
-                                TerminalKind::Foreground,
-                            );
-                        }
-                    }
-
-                    if ui
-                        .button(icons::LAYOUT)
-                        .on_hover_text("Auto Tile Visible Terminals")
-                        .clicked()
-                    {
-                        self.apply_auto_tile(self.config.ui.auto_tile_scope);
-                    }
-
-                    if ui
-                        .button(icons::CHAT_TEXT)
-                        .on_hover_text("Saved Messages")
-                        .clicked()
-                    {
-                        self.show_saved_messages_picker = true;
-                    }
-
-                    if ui.button(icons::GEAR).on_hover_text("Settings").clicked() {
                         self.show_settings_popup = true;
                     }
 
-                    ui.separator();
+                    ui.add_space(8.0);
                     ui.label(
                         RichText::new(format!("{} {}", icons::CHECK_CIRCLE, self.status_line))
                             .color(TEXT_MUTED)
@@ -1014,6 +940,10 @@ impl AdeApp {
     }
 
     fn draw_terminal_manager(&mut self, ctx: &egui::Context) {
+        if !self.config.ui.show_terminal_manager {
+            return;
+        }
+
         egui::SidePanel::left("terminal_manager")
             .resizable(true)
             .min_width(180.0)
@@ -1062,22 +992,26 @@ impl AdeApp {
                                 .default_open(true)
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
-                                        if ui
-                                            .button(format!("{} {}", icons::TERMINAL, icons::PLUS))
-                                            .on_hover_text("Create Foreground Terminal")
-                                            .clicked()
-                                        {
+                                        if styled_pill_button(
+                                            ui,
+                                            icons::TERMINAL,
+                                            "New FG",
+                                            BTN_BLUE,
+                                            BTN_BLUE_HOVER,
+                                        ) {
                                             self.spawn_terminal_for_project(
                                                 ctx,
                                                 project_id,
                                                 TerminalKind::Foreground,
                                             );
                                         }
-                                        if ui
-                                            .button(format!("{} {}", icons::LIST, icons::PLUS))
-                                            .on_hover_text("Create Background Terminal")
-                                            .clicked()
-                                        {
+                                        if styled_pill_button(
+                                            ui,
+                                            icons::LIST,
+                                            "New BG",
+                                            BTN_TEAL,
+                                            BTN_TEAL_HOVER,
+                                        ) {
                                             self.spawn_terminal_for_project(
                                                 ctx,
                                                 project_id,
@@ -1267,7 +1201,7 @@ impl AdeApp {
                                 .strong(),
                         );
                         ui.label(
-                            RichText::new("Use New Terminal and Auto Tile to start.")
+                            RichText::new("Select a project, then use New FG/New BG to start.")
                                 .color(TEXT_MUTED),
                         );
                     });
@@ -1285,41 +1219,63 @@ impl AdeApp {
                 return;
             }
             let grid = layout::compute_tile_grid(visible_ids.len(), available.x, available.y);
-            let spacing = Vec2::new(TERMINAL_TILE_GAP_X, TERMINAL_TILE_GAP_Y);
 
-            let pane_width = ((available.x - spacing.x * (grid.cols.saturating_sub(1) as f32))
-                / grid.cols as f32)
+            let total_gap_x = TERMINAL_TILE_GAP_X * grid.cols.saturating_sub(1) as f32;
+            let total_gap_y = TERMINAL_TILE_GAP_Y * grid.rows.saturating_sub(1) as f32;
+
+            let pane_width = ((available.x - total_gap_x) / grid.cols as f32)
+                .floor()
                 .max(72.0);
-            let pane_height = ((available.y - spacing.y * (grid.rows.saturating_sub(1) as f32))
-                / grid.rows as f32)
+            let pane_height = ((available.y - total_gap_y) / grid.rows as f32)
+                .floor()
                 .max(80.0);
 
+            let origin = ui.cursor().min;
+
+            // Use absolute rect positioning to bypass egui auto-layout entirely
             for row in 0..grid.rows {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = spacing.x;
-                    for col in 0..grid.cols {
-                        let index = row * grid.cols + col;
-                        let size = Vec2::new(pane_width, pane_height);
-                        if let Some(terminal_id) = visible_ids.get(index) {
-                            ui.allocate_ui_with_layout(size, Layout::top_down(Align::Min), |ui| {
-                                egui::Frame::none()
-                                    .fill(SURFACE_BG)
-                                    .stroke(Stroke::new(1.0, BORDER_COLOR))
-                                    .rounding(10.0)
-                                    .inner_margin(egui::Margin::same(TERMINAL_PANE_INNER_MARGIN))
-                                    .show(ui, |ui| {
-                                        self.draw_terminal_pane(ui, *terminal_id, size);
-                                    });
-                            });
-                        } else {
-                            ui.allocate_space(size);
-                        }
-                    }
-                });
-                if row + 1 < grid.rows {
-                    ui.add_space(spacing.y);
+                for col in 0..grid.cols {
+                    let index = row * grid.cols + col;
+                    let Some(terminal_id) = visible_ids.get(index) else {
+                        continue;
+                    };
+
+                    let x = origin.x + col as f32 * (pane_width + TERMINAL_TILE_GAP_X);
+                    let y = origin.y + row as f32 * (pane_height + TERMINAL_TILE_GAP_Y);
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(x, y),
+                        Vec2::new(pane_width, pane_height),
+                    );
+
+                    let inner_margin = TERMINAL_PANE_INNER_MARGIN;
+                    let inner_size = Vec2::new(
+                        (pane_width - inner_margin * 2.0).max(64.0),
+                        (pane_height - inner_margin * 2.0).max(64.0),
+                    );
+
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(rect)
+                            .layout(Layout::top_down(Align::Min)),
+                    );
+                    child.set_clip_rect(rect);
+                    child.spacing_mut().item_spacing = Vec2::ZERO;
+                    egui::Frame::none()
+                        .fill(SURFACE_BG)
+                        .stroke(Stroke::new(1.0, BORDER_COLOR))
+                        .rounding(10.0)
+                        .inner_margin(egui::Margin::same(inner_margin))
+                        .show(&mut child, |ui| {
+                            ui.spacing_mut().item_spacing = Vec2::ZERO;
+                            self.draw_terminal_pane(ui, *terminal_id, inner_size);
+                        });
                 }
             }
+
+            // Reserve the full grid area so the CentralPanel knows the space is used
+            let total_width = grid.cols as f32 * pane_width + total_gap_x;
+            let total_height = grid.rows as f32 * pane_height + total_gap_y;
+            ui.allocate_space(Vec2::new(total_width, total_height));
         });
     }
 
@@ -1340,13 +1296,18 @@ impl AdeApp {
             let mut close_requested = false;
             let mut pane_clicked = false;
             let kind_fill = match terminal.kind {
-                TerminalKind::Foreground => Color32::from_rgb(14, 78, 117),
-                TerminalKind::Background => Color32::from_rgb(76, 54, 17),
+                TerminalKind::Foreground => Color32::from_rgb(18, 90, 140),
+                TerminalKind::Background => Color32::from_rgb(110, 76, 20),
             };
             let header_fill = if is_active {
-                Color32::from_rgb(30, 44, 62)
+                Color32::from_rgb(28, 48, 68)
             } else {
-                Color32::from_rgb(24, 34, 48)
+                Color32::from_rgb(22, 32, 46)
+            };
+            let header_stroke = if is_active {
+                Stroke::new(1.5, ACCENT)
+            } else {
+                Stroke::new(1.0, BORDER_COLOR)
             };
             let pane_width = pane_size.x.max(96.0);
             let pane_height = pane_size.y.max(124.0);
@@ -1356,7 +1317,7 @@ impl AdeApp {
                 ui.set_min_size(header_size);
                 egui::Frame::none()
                     .fill(header_fill)
-                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .stroke(header_stroke)
                     .rounding(8.0)
                     .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                     .show(ui, |ui| {
@@ -1397,7 +1358,7 @@ impl AdeApp {
                             ui.colored_label(Color32::LIGHT_RED, "Exited");
                         }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.small_button(format!("{} Close", icons::X)).clicked() {
+                            if styled_pill_button(ui, icons::X, "Close", BTN_RED, BTN_RED_HOVER) {
                                 close_requested = true;
                             }
                         });
@@ -1507,27 +1468,56 @@ impl AdeApp {
             return;
         }
 
-        let mut keep_open = self.show_settings_popup;
         let mut should_persist = false;
 
+        // Dark overlay backdrop
+        egui::Area::new("settings_overlay".into())
+            .fixed_pos(egui::pos2(0.0, 0.0))
+            .order(egui::Order::Background)
+            .interactable(true)
+            .show(ctx, |ui| {
+                let screen = ctx.screen_rect();
+                let response = ui.allocate_rect(screen, Sense::click());
+                ui.painter().rect_filled(
+                    screen,
+                    0.0,
+                    Color32::from_rgba_premultiplied(0, 0, 0, 140),
+                );
+                if response.clicked() {
+                    self.show_settings_popup = false;
+                }
+            });
+
         egui::Window::new(format!("{} Settings", icons::GEAR))
-            .open(&mut keep_open)
             .resizable(false)
             .collapsible(false)
+            .movable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .min_width(380.0)
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new("Application Settings")
                         .strong()
+                        .size(16.0)
                         .color(TEXT_PRIMARY),
                 );
                 ui.separator();
 
                 let mut show_explorer = self.config.ui.show_project_explorer;
                 if ui
-                    .checkbox(&mut show_explorer, "Show Left Sidebar")
+                    .checkbox(&mut show_explorer, "Show Project Explorer")
                     .changed()
                 {
                     self.config.ui.show_project_explorer = show_explorer;
+                    should_persist = true;
+                }
+
+                let mut show_terminal_mgr = self.config.ui.show_terminal_manager;
+                if ui
+                    .checkbox(&mut show_terminal_mgr, "Show Terminal Manager")
+                    .changed()
+                {
+                    self.config.ui.show_terminal_manager = show_terminal_mgr;
                     should_persist = true;
                 }
 
@@ -1550,6 +1540,7 @@ impl AdeApp {
                 let previous_scope = self.config.ui.auto_tile_scope;
                 egui::ComboBox::from_label("Auto Tile Scope")
                     .selected_text(self.config.ui.auto_tile_scope.label())
+                    .width(200.0)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
                             &mut self.config.ui.auto_tile_scope,
@@ -1569,6 +1560,7 @@ impl AdeApp {
                 let previous_shell = self.config.default_shell;
                 egui::ComboBox::from_label("Default Shell")
                     .selected_text(self.config.default_shell.label())
+                    .width(200.0)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
                             &mut self.config.default_shell,
@@ -1584,12 +1576,18 @@ impl AdeApp {
                 if self.config.default_shell != previous_shell {
                     should_persist = true;
                 }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if styled_pill_button(ui, icons::X, "Close", BTN_SUBTLE, BTN_SUBTLE_HOVER) {
+                        self.show_settings_popup = false;
+                    }
+                });
             });
 
         if should_persist {
             self.persist_config();
         }
-        self.show_settings_popup = keep_open;
     }
 
     fn draw_saved_messages_picker(&mut self, ctx: &egui::Context) {
@@ -1607,21 +1605,52 @@ impl AdeApp {
             return;
         };
 
-        let mut keep_open = self.show_saved_messages_picker;
         let mut should_close = false;
+
+        // Dark overlay backdrop
+        egui::Area::new("messages_overlay".into())
+            .fixed_pos(egui::pos2(0.0, 0.0))
+            .order(egui::Order::Background)
+            .interactable(true)
+            .show(ctx, |ui| {
+                let screen = ctx.screen_rect();
+                let response = ui.allocate_rect(screen, Sense::click());
+                ui.painter().rect_filled(
+                    screen,
+                    0.0,
+                    Color32::from_rgba_premultiplied(0, 0, 0, 140),
+                );
+                if response.clicked() {
+                    should_close = true;
+                }
+            });
+
         egui::Window::new(format!("{} Saved Messages", icons::CHAT_TEXT))
-            .open(&mut keep_open)
-            .resizable(true)
+            .resizable(false)
             .collapsible(false)
+            .movable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .min_width(360.0)
             .show(ctx, |ui| {
                 ui.label(
-                    RichText::new(format!("{} Project: {}", icons::FOLDER, project.name)).strong(),
+                    RichText::new(format!("{} Project: {}", icons::FOLDER, project.name))
+                        .strong()
+                        .size(15.0),
                 );
-                ui.label("Pick a message to insert into the active terminal.");
+                ui.label(
+                    RichText::new("Pick a message to insert into the active terminal.")
+                        .color(TEXT_MUTED),
+                );
                 ui.separator();
 
                 for message in &project.saved_messages {
-                    if ui.button(message).clicked() {
+                    if styled_pill_button(
+                        ui,
+                        icons::CHAT_TEXT,
+                        message,
+                        BTN_SUBTLE,
+                        BTN_SUBTLE_HOVER,
+                    ) {
                         if let Some(active_terminal_id) = self.active_terminal {
                             if let Some(active_terminal) =
                                 self.terminals.get_mut(&active_terminal_id)
@@ -1640,14 +1669,22 @@ impl AdeApp {
                 }
 
                 if project.saved_messages.is_empty() {
-                    ui.label("No saved messages for this project.");
+                    ui.label(
+                        RichText::new("No saved messages for this project.").color(TEXT_MUTED),
+                    );
                 }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if styled_pill_button(ui, icons::X, "Close", BTN_SUBTLE, BTN_SUBTLE_HOVER) {
+                        should_close = true;
+                    }
+                });
             });
 
         if should_close {
-            keep_open = false;
+            self.show_saved_messages_picker = false;
         }
-        self.show_saved_messages_picker = keep_open;
     }
 }
 
@@ -1868,6 +1905,50 @@ fn draw_folder_tree(ui: &mut Ui, path: &Path, depth: usize, max_depth: usize) {
             ui.label(name);
         }
     }
+}
+
+fn styled_pill_button(
+    ui: &mut Ui,
+    icon: &str,
+    label: &str,
+    bg: Color32,
+    hover_bg: Color32,
+) -> bool {
+    let text = format!("{} {}", icon, label);
+    let frame_response = egui::Frame::none()
+        .fill(bg)
+        .rounding(8.0)
+        .inner_margin(egui::Margin::symmetric(10.0, 5.0))
+        .show(ui, |ui| {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(text)
+                        .color(Color32::from_rgb(230, 240, 255))
+                        .size(13.0),
+                )
+                .sense(Sense::click()),
+            )
+        });
+
+    let label_response = frame_response.inner;
+    let is_hovered = label_response.hovered() || frame_response.response.hovered();
+
+    // Repaint with hover color if hovered
+    if is_hovered {
+        ui.painter()
+            .rect_filled(frame_response.response.rect, 8.0, hover_bg);
+        // Re-draw text on top
+        let text_pos = frame_response.response.rect.min + egui::vec2(10.0, 5.0);
+        ui.painter().text(
+            text_pos,
+            egui::Align2::LEFT_TOP,
+            format!("{} {}", icon, label),
+            egui::FontId::proportional(13.0),
+            Color32::from_rgb(230, 240, 255),
+        );
+    }
+
+    label_response.clicked()
 }
 
 fn build_terminal_layout_job(snapshot: &TerminalSnapshot, font_id: &FontId) -> LayoutJob {

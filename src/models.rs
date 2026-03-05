@@ -89,6 +89,7 @@ impl LeftSidebarTab {
 #[serde(default)]
 pub struct UiConfig {
     pub show_project_explorer: bool,
+    pub show_terminal_manager: bool,
     pub last_selected_project_id: Option<u64>,
     pub project_filter_mode: bool,
     pub auto_tile_scope: AutoTileScope,
@@ -100,6 +101,7 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             show_project_explorer: true,
+            show_terminal_manager: true,
             last_selected_project_id: None,
             project_filter_mode: false,
             auto_tile_scope: AutoTileScope::AllVisible,

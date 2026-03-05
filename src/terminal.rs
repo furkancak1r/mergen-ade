@@ -55,9 +55,6 @@ pub struct TerminalUiEvent {
 #[derive(Debug, Clone)]
 pub enum TerminalUiEventKind {
     Wakeup,
-    Title(String),
-    ResetTitle,
-    PtyWrite(String),
     ChildExit,
     Exit,
 }
