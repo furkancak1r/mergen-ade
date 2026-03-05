@@ -1220,7 +1220,8 @@ impl AdeApp {
                                     ui.separator();
                                     ui.label(
                                         RichText::new(format!("{} Foreground", icons::TERMINAL))
-                                            .strong(),
+                                            .strong()
+                                            .color(TEXT_MUTED),
                                     );
                                     self.draw_terminal_rows(
                                         ui,
