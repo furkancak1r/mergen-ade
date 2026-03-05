@@ -53,8 +53,8 @@ const BTN_BLUE: Color32 = Color32::from_rgb(16, 64, 112);
 const BTN_BLUE_HOVER: Color32 = Color32::from_rgb(22, 88, 150);
 const BTN_TEAL: Color32 = Color32::from_rgb(14, 68, 82);
 const BTN_TEAL_HOVER: Color32 = Color32::from_rgb(20, 92, 110);
-const BTN_SUBTLE: Color32 = Color32::from_rgb(34, 44, 58);
-const BTN_SUBTLE_HOVER: Color32 = Color32::from_rgb(44, 58, 78);
+const BTN_SUBTLE: Color32 = Color32::from_rgb(20, 63, 92);
+const BTN_SUBTLE_HOVER: Color32 = Color32::from_rgb(28, 85, 122);
 const BTN_RED: Color32 = Color32::from_rgb(120, 30, 30);
 const BTN_RED_HOVER: Color32 = Color32::from_rgb(160, 40, 40);
 #[cfg(target_os = "windows")]
@@ -72,8 +72,7 @@ pub struct AdeApp {
     terminal_events_tx: Sender<TerminalUiEvent>,
     terminal_events_rx: Receiver<TerminalUiEvent>,
     show_settings_popup: bool,
-    show_saved_messages_picker: bool,
-    new_saved_message: String,
+    saved_message_drafts: BTreeMap<u64, String>,
     status_line: String,
     layout_epoch: u64,
     repaint_pump_started: bool,
@@ -157,8 +156,7 @@ impl AdeApp {
             terminal_events_tx,
             terminal_events_rx,
             show_settings_popup: false,
-            show_saved_messages_picker: false,
-            new_saved_message: String::new(),
+            saved_message_drafts: BTreeMap::new(),
             status_line: "Ready".to_owned(),
             layout_epoch: 0,
             repaint_pump_started: false,
@@ -370,9 +368,7 @@ impl AdeApp {
     }
 
     fn route_active_terminal_input(&mut self, ctx: &egui::Context) {
-        if (self.show_settings_popup || self.show_saved_messages_picker)
-            && ctx.wants_keyboard_input()
-        {
+        if self.show_settings_popup && ctx.wants_keyboard_input() {
             return;
         }
 
@@ -512,8 +508,8 @@ impl AdeApp {
         visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(24, 33, 46);
         visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(45, 63, 84));
         visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_MUTED);
-        visuals.widgets.inactive.bg_fill = Color32::from_rgb(30, 43, 58);
-        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(58, 79, 103));
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(24, 54, 79);
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(66, 104, 138));
         visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
         visuals.widgets.hovered.bg_fill = Color32::from_rgb(39, 62, 84);
         visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT);
@@ -521,8 +517,8 @@ impl AdeApp {
         visuals.widgets.active.bg_fill = Color32::from_rgb(20, 95, 140);
         visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
         visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::from_rgb(244, 251, 255));
-        visuals.widgets.open.bg_fill = Color32::from_rgb(34, 50, 69);
-        visuals.widgets.open.bg_stroke = Stroke::new(1.0, BORDER_COLOR);
+        visuals.widgets.open.bg_fill = Color32::from_rgb(26, 57, 84);
+        visuals.widgets.open.bg_stroke = Stroke::new(1.0, Color32::from_rgb(56, 95, 132));
         visuals.selection.bg_fill = Color32::from_rgb(18, 93, 136);
         visuals.selection.stroke = Stroke::new(1.0, ACCENT);
 
@@ -617,6 +613,23 @@ impl AdeApp {
             self.active_terminal = self.terminals.keys().next().copied();
         }
         self.bump_layout_epoch();
+    }
+
+    fn send_saved_message_to_terminal(&mut self, terminal_id: u64, message: &str) {
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            self.status_line = "Target terminal not found".to_owned();
+            return;
+        };
+
+        if terminal.exited {
+            self.status_line = format!("{} is exited", terminal.title);
+            return;
+        }
+
+        terminal.runtime.send_bytes(message.as_bytes().to_vec());
+        Self::append_pending_line(&mut terminal.pending_line_for_title, message);
+        terminal.dirty = true;
+        self.status_line = format!("Sent saved message to {}", terminal.title);
     }
 
     fn draw_top_bar(&mut self, ctx: &egui::Context) {
@@ -980,9 +993,6 @@ impl AdeApp {
                                 continue;
                             };
 
-                            let mut add_message: Option<String> = None;
-                            let mut remove_message_index: Option<usize> = None;
-                            let mut requested_persist = false;
                             let project_path = project_snapshot.path.display().to_string();
 
                             let header_label =
@@ -1042,44 +1052,6 @@ impl AdeApp {
                                         project_id,
                                         TerminalKind::Background,
                                     );
-
-                                    ui.separator();
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{} Saved messages",
-                                            icons::CHAT_TEXT
-                                        ))
-                                        .strong(),
-                                    );
-                                    for (index, message) in
-                                        project_snapshot.saved_messages.iter().enumerate()
-                                    {
-                                        ui.horizontal(|ui| {
-                                            ui.label(RichText::new(message).monospace().small());
-                                            if ui
-                                                .small_button(icons::TRASH)
-                                                .on_hover_text("Remove message")
-                                                .clicked()
-                                            {
-                                                remove_message_index = Some(index);
-                                            }
-                                        });
-                                    }
-
-                                    ui.horizontal(|ui| {
-                                        ui.text_edit_singleline(&mut self.new_saved_message);
-                                        if ui
-                                            .button(icons::PLUS)
-                                            .on_hover_text("Add message")
-                                            .clicked()
-                                        {
-                                            let text = self.new_saved_message.trim();
-                                            if !text.is_empty() {
-                                                add_message = Some(text.to_owned());
-                                                self.new_saved_message.clear();
-                                            }
-                                        }
-                                    });
                                 });
 
                             header.header_response.context_menu(|ui| {
@@ -1109,23 +1081,6 @@ impl AdeApp {
                                     ui.close_menu();
                                 }
                             });
-
-                            if let Some(project) = self.projects.get_mut(&project_id) {
-                                if let Some(message) = add_message {
-                                    project.saved_messages.push(message);
-                                    requested_persist = true;
-                                }
-                                if let Some(index) = remove_message_index {
-                                    if index < project.saved_messages.len() {
-                                        project.saved_messages.remove(index);
-                                        requested_persist = true;
-                                    }
-                                }
-                            }
-
-                            if requested_persist {
-                                self.persist_config();
-                            }
                         }
                     });
             });
@@ -1138,43 +1093,72 @@ impl AdeApp {
             .filter(|(_, terminal)| terminal.project_id == project_id && terminal.kind == kind)
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
+        let saved_messages = self
+            .projects
+            .get(&project_id)
+            .map(|project| project.saved_messages.clone())
+            .unwrap_or_default();
         let current_active = self.active_terminal;
 
         for terminal_id in ids {
-            let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
-                continue;
-            };
-            let terminal_entry_id = terminal.id;
-
             let mut set_active = false;
             let mut close_terminal = false;
             let mut visibility_changed = false;
-            ui.horizontal(|ui| {
-                let active = current_active == Some(terminal_entry_id);
-                let label = if terminal.exited {
-                    format!("{} {} (Exited)", icons::TERMINAL, terminal.title)
-                } else {
-                    format!("{} {}", icons::TERMINAL, terminal.title)
+            let mut send_message: Option<String> = None;
+            let terminal_entry_id = {
+                let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+                    continue;
                 };
+                let terminal_entry_id = terminal.id;
 
-                if ui.selectable_label(active, label).clicked() {
-                    set_active = true;
-                }
+                ui.horizontal(|ui| {
+                    let active = current_active == Some(terminal_entry_id);
+                    let label = if terminal.exited {
+                        format!("{} {} (Exited)", icons::TERMINAL, terminal.title)
+                    } else {
+                        format!("{} {}", icons::TERMINAL, terminal.title)
+                    };
 
-                if ui
-                    .checkbox(
-                        &mut terminal.in_main_view,
-                        RichText::new(icons::EYE).color(TEXT_MUTED),
-                    )
-                    .on_hover_text("Show in main area")
-                    .changed()
-                {
-                    visibility_changed = true;
-                }
-                if ui.small_button(icons::X).on_hover_text("Close").clicked() {
-                    close_terminal = true;
-                }
-            });
+                    if ui.selectable_label(active, label).clicked() {
+                        set_active = true;
+                    }
+
+                    let message_menu = ui.menu_button(format!("{} Msg", icons::CHAT_TEXT), |ui| {
+                        if saved_messages.is_empty() {
+                            ui.label(RichText::new("No saved messages").color(TEXT_MUTED));
+                            return;
+                        }
+
+                        for message in &saved_messages {
+                            if ui.button(message).clicked() {
+                                send_message = Some(message.clone());
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                    message_menu.response.on_hover_text("Send saved message");
+
+                    if ui
+                        .checkbox(
+                            &mut terminal.in_main_view,
+                            RichText::new(icons::EYE).color(TEXT_MUTED),
+                        )
+                        .on_hover_text("Show in main area")
+                        .changed()
+                    {
+                        visibility_changed = true;
+                    }
+                    if ui.small_button(icons::X).on_hover_text("Close").clicked() {
+                        close_terminal = true;
+                    }
+                });
+
+                terminal_entry_id
+            };
+
+            if let Some(message) = send_message {
+                self.send_saved_message_to_terminal(terminal_entry_id, &message);
+            }
 
             if visibility_changed {
                 self.bump_layout_epoch();
@@ -1578,6 +1562,90 @@ impl AdeApp {
                 }
 
                 ui.separator();
+                ui.label(
+                    RichText::new(format!("{} Saved Messages", icons::CHAT_TEXT))
+                        .strong()
+                        .size(15.0)
+                        .color(TEXT_PRIMARY),
+                );
+
+                let mut project_ids = self.projects.keys().copied().collect::<Vec<_>>();
+                project_ids.sort_unstable();
+
+                if project_ids.is_empty() {
+                    ui.label(
+                        RichText::new("Add a project to manage saved messages.").color(TEXT_MUTED),
+                    );
+                }
+
+                for project_id in project_ids {
+                    let Some(project_snapshot) = self.projects.get(&project_id).cloned() else {
+                        continue;
+                    };
+
+                    let mut add_message: Option<String> = None;
+                    let mut remove_message_index: Option<usize> = None;
+
+                    egui::CollapsingHeader::new(format!(
+                        "{} {}",
+                        icons::FOLDER_OPEN,
+                        project_snapshot.name
+                    ))
+                    .id_salt(format!("settings-saved-messages-{project_id}"))
+                    .default_open(self.selected_project == Some(project_id))
+                    .show(ui, |ui| {
+                        if project_snapshot.saved_messages.is_empty() {
+                            ui.label(
+                                RichText::new("No saved messages for this project.")
+                                    .color(TEXT_MUTED),
+                            );
+                        }
+
+                        for (index, message) in project_snapshot.saved_messages.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(message).monospace().small());
+                                if ui
+                                    .small_button(icons::TRASH)
+                                    .on_hover_text("Remove message")
+                                    .clicked()
+                                {
+                                    remove_message_index = Some(index);
+                                }
+                            });
+                        }
+
+                        ui.horizontal(|ui| {
+                            let draft = self.saved_message_drafts.entry(project_id).or_default();
+                            ui.text_edit_singleline(draft);
+                            if ui
+                                .button(icons::PLUS)
+                                .on_hover_text("Add message")
+                                .clicked()
+                            {
+                                let text = draft.trim();
+                                if !text.is_empty() {
+                                    add_message = Some(text.to_owned());
+                                    draft.clear();
+                                }
+                            }
+                        });
+                    });
+
+                    if let Some(project) = self.projects.get_mut(&project_id) {
+                        if let Some(message) = add_message {
+                            project.saved_messages.push(message);
+                            should_persist = true;
+                        }
+                        if let Some(index) = remove_message_index {
+                            if index < project.saved_messages.len() {
+                                project.saved_messages.remove(index);
+                                should_persist = true;
+                            }
+                        }
+                    }
+                }
+
+                ui.separator();
                 ui.horizontal(|ui| {
                     if styled_pill_button(ui, icons::X, "Close", BTN_SUBTLE, BTN_SUBTLE_HOVER) {
                         self.show_settings_popup = false;
@@ -1587,103 +1655,6 @@ impl AdeApp {
 
         if should_persist {
             self.persist_config();
-        }
-    }
-
-    fn draw_saved_messages_picker(&mut self, ctx: &egui::Context) {
-        if !self.show_saved_messages_picker {
-            return;
-        }
-
-        let Some(project_id) = self.selected_project else {
-            self.show_saved_messages_picker = false;
-            return;
-        };
-
-        let Some(project) = self.projects.get(&project_id).cloned() else {
-            self.show_saved_messages_picker = false;
-            return;
-        };
-
-        let mut should_close = false;
-
-        // Dark overlay backdrop
-        egui::Area::new("messages_overlay".into())
-            .fixed_pos(egui::pos2(0.0, 0.0))
-            .order(egui::Order::Background)
-            .interactable(true)
-            .show(ctx, |ui| {
-                let screen = ctx.screen_rect();
-                let response = ui.allocate_rect(screen, Sense::click());
-                ui.painter().rect_filled(
-                    screen,
-                    0.0,
-                    Color32::from_rgba_premultiplied(0, 0, 0, 140),
-                );
-                if response.clicked() {
-                    should_close = true;
-                }
-            });
-
-        egui::Window::new(format!("{} Saved Messages", icons::CHAT_TEXT))
-            .resizable(false)
-            .collapsible(false)
-            .movable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .min_width(360.0)
-            .show(ctx, |ui| {
-                ui.label(
-                    RichText::new(format!("{} Project: {}", icons::FOLDER, project.name))
-                        .strong()
-                        .size(15.0),
-                );
-                ui.label(
-                    RichText::new("Pick a message to insert into the active terminal.")
-                        .color(TEXT_MUTED),
-                );
-                ui.separator();
-
-                for message in &project.saved_messages {
-                    if styled_pill_button(
-                        ui,
-                        icons::CHAT_TEXT,
-                        message,
-                        BTN_SUBTLE,
-                        BTN_SUBTLE_HOVER,
-                    ) {
-                        if let Some(active_terminal_id) = self.active_terminal {
-                            if let Some(active_terminal) =
-                                self.terminals.get_mut(&active_terminal_id)
-                            {
-                                active_terminal
-                                    .runtime
-                                    .send_bytes(message.as_bytes().to_vec());
-                                Self::append_pending_line(
-                                    &mut active_terminal.pending_line_for_title,
-                                    message,
-                                );
-                            }
-                        }
-                        should_close = true;
-                    }
-                }
-
-                if project.saved_messages.is_empty() {
-                    ui.label(
-                        RichText::new("No saved messages for this project.").color(TEXT_MUTED),
-                    );
-                }
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if styled_pill_button(ui, icons::X, "Close", BTN_SUBTLE, BTN_SUBTLE_HOVER) {
-                        should_close = true;
-                    }
-                });
-            });
-
-        if should_close {
-            self.show_saved_messages_picker = false;
         }
     }
 }
@@ -1702,7 +1673,6 @@ impl eframe::App for AdeApp {
         self.draw_terminal_manager(ctx);
         self.draw_main_area(ctx);
         self.draw_settings_popup(ctx);
-        self.draw_saved_messages_picker(ctx);
 
         self.route_active_terminal_input(ctx);
     }
