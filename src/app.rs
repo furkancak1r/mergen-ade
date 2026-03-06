@@ -1650,11 +1650,19 @@ impl AdeApp {
             let project_path = project_snapshot.path.display().to_string();
 
             let header_label = format!("{} {}", icons::FOLDER_OPEN, project_snapshot.name);
-            let header = egui::CollapsingHeader::new(header_label)
-                .id_salt(format!("project-group-{project_id}"))
-                .default_open(true)
-                .icon(paint_minimal_disclosure_icon)
-                .show(ui, |ui| {
+            let header_id = ui.make_persistent_id(format!("project-group-{project_id}"));
+            let mut header_state =
+                egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    header_id,
+                    true,
+                );
+            let header_response =
+                styled_flat_section_header(ui, &header_label, header_state.is_open());
+            if header_response.clicked() {
+                header_state.toggle(ui);
+            }
+            let _ = header_state.show_body_unindented(ui, |ui| {
                     ui.horizontal(|ui| {
                         if styled_icon_button(
                             ui,
@@ -1695,7 +1703,7 @@ impl AdeApp {
                     self.draw_terminal_rows(ui, project_id, TerminalKind::Background);
                 });
 
-            header.header_response.context_menu(|ui| {
+            header_response.context_menu(|ui| {
                 with_minimal_button_chrome(ui, |ui| {
                     if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
                         ui.ctx().copy_text(project_path.clone());
@@ -1722,6 +1730,7 @@ impl AdeApp {
                     }
                 });
             });
+            ui.add_space(4.0);
         }
 
         ui.expand_to_include_x(panel_right);
@@ -2864,6 +2873,32 @@ fn with_minimal_button_chrome<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)
         add_contents(ui)
     })
     .inner
+}
+
+fn styled_flat_section_header(ui: &mut Ui, label: &str, open: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), CONTROL_ROW_HEIGHT),
+        Sense::click(),
+    );
+
+    let text_color = if response.is_pointer_button_down_on() {
+        Color32::from_rgb(244, 249, 255)
+    } else if open {
+        with_alpha(TEXT_PRIMARY, 232)
+    } else if response.hovered() {
+        with_alpha(TEXT_PRIMARY, 214)
+    } else {
+        with_alpha(TEXT_MUTED, 220)
+    };
+    ui.painter().text(
+        egui::pos2(rect.left() + 6.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(14.0),
+        text_color,
+    );
+
+    response
 }
 
 fn styled_pill_button(
