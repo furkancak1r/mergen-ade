@@ -34,7 +34,8 @@ const TITLE_MAX_LEN: usize = 40;
 const TERMINAL_EVENT_BUDGET: usize = 4096;
 const TERMINAL_RETRY_MS: u64 = 8;
 const TERMINAL_FALLBACK_REFRESH_MS: u64 = 16;
-const CURSOR_BLINK_STEP_SECS: f64 = 0.5;
+const CURSOR_BLINK_STEP_SECS: f64 = 0.6;
+const POWERSHELL_CURSOR_ROW_STABLE_SECS: f64 = 0.06;
 const CURSOR_BAR_WIDTH_PX: f32 = 2.0;
 const CURSOR_UNDERLINE_HEIGHT_PX: f32 = 2.0;
 const DIRECTORY_INDEX_MAX_DEPTH: usize = 8;
@@ -201,6 +202,9 @@ mod icons {
 pub struct AdeApp {
     config_path: PathBuf,
     config: AppConfig,
+    config_load_error: Option<String>,
+    config_save_requires_reload: bool,
+    pending_config_changes: PendingConfigChanges,
     projects: BTreeMap<u64, ProjectRecord>,
     terminals: BTreeMap<u64, TerminalEntry>,
     next_project_id: u64,
@@ -232,12 +236,16 @@ struct TerminalEntry {
     id: u64,
     project_id: u64,
     kind: TerminalKind,
+    shell: ShellKind,
     title: String,
     full_title: String,
     pending_line_for_title: String,
     in_main_view: bool,
     dirty: bool,
     last_seqno: usize,
+    last_cursor_row: Option<usize>,
+    last_cursor_row_changed_at: Option<f64>,
+    stable_input_cursor_row: Option<usize>,
     render_cache: TerminalSnapshot,
     exited: bool,
     runtime: TerminalRuntime,
@@ -303,10 +311,21 @@ struct DirectoryIndexEvent {
     snapshot: DirectoryIndexSnapshot,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PendingConfigChanges {
+    default_shell: bool,
+    ui: bool,
+    projects: bool,
+    selection: bool,
+}
+
 impl AdeApp {
     pub fn bootstrap(cc: &eframe::CreationContext<'_>) -> Self {
         let config_path = config::config_path().unwrap_or_else(|_| PathBuf::from("config.toml"));
-        let mut config = config::load_config(&config_path).unwrap_or_default();
+        let (mut config, config_load_error) = match config::load_config(&config_path) {
+            Ok(config) => (config, None),
+            Err(err) => (AppConfig::default(), Some(err.to_string())),
+        };
         config.ui.show_project_explorer = true;
         config.ui.show_terminal_manager = true;
         config.ui.main_visibility_mode = MainVisibilityMode::Global;
@@ -335,6 +354,9 @@ impl AdeApp {
         let app = Self {
             config_path,
             config,
+            config_load_error: config_load_error.clone(),
+            config_save_requires_reload: config_load_error.is_some(),
+            pending_config_changes: PendingConfigChanges::default(),
             projects,
             terminals: BTreeMap::new(),
             next_project_id,
@@ -346,7 +368,9 @@ impl AdeApp {
             show_settings_popup: false,
             saved_message_drafts: BTreeMap::new(),
             directory_search_query: String::new(),
-            status_line: "Ready".to_owned(),
+            status_line: config_load_error
+                .map(|err| format!("Config load error: {err}. Existing config preserved."))
+                .unwrap_or_else(|| "Ready".to_owned()),
             layout_epoch: 0,
             theme_initialized: false,
             #[cfg(target_os = "windows")]
@@ -365,12 +389,62 @@ impl AdeApp {
     }
 
     fn persist_config(&mut self) {
-        self.config.projects = self.projects.values().cloned().collect();
-        self.config.ui.last_selected_project_id = self.selected_project;
+        let recovered_from_disk = self.config_load_error.is_some();
+        let mut config_to_save = if self.config_save_requires_reload {
+            match config::load_config(&self.config_path) {
+                Ok(loaded_config) => {
+                    self.config_load_error = None;
+                    recover_config_state(
+                        &self.config,
+                        &self.projects,
+                        self.selected_project,
+                        loaded_config,
+                        self.pending_config_changes,
+                    )
+                }
+                Err(err) => {
+                    let err = err.to_string();
+                    self.config_load_error = Some(err.clone());
+                    self.status_line =
+                        format!("Config save skipped while config reload still fails: {err}");
+                    return;
+                }
+            }
+        } else {
+            self.config.clone()
+        };
 
-        if let Err(err) = config::save_config(&self.config_path, &self.config) {
-            self.status_line = format!("Config save error: {err}");
+        if !self.config_save_requires_reload {
+            self.config.projects = self.projects.values().cloned().collect();
+            self.config.ui.last_selected_project_id = self.selected_project;
+            config_to_save = self.config.clone();
         }
+
+        if let Err(err) = config::save_config(&self.config_path, &config_to_save) {
+            self.status_line = format!("Config save error: {err}");
+            return;
+        }
+
+        self.pending_config_changes = PendingConfigChanges::default();
+        if recovered_from_disk {
+            self.status_line = "Config recovered and changes saved.".to_owned();
+        }
+    }
+
+    fn note_ui_config_changed(&mut self) {
+        self.pending_config_changes.ui = true;
+    }
+
+    fn note_default_shell_changed(&mut self) {
+        self.pending_config_changes.default_shell = true;
+    }
+
+    fn note_projects_changed(&mut self) {
+        self.pending_config_changes.projects = true;
+    }
+
+    fn note_selection_changed(&mut self) {
+        self.pending_config_changes.selection = true;
     }
 
     fn bump_layout_epoch(&mut self) {
@@ -404,6 +478,8 @@ impl AdeApp {
         self.projects.insert(project.id, project);
         self.next_project_id += 1;
         self.bump_layout_epoch();
+        self.note_projects_changed();
+        self.note_selection_changed();
         self.persist_config();
     }
 
@@ -443,12 +519,16 @@ impl AdeApp {
             id: terminal_id,
             project_id,
             kind,
+            shell,
             title: fallback_title.clone(),
             full_title: fallback_title,
             pending_line_for_title: String::new(),
             in_main_view: true,
             dirty: true,
             last_seqno: runtime.latest_seqno(),
+            last_cursor_row: None,
+            last_cursor_row_changed_at: None,
+            stable_input_cursor_row: None,
             render_cache: TerminalSnapshot::default(),
             exited: false,
             runtime,
@@ -1138,6 +1218,7 @@ impl AdeApp {
                 });
 
                 if should_persist {
+                    self.note_ui_config_changed();
                     self.persist_config();
                 }
             });
@@ -1319,6 +1400,7 @@ impl AdeApp {
                             });
                         });
                         if self.selected_project != previous_selected_project {
+                            self.note_selection_changed();
                             self.persist_config();
                         }
                         ui.add_sized(
@@ -1532,6 +1614,7 @@ impl AdeApp {
                                     should_persist_selection = true;
                                 }
                                 if should_persist_selection {
+                                    self.note_selection_changed();
                                     self.persist_config();
                                 }
 
@@ -2170,6 +2253,9 @@ impl AdeApp {
                 }
             }
 
+            let now = ui.ctx().input(|input| input.time);
+            sync_terminal_cursor_row_state(terminal, now);
+
             ui.allocate_ui_with_layout(output_size, Layout::top_down(Align::Min), |ui| {
                 egui::Frame::none()
                     .fill(TERMINAL_OUTPUT_BG)
@@ -2201,6 +2287,8 @@ impl AdeApp {
                                         &terminal.render_cache,
                                         &font_id,
                                         terminal.exited,
+                                        terminal.shell,
+                                        terminal.stable_input_cursor_row,
                                         ui.ctx().input(|input| input.time),
                                     );
                                     let response = ui.add(
@@ -2244,6 +2332,9 @@ impl AdeApp {
         }
 
         let mut should_persist = false;
+        let mut ui_config_changed = false;
+        let mut default_shell_changed = false;
+        let mut projects_changed = false;
 
         // Dark overlay backdrop
         egui::Area::new("settings_overlay".into())
@@ -2307,6 +2398,7 @@ impl AdeApp {
                 {
                     self.config.ui.project_filter_mode = filter_mode;
                     should_persist = true;
+                    ui_config_changed = true;
                 }
 
                 ui.separator();
@@ -2331,6 +2423,7 @@ impl AdeApp {
                     });
                 if self.config.ui.auto_tile_scope != previous_scope {
                     should_persist = true;
+                    ui_config_changed = true;
                 }
 
                 let previous_shell = self.config.default_shell;
@@ -2351,6 +2444,7 @@ impl AdeApp {
                     });
                 if self.config.default_shell != previous_shell {
                     should_persist = true;
+                    default_shell_changed = true;
                 }
 
                 ui.separator();
@@ -2469,11 +2563,13 @@ impl AdeApp {
                         if let Some(message) = add_message {
                             project.saved_messages.push(message);
                             should_persist = true;
+                            projects_changed = true;
                         }
                         if let Some(index) = remove_message_index {
                             if index < project.saved_messages.len() {
                                 project.saved_messages.remove(index);
                                 should_persist = true;
+                                projects_changed = true;
                             }
                         }
                     }
@@ -2488,6 +2584,15 @@ impl AdeApp {
             });
 
         if should_persist {
+            if ui_config_changed {
+                self.note_ui_config_changed();
+            }
+            if default_shell_changed {
+                self.note_default_shell_changed();
+            }
+            if projects_changed {
+                self.note_projects_changed();
+            }
             self.persist_config();
         }
     }
@@ -2526,6 +2631,132 @@ impl eframe::App for AdeApp {
 
         self.persist_config();
     }
+}
+
+fn recover_config_state(
+    current_config: &AppConfig,
+    current_projects: &BTreeMap<u64, ProjectRecord>,
+    current_selected_project: Option<u64>,
+    loaded_config: AppConfig,
+    pending_config_changes: PendingConfigChanges,
+) -> AppConfig {
+    let mut config = loaded_config;
+
+    if pending_config_changes.default_shell {
+        config.default_shell = current_config.default_shell;
+    }
+
+    config.ui.show_project_explorer = current_config.ui.show_project_explorer;
+    config.ui.show_terminal_manager = current_config.ui.show_terminal_manager;
+    config.ui.main_visibility_mode = current_config.ui.main_visibility_mode;
+    config.ui.project_filter_mode = current_config.ui.project_filter_mode;
+
+    if pending_config_changes.ui {
+        config.ui.project_explorer_expanded = current_config.ui.project_explorer_expanded;
+        config.ui.terminal_manager_expanded = current_config.ui.terminal_manager_expanded;
+        config.ui.auto_tile_scope = current_config.ui.auto_tile_scope;
+        config.ui.left_sidebar_tab = current_config.ui.left_sidebar_tab;
+    }
+
+    let (projects, project_id_remap) = recover_project_records(
+        &config.projects,
+        current_projects,
+        pending_config_changes.projects,
+    );
+
+    let selected_project = if pending_config_changes.selection {
+        valid_selected_project(
+            current_selected_project.map(|project_id| {
+                project_id_remap
+                    .get(&project_id)
+                    .copied()
+                    .unwrap_or(project_id)
+            }),
+            &projects,
+        )
+    } else {
+        valid_selected_project(config.ui.last_selected_project_id, &projects)
+    };
+
+    config.projects = projects.values().cloned().collect();
+    config.ui.last_selected_project_id = selected_project;
+
+    config
+}
+
+fn recover_project_records(
+    loaded_projects: &[ProjectRecord],
+    current_projects: &BTreeMap<u64, ProjectRecord>,
+    merge_current_projects: bool,
+) -> (BTreeMap<u64, ProjectRecord>, BTreeMap<u64, u64>) {
+    let mut projects = loaded_projects
+        .iter()
+        .cloned()
+        .map(|project| (project.id, project))
+        .collect::<BTreeMap<_, _>>();
+    let mut project_id_remap = BTreeMap::new();
+
+    if !merge_current_projects {
+        return (projects, project_id_remap);
+    }
+
+    let mut next_project_id = projects.keys().last().copied().unwrap_or(0) + 1;
+
+    for current_project in current_projects.values() {
+        if let Some((loaded_id, loaded_project)) =
+            projects.iter().find_map(|(project_id, project)| {
+                (project.path == current_project.path).then(|| (*project_id, project.clone()))
+            })
+        {
+            let mut merged_project = loaded_project;
+            merged_project.name = current_project.name.clone();
+            merged_project.saved_messages = merge_saved_messages(
+                &merged_project.saved_messages,
+                &current_project.saved_messages,
+            );
+            projects.insert(loaded_id, merged_project);
+            project_id_remap.insert(current_project.id, loaded_id);
+            continue;
+        }
+
+        let target_project_id = if projects.contains_key(&current_project.id) {
+            let assigned_id = next_project_id;
+            next_project_id += 1;
+            assigned_id
+        } else {
+            current_project.id
+        };
+
+        let mut project = current_project.clone();
+        project.id = target_project_id;
+        projects.insert(target_project_id, project);
+        project_id_remap.insert(current_project.id, target_project_id);
+        if target_project_id >= next_project_id {
+            next_project_id = target_project_id + 1;
+        }
+    }
+
+    (projects, project_id_remap)
+}
+
+fn merge_saved_messages(loaded_messages: &[String], current_messages: &[String]) -> Vec<String> {
+    let mut merged_messages = Vec::with_capacity(loaded_messages.len() + current_messages.len());
+    let mut seen_messages = HashSet::with_capacity(loaded_messages.len() + current_messages.len());
+
+    for message in loaded_messages.iter().chain(current_messages.iter()) {
+        if seen_messages.insert(message.clone()) {
+            merged_messages.push(message.clone());
+        }
+    }
+
+    merged_messages
+}
+
+fn valid_selected_project(
+    selected_project: Option<u64>,
+    projects: &BTreeMap<u64, ProjectRecord>,
+) -> Option<u64> {
+    selected_project.filter(|project_id| projects.contains_key(project_id))
 }
 
 fn collect_source_control_snapshot(project_path: &Path, run_fetch: bool) -> SourceControlSnapshot {
@@ -3157,9 +3388,17 @@ fn build_terminal_render(
     snapshot: &TerminalSnapshot,
     font_id: &FontId,
     terminal_exited: bool,
+    shell: ShellKind,
+    stable_input_cursor_row: Option<usize>,
     time_seconds: f64,
 ) -> TerminalRenderModel {
-    let visible_cursor = visible_terminal_cursor(snapshot.cursor, terminal_exited, time_seconds);
+    let visible_cursor = visible_terminal_cursor(
+        snapshot.cursor,
+        terminal_exited,
+        shell,
+        stable_input_cursor_row,
+        time_seconds,
+    );
     let cursor_overlay =
         visible_cursor.and_then(|cursor| build_terminal_cursor_overlay(snapshot, cursor));
     let mut job = LayoutJob::default();
@@ -3236,15 +3475,75 @@ fn build_terminal_cursor_overlay(
 fn visible_terminal_cursor(
     cursor: Option<TerminalCursor>,
     terminal_exited: bool,
+    shell: ShellKind,
+    stable_input_cursor_row: Option<usize>,
     time_seconds: f64,
 ) -> Option<TerminalCursor> {
     cursor.filter(|cursor| {
-        !terminal_exited && (!cursor.blinking || terminal_cursor_blink_phase_visible(time_seconds))
+        !terminal_exited
+            && !cursor_hidden_by_row_filter(shell, stable_input_cursor_row, cursor.y)
+            && (!cursor.blinking || terminal_cursor_blink_phase_visible(time_seconds))
     })
 }
 
 fn terminal_cursor_blink_phase_visible(time_seconds: f64) -> bool {
     ((time_seconds / CURSOR_BLINK_STEP_SECS).floor() as u64) % 2 == 0
+}
+
+fn cursor_hidden_by_row_filter(
+    shell: ShellKind,
+    stable_input_cursor_row: Option<usize>,
+    cursor_row: usize,
+) -> bool {
+    shell == ShellKind::PowerShell && stable_input_cursor_row != Some(cursor_row)
+}
+
+fn sync_terminal_cursor_row_state(terminal: &mut TerminalEntry, time_seconds: f64) {
+    let current_cursor_row = terminal.render_cache.cursor.map(|cursor| cursor.y);
+
+    if terminal.shell != ShellKind::PowerShell {
+        terminal.last_cursor_row = current_cursor_row;
+        terminal.last_cursor_row_changed_at = None;
+        terminal.stable_input_cursor_row = current_cursor_row;
+        return;
+    }
+
+    update_stable_cursor_row(
+        &mut terminal.last_cursor_row,
+        &mut terminal.last_cursor_row_changed_at,
+        &mut terminal.stable_input_cursor_row,
+        current_cursor_row,
+        time_seconds,
+    );
+}
+
+fn update_stable_cursor_row(
+    last_cursor_row: &mut Option<usize>,
+    last_cursor_row_changed_at: &mut Option<f64>,
+    stable_input_cursor_row: &mut Option<usize>,
+    current_cursor_row: Option<usize>,
+    time_seconds: f64,
+) {
+    if current_cursor_row != *last_cursor_row {
+        *last_cursor_row = current_cursor_row;
+        *last_cursor_row_changed_at = Some(time_seconds);
+    }
+
+    let Some(current_cursor_row) = current_cursor_row else {
+        *stable_input_cursor_row = None;
+        return;
+    };
+
+    if *stable_input_cursor_row == Some(current_cursor_row) {
+        return;
+    }
+
+    if last_cursor_row_changed_at.is_some_and(|changed_at| {
+        time_seconds >= changed_at
+            && (time_seconds - changed_at) >= POWERSHELL_CURSOR_ROW_STABLE_SECS
+    }) {
+        *stable_input_cursor_row = Some(current_cursor_row);
+    }
 }
 
 fn invert_terminal_style(style: crate::terminal::TerminalStyle) -> crate::terminal::TerminalStyle {
@@ -3339,15 +3638,20 @@ fn normalize_terminal_background(color: TerminalColor) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_terminal_cursor_overlay, build_terminal_render, normalize_terminal_background,
-        parse_branch_header, terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect,
-        to_egui_color, AdeApp, TerminalCursorOverlay, TERMINAL_OUTPUT_BG,
+        build_terminal_cursor_overlay, build_terminal_render, cursor_hidden_by_row_filter,
+        normalize_terminal_background, parse_branch_header, recover_config_state,
+        terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect, to_egui_color,
+        update_stable_cursor_row, visible_terminal_cursor, AdeApp, PendingConfigChanges,
+        TerminalCursorOverlay, TERMINAL_OUTPUT_BG,
     };
+    use crate::models::{AppConfig, AutoTileScope, MainVisibilityMode, ProjectRecord, ShellKind};
     use crate::terminal::{
         TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape, TerminalSnapshot,
         TerminalStyle, TerminalStyledCell, TerminalStyledLine, TerminalStyledRun,
     };
     use eframe::egui::{pos2, Color32, FontFamily, FontId, Key, Modifiers};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     #[test]
     fn maps_navigation_keys_to_escape_sequences() {
@@ -3370,6 +3674,160 @@ mod tests {
 
         assert_eq!(ctrl_c, Some(vec![0x03]));
         assert_eq!(ctrl_z, Some(vec![0x1a]));
+    }
+
+    #[test]
+    fn recovered_config_preserves_loaded_settings_until_session_changes_them() {
+        let loaded_project = test_project(7, "Loaded", "C:/loaded/demo", &[]);
+        let loaded_config = AppConfig {
+            default_shell: ShellKind::Cmd,
+            ui: crate::models::UiConfig {
+                auto_tile_scope: AutoTileScope::SelectedProjectOnly,
+                project_explorer_expanded: false,
+                last_selected_project_id: Some(loaded_project.id),
+                ..boot_failed_current_config().ui
+            },
+            projects: vec![loaded_project.clone()],
+            ..AppConfig::default()
+        };
+
+        let recovered = recover_config_state(
+            &boot_failed_current_config(),
+            &BTreeMap::new(),
+            None,
+            loaded_config,
+            PendingConfigChanges::default(),
+        );
+
+        assert_eq!(recovered.default_shell, ShellKind::Cmd);
+        assert_eq!(
+            recovered.ui.auto_tile_scope,
+            AutoTileScope::SelectedProjectOnly
+        );
+        assert!(!recovered.ui.project_explorer_expanded);
+        assert_eq!(
+            recovered.ui.last_selected_project_id,
+            Some(loaded_project.id)
+        );
+        assert_eq!(recovered.projects.len(), 1);
+        assert_eq!(recovered.projects[0].id, loaded_project.id);
+        assert_eq!(recovered.projects[0].name, loaded_project.name);
+        assert_eq!(recovered.projects[0].path, loaded_project.path);
+    }
+
+    #[test]
+    fn recovered_config_keeps_loaded_projects_when_added_project_reuses_hidden_id() {
+        let loaded_project = test_project(1, "Loaded", "C:/loaded/demo", &[]);
+        let current_project = test_project(1, "Added", "C:/added/demo", &[]);
+        let loaded_config = AppConfig {
+            projects: vec![loaded_project.clone()],
+            ..AppConfig::default()
+        };
+        let current_projects = BTreeMap::from([(current_project.id, current_project.clone())]);
+
+        let recovered = recover_config_state(
+            &boot_failed_current_config(),
+            &current_projects,
+            Some(current_project.id),
+            loaded_config,
+            PendingConfigChanges {
+                projects: true,
+                selection: true,
+                ..PendingConfigChanges::default()
+            },
+        );
+
+        assert_eq!(recovered.projects.len(), 2);
+        assert_eq!(recovered.ui.last_selected_project_id, Some(2));
+        assert_eq!(recovered.projects[0].id, loaded_project.id);
+        assert_eq!(recovered.projects[0].path, loaded_project.path);
+        assert_eq!(recovered.projects[1].id, 2);
+        assert_eq!(recovered.projects[1].name, current_project.name);
+        assert_eq!(recovered.projects[1].path, current_project.path);
+    }
+
+    #[test]
+    fn recovered_config_merges_duplicate_project_paths_and_saved_messages() {
+        let loaded_project = test_project(5, "Loaded", "C:/shared/demo", &["existing"]);
+        let current_project = test_project(1, "Added", "C:/shared/demo", &["new"]);
+        let loaded_config = AppConfig {
+            projects: vec![loaded_project.clone()],
+            ..AppConfig::default()
+        };
+        let current_projects = BTreeMap::from([(current_project.id, current_project)]);
+
+        let recovered = recover_config_state(
+            &boot_failed_current_config(),
+            &current_projects,
+            Some(1),
+            loaded_config,
+            PendingConfigChanges {
+                projects: true,
+                selection: true,
+                ..PendingConfigChanges::default()
+            },
+        );
+
+        assert_eq!(recovered.projects.len(), 1);
+        assert_eq!(recovered.ui.last_selected_project_id, Some(5));
+        assert_eq!(
+            recovered.projects[0].saved_messages,
+            vec!["existing".to_owned(), "new".to_owned()]
+        );
+    }
+
+    #[test]
+    fn recovered_config_only_overrides_loaded_shell_when_shell_changed_in_session() {
+        let loaded_config = AppConfig {
+            default_shell: ShellKind::Cmd,
+            ui: crate::models::UiConfig {
+                auto_tile_scope: AutoTileScope::SelectedProjectOnly,
+                ..boot_failed_current_config().ui
+            },
+            ..AppConfig::default()
+        };
+
+        let recovered = recover_config_state(
+            &boot_failed_current_config(),
+            &BTreeMap::new(),
+            None,
+            loaded_config,
+            PendingConfigChanges {
+                default_shell: true,
+                ..PendingConfigChanges::default()
+            },
+        );
+
+        assert_eq!(recovered.default_shell, ShellKind::PowerShell);
+        assert_eq!(
+            recovered.ui.auto_tile_scope,
+            AutoTileScope::SelectedProjectOnly
+        );
+    }
+
+    fn boot_failed_current_config() -> AppConfig {
+        AppConfig {
+            ui: crate::models::UiConfig {
+                show_project_explorer: true,
+                show_terminal_manager: true,
+                main_visibility_mode: MainVisibilityMode::Global,
+                project_filter_mode: false,
+                ..crate::models::UiConfig::default()
+            },
+            ..AppConfig::default()
+        }
+    }
+
+    fn test_project(id: u64, name: &str, path: &str, saved_messages: &[&str]) -> ProjectRecord {
+        ProjectRecord {
+            id,
+            name: name.to_owned(),
+            path: PathBuf::from(path),
+            saved_messages: saved_messages
+                .iter()
+                .map(|message| (*message).to_owned())
+                .collect(),
+        }
     }
 
     #[test]
@@ -3441,6 +3899,8 @@ mod tests {
             &snapshot,
             &FontId::new(14.0, FontFamily::Monospace),
             false,
+            ShellKind::PowerShell,
+            Some(0),
             0.0,
         );
         let section = &render.layout_job.sections[0];
@@ -3493,8 +3953,129 @@ mod tests {
     #[test]
     fn blinking_cursor_toggles_visibility_by_half_second_steps() {
         assert!(terminal_cursor_blink_phase_visible(0.0));
-        assert!(!terminal_cursor_blink_phase_visible(0.51));
-        assert!(terminal_cursor_blink_phase_visible(1.01));
+        assert!(!terminal_cursor_blink_phase_visible(0.61));
+        assert!(terminal_cursor_blink_phase_visible(1.21));
+    }
+
+    #[test]
+    fn steady_cursor_stays_visible_across_blink_phases() {
+        let cursor = TerminalCursor {
+            x: 0,
+            y: 0,
+            shape: TerminalCursorShape::Block,
+            blinking: false,
+        };
+
+        assert_eq!(
+            visible_terminal_cursor(Some(cursor), false, ShellKind::PowerShell, Some(0), 0.0),
+            Some(cursor)
+        );
+        assert_eq!(
+            visible_terminal_cursor(Some(cursor), false, ShellKind::PowerShell, Some(0), 0.61),
+            Some(cursor)
+        );
+        assert_eq!(
+            visible_terminal_cursor(Some(cursor), false, ShellKind::PowerShell, Some(0), 1.21),
+            Some(cursor)
+        );
+    }
+
+    #[test]
+    fn powershell_cursor_is_hidden_when_row_differs_from_stable_row() {
+        assert!(cursor_hidden_by_row_filter(
+            ShellKind::PowerShell,
+            Some(4),
+            3,
+        ));
+    }
+
+    #[test]
+    fn powershell_cursor_reappears_when_row_matches_stable_row() {
+        let cursor = TerminalCursor {
+            x: 0,
+            y: 0,
+            shape: TerminalCursorShape::Block,
+            blinking: false,
+        };
+
+        assert_eq!(
+            visible_terminal_cursor(Some(cursor), false, ShellKind::PowerShell, Some(0), 0.0),
+            Some(cursor)
+        );
+    }
+
+    #[test]
+    fn cmd_cursor_is_not_hidden_by_row_filter() {
+        let cursor = TerminalCursor {
+            x: 0,
+            y: 0,
+            shape: TerminalCursorShape::Block,
+            blinking: false,
+        };
+
+        assert_eq!(
+            visible_terminal_cursor(Some(cursor), false, ShellKind::Cmd, Some(1), 0.0),
+            Some(cursor)
+        );
+    }
+
+    #[test]
+    fn stable_cursor_row_updates_only_after_row_is_stable() {
+        let mut last_cursor_row = None;
+        let mut last_cursor_row_changed_at = None;
+        let mut stable_input_cursor_row = None;
+
+        update_stable_cursor_row(
+            &mut last_cursor_row,
+            &mut last_cursor_row_changed_at,
+            &mut stable_input_cursor_row,
+            Some(5),
+            0.0,
+        );
+        assert_eq!(stable_input_cursor_row, None);
+
+        update_stable_cursor_row(
+            &mut last_cursor_row,
+            &mut last_cursor_row_changed_at,
+            &mut stable_input_cursor_row,
+            Some(5),
+            0.03,
+        );
+        assert_eq!(stable_input_cursor_row, None);
+
+        update_stable_cursor_row(
+            &mut last_cursor_row,
+            &mut last_cursor_row_changed_at,
+            &mut stable_input_cursor_row,
+            Some(5),
+            0.07,
+        );
+        assert_eq!(stable_input_cursor_row, Some(5));
+    }
+
+    #[test]
+    fn stable_cursor_row_keeps_previous_input_row_during_transient_jump() {
+        let mut last_cursor_row = Some(5);
+        let mut last_cursor_row_changed_at = Some(0.0);
+        let mut stable_input_cursor_row = Some(5);
+
+        update_stable_cursor_row(
+            &mut last_cursor_row,
+            &mut last_cursor_row_changed_at,
+            &mut stable_input_cursor_row,
+            Some(4),
+            0.08,
+        );
+        assert_eq!(stable_input_cursor_row, Some(5));
+
+        update_stable_cursor_row(
+            &mut last_cursor_row,
+            &mut last_cursor_row_changed_at,
+            &mut stable_input_cursor_row,
+            Some(5),
+            0.09,
+        );
+        assert_eq!(stable_input_cursor_row, Some(5));
     }
 
     #[test]

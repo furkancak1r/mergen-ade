@@ -592,7 +592,8 @@ fn snapshot_cursor(terminal: &Terminal, rows: usize, cols: usize) -> Option<Term
 
 fn map_cursor_shape(shape: CursorShape) -> (TerminalCursorShape, bool) {
     match shape {
-        CursorShape::Default | CursorShape::BlinkingBlock => (TerminalCursorShape::Block, true),
+        CursorShape::Default => (TerminalCursorShape::Block, true),
+        CursorShape::BlinkingBlock => (TerminalCursorShape::Block, true),
         CursorShape::SteadyBlock => (TerminalCursorShape::Block, false),
         CursorShape::BlinkingUnderline => (TerminalCursorShape::Underline, true),
         CursorShape::SteadyUnderline => (TerminalCursorShape::Underline, false),
@@ -983,6 +984,29 @@ mod tests {
             .as_ref()
             .and_then(|line| line.cell_covering_column(5))
             .is_some());
+    }
+
+    #[test]
+    fn snapshot_treats_default_cursor_shape_as_blinking_block() {
+        let terminal = make_test_terminal(TerminalSize {
+            rows: 4,
+            cols: 10,
+            pixel_width: 80,
+            pixel_height: 64,
+            dpi: 96,
+        });
+
+        let snapshot = snapshot_from_terminal(&terminal);
+
+        assert_eq!(
+            snapshot.cursor,
+            Some(TerminalCursor {
+                x: 0,
+                y: 0,
+                shape: TerminalCursorShape::Block,
+                blinking: true,
+            })
+        );
     }
 
     #[test]

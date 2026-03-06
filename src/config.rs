@@ -62,14 +62,19 @@ struct LegacyProjectRecord {
     name: String,
     path: PathBuf,
     shell_override: Option<ShellKind>,
+    #[serde(default)]
     saved_messages: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct LegacyAppConfig {
+    #[serde(default = "default_config_version")]
     version: u32,
+    #[serde(default)]
     default_shell: ShellKind,
+    #[serde(default)]
     ui: UiConfig,
+    #[serde(default)]
     projects: Vec<LegacyProjectRecord>,
 }
 
@@ -95,5 +100,53 @@ impl From<LegacyAppConfig> for AppConfig {
             ui: value.ui,
             projects,
         }
+    }
+}
+
+const fn default_config_version() -> u32 {
+    1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_config;
+    use crate::models::ShellKind;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn loads_project_without_saved_messages_field() {
+        let path = unique_temp_path("missing-saved-messages");
+        fs::write(
+            &path,
+            r#"
+version = 1
+default_shell = "powershell"
+
+[[projects]]
+id = 7
+name = "Demo"
+path = "C:/work/demo"
+"#,
+        )
+        .expect("should write config");
+
+        let config = load_config(&path).expect("should load config");
+
+        assert_eq!(config.default_shell, ShellKind::PowerShell);
+        assert_eq!(config.projects.len(), 1);
+        assert_eq!(config.projects[0].name, "Demo");
+        assert!(config.projects[0].saved_messages.is_empty());
+
+        let _ = fs::remove_file(path);
+    }
+
+    fn unique_temp_path(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        std::env::temp_dir().join(format!("mergen-ade-{label}-{unique}.toml"))
     }
 }

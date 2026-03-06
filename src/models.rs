@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum ShellKind {
     #[default]
+    #[serde(alias = "powershell")]
+    #[serde(alias = "PowerShell")]
+    #[serde(alias = "powerShell")]
     PowerShell,
     Cmd,
 }
@@ -112,6 +115,7 @@ pub struct ProjectRecord {
     pub id: u64,
     pub name: String,
     pub path: PathBuf,
+    #[serde(default)]
     pub saved_messages: Vec<String>,
 }
 
