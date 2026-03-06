@@ -15,6 +15,7 @@ raw-window-handle = "0.6"
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 tattoy-wezterm-term = "0.1.0-fork.5"
+tattoy-wezterm-surface = "0.1.0-fork.2"
 toml = "0.8"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
 

@@ -23,8 +23,8 @@ use crate::models::{
     TerminalKind,
 };
 use crate::terminal::{
-    try_terminal_snapshot, TerminalColor, TerminalDimensions, TerminalRuntime, TerminalSnapshot,
-    TerminalUiEvent, TerminalUiEventKind,
+    try_terminal_snapshot, TerminalColor, TerminalCursor, TerminalCursorShape, TerminalDimensions,
+    TerminalRuntime, TerminalSnapshot, TerminalUiEvent, TerminalUiEventKind,
 };
 use crate::title::{terminal_title_text, update_terminal_title};
 
@@ -34,6 +34,9 @@ const TITLE_MAX_LEN: usize = 40;
 const TERMINAL_EVENT_BUDGET: usize = 4096;
 const TERMINAL_RETRY_MS: u64 = 8;
 const TERMINAL_FALLBACK_REFRESH_MS: u64 = 16;
+const CURSOR_BLINK_STEP_SECS: f64 = 0.5;
+const CURSOR_BAR_WIDTH_PX: f32 = 2.0;
+const CURSOR_UNDERLINE_HEIGHT_PX: f32 = 2.0;
 const DIRECTORY_INDEX_MAX_DEPTH: usize = 8;
 const DIRECTORY_INDEX_MAX_NODES: usize = 20_000;
 const TERMINAL_OUTPUT_BG: Color32 = Color32::from_rgb(26, 30, 36);
@@ -261,6 +264,20 @@ struct SourceControlFile {
 struct SourceControlEvent {
     project_id: u64,
     snapshot: SourceControlSnapshot,
+}
+
+struct TerminalRenderModel {
+    layout_job: LayoutJob,
+    cursor_overlay: Option<TerminalCursorOverlay>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalCursorOverlay {
+    shape: TerminalCursorShape,
+    row: usize,
+    column: usize,
+    width_columns: usize,
+    color: Color32,
 }
 
 #[derive(Debug, Clone)]
@@ -970,9 +987,11 @@ impl AdeApp {
 
     fn preferred_terminal_for_project(&self, project_id: u64) -> Option<u64> {
         if let Some(active_terminal_id) = self.active_terminal {
-            if self.terminals.get(&active_terminal_id).is_some_and(|terminal| {
-                terminal.project_id == project_id && !terminal.exited
-            }) {
+            if self
+                .terminals
+                .get(&active_terminal_id)
+                .is_some_and(|terminal| terminal.project_id == project_id && !terminal.exited)
+            {
                 return Some(active_terminal_id);
             }
         }
@@ -1691,12 +1710,11 @@ impl AdeApp {
 
             let header_label = format!("{} {}", icons::FOLDER_OPEN, project_snapshot.name);
             let header_id = ui.make_persistent_id(format!("project-group-{project_id}"));
-            let mut header_state =
-                egui::collapsing_header::CollapsingState::load_with_default_open(
-                    ui.ctx(),
-                    header_id,
-                    false,
-                );
+            let mut header_state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                header_id,
+                false,
+            );
             let header_response =
                 styled_flat_section_header(ui, &header_label, header_state.is_open());
             if header_response.clicked() {
@@ -1717,41 +1735,41 @@ impl AdeApp {
                 })
                 .count();
             let _ = header_state.show_body_unindented(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if styled_icon_button(
-                            ui,
-                            icons::TERMINAL,
-                            BTN_BLUE,
-                            BTN_BLUE_HOVER,
-                            BTN_ICON_ACTIVE,
-                            "New Foreground Terminal",
-                        ) {
-                            self.spawn_terminal_for_project(ctx, project_id, TerminalKind::Foreground);
-                        }
-                        if styled_icon_button(
-                            ui,
-                            icons::LIST,
-                            BTN_TEAL,
-                            BTN_TEAL_HOVER,
-                            BTN_ICON_ACTIVE,
-                            "New Background Terminal",
-                        ) {
-                            self.spawn_terminal_for_project(ctx, project_id, TerminalKind::Background);
-                        }
-                    });
-
-                    if foreground_count > 0 {
-                        ui.separator();
-                        draw_meta_kicker(ui, icons::TERMINAL, "Foreground");
-                        self.draw_terminal_rows(ui, project_id, TerminalKind::Foreground);
+                ui.horizontal(|ui| {
+                    if styled_icon_button(
+                        ui,
+                        icons::TERMINAL,
+                        BTN_BLUE,
+                        BTN_BLUE_HOVER,
+                        BTN_ICON_ACTIVE,
+                        "New Foreground Terminal",
+                    ) {
+                        self.spawn_terminal_for_project(ctx, project_id, TerminalKind::Foreground);
                     }
-
-                    if background_count > 0 {
-                        ui.separator();
-                        draw_meta_kicker(ui, icons::LIST, "Background");
-                        self.draw_terminal_rows(ui, project_id, TerminalKind::Background);
+                    if styled_icon_button(
+                        ui,
+                        icons::LIST,
+                        BTN_TEAL,
+                        BTN_TEAL_HOVER,
+                        BTN_ICON_ACTIVE,
+                        "New Background Terminal",
+                    ) {
+                        self.spawn_terminal_for_project(ctx, project_id, TerminalKind::Background);
                     }
                 });
+
+                if foreground_count > 0 {
+                    ui.separator();
+                    draw_meta_kicker(ui, icons::TERMINAL, "Foreground");
+                    self.draw_terminal_rows(ui, project_id, TerminalKind::Foreground);
+                }
+
+                if background_count > 0 {
+                    ui.separator();
+                    draw_meta_kicker(ui, icons::LIST, "Background");
+                    self.draw_terminal_rows(ui, project_id, TerminalKind::Background);
+                }
+            });
 
             header_response.context_menu(|ui| {
                 with_minimal_button_chrome(ui, |ui| {
@@ -2179,13 +2197,26 @@ impl AdeApp {
                                         pane_clicked = true;
                                     }
                                 } else {
-                                    let render_job =
-                                        build_terminal_layout_job(&terminal.render_cache, &font_id);
+                                    let render = build_terminal_render(
+                                        &terminal.render_cache,
+                                        &font_id,
+                                        terminal.exited,
+                                        ui.ctx().input(|input| input.time),
+                                    );
                                     let response = ui.add(
-                                        egui::Label::new(render_job)
+                                        egui::Label::new(render.layout_job)
                                             .wrap_mode(TextWrapMode::Extend)
                                             .sense(Sense::click()),
                                     );
+                                    if let Some(cursor_overlay) = render.cursor_overlay {
+                                        paint_terminal_cursor(
+                                            ui,
+                                            response.rect.min,
+                                            char_width,
+                                            line_height,
+                                            cursor_overlay,
+                                        );
+                                    }
                                     if response.clicked() {
                                         pane_clicked = true;
                                     }
@@ -3000,8 +3031,7 @@ fn with_minimal_button_chrome<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)
         style.visuals.widgets.inactive.bg_fill = Color32::TRANSPARENT;
         style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
         style.visuals.widgets.inactive.bg_stroke = Stroke::NONE;
-        style.visuals.widgets.inactive.fg_stroke =
-            Stroke::new(1.0, with_alpha(TEXT_PRIMARY, 190));
+        style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, with_alpha(TEXT_PRIMARY, 190));
 
         style.visuals.widgets.hovered.bg_fill = hover_fill;
         style.visuals.widgets.hovered.weak_bg_fill = hover_fill;
@@ -3012,14 +3042,12 @@ fn with_minimal_button_chrome<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)
         style.visuals.widgets.active.bg_fill = Color32::TRANSPARENT;
         style.visuals.widgets.active.weak_bg_fill = Color32::TRANSPARENT;
         style.visuals.widgets.active.bg_stroke = Stroke::NONE;
-        style.visuals.widgets.active.fg_stroke =
-            Stroke::new(1.0, Color32::from_rgb(244, 249, 255));
+        style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::from_rgb(244, 249, 255));
 
         style.visuals.widgets.open.bg_fill = Color32::TRANSPARENT;
         style.visuals.widgets.open.weak_bg_fill = Color32::TRANSPARENT;
         style.visuals.widgets.open.bg_stroke = Stroke::NONE;
-        style.visuals.widgets.open.fg_stroke =
-            Stroke::new(1.0, Color32::from_rgb(244, 249, 255));
+        style.visuals.widgets.open.fg_stroke = Stroke::new(1.0, Color32::from_rgb(244, 249, 255));
 
         add_contents(ui)
     })
@@ -3070,8 +3098,10 @@ fn styled_icon_button(
     _active_bg: Color32,
     tooltip: &str,
 ) -> bool {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT),
+        Sense::click(),
+    );
     let response = response.on_hover_text(tooltip);
 
     if response.hovered() {
@@ -3096,8 +3126,10 @@ fn styled_icon_button(
 }
 
 fn styled_icon_toggle(ui: &mut Ui, selected: bool, icon: AppIcon, tooltip: &str) -> bool {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT),
+        Sense::click(),
+    );
     let response = response.on_hover_text(tooltip);
 
     if response.hovered() {
@@ -3121,29 +3153,41 @@ fn styled_icon_toggle(ui: &mut Ui, selected: bool, icon: AppIcon, tooltip: &str)
     response.clicked()
 }
 
-fn build_terminal_layout_job(snapshot: &TerminalSnapshot, font_id: &FontId) -> LayoutJob {
+fn build_terminal_render(
+    snapshot: &TerminalSnapshot,
+    font_id: &FontId,
+    terminal_exited: bool,
+    time_seconds: f64,
+) -> TerminalRenderModel {
+    let visible_cursor = visible_terminal_cursor(snapshot.cursor, terminal_exited, time_seconds);
+    let cursor_overlay =
+        visible_cursor.and_then(|cursor| build_terminal_cursor_overlay(snapshot, cursor));
     let mut job = LayoutJob::default();
     job.wrap.max_width = f32::INFINITY;
 
     for (line_index, line) in snapshot.lines.iter().enumerate() {
-        for run in &line.runs {
-            let fg = to_egui_color(run.style.fg);
-            let mut format = TextFormat {
-                font_id: font_id.clone(),
-                color: fg,
-                background: normalize_terminal_background(run.style.bg),
-                italics: run.style.italic,
-                ..TextFormat::default()
-            };
+        let block_cursor = visible_cursor
+            .filter(|cursor| cursor.y == line_index && cursor.shape == TerminalCursorShape::Block);
 
-            if run.style.underline {
-                format.underline = Stroke::new(1.0, fg);
+        if let (Some(cursor), Some(cursor_line)) = (block_cursor, snapshot.cursor_line.as_ref()) {
+            if cursor_line.row == line_index {
+                for cell in &cursor_line.cells {
+                    let style = if cell.covers_column(cursor.x) {
+                        invert_terminal_style(cell.style)
+                    } else {
+                        cell.style
+                    };
+                    append_terminal_text(&mut job, &cell.rendered_text(), style, font_id);
+                }
+            } else {
+                for run in &line.runs {
+                    append_terminal_text(&mut job, &run.text, run.style, font_id);
+                }
             }
-            if run.style.strike {
-                format.strikethrough = Stroke::new(1.0, fg);
+        } else {
+            for run in &line.runs {
+                append_terminal_text(&mut job, &run.text, run.style, font_id);
             }
-
-            job.append(&run.text, 0.0, format);
         }
 
         if line_index + 1 < snapshot.lines.len() {
@@ -3158,7 +3202,125 @@ fn build_terminal_layout_job(snapshot: &TerminalSnapshot, font_id: &FontId) -> L
         }
     }
 
-    job
+    TerminalRenderModel {
+        layout_job: job,
+        cursor_overlay,
+    }
+}
+
+fn build_terminal_cursor_overlay(
+    snapshot: &TerminalSnapshot,
+    cursor: TerminalCursor,
+) -> Option<TerminalCursorOverlay> {
+    if cursor.shape == TerminalCursorShape::Block {
+        return None;
+    }
+
+    let color = snapshot
+        .cursor_line
+        .as_ref()
+        .filter(|line| line.row == cursor.y)
+        .and_then(|line| line.cell_covering_column(cursor.x))
+        .map(|cell| to_egui_color(cell.style.fg))
+        .unwrap_or(TEXT_PRIMARY);
+
+    Some(TerminalCursorOverlay {
+        shape: cursor.shape,
+        row: cursor.y,
+        column: cursor.x,
+        width_columns: 1,
+        color,
+    })
+}
+
+fn visible_terminal_cursor(
+    cursor: Option<TerminalCursor>,
+    terminal_exited: bool,
+    time_seconds: f64,
+) -> Option<TerminalCursor> {
+    cursor.filter(|cursor| {
+        !terminal_exited && (!cursor.blinking || terminal_cursor_blink_phase_visible(time_seconds))
+    })
+}
+
+fn terminal_cursor_blink_phase_visible(time_seconds: f64) -> bool {
+    ((time_seconds / CURSOR_BLINK_STEP_SECS).floor() as u64) % 2 == 0
+}
+
+fn invert_terminal_style(style: crate::terminal::TerminalStyle) -> crate::terminal::TerminalStyle {
+    crate::terminal::TerminalStyle {
+        fg: style.bg,
+        bg: style.fg,
+        ..style
+    }
+}
+
+fn append_terminal_text(
+    job: &mut LayoutJob,
+    text: &str,
+    style: crate::terminal::TerminalStyle,
+    font_id: &FontId,
+) {
+    let fg = to_egui_color(style.fg);
+    let mut format = TextFormat {
+        font_id: font_id.clone(),
+        color: fg,
+        background: normalize_terminal_background(style.bg),
+        italics: style.italic,
+        ..TextFormat::default()
+    };
+
+    if style.underline {
+        format.underline = Stroke::new(1.0, fg);
+    }
+    if style.strike {
+        format.strikethrough = Stroke::new(1.0, fg);
+    }
+
+    job.append(text, 0.0, format);
+}
+
+fn paint_terminal_cursor(
+    ui: &mut Ui,
+    origin: egui::Pos2,
+    char_width: f32,
+    line_height: f32,
+    overlay: TerminalCursorOverlay,
+) {
+    if overlay.shape == TerminalCursorShape::Block {
+        return;
+    }
+
+    let rect = terminal_cursor_overlay_rect(origin, char_width, line_height, overlay);
+    ui.painter().rect_filled(rect, 0.0, overlay.color);
+}
+
+fn terminal_cursor_overlay_rect(
+    origin: egui::Pos2,
+    char_width: f32,
+    line_height: f32,
+    overlay: TerminalCursorOverlay,
+) -> egui::Rect {
+    let x = origin.x + (overlay.column as f32 * char_width);
+    let y = origin.y + (overlay.row as f32 * line_height);
+    let width = (overlay.width_columns.max(1) as f32 * char_width).max(1.0);
+
+    match overlay.shape {
+        TerminalCursorShape::Bar => egui::Rect::from_min_size(
+            egui::pos2(x, y),
+            egui::vec2(CURSOR_BAR_WIDTH_PX.min(width), line_height),
+        ),
+        TerminalCursorShape::Underline => {
+            let height = CURSOR_UNDERLINE_HEIGHT_PX.min(line_height.max(1.0));
+            egui::Rect::from_min_size(
+                egui::pos2(x, y + line_height - height),
+                egui::vec2(width, height),
+            )
+        }
+        TerminalCursorShape::Block => {
+            egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(width, line_height))
+        }
+    }
 }
 
 fn to_egui_color(color: TerminalColor) -> Color32 {
@@ -3176,9 +3338,16 @@ fn normalize_terminal_background(color: TerminalColor) -> Color32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_terminal_background, parse_branch_header, AdeApp, TERMINAL_OUTPUT_BG};
-    use crate::terminal::TerminalColor;
-    use eframe::egui::{Key, Modifiers};
+    use super::{
+        build_terminal_cursor_overlay, build_terminal_render, normalize_terminal_background,
+        parse_branch_header, terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect,
+        to_egui_color, AdeApp, TerminalCursorOverlay, TERMINAL_OUTPUT_BG,
+    };
+    use crate::terminal::{
+        TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape, TerminalSnapshot,
+        TerminalStyle, TerminalStyledCell, TerminalStyledLine, TerminalStyledRun,
+    };
+    use eframe::egui::{pos2, Color32, FontFamily, FontId, Key, Modifiers};
 
     #[test]
     fn maps_navigation_keys_to_escape_sequences() {
@@ -3237,5 +3406,150 @@ mod tests {
         assert_eq!(normalized.r(), 32);
         assert_eq!(normalized.g(), 80);
         assert_eq!(normalized.b(), 120);
+    }
+
+    #[test]
+    fn block_cursor_swaps_foreground_and_background_colors() {
+        let style = sample_style();
+        let snapshot = TerminalSnapshot {
+            lines: vec![TerminalStyledLine {
+                runs: vec![TerminalStyledRun {
+                    text: "A".to_owned(),
+                    style,
+                    column: 0,
+                    display_width: 1,
+                }],
+            }],
+            cursor: Some(TerminalCursor {
+                x: 0,
+                y: 0,
+                shape: TerminalCursorShape::Block,
+                blinking: false,
+            }),
+            cursor_line: Some(TerminalCursorLine {
+                row: 0,
+                cells: vec![TerminalStyledCell {
+                    text: "A".to_owned(),
+                    style,
+                    column: 0,
+                    display_width: 1,
+                }],
+            }),
+        };
+
+        let render = build_terminal_render(
+            &snapshot,
+            &FontId::new(14.0, FontFamily::Monospace),
+            false,
+            0.0,
+        );
+        let section = &render.layout_job.sections[0];
+
+        assert!(render.cursor_overlay.is_none());
+        assert_eq!(section.format.color, to_egui_color(style.bg));
+        assert_eq!(section.format.background, to_egui_color(style.fg));
+    }
+
+    #[test]
+    fn underline_cursor_overlay_rect_uses_single_cursor_column() {
+        let rect = terminal_cursor_overlay_rect(
+            pos2(10.0, 20.0),
+            8.0,
+            16.0,
+            TerminalCursorOverlay {
+                shape: TerminalCursorShape::Underline,
+                row: 1,
+                column: 3,
+                width_columns: 1,
+                color: Color32::WHITE,
+            },
+        );
+
+        assert_eq!(rect.min, pos2(34.0, 50.0));
+        assert_eq!(rect.width(), 8.0);
+        assert_eq!(rect.height(), 2.0);
+    }
+
+    #[test]
+    fn bar_cursor_overlay_rect_uses_terminal_origin() {
+        let rect = terminal_cursor_overlay_rect(
+            pos2(4.0, 6.0),
+            8.0,
+            16.0,
+            TerminalCursorOverlay {
+                shape: TerminalCursorShape::Bar,
+                row: 2,
+                column: 1,
+                width_columns: 1,
+                color: Color32::WHITE,
+            },
+        );
+
+        assert_eq!(rect.min, pos2(12.0, 38.0));
+        assert_eq!(rect.width(), 2.0);
+        assert_eq!(rect.height(), 16.0);
+    }
+
+    #[test]
+    fn blinking_cursor_toggles_visibility_by_half_second_steps() {
+        assert!(terminal_cursor_blink_phase_visible(0.0));
+        assert!(!terminal_cursor_blink_phase_visible(0.51));
+        assert!(terminal_cursor_blink_phase_visible(1.01));
+    }
+
+    #[test]
+    fn non_block_cursor_overlay_anchors_to_cursor_column_on_wide_cell() {
+        let style = sample_style();
+        let snapshot = TerminalSnapshot {
+            lines: vec![TerminalStyledLine {
+                runs: vec![TerminalStyledRun {
+                    text: "\u{4f60} ".to_owned(),
+                    style,
+                    column: 0,
+                    display_width: 2,
+                }],
+            }],
+            cursor: Some(TerminalCursor {
+                x: 1,
+                y: 0,
+                shape: TerminalCursorShape::Underline,
+                blinking: false,
+            }),
+            cursor_line: Some(TerminalCursorLine {
+                row: 0,
+                cells: vec![TerminalStyledCell {
+                    text: "\u{4f60}".to_owned(),
+                    style,
+                    column: 0,
+                    display_width: 2,
+                }],
+            }),
+        };
+
+        let overlay =
+            build_terminal_cursor_overlay(&snapshot, snapshot.cursor.expect("expected cursor"))
+                .expect("expected overlay");
+
+        assert_eq!(overlay.column, 1);
+        assert_eq!(overlay.width_columns, 1);
+        assert_eq!(overlay.color, to_egui_color(style.fg));
+    }
+
+    fn sample_style() -> TerminalStyle {
+        TerminalStyle {
+            fg: TerminalColor {
+                r: 26,
+                g: 179,
+                b: 255,
+            },
+            bg: TerminalColor {
+                r: 12,
+                g: 18,
+                b: 28,
+            },
+            italic: false,
+            underline: false,
+            strike: false,
+        }
     }
 }

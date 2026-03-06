@@ -5,6 +5,7 @@ use std::thread;
 
 use crossbeam_channel::{Receiver, Sender};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use tattoy_wezterm_surface::{CursorShape, CursorVisibility};
 use tattoy_wezterm_term::color::{ColorPalette, SrgbaTuple};
 use tattoy_wezterm_term::config::TerminalConfiguration;
 use tattoy_wezterm_term::{CellAttributes, Terminal, TerminalSize};
@@ -30,10 +31,78 @@ pub struct TerminalStyle {
     pub strike: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalCursorShape {
+    Block,
+    Underline,
+    Bar,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalCursor {
+    pub x: usize,
+    pub y: usize,
+    pub shape: TerminalCursorShape,
+    pub blinking: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalStyledRun {
     pub text: String,
     pub style: TerminalStyle,
+    pub column: usize,
+    pub display_width: usize,
+}
+
+impl TerminalStyledRun {
+    fn blank(column: usize, display_width: usize, style: TerminalStyle) -> Self {
+        Self {
+            text: " ".repeat(display_width),
+            style,
+            column,
+            display_width,
+        }
+    }
+
+    fn is_blank(&self) -> bool {
+        self.text.chars().all(|ch| ch == ' ')
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalStyledCell {
+    pub text: String,
+    pub style: TerminalStyle,
+    pub column: usize,
+    pub display_width: usize,
+}
+
+impl TerminalStyledCell {
+    fn blank(column: usize, style: TerminalStyle) -> Self {
+        Self {
+            text: " ".to_owned(),
+            style,
+            column,
+            display_width: 1,
+        }
+    }
+
+    pub fn covers_column(&self, column: usize) -> bool {
+        let end_column = self.column.saturating_add(self.display_width.max(1));
+        column >= self.column && column < end_column
+    }
+
+    pub fn rendered_text(&self) -> String {
+        let mut rendered = if self.text.is_empty() {
+            " ".to_owned()
+        } else {
+            self.text.clone()
+        };
+        if self.display_width > 1 {
+            rendered.push_str(&" ".repeat(self.display_width - 1));
+        }
+        rendered
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -41,9 +110,23 @@ pub struct TerminalStyledLine {
     pub runs: Vec<TerminalStyledRun>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalCursorLine {
+    pub row: usize,
+    pub cells: Vec<TerminalStyledCell>,
+}
+
+impl TerminalCursorLine {
+    pub fn cell_covering_column(&self, column: usize) -> Option<&TerminalStyledCell> {
+        self.cells.iter().find(|cell| cell.covers_column(column))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TerminalSnapshot {
     pub lines: Vec<TerminalStyledLine>,
+    pub cursor: Option<TerminalCursor>,
+    pub cursor_line: Option<TerminalCursorLine>,
 }
 
 #[derive(Debug, Clone)]
@@ -389,15 +472,22 @@ fn snapshot_from_terminal(terminal: &Terminal) -> TerminalSnapshot {
 
     let first_visible_row = screen.scrollback_rows().saturating_sub(rows);
     let default_style = default_style(&palette);
+    let cursor = snapshot_cursor(terminal, rows, cols);
+    let cursor_row = cursor.map(|cursor| cursor.y);
     let mut lines = Vec::with_capacity(rows);
+    let mut cursor_line = None;
 
     screen.for_each_phys_line(|row_index, line| {
         if row_index < first_visible_row || lines.len() >= rows {
             return;
         }
 
-        let mut segments: Vec<(String, TerminalStyle)> = Vec::new();
-        let mut cursor_col = 0usize;
+        let visible_row = lines.len();
+        let min_columns_to_keep = cursor_columns_to_keep(cursor, visible_row, cols);
+        let track_cursor_cells = cursor_row == Some(visible_row);
+        let mut cursor_cells = track_cursor_cells.then(Vec::new);
+        let mut runs = Vec::new();
+        let mut next_column = 0usize;
 
         for cell in line.visible_cells() {
             let col = cell.cell_index();
@@ -405,8 +495,11 @@ fn snapshot_from_terminal(terminal: &Terminal) -> TerminalSnapshot {
                 continue;
             }
 
-            if col > cursor_col {
-                push_segment(&mut segments, " ".repeat(col - cursor_col), default_style);
+            if col > next_column {
+                push_blank_run(&mut runs, next_column, col - next_column, default_style);
+                if let Some(cells) = cursor_cells.as_mut() {
+                    append_blank_cells(cells, next_column, col - next_column, default_style);
+                }
             }
 
             let style = resolve_style(cell.attrs(), &palette);
@@ -415,83 +508,257 @@ fn snapshot_from_terminal(terminal: &Terminal) -> TerminalSnapshot {
                 text.push(' ');
             }
 
-            push_segment(&mut segments, text, style);
-            cursor_col = (col + cell.width().max(1)).min(cols);
-        }
-
-        if cursor_col < cols {
-            push_segment(&mut segments, " ".repeat(cols - cursor_col), default_style);
-        }
-
-        trim_trailing_default_spaces(&mut segments, default_style);
-
-        let mut styled_line = TerminalStyledLine::default();
-        for (text, style) in segments {
-            if text.is_empty() {
+            let display_width = cell.width().max(1).min(cols.saturating_sub(col));
+            if display_width == 0 {
                 continue;
             }
 
-            if let Some(last) = styled_line.runs.last_mut() {
-                if last.style == style {
-                    last.text.push_str(&text);
-                    continue;
-                }
+            let rendered_text = rendered_cell_text(&text, display_width);
+            push_run(&mut runs, col, rendered_text, display_width, style);
+            if let Some(cells) = cursor_cells.as_mut() {
+                cells.push(TerminalStyledCell {
+                    text,
+                    style,
+                    column: col,
+                    display_width,
+                });
             }
-
-            styled_line.runs.push(TerminalStyledRun { text, style });
+            next_column = col.saturating_add(display_width).min(cols);
         }
 
-        lines.push(styled_line);
+        if next_column < cols {
+            push_blank_run(&mut runs, next_column, cols - next_column, default_style);
+            if let Some(cells) = cursor_cells.as_mut() {
+                append_blank_cells(cells, next_column, cols - next_column, default_style);
+            }
+        }
+
+        trim_trailing_default_runs(&mut runs, default_style, min_columns_to_keep);
+        if let Some(cells) = cursor_cells.as_mut() {
+            trim_trailing_default_cells(cells, default_style, min_columns_to_keep);
+        }
+
+        lines.push(TerminalStyledLine { runs });
+
+        if let Some(cells) = cursor_cells {
+            cursor_line = Some(TerminalCursorLine {
+                row: visible_row,
+                cells,
+            });
+        }
     });
 
     while lines.len() < rows {
-        lines.push(TerminalStyledLine::default());
+        let visible_row = lines.len();
+        let min_columns_to_keep = cursor_columns_to_keep(cursor, visible_row, cols);
+        let (line, blank_cursor_line) =
+            build_blank_line(default_style, min_columns_to_keep, visible_row, cursor_row);
+        lines.push(line);
+        if blank_cursor_line.is_some() {
+            cursor_line = blank_cursor_line;
+        }
     }
 
-    TerminalSnapshot { lines }
+    TerminalSnapshot {
+        lines,
+        cursor,
+        cursor_line,
+    }
 }
 
-fn push_segment(segments: &mut Vec<(String, TerminalStyle)>, text: String, style: TerminalStyle) {
-    if text.is_empty() {
+fn snapshot_cursor(terminal: &Terminal, rows: usize, cols: usize) -> Option<TerminalCursor> {
+    if rows == 0 || cols == 0 {
+        return None;
+    }
+
+    let cursor = terminal.cursor_pos();
+    if cursor.visibility != CursorVisibility::Visible {
+        return None;
+    }
+
+    let row = usize::try_from(cursor.y).ok()?;
+    if row >= rows {
+        return None;
+    }
+
+    let (shape, blinking) = map_cursor_shape(cursor.shape);
+    Some(TerminalCursor {
+        x: cursor.x.min(cols.saturating_sub(1)),
+        y: row,
+        shape,
+        blinking,
+    })
+}
+
+fn map_cursor_shape(shape: CursorShape) -> (TerminalCursorShape, bool) {
+    match shape {
+        CursorShape::Default | CursorShape::BlinkingBlock => (TerminalCursorShape::Block, true),
+        CursorShape::SteadyBlock => (TerminalCursorShape::Block, false),
+        CursorShape::BlinkingUnderline => (TerminalCursorShape::Underline, true),
+        CursorShape::SteadyUnderline => (TerminalCursorShape::Underline, false),
+        CursorShape::BlinkingBar => (TerminalCursorShape::Bar, true),
+        CursorShape::SteadyBar => (TerminalCursorShape::Bar, false),
+    }
+}
+
+fn cursor_columns_to_keep(
+    cursor: Option<TerminalCursor>,
+    visible_row: usize,
+    cols: usize,
+) -> usize {
+    cursor
+        .filter(|cursor| cursor.y == visible_row)
+        .map_or(0, |cursor| cursor.x.saturating_add(1).min(cols))
+}
+
+fn build_blank_line(
+    default_style: TerminalStyle,
+    min_columns_to_keep: usize,
+    visible_row: usize,
+    cursor_row: Option<usize>,
+) -> (TerminalStyledLine, Option<TerminalCursorLine>) {
+    let mut runs = Vec::new();
+    if min_columns_to_keep > 0 {
+        push_blank_run(&mut runs, 0, min_columns_to_keep, default_style);
+    }
+
+    let cursor_line = if min_columns_to_keep > 0 {
+        let mut cells = Vec::new();
+        append_blank_cells(&mut cells, 0, min_columns_to_keep, default_style);
+        Some(TerminalCursorLine {
+            row: visible_row,
+            cells,
+        })
+    } else {
+        Some(TerminalCursorLine {
+            row: visible_row,
+            cells: Vec::new(),
+        })
+    }
+    .filter(|_| cursor_row == Some(visible_row));
+
+    (TerminalStyledLine { runs }, cursor_line)
+}
+
+fn push_blank_run(
+    runs: &mut Vec<TerminalStyledRun>,
+    column: usize,
+    count: usize,
+    style: TerminalStyle,
+) {
+    if count == 0 {
+        return;
+    }
+    if let Some(previous_run) = runs.last_mut() {
+        let previous_end = previous_run
+            .column
+            .saturating_add(previous_run.display_width);
+        if previous_run.style == style && previous_run.is_blank() && previous_end == column {
+            previous_run.text.push_str(&" ".repeat(count));
+            previous_run.display_width += count;
+            return;
+        }
+    }
+    runs.push(TerminalStyledRun::blank(column, count, style));
+}
+
+fn push_run(
+    runs: &mut Vec<TerminalStyledRun>,
+    column: usize,
+    text: String,
+    display_width: usize,
+    style: TerminalStyle,
+) {
+    if display_width == 0 || text.is_empty() {
         return;
     }
 
-    if let Some((previous_text, previous_style)) = segments.last_mut() {
-        if *previous_style == style {
-            previous_text.push_str(&text);
+    if let Some(previous_run) = runs.last_mut() {
+        let previous_end = previous_run
+            .column
+            .saturating_add(previous_run.display_width);
+        if previous_run.style == style && previous_end == column {
+            previous_run.text.push_str(&text);
+            previous_run.display_width += display_width;
             return;
         }
     }
 
-    segments.push((text, style));
+    runs.push(TerminalStyledRun {
+        text,
+        style,
+        column,
+        display_width,
+    });
 }
 
-fn trim_trailing_default_spaces(
-    segments: &mut Vec<(String, TerminalStyle)>,
-    default: TerminalStyle,
+fn append_blank_cells(
+    cells: &mut Vec<TerminalStyledCell>,
+    start_column: usize,
+    count: usize,
+    style: TerminalStyle,
 ) {
-    loop {
-        let Some((text, style)) = segments.last_mut() else {
-            break;
-        };
+    for offset in 0..count {
+        cells.push(TerminalStyledCell::blank(start_column + offset, style));
+    }
+}
 
-        if *style != default {
+fn trim_trailing_default_runs(
+    runs: &mut Vec<TerminalStyledRun>,
+    default: TerminalStyle,
+    min_columns_to_keep: usize,
+) {
+    while let Some(run) = runs.last_mut() {
+        let run_end = run.column.saturating_add(run.display_width.max(1));
+        if run_end <= min_columns_to_keep {
             break;
         }
 
-        let trimmed_len = text.trim_end_matches(' ').len();
-        if trimmed_len == text.len() {
+        if run.style != default || !run.is_blank() {
             break;
         }
 
-        if trimmed_len == 0 {
-            segments.pop();
+        let keep_width = min_columns_to_keep.saturating_sub(run.column);
+        if keep_width == 0 {
+            runs.pop();
             continue;
         }
 
-        text.truncate(trimmed_len);
+        run.text.truncate(keep_width);
+        run.display_width = keep_width;
         break;
     }
+}
+
+fn trim_trailing_default_cells(
+    cells: &mut Vec<TerminalStyledCell>,
+    default: TerminalStyle,
+    min_columns_to_keep: usize,
+) {
+    while let Some(cell) = cells.last() {
+        let cell_end = cell.column.saturating_add(cell.display_width.max(1));
+        if cell_end <= min_columns_to_keep {
+            break;
+        }
+
+        if cell.style != default || cell.text != " " || cell.display_width != 1 {
+            break;
+        }
+
+        cells.pop();
+    }
+}
+
+fn rendered_cell_text(text: &str, display_width: usize) -> String {
+    let mut rendered = if text.is_empty() {
+        " ".to_owned()
+    } else {
+        text.to_owned()
+    };
+    if display_width > 1 {
+        rendered.push_str(&" ".repeat(display_width - 1));
+    }
+    rendered
 }
 
 fn resolve_style(attrs: &CellAttributes, palette: &ColorPalette) -> TerminalStyle {
@@ -579,8 +846,9 @@ fn io_error_from_anyhow(err: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_style, push_segment, sanitize_cell_text, snapshot_from_terminal,
-        trim_trailing_default_spaces, AdeTerminalConfig, TerminalColor, TerminalStyle,
+        default_style, sanitize_cell_text, snapshot_from_terminal, trim_trailing_default_cells,
+        AdeTerminalConfig, TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape,
+        TerminalStyle, TerminalStyledCell,
     };
     use std::sync::Arc;
     use tattoy_wezterm_term::color::ColorPalette;
@@ -602,56 +870,78 @@ mod tests {
             strike: false,
         };
         let default = default_style(&ColorPalette::default());
-        let mut segments = vec![
-            ("abc".to_owned(), style),
-            ("   ".to_owned(), default),
-            ("  ".to_owned(), default),
+        let mut cells = vec![
+            TerminalStyledCell {
+                text: "x".to_owned(),
+                style,
+                column: 0,
+                display_width: 1,
+            },
+            TerminalStyledCell::blank(1, default),
+            TerminalStyledCell::blank(2, default),
         ];
 
-        trim_trailing_default_spaces(&mut segments, default);
+        trim_trailing_default_cells(&mut cells, default, 1);
 
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].0, "abc");
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].column, 0);
     }
 
     #[test]
-    fn push_segment_merges_adjacent_styles() {
-        let style = TerminalStyle {
-            fg: TerminalColor {
-                r: 10,
-                g: 20,
-                b: 30,
-            },
-            bg: TerminalColor { r: 0, g: 0, b: 0 },
-            italic: false,
-            underline: false,
-            strike: false,
+    fn trimming_preserves_columns_reserved_for_cursor() {
+        let default = default_style(&ColorPalette::default());
+        let mut cells = vec![
+            TerminalStyledCell::blank(0, default),
+            TerminalStyledCell::blank(1, default),
+            TerminalStyledCell::blank(2, default),
+        ];
+
+        trim_trailing_default_cells(&mut cells, default, 2);
+
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[1].column, 1);
+    }
+
+    #[test]
+    fn wide_cells_pad_rendered_text_to_match_display_width() {
+        let style = default_style(&ColorPalette::default());
+        let cell = TerminalStyledCell {
+            text: "\u{4f60}".to_owned(),
+            style,
+            column: 0,
+            display_width: 2,
         };
 
-        let mut segments = Vec::new();
-        push_segment(&mut segments, "ab".to_owned(), style);
-        push_segment(&mut segments, "cd".to_owned(), style);
+        assert_eq!(cell.rendered_text(), "\u{4f60} ");
+    }
 
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].0, "abcd");
+    #[test]
+    fn snapshot_coalesces_adjacent_default_style_cells_into_single_run() {
+        let mut terminal = make_test_terminal(TerminalSize {
+            rows: 4,
+            cols: 10,
+            pixel_width: 80,
+            pixel_height: 64,
+            dpi: 96,
+        });
+        terminal.advance_bytes(b"abc\x1b[?25l");
+
+        let snapshot = snapshot_from_terminal(&terminal);
+
+        assert_eq!(snapshot.lines[0].runs.len(), 1);
+        assert_eq!(snapshot.lines[0].runs[0].text, "abc");
+        assert_eq!(snapshot.lines[0].runs[0].display_width, 3);
     }
 
     #[test]
     fn snapshot_preserves_ansi_foreground_color() {
-        let size = TerminalSize {
+        let mut terminal = make_test_terminal(TerminalSize {
             rows: 4,
             cols: 40,
             pixel_width: 320,
             pixel_height: 64,
             dpi: 96,
-        };
-        let mut terminal = Terminal::new(
-            size,
-            Arc::new(AdeTerminalConfig),
-            "test",
-            "0",
-            Box::new(std::io::sink()),
-        );
+        });
         terminal.advance_bytes(b"\x1b[31mRED\x1b[0m");
 
         let snapshot = snapshot_from_terminal(&terminal);
@@ -664,5 +954,101 @@ mod tests {
 
         assert!(red_run.style.fg.r > red_run.style.fg.g);
         assert!(red_run.style.fg.r > red_run.style.fg.b);
+    }
+
+    #[test]
+    fn snapshot_preserves_cursor_position_and_shape() {
+        let mut terminal = make_test_terminal(TerminalSize {
+            rows: 4,
+            cols: 10,
+            pixel_width: 80,
+            pixel_height: 64,
+            dpi: 96,
+        });
+        terminal.advance_bytes(b"\x1b[2;6H\x1b[6 q");
+
+        let snapshot = snapshot_from_terminal(&terminal);
+
+        assert_eq!(
+            snapshot.cursor,
+            Some(TerminalCursor {
+                x: 5,
+                y: 1,
+                shape: TerminalCursorShape::Bar,
+                blinking: false,
+            })
+        );
+        assert!(snapshot
+            .cursor_line
+            .as_ref()
+            .and_then(|line| line.cell_covering_column(5))
+            .is_some());
+    }
+
+    #[test]
+    fn snapshot_hides_cursor_when_terminal_requests_it() {
+        let mut terminal = make_test_terminal(TerminalSize {
+            rows: 4,
+            cols: 10,
+            pixel_width: 80,
+            pixel_height: 64,
+            dpi: 96,
+        });
+        terminal.advance_bytes(b"\x1b[?25l");
+
+        let snapshot = snapshot_from_terminal(&terminal);
+
+        assert_eq!(snapshot.cursor, None);
+    }
+
+    #[test]
+    fn snapshot_preserves_wide_cell_width() {
+        let mut terminal = make_test_terminal(TerminalSize {
+            rows: 4,
+            cols: 10,
+            pixel_width: 80,
+            pixel_height: 64,
+            dpi: 96,
+        });
+        terminal.advance_bytes("\u{4f60}".as_bytes());
+
+        let snapshot = snapshot_from_terminal(&terminal);
+        let first_run = &snapshot.lines[0].runs[0];
+
+        assert_eq!(first_run.display_width, 2);
+        assert_eq!(first_run.text, "\u{4f60} ");
+    }
+
+    #[test]
+    fn cursor_line_preserves_cell_level_details_for_cursor_row() {
+        let default = default_style(&ColorPalette::default());
+        let cursor_line = TerminalCursorLine {
+            row: 0,
+            cells: vec![
+                TerminalStyledCell::blank(0, default),
+                TerminalStyledCell {
+                    text: "\u{4f60}".to_owned(),
+                    style: default,
+                    column: 1,
+                    display_width: 2,
+                },
+            ],
+        };
+
+        let cell = cursor_line
+            .cell_covering_column(2)
+            .expect("expected wide cell");
+        assert_eq!(cell.column, 1);
+        assert_eq!(cell.display_width, 2);
+    }
+
+    fn make_test_terminal(size: TerminalSize) -> Terminal {
+        Terminal::new(
+            size,
+            Arc::new(AdeTerminalConfig),
+            "test",
+            "0",
+            Box::new(std::io::sink()),
+        )
     }
 }
