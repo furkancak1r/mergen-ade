@@ -26,7 +26,7 @@ use crate::terminal::{
     try_terminal_snapshot, TerminalColor, TerminalDimensions, TerminalRuntime, TerminalSnapshot,
     TerminalUiEvent, TerminalUiEventKind,
 };
-use crate::title::update_terminal_title;
+use crate::title::{terminal_title_text, update_terminal_title};
 
 const CELL_WIDTH_PX: f32 = 8.0;
 const CELL_HEIGHT_PX: f32 = 16.0;
@@ -229,6 +229,7 @@ struct TerminalEntry {
     project_id: u64,
     kind: TerminalKind,
     title: String,
+    full_title: String,
     pending_line_for_title: String,
     in_main_view: bool,
     dirty: bool,
@@ -422,7 +423,8 @@ impl AdeApp {
             id: terminal_id,
             project_id,
             kind,
-            title: fallback_title,
+            title: fallback_title.clone(),
+            full_title: fallback_title,
             pending_line_for_title: String::new(),
             in_main_view: true,
             dirty: true,
@@ -671,6 +673,7 @@ impl AdeApp {
                     if key == Key::Enter {
                         outbound.push(b'\r');
                         let line = std::mem::take(&mut terminal.pending_line_for_title);
+                        terminal.full_title = terminal_title_text(&line, terminal.id as usize);
                         terminal.title =
                             update_terminal_title(&line, terminal.id as usize, TITLE_MAX_LEN);
                         terminal.dirty = true;
@@ -1687,19 +1690,11 @@ impl AdeApp {
                     });
 
                     ui.separator();
-                    ui.label(
-                        RichText::new(format!("{} Foreground", icons::TERMINAL))
-                            .strong()
-                            .color(TEXT_MUTED),
-                    );
+                    draw_meta_kicker(ui, icons::TERMINAL, "Foreground");
                     self.draw_terminal_rows(ui, project_id, TerminalKind::Foreground);
 
                     ui.separator();
-                    ui.label(
-                        RichText::new(format!("{} Background", icons::LIST))
-                            .strong()
-                            .color(TEXT_MUTED),
-                    );
+                    draw_meta_kicker(ui, icons::LIST, "Background");
                     self.draw_terminal_rows(ui, project_id, TerminalKind::Background);
                 });
 
@@ -1763,11 +1758,7 @@ impl AdeApp {
 
                 ui.horizontal(|ui| {
                     let active = current_active == Some(terminal_entry_id);
-                    let label = if terminal.exited {
-                        format!("{} {} (Exited)", icons::TERMINAL, terminal.title)
-                    } else {
-                        format!("{} {}", icons::TERMINAL, terminal.title)
-                    };
+                    let label = terminal_display_label(&terminal.title, terminal.exited);
 
                     if ui.selectable_label(active, label).clicked() {
                         set_active = true;
@@ -1971,10 +1962,6 @@ impl AdeApp {
 
             let mut close_requested = false;
             let mut pane_clicked = false;
-            let kind_fill = match terminal.kind {
-                TerminalKind::Foreground => Color32::from_rgb(18, 90, 140),
-                TerminalKind::Background => Color32::from_rgb(110, 76, 20),
-            };
             let header_fill = if is_active {
                 Color32::from_rgb(28, 48, 68)
             } else {
@@ -1999,21 +1986,29 @@ impl AdeApp {
                     .show(ui, |ui| {
                         ui.set_min_height(TERMINAL_HEADER_HEIGHT - 12.0);
 
-                        let indicator = if is_active { "●" } else { "○" };
                         let indicator_color = if is_active { ACCENT } else { TEXT_MUTED };
-                        ui.label(RichText::new(indicator).color(indicator_color).size(10.0));
-                        let title = format!("{} {}", icons::TERMINAL, terminal.title);
+                        draw_terminal_header_dot(ui, indicator_color);
+                        ui.add_space(4.0);
+                        let title = terminal_display_label(&terminal.title, terminal.exited);
+                        let title_font = egui::TextStyle::Body.resolve(ui.style());
                         let title_response = ui.add(
                             egui::Label::new(RichText::new(title).color(TEXT_PRIMARY))
                                 .truncate()
                                 .sense(Sense::click()),
+                        );
+                        let title_response = with_truncation_tooltip(
+                            ui,
+                            title_response,
+                            &terminal.full_title,
+                            &title_font,
+                            TEXT_PRIMARY,
                         );
                         if title_response.clicked() {
                             pane_clicked = true;
                         }
 
                         ui.add_space(6.0);
-                        ui.label(RichText::new("│").color(BORDER_COLOR).size(12.0));
+                        draw_terminal_header_separator(ui);
                         ui.add_space(4.0);
                         ui.add(
                             egui::Label::new(
@@ -2023,24 +2018,26 @@ impl AdeApp {
                             .truncate(),
                         );
                         ui.add_space(4.0);
-                        ui.label(RichText::new("│").color(BORDER_COLOR).size(12.0));
+                        draw_terminal_header_separator(ui);
                         ui.add_space(4.0);
-                        egui::Frame::none()
-                            .fill(kind_fill)
-                            .rounding(6.0)
-                            .inner_margin(egui::Margin::symmetric(6.0, 2.0))
-                            .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new(terminal.kind.label())
-                                        .small()
-                                        .color(Color32::from_rgb(225, 243, 255)),
-                                );
-                            });
+                        ui.label(
+                            RichText::new(terminal.kind.label())
+                                .small()
+                                .strong()
+                                .color(with_alpha(TEXT_MUTED, 230)),
+                        );
                         if terminal.exited {
                             ui.colored_label(Color32::LIGHT_RED, "Exited");
                         }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if styled_pill_button(ui, icons::X, "Close", BTN_RED, BTN_RED_HOVER) {
+                            if styled_icon_button(
+                                ui,
+                                icons::X,
+                                BTN_RED,
+                                BTN_RED_HOVER,
+                                Color32::from_rgb(186, 58, 58),
+                                "Close",
+                            ) {
                                 close_requested = true;
                             }
                         });
@@ -2780,6 +2777,63 @@ fn with_alpha(color: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_premultiplied(r, g, b, alpha)
 }
 
+fn terminal_display_label(title: &str, exited: bool) -> String {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        if exited {
+            "Terminal (Exited)".to_owned()
+        } else {
+            "Terminal".to_owned()
+        }
+    } else if exited {
+        format!("{trimmed} (Exited)")
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn capped_hover_text(text: &str, max_chars: usize) -> String {
+    let mut result = String::new();
+    for (index, ch) in text.chars().enumerate() {
+        if index >= max_chars {
+            result.push('…');
+            break;
+        }
+        result.push(ch);
+    }
+    result
+}
+
+fn with_truncation_tooltip(
+    _ui: &Ui,
+    response: egui::Response,
+    text: &str,
+    _font_id: &FontId,
+    _color: Color32,
+) -> egui::Response {
+    if !text.trim().is_empty() {
+        response.on_hover_text(capped_hover_text(text, 500))
+    } else {
+        response
+    }
+}
+
+fn draw_terminal_header_dot(ui: &mut Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 12.0), Sense::hover());
+    ui.painter().circle_filled(rect.center(), 3.0, color);
+}
+
+fn draw_terminal_header_separator(ui: &mut Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(6.0, 14.0), Sense::hover());
+    ui.painter().line_segment(
+        [
+            egui::pos2(rect.center().x, rect.top()),
+            egui::pos2(rect.center().x, rect.bottom()),
+        ],
+        Stroke::new(1.0, with_alpha(BORDER_COLOR, 180)),
+    );
+}
+
 fn lerp_pos(a: egui::Pos2, b: egui::Pos2, t: f32) -> egui::Pos2 {
     egui::pos2(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
 }
@@ -2901,6 +2955,16 @@ fn styled_flat_section_header(ui: &mut Ui, label: &str, open: bool) -> egui::Res
     );
 
     response
+}
+
+fn draw_meta_kicker(ui: &mut Ui, icon: AppIcon, label: &str) {
+    let text = format!("{icon} {label}");
+    ui.label(
+        RichText::new(text)
+            .small()
+            .strong()
+            .color(with_alpha(TEXT_MUTED, 230)),
+    );
 }
 
 fn styled_pill_button(

@@ -1,11 +1,19 @@
-﻿pub fn update_terminal_title(input: &str, fallback_index: usize, max_len: usize) -> String {
+pub fn update_terminal_title(input: &str, fallback_index: usize, max_len: usize) -> String {
+    truncate_terminal_title(&terminal_title_text(input, fallback_index), max_len)
+}
+
+pub fn terminal_title_text(input: &str, fallback_index: usize) -> String {
     let compact = sanitize_input(input);
 
     if compact.is_empty() {
-        return format!("Terminal {fallback_index}");
+        format!("Terminal {fallback_index}")
+    } else {
+        compact
     }
+}
 
-    truncate_readable(&compact, max_len)
+pub fn truncate_terminal_title(input: &str, max_len: usize) -> String {
+    truncate_readable(input, max_len)
 }
 
 fn sanitize_input(input: &str) -> String {
@@ -69,5 +77,11 @@ mod tests {
         let title = update_terminal_title("terminal command sample", 1, 14);
         assert!(title.is_char_boundary(title.len()));
         assert!(title.chars().count() <= 14);
+    }
+
+    #[test]
+    fn keeps_full_terminal_title_text_without_truncation() {
+        let title = terminal_title_text("abcdefghijklmnopqrstuvwxyz0123456789XYZ", 1);
+        assert_eq!(title, "abcdefghijklmnopqrstuvwxyz0123456789XYZ");
     }
 }
