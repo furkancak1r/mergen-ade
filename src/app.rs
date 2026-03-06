@@ -1673,7 +1673,7 @@ impl AdeApp {
             return;
         }
 
-        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+        ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!("{} Terminal Manager", icons::TERMINAL_WINDOW))
                     .strong()
