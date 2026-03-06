@@ -470,21 +470,33 @@ fn snapshot_from_terminal(terminal: &Terminal) -> TerminalSnapshot {
         return TerminalSnapshot::default();
     }
 
-    let first_visible_row = screen.scrollback_rows().saturating_sub(rows);
+    let total_rows = screen.scrollback_rows().max(rows);
+    let viewport_top_row = total_rows.saturating_sub(rows);
     let default_style = default_style(&palette);
-    let cursor = snapshot_cursor(terminal, rows, cols);
+    let cursor = snapshot_cursor(terminal, rows, cols, viewport_top_row);
     let cursor_row = cursor.map(|cursor| cursor.y);
-    let mut lines = Vec::with_capacity(rows);
+    let mut lines = Vec::with_capacity(total_rows);
     let mut cursor_line = None;
 
     screen.for_each_phys_line(|row_index, line| {
-        if row_index < first_visible_row || lines.len() >= rows {
+        if row_index >= total_rows {
             return;
         }
 
-        let visible_row = lines.len();
-        let min_columns_to_keep = cursor_columns_to_keep(cursor, visible_row, cols);
-        let track_cursor_cells = cursor_row == Some(visible_row);
+        while lines.len() < row_index {
+            let snapshot_row = lines.len();
+            let min_columns_to_keep = cursor_columns_to_keep(cursor, snapshot_row, cols);
+            let (line, blank_cursor_line) =
+                build_blank_line(default_style, min_columns_to_keep, snapshot_row, cursor_row);
+            lines.push(line);
+            if blank_cursor_line.is_some() {
+                cursor_line = blank_cursor_line;
+            }
+        }
+
+        let snapshot_row = lines.len();
+        let min_columns_to_keep = cursor_columns_to_keep(cursor, snapshot_row, cols);
+        let track_cursor_cells = cursor_row == Some(snapshot_row);
         let mut cursor_cells = track_cursor_cells.then(Vec::new);
         let mut runs = Vec::new();
         let mut next_column = 0usize;
@@ -542,17 +554,17 @@ fn snapshot_from_terminal(terminal: &Terminal) -> TerminalSnapshot {
 
         if let Some(cells) = cursor_cells {
             cursor_line = Some(TerminalCursorLine {
-                row: visible_row,
+                row: snapshot_row,
                 cells,
             });
         }
     });
 
-    while lines.len() < rows {
-        let visible_row = lines.len();
-        let min_columns_to_keep = cursor_columns_to_keep(cursor, visible_row, cols);
+    while lines.len() < total_rows {
+        let snapshot_row = lines.len();
+        let min_columns_to_keep = cursor_columns_to_keep(cursor, snapshot_row, cols);
         let (line, blank_cursor_line) =
-            build_blank_line(default_style, min_columns_to_keep, visible_row, cursor_row);
+            build_blank_line(default_style, min_columns_to_keep, snapshot_row, cursor_row);
         lines.push(line);
         if blank_cursor_line.is_some() {
             cursor_line = blank_cursor_line;
@@ -566,7 +578,12 @@ fn snapshot_from_terminal(terminal: &Terminal) -> TerminalSnapshot {
     }
 }
 
-fn snapshot_cursor(terminal: &Terminal, rows: usize, cols: usize) -> Option<TerminalCursor> {
+fn snapshot_cursor(
+    terminal: &Terminal,
+    rows: usize,
+    cols: usize,
+    viewport_top_row: usize,
+) -> Option<TerminalCursor> {
     if rows == 0 || cols == 0 {
         return None;
     }
@@ -584,7 +601,7 @@ fn snapshot_cursor(terminal: &Terminal, rows: usize, cols: usize) -> Option<Term
     let (shape, blinking) = map_cursor_shape(cursor.shape);
     Some(TerminalCursor {
         x: cursor.x.min(cols.saturating_sub(1)),
-        y: row,
+        y: viewport_top_row.saturating_add(row),
         shape,
         blinking,
     })
@@ -935,6 +952,46 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_includes_scrollback_lines_in_history() {
+        let mut terminal = make_test_terminal(TerminalSize {
+            rows: 2,
+            cols: 12,
+            pixel_width: 96,
+            pixel_height: 32,
+            dpi: 96,
+        });
+        terminal.advance_bytes(b"first\r\nsecond\r\nthird");
+
+        let snapshot = snapshot_from_terminal(&terminal);
+
+        assert_eq!(snapshot_line_text(&snapshot.lines[0]), "first");
+        assert_eq!(snapshot_line_text(&snapshot.lines[1]), "second");
+        assert_eq!(snapshot_line_text(&snapshot.lines[2]), "third");
+    }
+
+    #[test]
+    fn snapshot_offsets_cursor_row_by_scrollback_history() {
+        let mut terminal = make_test_terminal(TerminalSize {
+            rows: 2,
+            cols: 12,
+            pixel_width: 96,
+            pixel_height: 32,
+            dpi: 96,
+        });
+        terminal.advance_bytes(b"first\r\nsecond\r\nthird");
+
+        let snapshot = snapshot_from_terminal(&terminal);
+        let cursor = snapshot.cursor.expect("expected cursor");
+
+        assert_eq!(cursor.y, 2);
+        assert_eq!(
+            snapshot.cursor_line.as_ref().map(|line| line.row),
+            Some(cursor.y)
+        );
+        assert_eq!(snapshot_line_text(&snapshot.lines[cursor.y]), "third");
+    }
+
+    #[test]
     fn snapshot_preserves_ansi_foreground_color() {
         let mut terminal = make_test_terminal(TerminalSize {
             rows: 4,
@@ -1074,5 +1131,14 @@ mod tests {
             "0",
             Box::new(std::io::sink()),
         )
+    }
+
+    fn snapshot_line_text(line: &super::TerminalStyledLine) -> String {
+        line.runs
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
     }
 }
