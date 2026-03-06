@@ -2850,22 +2850,23 @@ fn with_minimal_button_chrome<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)
         style.visuals.widgets.inactive.bg_fill = Color32::TRANSPARENT;
         style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
         style.visuals.widgets.inactive.bg_stroke = Stroke::NONE;
-        style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+        style.visuals.widgets.inactive.fg_stroke =
+            Stroke::new(1.0, with_alpha(TEXT_PRIMARY, 190));
 
-        style.visuals.widgets.hovered.bg_fill = with_alpha(BTN_ICON_HOVER, 58);
-        style.visuals.widgets.hovered.weak_bg_fill = with_alpha(BTN_ICON_HOVER, 58);
+        style.visuals.widgets.hovered.bg_fill = Color32::TRANSPARENT;
+        style.visuals.widgets.hovered.weak_bg_fill = Color32::TRANSPARENT;
         style.visuals.widgets.hovered.bg_stroke = Stroke::NONE;
         style.visuals.widgets.hovered.fg_stroke =
             Stroke::new(1.0, Color32::from_rgb(244, 249, 255));
 
-        style.visuals.widgets.active.bg_fill = with_alpha(ACCENT, 72);
-        style.visuals.widgets.active.weak_bg_fill = with_alpha(ACCENT, 72);
+        style.visuals.widgets.active.bg_fill = Color32::TRANSPARENT;
+        style.visuals.widgets.active.weak_bg_fill = Color32::TRANSPARENT;
         style.visuals.widgets.active.bg_stroke = Stroke::NONE;
         style.visuals.widgets.active.fg_stroke =
             Stroke::new(1.0, Color32::from_rgb(244, 249, 255));
 
-        style.visuals.widgets.open.bg_fill = with_alpha(ACCENT, 52);
-        style.visuals.widgets.open.weak_bg_fill = with_alpha(ACCENT, 52);
+        style.visuals.widgets.open.bg_fill = Color32::TRANSPARENT;
+        style.visuals.widgets.open.weak_bg_fill = Color32::TRANSPARENT;
         style.visuals.widgets.open.bg_stroke = Stroke::NONE;
         style.visuals.widgets.open.fg_stroke =
             Stroke::new(1.0, Color32::from_rgb(244, 249, 255));
@@ -2924,7 +2925,7 @@ fn styled_pill_button(
     } else if response.hovered() {
         with_alpha(hover_bg, 80)
     } else {
-        with_alpha(bg, 34)
+        with_alpha(bg, 48)
     };
     ui.painter().rect_filled(rect, 8.0, fill);
     ui.painter().galley(
@@ -2942,30 +2943,19 @@ fn styled_pill_button(
 fn styled_icon_button(
     ui: &mut Ui,
     icon: AppIcon,
-    bg: Color32,
-    hover_bg: Color32,
-    active_bg: Color32,
+    _bg: Color32,
+    _hover_bg: Color32,
+    _active_bg: Color32,
     tooltip: &str,
 ) -> bool {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT), Sense::click());
     let response = response.on_hover_text(tooltip);
 
-    let fill = if response.is_pointer_button_down_on() {
-        with_alpha(active_bg, 120)
-    } else if response.hovered() {
-        with_alpha(hover_bg, 78)
-    } else {
-        Color32::TRANSPARENT
-    };
-    if fill != Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect.shrink(1.0), 8.0, fill);
-    }
-
     let icon_color = if response.is_pointer_button_down_on() || response.hovered() {
         Color32::from_rgb(244, 249, 255)
     } else {
-        with_alpha(bg, 220)
+        with_alpha(TEXT_PRIMARY, 178)
     };
     ui.painter().text(
         rect.center(),
@@ -2983,32 +2973,10 @@ fn styled_icon_toggle(ui: &mut Ui, selected: bool, icon: AppIcon, tooltip: &str)
         ui.allocate_exact_size(egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT), Sense::click());
     let response = response.on_hover_text(tooltip);
 
-    let fill = if response.is_pointer_button_down_on() {
-        with_alpha(ACCENT, 98)
-    } else if selected {
-        with_alpha(ACCENT, 54)
-    } else if response.hovered() {
-        with_alpha(BTN_ICON_HOVER, 72)
-    } else {
-        Color32::TRANSPARENT
-    };
-    if fill != Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect.shrink(1.0), 8.0, fill);
-    }
-
-    if selected {
-        let indicator = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + 2.0, rect.top() + 6.0),
-            egui::pos2(rect.left() + 4.0, rect.bottom() - 6.0),
-        );
-        ui.painter()
-            .rect_filled(indicator, 2.0, with_alpha(ACCENT, 210));
-    }
-
     let icon_color = if selected || response.hovered() || response.is_pointer_button_down_on() {
         Color32::from_rgb(244, 249, 255)
     } else {
-        with_alpha(TEXT_PRIMARY, 194)
+        with_alpha(TEXT_PRIMARY, 170)
     };
     ui.painter().text(
         rect.center(),
