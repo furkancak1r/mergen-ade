@@ -1963,12 +1963,12 @@ impl AdeApp {
             let mut close_requested = false;
             let mut pane_clicked = false;
             let header_fill = if is_active {
-                Color32::from_rgb(28, 48, 68)
+                Color32::from_rgb(24, 36, 50)
             } else {
                 Color32::from_rgb(22, 32, 46)
             };
             let header_stroke = if is_active {
-                Stroke::new(1.5, ACCENT)
+                Stroke::new(1.0, Color32::from_rgb(58, 72, 90))
             } else {
                 Stroke::new(1.0, BORDER_COLOR)
             };
