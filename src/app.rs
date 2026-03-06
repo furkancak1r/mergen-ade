@@ -1155,18 +1155,20 @@ impl AdeApp {
                                     30.0 * 3.0 + ui.spacing().item_spacing.x * 2.0;
                                 let combo_width =
                                     (ui.available_width() - button_group_width).clamp(96.0, 150.0);
-                                egui::ComboBox::from_id_salt("directory-project-select")
-                                    .selected_text(selected_project_label)
-                                    .width(combo_width)
-                                    .show_ui(ui, |ui| {
-                                        for (project_id, project_name, _, _) in &project_rows {
-                                            ui.selectable_value(
-                                                &mut self.selected_project,
-                                                Some(*project_id),
-                                                format!("{} {}", icons::FOLDER, project_name),
-                                            );
-                                        }
-                                    });
+                                with_minimal_button_chrome(ui, |ui| {
+                                    egui::ComboBox::from_id_salt("directory-project-select")
+                                        .selected_text(selected_project_label)
+                                        .width(combo_width)
+                                        .show_ui(ui, |ui| {
+                                            for (project_id, project_name, _, _) in &project_rows {
+                                                ui.selectable_value(
+                                                    &mut self.selected_project,
+                                                    Some(*project_id),
+                                                    format!("{} {}", icons::FOLDER, project_name),
+                                                );
+                                            }
+                                        });
+                                });
 
                                 ui.add_enabled_ui(selected_project_details.is_some(), |ui| {
                                     if styled_icon_button(
@@ -1377,22 +1379,24 @@ impl AdeApp {
                                         let combo_width = (ui.available_width()
                                             - button_group_width)
                                             .clamp(96.0, 150.0);
-                                        egui::ComboBox::from_id_salt(
-                                            "source-control-project-select",
-                                        )
-                                        .selected_text(selected_project_label)
-                                        .width(combo_width)
-                                        .show_ui(ui, |ui| {
-                                            for (project_id, project_name) in &project_rows {
-                                                ui.selectable_value(
-                                                    &mut self.selected_project,
-                                                    Some(*project_id),
-                                                    format!(
-                                                        "{} {}",
-                                                        icons::FOLDER, project_name
-                                                    ),
-                                                );
-                                            }
+                                        with_minimal_button_chrome(ui, |ui| {
+                                            egui::ComboBox::from_id_salt(
+                                                "source-control-project-select",
+                                            )
+                                            .selected_text(selected_project_label)
+                                            .width(combo_width)
+                                            .show_ui(ui, |ui| {
+                                                for (project_id, project_name) in &project_rows {
+                                                    ui.selectable_value(
+                                                        &mut self.selected_project,
+                                                        Some(*project_id),
+                                                        format!(
+                                                            "{} {}",
+                                                            icons::FOLDER, project_name
+                                                        ),
+                                                    );
+                                                }
+                                            });
                                         });
 
                                         ui.add_enabled_ui(
@@ -1531,15 +1535,16 @@ impl AdeApp {
                                                     RichText::new(status_icon.to_string())
                                                         .color(TEXT_MUTED),
                                                 );
-                                                ui.label(
-                                                    RichText::new(format!(
-                                                        "{} {}",
-                                                        file.status, file.path
-                                                    ))
-                                                    .monospace()
-                                                    .small(),
-                                                )
-                                                .context_menu(|ui| {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{} {}",
+                                                    file.status, file.path
+                                                ))
+                                                .monospace()
+                                                .small(),
+                                            )
+                                            .context_menu(|ui| {
+                                                with_minimal_button_chrome(ui, |ui| {
                                                     if ui
                                                         .button(format!(
                                                             "{} Open in Folder",
@@ -1574,6 +1579,7 @@ impl AdeApp {
                                                             "Copied relative path".to_owned();
                                                         ui.close_menu();
                                                     }
+                                                });
                                                 });
                                             });
                                         }
@@ -1687,27 +1693,31 @@ impl AdeApp {
                 });
 
             header.header_response.context_menu(|ui| {
-                if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
-                    ui.ctx().copy_text(project_path.clone());
-                    self.status_line =
-                        format!("Copied path for project '{}'", project_snapshot.name);
-                    ui.close_menu();
-                }
-                if ui
-                    .button(format!("{} Open in Folder", icons::FOLDER_OPEN))
-                    .clicked()
-                {
-                    match open_in_file_explorer(&project_snapshot.path, false) {
-                        Ok(()) => {
-                            self.status_line =
-                                format!("Opened project '{}' in Explorer", project_snapshot.name);
-                        }
-                        Err(err) => {
-                            self.status_line = format!("Open folder failed: {err}");
-                        }
+                with_minimal_button_chrome(ui, |ui| {
+                    if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
+                        ui.ctx().copy_text(project_path.clone());
+                        self.status_line =
+                            format!("Copied path for project '{}'", project_snapshot.name);
+                        ui.close_menu();
                     }
-                    ui.close_menu();
-                }
+                    if ui
+                        .button(format!("{} Open in Folder", icons::FOLDER_OPEN))
+                        .clicked()
+                    {
+                        match open_in_file_explorer(&project_snapshot.path, false) {
+                            Ok(()) => {
+                                self.status_line = format!(
+                                    "Opened project '{}' in Explorer",
+                                    project_snapshot.name
+                                );
+                            }
+                            Err(err) => {
+                                self.status_line = format!("Open folder failed: {err}");
+                            }
+                        }
+                        ui.close_menu();
+                    }
+                });
             });
         }
 
@@ -1751,18 +1761,22 @@ impl AdeApp {
                         set_active = true;
                     }
 
-                    let message_menu = ui.menu_button(format!("{}", icons::CHAT_TEXT), |ui| {
-                        if saved_messages.is_empty() {
-                            ui.label(RichText::new("No saved messages").color(TEXT_MUTED));
-                            return;
-                        }
+                    let message_menu = with_minimal_button_chrome(ui, |ui| {
+                        ui.menu_button(format!("{}", icons::CHAT_TEXT), |ui| {
+                            with_minimal_button_chrome(ui, |ui| {
+                                if saved_messages.is_empty() {
+                                    ui.label(RichText::new("No saved messages").color(TEXT_MUTED));
+                                    return;
+                                }
 
-                        for message in &saved_messages {
-                            if ui.button(message).clicked() {
-                                send_message = Some(message.clone());
-                                ui.close_menu();
-                            }
-                        }
+                                for message in &saved_messages {
+                                    if ui.button(message).clicked() {
+                                        send_message = Some(message.clone());
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                        })
                     });
                     message_menu.response.on_hover_text("Send saved message");
 
@@ -2687,12 +2701,14 @@ fn draw_folder_tree(
                     );
                 });
             header.header_response.context_menu(|ui| {
-                if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
-                    let item_path_text = item.path.display().to_string();
-                    ui.ctx().copy_text(item_path_text.clone());
-                    *status_line_update = Some(format!("Copied path: {}", item_path_text));
-                    ui.close_menu();
-                }
+                with_minimal_button_chrome(ui, |ui| {
+                    if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
+                        let item_path_text = item.path.display().to_string();
+                        ui.ctx().copy_text(item_path_text.clone());
+                        *status_line_update = Some(format!("Copied path: {}", item_path_text));
+                        ui.close_menu();
+                    }
+                });
             });
         } else {
             let should_show_file = match search_query {
@@ -2705,12 +2721,14 @@ fn draw_folder_tree(
             rendered_any = true;
 
             ui.label(item.name.clone()).context_menu(|ui| {
-                if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
-                    let item_path_text = item.path.display().to_string();
-                    ui.ctx().copy_text(item_path_text.clone());
-                    *status_line_update = Some(format!("Copied path: {}", item_path_text));
-                    ui.close_menu();
-                }
+                with_minimal_button_chrome(ui, |ui| {
+                    if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
+                        let item_path_text = item.path.display().to_string();
+                        ui.ctx().copy_text(item_path_text.clone());
+                        *status_line_update = Some(format!("Copied path: {}", item_path_text));
+                        ui.close_menu();
+                    }
+                });
             });
         }
     }
@@ -2743,6 +2761,44 @@ fn collect_matching_directory_paths(
     has_match
 }
 
+fn with_alpha(color: Color32, alpha: u8) -> Color32 {
+    let [r, g, b, _] = color.to_array();
+    Color32::from_rgba_premultiplied(r, g, b, alpha)
+}
+
+fn with_minimal_button_chrome<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.scope(|ui| {
+        let style = ui.style_mut();
+        style.spacing.button_padding = egui::vec2(8.0, 5.0);
+
+        style.visuals.widgets.inactive.bg_fill = Color32::TRANSPARENT;
+        style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+        style.visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+        style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+
+        style.visuals.widgets.hovered.bg_fill = with_alpha(BTN_ICON_HOVER, 58);
+        style.visuals.widgets.hovered.weak_bg_fill = with_alpha(BTN_ICON_HOVER, 58);
+        style.visuals.widgets.hovered.bg_stroke = Stroke::NONE;
+        style.visuals.widgets.hovered.fg_stroke =
+            Stroke::new(1.0, Color32::from_rgb(244, 249, 255));
+
+        style.visuals.widgets.active.bg_fill = with_alpha(ACCENT, 72);
+        style.visuals.widgets.active.weak_bg_fill = with_alpha(ACCENT, 72);
+        style.visuals.widgets.active.bg_stroke = Stroke::NONE;
+        style.visuals.widgets.active.fg_stroke =
+            Stroke::new(1.0, Color32::from_rgb(244, 249, 255));
+
+        style.visuals.widgets.open.bg_fill = with_alpha(ACCENT, 52);
+        style.visuals.widgets.open.weak_bg_fill = with_alpha(ACCENT, 52);
+        style.visuals.widgets.open.bg_stroke = Stroke::NONE;
+        style.visuals.widgets.open.fg_stroke =
+            Stroke::new(1.0, Color32::from_rgb(244, 249, 255));
+
+        add_contents(ui)
+    })
+    .inner
+}
+
 fn styled_pill_button(
     ui: &mut Ui,
     icon: AppIcon,
@@ -2751,40 +2807,34 @@ fn styled_pill_button(
     hover_bg: Color32,
 ) -> bool {
     let text = format!("{} {}", icon, label);
-    let frame_response = egui::Frame::none()
-        .fill(bg)
-        .rounding(8.0)
-        .inner_margin(egui::Margin::symmetric(10.0, 5.0))
-        .show(ui, |ui| {
-            ui.add(
-                egui::Label::new(
-                    RichText::new(text)
-                        .color(Color32::from_rgb(230, 240, 255))
-                        .size(13.0),
-                )
-                .sense(Sense::click()),
-            )
-        });
-
-    let label_response = frame_response.inner;
-    let is_hovered = label_response.hovered() || frame_response.response.hovered();
-
-    // Repaint with hover color if hovered
-    if is_hovered {
-        ui.painter()
-            .rect_filled(frame_response.response.rect, 8.0, hover_bg);
-        // Re-draw text on top
-        let text_pos = frame_response.response.rect.min + egui::vec2(10.0, 5.0);
-        ui.painter().text(
-            text_pos,
-            egui::Align2::LEFT_TOP,
-            format!("{} {}", icon, label),
-            egui::FontId::proportional(13.0),
+    let galley = ui.fonts(|fonts| {
+        fonts.layout_no_wrap(
+            text.clone(),
+            FontId::proportional(13.0),
             Color32::from_rgb(230, 240, 255),
-        );
-    }
+        )
+    });
+    let size = egui::vec2(galley.size().x + 18.0, CONTROL_ROW_HEIGHT);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
 
-    label_response.clicked()
+    let fill = if response.is_pointer_button_down_on() {
+        with_alpha(hover_bg, 120)
+    } else if response.hovered() {
+        with_alpha(hover_bg, 80)
+    } else {
+        with_alpha(bg, 34)
+    };
+    ui.painter().rect_filled(rect, 8.0, fill);
+    ui.painter().galley(
+        egui::pos2(
+            rect.center().x - galley.size().x * 0.5,
+            rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        Color32::from_rgb(230, 240, 255),
+    );
+
+    response.clicked()
 }
 
 fn styled_icon_button(
@@ -2795,56 +2845,78 @@ fn styled_icon_button(
     active_bg: Color32,
     tooltip: &str,
 ) -> bool {
-    let button = egui::Button::new(
-        RichText::new(format!("{icon}"))
-            .size(15.0)
-            .color(Color32::from_rgb(230, 240, 255)),
-    )
-    .fill(bg)
-    .stroke(Stroke::new(1.0, BORDER_COLOR))
-    .rounding(8.0)
-    .min_size(egui::vec2(30.0, 28.0));
-    let response = ui.add(button).on_hover_text(tooltip);
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT), Sense::click());
+    let response = response.on_hover_text(tooltip);
 
-    if response.hovered() {
-        ui.painter().rect_filled(response.rect, 8.0, hover_bg);
-        ui.painter().text(
-            response.rect.center(),
-            egui::Align2::CENTER_CENTER,
-            format!("{icon}"),
-            egui::FontId::proportional(15.0),
-            Color32::from_rgb(230, 240, 255),
-        );
-    } else if response.is_pointer_button_down_on() {
-        ui.painter().rect_filled(response.rect, 8.0, active_bg);
-        ui.painter().text(
-            response.rect.center(),
-            egui::Align2::CENTER_CENTER,
-            format!("{icon}"),
-            egui::FontId::proportional(15.0),
-            Color32::from_rgb(230, 240, 255),
-        );
+    let fill = if response.is_pointer_button_down_on() {
+        with_alpha(active_bg, 120)
+    } else if response.hovered() {
+        with_alpha(hover_bg, 78)
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect.shrink(1.0), 8.0, fill);
     }
+
+    let icon_color = if response.is_pointer_button_down_on() || response.hovered() {
+        Color32::from_rgb(244, 249, 255)
+    } else {
+        with_alpha(bg, 220)
+    };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        format!("{icon}"),
+        egui::FontId::proportional(15.0),
+        icon_color,
+    );
 
     response.clicked()
 }
 
 fn styled_icon_toggle(ui: &mut Ui, selected: bool, icon: AppIcon, tooltip: &str) -> bool {
-    let (fill, stroke) = if selected {
-        (Color32::from_rgb(28, 108, 158), Stroke::new(1.0, ACCENT))
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT), Sense::click());
+    let response = response.on_hover_text(tooltip);
+
+    let fill = if response.is_pointer_button_down_on() {
+        with_alpha(ACCENT, 98)
+    } else if selected {
+        with_alpha(ACCENT, 54)
+    } else if response.hovered() {
+        with_alpha(BTN_ICON_HOVER, 72)
     } else {
-        (BTN_ICON, Stroke::new(1.0, Color32::from_rgb(64, 104, 138)))
+        Color32::TRANSPARENT
     };
-    let button = egui::Button::new(
-        RichText::new(format!("{icon}"))
-            .size(14.0)
-            .color(Color32::from_rgb(236, 244, 255)),
-    )
-    .fill(fill)
-    .stroke(stroke)
-    .rounding(8.0)
-    .min_size(egui::vec2(30.0, 28.0));
-    ui.add(button).on_hover_text(tooltip).clicked()
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect.shrink(1.0), 8.0, fill);
+    }
+
+    if selected {
+        let indicator = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 2.0, rect.top() + 6.0),
+            egui::pos2(rect.left() + 4.0, rect.bottom() - 6.0),
+        );
+        ui.painter()
+            .rect_filled(indicator, 2.0, with_alpha(ACCENT, 210));
+    }
+
+    let icon_color = if selected || response.hovered() || response.is_pointer_button_down_on() {
+        Color32::from_rgb(244, 249, 255)
+    } else {
+        with_alpha(TEXT_PRIMARY, 194)
+    };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        format!("{icon}"),
+        egui::FontId::proportional(14.0),
+        icon_color,
+    );
+
+    response.clicked()
 }
 
 fn build_terminal_layout_job(snapshot: &TerminalSnapshot, font_id: &FontId) -> LayoutJob {
