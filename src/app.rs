@@ -50,9 +50,6 @@ const ACCENT: Color32 = Color32::from_rgb(26, 179, 255);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(225, 233, 245);
 const TEXT_MUTED: Color32 = Color32::from_rgb(148, 167, 191);
 const PROJECT_EXPLORER_WIDTH: f32 = 320.0;
-const TERMINAL_MANAGER_DEFAULT_WIDTH: f32 = 280.0;
-const TERMINAL_MANAGER_MIN_WIDTH: f32 = 180.0;
-const TERMINAL_MANAGER_MAX_WIDTH: f32 = 620.0;
 const ACTIVITY_RAIL_WIDTH: f32 = 48.0;
 const CONTROL_ROW_HEIGHT: f32 = 28.0;
 
@@ -293,6 +290,8 @@ impl AdeApp {
     pub fn bootstrap(cc: &eframe::CreationContext<'_>) -> Self {
         let config_path = config::config_path().unwrap_or_else(|_| PathBuf::from("config.toml"));
         let mut config = config::load_config(&config_path).unwrap_or_default();
+        config.ui.show_project_explorer = true;
+        config.ui.show_terminal_manager = true;
         config.ui.main_visibility_mode = MainVisibilityMode::Global;
         config.ui.project_filter_mode = false;
         #[cfg(target_os = "windows")]
@@ -1034,7 +1033,7 @@ impl AdeApp {
     }
 
     fn draw_activity_rail(&mut self, ctx: &egui::Context) -> Option<egui::Rect> {
-        if !self.config.ui.show_project_explorer && !self.config.ui.show_terminal_manager {
+        if !self.config.ui.show_project_explorer {
             return None;
         }
 
@@ -1051,6 +1050,15 @@ impl AdeApp {
             )
             .show(ctx, |ui| {
                 let mut should_persist = false;
+                let directory_active = self.config.ui.show_project_explorer
+                    && self.config.ui.project_explorer_expanded
+                    && self.config.ui.left_sidebar_tab == LeftSidebarTab::Directory;
+                let source_control_active = self.config.ui.show_project_explorer
+                    && self.config.ui.project_explorer_expanded
+                    && self.config.ui.left_sidebar_tab == LeftSidebarTab::SourceControl;
+                let terminal_manager_active = self.config.ui.show_project_explorer
+                    && self.config.ui.project_explorer_expanded
+                    && self.config.ui.left_sidebar_tab == LeftSidebarTab::TerminalManager;
 
                 ui.vertical_centered(|ui| {
                     ui.add_space(4.0);
@@ -1058,28 +1066,55 @@ impl AdeApp {
                     if self.config.ui.show_project_explorer
                         && styled_icon_toggle(
                             ui,
-                            self.config.ui.project_explorer_expanded,
+                            directory_active,
                             icons::TREE_VIEW,
-                            "Toggle Project Explorer",
+                            "Open Directory",
                         )
                     {
-                        self.config.ui.project_explorer_expanded =
-                            !self.config.ui.project_explorer_expanded;
+                        self.config.ui.show_project_explorer = true;
+                        if directory_active {
+                            self.config.ui.project_explorer_expanded = false;
+                        } else {
+                            self.config.ui.project_explorer_expanded = true;
+                            self.config.ui.left_sidebar_tab = LeftSidebarTab::Directory;
+                        }
                         should_persist = true;
                     }
 
-                    if self.config.ui.show_terminal_manager {
+                    if self.config.ui.show_project_explorer {
                         ui.add_space(6.0);
                         if styled_icon_toggle(
                             ui,
-                            self.config.ui.terminal_manager_expanded,
-                            icons::TERMINAL_WINDOW,
-                            "Toggle Terminal Manager",
+                            source_control_active,
+                            icons::GIT_BRANCH,
+                            "Open Source Control",
                         ) {
-                            self.config.ui.terminal_manager_expanded =
-                                !self.config.ui.terminal_manager_expanded;
+                            self.config.ui.show_project_explorer = true;
+                            if source_control_active {
+                                self.config.ui.project_explorer_expanded = false;
+                            } else {
+                                self.config.ui.project_explorer_expanded = true;
+                                self.config.ui.left_sidebar_tab = LeftSidebarTab::SourceControl;
+                            }
                             should_persist = true;
                         }
+                    }
+
+                    ui.add_space(6.0);
+                    if styled_icon_toggle(
+                        ui,
+                        terminal_manager_active,
+                        icons::TERMINAL_WINDOW,
+                        "Open Terminal Manager",
+                    ) {
+                        self.config.ui.show_project_explorer = true;
+                        if terminal_manager_active {
+                            self.config.ui.project_explorer_expanded = false;
+                        } else {
+                            self.config.ui.project_explorer_expanded = true;
+                            self.config.ui.left_sidebar_tab = LeftSidebarTab::TerminalManager;
+                        }
+                        should_persist = true;
                     }
                 });
 
@@ -1111,42 +1146,40 @@ impl AdeApp {
                 let panel_right = ui.max_rect().right();
                 ui.set_width(ui.max_rect().width());
 
-                let previous_tab = self.config.ui.left_sidebar_tab;
+                let (panel_icon, panel_title) = match self.config.ui.left_sidebar_tab {
+                    LeftSidebarTab::Directory => (icons::TREE_VIEW, "Directory"),
+                    LeftSidebarTab::SourceControl => (icons::GIT_BRANCH, "Source Control"),
+                    LeftSidebarTab::TerminalManager => (icons::TERMINAL_WINDOW, "Terminal Manager"),
+                };
                 ui.horizontal(|ui| {
-                    if styled_icon_toggle(
-                        ui,
-                        self.config.ui.left_sidebar_tab == LeftSidebarTab::Directory,
-                        icons::TREE_VIEW,
-                        LeftSidebarTab::Directory.label(),
-                    ) {
-                        self.config.ui.left_sidebar_tab = LeftSidebarTab::Directory;
-                    }
-                    if styled_icon_toggle(
-                        ui,
-                        self.config.ui.left_sidebar_tab == LeftSidebarTab::SourceControl,
-                        icons::GIT_BRANCH,
-                        LeftSidebarTab::SourceControl.label(),
-                    ) {
-                        self.config.ui.left_sidebar_tab = LeftSidebarTab::SourceControl;
-                    }
-                    if self.config.ui.left_sidebar_tab == LeftSidebarTab::Directory
-                        && styled_icon_button(
-                            ui,
-                            icons::FOLDER_PLUS,
-                            BTN_TEAL,
-                            BTN_TEAL_HOVER,
-                            BTN_ICON_ACTIVE,
-                            "Add Project",
-                        )
-                    {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.add_project(path);
-                        }
+                    ui.label(
+                        RichText::new(format!("{panel_icon} {panel_title}"))
+                            .strong()
+                            .size(15.0)
+                            .color(TEXT_PRIMARY),
+                    );
+                    if self.config.ui.left_sidebar_tab == LeftSidebarTab::Directory {
+                        let remaining_width = ui.available_size_before_wrap().x.max(0.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(remaining_width, CONTROL_ROW_HEIGHT),
+                            Layout::right_to_left(Align::Center),
+                            |ui| {
+                                if styled_icon_button(
+                                    ui,
+                                    icons::FOLDER_PLUS,
+                                    BTN_TEAL,
+                                    BTN_TEAL_HOVER,
+                                    BTN_ICON_ACTIVE,
+                                    "Add Project",
+                                ) {
+                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                        self.add_project(path);
+                                    }
+                                }
+                            },
+                        );
                     }
                 });
-                if previous_tab != self.config.ui.left_sidebar_tab {
-                    self.persist_config();
-                }
                 ui.separator();
 
                 match self.config.ui.left_sidebar_tab {
@@ -1625,49 +1658,18 @@ impl AdeApp {
                                         }
                                     });
                     }
+                    LeftSidebarTab::TerminalManager => {
+                        self.draw_terminal_manager_contents(ctx, ui);
+                    }
                 }
                 ui.expand_to_include_x(panel_right);
             });
         response.map(|inner| inner.response.rect)
     }
 
-    fn draw_terminal_manager(&mut self, ctx: &egui::Context) -> Option<egui::Rect> {
-        if !self.config.ui.show_terminal_manager {
-            return None;
-        }
-
-        let response = egui::SidePanel::left("terminal_manager")
-            .resizable(true)
-            .min_width(TERMINAL_MANAGER_MIN_WIDTH)
-            .max_width(TERMINAL_MANAGER_MAX_WIDTH)
-            .default_width(TERMINAL_MANAGER_DEFAULT_WIDTH)
-            .show_separator_line(false)
-            .frame(
-                egui::Frame::none()
-                    .fill(SURFACE_BG)
-                    .stroke(Stroke::new(1.0, BORDER_COLOR))
-                    .rounding(8.0)
-                    .inner_margin(egui::Margin::same(10.0)),
-            )
-            .show_animated(ctx, self.config.ui.terminal_manager_expanded, |ui| {
-                self.draw_terminal_manager_contents(ctx, ui)
-            });
-
-        response.map(|inner| inner.response.rect)
-    }
-
     fn draw_terminal_manager_contents(&mut self, ctx: &egui::Context, ui: &mut Ui) {
         let panel_right = ui.max_rect().right();
         ui.set_width(ui.max_rect().width());
-
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("{} Terminal Manager", icons::TERMINAL_WINDOW))
-                    .strong()
-                    .size(15.0),
-            );
-        });
-        ui.separator();
 
         let mut project_ids = self.projects.keys().copied().collect::<Vec<_>>();
         project_ids.sort_unstable();
@@ -2473,15 +2475,9 @@ impl eframe::App for AdeApp {
         self.draw_top_bar(ctx);
         let activity_rect = self.draw_activity_rail(ctx);
         let explorer_rect = self.draw_project_explorer(ctx);
-        let terminal_rect = self.draw_terminal_manager(ctx);
         self.draw_main_area(ctx);
         if let (Some(activity_rect), Some(explorer_rect)) = (activity_rect, explorer_rect) {
             self.draw_sidebar_seam_fix(ctx, activity_rect, explorer_rect);
-        }
-        if let (Some(explorer_rect), Some(terminal_rect)) = (explorer_rect, terminal_rect) {
-            self.draw_sidebar_seam_fix(ctx, explorer_rect, terminal_rect);
-        } else if let (Some(activity_rect), Some(terminal_rect)) = (activity_rect, terminal_rect) {
-            self.draw_sidebar_seam_fix(ctx, activity_rect, terminal_rect);
         }
         self.draw_settings_popup(ctx);
 

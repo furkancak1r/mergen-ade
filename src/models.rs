@@ -74,15 +74,7 @@ pub enum LeftSidebarTab {
     #[default]
     Directory,
     SourceControl,
-}
-
-impl LeftSidebarTab {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Directory => "Directory",
-            Self::SourceControl => "Source Control",
-        }
-    }
+    TerminalManager,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
