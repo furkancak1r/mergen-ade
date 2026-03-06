@@ -50,6 +50,9 @@ const ACCENT: Color32 = Color32::from_rgb(26, 179, 255);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(225, 233, 245);
 const TEXT_MUTED: Color32 = Color32::from_rgb(148, 167, 191);
 const PROJECT_EXPLORER_WIDTH: f32 = 320.0;
+const PROJECT_EXPLORER_COLLAPSED_WIDTH: f32 = 46.0;
+const PROJECT_EXPLORER_HEADER_REVEAL_THRESHOLD: f32 = 0.46;
+const PROJECT_EXPLORER_CONTENT_REVEAL_THRESHOLD: f32 = 0.72;
 
 // Pill button palette
 const BTN_BLUE: Color32 = Color32::from_rgb(16, 64, 112);
@@ -206,6 +209,10 @@ pub struct AdeApp {
     status_line: String,
     layout_epoch: u64,
     theme_initialized: bool,
+    #[cfg(target_os = "windows")]
+    window_hwnd: Option<isize>,
+    #[cfg(target_os = "windows")]
+    window_layout_passes_remaining: u8,
     source_control_events_tx: Sender<SourceControlEvent>,
     source_control_events_rx: Receiver<SourceControlEvent>,
     source_control_state: BTreeMap<u64, SourceControlSnapshot>,
@@ -276,11 +283,13 @@ struct DirectoryIndexEvent {
 }
 
 impl AdeApp {
-    pub fn bootstrap() -> Self {
+    pub fn bootstrap(cc: &eframe::CreationContext<'_>) -> Self {
         let config_path = config::config_path().unwrap_or_else(|_| PathBuf::from("config.toml"));
         let mut config = config::load_config(&config_path).unwrap_or_default();
         config.ui.main_visibility_mode = MainVisibilityMode::Global;
         config.ui.project_filter_mode = false;
+        #[cfg(target_os = "windows")]
+        let window_hwnd = Self::extract_window_hwnd(cc);
 
         let projects = config
             .projects
@@ -300,7 +309,7 @@ impl AdeApp {
         let (source_control_events_tx, source_control_events_rx) = crossbeam_channel::unbounded();
         let (directory_index_events_tx, directory_index_events_rx) = crossbeam_channel::unbounded();
 
-        Self {
+        let app = Self {
             config_path,
             config,
             projects,
@@ -317,6 +326,10 @@ impl AdeApp {
             status_line: "Ready".to_owned(),
             layout_epoch: 0,
             theme_initialized: false,
+            #[cfg(target_os = "windows")]
+            window_hwnd,
+            #[cfg(target_os = "windows")]
+            window_layout_passes_remaining: 8,
             source_control_events_tx,
             source_control_events_rx,
             source_control_state: BTreeMap::new(),
@@ -324,7 +337,8 @@ impl AdeApp {
             directory_index_events_rx,
             directory_index_state: BTreeMap::new(),
             directory_index_generation: BTreeMap::new(),
-        }
+        };
+        app
     }
 
     fn persist_config(&mut self) {
@@ -785,6 +799,56 @@ impl AdeApp {
         self.theme_initialized = true;
     }
 
+    #[cfg(target_os = "windows")]
+    fn extract_window_hwnd(cc: &eframe::CreationContext<'_>) -> Option<isize> {
+        use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+        let Ok(window_handle) = cc.window_handle() else {
+            return None;
+        };
+        let RawWindowHandle::Win32(handle) = window_handle.as_raw() else {
+            return None;
+        };
+
+        Some(handle.hwnd.get())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn apply_initial_window_bounds(&mut self, ctx: &egui::Context) {
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_MAXIMIZE};
+
+        if self.window_layout_passes_remaining == 0 {
+            return;
+        }
+        let Some(hwnd_value) = self.window_hwnd else {
+            self.window_layout_passes_remaining = 0;
+            return;
+        };
+
+        let hwnd = hwnd_value as HWND;
+        if hwnd.is_null() {
+            self.window_layout_passes_remaining = 0;
+            return;
+        }
+
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+        }
+
+        self.window_layout_passes_remaining = self.window_layout_passes_remaining.saturating_sub(1);
+        if self.window_layout_passes_remaining > 0 {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn extract_window_hwnd(_cc: &eframe::CreationContext<'_>) -> Option<isize> {
+        None
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn apply_initial_window_bounds(&mut self, _ctx: &egui::Context) {}
+
     fn append_pending_line(pending: &mut String, text: &str) {
         for ch in text.chars() {
             if ch == '\r' || ch == '\n' {
@@ -934,9 +998,17 @@ impl AdeApp {
             return None;
         }
 
+        let is_expanded = self.config.ui.project_explorer_expanded;
+        let expansion = ctx.animate_bool_responsive(egui::Id::new("project_explorer_expand"), is_expanded);
+        if expansion > 0.0 && expansion < 1.0 {
+            ctx.request_repaint();
+        }
+        let panel_width =
+            egui::lerp(PROJECT_EXPLORER_COLLAPSED_WIDTH..=PROJECT_EXPLORER_WIDTH, expansion);
+
         let response = egui::SidePanel::left("project_explorer")
             .resizable(false)
-            .exact_width(PROJECT_EXPLORER_WIDTH)
+            .exact_width(panel_width)
             .show_separator_line(false)
             .frame(
                 egui::Frame::none()
@@ -948,8 +1020,37 @@ impl AdeApp {
             .show(ctx, |ui| {
                 let panel_right = ui.max_rect().right();
                 ui.set_width(ui.max_rect().width());
+                let toggle_symbol = if is_expanded { "<" } else { ">" };
+                let toggle_tooltip = if is_expanded {
+                    "Collapse Directory Panel"
+                } else {
+                    "Expand Directory Panel"
+                };
+                let mut should_persist = false;
+
+                if expansion <= PROJECT_EXPLORER_HEADER_REVEAL_THRESHOLD {
+                    ui.vertical_centered(|ui| {
+                        if styled_symbol_button(
+                            ui,
+                            toggle_symbol,
+                            BTN_SUBTLE,
+                            BTN_SUBTLE_HOVER,
+                            BTN_ICON_ACTIVE,
+                            toggle_tooltip,
+                        ) {
+                            self.config.ui.project_explorer_expanded = !is_expanded;
+                            should_persist = true;
+                        }
+                    });
+                    if should_persist {
+                        self.persist_config();
+                    }
+                    ui.expand_to_include_x(panel_right);
+                    return;
+                }
+
                 let previous_tab = self.config.ui.left_sidebar_tab;
-                ui.horizontal_wrapped(|ui| {
+                ui.horizontal(|ui| {
                     if styled_icon_toggle(
                         ui,
                         self.config.ui.left_sidebar_tab == LeftSidebarTab::Directory,
@@ -980,9 +1081,35 @@ impl AdeApp {
                             self.add_project(path);
                         }
                     }
+
+                    let remaining_width = ui.available_size_before_wrap().x.max(0.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(remaining_width, 28.0),
+                        Layout::right_to_left(Align::Center),
+                        |ui| {
+                            if styled_symbol_button(
+                                ui,
+                                toggle_symbol,
+                                BTN_SUBTLE,
+                                BTN_SUBTLE_HOVER,
+                                BTN_ICON_ACTIVE,
+                                toggle_tooltip,
+                            ) {
+                                self.config.ui.project_explorer_expanded = !is_expanded;
+                                should_persist = true;
+                            }
+                        },
+                    );
                 });
                 if previous_tab != self.config.ui.left_sidebar_tab {
+                    should_persist = true;
+                }
+                if should_persist {
                     self.persist_config();
+                }
+                if expansion <= PROJECT_EXPLORER_CONTENT_REVEAL_THRESHOLD {
+                    ui.expand_to_include_x(panel_right);
+                    return;
                 }
                 ui.separator();
 
@@ -2167,6 +2294,7 @@ impl AdeApp {
 impl eframe::App for AdeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ensure_theme_initialized(ctx);
+        self.apply_initial_window_bounds(ctx);
         self.process_terminal_events(ctx);
         self.process_source_control_events(ctx);
         self.process_directory_index_events(ctx);
@@ -2641,6 +2769,48 @@ fn styled_icon_button(
             response.rect.center(),
             egui::Align2::CENTER_CENTER,
             format!("{icon}"),
+            egui::FontId::proportional(15.0),
+            Color32::from_rgb(230, 240, 255),
+        );
+    }
+
+    response.clicked()
+}
+
+fn styled_symbol_button(
+    ui: &mut Ui,
+    symbol: &str,
+    bg: Color32,
+    hover_bg: Color32,
+    active_bg: Color32,
+    tooltip: &str,
+) -> bool {
+    let button = egui::Button::new(
+        RichText::new(symbol)
+            .size(15.0)
+            .color(Color32::from_rgb(230, 240, 255)),
+    )
+    .fill(bg)
+    .stroke(Stroke::new(1.0, BORDER_COLOR))
+    .rounding(8.0)
+    .min_size(egui::vec2(30.0, 28.0));
+    let response = ui.add(button).on_hover_text(tooltip);
+
+    if response.hovered() {
+        ui.painter().rect_filled(response.rect, 8.0, hover_bg);
+        ui.painter().text(
+            response.rect.center(),
+            egui::Align2::CENTER_CENTER,
+            symbol,
+            egui::FontId::proportional(15.0),
+            Color32::from_rgb(230, 240, 255),
+        );
+    } else if response.is_pointer_button_down_on() {
+        ui.painter().rect_filled(response.rect, 8.0, active_bg);
+        ui.painter().text(
+            response.rect.center(),
+            egui::Align2::CENTER_CENTER,
+            symbol,
             egui::FontId::proportional(15.0),
             Color32::from_rgb(230, 240, 255),
         );

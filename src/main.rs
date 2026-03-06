@@ -14,9 +14,11 @@ fn main() -> Result<(), eframe::Error> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1500.0, 900.0])
+            .with_inner_size([1600.0, 980.0])
             .with_min_inner_size([980.0, 620.0])
+            .with_clamp_size_to_monitor_size(true)
             .with_title("Mergen ADE"),
+        centered: true,
         persist_window: false,
         ..Default::default()
     };
@@ -24,6 +26,6 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "Mergen ADE",
         options,
-        Box::new(|_cc| Ok(Box::new(app::AdeApp::bootstrap()))),
+        Box::new(|cc| Ok(Box::new(app::AdeApp::bootstrap(cc)))),
     )
 }
