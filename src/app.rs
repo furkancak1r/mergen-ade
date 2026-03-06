@@ -964,7 +964,7 @@ impl AdeApp {
                     .inner_margin(egui::Margin::symmetric(10.0, 8.0)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.label(
                         RichText::new(format!("{}  Mergen ADE", icons::TERMINAL_WINDOW))
                             .strong()
@@ -1772,8 +1772,12 @@ impl AdeApp {
                 let visible_ids = self.visible_terminal_ids_for_main();
 
                 if visible_ids.is_empty() {
-                    ui.centered_and_justified(|ui| {
-                        ui.vertical_centered(|ui| {
+                    let empty_state_rect = ui.available_rect_before_wrap();
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(empty_state_rect)
+                            .layout(Layout::centered_and_justified(egui::Direction::TopDown)),
+                        |ui| {
                             ui.label(
                                 RichText::new(format!("{}  No visible terminals", icons::TERMINAL))
                                     .size(20.0)
@@ -1783,8 +1787,9 @@ impl AdeApp {
                                 RichText::new("Select a project, then use New FG/New BG to start.")
                                     .color(TEXT_MUTED),
                             );
-                        });
-                    });
+                        },
+                    );
+                    ui.allocate_rect(empty_state_rect, Sense::hover());
                     return;
                 }
 
