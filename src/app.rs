@@ -50,13 +50,10 @@ const ACCENT: Color32 = Color32::from_rgb(26, 179, 255);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(225, 233, 245);
 const TEXT_MUTED: Color32 = Color32::from_rgb(148, 167, 191);
 const PROJECT_EXPLORER_WIDTH: f32 = 320.0;
-const PROJECT_EXPLORER_COLLAPSED_WIDTH: f32 = 46.0;
-const PROJECT_EXPLORER_HEADER_REVEAL_THRESHOLD: f32 = 0.46;
-const PROJECT_EXPLORER_CONTENT_REVEAL_THRESHOLD: f32 = 0.72;
-const TERMINAL_MANAGER_COLLAPSED_WIDTH: f32 = 46.0;
 const TERMINAL_MANAGER_DEFAULT_WIDTH: f32 = 280.0;
 const TERMINAL_MANAGER_MIN_WIDTH: f32 = 180.0;
 const TERMINAL_MANAGER_MAX_WIDTH: f32 = 620.0;
+const ACTIVITY_RAIL_WIDTH: f32 = 48.0;
 const CONTROL_ROW_HEIGHT: f32 = 28.0;
 
 // Pill button palette
@@ -998,22 +995,72 @@ impl AdeApp {
             });
     }
 
+    fn draw_activity_rail(&mut self, ctx: &egui::Context) -> Option<egui::Rect> {
+        if !self.config.ui.show_project_explorer && !self.config.ui.show_terminal_manager {
+            return None;
+        }
+
+        let response = egui::SidePanel::left("activity_rail")
+            .resizable(false)
+            .exact_width(ACTIVITY_RAIL_WIDTH)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::none()
+                    .fill(SURFACE_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .rounding(8.0)
+                    .inner_margin(egui::Margin::same(8.0)),
+            )
+            .show(ctx, |ui| {
+                let mut should_persist = false;
+
+                ui.vertical_centered(|ui| {
+                    ui.add_space(4.0);
+
+                    if self.config.ui.show_project_explorer
+                        && styled_icon_toggle(
+                            ui,
+                            self.config.ui.project_explorer_expanded,
+                            icons::TREE_VIEW,
+                            "Toggle Project Explorer",
+                        )
+                    {
+                        self.config.ui.project_explorer_expanded =
+                            !self.config.ui.project_explorer_expanded;
+                        should_persist = true;
+                    }
+
+                    if self.config.ui.show_terminal_manager {
+                        ui.add_space(6.0);
+                        if styled_icon_toggle(
+                            ui,
+                            self.config.ui.terminal_manager_expanded,
+                            icons::TERMINAL_WINDOW,
+                            "Toggle Terminal Manager",
+                        ) {
+                            self.config.ui.terminal_manager_expanded =
+                                !self.config.ui.terminal_manager_expanded;
+                            should_persist = true;
+                        }
+                    }
+                });
+
+                if should_persist {
+                    self.persist_config();
+                }
+            });
+
+        Some(response.response.rect)
+    }
+
     fn draw_project_explorer(&mut self, ctx: &egui::Context) -> Option<egui::Rect> {
         if !self.config.ui.show_project_explorer {
             return None;
         }
 
-        let is_expanded = self.config.ui.project_explorer_expanded;
-        let expansion = ctx.animate_bool_responsive(egui::Id::new("project_explorer_expand"), is_expanded);
-        if expansion > 0.0 && expansion < 1.0 {
-            ctx.request_repaint();
-        }
-        let panel_width =
-            egui::lerp(PROJECT_EXPLORER_COLLAPSED_WIDTH..=PROJECT_EXPLORER_WIDTH, expansion);
-
         let response = egui::SidePanel::left("project_explorer")
             .resizable(false)
-            .exact_width(panel_width)
+            .exact_width(PROJECT_EXPLORER_WIDTH)
             .show_separator_line(false)
             .frame(
                 egui::Frame::none()
@@ -1022,37 +1069,9 @@ impl AdeApp {
                     .rounding(8.0)
                     .inner_margin(egui::Margin::same(10.0)),
             )
-            .show(ctx, |ui| {
+            .show_animated(ctx, self.config.ui.project_explorer_expanded, |ui| {
                 let panel_right = ui.max_rect().right();
                 ui.set_width(ui.max_rect().width());
-                let toggle_symbol = if is_expanded { "<" } else { ">" };
-                let toggle_tooltip = if is_expanded {
-                    "Collapse Directory Panel"
-                } else {
-                    "Expand Directory Panel"
-                };
-                let mut should_persist = false;
-
-                if expansion <= PROJECT_EXPLORER_HEADER_REVEAL_THRESHOLD {
-                    ui.vertical_centered(|ui| {
-                        if styled_symbol_button(
-                            ui,
-                            toggle_symbol,
-                            BTN_SUBTLE,
-                            BTN_SUBTLE_HOVER,
-                            BTN_ICON_ACTIVE,
-                            toggle_tooltip,
-                        ) {
-                            self.config.ui.project_explorer_expanded = !is_expanded;
-                            should_persist = true;
-                        }
-                    });
-                    if should_persist {
-                        self.persist_config();
-                    }
-                    ui.expand_to_include_x(panel_right);
-                    return;
-                }
 
                 let previous_tab = self.config.ui.left_sidebar_tab;
                 ui.horizontal(|ui| {
@@ -1086,35 +1105,9 @@ impl AdeApp {
                             self.add_project(path);
                         }
                     }
-
-                    let remaining_width = ui.available_size_before_wrap().x.max(0.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(remaining_width, 28.0),
-                        Layout::right_to_left(Align::Center),
-                        |ui| {
-                            if styled_symbol_button(
-                                ui,
-                                toggle_symbol,
-                                BTN_SUBTLE,
-                                BTN_SUBTLE_HOVER,
-                                BTN_ICON_ACTIVE,
-                                toggle_tooltip,
-                            ) {
-                                self.config.ui.project_explorer_expanded = !is_expanded;
-                                should_persist = true;
-                            }
-                        },
-                    );
                 });
                 if previous_tab != self.config.ui.left_sidebar_tab {
-                    should_persist = true;
-                }
-                if should_persist {
                     self.persist_config();
-                }
-                if expansion <= PROJECT_EXPLORER_CONTENT_REVEAL_THRESHOLD {
-                    ui.expand_to_include_x(panel_right);
-                    return;
                 }
                 ui.separator();
 
@@ -1589,7 +1582,7 @@ impl AdeApp {
                 }
                 ui.expand_to_include_x(panel_right);
             });
-        Some(response.response.rect)
+        response.map(|inner| inner.response.rect)
     }
 
     fn draw_terminal_manager(&mut self, ctx: &egui::Context) -> Option<egui::Rect> {
@@ -1597,19 +1590,7 @@ impl AdeApp {
             return None;
         }
 
-        let is_expanded = self.config.ui.terminal_manager_expanded;
-        let collapsed_panel = egui::SidePanel::left("terminal_manager_collapsed")
-            .resizable(false)
-            .exact_width(TERMINAL_MANAGER_COLLAPSED_WIDTH)
-            .show_separator_line(false)
-            .frame(
-                egui::Frame::none()
-                    .fill(SURFACE_BG)
-                    .stroke(Stroke::new(1.0, BORDER_COLOR))
-                    .rounding(8.0)
-                    .inner_margin(egui::Margin::same(10.0)),
-            );
-        let expanded_panel = egui::SidePanel::left("terminal_manager")
+        let response = egui::SidePanel::left("terminal_manager")
             .resizable(true)
             .min_width(TERMINAL_MANAGER_MIN_WIDTH)
             .max_width(TERMINAL_MANAGER_MAX_WIDTH)
@@ -1621,57 +1602,17 @@ impl AdeApp {
                     .stroke(Stroke::new(1.0, BORDER_COLOR))
                     .rounding(8.0)
                     .inner_margin(egui::Margin::same(10.0)),
-            );
-
-        let response = egui::SidePanel::show_animated_between(
-            ctx,
-            is_expanded,
-            collapsed_panel,
-            expanded_panel,
-            |ui, expansion| self.draw_terminal_manager_contents(ctx, ui, expansion, is_expanded),
-        );
+            )
+            .show_animated(ctx, self.config.ui.terminal_manager_expanded, |ui| {
+                self.draw_terminal_manager_contents(ctx, ui)
+            });
 
         response.map(|inner| inner.response.rect)
     }
 
-    fn draw_terminal_manager_contents(
-        &mut self,
-        ctx: &egui::Context,
-        ui: &mut Ui,
-        expansion: f32,
-        is_expanded: bool,
-    ) {
+    fn draw_terminal_manager_contents(&mut self, ctx: &egui::Context, ui: &mut Ui) {
         let panel_right = ui.max_rect().right();
         ui.set_width(ui.max_rect().width());
-
-        let toggle_symbol = if is_expanded { "<" } else { ">" };
-        let toggle_tooltip = if is_expanded {
-            "Collapse Terminal Manager"
-        } else {
-            "Expand Terminal Manager"
-        };
-        let mut should_persist = false;
-
-        if expansion <= PROJECT_EXPLORER_HEADER_REVEAL_THRESHOLD {
-            ui.vertical_centered(|ui| {
-                if styled_symbol_button(
-                    ui,
-                    toggle_symbol,
-                    BTN_SUBTLE,
-                    BTN_SUBTLE_HOVER,
-                    BTN_ICON_ACTIVE,
-                    toggle_tooltip,
-                ) {
-                    self.config.ui.terminal_manager_expanded = !is_expanded;
-                    should_persist = true;
-                }
-            });
-            if should_persist {
-                self.persist_config();
-            }
-            ui.expand_to_include_x(panel_right);
-            return;
-        }
 
         ui.horizontal(|ui| {
             ui.label(
@@ -1679,33 +1620,7 @@ impl AdeApp {
                     .strong()
                     .size(15.0),
             );
-
-            let remaining_width = ui.available_size_before_wrap().x.max(0.0);
-            ui.allocate_ui_with_layout(
-                egui::vec2(remaining_width, CONTROL_ROW_HEIGHT),
-                Layout::right_to_left(Align::Center),
-                |ui| {
-                    if styled_symbol_button(
-                        ui,
-                        toggle_symbol,
-                        BTN_SUBTLE,
-                        BTN_SUBTLE_HOVER,
-                        BTN_ICON_ACTIVE,
-                        toggle_tooltip,
-                    ) {
-                        self.config.ui.terminal_manager_expanded = !is_expanded;
-                        should_persist = true;
-                    }
-                },
-            );
         });
-        if should_persist {
-            self.persist_config();
-        }
-        if expansion <= PROJECT_EXPLORER_CONTENT_REVEAL_THRESHOLD {
-            ui.expand_to_include_x(panel_right);
-            return;
-        }
         ui.separator();
 
         let mut project_ids = self.projects.keys().copied().collect::<Vec<_>>();
@@ -2433,11 +2348,17 @@ impl eframe::App for AdeApp {
         self.handle_shortcuts(ctx);
 
         self.draw_top_bar(ctx);
+        let activity_rect = self.draw_activity_rail(ctx);
         let explorer_rect = self.draw_project_explorer(ctx);
         let terminal_rect = self.draw_terminal_manager(ctx);
         self.draw_main_area(ctx);
+        if let (Some(activity_rect), Some(explorer_rect)) = (activity_rect, explorer_rect) {
+            self.draw_sidebar_seam_fix(ctx, activity_rect, explorer_rect);
+        }
         if let (Some(explorer_rect), Some(terminal_rect)) = (explorer_rect, terminal_rect) {
             self.draw_sidebar_seam_fix(ctx, explorer_rect, terminal_rect);
+        } else if let (Some(activity_rect), Some(terminal_rect)) = (activity_rect, terminal_rect) {
+            self.draw_sidebar_seam_fix(ctx, activity_rect, terminal_rect);
         }
         self.draw_settings_popup(ctx);
 
@@ -2900,48 +2821,6 @@ fn styled_icon_button(
             response.rect.center(),
             egui::Align2::CENTER_CENTER,
             format!("{icon}"),
-            egui::FontId::proportional(15.0),
-            Color32::from_rgb(230, 240, 255),
-        );
-    }
-
-    response.clicked()
-}
-
-fn styled_symbol_button(
-    ui: &mut Ui,
-    symbol: &str,
-    bg: Color32,
-    hover_bg: Color32,
-    active_bg: Color32,
-    tooltip: &str,
-) -> bool {
-    let button = egui::Button::new(
-        RichText::new(symbol)
-            .size(15.0)
-            .color(Color32::from_rgb(230, 240, 255)),
-    )
-    .fill(bg)
-    .stroke(Stroke::new(1.0, BORDER_COLOR))
-    .rounding(8.0)
-    .min_size(egui::vec2(30.0, 28.0));
-    let response = ui.add(button).on_hover_text(tooltip);
-
-    if response.hovered() {
-        ui.painter().rect_filled(response.rect, 8.0, hover_bg);
-        ui.painter().text(
-            response.rect.center(),
-            egui::Align2::CENTER_CENTER,
-            symbol,
-            egui::FontId::proportional(15.0),
-            Color32::from_rgb(230, 240, 255),
-        );
-    } else if response.is_pointer_button_down_on() {
-        ui.painter().rect_filled(response.rect, 8.0, active_bg);
-        ui.painter().text(
-            response.rect.center(),
-            egui::Align2::CENTER_CENTER,
-            symbol,
             egui::FontId::proportional(15.0),
             Color32::from_rgb(230, 240, 255),
         );
