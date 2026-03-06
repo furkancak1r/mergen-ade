@@ -80,6 +80,7 @@ enum AppIcon {
     Copy,
     Download,
     Eye,
+    EyeOff,
     Folder,
     FolderOpen,
     FolderPlus,
@@ -95,7 +96,7 @@ enum AppIcon {
 }
 
 impl AppIcon {
-    const ALL: [Self; 19] = [
+    const ALL: [Self; 20] = [
         Self::ArrowClockwise,
         Self::ChatText,
         Self::CheckCircle,
@@ -103,6 +104,7 @@ impl AppIcon {
         Self::Copy,
         Self::Download,
         Self::Eye,
+        Self::EyeOff,
         Self::Folder,
         Self::FolderOpen,
         Self::FolderPlus,
@@ -126,6 +128,7 @@ impl AppIcon {
             Self::Copy => "copy",
             Self::Download => "download",
             Self::Eye => "eye",
+            Self::EyeOff => "eye-off",
             Self::Folder => "folder",
             Self::FolderOpen => "folder-open",
             Self::FolderPlus => "folder-plus",
@@ -180,6 +183,7 @@ mod icons {
     pub const COPY: AppIcon = AppIcon::Copy;
     pub const DOWNLOAD: AppIcon = AppIcon::Download;
     pub const EYE: AppIcon = AppIcon::Eye;
+    pub const EYE_OFF: AppIcon = AppIcon::EyeOff;
     pub const FOLDER: AppIcon = AppIcon::Folder;
     pub const FOLDER_OPEN: AppIcon = AppIcon::FolderOpen;
     pub const FOLDER_PLUS: AppIcon = AppIcon::FolderPlus;
@@ -1689,13 +1693,27 @@ impl AdeApp {
                 egui::collapsing_header::CollapsingState::load_with_default_open(
                     ui.ctx(),
                     header_id,
-                    true,
+                    false,
                 );
             let header_response =
                 styled_flat_section_header(ui, &header_label, header_state.is_open());
             if header_response.clicked() {
                 header_state.toggle(ui);
             }
+            let foreground_count = self
+                .terminals
+                .values()
+                .filter(|terminal| {
+                    terminal.project_id == project_id && terminal.kind == TerminalKind::Foreground
+                })
+                .count();
+            let background_count = self
+                .terminals
+                .values()
+                .filter(|terminal| {
+                    terminal.project_id == project_id && terminal.kind == TerminalKind::Background
+                })
+                .count();
             let _ = header_state.show_body_unindented(ui, |ui| {
                     ui.horizontal(|ui| {
                         if styled_icon_button(
@@ -1720,13 +1738,17 @@ impl AdeApp {
                         }
                     });
 
-                    ui.separator();
-                    draw_meta_kicker(ui, icons::TERMINAL, "Foreground");
-                    self.draw_terminal_rows(ui, project_id, TerminalKind::Foreground);
+                    if foreground_count > 0 {
+                        ui.separator();
+                        draw_meta_kicker(ui, icons::TERMINAL, "Foreground");
+                        self.draw_terminal_rows(ui, project_id, TerminalKind::Foreground);
+                    }
 
-                    ui.separator();
-                    draw_meta_kicker(ui, icons::LIST, "Background");
-                    self.draw_terminal_rows(ui, project_id, TerminalKind::Background);
+                    if background_count > 0 {
+                        ui.separator();
+                        draw_meta_kicker(ui, icons::LIST, "Background");
+                        self.draw_terminal_rows(ui, project_id, TerminalKind::Background);
+                    }
                 });
 
             header_response.context_menu(|ui| {
@@ -1814,11 +1836,21 @@ impl AdeApp {
                     });
                     message_menu.response.on_hover_text("Send saved message");
 
+                    let visibility_icon = if terminal.in_main_view {
+                        icons::EYE
+                    } else {
+                        icons::EYE_OFF
+                    };
+                    let visibility_tooltip = if terminal.in_main_view {
+                        "Hide from main area"
+                    } else {
+                        "Show in main area"
+                    };
                     if styled_icon_toggle(
                         ui,
                         terminal.in_main_view,
-                        icons::EYE,
-                        "Show in main area",
+                        visibility_icon,
+                        visibility_tooltip,
                     ) {
                         terminal.in_main_view = !terminal.in_main_view;
                         visibility_changed = true;
@@ -2205,12 +2237,31 @@ impl AdeApp {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .min_width(380.0)
             .show(ctx, |ui| {
-                ui.label(
-                    RichText::new("Application Settings")
-                        .strong()
-                        .size(16.0)
-                        .color(TEXT_PRIMARY),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Application Settings")
+                            .strong()
+                            .size(16.0)
+                            .color(TEXT_PRIMARY),
+                    );
+                    let remaining_width = ui.available_size_before_wrap().x.max(0.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(remaining_width, CONTROL_ROW_HEIGHT),
+                        Layout::right_to_left(Align::Center),
+                        |ui| {
+                            if styled_icon_button(
+                                ui,
+                                icons::X,
+                                BTN_SUBTLE,
+                                BTN_SUBTLE_HOVER,
+                                BTN_ICON_ACTIVE,
+                                "Close",
+                            ) {
+                                self.show_settings_popup = false;
+                            }
+                        },
+                    );
+                });
                 ui.separator();
 
                 let mut filter_mode = self.config.ui.project_filter_mode;
@@ -2401,12 +2452,6 @@ impl AdeApp {
                     }
                 }
 
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if styled_pill_button(ui, icons::X, "Close", BTN_SUBTLE, BTN_SUBTLE_HOVER) {
-                        self.show_settings_popup = false;
-                    }
-                });
             });
 
         if should_persist {
@@ -3019,40 +3064,6 @@ fn draw_meta_kicker(ui: &mut Ui, icon: AppIcon, label: &str) {
             .strong()
             .color(with_alpha(TEXT_MUTED, 230)),
     );
-}
-
-fn styled_pill_button(
-    ui: &mut Ui,
-    icon: AppIcon,
-    label: &str,
-    _bg: Color32,
-    _hover_bg: Color32,
-) -> bool {
-    let text = format!("{} {}", icon, label);
-    let galley = ui.fonts(|fonts| {
-        fonts.layout_no_wrap(
-            text.clone(),
-            FontId::proportional(13.0),
-            Color32::from_rgb(230, 240, 255),
-        )
-    });
-    let size = egui::vec2(galley.size().x + 18.0, CONTROL_ROW_HEIGHT);
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-
-    if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, 8.0, with_alpha(BTN_ICON_HOVER, 110));
-    }
-    ui.painter().galley(
-        egui::pos2(
-            rect.center().x - galley.size().x * 0.5,
-            rect.center().y - galley.size().y * 0.5,
-        ),
-        galley,
-        Color32::from_rgb(230, 240, 255),
-    );
-
-    response.clicked()
 }
 
 fn styled_icon_button(
