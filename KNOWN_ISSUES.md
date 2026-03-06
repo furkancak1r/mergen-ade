@@ -40,3 +40,17 @@
   - Gerekli DLL bağımlılıklarını `llvm-objdump -p <exe>` çıktısından CI adımıyla denetle.
 - Files/Commands touched: `target\\x86_64-pc-windows-gnullvm\\release\\libunwind.dll`, `.toolchain\\llvm-mingw-20260224-ucrt-x86_64\\x86_64-w64-mingw32\\bin\\libunwind.dll`, `llvm-objdump -p`, `Copy-Item`, `Start-Process`
 - References: local workspace fix (commit pending), baseline commit `0b3794b`
+
+#### Terminal geçmişi kaydırılamıyordu {#terminal-gecmisi-kaydirilamiyordu}
+- Date: 2026-03-06T16:09:54Z
+- Context: main/Windows local/cargo 1.93.1, rustc 1.93.1
+- Error signature: `ScrollArea görünüyordu ama TerminalSnapshot yalnızca görünür satırları topladığı için scrollback geçmişi render edilmiyordu.`
+- Symptoms/Impact: Terminal panelinde fare tekeri ve scrollbar görünse bile eski çıktı satırlarına çıkılamıyor, uzun komut geçmişi kaybolmuş gibi davranıyordu.
+- Root cause: Terminal snapshot üretimi fiziksel viewport ile sınırlıydı ve scrollback satırları ile imleç ofseti render modeline hiç taşınmıyordu.
+- Resolution: Scrollback satırlarını ve imleç ofsetini snapshot'a dahil eden düzeltme `2e332c7` commit'i ile eklendi.
+- Prevent recurrence:
+  - Terminal snapshot testlerinde scrollback ve cursor ofset senaryolarını zorunlu tut.
+  - UI'da scrollbar görmek ile gerçekte geçmiş satırların render edildiğini ayrı ayrı doğrula.
+  - Render modelinde viewport-relative ve absolute row indekslerini karıştırma.
+- Files/Commands touched: `src/terminal.rs`, `cargo fmt`, `cargo test`
+- References: commit `2e332c7` - https://github.com/furkancak1r/mergen-ade/commit/2e332c73898bb54b972ae9b9f3774409da1f0927
