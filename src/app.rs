@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::fs;
 #[cfg(target_os = "windows")]
@@ -34,6 +34,8 @@ const TITLE_MAX_LEN: usize = 40;
 const TERMINAL_EVENT_BUDGET: usize = 4096;
 const TERMINAL_RETRY_MS: u64 = 8;
 const TERMINAL_FALLBACK_REFRESH_MS: u64 = 16;
+const DIRECTORY_INDEX_MAX_DEPTH: usize = 8;
+const DIRECTORY_INDEX_MAX_NODES: usize = 20_000;
 const TERMINAL_OUTPUT_BG: Color32 = Color32::from_rgb(26, 30, 36);
 const TERMINAL_HEADER_HEIGHT: f32 = 38.0;
 const TERMINAL_HEADER_GAP: f32 = 6.0;
@@ -47,6 +49,7 @@ const BORDER_COLOR: Color32 = Color32::from_rgb(46, 60, 78);
 const ACCENT: Color32 = Color32::from_rgb(26, 179, 255);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(225, 233, 245);
 const TEXT_MUTED: Color32 = Color32::from_rgb(148, 167, 191);
+const PROJECT_EXPLORER_WIDTH: f32 = 320.0;
 
 // Pill button palette
 const BTN_BLUE: Color32 = Color32::from_rgb(16, 64, 112);
@@ -199,12 +202,17 @@ pub struct AdeApp {
     terminal_events_rx: Receiver<TerminalUiEvent>,
     show_settings_popup: bool,
     saved_message_drafts: BTreeMap<u64, String>,
+    directory_search_query: String,
     status_line: String,
     layout_epoch: u64,
     theme_initialized: bool,
     source_control_events_tx: Sender<SourceControlEvent>,
     source_control_events_rx: Receiver<SourceControlEvent>,
     source_control_state: BTreeMap<u64, SourceControlSnapshot>,
+    directory_index_events_tx: Sender<DirectoryIndexEvent>,
+    directory_index_events_rx: Receiver<DirectoryIndexEvent>,
+    directory_index_state: BTreeMap<u64, DirectoryIndexSnapshot>,
+    directory_index_generation: BTreeMap<u64, u64>,
 }
 
 struct TerminalEntry {
@@ -244,6 +252,29 @@ struct SourceControlEvent {
     snapshot: SourceControlSnapshot,
 }
 
+#[derive(Debug, Clone)]
+struct DirectoryNode {
+    name: String,
+    path: PathBuf,
+    is_dir: bool,
+    children: Vec<DirectoryNode>,
+}
+
+#[derive(Debug, Clone)]
+struct DirectoryIndexSnapshot {
+    root: DirectoryNode,
+    loading: bool,
+    last_error: Option<String>,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DirectoryIndexEvent {
+    project_id: u64,
+    generation: u64,
+    snapshot: DirectoryIndexSnapshot,
+}
+
 impl AdeApp {
     pub fn bootstrap() -> Self {
         let config_path = config::config_path().unwrap_or_else(|_| PathBuf::from("config.toml"));
@@ -267,6 +298,7 @@ impl AdeApp {
 
         let (terminal_events_tx, terminal_events_rx) = crossbeam_channel::unbounded();
         let (source_control_events_tx, source_control_events_rx) = crossbeam_channel::unbounded();
+        let (directory_index_events_tx, directory_index_events_rx) = crossbeam_channel::unbounded();
 
         Self {
             config_path,
@@ -281,12 +313,17 @@ impl AdeApp {
             terminal_events_rx,
             show_settings_popup: false,
             saved_message_drafts: BTreeMap::new(),
+            directory_search_query: String::new(),
             status_line: "Ready".to_owned(),
             layout_epoch: 0,
             theme_initialized: false,
             source_control_events_tx,
             source_control_events_rx,
             source_control_state: BTreeMap::new(),
+            directory_index_events_tx,
+            directory_index_events_rx,
+            directory_index_state: BTreeMap::new(),
+            directory_index_generation: BTreeMap::new(),
         }
     }
 
@@ -474,6 +511,79 @@ impl AdeApp {
         });
     }
 
+    fn process_directory_index_events(&mut self, ctx: &egui::Context) {
+        let mut changed = false;
+        while let Ok(event) = self.directory_index_events_rx.try_recv() {
+            let latest_generation = self
+                .directory_index_generation
+                .get(&event.project_id)
+                .copied()
+                .unwrap_or(0);
+            if event.generation != latest_generation {
+                continue;
+            }
+
+            self.directory_index_state
+                .insert(event.project_id, event.snapshot);
+            changed = true;
+        }
+        if changed {
+            ctx.request_repaint();
+        }
+        if !self.directory_index_events_rx.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(1));
+        }
+    }
+
+    fn request_directory_index_refresh(&mut self, project_id: u64, force: bool) {
+        let Some(project) = self.projects.get(&project_id).cloned() else {
+            return;
+        };
+
+        if self
+            .directory_index_state
+            .get(&project_id)
+            .is_some_and(|snapshot| snapshot.loading)
+        {
+            return;
+        }
+
+        if !force && self.directory_index_state.contains_key(&project_id) {
+            return;
+        }
+
+        let generation = self
+            .directory_index_generation
+            .entry(project_id)
+            .or_insert(0);
+        *generation = generation.wrapping_add(1);
+        let current_generation = *generation;
+
+        self.directory_index_state
+            .entry(project_id)
+            .and_modify(|snapshot| {
+                snapshot.loading = true;
+                snapshot.last_error = None;
+                snapshot.truncated = false;
+            })
+            .or_insert_with(|| DirectoryIndexSnapshot {
+                root: build_directory_root_node(&project.path),
+                loading: true,
+                last_error: None,
+                truncated: false,
+            });
+
+        let tx = self.directory_index_events_tx.clone();
+        std::thread::spawn(move || {
+            let snapshot = collect_directory_index_snapshot(&project.path);
+            let _ = tx.send(DirectoryIndexEvent {
+                project_id,
+                generation: current_generation,
+                snapshot,
+            });
+        });
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let _ = ctx;
     }
@@ -640,7 +750,7 @@ impl AdeApp {
 
         let mut visuals = egui::Visuals::dark();
         visuals.override_text_color = Some(TEXT_PRIMARY);
-        visuals.panel_fill = APP_BG;
+        visuals.panel_fill = SURFACE_BG;
         visuals.window_fill = SURFACE_BG;
         visuals.faint_bg_color = SURFACE_BG_SOFT;
         visuals.extreme_bg_color = Color32::from_rgb(18, 30, 44);
@@ -813,190 +923,267 @@ impl AdeApp {
             });
     }
 
-    fn draw_project_explorer(&mut self, ctx: &egui::Context) {
+    fn draw_project_explorer(&mut self, ctx: &egui::Context) -> Option<egui::Rect> {
         if !self.config.ui.show_project_explorer {
-            return;
+            return None;
         }
 
-        egui::SidePanel::left("project_explorer")
-            .resizable(true)
-            .min_width(220.0)
-            .max_width(540.0)
-            .default_width(250.0)
-            .show(ctx, |ui| {
+        let response = egui::SidePanel::left("project_explorer")
+            .resizable(false)
+            .exact_width(PROJECT_EXPLORER_WIDTH)
+            .show_separator_line(false)
+            .frame(
                 egui::Frame::none()
                     .fill(SURFACE_BG)
                     .stroke(Stroke::new(1.0, BORDER_COLOR))
                     .rounding(8.0)
-                    .inner_margin(egui::Margin::same(10.0))
-                    .show(ui, |ui| {
-                        let previous_tab = self.config.ui.left_sidebar_tab;
-                        ui.horizontal(|ui| {
-                            if styled_icon_toggle(
-                                ui,
-                                self.config.ui.left_sidebar_tab == LeftSidebarTab::Directory,
-                                icons::TREE_VIEW,
-                                LeftSidebarTab::Directory.label(),
-                            ) {
-                                self.config.ui.left_sidebar_tab = LeftSidebarTab::Directory;
-                            }
-                            if styled_icon_toggle(
-                                ui,
-                                self.config.ui.left_sidebar_tab == LeftSidebarTab::SourceControl,
-                                icons::GIT_BRANCH,
-                                LeftSidebarTab::SourceControl.label(),
-                            ) {
-                                self.config.ui.left_sidebar_tab = LeftSidebarTab::SourceControl;
-                            }
-                            if self.config.ui.left_sidebar_tab == LeftSidebarTab::Directory
-                                && styled_icon_button(
-                                    ui,
-                                    icons::FOLDER_PLUS,
-                                    BTN_TEAL,
-                                    BTN_TEAL_HOVER,
-                                    BTN_ICON_ACTIVE,
-                                    "Add Project",
-                                )
-                            {
-                                if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                    self.add_project(path);
-                                }
-                            }
-                        });
-                        if previous_tab != self.config.ui.left_sidebar_tab {
-                            self.persist_config();
+                    .inner_margin(egui::Margin::same(10.0)),
+            )
+            .show(ctx, |ui| {
+                let panel_right = ui.max_rect().right();
+                ui.set_width(ui.max_rect().width());
+                let previous_tab = self.config.ui.left_sidebar_tab;
+                ui.horizontal_wrapped(|ui| {
+                    if styled_icon_toggle(
+                        ui,
+                        self.config.ui.left_sidebar_tab == LeftSidebarTab::Directory,
+                        icons::TREE_VIEW,
+                        LeftSidebarTab::Directory.label(),
+                    ) {
+                        self.config.ui.left_sidebar_tab = LeftSidebarTab::Directory;
+                    }
+                    if styled_icon_toggle(
+                        ui,
+                        self.config.ui.left_sidebar_tab == LeftSidebarTab::SourceControl,
+                        icons::GIT_BRANCH,
+                        LeftSidebarTab::SourceControl.label(),
+                    ) {
+                        self.config.ui.left_sidebar_tab = LeftSidebarTab::SourceControl;
+                    }
+                    if self.config.ui.left_sidebar_tab == LeftSidebarTab::Directory
+                        && styled_icon_button(
+                            ui,
+                            icons::FOLDER_PLUS,
+                            BTN_TEAL,
+                            BTN_TEAL_HOVER,
+                            BTN_ICON_ACTIVE,
+                            "Add Project",
+                        )
+                    {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            self.add_project(path);
                         }
-                        ui.separator();
+                    }
+                });
+                if previous_tab != self.config.ui.left_sidebar_tab {
+                    self.persist_config();
+                }
+                ui.separator();
 
-                        match self.config.ui.left_sidebar_tab {
-                            LeftSidebarTab::Directory => {
-                                let project_rows = self
-                                    .projects
+                match self.config.ui.left_sidebar_tab {
+                    LeftSidebarTab::Directory => {
+                        let project_rows = self
+                            .projects
+                            .iter()
+                            .map(|(project_id, project)| {
+                                (
+                                    *project_id,
+                                    project.name.clone(),
+                                    project.path.clone(),
+                                    project.path.display().to_string(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+
+                        let selected_project_label = self
+                            .selected_project
+                            .and_then(|selected_id| {
+                                project_rows
                                     .iter()
-                                    .map(|(project_id, project)| {
-                                        (
-                                            *project_id,
-                                            project.name.clone(),
-                                            project.path.clone(),
-                                            project.path.display().to_string(),
-                                        )
+                                    .find(|(project_id, _, _, _)| *project_id == selected_id)
+                                    .map(|(_, project_name, _, _)| {
+                                        format!("{} {}", icons::FOLDER_OPEN, project_name)
                                     })
-                                    .collect::<Vec<_>>();
+                            })
+                            .unwrap_or_else(|| "No project selected".to_owned());
 
-                                let selected_project_label = self
-                                    .selected_project
-                                    .and_then(|selected_id| {
-                                        project_rows
-                                            .iter()
-                                            .find(|(project_id, _, _, _)| {
-                                                *project_id == selected_id
-                                            })
-                                            .map(|(_, project_name, _, _)| {
-                                                format!("{} {}", icons::FOLDER_OPEN, project_name)
-                                            })
-                                    })
-                                    .unwrap_or_else(|| "No project selected".to_owned());
+                        let mut refresh_index = false;
+                        let selected_project_details =
+                            self.selected_project.and_then(|selected_id| {
+                                project_rows
+                                    .iter()
+                                    .find(|(project_id, _, _, _)| *project_id == selected_id)
+                                    .cloned()
+                            });
+                        let previous_selected_project = self.selected_project;
+                        ui.label(RichText::new("Project").color(TEXT_MUTED));
+                        ui.horizontal(|ui| {
+                            let button_group_width = 30.0 * 3.0 + ui.spacing().item_spacing.x * 2.0;
+                            let combo_width =
+                                (ui.available_width() - button_group_width).clamp(96.0, 150.0);
+                            egui::ComboBox::from_id_salt("directory-project-select")
+                                .selected_text(selected_project_label)
+                                .width(combo_width)
+                                .show_ui(ui, |ui| {
+                                    for (project_id, project_name, _, _) in &project_rows {
+                                        ui.selectable_value(
+                                            &mut self.selected_project,
+                                            Some(*project_id),
+                                            format!("{} {}", icons::FOLDER, project_name),
+                                        );
+                                    }
+                                });
 
-                                let previous_selected_project = self.selected_project;
-                                egui::ComboBox::from_label("Project")
-                                    .selected_text(selected_project_label)
-                                    .width(220.0)
-                                    .show_ui(ui, |ui| {
-                                        for (project_id, project_name, _, _) in &project_rows {
-                                            ui.selectable_value(
-                                                &mut self.selected_project,
-                                                Some(*project_id),
-                                                format!("{} {}", icons::FOLDER, project_name),
-                                            );
-                                        }
-                                    });
-                                if self.selected_project != previous_selected_project {
-                                    self.persist_config();
-                                }
-
-                                if let Some(selected_id) = self.selected_project {
-                                    if let Some((
-                                        _,
-                                        project_name,
-                                        project_path,
-                                        project_path_text,
-                                    )) = project_rows
-                                        .iter()
-                                        .find(|(project_id, _, _, _)| *project_id == selected_id)
-                                        .cloned()
+                            ui.add_enabled_ui(selected_project_details.is_some(), |ui| {
+                                if styled_icon_button(
+                                    ui,
+                                    icons::COPY,
+                                    BTN_SUBTLE,
+                                    BTN_SUBTLE_HOVER,
+                                    BTN_ICON_ACTIVE,
+                                    "Copy Path",
+                                ) {
+                                    if let Some((_, project_name, _, project_path_text)) =
+                                        selected_project_details.as_ref()
                                     {
-                                        ui.horizontal(|ui| {
-                                            if styled_pill_button(
-                                                ui,
-                                                icons::COPY,
-                                                "Copy Path",
-                                                BTN_SUBTLE,
-                                                BTN_SUBTLE_HOVER,
-                                            ) {
-                                                ui.ctx().copy_text(project_path_text.clone());
+                                        ui.ctx().copy_text(project_path_text.clone());
+                                        self.status_line =
+                                            format!("Copied path for project '{}'", project_name);
+                                    }
+                                }
+                                if styled_icon_button(
+                                    ui,
+                                    icons::FOLDER_OPEN,
+                                    BTN_SUBTLE,
+                                    BTN_SUBTLE_HOVER,
+                                    BTN_ICON_ACTIVE,
+                                    "Open in Folder",
+                                ) {
+                                    if let Some((_, project_name, project_path, _)) =
+                                        selected_project_details.as_ref()
+                                    {
+                                        match open_in_file_explorer(project_path, false) {
+                                            Ok(()) => {
                                                 self.status_line = format!(
-                                                    "Copied path for project '{}'",
+                                                    "Opened project '{}' in Explorer",
                                                     project_name
                                                 );
                                             }
-                                            if styled_pill_button(
-                                                ui,
-                                                icons::FOLDER_OPEN,
-                                                "Open in Folder",
-                                                BTN_SUBTLE,
-                                                BTN_SUBTLE_HOVER,
-                                            ) {
-                                                match open_in_file_explorer(&project_path, false) {
-                                                    Ok(()) => {
-                                                        self.status_line = format!(
-                                                            "Opened project '{}' in Explorer",
-                                                            project_name
-                                                        );
-                                                    }
-                                                    Err(err) => {
-                                                        self.status_line =
-                                                            format!("Open folder failed: {err}");
-                                                    }
-                                                }
+                                            Err(err) => {
+                                                self.status_line =
+                                                    format!("Open folder failed: {err}");
                                             }
-                                        });
+                                        }
                                     }
                                 }
+                                if styled_icon_button(
+                                    ui,
+                                    icons::ARROW_CLOCKWISE,
+                                    BTN_ICON,
+                                    BTN_ICON_HOVER,
+                                    BTN_ICON_ACTIVE,
+                                    "Refresh Directory Index",
+                                ) {
+                                    refresh_index = true;
+                                }
+                            });
+                        });
+                        if self.selected_project != previous_selected_project {
+                            self.persist_config();
+                        }
+                        ui.add_sized(
+                            [ui.available_width(), 28.0],
+                            egui::TextEdit::singleline(&mut self.directory_search_query)
+                                .hint_text("Search files and folders"),
+                        );
+                        ui.separator();
 
-                                ui.separator();
+                        egui::ScrollArea::vertical()
+                            .id_salt("directory-tree-scroll")
+                            .max_height(ui.available_height())
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let search_query =
+                                    self.directory_search_query.trim().to_lowercase();
+                                let search_query =
+                                    (!search_query.is_empty()).then_some(search_query);
+                                if let Some(project_id) = self.selected_project {
+                                    if refresh_index {
+                                        self.request_directory_index_refresh(project_id, true);
+                                    }
+                                    self.request_directory_index_refresh(project_id, false);
 
-                                egui::ScrollArea::vertical()
-                                    .id_salt("directory-tree-scroll")
-                                    .max_height(ui.available_height())
-                                    .auto_shrink([false, false])
-                                    .show(ui, |ui| {
-                                        if let Some(project_id) = self.selected_project {
-                                            if let Some(project) = self.projects.get(&project_id) {
-                                                ui.label(
-                                                    RichText::new(format!(
-                                                        "{} Files",
-                                                        icons::FOLDER_OPEN
-                                                    ))
-                                                    .color(TEXT_MUTED)
-                                                    .strong(),
-                                                );
-                                                draw_folder_tree(
-                                                    ui,
-                                                    &project.path,
-                                                    0,
-                                                    8,
-                                                    &mut self.status_line,
-                                                );
-                                            }
-                                        } else {
+                                    let mut status_line_update = None;
+                                    {
+                                        let Some(snapshot) =
+                                            self.directory_index_state.get(&project_id)
+                                        else {
                                             ui.label(
-                                                RichText::new("No project selected")
-                                                    .color(TEXT_MUTED),
+                                                RichText::new("Indexing files...").color(TEXT_MUTED),
+                                            );
+                                            return;
+                                        };
+
+                                        ui.label(
+                                            RichText::new(format!("{} Files", icons::FOLDER_OPEN))
+                                                .color(TEXT_MUTED)
+                                                .strong(),
+                                        );
+
+                                        if snapshot.loading {
+                                            ui.label(
+                                                RichText::new("Indexing files...").color(TEXT_MUTED),
                                             );
                                         }
-                                    });
-                            }
-                            LeftSidebarTab::SourceControl => {
+
+                                        if let Some(error) = &snapshot.last_error {
+                                            ui.colored_label(Color32::LIGHT_RED, error);
+                                        } else if !snapshot.loading {
+                                            let mut matching_directories = HashSet::new();
+                                            if let Some(query) = search_query.as_deref() {
+                                                let _ = collect_matching_directory_paths(
+                                                    &snapshot.root,
+                                                    query,
+                                                    false,
+                                                    &mut matching_directories,
+                                                );
+                                            }
+
+                                            let has_results = draw_folder_tree(
+                                                ui,
+                                                &snapshot.root,
+                                                &mut status_line_update,
+                                                search_query.as_deref(),
+                                                false,
+                                                search_query.as_deref().map(|_| &matching_directories),
+                                            );
+
+                                            if search_query.is_some() && !has_results {
+                                                ui.label(
+                                                    RichText::new("No matching files or folders")
+                                                        .color(TEXT_MUTED),
+                                                );
+                                            }
+                                            if snapshot.truncated {
+                                                ui.label(
+                                                    RichText::new(
+                                                        "Index truncated for performance. Refine search or refresh after narrowing scope.",
+                                                    )
+                                                    .color(TEXT_MUTED),
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    if let Some(status_line) = status_line_update {
+                                        self.status_line = status_line;
+                                    }
+                                } else {
+                                    ui.label(RichText::new("No project selected").color(TEXT_MUTED));
+                                }
+                            });
+                    }
+                    LeftSidebarTab::SourceControl => {
                                 let project_rows = self
                                     .projects
                                     .iter()
@@ -1033,9 +1220,10 @@ impl AdeApp {
                                     .unwrap_or_else(|| "No project selected".to_owned());
 
                                 let previous_selected_project = self.selected_project;
-                                egui::ComboBox::from_label("Project")
+                                ui.label(RichText::new("Project").color(TEXT_MUTED));
+                                egui::ComboBox::from_id_salt("source-control-project-select")
                                     .selected_text(selected_project_label)
-                                    .width(220.0)
+                                    .width(ui.available_width().max(100.0))
                                     .show_ui(ui, |ui| {
                                         for (project_id, project_name) in &project_rows {
                                             ui.selectable_value(
@@ -1067,7 +1255,7 @@ impl AdeApp {
                                     self.request_source_control_refresh(project_id, false);
                                 }
 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     if styled_icon_button(
                                         ui,
                                         icons::ARROW_CLOCKWISE,
@@ -1214,147 +1402,141 @@ impl AdeApp {
                                             });
                                         }
                                     });
-                            }
-                        }
-                    });
+                    }
+                }
+                ui.expand_to_include_x(panel_right);
             });
+        Some(response.response.rect)
     }
 
-    fn draw_terminal_manager(&mut self, ctx: &egui::Context) {
+    fn draw_terminal_manager(&mut self, ctx: &egui::Context) -> Option<egui::Rect> {
         if !self.config.ui.show_terminal_manager {
-            return;
+            return None;
         }
 
-        egui::SidePanel::left("terminal_manager")
+        let response = egui::SidePanel::left("terminal_manager")
             .resizable(true)
             .min_width(180.0)
             .max_width(620.0)
             .default_width(280.0)
-            .show(ctx, |ui| {
+            .show_separator_line(false)
+            .frame(
                 egui::Frame::none()
                     .fill(SURFACE_BG)
                     .stroke(Stroke::new(1.0, BORDER_COLOR))
                     .rounding(8.0)
-                    .inner_margin(egui::Margin::same(10.0))
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(format!("{} Terminal Manager", icons::TERMINAL_WINDOW))
-                                .strong()
-                                .size(15.0),
-                        );
-                        ui.separator();
+                    .inner_margin(egui::Margin::same(10.0)),
+            )
+            .show(ctx, |ui| {
+                let panel_right = ui.max_rect().right();
+                ui.set_width(ui.max_rect().width());
+                ui.label(
+                    RichText::new(format!("{} Terminal Manager", icons::TERMINAL_WINDOW))
+                        .strong()
+                        .size(15.0),
+                );
+                ui.separator();
 
-                        let mut project_ids = self.projects.keys().copied().collect::<Vec<_>>();
-                        project_ids.sort_unstable();
+                let mut project_ids = self.projects.keys().copied().collect::<Vec<_>>();
+                project_ids.sort_unstable();
 
-                        for project_id in project_ids {
-                            if self.config.ui.project_filter_mode
-                                && self
-                                    .selected_project
-                                    .is_some_and(|selected| selected != project_id)
-                            {
-                                continue;
-                            }
+                for project_id in project_ids {
+                    if self.config.ui.project_filter_mode
+                        && self
+                            .selected_project
+                            .is_some_and(|selected| selected != project_id)
+                    {
+                        continue;
+                    }
 
-                            let Some(project_snapshot) = self.projects.get(&project_id).cloned()
-                            else {
-                                continue;
-                            };
+                    let Some(project_snapshot) = self.projects.get(&project_id).cloned() else {
+                        continue;
+                    };
 
-                            let project_path = project_snapshot.path.display().to_string();
+                    let project_path = project_snapshot.path.display().to_string();
 
-                            let header_label =
-                                format!("{} {}", icons::FOLDER_OPEN, project_snapshot.name);
-                            let header = egui::CollapsingHeader::new(header_label)
-                                .id_salt(format!("project-group-{project_id}"))
-                                .default_open(true)
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        if styled_icon_button(
-                                            ui,
-                                            icons::TERMINAL,
-                                            BTN_BLUE,
-                                            BTN_BLUE_HOVER,
-                                            BTN_ICON_ACTIVE,
-                                            "New Foreground Terminal",
-                                        ) {
-                                            self.spawn_terminal_for_project(
-                                                ctx,
-                                                project_id,
-                                                TerminalKind::Foreground,
-                                            );
-                                        }
-                                        if styled_icon_button(
-                                            ui,
-                                            icons::LIST,
-                                            BTN_TEAL,
-                                            BTN_TEAL_HOVER,
-                                            BTN_ICON_ACTIVE,
-                                            "New Background Terminal",
-                                        ) {
-                                            self.spawn_terminal_for_project(
-                                                ctx,
-                                                project_id,
-                                                TerminalKind::Background,
-                                            );
-                                        }
-                                    });
-
-                                    ui.separator();
-                                    ui.label(
-                                        RichText::new(format!("{} Foreground", icons::TERMINAL))
-                                            .strong()
-                                            .color(TEXT_MUTED),
-                                    );
-                                    self.draw_terminal_rows(
-                                        ui,
+                    let header_label = format!("{} {}", icons::FOLDER_OPEN, project_snapshot.name);
+                    let header = egui::CollapsingHeader::new(header_label)
+                        .id_salt(format!("project-group-{project_id}"))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if styled_icon_button(
+                                    ui,
+                                    icons::TERMINAL,
+                                    BTN_BLUE,
+                                    BTN_BLUE_HOVER,
+                                    BTN_ICON_ACTIVE,
+                                    "New Foreground Terminal",
+                                ) {
+                                    self.spawn_terminal_for_project(
+                                        ctx,
                                         project_id,
                                         TerminalKind::Foreground,
                                     );
-
-                                    ui.separator();
-                                    ui.label(
-                                        RichText::new(format!("{} Background", icons::LIST))
-                                            .strong()
-                                            .color(TEXT_MUTED),
-                                    );
-                                    self.draw_terminal_rows(
-                                        ui,
+                                }
+                                if styled_icon_button(
+                                    ui,
+                                    icons::LIST,
+                                    BTN_TEAL,
+                                    BTN_TEAL_HOVER,
+                                    BTN_ICON_ACTIVE,
+                                    "New Background Terminal",
+                                ) {
+                                    self.spawn_terminal_for_project(
+                                        ctx,
                                         project_id,
                                         TerminalKind::Background,
                                     );
-                                });
-
-                            header.header_response.context_menu(|ui| {
-                                if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
-                                    ui.ctx().copy_text(project_path.clone());
-                                    self.status_line = format!(
-                                        "Copied path for project '{}'",
-                                        project_snapshot.name
-                                    );
-                                    ui.close_menu();
-                                }
-                                if ui
-                                    .button(format!("{} Open in Folder", icons::FOLDER_OPEN))
-                                    .clicked()
-                                {
-                                    match open_in_file_explorer(&project_snapshot.path, false) {
-                                        Ok(()) => {
-                                            self.status_line = format!(
-                                                "Opened project '{}' in Explorer",
-                                                project_snapshot.name
-                                            );
-                                        }
-                                        Err(err) => {
-                                            self.status_line = format!("Open folder failed: {err}");
-                                        }
-                                    }
-                                    ui.close_menu();
                                 }
                             });
+
+                            ui.separator();
+                            ui.label(
+                                RichText::new(format!("{} Foreground", icons::TERMINAL))
+                                    .strong()
+                                    .color(TEXT_MUTED),
+                            );
+                            self.draw_terminal_rows(ui, project_id, TerminalKind::Foreground);
+
+                            ui.separator();
+                            ui.label(
+                                RichText::new(format!("{} Background", icons::LIST))
+                                    .strong()
+                                    .color(TEXT_MUTED),
+                            );
+                            self.draw_terminal_rows(ui, project_id, TerminalKind::Background);
+                        });
+
+                    header.header_response.context_menu(|ui| {
+                        if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
+                            ui.ctx().copy_text(project_path.clone());
+                            self.status_line =
+                                format!("Copied path for project '{}'", project_snapshot.name);
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button(format!("{} Open in Folder", icons::FOLDER_OPEN))
+                            .clicked()
+                        {
+                            match open_in_file_explorer(&project_snapshot.path, false) {
+                                Ok(()) => {
+                                    self.status_line = format!(
+                                        "Opened project '{}' in Explorer",
+                                        project_snapshot.name
+                                    );
+                                }
+                                Err(err) => {
+                                    self.status_line = format!("Open folder failed: {err}");
+                                }
+                            }
+                            ui.close_menu();
                         }
                     });
+                }
+                ui.expand_to_include_x(panel_right);
             });
+        Some(response.response.rect)
     }
 
     fn draw_terminal_rows(&mut self, ui: &mut Ui, project_id: u64, kind: TerminalKind) {
@@ -1450,94 +1632,121 @@ impl AdeApp {
     }
 
     fn draw_main_area(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let visible_ids = self.visible_terminal_ids_for_main();
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(APP_BG))
+            .show(ctx, |ui| {
+                let visible_ids = self.visible_terminal_ids_for_main();
 
-            if visible_ids.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.vertical_centered(|ui| {
+                if visible_ids.is_empty() {
+                    ui.centered_and_justified(|ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                RichText::new(format!("{}  No visible terminals", icons::TERMINAL))
+                                    .size(20.0)
+                                    .strong(),
+                            );
+                            ui.label(
+                                RichText::new("Select a project, then use New FG/New BG to start.")
+                                    .color(TEXT_MUTED),
+                            );
+                        });
+                    });
+                    return;
+                }
+
+                let available = ui.available_size();
+                if available.x < 160.0 || available.y < 120.0 {
+                    ui.centered_and_justified(|ui| {
                         ui.label(
-                            RichText::new(format!("{}  No visible terminals", icons::TERMINAL))
-                                .size(20.0)
-                                .strong(),
-                        );
-                        ui.label(
-                            RichText::new("Select a project, then use New FG/New BG to start.")
+                            RichText::new("Expand the window to render terminals")
                                 .color(TEXT_MUTED),
                         );
                     });
-                });
-                return;
-            }
-
-            let available = ui.available_size();
-            if available.x < 160.0 || available.y < 120.0 {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        RichText::new("Expand the window to render terminals").color(TEXT_MUTED),
-                    );
-                });
-                return;
-            }
-            let grid = layout::compute_tile_grid(visible_ids.len(), available.x, available.y);
-
-            let total_gap_x = TERMINAL_TILE_GAP_X * grid.cols.saturating_sub(1) as f32;
-            let total_gap_y = TERMINAL_TILE_GAP_Y * grid.rows.saturating_sub(1) as f32;
-
-            let pane_width = ((available.x - total_gap_x) / grid.cols as f32)
-                .floor()
-                .max(72.0);
-            let pane_height = ((available.y - total_gap_y) / grid.rows as f32)
-                .floor()
-                .max(80.0);
-
-            let origin = ui.cursor().min;
-
-            // Use absolute rect positioning to bypass egui auto-layout entirely
-            for row in 0..grid.rows {
-                for col in 0..grid.cols {
-                    let index = row * grid.cols + col;
-                    let Some(terminal_id) = visible_ids.get(index) else {
-                        continue;
-                    };
-
-                    let x = origin.x + col as f32 * (pane_width + TERMINAL_TILE_GAP_X);
-                    let y = origin.y + row as f32 * (pane_height + TERMINAL_TILE_GAP_Y);
-                    let rect = egui::Rect::from_min_size(
-                        egui::pos2(x, y),
-                        Vec2::new(pane_width, pane_height),
-                    );
-
-                    let inner_margin = TERMINAL_PANE_INNER_MARGIN;
-                    let inner_size = Vec2::new(
-                        (pane_width - inner_margin * 2.0).max(64.0),
-                        (pane_height - inner_margin * 2.0).max(64.0),
-                    );
-
-                    let mut child = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(rect)
-                            .layout(Layout::top_down(Align::Min)),
-                    );
-                    child.set_clip_rect(rect);
-                    child.spacing_mut().item_spacing = Vec2::ZERO;
-                    egui::Frame::none()
-                        .fill(SURFACE_BG)
-                        .stroke(Stroke::new(1.0, BORDER_COLOR))
-                        .rounding(10.0)
-                        .inner_margin(egui::Margin::same(inner_margin))
-                        .show(&mut child, |ui| {
-                            ui.spacing_mut().item_spacing = Vec2::ZERO;
-                            self.draw_terminal_pane(ui, *terminal_id, inner_size);
-                        });
+                    return;
                 }
-            }
+                let grid = layout::compute_tile_grid(visible_ids.len(), available.x, available.y);
 
-            // Reserve the full grid area so the CentralPanel knows the space is used
-            let total_width = grid.cols as f32 * pane_width + total_gap_x;
-            let total_height = grid.rows as f32 * pane_height + total_gap_y;
-            ui.allocate_space(Vec2::new(total_width, total_height));
-        });
+                let total_gap_x = TERMINAL_TILE_GAP_X * grid.cols.saturating_sub(1) as f32;
+                let total_gap_y = TERMINAL_TILE_GAP_Y * grid.rows.saturating_sub(1) as f32;
+
+                let pane_width = ((available.x - total_gap_x) / grid.cols as f32)
+                    .floor()
+                    .max(72.0);
+                let pane_height = ((available.y - total_gap_y) / grid.rows as f32)
+                    .floor()
+                    .max(80.0);
+
+                let origin = ui.cursor().min;
+
+                // Use absolute rect positioning to bypass egui auto-layout entirely
+                for row in 0..grid.rows {
+                    for col in 0..grid.cols {
+                        let index = row * grid.cols + col;
+                        let Some(terminal_id) = visible_ids.get(index) else {
+                            continue;
+                        };
+
+                        let x = origin.x + col as f32 * (pane_width + TERMINAL_TILE_GAP_X);
+                        let y = origin.y + row as f32 * (pane_height + TERMINAL_TILE_GAP_Y);
+                        let rect = egui::Rect::from_min_size(
+                            egui::pos2(x, y),
+                            Vec2::new(pane_width, pane_height),
+                        );
+
+                        let inner_margin = TERMINAL_PANE_INNER_MARGIN;
+                        let inner_size = Vec2::new(
+                            (pane_width - inner_margin * 2.0).max(64.0),
+                            (pane_height - inner_margin * 2.0).max(64.0),
+                        );
+
+                        let mut child = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(rect)
+                                .layout(Layout::top_down(Align::Min)),
+                        );
+                        child.set_clip_rect(rect);
+                        child.spacing_mut().item_spacing = Vec2::ZERO;
+                        egui::Frame::none()
+                            .fill(SURFACE_BG)
+                            .stroke(Stroke::new(1.0, BORDER_COLOR))
+                            .rounding(10.0)
+                            .inner_margin(egui::Margin::same(inner_margin))
+                            .show(&mut child, |ui| {
+                                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                                self.draw_terminal_pane(ui, *terminal_id, inner_size);
+                            });
+                    }
+                }
+
+                // Reserve the full grid area so the CentralPanel knows the space is used
+                let total_width = grid.cols as f32 * pane_width + total_gap_x;
+                let total_height = grid.rows as f32 * pane_height + total_gap_y;
+                ui.allocate_space(Vec2::new(total_width, total_height));
+            });
+    }
+
+    fn draw_sidebar_seam_fix(
+        &self,
+        ctx: &egui::Context,
+        explorer_rect: egui::Rect,
+        terminal_rect: egui::Rect,
+    ) {
+        let top = explorer_rect.min.y.max(terminal_rect.min.y);
+        let bottom = explorer_rect.max.y.min(terminal_rect.max.y);
+        if bottom <= top {
+            return;
+        }
+
+        let seam_left = explorer_rect.max.x.min(terminal_rect.min.x) - 1.0;
+        let seam_right = explorer_rect.max.x.max(terminal_rect.min.x) + 1.0;
+        let seam_rect =
+            egui::Rect::from_min_max(egui::pos2(seam_left, top), egui::pos2(seam_right, bottom));
+
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("sidebar-seam-fix"),
+        ))
+        .rect_filled(seam_rect, 0.0, SURFACE_BG);
     }
 
     fn draw_terminal_pane(&mut self, ui: &mut Ui, terminal_id: u64, pane_size: Vec2) {
@@ -1953,16 +2162,24 @@ impl eframe::App for AdeApp {
         self.ensure_theme_initialized(ctx);
         self.process_terminal_events(ctx);
         self.process_source_control_events(ctx);
+        self.process_directory_index_events(ctx);
         self.schedule_terminal_refresh(ctx);
         self.handle_shortcuts(ctx);
 
         self.draw_top_bar(ctx);
-        self.draw_project_explorer(ctx);
-        self.draw_terminal_manager(ctx);
+        let explorer_rect = self.draw_project_explorer(ctx);
+        let terminal_rect = self.draw_terminal_manager(ctx);
         self.draw_main_area(ctx);
+        if let (Some(explorer_rect), Some(terminal_rect)) = (explorer_rect, terminal_rect) {
+            self.draw_sidebar_seam_fix(ctx, explorer_rect, terminal_rect);
+        }
         self.draw_settings_popup(ctx);
 
         self.route_active_terminal_input(ctx);
+    }
+
+    fn persist_egui_memory(&self) -> bool {
+        false
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -2118,6 +2335,118 @@ fn parse_branch_header(header: &str) -> (String, usize, usize) {
     (branch_part, ahead, behind)
 }
 
+fn build_directory_root_node(path: &Path) -> DirectoryNode {
+    let name = path
+        .file_name()
+        .map(|segment| segment.to_string_lossy().to_string())
+        .filter(|segment| !segment.trim().is_empty())
+        .unwrap_or_else(|| path.display().to_string());
+
+    DirectoryNode {
+        name,
+        path: path.to_path_buf(),
+        is_dir: true,
+        children: Vec::new(),
+    }
+}
+
+fn collect_directory_index_snapshot(project_path: &Path) -> DirectoryIndexSnapshot {
+    let mut root = build_directory_root_node(project_path);
+    let mut node_budget = DIRECTORY_INDEX_MAX_NODES;
+    let mut truncated = false;
+
+    let snapshot_error = match read_directory_children(
+        project_path,
+        0,
+        DIRECTORY_INDEX_MAX_DEPTH,
+        &mut node_budget,
+        &mut truncated,
+    ) {
+        Ok(children) => {
+            root.children = children;
+            None
+        }
+        Err(err) => Some(format!("Directory index failed: {err}")),
+    };
+
+    DirectoryIndexSnapshot {
+        root,
+        loading: false,
+        last_error: snapshot_error,
+        truncated,
+    }
+}
+
+fn read_directory_children(
+    path: &Path,
+    depth: usize,
+    max_depth: usize,
+    node_budget: &mut usize,
+    truncated: &mut bool,
+) -> Result<Vec<DirectoryNode>, String> {
+    if depth >= max_depth || *node_budget == 0 {
+        return Ok(Vec::new());
+    }
+
+    let entries = fs::read_dir(path).map_err(|err| err.to_string())?;
+    let mut children_paths = entries
+        .filter_map(|entry| entry.ok().map(|dir_entry| dir_entry.path()))
+        .collect::<Vec<PathBuf>>();
+    children_paths.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
+
+    let mut children = Vec::new();
+    for child_path in children_paths {
+        if *node_budget == 0 {
+            *truncated = true;
+            break;
+        }
+        if let Some(node) =
+            build_directory_node(&child_path, depth + 1, max_depth, node_budget, truncated)
+        {
+            children.push(node);
+        }
+    }
+
+    Ok(children)
+}
+
+fn build_directory_node(
+    path: &Path,
+    depth: usize,
+    max_depth: usize,
+    node_budget: &mut usize,
+    truncated: &mut bool,
+) -> Option<DirectoryNode> {
+    if *node_budget == 0 {
+        *truncated = true;
+        return None;
+    }
+    *node_budget -= 1;
+
+    let name = path
+        .file_name()
+        .map(|segment| segment.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    let is_dir = path.is_dir();
+
+    let mut node = DirectoryNode {
+        name,
+        path: path.to_path_buf(),
+        is_dir,
+        children: Vec::new(),
+    };
+
+    if is_dir && depth < max_depth {
+        if let Ok(children) =
+            read_directory_children(path, depth, max_depth, node_budget, truncated)
+        {
+            node.children = children;
+        }
+    }
+
+    Some(node)
+}
+
 fn open_in_file_explorer(path: &Path, select_file: bool) -> Result<(), String> {
     let mut command = Command::new("explorer.exe");
     if select_file {
@@ -2134,56 +2463,97 @@ fn open_in_file_explorer(path: &Path, select_file: bool) -> Result<(), String> {
 
 fn draw_folder_tree(
     ui: &mut Ui,
-    path: &Path,
-    depth: usize,
-    max_depth: usize,
-    status_line: &mut String,
-) {
-    if depth > max_depth {
-        return;
-    }
+    root: &DirectoryNode,
+    status_line_update: &mut Option<String>,
+    search_query: Option<&str>,
+    force_show_all_descendants: bool,
+    matching_directories: Option<&HashSet<PathBuf>>,
+) -> bool {
+    let mut rendered_any = false;
+    for item in &root.children {
+        let item_name_lower = item.name.to_lowercase();
+        let item_matches = search_query.is_some_and(|query| item_name_lower.contains(query));
 
-    let Ok(entries) = fs::read_dir(path) else {
-        return;
-    };
+        if item.is_dir {
+            let should_show_dir = match search_query {
+                Some(_) => matching_directories.is_some_and(|dirs| dirs.contains(&item.path)),
+                None => true,
+            };
+            if !should_show_dir {
+                continue;
+            }
+            rendered_any = true;
 
-    let mut items = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .collect::<Vec<PathBuf>>();
-
-    items.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
-
-    for item in items {
-        let name = item
-            .file_name()
-            .map(|segment| segment.to_string_lossy().to_string())
-            .unwrap_or_else(|| item.display().to_string());
-        let item_path_text = item.display().to_string();
-
-        if item.is_dir() {
-            let header = egui::CollapsingHeader::new(name)
-                .id_salt(item.display().to_string())
+            let show_all_descendants =
+                force_show_all_descendants || search_query.is_some() && item_matches;
+            let header = egui::CollapsingHeader::new(item.name.clone())
+                .id_salt(item.path.display().to_string())
+                .open(search_query.map(|_| true))
                 .show(ui, |ui| {
-                    draw_folder_tree(ui, &item, depth + 1, max_depth, status_line)
+                    let _ = draw_folder_tree(
+                        ui,
+                        item,
+                        status_line_update,
+                        search_query,
+                        show_all_descendants,
+                        matching_directories,
+                    );
                 });
             header.header_response.context_menu(|ui| {
                 if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
+                    let item_path_text = item.path.display().to_string();
                     ui.ctx().copy_text(item_path_text.clone());
-                    *status_line = format!("Copied path: {}", item_path_text);
+                    *status_line_update = Some(format!("Copied path: {}", item_path_text));
                     ui.close_menu();
                 }
             });
         } else {
-            ui.label(name).context_menu(|ui| {
+            let should_show_file = match search_query {
+                Some(_) => force_show_all_descendants || item_matches,
+                None => true,
+            };
+            if !should_show_file {
+                continue;
+            }
+            rendered_any = true;
+
+            ui.label(item.name.clone()).context_menu(|ui| {
                 if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
+                    let item_path_text = item.path.display().to_string();
                     ui.ctx().copy_text(item_path_text.clone());
-                    *status_line = format!("Copied path: {}", item_path_text);
+                    *status_line_update = Some(format!("Copied path: {}", item_path_text));
                     ui.close_menu();
                 }
             });
         }
     }
+
+    rendered_any
+}
+
+fn collect_matching_directory_paths(
+    root: &DirectoryNode,
+    query: &str,
+    include_self: bool,
+    matching_directories: &mut HashSet<PathBuf>,
+) -> bool {
+    let mut has_match = include_self && root.name.to_lowercase().contains(query);
+
+    for child in &root.children {
+        if child.is_dir {
+            if collect_matching_directory_paths(child, query, true, matching_directories) {
+                has_match = true;
+            }
+        } else if child.name.to_lowercase().contains(query) {
+            has_match = true;
+        }
+    }
+
+    if root.is_dir && has_match {
+        matching_directories.insert(root.path.clone());
+    }
+
+    has_match
 }
 
 fn styled_pill_button(

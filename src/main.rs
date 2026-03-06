@@ -17,7 +17,7 @@ fn main() -> Result<(), eframe::Error> {
             .with_inner_size([1500.0, 900.0])
             .with_min_inner_size([980.0, 620.0])
             .with_title("Mergen ADE"),
-        centered: true,
+        persist_window: false,
         ..Default::default()
     };
 
