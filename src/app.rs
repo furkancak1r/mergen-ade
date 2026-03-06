@@ -2846,6 +2846,7 @@ fn with_minimal_button_chrome<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)
     ui.scope(|ui| {
         let style = ui.style_mut();
         style.spacing.button_padding = egui::vec2(8.0, 5.0);
+        let hover_fill = with_alpha(BTN_ICON_HOVER, 110);
 
         style.visuals.widgets.inactive.bg_fill = Color32::TRANSPARENT;
         style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
@@ -2853,8 +2854,8 @@ fn with_minimal_button_chrome<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)
         style.visuals.widgets.inactive.fg_stroke =
             Stroke::new(1.0, with_alpha(TEXT_PRIMARY, 190));
 
-        style.visuals.widgets.hovered.bg_fill = Color32::TRANSPARENT;
-        style.visuals.widgets.hovered.weak_bg_fill = Color32::TRANSPARENT;
+        style.visuals.widgets.hovered.bg_fill = hover_fill;
+        style.visuals.widgets.hovered.weak_bg_fill = hover_fill;
         style.visuals.widgets.hovered.bg_stroke = Stroke::NONE;
         style.visuals.widgets.hovered.fg_stroke =
             Stroke::new(1.0, Color32::from_rgb(244, 249, 255));
@@ -2906,8 +2907,8 @@ fn styled_pill_button(
     ui: &mut Ui,
     icon: AppIcon,
     label: &str,
-    bg: Color32,
-    hover_bg: Color32,
+    _bg: Color32,
+    _hover_bg: Color32,
 ) -> bool {
     let text = format!("{} {}", icon, label);
     let galley = ui.fonts(|fonts| {
@@ -2920,14 +2921,10 @@ fn styled_pill_button(
     let size = egui::vec2(galley.size().x + 18.0, CONTROL_ROW_HEIGHT);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
 
-    let fill = if response.is_pointer_button_down_on() {
-        with_alpha(hover_bg, 120)
-    } else if response.hovered() {
-        with_alpha(hover_bg, 80)
-    } else {
-        with_alpha(bg, 48)
-    };
-    ui.painter().rect_filled(rect, 8.0, fill);
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, 8.0, with_alpha(BTN_ICON_HOVER, 110));
+    }
     ui.painter().galley(
         egui::pos2(
             rect.center().x - galley.size().x * 0.5,
@@ -2952,6 +2949,11 @@ fn styled_icon_button(
         ui.allocate_exact_size(egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT), Sense::click());
     let response = response.on_hover_text(tooltip);
 
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect.shrink(1.0), 8.0, with_alpha(BTN_ICON_HOVER, 110));
+    }
+
     let icon_color = if response.is_pointer_button_down_on() || response.hovered() {
         Color32::from_rgb(244, 249, 255)
     } else {
@@ -2972,6 +2974,11 @@ fn styled_icon_toggle(ui: &mut Ui, selected: bool, icon: AppIcon, tooltip: &str)
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT), Sense::click());
     let response = response.on_hover_text(tooltip);
+
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect.shrink(1.0), 8.0, with_alpha(BTN_ICON_HOVER, 110));
+    }
 
     let icon_color = if selected || response.hovered() || response.is_pointer_button_down_on() {
         Color32::from_rgb(244, 249, 255)
