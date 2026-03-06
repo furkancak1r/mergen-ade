@@ -53,6 +53,10 @@ const PROJECT_EXPLORER_WIDTH: f32 = 320.0;
 const PROJECT_EXPLORER_COLLAPSED_WIDTH: f32 = 46.0;
 const PROJECT_EXPLORER_HEADER_REVEAL_THRESHOLD: f32 = 0.46;
 const PROJECT_EXPLORER_CONTENT_REVEAL_THRESHOLD: f32 = 0.72;
+const TERMINAL_MANAGER_COLLAPSED_WIDTH: f32 = 46.0;
+const TERMINAL_MANAGER_DEFAULT_WIDTH: f32 = 280.0;
+const TERMINAL_MANAGER_MIN_WIDTH: f32 = 180.0;
+const TERMINAL_MANAGER_MAX_WIDTH: f32 = 620.0;
 const CONTROL_ROW_HEIGHT: f32 = 28.0;
 
 // Pill button palette
@@ -1593,11 +1597,10 @@ impl AdeApp {
             return None;
         }
 
-        let response = egui::SidePanel::left("terminal_manager")
-            .resizable(true)
-            .min_width(180.0)
-            .max_width(620.0)
-            .default_width(280.0)
+        let is_expanded = self.config.ui.terminal_manager_expanded;
+        let collapsed_panel = egui::SidePanel::left("terminal_manager_collapsed")
+            .resizable(false)
+            .exact_width(TERMINAL_MANAGER_COLLAPSED_WIDTH)
             .show_separator_line(false)
             .frame(
                 egui::Frame::none()
@@ -1605,117 +1608,195 @@ impl AdeApp {
                     .stroke(Stroke::new(1.0, BORDER_COLOR))
                     .rounding(8.0)
                     .inner_margin(egui::Margin::same(10.0)),
-            )
-            .show(ctx, |ui| {
-                let panel_right = ui.max_rect().right();
-                ui.set_width(ui.max_rect().width());
-                ui.label(
-                    RichText::new(format!("{} Terminal Manager", icons::TERMINAL_WINDOW))
-                        .strong()
-                        .size(15.0),
-                );
-                ui.separator();
+            );
+        let expanded_panel = egui::SidePanel::left("terminal_manager")
+            .resizable(true)
+            .min_width(TERMINAL_MANAGER_MIN_WIDTH)
+            .max_width(TERMINAL_MANAGER_MAX_WIDTH)
+            .default_width(TERMINAL_MANAGER_DEFAULT_WIDTH)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::none()
+                    .fill(SURFACE_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .rounding(8.0)
+                    .inner_margin(egui::Margin::same(10.0)),
+            );
 
-                let mut project_ids = self.projects.keys().copied().collect::<Vec<_>>();
-                project_ids.sort_unstable();
+        let response = egui::SidePanel::show_animated_between(
+            ctx,
+            is_expanded,
+            collapsed_panel,
+            expanded_panel,
+            |ui, expansion| self.draw_terminal_manager_contents(ctx, ui, expansion, is_expanded),
+        );
 
-                for project_id in project_ids {
-                    if self.config.ui.project_filter_mode
-                        && self
-                            .selected_project
-                            .is_some_and(|selected| selected != project_id)
-                    {
-                        continue;
+        response.map(|inner| inner.response.rect)
+    }
+
+    fn draw_terminal_manager_contents(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut Ui,
+        expansion: f32,
+        is_expanded: bool,
+    ) {
+        let panel_right = ui.max_rect().right();
+        ui.set_width(ui.max_rect().width());
+
+        let toggle_symbol = if is_expanded { "<" } else { ">" };
+        let toggle_tooltip = if is_expanded {
+            "Collapse Terminal Manager"
+        } else {
+            "Expand Terminal Manager"
+        };
+        let mut should_persist = false;
+
+        if expansion <= PROJECT_EXPLORER_HEADER_REVEAL_THRESHOLD {
+            ui.vertical_centered(|ui| {
+                if styled_symbol_button(
+                    ui,
+                    toggle_symbol,
+                    BTN_SUBTLE,
+                    BTN_SUBTLE_HOVER,
+                    BTN_ICON_ACTIVE,
+                    toggle_tooltip,
+                ) {
+                    self.config.ui.terminal_manager_expanded = !is_expanded;
+                    should_persist = true;
+                }
+            });
+            if should_persist {
+                self.persist_config();
+            }
+            ui.expand_to_include_x(panel_right);
+            return;
+        }
+
+        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+            ui.label(
+                RichText::new(format!("{} Terminal Manager", icons::TERMINAL_WINDOW))
+                    .strong()
+                    .size(15.0),
+            );
+
+            let remaining_width = ui.available_size_before_wrap().x.max(0.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(remaining_width, CONTROL_ROW_HEIGHT),
+                Layout::right_to_left(Align::Center),
+                |ui| {
+                    if styled_symbol_button(
+                        ui,
+                        toggle_symbol,
+                        BTN_SUBTLE,
+                        BTN_SUBTLE_HOVER,
+                        BTN_ICON_ACTIVE,
+                        toggle_tooltip,
+                    ) {
+                        self.config.ui.terminal_manager_expanded = !is_expanded;
+                        should_persist = true;
                     }
+                },
+            );
+        });
+        if should_persist {
+            self.persist_config();
+        }
+        if expansion <= PROJECT_EXPLORER_CONTENT_REVEAL_THRESHOLD {
+            ui.expand_to_include_x(panel_right);
+            return;
+        }
+        ui.separator();
 
-                    let Some(project_snapshot) = self.projects.get(&project_id).cloned() else {
-                        continue;
-                    };
+        let mut project_ids = self.projects.keys().copied().collect::<Vec<_>>();
+        project_ids.sort_unstable();
 
-                    let project_path = project_snapshot.path.display().to_string();
+        for project_id in project_ids {
+            if self.config.ui.project_filter_mode
+                && self
+                    .selected_project
+                    .is_some_and(|selected| selected != project_id)
+            {
+                continue;
+            }
 
-                    let header_label = format!("{} {}", icons::FOLDER_OPEN, project_snapshot.name);
-                    let header = egui::CollapsingHeader::new(header_label)
-                        .id_salt(format!("project-group-{project_id}"))
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                if styled_icon_button(
-                                    ui,
-                                    icons::TERMINAL,
-                                    BTN_BLUE,
-                                    BTN_BLUE_HOVER,
-                                    BTN_ICON_ACTIVE,
-                                    "New Foreground Terminal",
-                                ) {
-                                    self.spawn_terminal_for_project(
-                                        ctx,
-                                        project_id,
-                                        TerminalKind::Foreground,
-                                    );
-                                }
-                                if styled_icon_button(
-                                    ui,
-                                    icons::LIST,
-                                    BTN_TEAL,
-                                    BTN_TEAL_HOVER,
-                                    BTN_ICON_ACTIVE,
-                                    "New Background Terminal",
-                                ) {
-                                    self.spawn_terminal_for_project(
-                                        ctx,
-                                        project_id,
-                                        TerminalKind::Background,
-                                    );
-                                }
-                            });
+            let Some(project_snapshot) = self.projects.get(&project_id).cloned() else {
+                continue;
+            };
 
-                            ui.separator();
-                            ui.label(
-                                RichText::new(format!("{} Foreground", icons::TERMINAL))
-                                    .strong()
-                                    .color(TEXT_MUTED),
-                            );
-                            self.draw_terminal_rows(ui, project_id, TerminalKind::Foreground);
+            let project_path = project_snapshot.path.display().to_string();
 
-                            ui.separator();
-                            ui.label(
-                                RichText::new(format!("{} Background", icons::LIST))
-                                    .strong()
-                                    .color(TEXT_MUTED),
-                            );
-                            self.draw_terminal_rows(ui, project_id, TerminalKind::Background);
-                        });
-
-                    header.header_response.context_menu(|ui| {
-                        if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
-                            ui.ctx().copy_text(project_path.clone());
-                            self.status_line =
-                                format!("Copied path for project '{}'", project_snapshot.name);
-                            ui.close_menu();
+            let header_label = format!("{} {}", icons::FOLDER_OPEN, project_snapshot.name);
+            let header = egui::CollapsingHeader::new(header_label)
+                .id_salt(format!("project-group-{project_id}"))
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if styled_icon_button(
+                            ui,
+                            icons::TERMINAL,
+                            BTN_BLUE,
+                            BTN_BLUE_HOVER,
+                            BTN_ICON_ACTIVE,
+                            "New Foreground Terminal",
+                        ) {
+                            self.spawn_terminal_for_project(ctx, project_id, TerminalKind::Foreground);
                         }
-                        if ui
-                            .button(format!("{} Open in Folder", icons::FOLDER_OPEN))
-                            .clicked()
-                        {
-                            match open_in_file_explorer(&project_snapshot.path, false) {
-                                Ok(()) => {
-                                    self.status_line = format!(
-                                        "Opened project '{}' in Explorer",
-                                        project_snapshot.name
-                                    );
-                                }
-                                Err(err) => {
-                                    self.status_line = format!("Open folder failed: {err}");
-                                }
-                            }
-                            ui.close_menu();
+                        if styled_icon_button(
+                            ui,
+                            icons::LIST,
+                            BTN_TEAL,
+                            BTN_TEAL_HOVER,
+                            BTN_ICON_ACTIVE,
+                            "New Background Terminal",
+                        ) {
+                            self.spawn_terminal_for_project(ctx, project_id, TerminalKind::Background);
                         }
                     });
+
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!("{} Foreground", icons::TERMINAL))
+                            .strong()
+                            .color(TEXT_MUTED),
+                    );
+                    self.draw_terminal_rows(ui, project_id, TerminalKind::Foreground);
+
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!("{} Background", icons::LIST))
+                            .strong()
+                            .color(TEXT_MUTED),
+                    );
+                    self.draw_terminal_rows(ui, project_id, TerminalKind::Background);
+                });
+
+            header.header_response.context_menu(|ui| {
+                if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
+                    ui.ctx().copy_text(project_path.clone());
+                    self.status_line =
+                        format!("Copied path for project '{}'", project_snapshot.name);
+                    ui.close_menu();
                 }
-                ui.expand_to_include_x(panel_right);
+                if ui
+                    .button(format!("{} Open in Folder", icons::FOLDER_OPEN))
+                    .clicked()
+                {
+                    match open_in_file_explorer(&project_snapshot.path, false) {
+                        Ok(()) => {
+                            self.status_line =
+                                format!("Opened project '{}' in Explorer", project_snapshot.name);
+                        }
+                        Err(err) => {
+                            self.status_line = format!("Open folder failed: {err}");
+                        }
+                    }
+                    ui.close_menu();
+                }
             });
-        Some(response.response.rect)
+        }
+
+        ui.expand_to_include_x(panel_right);
     }
 
     fn draw_terminal_rows(&mut self, ui: &mut Ui, project_id: u64, kind: TerminalKind) {
