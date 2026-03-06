@@ -908,17 +908,23 @@ impl AdeApp {
                             .color(ACCENT),
                     );
                     ui.add_space(6.0);
-
-                    if styled_icon_button(
-                        ui,
-                        icons::GEAR,
-                        BTN_SUBTLE,
-                        BTN_SUBTLE_HOVER,
-                        BTN_ICON_ACTIVE,
-                        "Settings",
-                    ) {
-                        self.show_settings_popup = true;
-                    }
+                    let remaining_width = ui.available_size_before_wrap().x.max(0.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(remaining_width, 28.0),
+                        Layout::right_to_left(Align::Center),
+                        |ui| {
+                            if styled_icon_button(
+                                ui,
+                                icons::GEAR,
+                                BTN_SUBTLE,
+                                BTN_SUBTLE_HOVER,
+                                BTN_ICON_ACTIVE,
+                                "Settings",
+                            ) {
+                                self.show_settings_popup = true;
+                            }
+                        },
+                    );
                 });
             });
     }
@@ -1094,7 +1100,8 @@ impl AdeApp {
                         ui.add_sized(
                             [ui.available_width(), 28.0],
                             egui::TextEdit::singleline(&mut self.directory_search_query)
-                                .hint_text("Search files and folders"),
+                                .hint_text("Search files and folders")
+                                .vertical_align(Align::Center),
                         );
                         ui.separator();
 
