@@ -12,7 +12,7 @@ use crossbeam_channel::{Receiver, Sender};
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{
     self, Align, Color32, Event, FontData, FontFamily, FontId, Key, Layout, RichText, Sense,
-    Stroke, TextWrapMode, Ui, Vec2,
+    Stroke, TextWrapMode, Ui, Vec2, WidgetInfo, WidgetText, WidgetType,
 };
 use iconflow::{fonts as icon_fonts, try_icon, Pack, Size, Style};
 
@@ -56,6 +56,7 @@ const TEXT_MUTED: Color32 = Color32::from_rgb(148, 167, 191);
 const PROJECT_EXPLORER_WIDTH: f32 = 320.0;
 const ACTIVITY_RAIL_WIDTH: f32 = 48.0;
 const CONTROL_ROW_HEIGHT: f32 = 28.0;
+const TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH: f32 = 32.0;
 
 // Pill button palette
 const BTN_BLUE: Color32 = Color32::from_rgb(16, 64, 112);
@@ -1911,64 +1912,108 @@ impl AdeApp {
                     continue;
                 };
                 let terminal_entry_id = terminal.id;
+                let active = current_active == Some(terminal_entry_id);
+                let label = terminal_display_label(&terminal.full_title, terminal.exited);
+                let title_font = egui::TextStyle::Button.resolve(ui.style());
+                let section_gap = ui.spacing().item_spacing.x;
+                let actions_width = terminal_manager_actions_width(section_gap);
+                let row_width = ui.available_width().max(0.0);
+                let (row_label_width, row_actions_width) =
+                    terminal_manager_row_widths(row_width, actions_width, section_gap);
+                let row_height = ui.spacing().interact_size.y.max(CONTROL_ROW_HEIGHT);
+                let (row_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(row_width, row_height), Sense::hover());
 
-                ui.horizontal(|ui| {
-                    let active = current_active == Some(terminal_entry_id);
-                    let label = terminal_display_label(&terminal.title, terminal.exited);
-
-                    if ui.selectable_label(active, label).clicked() {
+                if row_label_width > 0.0 {
+                    let label_rect = egui::Rect::from_min_size(
+                        row_rect.min,
+                        egui::vec2(row_label_width, row_rect.height()),
+                    );
+                    let label_response = ui
+                        .scope_builder(
+                            egui::UiBuilder::new()
+                                .max_rect(label_rect)
+                                .layout(Layout::left_to_right(Align::Center)),
+                            |ui| {
+                                let label_response =
+                                    draw_truncated_selectable_label(ui, active, &label);
+                                with_truncation_tooltip(
+                                    ui,
+                                    label_response,
+                                    &label,
+                                    &title_font,
+                                    TEXT_PRIMARY,
+                                )
+                            },
+                        )
+                        .inner;
+                    if label_response.clicked() {
                         set_active = true;
                     }
+                }
 
-                    let message_menu = with_minimal_button_chrome(ui, |ui| {
-                        ui.menu_button(format!("{}", icons::CHAT_TEXT), |ui| {
-                            with_minimal_button_chrome(ui, |ui| {
-                                if saved_messages.is_empty() {
-                                    ui.label(RichText::new("No saved messages").color(TEXT_MUTED));
-                                    return;
-                                }
+                let actions_rect = egui::Rect::from_min_size(
+                    egui::pos2(row_rect.right() - row_actions_width, row_rect.top()),
+                    egui::vec2(row_actions_width, row_rect.height()),
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(actions_rect)
+                        .layout(Layout::right_to_left(Align::Center)),
+                    |ui| {
+                        if styled_icon_button(
+                            ui,
+                            icons::X,
+                            BTN_RED,
+                            BTN_RED_HOVER,
+                            Color32::from_rgb(186, 58, 58),
+                            "Close",
+                        ) {
+                            close_terminal = true;
+                        }
 
-                                for message in &saved_messages {
-                                    if ui.button(message).clicked() {
-                                        send_message = Some(message.clone());
-                                        ui.close_menu();
+                        let visibility_icon = if terminal.in_main_view {
+                            icons::EYE
+                        } else {
+                            icons::EYE_OFF
+                        };
+                        let visibility_tooltip = if terminal.in_main_view {
+                            "Hide from main area"
+                        } else {
+                            "Show in main area"
+                        };
+                        if styled_icon_toggle(
+                            ui,
+                            terminal.in_main_view,
+                            visibility_icon,
+                            visibility_tooltip,
+                        ) {
+                            terminal.in_main_view = !terminal.in_main_view;
+                            visibility_changed = true;
+                        }
+
+                        let message_menu = with_minimal_button_chrome(ui, |ui| {
+                            ui.menu_button(format!("{}", icons::CHAT_TEXT), |ui| {
+                                with_minimal_button_chrome(ui, |ui| {
+                                    if saved_messages.is_empty() {
+                                        ui.label(
+                                            RichText::new("No saved messages").color(TEXT_MUTED),
+                                        );
+                                        return;
                                     }
-                                }
-                            });
-                        })
-                    });
-                    message_menu.response.on_hover_text("Send saved message");
 
-                    let visibility_icon = if terminal.in_main_view {
-                        icons::EYE
-                    } else {
-                        icons::EYE_OFF
-                    };
-                    let visibility_tooltip = if terminal.in_main_view {
-                        "Hide from main area"
-                    } else {
-                        "Show in main area"
-                    };
-                    if styled_icon_toggle(
-                        ui,
-                        terminal.in_main_view,
-                        visibility_icon,
-                        visibility_tooltip,
-                    ) {
-                        terminal.in_main_view = !terminal.in_main_view;
-                        visibility_changed = true;
-                    }
-                    if styled_icon_button(
-                        ui,
-                        icons::X,
-                        BTN_RED,
-                        BTN_RED_HOVER,
-                        Color32::from_rgb(186, 58, 58),
-                        "Close",
-                    ) {
-                        close_terminal = true;
-                    }
-                });
+                                    for message in &saved_messages {
+                                        if ui.button(message).clicked() {
+                                            send_message = Some(message.clone());
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
+                            })
+                        });
+                        message_menu.response.on_hover_text("Send saved message");
+                    },
+                );
 
                 terminal_entry_id
             };
@@ -3149,6 +3194,70 @@ fn terminal_display_label(title: &str, exited: bool) -> String {
     }
 }
 
+fn terminal_manager_actions_width(section_gap: f32) -> f32 {
+    (CONTROL_ROW_HEIGHT * 2.0) + TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH + (section_gap * 2.0)
+}
+
+fn terminal_manager_row_widths(
+    total_width: f32,
+    preferred_actions_width: f32,
+    section_gap: f32,
+) -> (f32, f32) {
+    let total_width = total_width.max(0.0);
+    let preferred_actions_width = preferred_actions_width.max(0.0).min(total_width);
+    let label_width = (total_width - preferred_actions_width - section_gap.max(0.0)).max(0.0);
+    let actions_width = if label_width > 0.0 {
+        preferred_actions_width
+    } else {
+        total_width
+    };
+    (label_width, actions_width)
+}
+
+fn draw_truncated_selectable_label(ui: &mut Ui, selected: bool, text: &str) -> egui::Response {
+    let button_padding = ui.spacing().button_padding;
+    let available_width = ui.available_width().max(0.0);
+    let wrap_width = (available_width - (button_padding.x * 2.0)).max(0.0);
+    let galley = WidgetText::from(text.to_owned()).into_galley(
+        ui,
+        Some(TextWrapMode::Truncate),
+        wrap_width,
+        egui::TextStyle::Button,
+    );
+    let galley_text = galley.text().to_owned();
+    let desired_size = egui::vec2(available_width, ui.spacing().interact_size.y);
+    let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
+    response.widget_info(|| {
+        WidgetInfo::selected(
+            WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            &galley_text,
+        )
+    });
+
+    if ui.is_rect_visible(response.rect) {
+        let visuals = ui.style().interact_selectable(&response, selected);
+        if selected || response.hovered() || response.highlighted() || response.has_focus() {
+            let rect = rect.expand(visuals.expansion);
+            ui.painter().rect(
+                rect,
+                visuals.rounding,
+                visuals.weak_bg_fill,
+                visuals.bg_stroke,
+            );
+        }
+
+        let text_pos = ui
+            .layout()
+            .align_size_within_rect(galley.size(), rect.shrink2(button_padding))
+            .min;
+        ui.painter().galley(text_pos, galley, visuals.text_color());
+    }
+
+    response
+}
+
 fn capped_hover_text(text: &str, max_chars: usize) -> String {
     let mut result = String::new();
     for (index, ch) in text.chars().enumerate() {
@@ -3640,7 +3749,8 @@ mod tests {
     use super::{
         build_terminal_cursor_overlay, build_terminal_render, cursor_hidden_by_row_filter,
         normalize_terminal_background, parse_branch_header, recover_config_state,
-        terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect, to_egui_color,
+        terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect,
+        terminal_manager_actions_width, terminal_manager_row_widths, to_egui_color,
         update_stable_cursor_row, visible_terminal_cursor, AdeApp, PendingConfigChanges,
         TerminalCursorOverlay, TERMINAL_OUTPUT_BG,
     };
@@ -3674,6 +3784,26 @@ mod tests {
 
         assert_eq!(ctrl_c, Some(vec![0x03]));
         assert_eq!(ctrl_z, Some(vec![0x1a]));
+    }
+
+    #[test]
+    fn terminal_manager_row_reserves_gap_and_actions_width() {
+        let actions_width = terminal_manager_actions_width(8.0);
+        let (label_width, actions_area_width) =
+            terminal_manager_row_widths(160.0, actions_width, 8.0);
+
+        assert_eq!(actions_area_width, actions_width);
+        assert!((label_width - 48.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn terminal_manager_row_gives_actions_full_width_when_space_is_tight() {
+        let actions_width = terminal_manager_actions_width(8.0);
+        let (label_width, actions_area_width) =
+            terminal_manager_row_widths(70.0, actions_width, 8.0);
+
+        assert_eq!(label_width, 0.0);
+        assert_eq!(actions_area_width, 70.0);
     }
 
     #[test]
