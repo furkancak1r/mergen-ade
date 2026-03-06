@@ -953,10 +953,41 @@ impl AdeApp {
             return;
         }
 
-        terminal.runtime.send_bytes(message.as_bytes().to_vec());
+        let destination_title = terminal.title.clone();
+        let mut outbound = message.as_bytes().to_vec();
+        outbound.push(b'\r');
+        terminal.runtime.send_bytes(outbound);
         Self::append_pending_line(&mut terminal.pending_line_for_title, message);
+        let line = std::mem::take(&mut terminal.pending_line_for_title);
+        terminal.full_title = terminal_title_text(&line, terminal.id as usize);
+        terminal.title = update_terminal_title(&line, terminal.id as usize, TITLE_MAX_LEN);
         terminal.dirty = true;
-        self.status_line = format!("Sent saved message to {}", terminal.title);
+        self.status_line = format!("Sent saved message to {}", destination_title);
+    }
+
+    fn preferred_terminal_for_project(&self, project_id: u64) -> Option<u64> {
+        if let Some(active_terminal_id) = self.active_terminal {
+            if self.terminals.get(&active_terminal_id).is_some_and(|terminal| {
+                terminal.project_id == project_id && !terminal.exited
+            }) {
+                return Some(active_terminal_id);
+            }
+        }
+
+        self.terminals
+            .iter()
+            .find(|(_, terminal)| {
+                terminal.project_id == project_id
+                    && terminal.kind == TerminalKind::Foreground
+                    && !terminal.exited
+            })
+            .map(|(terminal_id, _)| *terminal_id)
+            .or_else(|| {
+                self.terminals
+                    .iter()
+                    .find(|(_, terminal)| terminal.project_id == project_id && !terminal.exited)
+                    .map(|(terminal_id, _)| *terminal_id)
+            })
     }
 
     fn draw_top_bar(&mut self, ctx: &egui::Context) {
@@ -2182,24 +2213,6 @@ impl AdeApp {
                 );
                 ui.separator();
 
-                let mut show_explorer = self.config.ui.show_project_explorer;
-                if ui
-                    .checkbox(&mut show_explorer, "Show Project Explorer")
-                    .changed()
-                {
-                    self.config.ui.show_project_explorer = show_explorer;
-                    should_persist = true;
-                }
-
-                let mut show_terminal_mgr = self.config.ui.show_terminal_manager;
-                if ui
-                    .checkbox(&mut show_terminal_mgr, "Show Terminal Manager")
-                    .changed()
-                {
-                    self.config.ui.show_terminal_manager = show_terminal_mgr;
-                    should_persist = true;
-                }
-
                 let mut filter_mode = self.config.ui.project_filter_mode;
                 if ui
                     .checkbox(
@@ -2280,6 +2293,8 @@ impl AdeApp {
 
                     let mut add_message: Option<String> = None;
                     let mut remove_message_index: Option<usize> = None;
+                    let mut send_message_request: Option<String> = None;
+                    let send_target_terminal = self.preferred_terminal_for_project(project_id);
 
                     egui::CollapsingHeader::new(format!(
                         "{} {}",
@@ -2295,21 +2310,54 @@ impl AdeApp {
                                 RichText::new("No saved messages for this project.")
                                     .color(TEXT_MUTED),
                             );
+                        } else if send_target_terminal.is_none() {
+                            ui.label(
+                                RichText::new(
+                                    "Open a live terminal in this project to send messages one by one.",
+                                )
+                                .color(TEXT_MUTED),
+                            );
                         }
 
                         for (index, message) in project_snapshot.saved_messages.iter().enumerate() {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new(message).monospace().small());
-                                if styled_icon_button(
+                                let message_label = ui.add(
+                                    egui::Label::new(RichText::new(message).monospace().small())
+                                        .truncate(),
+                                );
+                                let _ = with_truncation_tooltip(
                                     ui,
-                                    icons::TRASH,
-                                    BTN_RED,
-                                    BTN_RED_HOVER,
-                                    Color32::from_rgb(186, 58, 58),
-                                    "Remove message",
-                                ) {
-                                    remove_message_index = Some(index);
-                                }
+                                    message_label,
+                                    message,
+                                    &egui::TextStyle::Monospace.resolve(ui.style()),
+                                    TEXT_PRIMARY,
+                                );
+
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if styled_icon_button(
+                                        ui,
+                                        icons::TRASH,
+                                        BTN_RED,
+                                        BTN_RED_HOVER,
+                                        Color32::from_rgb(186, 58, 58),
+                                        "Remove message",
+                                    ) {
+                                        remove_message_index = Some(index);
+                                    }
+
+                                    if let Some(_terminal_id) = send_target_terminal {
+                                        if styled_icon_button(
+                                            ui,
+                                            icons::TERMINAL,
+                                            BTN_BLUE,
+                                            BTN_BLUE_HOVER,
+                                            BTN_ICON_ACTIVE,
+                                            "Send message",
+                                        ) {
+                                            send_message_request = Some(message.clone());
+                                        }
+                                    }
+                                });
                             });
                         }
 
@@ -2344,6 +2392,12 @@ impl AdeApp {
                                 should_persist = true;
                             }
                         }
+                    }
+
+                    if let (Some(terminal_id), Some(message)) =
+                        (send_target_terminal, send_message_request)
+                    {
+                        self.send_saved_message_to_terminal(terminal_id, &message);
                     }
                 }
 
