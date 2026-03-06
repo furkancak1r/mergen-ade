@@ -53,6 +53,7 @@ const PROJECT_EXPLORER_WIDTH: f32 = 320.0;
 const PROJECT_EXPLORER_COLLAPSED_WIDTH: f32 = 46.0;
 const PROJECT_EXPLORER_HEADER_REVEAL_THRESHOLD: f32 = 0.46;
 const PROJECT_EXPLORER_CONTENT_REVEAL_THRESHOLD: f32 = 0.72;
+const CONTROL_ROW_HEIGHT: f32 = 28.0;
 
 // Pill button palette
 const BTN_BLUE: Color32 = Color32::from_rgb(16, 64, 112);
@@ -1150,82 +1151,88 @@ impl AdeApp {
                             });
                         let previous_selected_project = self.selected_project;
                         ui.label(RichText::new("Project").color(TEXT_MUTED));
-                        ui.horizontal(|ui| {
-                            let button_group_width = 30.0 * 3.0 + ui.spacing().item_spacing.x * 2.0;
-                            let combo_width =
-                                (ui.available_width() - button_group_width).clamp(96.0, 150.0);
-                            egui::ComboBox::from_id_salt("directory-project-select")
-                                .selected_text(selected_project_label)
-                                .width(combo_width)
-                                .show_ui(ui, |ui| {
-                                    for (project_id, project_name, _, _) in &project_rows {
-                                        ui.selectable_value(
-                                            &mut self.selected_project,
-                                            Some(*project_id),
-                                            format!("{} {}", icons::FOLDER, project_name),
-                                        );
-                                    }
-                                });
+                        ui.scope(|ui| {
+                            ui.spacing_mut().interact_size.y = CONTROL_ROW_HEIGHT;
+                            ui.horizontal(|ui| {
+                                let button_group_width =
+                                    30.0 * 3.0 + ui.spacing().item_spacing.x * 2.0;
+                                let combo_width =
+                                    (ui.available_width() - button_group_width).clamp(96.0, 150.0);
+                                egui::ComboBox::from_id_salt("directory-project-select")
+                                    .selected_text(selected_project_label)
+                                    .width(combo_width)
+                                    .show_ui(ui, |ui| {
+                                        for (project_id, project_name, _, _) in &project_rows {
+                                            ui.selectable_value(
+                                                &mut self.selected_project,
+                                                Some(*project_id),
+                                                format!("{} {}", icons::FOLDER, project_name),
+                                            );
+                                        }
+                                    });
 
-                            ui.add_enabled_ui(selected_project_details.is_some(), |ui| {
-                                if styled_icon_button(
-                                    ui,
-                                    icons::COPY,
-                                    BTN_SUBTLE,
-                                    BTN_SUBTLE_HOVER,
-                                    BTN_ICON_ACTIVE,
-                                    "Copy Path",
-                                ) {
-                                    if let Some((_, project_name, _, project_path_text)) =
-                                        selected_project_details.as_ref()
-                                    {
-                                        ui.ctx().copy_text(project_path_text.clone());
-                                        self.status_line =
-                                            format!("Copied path for project '{}'", project_name);
+                                ui.add_enabled_ui(selected_project_details.is_some(), |ui| {
+                                    if styled_icon_button(
+                                        ui,
+                                        icons::COPY,
+                                        BTN_SUBTLE,
+                                        BTN_SUBTLE_HOVER,
+                                        BTN_ICON_ACTIVE,
+                                        "Copy Path",
+                                    ) {
+                                        if let Some((_, project_name, _, project_path_text)) =
+                                            selected_project_details.as_ref()
+                                        {
+                                            ui.ctx().copy_text(project_path_text.clone());
+                                            self.status_line = format!(
+                                                "Copied path for project '{}'",
+                                                project_name
+                                            );
+                                        }
                                     }
-                                }
-                                if styled_icon_button(
-                                    ui,
-                                    icons::FOLDER_OPEN,
-                                    BTN_SUBTLE,
-                                    BTN_SUBTLE_HOVER,
-                                    BTN_ICON_ACTIVE,
-                                    "Open in Folder",
-                                ) {
-                                    if let Some((_, project_name, project_path, _)) =
-                                        selected_project_details.as_ref()
-                                    {
-                                        match open_in_file_explorer(project_path, false) {
-                                            Ok(()) => {
-                                                self.status_line = format!(
-                                                    "Opened project '{}' in Explorer",
-                                                    project_name
-                                                );
-                                            }
-                                            Err(err) => {
-                                                self.status_line =
-                                                    format!("Open folder failed: {err}");
+                                    if styled_icon_button(
+                                        ui,
+                                        icons::FOLDER_OPEN,
+                                        BTN_SUBTLE,
+                                        BTN_SUBTLE_HOVER,
+                                        BTN_ICON_ACTIVE,
+                                        "Open in Folder",
+                                    ) {
+                                        if let Some((_, project_name, project_path, _)) =
+                                            selected_project_details.as_ref()
+                                        {
+                                            match open_in_file_explorer(project_path, false) {
+                                                Ok(()) => {
+                                                    self.status_line = format!(
+                                                        "Opened project '{}' in Explorer",
+                                                        project_name
+                                                    );
+                                                }
+                                                Err(err) => {
+                                                    self.status_line =
+                                                        format!("Open folder failed: {err}");
+                                                }
                                             }
                                         }
                                     }
-                                }
-                                if styled_icon_button(
-                                    ui,
-                                    icons::ARROW_CLOCKWISE,
-                                    BTN_ICON,
-                                    BTN_ICON_HOVER,
-                                    BTN_ICON_ACTIVE,
-                                    "Refresh Directory Index",
-                                ) {
-                                    refresh_index = true;
-                                }
+                                    if styled_icon_button(
+                                        ui,
+                                        icons::ARROW_CLOCKWISE,
+                                        BTN_ICON,
+                                        BTN_ICON_HOVER,
+                                        BTN_ICON_ACTIVE,
+                                        "Refresh Directory Index",
+                                    ) {
+                                        refresh_index = true;
+                                    }
+                                });
                             });
                         });
                         if self.selected_project != previous_selected_project {
                             self.persist_config();
                         }
                         ui.add_sized(
-                            [ui.available_width(), 28.0],
+                            [ui.available_width(), CONTROL_ROW_HEIGHT],
                             egui::TextEdit::singleline(&mut self.directory_search_query)
                                 .hint_text("Search files and folders")
                                 .vertical_align(Align::Center),
@@ -1353,20 +1360,81 @@ impl AdeApp {
                                     })
                                     .unwrap_or_else(|| "No project selected".to_owned());
 
+                                let selected_project_details =
+                                    self.selected_project.and_then(|selected_id| {
+                                        project_rows
+                                            .iter()
+                                            .find(|(project_id, _)| *project_id == selected_id)
+                                            .cloned()
+                                    });
                                 let previous_selected_project = self.selected_project;
                                 ui.label(RichText::new("Project").color(TEXT_MUTED));
-                                egui::ComboBox::from_id_salt("source-control-project-select")
-                                    .selected_text(selected_project_label)
-                                    .width(ui.available_width().max(100.0))
-                                    .show_ui(ui, |ui| {
-                                        for (project_id, project_name) in &project_rows {
-                                            ui.selectable_value(
-                                                &mut self.selected_project,
-                                                Some(*project_id),
-                                                format!("{} {}", icons::FOLDER, project_name),
-                                            );
-                                        }
+                                let mut refresh_status = false;
+                                let mut fetch_and_refresh = false;
+                                let mut open_project_folder = false;
+                                ui.scope(|ui| {
+                                    ui.spacing_mut().interact_size.y = CONTROL_ROW_HEIGHT;
+                                    ui.horizontal(|ui| {
+                                        let button_group_width =
+                                            30.0 * 3.0 + ui.spacing().item_spacing.x * 2.0;
+                                        let combo_width = (ui.available_width()
+                                            - button_group_width)
+                                            .clamp(96.0, 150.0);
+                                        egui::ComboBox::from_id_salt(
+                                            "source-control-project-select",
+                                        )
+                                        .selected_text(selected_project_label)
+                                        .width(combo_width)
+                                        .show_ui(ui, |ui| {
+                                            for (project_id, project_name) in &project_rows {
+                                                ui.selectable_value(
+                                                    &mut self.selected_project,
+                                                    Some(*project_id),
+                                                    format!(
+                                                        "{} {}",
+                                                        icons::FOLDER, project_name
+                                                    ),
+                                                );
+                                            }
+                                        });
+
+                                        ui.add_enabled_ui(
+                                            selected_project_details.is_some(),
+                                            |ui| {
+                                                if styled_icon_button(
+                                                    ui,
+                                                    icons::ARROW_CLOCKWISE,
+                                                    BTN_ICON,
+                                                    BTN_ICON_HOVER,
+                                                    BTN_ICON_ACTIVE,
+                                                    "Refresh Status",
+                                                ) {
+                                                    refresh_status = true;
+                                                }
+                                                if styled_icon_button(
+                                                    ui,
+                                                    icons::DOWNLOAD,
+                                                    BTN_ICON,
+                                                    BTN_ICON_HOVER,
+                                                    BTN_ICON_ACTIVE,
+                                                    "Fetch and Refresh",
+                                                ) {
+                                                    fetch_and_refresh = true;
+                                                }
+                                                if styled_icon_button(
+                                                    ui,
+                                                    icons::FOLDER_OPEN,
+                                                    BTN_ICON,
+                                                    BTN_ICON_HOVER,
+                                                    BTN_ICON_ACTIVE,
+                                                    "Open Project Folder",
+                                                ) {
+                                                    open_project_folder = true;
+                                                }
+                                            },
+                                        );
                                     });
+                                });
                                 if self.selected_project != previous_selected_project {
                                     should_persist_selection = true;
                                 }
@@ -1389,47 +1457,24 @@ impl AdeApp {
                                     self.request_source_control_refresh(project_id, false);
                                 }
 
-                                ui.horizontal_wrapped(|ui| {
-                                    if styled_icon_button(
-                                        ui,
-                                        icons::ARROW_CLOCKWISE,
-                                        BTN_ICON,
-                                        BTN_ICON_HOVER,
-                                        BTN_ICON_ACTIVE,
-                                        "Refresh Status",
-                                    ) {
-                                        self.request_source_control_refresh(project_id, false);
-                                    }
-                                    if styled_icon_button(
-                                        ui,
-                                        icons::DOWNLOAD,
-                                        BTN_ICON,
-                                        BTN_ICON_HOVER,
-                                        BTN_ICON_ACTIVE,
-                                        "Fetch and Refresh",
-                                    ) {
-                                        self.request_source_control_refresh(project_id, true);
-                                    }
-                                    if styled_icon_button(
-                                        ui,
-                                        icons::FOLDER_OPEN,
-                                        BTN_ICON,
-                                        BTN_ICON_HOVER,
-                                        BTN_ICON_ACTIVE,
-                                        "Open Project Folder",
-                                    ) {
-                                        match open_in_file_explorer(&project.path, false) {
-                                            Ok(()) => {
-                                                self.status_line =
-                                                    "Opened project folder".to_owned();
-                                            }
-                                            Err(err) => {
-                                                self.status_line =
-                                                    format!("Open folder failed: {err}");
-                                            }
+                                if refresh_status {
+                                    self.request_source_control_refresh(project_id, false);
+                                }
+                                if fetch_and_refresh {
+                                    self.request_source_control_refresh(project_id, true);
+                                }
+                                if open_project_folder {
+                                    match open_in_file_explorer(&project.path, false) {
+                                        Ok(()) => {
+                                            self.status_line =
+                                                "Opened project folder".to_owned();
+                                        }
+                                        Err(err) => {
+                                            self.status_line =
+                                                format!("Open folder failed: {err}");
                                         }
                                     }
-                                });
+                                }
                                 ui.separator();
 
                                 egui::ScrollArea::vertical()
