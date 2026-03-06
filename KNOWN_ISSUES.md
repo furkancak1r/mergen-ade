@@ -1,5 +1,18 @@
 ### Known Issues & Fix Log
 
+#### Duplicate collapse arrows created noisy left chrome {#duplicate-collapse-arrows-created-noisy-left-chrome}
+- Date: 2026-03-06T09:00:00Z
+- Context: main/Windows local UI shell refresh
+- Error signature: Both collapsible left panels could show their own narrow collapsed strip with separate arrow controls.
+- Symptoms/Impact: When `Project Explorer` and `Terminal Manager` were both collapsed, the left edge showed multiple tiny arrow targets and felt visually noisy and outdated.
+- Root cause: Each panel owned its own collapse affordance instead of sharing one navigation surface.
+- Resolution: Replaced per-panel arrow strips with a single left activity rail that toggles both panels and keeps the shell closer to a modern editor layout.
+- Prevent recurrence:
+  - Prefer one shared navigation/toggle surface for adjacent collapsible panels.
+  - Avoid duplicating narrow collapsed placeholders for sibling panes.
+  - Review collapsed-state screenshots before accepting UI shell changes.
+- Files/Commands touched: `src/app.rs`, `src/models.rs`, `cargo check`
+
 #### Release binary wrong output location (root vs target/release) {#release-binary-wrong-output-location-root-vs-target-release}
 - Date: 2026-03-04T14:20:34Z
 - Context: main/Windows local PowerShell/cargo 1.93.1

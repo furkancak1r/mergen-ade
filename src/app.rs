@@ -1158,6 +1158,7 @@ impl AdeApp {
                                 with_minimal_button_chrome(ui, |ui| {
                                     egui::ComboBox::from_id_salt("directory-project-select")
                                         .selected_text(selected_project_label)
+                                        .icon(paint_minimal_combo_icon)
                                         .width(combo_width)
                                         .show_ui(ui, |ui| {
                                             for (project_id, project_name, _, _) in &project_rows {
@@ -1384,6 +1385,7 @@ impl AdeApp {
                                                 "source-control-project-select",
                                             )
                                             .selected_text(selected_project_label)
+                                            .icon(paint_minimal_combo_icon)
                                             .width(combo_width)
                                             .show_ui(ui, |ui| {
                                                 for (project_id, project_name) in &project_rows {
@@ -1651,6 +1653,7 @@ impl AdeApp {
             let header = egui::CollapsingHeader::new(header_label)
                 .id_salt(format!("project-group-{project_id}"))
                 .default_open(true)
+                .icon(paint_minimal_disclosure_icon)
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         if styled_icon_button(
@@ -2279,6 +2282,7 @@ impl AdeApp {
                     ))
                     .id_salt(format!("settings-saved-messages-{project_id}"))
                     .default_open(self.selected_project == Some(project_id))
+                    .icon(paint_minimal_disclosure_icon)
                     .show(ui, |ui| {
                         if project_snapshot.saved_messages.is_empty() {
                             ui.label(
@@ -2690,6 +2694,7 @@ fn draw_folder_tree(
             let header = egui::CollapsingHeader::new(item.name.clone())
                 .id_salt(item.path.display().to_string())
                 .open(search_query.map(|_| true))
+                .icon(paint_minimal_disclosure_icon)
                 .show(ui, |ui| {
                     let _ = draw_folder_tree(
                         ui,
@@ -2764,6 +2769,68 @@ fn collect_matching_directory_paths(
 fn with_alpha(color: Color32, alpha: u8) -> Color32 {
     let [r, g, b, _] = color.to_array();
     Color32::from_rgba_premultiplied(r, g, b, alpha)
+}
+
+fn lerp_pos(a: egui::Pos2, b: egui::Pos2, t: f32) -> egui::Pos2 {
+    egui::pos2(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
+}
+
+fn paint_minimal_disclosure_icon(ui: &mut Ui, openness: f32, response: &egui::Response) {
+    let rect = response.rect;
+    let center = rect.center();
+    let stroke_color = if response.hovered() {
+        Color32::from_rgb(244, 249, 255)
+    } else {
+        with_alpha(TEXT_MUTED, 210)
+    };
+    let stroke = Stroke::new(1.6, stroke_color);
+
+    let closed = [
+        egui::pos2(center.x - 2.0, center.y - 5.0),
+        egui::pos2(center.x + 2.5, center.y),
+        egui::pos2(center.x - 2.0, center.y + 5.0),
+    ];
+    let open = [
+        egui::pos2(center.x - 5.0, center.y - 2.0),
+        egui::pos2(center.x, center.y + 2.5),
+        egui::pos2(center.x + 5.0, center.y - 2.0),
+    ];
+
+    let p0 = lerp_pos(closed[0], open[0], openness);
+    let p1 = lerp_pos(closed[1], open[1], openness);
+    let p2 = lerp_pos(closed[2], open[2], openness);
+
+    ui.painter().line_segment([p0, p1], stroke);
+    ui.painter().line_segment([p1, p2], stroke);
+}
+
+fn paint_minimal_combo_icon(
+    ui: &Ui,
+    rect: egui::Rect,
+    visuals: &egui::style::WidgetVisuals,
+    is_open: bool,
+    _above_or_below: egui::AboveOrBelow,
+) {
+    let center = rect.center();
+    let stroke = Stroke::new(1.6, visuals.fg_stroke.color);
+    let top = if is_open {
+        egui::pos2(center.x - 4.0, center.y + 1.5)
+    } else {
+        egui::pos2(center.x - 4.0, center.y - 1.5)
+    };
+    let mid = if is_open {
+        egui::pos2(center.x, center.y - 2.5)
+    } else {
+        egui::pos2(center.x, center.y + 2.5)
+    };
+    let bottom = if is_open {
+        egui::pos2(center.x + 4.0, center.y + 1.5)
+    } else {
+        egui::pos2(center.x + 4.0, center.y - 1.5)
+    };
+
+    ui.painter().line_segment([top, mid], stroke);
+    ui.painter().line_segment([mid, bottom], stroke);
 }
 
 fn with_minimal_button_chrome<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {

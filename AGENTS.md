@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 - `src/main.rs`: app entrypoint and native window startup.
-- `src/app.rs`: UI composition (top bar, sidebars, terminal manager, main tiled panes) and app state flow.
+- `src/app.rs`: UI composition (top bar, activity rail, collapsible side panels, terminal manager, main tiled panes) and app state flow.
 - `src/terminal.rs`: terminal runtime, PTY integration, event forwarding, snapshot rendering data.
 - `src/layout.rs`: auto-tiling grid math and related unit tests.
 - `src/title.rs`: terminal title update/truncation logic and unit tests.
@@ -24,6 +24,7 @@ If `cargo` is not on PATH in PowerShell, use:
 - Keep modules focused; prefer small functions over large mixed-responsibility blocks.
 - Naming: `snake_case` for functions/modules, `PascalCase` for types, `SCREAMING_SNAKE_CASE` for constants.
 - Avoid heavy dependencies; preserve the low-memory, native-first design.
+- Keep UI controls visually lightweight; prefer minimal icon-first interactions over heavy bordered button chrome unless emphasis is required.
 - Run `cargo fmt` after edits; keep warnings minimal and intentional.
 
 ## Testing Guidelines

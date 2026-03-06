@@ -9,7 +9,7 @@ It is **not an IDE** and does not include an editor, LSP, or debugging UI.
 - Native Rust desktop app (no Electron)
 - Terminal emulation via `tattoy-wezterm-term`
 - ConPTY-backed terminal process integration on Windows
-- Two left sidebars + tiled main terminal area
+- Left activity rail + collapsible side panels + tiled main terminal area
 - Very small persisted state in local TOML config
 
 ## Assumptions used for this prototype
@@ -69,15 +69,18 @@ git push origin v0.1.0
 
 ## UI Overview
 
-- **Sidebar A (leftmost):** `Directory` / `Source Control` tabs
-  - `Directory`: project list + folder tree
-  - `Source Control`: selected project git status list (`modified`, `added`, `deleted`, `untracked`) with Refresh / Fetch buttons
-- **Sidebar B:** Terminal Manager grouped by project, with separate Foreground/Background sections
+- **Activity rail (leftmost):** minimalist icon rail that toggles the `Project Explorer` and `Terminal Manager`
+- **Project Explorer:** collapsible left panel with `Directory` / `Source Control` tabs
+  - `Directory`: project picker, quick actions, search, and indexed folder tree
+  - `Source Control`: selected project git status list (`modified`, `added`, `deleted`, `untracked`) with compact quick actions
+- **Terminal Manager:** collapsible side panel grouped by project, with separate Foreground/Background sections
 - **Main area:** Embedded, tiled terminal panes
 - **Terminal input model:** Type directly into the active terminal pane (no separate message input bar)
+- **Control styling:** icon-first, minimal chrome with subtle hover/active surfaces instead of heavy bordered buttons
 - **Terminal visibility mode:** configurable in Settings
   - `Global`: project switch does not hide visible terminals
   - `Selected project only`: main area shows only selected project's terminals
+- **Window startup:** opens as a standard maximized desktop window on Windows (not borderless fullscreen)
 
 ## Key bindings
 
@@ -97,6 +100,9 @@ Persisted data includes:
 - Per-project saved messages
 - UI state:
   - Project explorer visibility
+  - Project explorer expanded/collapsed state
+  - Terminal manager visibility
+  - Terminal manager expanded/collapsed state
   - Left sidebar active tab (`Directory` / `Source Control`)
   - Last selected project
   - Project filter mode
