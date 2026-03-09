@@ -487,6 +487,44 @@ impl TerminalRuntime {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct NoopChildKiller;
+
+#[cfg(test)]
+impl portable_pty::ChildKiller for NoopChildKiller {
+    fn kill(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        Box::new(Self)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_terminal_runtime() -> TerminalRuntime {
+    let dimensions = TerminalDimensions::default();
+    let terminal = Terminal::new(
+        dimensions.to_term_size(),
+        Arc::new(AdeTerminalConfig),
+        "test",
+        "0",
+        Box::new(std::io::sink()),
+    );
+    let latest_seqno = Arc::new(AtomicUsize::new(terminal.current_seqno()));
+
+    TerminalRuntime {
+        term: Arc::new(Mutex::new(terminal)),
+        command_tx: crossbeam_channel::unbounded().0,
+        latest_seqno,
+        last_size: dimensions,
+        child_killer: Arc::new(Mutex::new(Box::new(NoopChildKiller))),
+        child_pid: None,
+        child_creation_time: None,
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn is_benign_process_exit_error(err: &io::Error) -> bool {
     matches!(err.kind(), io::ErrorKind::NotFound)

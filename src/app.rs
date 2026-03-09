@@ -1156,7 +1156,7 @@ impl AdeApp {
         }
     }
 
-    fn close_terminal(&mut self, terminal_id: u64) {
+    fn close_terminal(&mut self, ctx: &egui::Context, terminal_id: u64) {
         let Some((title, close_result)) = self.terminals.get(&terminal_id).map(|terminal| {
             let close_result = terminal.runtime.terminate();
             (terminal.title.clone(), close_result)
@@ -1171,10 +1171,14 @@ impl AdeApp {
         };
         self.pending_ctrl_c = None;
 
-        if self.active_terminal == Some(terminal_id) {
-            self.set_active_terminal(self.terminals.keys().next().copied());
-        }
+        let remaining_terminal_ids = self.terminals.keys().copied().collect::<Vec<_>>();
+        self.set_active_terminal(next_active_terminal_after_close(
+            self.active_terminal,
+            terminal_id,
+            &remaining_terminal_ids,
+        ));
         self.bump_layout_epoch();
+        ctx.request_repaint();
     }
 
     fn set_active_terminal(&mut self, terminal_id: Option<u64>) {
@@ -2110,13 +2114,13 @@ impl AdeApp {
                 if foreground_count > 0 {
                     ui.separator();
                     draw_meta_kicker(ui, icons::TERMINAL, "Foreground");
-                    self.draw_terminal_rows(ui, project_id, TerminalKind::Foreground);
+                    self.draw_terminal_rows(ctx, ui, project_id, TerminalKind::Foreground);
                 }
 
                 if background_count > 0 {
                     ui.separator();
                     draw_meta_kicker(ui, icons::LIST, "Background");
-                    self.draw_terminal_rows(ui, project_id, TerminalKind::Background);
+                    self.draw_terminal_rows(ctx, ui, project_id, TerminalKind::Background);
                 }
             });
 
@@ -2153,7 +2157,13 @@ impl AdeApp {
         ui.expand_to_include_x(panel_right);
     }
 
-    fn draw_terminal_rows(&mut self, ui: &mut Ui, project_id: u64, kind: TerminalKind) {
+    fn draw_terminal_rows(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut Ui,
+        project_id: u64,
+        kind: TerminalKind,
+    ) {
         let ids = self
             .terminals
             .iter()
@@ -2294,7 +2304,7 @@ impl AdeApp {
                 self.set_active_terminal(Some(terminal_entry_id));
             }
             if close_terminal {
-                self.close_terminal(terminal_entry_id);
+                self.close_terminal(ctx, terminal_entry_id);
             }
         }
     }
@@ -2521,144 +2531,132 @@ impl AdeApp {
                         });
                     });
             });
-            ui.add_space(TERMINAL_HEADER_GAP);
+            if !close_requested {
+                ui.add_space(TERMINAL_HEADER_GAP);
 
-            let monospace = egui::TextStyle::Monospace;
-            let font_id = monospace.resolve(ui.style());
-            let char_width = ui
-                .fonts(|fonts| fonts.glyph_width(&font_id, 'W'))
-                .max(CELL_WIDTH_PX);
-            let line_height = ui.text_style_height(&monospace).max(CELL_HEIGHT_PX);
+                let monospace = egui::TextStyle::Monospace;
+                let font_id = monospace.resolve(ui.style());
+                let char_width = ui
+                    .fonts(|fonts| fonts.glyph_width(&font_id, 'W'))
+                    .max(CELL_WIDTH_PX);
+                let line_height = ui.text_style_height(&monospace).max(CELL_HEIGHT_PX);
 
-            let output_height =
-                (pane_height - TERMINAL_HEADER_HEIGHT - TERMINAL_HEADER_GAP).max(line_height * 2.0);
-            let output_size = Vec2::new(pane_width, output_height);
+                let output_height = (pane_height - TERMINAL_HEADER_HEIGHT - TERMINAL_HEADER_GAP)
+                    .max(line_height * 2.0);
+                let output_size = Vec2::new(pane_width, output_height);
 
-            let cols = ((output_size.x / char_width).floor() as u16).max(8);
-            let lines = ((output_size.y / line_height).floor() as u16).max(3);
-            if output_size.x >= char_width * 8.0 && output_size.y >= line_height * 3.0 {
-                let resize_applied = terminal.runtime.resize(TerminalDimensions {
-                    cols,
-                    lines,
-                    cell_width: char_width as u16,
-                    cell_height: line_height as u16,
-                });
-                if !resize_applied {
-                    ui.ctx()
-                        .request_repaint_after(Duration::from_millis(TERMINAL_RETRY_MS));
+                let cols = ((output_size.x / char_width).floor() as u16).max(8);
+                let lines = ((output_size.y / line_height).floor() as u16).max(3);
+                if output_size.x >= char_width * 8.0 && output_size.y >= line_height * 3.0 {
+                    let resize_applied = terminal.runtime.resize(TerminalDimensions {
+                        cols,
+                        lines,
+                        cell_width: char_width as u16,
+                        cell_height: line_height as u16,
+                    });
+                    if !resize_applied {
+                        ui.ctx()
+                            .request_repaint_after(Duration::from_millis(TERMINAL_RETRY_MS));
+                    }
                 }
-            }
 
-            let latest_seqno = terminal.runtime.latest_seqno();
-            if latest_seqno > terminal.last_seqno {
-                terminal.last_seqno = latest_seqno;
-                terminal.dirty = true;
-            }
+                let latest_seqno = terminal.runtime.latest_seqno();
+                if latest_seqno > terminal.last_seqno {
+                    terminal.last_seqno = latest_seqno;
+                    terminal.dirty = true;
+                }
 
-            if terminal.dirty
-                || terminal.snapshot_refresh_deferred
-                || terminal.render_cache.lines.is_empty()
-            {
-                if Self::should_defer_terminal_snapshot(terminal.selection.as_ref()) {
-                    Self::acknowledge_deferred_terminal_snapshot(
-                        &mut terminal.dirty,
-                        &mut terminal.snapshot_refresh_deferred,
-                    );
-                    ui.ctx()
-                        .request_repaint_after(Duration::from_millis(TERMINAL_FALLBACK_REFRESH_MS));
-                } else if let Some((snapshot, selection_snapshot)) =
-                    try_terminal_snapshots(&terminal.runtime)
+                if terminal.dirty
+                    || terminal.snapshot_refresh_deferred
+                    || terminal.render_cache.lines.is_empty()
                 {
-                    Self::apply_terminal_snapshot(terminal, snapshot, selection_snapshot);
-                } else {
-                    ui.ctx()
-                        .request_repaint_after(Duration::from_millis(TERMINAL_RETRY_MS));
+                    if Self::should_defer_terminal_snapshot(terminal.selection.as_ref()) {
+                        Self::acknowledge_deferred_terminal_snapshot(
+                            &mut terminal.dirty,
+                            &mut terminal.snapshot_refresh_deferred,
+                        );
+                        ui.ctx().request_repaint_after(Duration::from_millis(
+                            TERMINAL_FALLBACK_REFRESH_MS,
+                        ));
+                    } else if let Some((snapshot, selection_snapshot)) =
+                        try_terminal_snapshots(&terminal.runtime)
+                    {
+                        Self::apply_terminal_snapshot(terminal, snapshot, selection_snapshot);
+                    } else {
+                        ui.ctx()
+                            .request_repaint_after(Duration::from_millis(TERMINAL_RETRY_MS));
+                    }
                 }
-            }
 
-            let now = ui.ctx().input(|input| input.time);
-            sync_terminal_cursor_row_state(terminal, now);
+                let now = ui.ctx().input(|input| input.time);
+                sync_terminal_cursor_row_state(terminal, now);
 
-            ui.allocate_ui_with_layout(output_size, Layout::top_down(Align::Min), |ui| {
-                egui::Frame::none()
-                    .fill(TERMINAL_OUTPUT_BG)
-                    .stroke(Stroke::NONE)
-                    .rounding(0.0)
-                    .inner_margin(egui::Margin::same(0.0))
-                    .outer_margin(egui::Margin::same(0.0))
-                    .show(ui, |ui| {
-                        ui.set_min_size(output_size);
-                        egui::ScrollArea::vertical()
-                            .id_salt(format!("term-output-{terminal_id}"))
-                            .max_height(output_height)
-                            .auto_shrink([false, false])
-                            .stick_to_bottom(true)
-                            .show(ui, |ui| {
-                                if terminal.render_cache.lines.is_empty() {
-                                    let response = ui.add(
-                                        egui::Label::new(
-                                            RichText::new("Terminal is resizing...")
-                                                .color(TEXT_MUTED),
-                                        )
-                                        .sense(Sense::click()),
-                                    );
-                                    if response.clicked() {
-                                        pane_clicked = true;
-                                    }
-                                    if response.secondary_clicked() {
-                                        pane_clicked = true;
-                                    }
-                                    let can_paste = !terminal.exited;
-                                    response.context_menu(|ui| {
-                                        with_minimal_button_chrome(ui, |ui| {
-                                            ui.add_enabled_ui(false, |ui| {
-                                                let _ = ui.button(format!("{} Copy", icons::COPY));
-                                            });
-                                            ui.add_enabled_ui(can_paste, |ui| {
-                                                if ui
-                                                    .button(format!("{} Paste", icons::DOWNLOAD))
-                                                    .clicked()
-                                                {
-                                                    paste_requested = true;
-                                                    ui.close_menu();
-                                                }
+                ui.allocate_ui_with_layout(output_size, Layout::top_down(Align::Min), |ui| {
+                    egui::Frame::none()
+                        .fill(TERMINAL_OUTPUT_BG)
+                        .stroke(Stroke::NONE)
+                        .rounding(0.0)
+                        .inner_margin(egui::Margin::same(0.0))
+                        .outer_margin(egui::Margin::same(0.0))
+                        .show(ui, |ui| {
+                            ui.set_min_size(output_size);
+                            egui::ScrollArea::vertical()
+                                .id_salt(format!("term-output-{terminal_id}"))
+                                .max_height(output_height)
+                                .auto_shrink([false, false])
+                                .stick_to_bottom(true)
+                                .show(ui, |ui| {
+                                    if terminal.render_cache.lines.is_empty() {
+                                        let response = ui.add(
+                                            egui::Label::new(
+                                                RichText::new("Terminal is resizing...")
+                                                    .color(TEXT_MUTED),
+                                            )
+                                            .sense(Sense::click()),
+                                        );
+                                        if response.clicked() {
+                                            pane_clicked = true;
+                                        }
+                                        if response.secondary_clicked() {
+                                            pane_clicked = true;
+                                        }
+                                        let can_paste = !terminal.exited;
+                                        response.context_menu(|ui| {
+                                            with_minimal_button_chrome(ui, |ui| {
+                                                ui.add_enabled_ui(false, |ui| {
+                                                    let _ =
+                                                        ui.button(format!("{} Copy", icons::COPY));
+                                                });
+                                                ui.add_enabled_ui(can_paste, |ui| {
+                                                    if ui
+                                                        .button(format!(
+                                                            "{} Paste",
+                                                            icons::DOWNLOAD
+                                                        ))
+                                                        .clicked()
+                                                    {
+                                                        paste_requested = true;
+                                                        ui.close_menu();
+                                                    }
+                                                });
                                             });
                                         });
-                                    });
-                                } else {
-                                    let render = build_terminal_render(
-                                        &terminal.render_cache,
-                                        &font_id,
-                                        terminal.exited,
-                                        terminal.shell,
-                                        terminal.stable_input_cursor_row,
-                                        ui.ctx().input(|input| input.time),
-                                    );
-                                    let response = ui.add(
-                                        egui::Label::new(render.layout_job)
-                                            .wrap_mode(TextWrapMode::Extend)
-                                            .selectable(false)
-                                            .sense(Sense::click_and_drag()),
-                                    );
-                                    if response.drag_started_by(egui::PointerButton::Primary) {
-                                        if let Some(point) = terminal_selection_point_from_pointer(
-                                            response.interact_pointer_pos(),
-                                            response.rect.min,
+                                    } else {
+                                        let render = build_terminal_render(
                                             &terminal.render_cache,
-                                            char_width,
-                                            line_height,
-                                        ) {
-                                            Self::ensure_terminal_selection_snapshot(terminal);
-                                            terminal.selection =
-                                                Some(TerminalSelection::collapsed(point));
-                                            terminal.selection_drag_active = true;
-                                        }
-                                    }
-                                    if response.is_pointer_button_down_on()
-                                        && ui.ctx().input(|input| input.pointer.primary_down())
-                                    {
-                                        pane_clicked = true;
-                                        if terminal.selection.is_none() {
+                                            &font_id,
+                                            terminal.exited,
+                                            terminal.shell,
+                                            terminal.stable_input_cursor_row,
+                                            ui.ctx().input(|input| input.time),
+                                        );
+                                        let response = ui.add(
+                                            egui::Label::new(render.layout_job)
+                                                .wrap_mode(TextWrapMode::Extend)
+                                                .selectable(false)
+                                                .sense(Sense::click_and_drag()),
+                                        );
+                                        if response.drag_started_by(egui::PointerButton::Primary) {
                                             if let Some(point) =
                                                 terminal_selection_point_from_pointer(
                                                     response.interact_pointer_pos(),
@@ -2674,105 +2672,137 @@ impl AdeApp {
                                                 terminal.selection_drag_active = true;
                                             }
                                         }
-                                    }
-                                    if response.dragged_by(egui::PointerButton::Primary) {
-                                        if let Some(point) = terminal_selection_point_from_pointer(
-                                            response.interact_pointer_pos(),
-                                            response.rect.min,
-                                            &terminal.render_cache,
-                                            char_width,
-                                            line_height,
-                                        ) {
+                                        if response.is_pointer_button_down_on()
+                                            && ui.ctx().input(|input| input.pointer.primary_down())
+                                        {
+                                            pane_clicked = true;
                                             if terminal.selection.is_none() {
-                                                Self::ensure_terminal_selection_snapshot(terminal);
+                                                if let Some(point) =
+                                                    terminal_selection_point_from_pointer(
+                                                        response.interact_pointer_pos(),
+                                                        response.rect.min,
+                                                        &terminal.render_cache,
+                                                        char_width,
+                                                        line_height,
+                                                    )
+                                                {
+                                                    Self::ensure_terminal_selection_snapshot(
+                                                        terminal,
+                                                    );
+                                                    terminal.selection =
+                                                        Some(TerminalSelection::collapsed(point));
+                                                    terminal.selection_drag_active = true;
+                                                }
                                             }
-                                            let selection =
-                                                terminal.selection.get_or_insert_with(|| {
-                                                    TerminalSelection::collapsed(point)
-                                                });
-                                            selection.focus = point;
-                                            terminal.selection_drag_active = true;
                                         }
-                                    }
-                                    if !ui.ctx().input(|input| input.pointer.primary_down()) {
-                                        terminal.selection_drag_active = false;
-                                    }
-                                    if response.drag_stopped_by(egui::PointerButton::Primary)
-                                        && terminal
+                                        if response.dragged_by(egui::PointerButton::Primary) {
+                                            if let Some(point) =
+                                                terminal_selection_point_from_pointer(
+                                                    response.interact_pointer_pos(),
+                                                    response.rect.min,
+                                                    &terminal.render_cache,
+                                                    char_width,
+                                                    line_height,
+                                                )
+                                            {
+                                                if terminal.selection.is_none() {
+                                                    Self::ensure_terminal_selection_snapshot(
+                                                        terminal,
+                                                    );
+                                                }
+                                                let selection =
+                                                    terminal.selection.get_or_insert_with(|| {
+                                                        TerminalSelection::collapsed(point)
+                                                    });
+                                                selection.focus = point;
+                                                terminal.selection_drag_active = true;
+                                            }
+                                        }
+                                        if !ui.ctx().input(|input| input.pointer.primary_down()) {
+                                            terminal.selection_drag_active = false;
+                                        }
+                                        if response.drag_stopped_by(egui::PointerButton::Primary)
+                                            && terminal
+                                                .selection
+                                                .as_ref()
+                                                .is_some_and(|selection| !selection.has_selection())
+                                        {
+                                            Self::clear_terminal_selection(terminal);
+                                        } else if response
+                                            .drag_stopped_by(egui::PointerButton::Primary)
+                                        {
+                                            terminal.selection_drag_active = false;
+                                        }
+                                        if response.clicked() {
+                                            pane_clicked = true;
+                                            Self::clear_terminal_selection(terminal);
+                                        }
+                                        if response.secondary_clicked() {
+                                            pane_clicked = true;
+                                        }
+
+                                        if terminal.selection.is_some() {
+                                            Self::ensure_terminal_selection_snapshot(terminal);
+                                        }
+                                        let can_copy = terminal
                                             .selection
                                             .as_ref()
-                                            .is_some_and(|selection| !selection.has_selection())
-                                    {
-                                        Self::clear_terminal_selection(terminal);
-                                    } else if response.drag_stopped_by(egui::PointerButton::Primary)
-                                    {
-                                        terminal.selection_drag_active = false;
-                                    }
-                                    if response.clicked() {
-                                        pane_clicked = true;
-                                        Self::clear_terminal_selection(terminal);
-                                    }
-                                    if response.secondary_clicked() {
-                                        pane_clicked = true;
-                                    }
-
-                                    if terminal.selection.is_some() {
-                                        Self::ensure_terminal_selection_snapshot(terminal);
-                                    }
-                                    let can_copy = terminal
-                                        .selection
-                                        .as_ref()
-                                        .is_some_and(TerminalSelection::has_selection)
-                                        && terminal.selection_snapshot.is_some();
-                                    let can_paste = !terminal.exited;
-                                    let mut copy_requested = false;
-                                    response.context_menu(|ui| {
-                                        with_minimal_button_chrome(ui, |ui| {
-                                            ui.add_enabled_ui(can_copy, |ui| {
-                                                if ui
-                                                    .button(format!("{} Copy", icons::COPY))
-                                                    .clicked()
-                                                {
-                                                    copy_requested = true;
-                                                    ui.close_menu();
-                                                }
-                                            });
-                                            ui.add_enabled_ui(can_paste, |ui| {
-                                                if ui
-                                                    .button(format!("{} Paste", icons::DOWNLOAD))
-                                                    .clicked()
-                                                {
-                                                    paste_requested = true;
-                                                    ui.close_menu();
-                                                }
+                                            .is_some_and(TerminalSelection::has_selection)
+                                            && terminal.selection_snapshot.is_some();
+                                        let can_paste = !terminal.exited;
+                                        let mut copy_requested = false;
+                                        response.context_menu(|ui| {
+                                            with_minimal_button_chrome(ui, |ui| {
+                                                ui.add_enabled_ui(can_copy, |ui| {
+                                                    if ui
+                                                        .button(format!("{} Copy", icons::COPY))
+                                                        .clicked()
+                                                    {
+                                                        copy_requested = true;
+                                                        ui.close_menu();
+                                                    }
+                                                });
+                                                ui.add_enabled_ui(can_paste, |ui| {
+                                                    if ui
+                                                        .button(format!(
+                                                            "{} Paste",
+                                                            icons::DOWNLOAD
+                                                        ))
+                                                        .clicked()
+                                                    {
+                                                        paste_requested = true;
+                                                        ui.close_menu();
+                                                    }
+                                                });
                                             });
                                         });
-                                    });
-                                    if copy_requested {
-                                        copied_selection = Self::selected_terminal_text(terminal);
-                                        Self::clear_terminal_selection(terminal);
-                                    }
-                                    paint_terminal_selection(
-                                        ui,
-                                        response.rect.min,
-                                        &terminal.render_cache,
-                                        terminal.selection.as_ref(),
-                                        char_width,
-                                        line_height,
-                                    );
-                                    if let Some(cursor_overlay) = render.cursor_overlay {
-                                        paint_terminal_cursor(
+                                        if copy_requested {
+                                            copied_selection =
+                                                Self::selected_terminal_text(terminal);
+                                            Self::clear_terminal_selection(terminal);
+                                        }
+                                        paint_terminal_selection(
                                             ui,
                                             response.rect.min,
+                                            &terminal.render_cache,
+                                            terminal.selection.as_ref(),
                                             char_width,
                                             line_height,
-                                            cursor_overlay,
                                         );
+                                        if let Some(cursor_overlay) = render.cursor_overlay {
+                                            paint_terminal_cursor(
+                                                ui,
+                                                response.rect.min,
+                                                char_width,
+                                                line_height,
+                                                cursor_overlay,
+                                            );
+                                        }
                                     }
-                                }
-                            });
-                    });
-            });
+                                });
+                        });
+                });
+            }
 
             (
                 pane_clicked,
@@ -2783,7 +2813,7 @@ impl AdeApp {
         };
 
         if close_requested {
-            self.close_terminal(terminal_id);
+            self.close_terminal(ui.ctx(), terminal_id);
             return;
         }
 
@@ -3617,6 +3647,18 @@ fn with_alpha(color: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_premultiplied(r, g, b, alpha)
 }
 
+fn next_active_terminal_after_close(
+    active_terminal: Option<u64>,
+    closed_terminal_id: u64,
+    remaining_terminal_ids: &[u64],
+) -> Option<u64> {
+    if active_terminal == Some(closed_terminal_id) {
+        remaining_terminal_ids.first().copied()
+    } else {
+        active_terminal
+    }
+}
+
 fn terminal_display_label(title: &str, exited: bool) -> String {
     let trimmed = title.trim();
     if trimmed.is_empty() {
@@ -4365,18 +4407,20 @@ fn normalize_terminal_background(color: TerminalColor) -> Color32 {
 mod tests {
     use super::{
         build_terminal_cursor_overlay, build_terminal_render, cursor_hidden_by_row_filter,
-        normalize_terminal_background, parse_branch_header, recover_config_state,
-        resolve_ctrl_c_action, terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect,
-        terminal_manager_actions_width, terminal_manager_row_widths, terminal_selection_text,
-        to_egui_color, update_stable_cursor_row, visible_terminal_cursor, AdeApp, CtrlCAction,
-        PendingConfigChanges, PendingCtrlC, TerminalCursorOverlay, TerminalSelection,
-        TerminalSelectionPoint, TERMINAL_OUTPUT_BG,
+        next_active_terminal_after_close, normalize_terminal_background, parse_branch_header,
+        recover_config_state, resolve_ctrl_c_action, terminal_cursor_blink_phase_visible,
+        terminal_cursor_overlay_rect, terminal_manager_actions_width, terminal_manager_row_widths,
+        terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
+        AdeApp, CtrlCAction, PendingConfigChanges, PendingCtrlC, TerminalCursorOverlay,
+        TerminalEntry, TerminalSelection, TerminalSelectionPoint, TERMINAL_OUTPUT_BG,
     };
-    use crate::models::{AppConfig, AutoTileScope, MainVisibilityMode, ProjectRecord, ShellKind};
+    use crate::models::{
+        AppConfig, AutoTileScope, MainVisibilityMode, ProjectRecord, ShellKind, TerminalKind,
+    };
     use crate::terminal::{
-        TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape,
-        TerminalSelectionLine, TerminalSelectionSnapshot, TerminalSnapshot, TerminalStyle,
-        TerminalStyledCell, TerminalStyledLine, TerminalStyledRun,
+        test_terminal_runtime, TerminalColor, TerminalCursor, TerminalCursorLine,
+        TerminalCursorShape, TerminalSelectionLine, TerminalSelectionSnapshot, TerminalSnapshot,
+        TerminalStyle, TerminalStyledCell, TerminalStyledLine, TerminalStyledRun,
     };
     use eframe::egui::{pos2, Color32, FontFamily, FontId, Key, Modifiers};
     use std::collections::BTreeMap;
@@ -4684,6 +4728,44 @@ mod tests {
     }
 
     #[test]
+    fn closing_active_terminal_selects_first_remaining_terminal() {
+        let next = next_active_terminal_after_close(Some(7), 7, &[3, 5]);
+
+        assert_eq!(next, Some(3));
+    }
+
+    #[test]
+    fn closing_inactive_terminal_keeps_current_active_terminal() {
+        let next = next_active_terminal_after_close(Some(9), 7, &[3, 9]);
+
+        assert_eq!(next, Some(9));
+    }
+
+    #[test]
+    fn close_terminal_removes_entry_and_clears_pending_interrupt_state() {
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(1),
+        );
+        app.pending_ctrl_c = Some(PendingCtrlC {
+            terminal_id: 1,
+            expires_at: 4.0,
+        });
+
+        let ctx = eframe::egui::Context::default();
+        app.close_terminal(&ctx, 1);
+
+        assert!(!app.terminals.contains_key(&1));
+        assert_eq!(app.active_terminal, Some(2));
+        assert_eq!(app.pending_ctrl_c, None);
+        assert_eq!(app.layout_epoch, 1);
+        assert_eq!(app.status_line, "Closed Terminal 1");
+    }
+
+    #[test]
     fn recovered_config_preserves_loaded_settings_until_session_changes_them() {
         let loaded_project = test_project(7, "Loaded", "C:/loaded/demo", &[]);
         let loaded_config = AppConfig {
@@ -4895,6 +4977,74 @@ mod tests {
                 .iter()
                 .map(|message| (*message).to_owned())
                 .collect(),
+        }
+    }
+
+    fn test_terminal_entry(id: u64, project_id: u64) -> TerminalEntry {
+        TerminalEntry {
+            id,
+            project_id,
+            kind: TerminalKind::Foreground,
+            shell: ShellKind::PowerShell,
+            title: format!("Terminal {id}"),
+            full_title: format!("Terminal {id}"),
+            pending_line_for_title: String::new(),
+            in_main_view: true,
+            dirty: false,
+            last_seqno: 0,
+            last_cursor_row: None,
+            last_cursor_row_changed_at: None,
+            stable_input_cursor_row: None,
+            render_cache: TerminalSnapshot::default(),
+            selection: None,
+            selection_snapshot: None,
+            selection_drag_active: false,
+            snapshot_refresh_deferred: false,
+            exited: false,
+            runtime: test_terminal_runtime(),
+        }
+    }
+
+    fn test_app(
+        terminals: impl IntoIterator<Item = (u64, TerminalEntry)>,
+        active_terminal: Option<u64>,
+    ) -> AdeApp {
+        let (terminal_events_tx, terminal_events_rx) = crossbeam_channel::unbounded();
+        let (source_control_events_tx, source_control_events_rx) = crossbeam_channel::unbounded();
+        let (directory_index_events_tx, directory_index_events_rx) = crossbeam_channel::unbounded();
+
+        AdeApp {
+            config_path: PathBuf::new(),
+            config: AppConfig::default(),
+            config_load_error: None,
+            config_save_requires_reload: false,
+            pending_config_changes: PendingConfigChanges::default(),
+            projects: BTreeMap::new(),
+            terminals: terminals.into_iter().collect(),
+            next_project_id: 1,
+            next_terminal_id: 3,
+            selected_project: None,
+            active_terminal,
+            pending_ctrl_c: None,
+            terminal_events_tx,
+            terminal_events_rx,
+            show_settings_popup: false,
+            saved_message_drafts: BTreeMap::new(),
+            directory_search_query: String::new(),
+            status_line: "Ready".to_owned(),
+            layout_epoch: 0,
+            theme_initialized: false,
+            #[cfg(target_os = "windows")]
+            window_hwnd: None,
+            #[cfg(target_os = "windows")]
+            window_layout_passes_remaining: 0,
+            source_control_events_tx,
+            source_control_events_rx,
+            source_control_state: BTreeMap::new(),
+            directory_index_events_tx,
+            directory_index_events_rx,
+            directory_index_state: BTreeMap::new(),
+            directory_index_generation: BTreeMap::new(),
         }
     }
 
