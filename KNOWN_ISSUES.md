@@ -1,5 +1,18 @@
 ### Known Issues & Fix Log
 
+#### Portable release flow switched to single EXE MSVC output {#portable-release-flow-switched-to-single-exe-msvc-output}
+- Date: 2026-03-09T00:00:00Z
+- Context: main/Windows release packaging refresh
+- Error signature: Previous release path produced a `gnullvm` EXE that could require `libunwind.dll`.
+- Symptoms/Impact: Copying the old release EXE to another Windows machine could fail unless extra runtime DLLs were bundled manually.
+- Root cause: The canonical release path pointed at the LLVM-MinGW target instead of an explicit MSVC portable build script.
+- Resolution: Portable Windows release output moved to `target\\x86_64-pc-windows-msvc\\release\\mergen-ade.exe`, while plain `cargo` build/test remains on the repo host toolchain. Build automation now provisions the MSVC host toolchain via `rustup` when needed, forces the MSVC host through `rustup run`, enforces static CRT, and resolves import inspection through repo-local `llvm-objdump.exe` or Visual Studio `dumpbin.exe`.
+- Prevent recurrence:
+  - Use `powershell -ExecutionPolicy Bypass -File .\\scripts\\build-release.ps1` for release builds.
+  - Keep CI packaging aligned with the MSVC portable artifact only.
+  - Treat the older `gnullvm` `libunwind.dll` issue below as historical, not the current release path.
+- Files/Commands touched: `.cargo\\config.toml`, `Cargo.toml`, `rust-toolchain.toml`, `scripts\\build-release.ps1`, `.github\\workflows\\release.yml`, `README.md`
+
 #### Duplicate collapse arrows created noisy left chrome {#duplicate-collapse-arrows-created-noisy-left-chrome}
 - Date: 2026-03-06T09:00:00Z
 - Context: main/Windows local UI shell refresh

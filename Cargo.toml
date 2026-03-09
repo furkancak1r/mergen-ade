@@ -21,7 +21,7 @@ toml = "0.8"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
-lto = "thin"
-codegen-units = 1
+lto = false
+codegen-units = 8
 panic = "abort"
 strip = "symbols"
