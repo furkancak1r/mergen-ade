@@ -8,6 +8,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use arboard::Clipboard;
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{
@@ -23,8 +24,9 @@ use crate::models::{
     TerminalKind,
 };
 use crate::terminal::{
-    try_terminal_snapshot, TerminalColor, TerminalCursor, TerminalCursorShape, TerminalDimensions,
-    TerminalRuntime, TerminalSnapshot, TerminalUiEvent, TerminalUiEventKind,
+    try_terminal_selection_snapshot, try_terminal_snapshots, TerminalColor, TerminalCursor,
+    TerminalCursorShape, TerminalDimensions, TerminalRuntime, TerminalSelectionLine,
+    TerminalSelectionSnapshot, TerminalSnapshot, TerminalUiEvent, TerminalUiEventKind,
 };
 use crate::title::{terminal_title_text, update_terminal_title};
 
@@ -35,6 +37,7 @@ const TERMINAL_EVENT_BUDGET: usize = 4096;
 const TERMINAL_RETRY_MS: u64 = 8;
 const TERMINAL_FALLBACK_REFRESH_MS: u64 = 16;
 const CURSOR_BLINK_STEP_SECS: f64 = 0.6;
+const CTRL_C_DOUBLE_PRESS_WINDOW_SECS: f64 = 0.75;
 const POWERSHELL_CURSOR_ROW_STABLE_SECS: f64 = 0.06;
 const CURSOR_BAR_WIDTH_PX: f32 = 2.0;
 const CURSOR_UNDERLINE_HEIGHT_PX: f32 = 2.0;
@@ -212,6 +215,7 @@ pub struct AdeApp {
     next_terminal_id: u64,
     selected_project: Option<u64>,
     active_terminal: Option<u64>,
+    pending_ctrl_c: Option<PendingCtrlC>,
     terminal_events_tx: Sender<TerminalUiEvent>,
     terminal_events_rx: Receiver<TerminalUiEvent>,
     show_settings_popup: bool,
@@ -248,8 +252,58 @@ struct TerminalEntry {
     last_cursor_row_changed_at: Option<f64>,
     stable_input_cursor_row: Option<usize>,
     render_cache: TerminalSnapshot,
+    selection: Option<TerminalSelection>,
+    selection_snapshot: Option<TerminalSelectionSnapshot>,
+    selection_drag_active: bool,
+    snapshot_refresh_deferred: bool,
     exited: bool,
     runtime: TerminalRuntime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PendingCtrlC {
+    terminal_id: u64,
+    expires_at: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalSelectionPoint {
+    row: usize,
+    column: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalSelection {
+    anchor: TerminalSelectionPoint,
+    focus: TerminalSelectionPoint,
+}
+
+impl TerminalSelection {
+    fn collapsed(point: TerminalSelectionPoint) -> Self {
+        Self {
+            anchor: point,
+            focus: point,
+        }
+    }
+
+    fn has_selection(&self) -> bool {
+        self.anchor != self.focus
+    }
+
+    fn normalized(&self) -> (TerminalSelectionPoint, TerminalSelectionPoint) {
+        if (self.anchor.row, self.anchor.column) <= (self.focus.row, self.focus.column) {
+            (self.anchor, self.focus)
+        } else {
+            (self.focus, self.anchor)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtrlCAction {
+    CopySelection,
+    ArmInterrupt,
+    SendInterrupt,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -364,6 +418,7 @@ impl AdeApp {
             next_terminal_id: 1,
             selected_project,
             active_terminal: None,
+            pending_ctrl_c: None,
             terminal_events_tx,
             terminal_events_rx,
             show_settings_popup: false,
@@ -531,12 +586,16 @@ impl AdeApp {
             last_cursor_row_changed_at: None,
             stable_input_cursor_row: None,
             render_cache: TerminalSnapshot::default(),
+            selection: None,
+            selection_snapshot: None,
+            selection_drag_active: false,
+            snapshot_refresh_deferred: false,
             exited: false,
             runtime,
         };
 
-        self.active_terminal = Some(terminal_id);
         self.terminals.insert(terminal_id, entry);
+        self.set_active_terminal(Some(terminal_id));
         self.bump_layout_epoch();
 
         self.status_line = "Terminal created".to_owned();
@@ -723,7 +782,16 @@ impl AdeApp {
             return;
         }
 
+        let now = ctx.input(|input| input.time);
+        if self
+            .pending_ctrl_c
+            .is_some_and(|pending| now > pending.expires_at)
+        {
+            self.pending_ctrl_c = None;
+        }
+
         let Some(active_terminal_id) = self.active_terminal else {
+            self.pending_ctrl_c = None;
             return;
         };
 
@@ -732,6 +800,7 @@ impl AdeApp {
             .get(&active_terminal_id)
             .is_some_and(|terminal| self.terminal_visible_in_main(terminal) && !terminal.exited);
         if !can_receive_input {
+            self.pending_ctrl_c = None;
             return;
         }
 
@@ -741,20 +810,50 @@ impl AdeApp {
         }
 
         let Some(terminal) = self.terminals.get_mut(&active_terminal_id) else {
+            self.pending_ctrl_c = None;
             return;
         };
 
         let mut outbound = Vec::new();
+        let mut copied_selection = None;
+        let mut armed_interrupt = false;
 
         for event in events {
             match event {
                 Event::Copy => {
-                    outbound.push(0x03);
+                    let has_selection = terminal
+                        .selection
+                        .as_ref()
+                        .is_some_and(TerminalSelection::has_selection);
+                    let (next_pending, action) = resolve_ctrl_c_action(
+                        self.pending_ctrl_c,
+                        active_terminal_id,
+                        now,
+                        has_selection,
+                    );
+                    self.pending_ctrl_c = next_pending;
+
+                    match action {
+                        CtrlCAction::CopySelection => {
+                            copied_selection = Self::selected_terminal_text(terminal);
+                            Self::clear_terminal_selection(terminal);
+                            armed_interrupt = self.pending_ctrl_c.is_some();
+                        }
+                        CtrlCAction::ArmInterrupt => {
+                            armed_interrupt = true;
+                        }
+                        CtrlCAction::SendInterrupt => {
+                            Self::clear_terminal_selection(terminal);
+                            outbound.push(0x03);
+                        }
+                    }
                 }
                 Event::Text(text) => {
                     if text.is_empty() {
                         continue;
                     }
+                    self.pending_ctrl_c = None;
+                    Self::clear_terminal_selection(terminal);
                     outbound.extend_from_slice(text.as_bytes());
                     Self::append_pending_line(&mut terminal.pending_line_for_title, &text);
                 }
@@ -762,6 +861,9 @@ impl AdeApp {
                     if text.is_empty() {
                         continue;
                     }
+                    self.pending_ctrl_c = None;
+                    Self::clear_terminal_selection(terminal);
+                    let text = Self::pasted_text(&text);
                     outbound.extend_from_slice(text.as_bytes());
                     Self::append_pending_line(&mut terminal.pending_line_for_title, &text);
                 }
@@ -772,6 +874,8 @@ impl AdeApp {
                     ..
                 } if pressed => {
                     if key == Key::Enter {
+                        self.pending_ctrl_c = None;
+                        Self::clear_terminal_selection(terminal);
                         outbound.push(b'\r');
                         let line = std::mem::take(&mut terminal.pending_line_for_title);
                         terminal.full_title = terminal_title_text(&line, terminal.id as usize);
@@ -782,15 +886,34 @@ impl AdeApp {
                     }
 
                     if key == Key::Backspace {
+                        self.pending_ctrl_c = None;
+                        Self::clear_terminal_selection(terminal);
                         terminal.pending_line_for_title.pop();
                     }
 
                     if let Some(bytes) = Self::key_to_terminal_bytes(key, modifiers) {
+                        self.pending_ctrl_c = None;
+                        Self::clear_terminal_selection(terminal);
                         outbound.extend_from_slice(&bytes);
                     }
                 }
                 _ => {}
             }
+        }
+
+        if let Some(text) = copied_selection {
+            ctx.copy_text(text);
+            if armed_interrupt {
+                self.status_line =
+                    "Copied terminal selection. Press Ctrl+C again to interrupt".to_owned();
+                ctx.request_repaint_after(Duration::from_secs_f64(CTRL_C_DOUBLE_PRESS_WINDOW_SECS));
+            } else {
+                self.status_line = "Copied terminal selection".to_owned();
+                ctx.request_repaint();
+            }
+        } else if armed_interrupt {
+            self.status_line = "Press Ctrl+C again to interrupt".to_owned();
+            ctx.request_repaint_after(Duration::from_secs_f64(CTRL_C_DOUBLE_PRESS_WINDOW_SECS));
         }
 
         if !outbound.is_empty() {
@@ -965,6 +1088,10 @@ impl AdeApp {
         }
     }
 
+    fn pasted_text(text: &str) -> &str {
+        text
+    }
+
     fn key_to_terminal_bytes(key: Key, modifiers: egui::Modifiers) -> Option<Vec<u8>> {
         if modifiers.ctrl && !modifiers.alt {
             if let Some(ctrl) = Self::ctrl_key_to_byte(key) {
@@ -1030,20 +1157,149 @@ impl AdeApp {
     }
 
     fn close_terminal(&mut self, terminal_id: u64) {
-        let Some(terminal) = self.terminals.remove(&terminal_id) else {
+        let Some((title, close_result)) = self.terminals.get(&terminal_id).map(|terminal| {
+            let close_result = terminal.runtime.terminate();
+            (terminal.title.clone(), close_result)
+        }) else {
             return;
         };
 
-        terminal.runtime.shutdown();
-        self.status_line = format!("Closed {}", terminal.title);
+        self.terminals.remove(&terminal_id);
+        self.status_line = match close_result {
+            Ok(()) => format!("Closed {title}"),
+            Err(err) => format!("Closed {title} (cleanup failed: {err})"),
+        };
+        self.pending_ctrl_c = None;
 
         if self.active_terminal == Some(terminal_id) {
-            self.active_terminal = self.terminals.keys().next().copied();
+            self.set_active_terminal(self.terminals.keys().next().copied());
         }
         self.bump_layout_epoch();
     }
 
+    fn set_active_terminal(&mut self, terminal_id: Option<u64>) {
+        if self.active_terminal == terminal_id {
+            return;
+        }
+
+        self.active_terminal = terminal_id;
+        self.pending_ctrl_c = None;
+        self.clear_terminal_selections_except(terminal_id);
+    }
+
+    fn clear_terminal_selections_except(&mut self, keep_terminal_id: Option<u64>) {
+        for (terminal_id, terminal) in &mut self.terminals {
+            if Some(*terminal_id) != keep_terminal_id {
+                Self::clear_terminal_selection(terminal);
+            }
+        }
+    }
+
+    fn clear_terminal_selection(terminal: &mut TerminalEntry) {
+        terminal.selection = None;
+        terminal.selection_snapshot = None;
+        terminal.selection_drag_active = false;
+    }
+
+    fn should_defer_terminal_snapshot(selection: Option<&TerminalSelection>) -> bool {
+        selection.is_some()
+    }
+
+    fn acknowledge_deferred_terminal_snapshot(
+        dirty: &mut bool,
+        snapshot_refresh_deferred: &mut bool,
+    ) {
+        *dirty = false;
+        *snapshot_refresh_deferred = true;
+    }
+
+    fn apply_terminal_snapshot(
+        terminal: &mut TerminalEntry,
+        snapshot: TerminalSnapshot,
+        selection_snapshot: TerminalSelectionSnapshot,
+    ) {
+        Self::apply_terminal_snapshot_parts(
+            &mut terminal.render_cache,
+            &mut terminal.dirty,
+            &mut terminal.snapshot_refresh_deferred,
+            &mut terminal.selection_snapshot,
+            snapshot,
+            selection_snapshot,
+        );
+    }
+
+    fn apply_terminal_snapshot_parts(
+        render_cache: &mut TerminalSnapshot,
+        dirty: &mut bool,
+        snapshot_refresh_deferred: &mut bool,
+        selection_snapshot: &mut Option<TerminalSelectionSnapshot>,
+        snapshot: TerminalSnapshot,
+        next_selection_snapshot: TerminalSelectionSnapshot,
+    ) {
+        *render_cache = snapshot;
+        *dirty = false;
+        *snapshot_refresh_deferred = false;
+        *selection_snapshot = Some(next_selection_snapshot);
+    }
+
+    fn ensure_terminal_selection_snapshot(terminal: &mut TerminalEntry) {
+        if terminal.selection_snapshot.is_none() {
+            terminal.selection_snapshot = try_terminal_selection_snapshot(&terminal.runtime);
+        }
+    }
+
+    fn selected_terminal_text(terminal: &mut TerminalEntry) -> Option<String> {
+        Self::ensure_terminal_selection_snapshot(terminal);
+        terminal
+            .selection_snapshot
+            .as_ref()
+            .and_then(|snapshot| terminal_selection_text(snapshot, terminal.selection.as_ref()))
+    }
+
+    fn send_pasted_text_to_terminal(&mut self, terminal_id: u64, text: &str) -> bool {
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            self.status_line = "Target terminal not found".to_owned();
+            return false;
+        };
+
+        if terminal.exited {
+            self.status_line = format!("{} is exited", terminal.title);
+            return false;
+        }
+
+        let text = Self::pasted_text(text);
+        if text.is_empty() {
+            return false;
+        }
+
+        terminal.runtime.send_bytes(text.as_bytes().to_vec());
+        Self::append_pending_line(&mut terminal.pending_line_for_title, &text);
+        Self::clear_terminal_selection(terminal);
+        terminal.dirty = true;
+        true
+    }
+
+    fn paste_clipboard_to_terminal(&mut self, terminal_id: u64) {
+        self.pending_ctrl_c = None;
+
+        let text = match Clipboard::new()
+            .map_err(|err| err.to_string())
+            .and_then(|mut clipboard| clipboard.get_text().map_err(|err| err.to_string()))
+        {
+            Ok(text) => text,
+            Err(err) => {
+                self.status_line = format!("Clipboard read failed: {err}");
+                return;
+            }
+        };
+
+        if self.send_pasted_text_to_terminal(terminal_id, &text) {
+            self.status_line = "Pasted clipboard into terminal".to_owned();
+        }
+    }
+
     fn send_saved_message_to_terminal(&mut self, terminal_id: u64, message: &str) {
+        self.pending_ctrl_c = None;
         let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
             self.status_line = "Target terminal not found".to_owned();
             return;
@@ -1058,12 +1314,21 @@ impl AdeApp {
         let mut outbound = message.as_bytes().to_vec();
         outbound.push(b'\r');
         terminal.runtime.send_bytes(outbound);
+        Self::clear_terminal_selection(terminal);
         Self::append_pending_line(&mut terminal.pending_line_for_title, message);
         let line = std::mem::take(&mut terminal.pending_line_for_title);
         terminal.full_title = terminal_title_text(&line, terminal.id as usize);
         terminal.title = update_terminal_title(&line, terminal.id as usize, TITLE_MAX_LEN);
         terminal.dirty = true;
         self.status_line = format!("Sent saved message to {}", destination_title);
+    }
+
+    fn finalize_pointer_selection_copy(
+        pending_ctrl_c: &mut Option<PendingCtrlC>,
+        status_line: &mut String,
+    ) {
+        *pending_ctrl_c = None;
+        *status_line = "Copied terminal selection".to_owned();
     }
 
     fn preferred_terminal_for_project(&self, project_id: u64) -> Option<u64> {
@@ -2026,7 +2291,7 @@ impl AdeApp {
                 self.bump_layout_epoch();
             }
             if set_active {
-                self.active_terminal = Some(terminal_entry_id);
+                self.set_active_terminal(Some(terminal_entry_id));
             }
             if close_terminal {
                 self.close_terminal(terminal_entry_id);
@@ -2166,13 +2431,15 @@ impl AdeApp {
             .unwrap_or_else(|| "Unknown Project".to_owned());
         let is_active = self.active_terminal == Some(terminal_id);
 
-        let (clicked, close_requested) = {
+        let (clicked, close_requested, copied_selection, paste_requested) = {
             let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
                 return;
             };
 
             let mut close_requested = false;
             let mut pane_clicked = false;
+            let mut copied_selection = None;
+            let mut paste_requested = false;
             let header_fill = if is_active {
                 Color32::from_rgb(24, 36, 50)
             } else {
@@ -2288,10 +2555,21 @@ impl AdeApp {
                 terminal.dirty = true;
             }
 
-            if terminal.dirty || terminal.render_cache.lines.is_empty() {
-                if let Some(snapshot) = try_terminal_snapshot(&terminal.runtime) {
-                    terminal.render_cache = snapshot;
-                    terminal.dirty = false;
+            if terminal.dirty
+                || terminal.snapshot_refresh_deferred
+                || terminal.render_cache.lines.is_empty()
+            {
+                if Self::should_defer_terminal_snapshot(terminal.selection.as_ref()) {
+                    Self::acknowledge_deferred_terminal_snapshot(
+                        &mut terminal.dirty,
+                        &mut terminal.snapshot_refresh_deferred,
+                    );
+                    ui.ctx()
+                        .request_repaint_after(Duration::from_millis(TERMINAL_FALLBACK_REFRESH_MS));
+                } else if let Some((snapshot, selection_snapshot)) =
+                    try_terminal_snapshots(&terminal.runtime)
+                {
+                    Self::apply_terminal_snapshot(terminal, snapshot, selection_snapshot);
                 } else {
                     ui.ctx()
                         .request_repaint_after(Duration::from_millis(TERMINAL_RETRY_MS));
@@ -2327,6 +2605,26 @@ impl AdeApp {
                                     if response.clicked() {
                                         pane_clicked = true;
                                     }
+                                    if response.secondary_clicked() {
+                                        pane_clicked = true;
+                                    }
+                                    let can_paste = !terminal.exited;
+                                    response.context_menu(|ui| {
+                                        with_minimal_button_chrome(ui, |ui| {
+                                            ui.add_enabled_ui(false, |ui| {
+                                                let _ = ui.button(format!("{} Copy", icons::COPY));
+                                            });
+                                            ui.add_enabled_ui(can_paste, |ui| {
+                                                if ui
+                                                    .button(format!("{} Paste", icons::DOWNLOAD))
+                                                    .clicked()
+                                                {
+                                                    paste_requested = true;
+                                                    ui.close_menu();
+                                                }
+                                            });
+                                        });
+                                    });
                                 } else {
                                     let render = build_terminal_render(
                                         &terminal.render_cache,
@@ -2339,7 +2637,128 @@ impl AdeApp {
                                     let response = ui.add(
                                         egui::Label::new(render.layout_job)
                                             .wrap_mode(TextWrapMode::Extend)
-                                            .sense(Sense::click()),
+                                            .selectable(false)
+                                            .sense(Sense::click_and_drag()),
+                                    );
+                                    if response.drag_started_by(egui::PointerButton::Primary) {
+                                        if let Some(point) = terminal_selection_point_from_pointer(
+                                            response.interact_pointer_pos(),
+                                            response.rect.min,
+                                            &terminal.render_cache,
+                                            char_width,
+                                            line_height,
+                                        ) {
+                                            Self::ensure_terminal_selection_snapshot(terminal);
+                                            terminal.selection =
+                                                Some(TerminalSelection::collapsed(point));
+                                            terminal.selection_drag_active = true;
+                                        }
+                                    }
+                                    if response.is_pointer_button_down_on()
+                                        && ui.ctx().input(|input| input.pointer.primary_down())
+                                    {
+                                        pane_clicked = true;
+                                        if terminal.selection.is_none() {
+                                            if let Some(point) =
+                                                terminal_selection_point_from_pointer(
+                                                    response.interact_pointer_pos(),
+                                                    response.rect.min,
+                                                    &terminal.render_cache,
+                                                    char_width,
+                                                    line_height,
+                                                )
+                                            {
+                                                Self::ensure_terminal_selection_snapshot(terminal);
+                                                terminal.selection =
+                                                    Some(TerminalSelection::collapsed(point));
+                                                terminal.selection_drag_active = true;
+                                            }
+                                        }
+                                    }
+                                    if response.dragged_by(egui::PointerButton::Primary) {
+                                        if let Some(point) = terminal_selection_point_from_pointer(
+                                            response.interact_pointer_pos(),
+                                            response.rect.min,
+                                            &terminal.render_cache,
+                                            char_width,
+                                            line_height,
+                                        ) {
+                                            if terminal.selection.is_none() {
+                                                Self::ensure_terminal_selection_snapshot(terminal);
+                                            }
+                                            let selection =
+                                                terminal.selection.get_or_insert_with(|| {
+                                                    TerminalSelection::collapsed(point)
+                                                });
+                                            selection.focus = point;
+                                            terminal.selection_drag_active = true;
+                                        }
+                                    }
+                                    if !ui.ctx().input(|input| input.pointer.primary_down()) {
+                                        terminal.selection_drag_active = false;
+                                    }
+                                    if response.drag_stopped_by(egui::PointerButton::Primary)
+                                        && terminal
+                                            .selection
+                                            .as_ref()
+                                            .is_some_and(|selection| !selection.has_selection())
+                                    {
+                                        Self::clear_terminal_selection(terminal);
+                                    } else if response.drag_stopped_by(egui::PointerButton::Primary)
+                                    {
+                                        terminal.selection_drag_active = false;
+                                    }
+                                    if response.clicked() {
+                                        pane_clicked = true;
+                                        Self::clear_terminal_selection(terminal);
+                                    }
+                                    if response.secondary_clicked() {
+                                        pane_clicked = true;
+                                    }
+
+                                    if terminal.selection.is_some() {
+                                        Self::ensure_terminal_selection_snapshot(terminal);
+                                    }
+                                    let can_copy = terminal
+                                        .selection
+                                        .as_ref()
+                                        .is_some_and(TerminalSelection::has_selection)
+                                        && terminal.selection_snapshot.is_some();
+                                    let can_paste = !terminal.exited;
+                                    let mut copy_requested = false;
+                                    response.context_menu(|ui| {
+                                        with_minimal_button_chrome(ui, |ui| {
+                                            ui.add_enabled_ui(can_copy, |ui| {
+                                                if ui
+                                                    .button(format!("{} Copy", icons::COPY))
+                                                    .clicked()
+                                                {
+                                                    copy_requested = true;
+                                                    ui.close_menu();
+                                                }
+                                            });
+                                            ui.add_enabled_ui(can_paste, |ui| {
+                                                if ui
+                                                    .button(format!("{} Paste", icons::DOWNLOAD))
+                                                    .clicked()
+                                                {
+                                                    paste_requested = true;
+                                                    ui.close_menu();
+                                                }
+                                            });
+                                        });
+                                    });
+                                    if copy_requested {
+                                        copied_selection = Self::selected_terminal_text(terminal);
+                                        Self::clear_terminal_selection(terminal);
+                                    }
+                                    paint_terminal_selection(
+                                        ui,
+                                        response.rect.min,
+                                        &terminal.render_cache,
+                                        terminal.selection.as_ref(),
+                                        char_width,
+                                        line_height,
                                     );
                                     if let Some(cursor_overlay) = render.cursor_overlay {
                                         paint_terminal_cursor(
@@ -2350,15 +2769,17 @@ impl AdeApp {
                                             cursor_overlay,
                                         );
                                     }
-                                    if response.clicked() {
-                                        pane_clicked = true;
-                                    }
                                 }
                             });
                     });
             });
 
-            (pane_clicked, close_requested)
+            (
+                pane_clicked,
+                close_requested,
+                copied_selection,
+                paste_requested,
+            )
         };
 
         if close_requested {
@@ -2367,7 +2788,24 @@ impl AdeApp {
         }
 
         if clicked {
-            self.active_terminal = Some(terminal_id);
+            self.pending_ctrl_c = None;
+        }
+
+        if clicked || copied_selection.is_some() || paste_requested {
+            self.set_active_terminal(Some(terminal_id));
+        }
+
+        if let Some(text) = copied_selection {
+            ui.ctx().copy_text(text);
+            Self::finalize_pointer_selection_copy(&mut self.pending_ctrl_c, &mut self.status_line);
+        }
+
+        if paste_requested {
+            self.paste_clipboard_to_terminal(terminal_id);
+        }
+
+        if clicked {
+            ui.ctx().request_repaint();
         }
     }
 
@@ -2671,7 +3109,7 @@ impl eframe::App for AdeApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         for terminal in self.terminals.values() {
-            terminal.runtime.shutdown();
+            let _ = terminal.runtime.terminate();
         }
 
         self.persist_config();
@@ -3493,6 +3931,185 @@ fn styled_icon_toggle(ui: &mut Ui, selected: bool, icon: AppIcon, tooltip: &str)
     response.clicked()
 }
 
+fn resolve_ctrl_c_action(
+    pending: Option<PendingCtrlC>,
+    terminal_id: u64,
+    time_seconds: f64,
+    has_selection: bool,
+) -> (Option<PendingCtrlC>, CtrlCAction) {
+    if pending.is_some_and(|pending| {
+        pending.terminal_id == terminal_id && time_seconds <= pending.expires_at
+    }) {
+        return (None, CtrlCAction::SendInterrupt);
+    }
+
+    if has_selection {
+        return (
+            Some(PendingCtrlC {
+                terminal_id,
+                expires_at: time_seconds + CTRL_C_DOUBLE_PRESS_WINDOW_SECS,
+            }),
+            CtrlCAction::CopySelection,
+        );
+    }
+
+    (
+        Some(PendingCtrlC {
+            terminal_id,
+            expires_at: time_seconds + CTRL_C_DOUBLE_PRESS_WINDOW_SECS,
+        }),
+        CtrlCAction::ArmInterrupt,
+    )
+}
+
+fn terminal_selection_point_from_pointer(
+    pointer_pos: Option<egui::Pos2>,
+    origin: egui::Pos2,
+    snapshot: &TerminalSnapshot,
+    char_width: f32,
+    line_height: f32,
+) -> Option<TerminalSelectionPoint> {
+    let pointer_pos = pointer_pos?;
+    if snapshot.lines.is_empty() || char_width <= 0.0 || line_height <= 0.0 {
+        return None;
+    }
+
+    let max_row = snapshot.lines.len().saturating_sub(1);
+    let row = (((pointer_pos.y - origin.y).max(0.0) / line_height).floor() as usize).min(max_row);
+    let line_width = terminal_snapshot_line_width(&snapshot.lines[row]);
+    let column =
+        (((pointer_pos.x - origin.x).max(0.0) / char_width).floor() as usize).min(line_width);
+
+    Some(TerminalSelectionPoint { row, column })
+}
+
+fn terminal_selection_text(
+    snapshot: &TerminalSelectionSnapshot,
+    selection: Option<&TerminalSelection>,
+) -> Option<String> {
+    let selection = selection?;
+    if !selection.has_selection() || snapshot.lines.is_empty() {
+        return None;
+    }
+
+    let (start, end) = selection.normalized();
+    let last_row = snapshot.lines.len().saturating_sub(1);
+    let start_row = start.row.min(last_row);
+    let end_row = end.row.min(last_row);
+
+    let mut rendered = String::new();
+    for row in start_row..=end_row {
+        let line = &snapshot.lines[row];
+        let line_width = terminal_selection_line_width(line);
+        let start_column = if row == start_row {
+            start.column.min(line_width)
+        } else {
+            0
+        };
+        let end_column = if row == end_row {
+            end.column.min(line_width)
+        } else {
+            line_width
+        };
+        if row > start_row && !snapshot.lines[row - 1].wraps_to_next {
+            rendered.push('\n');
+        }
+        rendered.push_str(&slice_terminal_line_columns(line, start_column, end_column));
+    }
+
+    Some(rendered)
+}
+
+fn terminal_snapshot_line_width(line: &crate::terminal::TerminalStyledLine) -> usize {
+    line.runs
+        .last()
+        .map(|run| run.column.saturating_add(run.display_width.max(1)))
+        .unwrap_or(0)
+}
+
+fn terminal_selection_line_width(line: &TerminalSelectionLine) -> usize {
+    line.width
+}
+
+fn slice_terminal_line_columns(line: &TerminalSelectionLine, start: usize, end: usize) -> String {
+    if end <= start {
+        return String::new();
+    }
+
+    let mut rendered = String::new();
+    let mut column = start;
+
+    for cell in &line.cells {
+        let cell_end = cell.column.saturating_add(cell.display_width.max(1));
+        if cell_end <= start {
+            continue;
+        }
+        if cell.column >= end {
+            break;
+        }
+
+        if cell.column > column {
+            rendered.push_str(&" ".repeat(cell.column.min(end).saturating_sub(column)));
+        }
+
+        rendered.push_str(&cell.rendered_text());
+        column = cell_end;
+    }
+
+    if column < end {
+        rendered.push_str(&" ".repeat(end - column));
+    }
+
+    rendered
+}
+
+fn paint_terminal_selection(
+    ui: &mut Ui,
+    origin: egui::Pos2,
+    snapshot: &TerminalSnapshot,
+    selection: Option<&TerminalSelection>,
+    char_width: f32,
+    line_height: f32,
+) {
+    if snapshot.lines.is_empty() {
+        return;
+    }
+
+    let Some(selection) = selection.filter(|selection| selection.has_selection()) else {
+        return;
+    };
+
+    let (start, end) = selection.normalized();
+    let fill = with_alpha(ui.visuals().selection.bg_fill, 92);
+
+    for row in start.row..=end.row.min(snapshot.lines.len().saturating_sub(1)) {
+        let line_width = terminal_snapshot_line_width(&snapshot.lines[row]);
+        let start_column = if row == start.row {
+            start.column.min(line_width)
+        } else {
+            0
+        };
+        let end_column = if row == end.row {
+            end.column.min(line_width)
+        } else {
+            line_width
+        };
+
+        if end_column <= start_column {
+            continue;
+        }
+
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(
+                origin.x + start_column as f32 * char_width,
+                origin.y + row as f32 * line_height,
+            ),
+            egui::vec2((end_column - start_column) as f32 * char_width, line_height),
+        );
+        ui.painter().rect_filled(rect, 2.0, fill);
+    }
+}
+
 fn build_terminal_render(
     snapshot: &TerminalSnapshot,
     font_id: &FontId,
@@ -3749,15 +4366,17 @@ mod tests {
     use super::{
         build_terminal_cursor_overlay, build_terminal_render, cursor_hidden_by_row_filter,
         normalize_terminal_background, parse_branch_header, recover_config_state,
-        terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect,
-        terminal_manager_actions_width, terminal_manager_row_widths, to_egui_color,
-        update_stable_cursor_row, visible_terminal_cursor, AdeApp, PendingConfigChanges,
-        TerminalCursorOverlay, TERMINAL_OUTPUT_BG,
+        resolve_ctrl_c_action, terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect,
+        terminal_manager_actions_width, terminal_manager_row_widths, terminal_selection_text,
+        to_egui_color, update_stable_cursor_row, visible_terminal_cursor, AdeApp, CtrlCAction,
+        PendingConfigChanges, PendingCtrlC, TerminalCursorOverlay, TerminalSelection,
+        TerminalSelectionPoint, TERMINAL_OUTPUT_BG,
     };
     use crate::models::{AppConfig, AutoTileScope, MainVisibilityMode, ProjectRecord, ShellKind};
     use crate::terminal::{
-        TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape, TerminalSnapshot,
-        TerminalStyle, TerminalStyledCell, TerminalStyledLine, TerminalStyledRun,
+        TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape,
+        TerminalSelectionLine, TerminalSelectionSnapshot, TerminalSnapshot, TerminalStyle,
+        TerminalStyledCell, TerminalStyledLine, TerminalStyledRun,
     };
     use eframe::egui::{pos2, Color32, FontFamily, FontId, Key, Modifiers};
     use std::collections::BTreeMap;
@@ -3784,6 +4403,264 @@ mod tests {
 
         assert_eq!(ctrl_c, Some(vec![0x03]));
         assert_eq!(ctrl_z, Some(vec![0x1a]));
+    }
+
+    #[test]
+    fn first_ctrl_c_arms_interrupt_without_sending_signal() {
+        let (pending, action) = resolve_ctrl_c_action(None, 9, 2.0, false);
+
+        assert_eq!(action, CtrlCAction::ArmInterrupt);
+        let pending = pending.expect("expected pending ctrl+c state");
+        assert_eq!(pending.terminal_id, 9);
+        assert!((pending.expires_at - 2.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn second_ctrl_c_within_window_sends_interrupt() {
+        let pending = Some(PendingCtrlC {
+            terminal_id: 9,
+            expires_at: 2.75,
+        });
+        let (next_pending, action) = resolve_ctrl_c_action(pending, 9, 2.4, false);
+
+        assert_eq!(action, CtrlCAction::SendInterrupt);
+        assert_eq!(next_pending, None);
+    }
+
+    #[test]
+    fn ctrl_c_copies_selection_and_arms_interrupt_on_first_press() {
+        let (next_pending, action) = resolve_ctrl_c_action(None, 9, 2.0, true);
+
+        assert_eq!(action, CtrlCAction::CopySelection);
+        let pending = next_pending.expect("expected pending ctrl+c state");
+        assert_eq!(pending.terminal_id, 9);
+        assert!((pending.expires_at - 2.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn ctrl_c_sends_interrupt_on_second_press_even_when_selection_exists() {
+        let pending = Some(PendingCtrlC {
+            terminal_id: 9,
+            expires_at: 2.75,
+        });
+        let (next_pending, action) = resolve_ctrl_c_action(pending, 9, 2.4, true);
+
+        assert_eq!(action, CtrlCAction::SendInterrupt);
+        assert_eq!(next_pending, None);
+    }
+
+    #[test]
+    fn should_defer_terminal_snapshot_while_selection_exists() {
+        let selection = TerminalSelection {
+            anchor: TerminalSelectionPoint { row: 0, column: 1 },
+            focus: TerminalSelectionPoint { row: 0, column: 4 },
+        };
+
+        assert!(AdeApp::should_defer_terminal_snapshot(Some(&selection)));
+        assert!(!AdeApp::should_defer_terminal_snapshot(None));
+    }
+
+    #[test]
+    fn deferred_terminal_snapshot_clears_dirty_latch_and_marks_refresh_pending() {
+        let mut dirty = true;
+        let mut snapshot_refresh_deferred = false;
+
+        AdeApp::acknowledge_deferred_terminal_snapshot(&mut dirty, &mut snapshot_refresh_deferred);
+
+        assert!(!dirty);
+        assert!(snapshot_refresh_deferred);
+    }
+
+    #[test]
+    fn pointer_copy_clears_pending_ctrl_c_state() {
+        let mut pending_ctrl_c = Some(PendingCtrlC {
+            terminal_id: 9,
+            expires_at: 2.75,
+        });
+        let mut status_line = String::new();
+
+        AdeApp::finalize_pointer_selection_copy(&mut pending_ctrl_c, &mut status_line);
+
+        assert_eq!(pending_ctrl_c, None);
+        assert_eq!(status_line, "Copied terminal selection");
+    }
+
+    #[test]
+    fn applying_terminal_snapshot_replaces_cached_selection_snapshot() {
+        let snapshot = TerminalSnapshot {
+            lines: vec![TerminalStyledLine {
+                runs: vec![TerminalStyledRun {
+                    text: "next".to_owned(),
+                    style: test_terminal_style(),
+                    column: 0,
+                    display_width: 4,
+                }],
+            }],
+            ..TerminalSnapshot::default()
+        };
+        let mut render_cache = TerminalSnapshot::default();
+        let mut dirty = true;
+        let mut snapshot_refresh_deferred = true;
+        let mut selection_snapshot = Some(TerminalSelectionSnapshot {
+            lines: vec![test_selection_line(&[("stale", 0, 5)], 5)],
+        });
+        let next_selection_snapshot = TerminalSelectionSnapshot {
+            lines: vec![test_selection_line(&[("next", 0, 4)], 4)],
+        };
+
+        AdeApp::apply_terminal_snapshot_parts(
+            &mut render_cache,
+            &mut dirty,
+            &mut snapshot_refresh_deferred,
+            &mut selection_snapshot,
+            snapshot.clone(),
+            next_selection_snapshot.clone(),
+        );
+
+        assert_eq!(render_cache, snapshot);
+        assert!(!dirty);
+        assert!(!snapshot_refresh_deferred);
+        assert_eq!(selection_snapshot, Some(next_selection_snapshot));
+    }
+
+    #[test]
+    fn terminal_selection_text_joins_multiple_lines() {
+        let snapshot = TerminalSelectionSnapshot {
+            lines: vec![
+                test_selection_line(&[("echo test", 0, 9)], 9),
+                test_selection_line(&[("next line", 0, 9)], 9),
+            ],
+            ..TerminalSelectionSnapshot::default()
+        };
+        let selection = TerminalSelection {
+            anchor: TerminalSelectionPoint { row: 0, column: 5 },
+            focus: TerminalSelectionPoint { row: 1, column: 4 },
+        };
+
+        let text = terminal_selection_text(&snapshot, Some(&selection))
+            .expect("selection should produce text");
+
+        assert_eq!(text, "test\nnext");
+    }
+
+    #[test]
+    fn terminal_selection_text_preserves_wide_cell_padding() {
+        let style = test_terminal_style();
+        let snapshot = TerminalSelectionSnapshot {
+            lines: vec![TerminalSelectionLine {
+                width: 3,
+                wraps_to_next: false,
+                cells: vec![
+                    TerminalStyledCell {
+                        text: "你".to_owned(),
+                        style,
+                        column: 0,
+                        display_width: 2,
+                    },
+                    TerminalStyledCell {
+                        text: "x".to_owned(),
+                        style,
+                        column: 2,
+                        display_width: 1,
+                    },
+                ],
+            }],
+            ..TerminalSelectionSnapshot::default()
+        };
+        let selection = TerminalSelection {
+            anchor: TerminalSelectionPoint { row: 0, column: 0 },
+            focus: TerminalSelectionPoint { row: 0, column: 2 },
+        };
+
+        let text = terminal_selection_text(&snapshot, Some(&selection))
+            .expect("selection should produce text");
+
+        assert_eq!(text, "你 ");
+    }
+
+    #[test]
+    fn terminal_selection_text_keeps_wide_character_when_drag_starts_mid_cell() {
+        let style = test_terminal_style();
+        let snapshot = TerminalSelectionSnapshot {
+            lines: vec![TerminalSelectionLine {
+                width: 2,
+                wraps_to_next: false,
+                cells: vec![TerminalStyledCell {
+                    text: "你".to_owned(),
+                    style,
+                    column: 0,
+                    display_width: 2,
+                }],
+            }],
+            ..TerminalSelectionSnapshot::default()
+        };
+        let selection = TerminalSelection {
+            anchor: TerminalSelectionPoint { row: 0, column: 1 },
+            focus: TerminalSelectionPoint { row: 0, column: 2 },
+        };
+
+        let text = terminal_selection_text(&snapshot, Some(&selection))
+            .expect("selection should produce text");
+
+        assert_eq!(text, "你 ");
+    }
+
+    #[test]
+    fn terminal_selection_text_reconstructs_internal_blank_columns() {
+        let snapshot = TerminalSelectionSnapshot {
+            lines: vec![test_selection_line(&[("a", 0, 1), ("b", 2, 1)], 3)],
+            ..TerminalSelectionSnapshot::default()
+        };
+        let selection = TerminalSelection {
+            anchor: TerminalSelectionPoint { row: 0, column: 0 },
+            focus: TerminalSelectionPoint { row: 0, column: 3 },
+        };
+
+        let text = terminal_selection_text(&snapshot, Some(&selection))
+            .expect("selection should produce text");
+
+        assert_eq!(text, "a b");
+    }
+
+    #[test]
+    fn terminal_selection_text_joins_soft_wrapped_rows_without_newline() {
+        let snapshot = TerminalSelectionSnapshot {
+            lines: vec![
+                test_selection_line_with_wrap(&[("hello", 0, 5)], 5, true),
+                test_selection_line(&[(" world", 0, 6)], 6),
+            ],
+            ..TerminalSelectionSnapshot::default()
+        };
+        let selection = TerminalSelection {
+            anchor: TerminalSelectionPoint { row: 0, column: 0 },
+            focus: TerminalSelectionPoint { row: 1, column: 6 },
+        };
+
+        let text = terminal_selection_text(&snapshot, Some(&selection))
+            .expect("selection should produce text");
+
+        assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn terminal_selection_text_inserts_newline_after_wrapped_logical_line_ends() {
+        let snapshot = TerminalSelectionSnapshot {
+            lines: vec![
+                test_selection_line_with_wrap(&[("hello", 0, 5)], 5, true),
+                test_selection_line(&[(" world", 0, 6)], 6),
+                test_selection_line(&[("next", 0, 4)], 4),
+            ],
+            ..TerminalSelectionSnapshot::default()
+        };
+        let selection = TerminalSelection {
+            anchor: TerminalSelectionPoint { row: 0, column: 0 },
+            focus: TerminalSelectionPoint { row: 2, column: 4 },
+        };
+
+        let text = terminal_selection_text(&snapshot, Some(&selection))
+            .expect("selection should produce text");
+
+        assert_eq!(text, "hello world\nnext");
     }
 
     #[test]
@@ -3948,6 +4825,67 @@ mod tests {
         }
     }
 
+    fn test_terminal_style() -> TerminalStyle {
+        TerminalStyle {
+            fg: TerminalColor {
+                r: 220,
+                g: 220,
+                b: 220,
+            },
+            bg: TerminalColor {
+                r: 20,
+                g: 24,
+                b: 30,
+            },
+            italic: false,
+            underline: false,
+            strike: false,
+        }
+    }
+
+    fn test_selection_line(
+        segments: &[(&str, usize, usize)],
+        width: usize,
+    ) -> TerminalSelectionLine {
+        test_selection_line_with_wrap(segments, width, false)
+    }
+
+    fn test_selection_line_with_wrap(
+        segments: &[(&str, usize, usize)],
+        width: usize,
+        wraps_to_next: bool,
+    ) -> TerminalSelectionLine {
+        let style = test_terminal_style();
+        TerminalSelectionLine {
+            width,
+            wraps_to_next,
+            cells: segments
+                .iter()
+                .flat_map(|(text, column, display_width)| {
+                    let char_count = text.chars().count();
+                    if *display_width == char_count {
+                        text.chars()
+                            .enumerate()
+                            .map(move |(offset, ch)| TerminalStyledCell {
+                                text: ch.to_string(),
+                                style,
+                                column: *column + offset,
+                                display_width: 1,
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        vec![TerminalStyledCell {
+                            text: (*text).to_owned(),
+                            style,
+                            column: *column,
+                            display_width: *display_width,
+                        }]
+                    }
+                })
+                .collect(),
+        }
+    }
+
     fn test_project(id: u64, name: &str, path: &str, saved_messages: &[&str]) -> ProjectRecord {
         ProjectRecord {
             id,
@@ -3968,6 +4906,20 @@ mod tests {
         AdeApp::append_pending_line(&mut pending, "\nnext");
 
         assert_eq!(pending, "next");
+    }
+
+    #[test]
+    fn pasted_text_preserves_windows_newlines() {
+        let pasted = AdeApp::pasted_text("first\r\nsecond\rthird");
+
+        assert_eq!(pasted, "first\r\nsecond\rthird");
+    }
+
+    #[test]
+    fn pasted_text_preserves_unix_newlines() {
+        let pasted = AdeApp::pasted_text("first\nsecond");
+
+        assert_eq!(pasted, "first\nsecond");
     }
 
     #[test]
