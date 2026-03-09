@@ -13,13 +13,13 @@ use tattoy_wezterm_surface::{CursorShape, CursorVisibility};
 use tattoy_wezterm_term::color::{ColorPalette, SrgbaTuple};
 use tattoy_wezterm_term::config::TerminalConfiguration;
 use tattoy_wezterm_term::{CellAttributes, Terminal, TerminalSize};
+#[cfg(all(target_os = "windows", test))]
+use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, FILETIME, HANDLE,
     INVALID_HANDLE_VALUE,
 };
-#[cfg(all(target_os = "windows", test))]
-use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,

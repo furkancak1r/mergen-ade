@@ -507,6 +507,64 @@ impl AdeApp {
         self.layout_epoch = self.layout_epoch.wrapping_add(1);
     }
 
+    fn first_visible_terminal_for_main(&self) -> Option<u64> {
+        self.terminals
+            .iter()
+            .filter_map(|(id, terminal)| self.terminal_visible_in_main(terminal).then_some(*id))
+            .min()
+    }
+
+    fn apply_auto_tile_scope_to_open_terminals(&mut self) -> bool {
+        let auto_tile_scope = self.config.ui.auto_tile_scope;
+        let selected_project = self.selected_project;
+        let mut changed = false;
+
+        for terminal in self.terminals.values_mut() {
+            let next_in_main_view = match auto_tile_scope {
+                AutoTileScope::AllVisible => true,
+                AutoTileScope::SelectedProjectOnly => {
+                    selected_project.is_some_and(|project_id| terminal.project_id == project_id)
+                }
+            };
+
+            if terminal.in_main_view != next_in_main_view {
+                terminal.in_main_view = next_in_main_view;
+                changed = true;
+            }
+        }
+
+        let active_visible = self
+            .active_terminal
+            .and_then(|terminal_id| self.terminals.get(&terminal_id))
+            .is_some_and(|terminal| self.terminal_visible_in_main(terminal));
+        let next_active_terminal = if active_visible {
+            self.active_terminal
+        } else {
+            self.first_visible_terminal_for_main()
+        };
+        if self.active_terminal != next_active_terminal {
+            self.set_active_terminal(next_active_terminal);
+            changed = true;
+        }
+
+        changed
+    }
+
+    fn apply_auto_tile_scope_and_refresh_layout(&mut self, ctx: &egui::Context) {
+        if self.apply_auto_tile_scope_to_open_terminals() {
+            self.bump_layout_epoch();
+            ctx.request_repaint();
+        }
+    }
+
+    fn apply_selected_project_auto_tile_scope_and_refresh_layout(&mut self, ctx: &egui::Context) {
+        if self.config.ui.auto_tile_scope != AutoTileScope::SelectedProjectOnly {
+            return;
+        }
+
+        self.apply_auto_tile_scope_and_refresh_layout(ctx);
+    }
+
     fn terminal_visible_in_main(&self, terminal: &TerminalEntry) -> bool {
         terminal.in_main_view
     }
@@ -533,6 +591,9 @@ impl AdeApp {
         self.selected_project = Some(project.id);
         self.projects.insert(project.id, project);
         self.next_project_id += 1;
+        if self.config.ui.auto_tile_scope == AutoTileScope::SelectedProjectOnly {
+            let _ = self.apply_auto_tile_scope_to_open_terminals();
+        }
         self.bump_layout_epoch();
         self.note_projects_changed();
         self.note_selection_changed();
@@ -1670,6 +1731,7 @@ impl AdeApp {
                             });
                         });
                         if self.selected_project != previous_selected_project {
+                            self.apply_selected_project_auto_tile_scope_and_refresh_layout(ctx);
                             self.note_selection_changed();
                             self.persist_config();
                         }
@@ -1881,6 +1943,9 @@ impl AdeApp {
                                     });
                                 });
                                 if self.selected_project != previous_selected_project {
+                                    self.apply_selected_project_auto_tile_scope_and_refresh_layout(
+                                        ctx,
+                                    );
                                     should_persist_selection = true;
                                 }
                                 if should_persist_selection {
@@ -2935,6 +3000,7 @@ impl AdeApp {
                         );
                     });
                 if self.config.ui.auto_tile_scope != previous_scope {
+                    self.apply_auto_tile_scope_and_refresh_layout(ui.ctx());
                     should_persist = true;
                     ui_config_changed = true;
                 }
@@ -4763,6 +4829,136 @@ mod tests {
         assert_eq!(app.pending_ctrl_c, None);
         assert_eq!(app.layout_epoch, 1);
         assert_eq!(app.status_line, "Closed Terminal 1");
+    }
+
+    #[test]
+    fn auto_tile_scope_selected_project_only_rewrites_existing_terminal_visibility() {
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+                (3, test_terminal_entry(3, 9)),
+            ],
+            Some(3),
+        );
+        app.config.ui.auto_tile_scope = AutoTileScope::SelectedProjectOnly;
+        app.selected_project = Some(7);
+
+        let changed = app.apply_auto_tile_scope_to_open_terminals();
+
+        assert!(changed);
+        assert!(app
+            .terminals
+            .get(&1)
+            .is_some_and(|terminal| terminal.in_main_view));
+        assert!(app
+            .terminals
+            .get(&2)
+            .is_some_and(|terminal| terminal.in_main_view));
+        assert!(app
+            .terminals
+            .get(&3)
+            .is_some_and(|terminal| !terminal.in_main_view));
+        assert_eq!(app.active_terminal, Some(1));
+    }
+
+    #[test]
+    fn auto_tile_scope_all_visible_restores_all_open_terminals() {
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 9)),
+            ],
+            Some(1),
+        );
+        app.config.ui.auto_tile_scope = AutoTileScope::SelectedProjectOnly;
+        app.selected_project = Some(7);
+        let _ = app.apply_auto_tile_scope_to_open_terminals();
+
+        app.config.ui.auto_tile_scope = AutoTileScope::AllVisible;
+
+        let changed = app.apply_auto_tile_scope_to_open_terminals();
+
+        assert!(changed);
+        assert!(app
+            .terminals
+            .get(&1)
+            .is_some_and(|terminal| terminal.in_main_view));
+        assert!(app
+            .terminals
+            .get(&2)
+            .is_some_and(|terminal| terminal.in_main_view));
+        assert_eq!(app.active_terminal, Some(1));
+    }
+
+    #[test]
+    fn selected_project_change_does_not_reshow_hidden_terminals_in_all_visible_mode() {
+        let ctx = eframe::egui::Context::default();
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 9)),
+            ],
+            Some(1),
+        );
+        app.config.ui.auto_tile_scope = AutoTileScope::AllVisible;
+        app.selected_project = Some(7);
+        app.terminals.get_mut(&2).expect("terminal 2").in_main_view = false;
+
+        app.selected_project = Some(9);
+        app.apply_selected_project_auto_tile_scope_and_refresh_layout(&ctx);
+
+        assert!(app
+            .terminals
+            .get(&1)
+            .is_some_and(|terminal| terminal.in_main_view));
+        assert!(app
+            .terminals
+            .get(&2)
+            .is_some_and(|terminal| !terminal.in_main_view));
+        assert_eq!(app.active_terminal, Some(1));
+        assert_eq!(app.layout_epoch, 0);
+    }
+
+    #[test]
+    fn auto_tile_scope_selected_project_only_hides_all_terminals_without_selection() {
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 9)),
+            ],
+            Some(2),
+        );
+        app.config.ui.auto_tile_scope = AutoTileScope::SelectedProjectOnly;
+        app.selected_project = None;
+
+        let changed = app.apply_auto_tile_scope_to_open_terminals();
+
+        assert!(changed);
+        assert!(app
+            .terminals
+            .values()
+            .all(|terminal| !terminal.in_main_view));
+        assert_eq!(app.active_terminal, None);
+    }
+
+    #[test]
+    fn auto_tile_scope_keeps_active_terminal_when_it_remains_visible() {
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+                (3, test_terminal_entry(3, 9)),
+            ],
+            Some(2),
+        );
+        app.config.ui.auto_tile_scope = AutoTileScope::SelectedProjectOnly;
+        app.selected_project = Some(7);
+
+        let changed = app.apply_auto_tile_scope_to_open_terminals();
+
+        assert!(changed);
+        assert_eq!(app.active_terminal, Some(2));
     }
 
     #[test]
