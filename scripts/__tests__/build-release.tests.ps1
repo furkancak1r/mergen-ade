@@ -1035,6 +1035,39 @@ function Test-CleanupRunsAfterSuccessfulBuildValidation {
     Assert-True -Condition ($cleanupIndex -lt $successMessageIndex) -Message "Expected cleanup to finish before the success message is printed."
 }
 
+function Test-WindowsIconPipelineIsConfigured {
+    $buildRsPath = Join-Path $repoRoot "build.rs"
+    $mainRsPath = Join-Path $repoRoot "src\main.rs"
+    $logoPath = Join-Path $repoRoot "logo.png"
+
+    Assert-True -Condition (Test-Path $buildRsPath) -Message "Expected build.rs to exist for Windows icon generation."
+    Assert-True -Condition (Test-Path $logoPath) -Message "Expected logo.png to exist as the committed icon source asset."
+
+    $buildContent = Get-Content -Path $buildRsPath -Raw
+    $mainContent = Get-Content -Path $mainRsPath -Raw
+
+    Assert-True -Condition $buildContent.Contains('const SOURCE_LOGO: &str = "logo.png";') -Message "Expected build.rs to use logo.png as the icon source asset."
+    Assert-True -Condition $buildContent.Contains('const OUTPUT_PNG: &str = "app-icon.png";') -Message "Expected build.rs to generate a runtime PNG icon."
+    Assert-True -Condition $buildContent.Contains('cargo:rerun-if-env-changed=WindowsSdkDir') -Message "Expected build.rs to rerun when WindowsSdkDir changes."
+    Assert-True -Condition $buildContent.Contains('cargo:rerun-if-env-changed=WindowsSdkVersion') -Message "Expected build.rs to rerun when WindowsSdkVersion changes."
+    Assert-True -Condition $buildContent.Contains('cargo:rerun-if-env-changed=ProgramFiles') -Message "Expected build.rs to rerun when ProgramFiles changes."
+    Assert-True -Condition $buildContent.Contains('cargo:rerun-if-env-changed=ProgramFiles(x86)') -Message "Expected build.rs to rerun when ProgramFiles(x86) changes."
+    Assert-True -Condition $buildContent.Contains('cargo:rerun-if-env-changed=PATH') -Message "Expected build.rs to rerun when PATH changes."
+    Assert-True -Condition $buildContent.Contains('if target_os == "windows" && !is_test_build {') -Message "Expected build.rs to compile the icon resource for all non-test Windows targets."
+    Assert-True -Condition $buildContent.Contains('if target.contains("-windows-gnu") {') -Message "Expected build.rs to configure a GNU resource compiler path for the default gnullvm build."
+    Assert-True -Condition $buildContent.Contains('.toolchain/llvm-mingw-20260224-ucrt-x86_64/bin') -Message "Expected build.rs to use the repo-local LLVM-MinGW toolkit for GNU resource compilation."
+    Assert-True -Condition $buildContent.Contains('.set_windres_path(') -Message "Expected build.rs to explicitly set the GNU windres path."
+    Assert-True -Condition $buildContent.Contains('.set_ar_path(') -Message "Expected build.rs to explicitly set the GNU ar path."
+    Assert-True -Condition $buildContent.Contains('Skipping GNU exe icon embedding') -Message "Expected build.rs to skip GNU resource compilation gracefully when repo-local tools are unavailable."
+    Assert-True -Condition $buildContent.Contains('else if target.contains("-windows-msvc") {') -Message "Expected build.rs to handle the MSVC target separately from GNU."
+    Assert-True -Condition $buildContent.Contains('resolve_msvc_toolkit_path()') -Message "Expected build.rs to probe for an MSVC rc.exe toolkit path."
+    Assert-True -Condition $buildContent.Contains('resolve_msvc_toolkit_path_from_path') -Message "Expected build.rs to fall back to PATH-based rc.exe detection for MSVC."
+    Assert-True -Condition $buildContent.Contains('cargo:warning=Skipping MSVC exe icon embedding') -Message "Expected build.rs to skip MSVC resource compilation gracefully when rc.exe is unavailable."
+    Assert-True -Condition $buildContent.Contains('resource.set_icon') -Message "Expected build.rs to embed the generated .ico into the Windows executable."
+    Assert-True -Condition $mainContent.Contains('.with_icon(app_icon)') -Message "Expected src/main.rs to set the runtime window icon."
+    Assert-True -Condition $mainContent.Contains('include_bytes!(concat!(') -Message "Expected src/main.rs to load the generated runtime icon at compile time."
+}
+
 Test-CargoConfigRetainsRepoLocalGnullvmLinker
 Test-SortVsInstallationsPrefersHealthyBuildTools
 Test-FindDumpbinUnderRootsFallsBackToProgramFilesSearch
@@ -1064,5 +1097,6 @@ Test-EnsureMsvcBuildEnvironmentRetriesAfterImportFailure
 Test-UnsupportedConvenienceArtifactsExcludeGnullvmDevOutputs
 Test-RemoveUnsupportedConvenienceArtifactsFailsWhenDeletionFails
 Test-CleanupRunsAfterSuccessfulBuildValidation
+Test-WindowsIconPipelineIsConfigured
 
 Write-Host "build-release PowerShell tests passed."
