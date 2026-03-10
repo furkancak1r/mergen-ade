@@ -1,27 +1,45 @@
-# Mergen ADE (Prototype)
+<p align="center">
+  <img src="logo.png" alt="Mergen ADE logo" width="220">
+</p>
 
-Mergen ADE is a **Windows desktop ADE** (Application Development Environment) focused on terminal orchestration and project contexts.
+<h1 align="center">Mergen ADE</h1>
 
-It is **not an IDE** and does not include an editor, LSP, or debugging UI.
+<p align="center">
+  Windows-native terminal workspace for running and organizing multiple project contexts.
+</p>
 
-## Goals in this prototype
+<p align="center">
+  <a href="https://github.com/furkancak1r/mergen-ade/releases/latest"><strong>Download for Windows</strong></a>
+  |
+  <a href="#build-from-source"><strong>Build from Source</strong></a>
+</p>
 
-- Native Rust desktop app (no Electron)
-- Terminal emulation via `tattoy-wezterm-term`
-- ConPTY-backed terminal process integration on Windows
-- Left activity rail + collapsible side panels + tiled main terminal area
-- Very small persisted state in local TOML config
+<p align="center">
+  No release published yet? Use the one-command local build below.
+</p>
 
-## Assumptions used for this prototype
+Mergen ADE is a desktop ADE focused on terminal orchestration, project context switching, and lightweight workspace management on Windows.
 
-- This repository started empty (greenfield implementation).
-- Target platform is Windows 10/11.
-- Rust toolchain is expected to be installed by the user.
-- Default shell is PowerShell (`powershell -NoLogo`).
-- Terminal title max length is 40 characters.
-- Terminal scrollback is intentionally limited (`1000` lines) and not persisted to disk.
+It is not an IDE. There is no built-in editor, LSP, or debugger UI in this project.
 
-## Build (Windows)
+## Why Mergen ADE
+
+- Keep multiple terminals visible without turning your desktop into window clutter.
+- Group sessions by project so context switches stay fast and predictable.
+- Run a native Rust desktop app instead of a browser or Electron shell.
+- Persist only the small amount of state that helps you get back to work quickly.
+
+## Quick Start
+
+### Download the Windows build
+
+The canonical download location is the GitHub Releases page:
+
+- https://github.com/furkancak1r/mergen-ade/releases/latest
+
+As of March 10, 2026, this repository does not have a published GitHub Release yet. When the first release is published, the Windows portable ZIP will appear there.
+
+### Local build
 
 Preferred one-command build:
 
@@ -29,22 +47,62 @@ Preferred one-command build:
 powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
 ```
 
-This script:
+This produces the portable Windows executable at:
 
-1. Builds a portable Windows release for `x86_64-pc-windows-msvc`
-2. Uses an explicit `stable-x86_64-pc-windows-msvc` toolchain and provisions it when missing
-3. Accepts an already-configured x64 MSVC shell or resolves the local Visual Studio build environment when the current shell is missing x64 MSVC tools
-4. Statically links the MSVC CRT so the EXE can be copied to another Windows 10/11 machine without bundling extra runtime DLLs
-5. Verifies imports with repo-local `llvm-objdump.exe` when available, otherwise resolves `dumpbin.exe` from the local Visual Studio installation
-6. After a successful portable build, removes unsupported convenience EXE copies from older output paths without touching the documented `gnullvm` dev artifact
-7. Produces the only supported Windows release artifact at `target\x86_64-pc-windows-msvc\release\mergen-ade.exe`
+```text
+target\x86_64-pc-windows-msvc\release\mergen-ade.exe
+```
 
-For normal local development, plain `cargo` stays on the repo's `gnullvm` host flow, even when Cargo is launched directly from a toolchain binary instead of the rustup shim:
+For normal local development:
 
 ```powershell
 cargo build --release
 cargo test
 ```
+
+If `cargo` is not on PATH in PowerShell:
+
+```powershell
+$env:USERPROFILE\.cargo\bin\cargo.exe build --release
+$env:USERPROFILE\.cargo\bin\cargo.exe test
+```
+
+## Core Features
+
+- Native Windows desktop app built in Rust
+- Embedded terminal panes with tiled layout management
+- Project-aware terminal grouping in the side panel
+- ConPTY-backed shell sessions with responsive IO flow
+- Lightweight local TOML configuration
+- Portable Windows release pipeline through GitHub Actions
+
+## How It Works
+
+- Terminal sessions are created through `portable-pty` using the native Windows PTY system.
+- Terminal emulation and parsing are handled by `tattoy-wezterm-term`.
+- PTY reads, writes, and resize handling run off the UI thread to keep the app responsive.
+- The main window combines an activity rail, collapsible side panels, and tiled terminal panes.
+
+## UI Overview
+
+- **Activity rail:** icon-first left rail for switching between `Project Explorer` and `Terminal Manager`
+- **Project Explorer:** project picker, quick actions, search, indexed folder tree, and source control view
+- **Terminal Manager:** project-grouped foreground and background terminal lists
+- **Main area:** embedded tiled terminal panes for concurrent terminal work
+- **Terminal visibility mode:** configurable between global visibility and selected-project-only visibility
+
+## Build From Source
+
+The release script is the supported path for a portable Windows binary.
+
+What it does:
+
+1. Builds a portable release for `x86_64-pc-windows-msvc`
+2. Ensures the `stable-x86_64-pc-windows-msvc` toolchain is available
+3. Resolves the local Visual Studio build environment when needed
+4. Statically links the MSVC CRT for a portable EXE workflow
+5. Verifies imports with repo-local `llvm-objdump.exe` when available, otherwise `dumpbin.exe`
+6. Produces `target\x86_64-pc-windows-msvc\release\mergen-ade.exe`
 
 Regression check:
 
@@ -52,129 +110,61 @@ Regression check:
 powershell -ExecutionPolicy Bypass -File .\scripts\__tests__\build-release.tests.ps1
 ```
 
-Portable single-EXE release remains the script path above.
+## GitHub Releases
 
-## Automatic GitHub Release (Windows)
+This repository includes a Windows release workflow at `.github/workflows/release.yml`.
 
-This repository includes a GitHub Actions workflow at `.github/workflows/release.yml`.
+When a tag starting with `v` is pushed, GitHub Actions will:
 
-When you push a tag that starts with `v` (for example `v0.1.0`), GitHub will:
+1. Build the portable `mergen-ade.exe` for `x86_64-pc-windows-msvc`
+2. Package it as `mergen-ade-<tag>-windows-x64-portable.zip`
+3. Publish a GitHub Release and attach the ZIP asset
 
-1. Build the portable `mergen-ade.exe` in release mode for `x86_64-pc-windows-msvc`
-2. Package the binary into:
-   - `mergen-ade-<tag>-windows-x64-portable.zip`
-3. Publish a GitHub Release with autogenerated notes and attach the zip asset
-
-Tag and push example:
+Maintainer tag example:
 
 ```powershell
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
-## How ConPTY is used
+## Configuration
 
-- Each terminal session is created through `portable-pty` using `native_pty_system()` (Windows resolves to ConPTY).
-- The app opens a PTY pair with `openpty(...)`, spawns the shell process via `spawn_command(...)`, and keeps PTY master handles for resize and IO.
-- Terminal emulation/parsing is handled by `tattoy-wezterm-term::Terminal`, fed incrementally from a dedicated PTY reader thread.
-- Input writes and resize requests are sent over channels to a dedicated IO thread so the UI thread remains responsive.
-- The UI thread consumes wake/exit notifications via channel and renders snapshots from the in-memory terminal model.
+Config is stored in Windows app data via `ProjectDirs`:
 
-## UI Overview
-
-- **Activity rail (leftmost):** minimalist icon rail that toggles the `Project Explorer` and `Terminal Manager`
-- **Project Explorer:** collapsible left panel with `Directory` / `Source Control` tabs
-  - `Directory`: project picker, quick actions, search, and indexed folder tree
-  - `Source Control`: selected project git status list (`modified`, `added`, `deleted`, `untracked`) with compact quick actions
-- **Terminal Manager:** collapsible side panel grouped by project, with separate Foreground/Background sections
-- **Main area:** Embedded, tiled terminal panes
-- **Terminal input model:** Type directly into the active terminal pane (no separate message input bar)
-- **Control styling:** icon-first, minimal chrome with subtle hover/active surfaces instead of heavy bordered buttons
-- **Terminal visibility mode:** configurable in Settings
-  - `Global`: project switch does not hide visible terminals
-  - `Selected project only`: main area shows only selected project's terminals
-- **Window startup:** opens as a standard maximized desktop window on Windows (not borderless fullscreen)
-
-## Key bindings
-
-- No app-level keyboard shortcuts are bound in this build.
-- Standard terminal control combinations (for example `Ctrl+C`, `Ctrl+V`, arrows, `Tab`, `Backspace`) are sent directly to the active terminal.
-
-## Configuration and storage
-
-Config file is stored in Windows app data using `directories`:
-
-- `%APPDATA%\Mergen\MergenADE\config\config.toml` (platform-dependent exact path resolved by `ProjectDirs`)
+- `%APPDATA%\Mergen\MergenADE\config\config.toml`
 
 Persisted data includes:
 
-- Global default shell
-- Projects (id, name, path)
-- Per-project saved messages
-- UI state:
-  - Project explorer visibility
-  - Project explorer expanded/collapsed state
-  - Terminal manager visibility
-  - Terminal manager expanded/collapsed state
-  - Left sidebar active tab (`Directory` / `Source Control`)
-  - Last selected project
-  - Project filter mode
-  - Main terminal visibility mode
-  - Auto tile scope
+- global default shell
+- projects with id, name, and path
+- per-project saved messages
+- UI state such as visible panels, selected project, filter mode, and auto tile scope
 
 Not persisted:
 
-- Terminal scrollback
-- Live terminal sessions
+- terminal scrollback
+- live terminal sessions
 
-## Minimal test strategy
+## Testing
 
-The prototype includes unit tests for:
+The project currently includes unit tests for:
 
-- Tiling grid calculation (`src/layout.rs`)
-- Terminal title update logic (`src/title.rs`)
-- Windows release helper regressions (`scripts/__tests__/build-release.tests.ps1`)
+- tiling grid calculation in `src/layout.rs`
+- terminal title update logic in `src/title.rs`
+- Windows release helper regressions in `scripts/__tests__/build-release.tests.ps1`
 
-Run tests:
+Run checks:
 
 ```powershell
 cargo test
 powershell -ExecutionPolicy Bypass -File .\scripts\__tests__\build-release.tests.ps1
 ```
 
-## Performance notes and profiling guidance
-
-Low-memory / responsiveness choices in this prototype:
-
-- Bounded terminal scrollback (`1000` lines)
-- No terminal scrollback persistence
-- PTY I/O and parsing isolated from UI thread
-- UI updates driven by terminal wake events
-- Main area redraw avoids unnecessary recompute except dirty sessions
-
-Simple profiling checks:
-
-1. Startup timing:
-
-```powershell
-Measure-Command { cargo run --release }
-```
-
-2. Memory snapshot while running:
-
-```powershell
-Get-Process mergen-ade | Select-Object Name, Id, WorkingSet64, PM, CPU
-```
-
-3. Multi-terminal behavior:
-- Open many terminals across projects
-- Verify input responsiveness and no obvious UI jank while output streams
-
-## Non-goals (explicit)
+## Non-goals
 
 - Built-in code editor
-- LSP/debugging IDE workflows
-- Telemetry/sign-in/network account features
+- LSP or debugger workflows
+- Telemetry, sign-in, or online account features
 
 ## Build Troubleshooting
 
@@ -185,7 +175,7 @@ Get-Process mergen-ade | Select-Object Name, Id, WorkingSet64, PM, CPU
 - `MSVC Rust toolchain not found`
   - The release script provisions `stable-x86_64-pc-windows-msvc` automatically when `rustup` is available.
 - `toolchain 'stable-x86_64-pc-windows-msvc' is not installed`
-  - The release script now installs it automatically through `rustup toolchain install ... --profile minimal`.
+  - The release script installs it automatically through `rustup toolchain install ... --profile minimal`.
 - `dependency tool not found`
   - The release script first checks repo-local `llvm-objdump.exe`, then resolves `dumpbin.exe` from Visual Studio or Build Tools even outside Developer PowerShell.
 - `x86_64-w64-mingw32-clang.exe not found`
