@@ -190,3 +190,7 @@ Get-Process mergen-ade | Select-Object Name, Id, WorkingSet64, PM, CPU
   - The release script first checks repo-local `llvm-objdump.exe`, then resolves `dumpbin.exe` from Visual Studio or Build Tools even outside Developer PowerShell.
 - `x86_64-w64-mingw32-clang.exe not found`
   - Plain local `cargo` builds still depend on the repo-local LLVM-MinGW linker configured in `.cargo\config.toml`; make sure `.toolchain\llvm-mingw-20260224-ucrt-x86_64\bin` exists.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
