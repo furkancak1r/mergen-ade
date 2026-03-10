@@ -3,14 +3,16 @@
 #### Portable release flow switched to single EXE MSVC output {#portable-release-flow-switched-to-single-exe-msvc-output}
 - Date: 2026-03-09T00:00:00Z
 - Context: main/Windows release packaging refresh
-- Error signature: Previous release path produced a `gnullvm` EXE that could require `libunwind.dll`.
-- Symptoms/Impact: Copying the old release EXE to another Windows machine could fail unless extra runtime DLLs were bundled manually.
-- Root cause: The canonical release path pointed at the LLVM-MinGW target instead of an explicit MSVC portable build script.
-- Resolution: Portable Windows release output moved to `target\\x86_64-pc-windows-msvc\\release\\mergen-ade.exe`, while plain `cargo` build/test remains on the repo host toolchain. Build automation now provisions the MSVC host toolchain via `rustup` when needed, forces the MSVC host through `rustup run`, enforces static CRT, and resolves import inspection through repo-local `llvm-objdump.exe` or Visual Studio `dumpbin.exe`.
+- Error signature: Previous release path produced extra EXEs that were not portable across Windows machines.
+- Symptoms/Impact: Copying the wrong EXE could fail on another PC or leave users running stale legacy artifacts.
+- Root cause: The repository still carried legacy Windows release paths instead of one canonical portable output.
+- Resolution: Windows release flow now targets only `target\\x86_64-pc-windows-msvc\\release\\mergen-ade.exe`. Plain local `cargo` development remains on the repo's `gnullvm` host flow, including direct toolchain `cargo.exe` launches that bypass the rustup shim, while the release script uses an explicit MSVC toolchain for the portable artifact and removes stale legacy EXEs during release generation.
 - Prevent recurrence:
   - Use `powershell -ExecutionPolicy Bypass -File .\\scripts\\build-release.ps1` for release builds.
+  - Keep plain local `cargo` on the repo `gnullvm` flow with the repo-local linker stanza intact, and use `scripts\\build-release.ps1` for the MSVC portable release.
+  - Keep the Rust MSVC toolchain installed and make sure Visual Studio Build Tools plus the Windows SDK are present for release builds.
   - Keep CI packaging aligned with the MSVC portable artifact only.
-  - Treat the older `gnullvm` `libunwind.dll` issue below as historical, not the current release path.
+  - Do not distribute or reintroduce alternate Windows EXE output paths.
 - Files/Commands touched: `.cargo\\config.toml`, `Cargo.toml`, `rust-toolchain.toml`, `scripts\\build-release.ps1`, `.github\\workflows\\release.yml`, `README.md`
 
 #### Duplicate collapse arrows created noisy left chrome {#duplicate-collapse-arrows-created-noisy-left-chrome}
@@ -39,20 +41,6 @@
   - Add/keep CI checks and release notes explicitly referencing `target/release` output path.
 - Files/Commands touched: `target/release/mergen-ade.exe`, `mergen-ade.exe` (removed), `cargo build --release`, `cmd /c del /f /q mergen-ade.exe`
 - References: commit pending in local workspace; recent baseline commits `3eee74b`, `559605d`
-
-#### Release EXE fails to start: missing libunwind.dll {#release-exe-fails-to-start-missing-libunwind-dll}
-- Date: 2026-03-05T07:57:34Z
-- Context: main/Windows local PowerShell/cargo 1.93.1 (host x86_64-pc-windows-gnullvm)
-- Error signature: `libunwind.dll bulamıyor`
-- Symptoms/Impact: `target\\x86_64-pc-windows-gnullvm\\release\\mergen-ade.exe` açılırken uygulama başlatılamıyor.
-- Root cause: LLVM-MinGW hedefinde gerekli çalışma zamanı DLL'i (`libunwind.dll`) EXE ile aynı klasöre taşınmadığı için dinamik bağlama başarısız oldu.
-- Resolution: `x86_64-w64-mingw32\\bin\\libunwind.dll` dosyası release EXE klasörüne kopyalanarak çalışma doğrulandı (`RUNNING PID=37512`), commit/PR referansı henüz yok (local fix).
-- Prevent recurrence:
-  - Dağıtım paketine `libunwind.dll` dahil edildiğini build sonrası otomatik kontrol et.
-  - Dağıtım doğrulamasında temiz makine/shell üzerinde EXE açılış testi çalıştır.
-  - Gerekli DLL bağımlılıklarını `llvm-objdump -p <exe>` çıktısından CI adımıyla denetle.
-- Files/Commands touched: `target\\x86_64-pc-windows-gnullvm\\release\\libunwind.dll`, `.toolchain\\llvm-mingw-20260224-ucrt-x86_64\\x86_64-w64-mingw32\\bin\\libunwind.dll`, `llvm-objdump -p`, `Copy-Item`, `Start-Process`
-- References: local workspace fix (commit pending), baseline commit `0b3794b`
 
 #### Terminal geçmişi kaydırılamıyordu {#terminal-gecmisi-kaydirilamiyordu}
 - Date: 2026-03-06T16:09:54Z

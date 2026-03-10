@@ -32,20 +32,27 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
 This script:
 
 1. Builds a portable Windows release for `x86_64-pc-windows-msvc`
-2. Uses `rustup` to provision the MSVC host toolchain on fresh checkouts when it is missing
-3. Forces `cargo` to run through `rustup run stable-x86_64-pc-windows-msvc` so host build scripts and proc-macros also use the MSVC toolchain
+2. Uses an explicit `stable-x86_64-pc-windows-msvc` toolchain and provisions it when missing
+3. Accepts an already-configured x64 MSVC shell or resolves the local Visual Studio build environment when the current shell is missing x64 MSVC tools
 4. Statically links the MSVC CRT so the EXE can be copied to another Windows 10/11 machine without bundling extra runtime DLLs
 5. Verifies imports with repo-local `llvm-objdump.exe` when available, otherwise resolves `dumpbin.exe` from the local Visual Studio installation
-6. Produces `target\x86_64-pc-windows-msvc\release\mergen-ade.exe`
+6. After a successful portable build, removes unsupported convenience EXE copies from older output paths without touching the documented `gnullvm` dev artifact
+7. Produces the only supported Windows release artifact at `target\x86_64-pc-windows-msvc\release\mergen-ade.exe`
 
-Host-local manual build/test flow stays on the repo host toolchain:
+For normal local development, plain `cargo` stays on the repo's `gnullvm` host flow, even when Cargo is launched directly from a toolchain binary instead of the rustup shim:
 
 ```powershell
 cargo build --release
 cargo test
 ```
 
-Portable single-EXE release is only the script path above.
+Regression check:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\__tests__\build-release.tests.ps1
+```
+
+Portable single-EXE release remains the script path above.
 
 ## Automatic GitHub Release (Windows)
 
@@ -126,11 +133,13 @@ The prototype includes unit tests for:
 
 - Tiling grid calculation (`src/layout.rs`)
 - Terminal title update logic (`src/title.rs`)
+- Windows release helper regressions (`scripts/__tests__/build-release.tests.ps1`)
 
 Run tests:
 
 ```powershell
 cargo test
+powershell -ExecutionPolicy Bypass -File .\scripts\__tests__\build-release.tests.ps1
 ```
 
 ## Performance notes and profiling guidance
@@ -170,12 +179,14 @@ Get-Process mergen-ade | Select-Object Name, Id, WorkingSet64, PM, CPU
 ## Build Troubleshooting
 
 - `link.exe not found`
-  - Install MSVC Build Tools so `x86_64-pc-windows-msvc` builds can link successfully.
-- `rustup not found`
-  - Portable release script requires `rustup` so it can force the MSVC host toolchain explicitly.
+  - Install Visual Studio Build Tools or Visual Studio 2022 with `Desktop development with C++`, then rerun the release script.
+- `Required x64 MSVC/SDK libraries were not found in LIB`
+  - Install the Windows SDK and MSVC CRT libraries that ship with the Desktop development with C++ workload, then rerun the release script.
+- `MSVC Rust toolchain not found`
+  - The release script provisions `stable-x86_64-pc-windows-msvc` automatically when `rustup` is available.
 - `toolchain 'stable-x86_64-pc-windows-msvc' is not installed`
   - The release script now installs it automatically through `rustup toolchain install ... --profile minimal`.
 - `dependency tool not found`
   - The release script first checks repo-local `llvm-objdump.exe`, then resolves `dumpbin.exe` from Visual Studio or Build Tools even outside Developer PowerShell.
-- `x86_64-w64-mingw32-clang not found`
-  - Only affects optional `gnullvm` builds now; the portable release path does not require LLVM-MinGW.
+- `x86_64-w64-mingw32-clang.exe not found`
+  - Plain local `cargo` builds still depend on the repo-local LLVM-MinGW linker configured in `.cargo\config.toml`; make sure `.toolchain\llvm-mingw-20260224-ucrt-x86_64\bin` exists.
