@@ -2932,14 +2932,26 @@ impl AdeApp {
                                 .auto_shrink([false, false])
                                 .stick_to_bottom(true)
                                 .show(ui, |ui| {
+                                    ui.set_width(output_size.x);
+                                    ui.set_min_width(output_size.x);
                                     if terminal.render_cache.lines.is_empty() {
-                                        let response = ui.add(
-                                            egui::Label::new(
-                                                RichText::new("Terminal is resizing...")
-                                                    .color(TEXT_MUTED),
-                                            )
-                                            .sense(Sense::click()),
+                                        let placeholder = WidgetText::from(
+                                            RichText::new("Terminal is resizing...")
+                                                .color(TEXT_MUTED),
                                         );
+                                        let galley = placeholder.into_galley(
+                                            ui,
+                                            Some(TextWrapMode::Extend),
+                                            output_size.x,
+                                            egui::TextStyle::Monospace,
+                                        );
+                                        let (rect, response) = allocate_terminal_output_surface(
+                                            ui,
+                                            output_size,
+                                            galley.size().y,
+                                            Sense::click(),
+                                        );
+                                        ui.painter().galley(rect.min, galley, TEXT_MUTED);
                                         if response.clicked() {
                                             pane_clicked = true;
                                         }
@@ -2976,17 +2988,23 @@ impl AdeApp {
                                             terminal.stable_input_cursor_row,
                                             ui.ctx().input(|input| input.time),
                                         );
-                                        let response = ui.add(
-                                            egui::Label::new(render.layout_job)
-                                                .wrap_mode(TextWrapMode::Extend)
-                                                .selectable(false)
-                                                .sense(Sense::click_and_drag()),
+                                        let TerminalRenderModel {
+                                            layout_job,
+                                            cursor_overlay,
+                                        } = render;
+                                        let galley = ui.painter().layout_job(layout_job);
+                                        let (rect, response) = allocate_terminal_output_surface(
+                                            ui,
+                                            output_size,
+                                            galley.size().y,
+                                            Sense::click_and_drag(),
                                         );
+                                        ui.painter().galley(rect.min, galley, TEXT_PRIMARY);
                                         if response.drag_started_by(egui::PointerButton::Primary) {
                                             if let Some(point) =
                                                 terminal_selection_point_from_pointer(
                                                     response.interact_pointer_pos(),
-                                                    response.rect.min,
+                                                    rect.min,
                                                     &terminal.render_cache,
                                                     char_width,
                                                     line_height,
@@ -3006,7 +3024,7 @@ impl AdeApp {
                                                 if let Some(point) =
                                                     terminal_selection_point_from_pointer(
                                                         response.interact_pointer_pos(),
-                                                        response.rect.min,
+                                                        rect.min,
                                                         &terminal.render_cache,
                                                         char_width,
                                                         line_height,
@@ -3025,7 +3043,7 @@ impl AdeApp {
                                             if let Some(point) =
                                                 terminal_selection_point_from_pointer(
                                                     response.interact_pointer_pos(),
-                                                    response.rect.min,
+                                                    rect.min,
                                                     &terminal.render_cache,
                                                     char_width,
                                                     line_height,
@@ -3109,16 +3127,16 @@ impl AdeApp {
                                         }
                                         paint_terminal_selection(
                                             ui,
-                                            response.rect.min,
+                                            rect.min,
                                             &terminal.render_cache,
                                             terminal.selection.as_ref(),
                                             char_width,
                                             line_height,
                                         );
-                                        if let Some(cursor_overlay) = render.cursor_overlay {
+                                        if let Some(cursor_overlay) = cursor_overlay {
                                             paint_terminal_cursor(
                                                 ui,
-                                                response.rect.min,
+                                                rect.min,
                                                 char_width,
                                                 line_height,
                                                 cursor_overlay,
@@ -4417,6 +4435,25 @@ fn terminal_selection_point_from_pointer(
     Some(TerminalSelectionPoint { row, column })
 }
 
+fn terminal_output_surface_size(output_size: Vec2, content_height: f32) -> Vec2 {
+    egui::vec2(
+        output_size.x.max(0.0),
+        output_size.y.max(content_height.max(0.0)),
+    )
+}
+
+fn allocate_terminal_output_surface(
+    ui: &mut Ui,
+    output_size: Vec2,
+    content_height: f32,
+    sense: Sense,
+) -> (egui::Rect, egui::Response) {
+    ui.allocate_exact_size(
+        terminal_output_surface_size(output_size, content_height),
+        sense,
+    )
+}
+
 fn terminal_selection_text(
     snapshot: &TerminalSelectionSnapshot,
     selection: Option<&TerminalSelection>,
@@ -4802,10 +4839,11 @@ mod tests {
         next_active_terminal_after_close, next_terminal_in_direction,
         normalize_terminal_background, parse_branch_header, recover_config_state,
         resolve_ctrl_c_action, terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect,
-        terminal_manager_actions_width, terminal_manager_row_widths, terminal_selection_text,
-        to_egui_color, update_stable_cursor_row, visible_terminal_cursor, AdeApp, CtrlCAction,
-        PendingConfigChanges, PendingCtrlC, TerminalCursorOverlay, TerminalEntry,
-        TerminalNavigationDirection, TerminalSelection, TerminalSelectionPoint, TERMINAL_OUTPUT_BG,
+        terminal_manager_actions_width, terminal_manager_row_widths, terminal_output_surface_size,
+        terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
+        AdeApp, CtrlCAction, PendingConfigChanges, PendingCtrlC, TerminalCursorOverlay,
+        TerminalEntry, TerminalNavigationDirection, TerminalSelection, TerminalSelectionPoint,
+        TERMINAL_OUTPUT_BG,
     };
     use crate::layout;
     use crate::models::{
@@ -5536,6 +5574,22 @@ mod tests {
 
         assert_eq!(label_width, 0.0);
         assert_eq!(actions_area_width, 70.0);
+    }
+
+    #[test]
+    fn terminal_output_surface_size_preserves_full_output_width() {
+        let size = terminal_output_surface_size(egui::vec2(320.0, 180.0), 64.0);
+
+        assert_eq!(size.x, 320.0);
+        assert_eq!(size.y, 180.0);
+    }
+
+    #[test]
+    fn terminal_output_surface_size_expands_for_taller_content() {
+        let size = terminal_output_surface_size(egui::vec2(320.0, 180.0), 260.0);
+
+        assert_eq!(size.x, 320.0);
+        assert_eq!(size.y, 260.0);
     }
 
     #[test]
