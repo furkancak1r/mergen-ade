@@ -63,7 +63,6 @@ const TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH: f32 = 32.0;
 const TOP_BAR_HEIGHT: f32 = 54.0;
 const DIRECTORY_SEARCH_INPUT_ID: &str = "directory-search-input";
 const SAVED_MESSAGE_DRAFT_INPUT_ID: &str = "saved-message-draft-input";
-
 // Pill button palette
 const BTN_BLUE: Color32 = Color32::from_rgb(16, 64, 112);
 const BTN_BLUE_HOVER: Color32 = Color32::from_rgb(22, 88, 150);
@@ -220,6 +219,7 @@ pub struct AdeApp {
     active_terminal: Option<u64>,
     pending_ctrl_c: Option<PendingCtrlC>,
     buffered_terminal_input: Vec<Event>,
+    buffered_terminal_navigation: Vec<TerminalNavigationDirection>,
     terminal_events_tx: Sender<TerminalUiEvent>,
     terminal_events_rx: Receiver<TerminalUiEvent>,
     show_settings_popup: bool,
@@ -432,6 +432,7 @@ impl AdeApp {
             active_terminal: None,
             pending_ctrl_c: None,
             buffered_terminal_input: Vec::new(),
+            buffered_terminal_navigation: Vec::new(),
             terminal_events_tx,
             terminal_events_rx,
             show_settings_popup: false,
@@ -842,7 +843,8 @@ impl AdeApp {
         }
 
         let mut changed = false;
-        for direction in self.take_terminal_navigation_shortcuts(ctx) {
+        let directions = self.take_terminal_navigation_shortcuts(ctx);
+        for direction in directions {
             let visible_ids = self.visible_terminal_ids_for_main();
             let grid =
                 layout::compute_tile_grid(visible_ids.len(), main_area_size.x, main_area_size.y);
@@ -894,6 +896,15 @@ impl AdeApp {
         self.selected_project.is_some_and(|project_id| {
             ctx.memory(|mem| mem.has_focus(Self::saved_message_draft_input_id(project_id)))
         })
+    }
+
+    fn surrender_ui_text_focus(&self, ctx: &egui::Context) {
+        ctx.memory_mut(|mem| {
+            mem.surrender_focus(Self::directory_search_input_id());
+            if let Some(project_id) = self.selected_project {
+                mem.surrender_focus(Self::saved_message_draft_input_id(project_id));
+            }
+        });
     }
 
     fn ui_owns_keyboard_state(
@@ -969,19 +980,13 @@ impl AdeApp {
                 pressed: true,
                 modifiers,
                 ..
-            } if modifiers.ctrl
-                && !modifiers.alt
-                && !modifiers.shift
-                && !modifiers.command =>
-            {
-                match key {
-                    Key::ArrowLeft => Some(TerminalNavigationDirection::Left),
-                    Key::ArrowRight => Some(TerminalNavigationDirection::Right),
-                    Key::ArrowUp => Some(TerminalNavigationDirection::Up),
-                    Key::ArrowDown => Some(TerminalNavigationDirection::Down),
-                    _ => None,
-                }
-            }
+            } if modifiers.ctrl && !modifiers.alt && !modifiers.shift => match key {
+                Key::ArrowLeft => Some(TerminalNavigationDirection::Left),
+                Key::ArrowRight => Some(TerminalNavigationDirection::Right),
+                Key::ArrowUp => Some(TerminalNavigationDirection::Up),
+                Key::ArrowDown => Some(TerminalNavigationDirection::Down),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1010,6 +1015,23 @@ impl AdeApp {
         (terminal_events, remaining_events)
     }
 
+    fn partition_terminal_navigation_shortcuts(
+        events: Vec<Event>,
+    ) -> (Vec<TerminalNavigationDirection>, Vec<Event>) {
+        let mut directions = Vec::new();
+        let mut remaining_events = Vec::new();
+
+        for event in events {
+            if let Some(direction) = Self::event_terminal_navigation_direction(&event) {
+                directions.push(direction);
+            } else {
+                remaining_events.push(event);
+            }
+        }
+
+        (directions, remaining_events)
+    }
+
     fn capture_active_terminal_input(&self, ctx: &egui::Context) -> Vec<Event> {
         if !self.should_capture_terminal_keyboard(ctx) {
             return Vec::new();
@@ -1027,26 +1049,23 @@ impl AdeApp {
         std::mem::take(&mut self.buffered_terminal_input)
     }
 
+    fn take_buffered_terminal_navigation_shortcuts(&mut self) -> Vec<TerminalNavigationDirection> {
+        std::mem::take(&mut self.buffered_terminal_navigation)
+    }
+
     fn take_terminal_navigation_shortcuts(
-        &self,
+        &mut self,
         ctx: &egui::Context,
     ) -> Vec<TerminalNavigationDirection> {
-        ctx.input_mut(|input| {
+        let mut directions = self.take_buffered_terminal_navigation_shortcuts();
+        directions.extend(ctx.input_mut(|input| {
             let events = std::mem::take(&mut input.events);
-            let mut directions = Vec::new();
-            let mut remaining_events = Vec::new();
-
-            for event in events {
-                if let Some(direction) = Self::event_terminal_navigation_direction(&event) {
-                    directions.push(direction);
-                } else {
-                    remaining_events.push(event);
-                }
-            }
-
+            let (directions, remaining_events) =
+                Self::partition_terminal_navigation_shortcuts(events);
             input.events = remaining_events;
             directions
-        })
+        }));
+        directions
     }
 
     fn visible_terminal_ids_for_main(&self) -> Vec<u64> {
@@ -3125,6 +3144,7 @@ impl AdeApp {
         }
 
         if clicked {
+            self.surrender_ui_text_focus(ui.ctx());
             self.pending_ctrl_c = None;
         }
 
@@ -3425,10 +3445,15 @@ impl AdeApp {
 impl eframe::App for AdeApp {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         let events = std::mem::take(&mut raw_input.events);
+        let capture_keyboard = self.should_capture_terminal_keyboard(ctx);
 
-        if self.should_capture_terminal_keyboard(ctx) {
+        if capture_keyboard {
             let (terminal_events, remaining_events) = Self::partition_terminal_key_events(events);
+            let (navigation_directions, remaining_events) =
+                Self::partition_terminal_navigation_shortcuts(remaining_events);
             self.buffered_terminal_input.extend(terminal_events);
+            self.buffered_terminal_navigation
+                .extend(navigation_directions);
             raw_input.events = remaining_events;
             return;
         }
@@ -4892,6 +4917,7 @@ mod tests {
             repeat: false,
             modifiers: Modifiers {
                 ctrl: true,
+                command: true,
                 ..Modifiers::default()
             },
         };
@@ -5052,6 +5078,17 @@ mod tests {
     }
 
     #[test]
+    fn surrender_ui_text_focus_clears_directory_search_focus() {
+        let ctx = Context::default();
+        let app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        ctx.memory_mut(|mem| mem.request_focus(AdeApp::directory_search_input_id()));
+
+        app.surrender_ui_text_focus(&ctx);
+
+        assert!(!ctx.memory(|mem| mem.has_focus(AdeApp::directory_search_input_id())));
+    }
+
+    #[test]
     fn focused_saved_message_draft_blocks_terminal_capture() {
         let ctx = Context::default();
         let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
@@ -5071,6 +5108,18 @@ mod tests {
 
         assert!(captured.is_empty());
         assert_eq!(ctx.input(|input| input.events.len()), 1);
+    }
+
+    #[test]
+    fn surrender_ui_text_focus_clears_saved_message_draft_focus() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.selected_project = Some(7);
+        ctx.memory_mut(|mem| mem.request_focus(AdeApp::saved_message_draft_input_id(7)));
+
+        app.surrender_ui_text_focus(&ctx);
+
+        assert!(!ctx.memory(|mem| mem.has_focus(AdeApp::saved_message_draft_input_id(7))));
     }
 
     #[test]
@@ -5137,6 +5186,17 @@ mod tests {
 
         assert_eq!(buffered_events, vec![shift_tab]);
         assert!(app.buffered_terminal_input.is_empty());
+    }
+
+    #[test]
+    fn take_buffered_terminal_navigation_shortcuts_drains_pre_egui_shortcuts() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.buffered_terminal_navigation = vec![TerminalNavigationDirection::Right];
+
+        let directions = app.take_buffered_terminal_navigation_shortcuts();
+
+        assert_eq!(directions, vec![TerminalNavigationDirection::Right]);
+        assert!(app.buffered_terminal_navigation.is_empty());
     }
 
     #[test]
@@ -5615,6 +5675,7 @@ mod tests {
                 repeat: false,
                 modifiers: Modifiers {
                     ctrl: true,
+                    command: true,
                     ..Modifiers::default()
                 },
             }];
@@ -5633,6 +5694,24 @@ mod tests {
         app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
 
         assert_eq!(app.active_terminal, Some(2));
+    }
+
+    #[test]
+    fn handle_shortcuts_uses_buffered_navigation_shortcuts() {
+        let ctx = Context::default();
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(1),
+        );
+        app.buffered_terminal_navigation = vec![TerminalNavigationDirection::Right];
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(app.active_terminal, Some(2));
+        assert!(app.buffered_terminal_navigation.is_empty());
     }
 
     #[test]
@@ -5737,6 +5816,85 @@ mod tests {
     }
 
     #[test]
+    fn raw_input_hook_buffers_ctrl_arrow_for_active_terminal() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let ctrl_right = Event::Key {
+            key: Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                command: true,
+                ..Modifiers::default()
+            },
+        };
+        let mut raw_input = RawInput {
+            events: vec![ctrl_right],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(raw_input.events.is_empty());
+        assert_eq!(
+            app.buffered_terminal_navigation,
+            vec![TerminalNavigationDirection::Right]
+        );
+    }
+
+    #[test]
+    fn surrender_ui_text_focus_allows_ctrl_arrow_buffering_after_terminal_click() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        ctx.memory_mut(|mem| mem.request_focus(AdeApp::directory_search_input_id()));
+        assert!(!app.should_capture_terminal_keyboard(&ctx));
+
+        app.surrender_ui_text_focus(&ctx);
+
+        let mut raw_input = RawInput {
+            events: vec![Event::Key {
+                key: Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    command: true,
+                    ..Modifiers::default()
+                },
+            }],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(raw_input.events.is_empty());
+        assert_eq!(
+            app.buffered_terminal_navigation,
+            vec![TerminalNavigationDirection::Right]
+        );
+    }
+
+    #[test]
+    fn event_terminal_navigation_direction_accepts_egui_command_alias_for_ctrl() {
+        let direction = AdeApp::event_terminal_navigation_direction(&Event::Key {
+            key: Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                command: true,
+                ..Modifiers::default()
+            },
+        });
+
+        assert_eq!(direction, Some(TerminalNavigationDirection::Down));
+    }
+
+    #[test]
     fn raw_input_hook_keeps_ctrl_shift_tab_available() {
         let ctx = Context::default();
         let mut app = test_app([], None);
@@ -5759,6 +5917,32 @@ mod tests {
         <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
 
         assert_eq!(raw_input.events, vec![ctrl_shift_tab]);
+    }
+
+    #[test]
+    fn raw_input_hook_leaves_ctrl_arrow_when_ui_owns_keyboard() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        ctx.memory_mut(|mem| mem.request_focus(AdeApp::directory_search_input_id()));
+        let ctrl_right = Event::Key {
+            key: Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        };
+        let mut raw_input = RawInput {
+            events: vec![ctrl_right.clone()],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert_eq!(raw_input.events, vec![ctrl_right]);
+        assert!(app.buffered_terminal_navigation.is_empty());
     }
 
     #[test]
@@ -6177,6 +6361,7 @@ mod tests {
             active_terminal,
             pending_ctrl_c: None,
             buffered_terminal_input: Vec::new(),
+            buffered_terminal_navigation: Vec::new(),
             terminal_events_tx,
             terminal_events_rx,
             show_settings_popup: false,
