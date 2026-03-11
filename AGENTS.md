@@ -48,6 +48,11 @@ If `cargo` is not on PATH in PowerShell, use:
 - Do not commit local paths, secrets, or generated executables.
 - Config is user-local in `%APPDATA%` via `ProjectDirs`; treat it as runtime data, not source-controlled state.
 
+## Known Issues Maintenance
+- Keep `KNOWN_ISSUES.md` up to date whenever a bug is diagnosed and fixed or a recurring failure mode is identified.
+- Treat `KNOWN_ISSUES.md` as append-only unless the user explicitly asks for a cleanup or rewrite; prefer adding a new dated entry over rewriting history.
+- Record the symptom, root cause, resolution summary, and concrete references (commit/PR/issue) so later regressions can be traced quickly.
+
 ## Subagent Usage Policy
 - For any non-trivial implementation, debugging, or review task, use subagents instead of running everything in a single agent.
 - When work can be split safely, delegate independent parts in parallel (for example: `explorer` for discovery, `fast_code` for implementation, `test` for verification, `reviewer` for risk checks).
