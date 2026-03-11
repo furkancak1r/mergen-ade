@@ -3199,38 +3199,25 @@ impl AdeApp {
                 }
             });
 
+        let mut open = self.show_settings_popup;
+        if !open {
+            return;
+        }
+
         egui::Window::new(format!("{} Settings", icons::GEAR))
+            .open(&mut open)
             .resizable(false)
             .collapsible(false)
             .movable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .min_width(380.0)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Application Settings")
-                            .strong()
-                            .size(16.0)
-                            .color(TEXT_PRIMARY),
-                    );
-                    let remaining_width = ui.available_size_before_wrap().x.max(0.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(remaining_width, CONTROL_ROW_HEIGHT),
-                        Layout::right_to_left(Align::Center),
-                        |ui| {
-                            if styled_icon_button(
-                                ui,
-                                icons::X,
-                                BTN_SUBTLE,
-                                BTN_SUBTLE_HOVER,
-                                BTN_ICON_ACTIVE,
-                                "Close",
-                            ) {
-                                self.show_settings_popup = false;
-                            }
-                        },
-                    );
-                });
+                ui.label(
+                    RichText::new("Application Settings")
+                        .strong()
+                        .size(16.0)
+                        .color(TEXT_PRIMARY),
+                );
                 ui.separator();
 
                 let mut filter_mode = self.config.ui.project_filter_mode;
@@ -3431,6 +3418,8 @@ impl AdeApp {
                 }
 
             });
+
+        self.show_settings_popup = open;
 
         if should_persist {
             if ui_config_changed {
