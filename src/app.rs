@@ -3922,7 +3922,7 @@ fn draw_folder_tree(
             }
             rendered_any = true;
 
-            ui.label(item.name.clone()).context_menu(|ui| {
+            draw_directory_file_row(ui, &item.name).context_menu(|ui| {
                 with_minimal_button_chrome(ui, |ui| {
                     if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
                         let item_path_text = item.path.display().to_string();
@@ -4047,6 +4047,47 @@ fn terminal_manager_row_widths(
         total_width
     };
     (label_width, actions_width)
+}
+
+fn draw_directory_file_row(ui: &mut Ui, text: &str) -> egui::Response {
+    let button_padding = ui.spacing().button_padding;
+    let available_width = ui.available_width().max(0.0);
+    let wrap_width = (available_width - (button_padding.x * 2.0)).max(0.0);
+    let galley = WidgetText::from(text.to_owned()).into_galley(
+        ui,
+        Some(TextWrapMode::Truncate),
+        wrap_width,
+        egui::TextStyle::Body,
+    );
+    let desired_height = ui
+        .spacing()
+        .interact_size
+        .y
+        .max(galley.size().y + (button_padding.y * 2.0));
+    let desired_size = egui::vec2(available_width, desired_height);
+    let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
+
+    if ui.is_rect_visible(rect) {
+        if let Some(fill) = directory_file_row_hover_fill(
+            response.hovered() || response.highlighted() || response.has_focus(),
+        ) {
+            ui.painter()
+                .rect_filled(rect.shrink2(egui::vec2(1.0, 1.0)), 8.0, fill);
+        }
+
+        let text_pos = ui
+            .layout()
+            .align_size_within_rect(galley.size(), rect.shrink2(button_padding))
+            .min;
+        ui.painter()
+            .galley(text_pos, galley, ui.visuals().text_color());
+    }
+
+    response
+}
+
+fn directory_file_row_hover_fill(is_hovered: bool) -> Option<Color32> {
+    is_hovered.then(|| with_alpha(BTN_ICON_HOVER, 110))
 }
 
 fn draw_truncated_selectable_label(ui: &mut Ui, selected: bool, text: &str) -> egui::Response {
@@ -6708,6 +6749,38 @@ mod tests {
 
         let (pane_right, min_right) = observed.expect("pane width was not observed");
         assert!(min_right >= pane_right);
+    }
+
+    #[test]
+    fn directory_file_row_uses_full_available_width() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let mut observed_width = None;
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(320.0, 80.0));
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                let response = super::draw_directory_file_row(&mut child, "src/app.rs");
+                observed_width = Some(response.rect.width());
+            });
+        });
+
+        let observed_width = observed_width.expect("directory row width was not observed");
+        assert_eq!(observed_width, 320.0);
+    }
+
+    #[test]
+    fn directory_file_row_hover_fill_is_translucent_and_only_present_on_hover() {
+        assert_eq!(super::directory_file_row_hover_fill(false), None);
+        assert_eq!(
+            super::directory_file_row_hover_fill(true),
+            Some(super::with_alpha(super::BTN_ICON_HOVER, 110))
+        );
     }
 
     #[test]
