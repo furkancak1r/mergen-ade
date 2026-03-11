@@ -30,8 +30,6 @@ use crate::terminal::{
 };
 use crate::title::{terminal_title_text, update_terminal_title};
 
-const CELL_WIDTH_PX: f32 = 8.0;
-const CELL_HEIGHT_PX: f32 = 16.0;
 const TITLE_MAX_LEN: usize = 40;
 const TERMINAL_EVENT_BUDGET: usize = 4096;
 const TERMINAL_RETRY_MS: u64 = 8;
@@ -39,6 +37,7 @@ const TERMINAL_FALLBACK_REFRESH_MS: u64 = 16;
 const CURSOR_BLINK_STEP_SECS: f64 = 0.6;
 const CTRL_C_DOUBLE_PRESS_WINDOW_SECS: f64 = 0.75;
 const POWERSHELL_CURSOR_ROW_STABLE_SECS: f64 = 0.06;
+const TERMINAL_CHAR_WIDTH_SAMPLE_CELLS: usize = 64;
 const CURSOR_BAR_WIDTH_PX: f32 = 2.0;
 const CURSOR_UNDERLINE_HEIGHT_PX: f32 = 2.0;
 const DIRECTORY_INDEX_MAX_DEPTH: usize = 8;
@@ -2787,6 +2786,7 @@ impl AdeApp {
             };
             let pane_width = pane_size.x.max(96.0);
             let pane_height = pane_size.y.max(124.0);
+            let pane_right = force_terminal_pane_width(ui, pane_width);
 
             let header_size = Vec2::new(pane_width, TERMINAL_HEADER_HEIGHT);
             ui.allocate_ui_with_layout(header_size, Layout::left_to_right(Align::Center), |ui| {
@@ -2861,23 +2861,20 @@ impl AdeApp {
 
                 let monospace = egui::TextStyle::Monospace;
                 let font_id = monospace.resolve(ui.style());
-                let char_width = ui
-                    .fonts(|fonts| fonts.glyph_width(&font_id, 'W'))
-                    .max(CELL_WIDTH_PX);
-                let line_height = ui.text_style_height(&monospace).max(CELL_HEIGHT_PX);
+                let char_width = terminal_char_width(ui, &font_id);
+                let line_height = terminal_cell_metric(ui.text_style_height(&monospace));
 
                 let output_height = (pane_height - TERMINAL_HEADER_HEIGHT - TERMINAL_HEADER_GAP)
                     .max(line_height * 2.0);
                 let output_size = Vec2::new(pane_width, output_height);
 
-                let cols = ((output_size.x / char_width).floor() as u16).max(8);
-                let lines = ((output_size.y / line_height).floor() as u16).max(3);
+                let (cols, lines) = terminal_grid_dimensions(output_size, char_width, line_height);
                 if output_size.x >= char_width * 8.0 && output_size.y >= line_height * 3.0 {
                     let resize_applied = terminal.runtime.resize(TerminalDimensions {
                         cols,
                         lines,
-                        cell_width: char_width as u16,
-                        cell_height: line_height as u16,
+                        pixel_width: output_size.x.round().clamp(1.0, u16::MAX as f32) as u16,
+                        pixel_height: output_size.y.round().clamp(1.0, u16::MAX as f32) as u16,
                     });
                     if !resize_applied {
                         ui.ctx()
@@ -2916,247 +2913,226 @@ impl AdeApp {
                 let now = ui.ctx().input(|input| input.time);
                 sync_terminal_cursor_row_state(terminal, now);
 
-                ui.allocate_ui_with_layout(output_size, Layout::top_down(Align::Min), |ui| {
-                    egui::Frame::none()
-                        .fill(TERMINAL_OUTPUT_BG)
-                        .stroke(Stroke::NONE)
-                        .rounding(0.0)
-                        .inner_margin(egui::Margin::same(0.0))
-                        .outer_margin(egui::Margin::same(0.0))
-                        .show(ui, |ui| {
-                            ui.set_min_size(output_size);
-                            egui::ScrollArea::vertical()
-                                .id_salt(format!("term-output-{terminal_id}"))
-                                .max_height(output_height)
-                                .auto_shrink([false, false])
-                                .stick_to_bottom(true)
-                                .show(ui, |ui| {
-                                    ui.set_width(output_size.x);
-                                    ui.set_min_width(output_size.x);
-                                    if terminal.render_cache.lines.is_empty() {
-                                        let placeholder = WidgetText::from(
-                                            RichText::new("Terminal is resizing...")
-                                                .color(TEXT_MUTED),
-                                        );
-                                        let galley = placeholder.into_galley(
-                                            ui,
-                                            Some(TextWrapMode::Extend),
-                                            output_size.x,
-                                            egui::TextStyle::Monospace,
-                                        );
-                                        let (rect, response) = allocate_terminal_output_surface(
-                                            ui,
-                                            output_size,
-                                            galley.size().y,
-                                            Sense::click(),
-                                        );
-                                        ui.painter().galley(rect.min, galley, TEXT_MUTED);
-                                        if response.clicked() {
-                                            pane_clicked = true;
-                                        }
-                                        if response.secondary_clicked() {
-                                            pane_clicked = true;
-                                        }
-                                        let can_paste = !terminal.exited;
-                                        response.context_menu(|ui| {
-                                            with_minimal_button_chrome(ui, |ui| {
-                                                ui.add_enabled_ui(false, |ui| {
-                                                    let _ =
-                                                        ui.button(format!("{} Copy", icons::COPY));
-                                                });
-                                                ui.add_enabled_ui(can_paste, |ui| {
-                                                    if ui
-                                                        .button(format!(
-                                                            "{} Paste",
-                                                            icons::DOWNLOAD
-                                                        ))
-                                                        .clicked()
-                                                    {
-                                                        paste_requested = true;
-                                                        ui.close_menu();
-                                                    }
-                                                });
-                                            });
-                                        });
-                                    } else {
-                                        let render = build_terminal_render(
-                                            &terminal.render_cache,
-                                            &font_id,
-                                            terminal.exited,
-                                            terminal.shell,
-                                            terminal.stable_input_cursor_row,
-                                            ui.ctx().input(|input| input.time),
-                                        );
-                                        let TerminalRenderModel {
-                                            layout_job,
-                                            cursor_overlay,
-                                        } = render;
-                                        let galley = ui.painter().layout_job(layout_job);
-                                        let (rect, response) = allocate_terminal_output_surface(
-                                            ui,
-                                            output_size,
-                                            galley.size().y,
-                                            Sense::click_and_drag(),
-                                        );
-                                        ui.painter().galley(rect.min, galley.clone(), TEXT_PRIMARY);
-                                        if response.drag_started_by(egui::PointerButton::Primary) {
-                                            Self::ensure_terminal_selection_snapshot(terminal);
-                                            if let Some(point) = terminal
-                                                .selection_snapshot
-                                                .as_ref()
-                                                .and_then(|selection_snapshot| {
-                                                    terminal_selection_point_from_pointer(
-                                                        response.interact_pointer_pos(),
-                                                        rect.min,
-                                                        selection_snapshot,
-                                                        char_width,
-                                                        &galley,
-                                                    )
-                                                })
-                                            {
-                                                terminal.selection =
-                                                    Some(TerminalSelection::collapsed(point));
-                                                terminal.selection_drag_active = true;
-                                            }
-                                        }
-                                        if response.is_pointer_button_down_on()
-                                            && ui.ctx().input(|input| input.pointer.primary_down())
-                                        {
-                                            pane_clicked = true;
-                                            if terminal.selection.is_none() {
-                                                Self::ensure_terminal_selection_snapshot(terminal);
-                                                if let Some(point) = terminal
-                                                    .selection_snapshot
-                                                    .as_ref()
-                                                    .and_then(|selection_snapshot| {
-                                                        terminal_selection_point_from_pointer(
-                                                            response.interact_pointer_pos(),
-                                                            rect.min,
-                                                            selection_snapshot,
-                                                            char_width,
-                                                            &galley,
-                                                        )
-                                                    })
-                                                {
-                                                    terminal.selection =
-                                                        Some(TerminalSelection::collapsed(point));
-                                                    terminal.selection_drag_active = true;
-                                                }
-                                            }
-                                        }
-                                        if response.dragged_by(egui::PointerButton::Primary) {
-                                            Self::ensure_terminal_selection_snapshot(terminal);
-                                            if let Some(point) = terminal
-                                                .selection_snapshot
-                                                .as_ref()
-                                                .and_then(|selection_snapshot| {
-                                                    terminal_selection_point_from_pointer(
-                                                        response.interact_pointer_pos(),
-                                                        rect.min,
-                                                        selection_snapshot,
-                                                        char_width,
-                                                        &galley,
-                                                    )
-                                                })
-                                            {
-                                                let selection =
-                                                    terminal.selection.get_or_insert_with(|| {
-                                                        TerminalSelection::collapsed(point)
-                                                    });
-                                                selection.focus = point;
-                                                terminal.selection_drag_active = true;
-                                            }
-                                        }
-                                        if !ui.ctx().input(|input| input.pointer.primary_down()) {
-                                            terminal.selection_drag_active = false;
-                                        }
-                                        if response.drag_stopped_by(egui::PointerButton::Primary)
-                                            && terminal
-                                                .selection
-                                                .as_ref()
-                                                .is_some_and(|selection| !selection.has_selection())
-                                        {
-                                            Self::clear_terminal_selection(terminal);
-                                        } else if response
-                                            .drag_stopped_by(egui::PointerButton::Primary)
-                                        {
-                                            terminal.selection_drag_active = false;
-                                        }
-                                        if response.clicked() {
-                                            pane_clicked = true;
-                                            Self::clear_terminal_selection(terminal);
-                                        }
-                                        if response.secondary_clicked() {
-                                            pane_clicked = true;
-                                        }
+                let viewport_size = terminal_output_viewport_size(output_size);
+                let (viewport_rect, _) = ui.allocate_exact_size(viewport_size, Sense::hover());
+                ui.painter()
+                    .rect_filled(viewport_rect, 0.0, TERMINAL_OUTPUT_BG);
 
-                                        if terminal.selection.is_some() {
-                                            Self::ensure_terminal_selection_snapshot(terminal);
+                let mut output_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(viewport_rect)
+                        .layout(Layout::top_down(Align::Min)),
+                );
+                output_ui.set_clip_rect(viewport_rect);
+                output_ui.set_min_size(viewport_size);
+
+                egui::ScrollArea::vertical()
+                    .id_salt(format!("term-output-{terminal_id}"))
+                    .max_height(output_height)
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(&mut output_ui, |ui| {
+                        ui.set_width(output_size.x);
+                        ui.set_min_width(output_size.x);
+                        ui.set_min_height(output_size.y);
+                        if terminal.render_cache.lines.is_empty() {
+                            let placeholder = WidgetText::from(
+                                RichText::new("Terminal is resizing...").color(TEXT_MUTED),
+                            );
+                            let galley = placeholder.into_galley(
+                                ui,
+                                Some(TextWrapMode::Extend),
+                                output_size.x,
+                                egui::TextStyle::Monospace,
+                            );
+                            let (rect, response) = allocate_terminal_output_surface(
+                                ui,
+                                output_size,
+                                galley.size().y,
+                                Sense::click(),
+                            );
+                            ui.painter().galley(rect.min, galley, TEXT_MUTED);
+                            if response.clicked() {
+                                pane_clicked = true;
+                            }
+                            if response.secondary_clicked() {
+                                pane_clicked = true;
+                            }
+                            let can_paste = !terminal.exited;
+                            response.context_menu(|ui| {
+                                with_minimal_button_chrome(ui, |ui| {
+                                    ui.add_enabled_ui(false, |ui| {
+                                        let _ = ui.button(format!("{} Copy", icons::COPY));
+                                    });
+                                    ui.add_enabled_ui(can_paste, |ui| {
+                                        if ui.button(format!("{} Paste", icons::DOWNLOAD)).clicked()
+                                        {
+                                            paste_requested = true;
+                                            ui.close_menu();
                                         }
-                                        let can_copy = terminal
-                                            .selection
-                                            .as_ref()
-                                            .is_some_and(TerminalSelection::has_selection)
-                                            && terminal.selection_snapshot.is_some();
-                                        let can_paste = !terminal.exited;
-                                        let mut copy_requested = false;
-                                        response.context_menu(|ui| {
-                                            with_minimal_button_chrome(ui, |ui| {
-                                                ui.add_enabled_ui(can_copy, |ui| {
-                                                    if ui
-                                                        .button(format!("{} Copy", icons::COPY))
-                                                        .clicked()
-                                                    {
-                                                        copy_requested = true;
-                                                        ui.close_menu();
-                                                    }
-                                                });
-                                                ui.add_enabled_ui(can_paste, |ui| {
-                                                    if ui
-                                                        .button(format!(
-                                                            "{} Paste",
-                                                            icons::DOWNLOAD
-                                                        ))
-                                                        .clicked()
-                                                    {
-                                                        paste_requested = true;
-                                                        ui.close_menu();
-                                                    }
-                                                });
-                                            });
-                                        });
-                                        if copy_requested {
-                                            copied_selection =
-                                                Self::selected_terminal_text(terminal);
-                                            Self::clear_terminal_selection(terminal);
-                                        }
-                                        let empty_selection_snapshot =
-                                            TerminalSelectionSnapshot::default();
-                                        let selection_snapshot = terminal
-                                            .selection_snapshot
-                                            .as_ref()
-                                            .unwrap_or(&empty_selection_snapshot);
-                                        paint_terminal_selection(
-                                            ui,
+                                    });
+                                });
+                            });
+                        } else {
+                            let render = build_terminal_render(
+                                &terminal.render_cache,
+                                &font_id,
+                                terminal.exited,
+                                terminal.shell,
+                                terminal.stable_input_cursor_row,
+                                ui.ctx().input(|input| input.time),
+                            );
+                            let TerminalRenderModel {
+                                layout_job,
+                                cursor_overlay,
+                            } = render;
+                            let galley = ui.painter().layout_job(layout_job);
+                            let (rect, response) = allocate_terminal_output_surface(
+                                ui,
+                                output_size,
+                                galley.size().y,
+                                Sense::click_and_drag(),
+                            );
+                            ui.painter().galley(rect.min, galley.clone(), TEXT_PRIMARY);
+                            if response.drag_started_by(egui::PointerButton::Primary) {
+                                Self::ensure_terminal_selection_snapshot(terminal);
+                                if let Some(point) = terminal.selection_snapshot.as_ref().and_then(
+                                    |selection_snapshot| {
+                                        terminal_selection_point_from_pointer(
+                                            response.interact_pointer_pos(),
                                             rect.min,
                                             selection_snapshot,
-                                            terminal.selection.as_ref(),
                                             char_width,
                                             &galley,
-                                        );
-                                        if let Some(cursor_overlay) = cursor_overlay {
-                                            paint_terminal_cursor(
-                                                ui,
+                                        )
+                                    },
+                                ) {
+                                    terminal.selection = Some(TerminalSelection::collapsed(point));
+                                    terminal.selection_drag_active = true;
+                                }
+                            }
+                            if response.is_pointer_button_down_on()
+                                && ui.ctx().input(|input| input.pointer.primary_down())
+                            {
+                                pane_clicked = true;
+                                if terminal.selection.is_none() {
+                                    Self::ensure_terminal_selection_snapshot(terminal);
+                                    if let Some(point) = terminal
+                                        .selection_snapshot
+                                        .as_ref()
+                                        .and_then(|selection_snapshot| {
+                                            terminal_selection_point_from_pointer(
+                                                response.interact_pointer_pos(),
                                                 rect.min,
+                                                selection_snapshot,
                                                 char_width,
-                                                line_height,
-                                                cursor_overlay,
-                                            );
-                                        }
+                                                &galley,
+                                            )
+                                        })
+                                    {
+                                        terminal.selection =
+                                            Some(TerminalSelection::collapsed(point));
+                                        terminal.selection_drag_active = true;
                                     }
+                                }
+                            }
+                            if response.dragged_by(egui::PointerButton::Primary) {
+                                Self::ensure_terminal_selection_snapshot(terminal);
+                                if let Some(point) = terminal.selection_snapshot.as_ref().and_then(
+                                    |selection_snapshot| {
+                                        terminal_selection_point_from_pointer(
+                                            response.interact_pointer_pos(),
+                                            rect.min,
+                                            selection_snapshot,
+                                            char_width,
+                                            &galley,
+                                        )
+                                    },
+                                ) {
+                                    let selection = terminal
+                                        .selection
+                                        .get_or_insert_with(|| TerminalSelection::collapsed(point));
+                                    selection.focus = point;
+                                    terminal.selection_drag_active = true;
+                                }
+                            }
+                            if !ui.ctx().input(|input| input.pointer.primary_down()) {
+                                terminal.selection_drag_active = false;
+                            }
+                            if response.drag_stopped_by(egui::PointerButton::Primary)
+                                && terminal
+                                    .selection
+                                    .as_ref()
+                                    .is_some_and(|selection| !selection.has_selection())
+                            {
+                                Self::clear_terminal_selection(terminal);
+                            } else if response.drag_stopped_by(egui::PointerButton::Primary) {
+                                terminal.selection_drag_active = false;
+                            }
+                            if response.clicked() {
+                                pane_clicked = true;
+                                Self::clear_terminal_selection(terminal);
+                            }
+                            if response.secondary_clicked() {
+                                pane_clicked = true;
+                            }
+
+                            if terminal.selection.is_some() {
+                                Self::ensure_terminal_selection_snapshot(terminal);
+                            }
+                            let can_copy = terminal
+                                .selection
+                                .as_ref()
+                                .is_some_and(TerminalSelection::has_selection)
+                                && terminal.selection_snapshot.is_some();
+                            let can_paste = !terminal.exited;
+                            let mut copy_requested = false;
+                            response.context_menu(|ui| {
+                                with_minimal_button_chrome(ui, |ui| {
+                                    ui.add_enabled_ui(can_copy, |ui| {
+                                        if ui.button(format!("{} Copy", icons::COPY)).clicked() {
+                                            copy_requested = true;
+                                            ui.close_menu();
+                                        }
+                                    });
+                                    ui.add_enabled_ui(can_paste, |ui| {
+                                        if ui.button(format!("{} Paste", icons::DOWNLOAD)).clicked()
+                                        {
+                                            paste_requested = true;
+                                            ui.close_menu();
+                                        }
+                                    });
                                 });
-                        });
-                });
+                            });
+                            if copy_requested {
+                                copied_selection = Self::selected_terminal_text(terminal);
+                                Self::clear_terminal_selection(terminal);
+                            }
+                            let empty_selection_snapshot = TerminalSelectionSnapshot::default();
+                            let selection_snapshot = terminal
+                                .selection_snapshot
+                                .as_ref()
+                                .unwrap_or(&empty_selection_snapshot);
+                            paint_terminal_selection(
+                                ui,
+                                rect.min,
+                                selection_snapshot,
+                                terminal.selection.as_ref(),
+                                char_width,
+                                &galley,
+                            );
+                            if let Some(cursor_overlay) = cursor_overlay {
+                                paint_terminal_cursor(
+                                    ui,
+                                    rect.min,
+                                    char_width,
+                                    line_height,
+                                    cursor_overlay,
+                                );
+                            }
+                        }
+                    });
+                ui.expand_to_include_x(pane_right);
             }
 
             (
@@ -4462,6 +4438,57 @@ fn terminal_selection_row_rect(
         .map(|galley_row| galley_row.rect.translate(origin.to_vec2()))
 }
 
+fn terminal_cell_metric(metric: f32) -> f32 {
+    if metric.is_finite() {
+        metric.max(1.0)
+    } else {
+        1.0
+    }
+}
+
+fn average_terminal_cell_width(sample_width: f32, sample_cells: usize) -> f32 {
+    let sample_cells = sample_cells.max(1) as f32;
+    terminal_cell_metric(sample_width / sample_cells)
+}
+
+fn terminal_char_width(ui: &Ui, font_id: &FontId) -> f32 {
+    let sample_width = ui.fonts(|fonts| {
+        let mut layout_job = LayoutJob::default();
+        layout_job.wrap.max_width = f32::INFINITY;
+        layout_job.append(
+            &"W".repeat(TERMINAL_CHAR_WIDTH_SAMPLE_CELLS),
+            0.0,
+            TextFormat {
+                font_id: font_id.clone(),
+                ..TextFormat::default()
+            },
+        );
+        fonts.layout_job(layout_job).size().x
+    });
+    average_terminal_cell_width(sample_width, TERMINAL_CHAR_WIDTH_SAMPLE_CELLS)
+}
+
+fn terminal_grid_dimensions(output_size: Vec2, char_width: f32, line_height: f32) -> (u16, u16) {
+    let char_width = terminal_cell_metric(char_width);
+    let line_height = terminal_cell_metric(line_height);
+    let cols = ((output_size.x.max(0.0) / char_width).floor() as u16).max(8);
+    let lines = ((output_size.y.max(0.0) / line_height).floor() as u16).max(3);
+    (cols, lines)
+}
+
+fn force_terminal_pane_width(ui: &mut Ui, pane_width: f32) -> f32 {
+    let pane_width = pane_width.max(0.0);
+    let pane_right = ui.max_rect().left() + pane_width;
+    ui.set_width(pane_width);
+    ui.set_min_width(pane_width);
+    ui.expand_to_include_x(pane_right);
+    pane_right
+}
+
+fn terminal_output_viewport_size(output_size: Vec2) -> Vec2 {
+    egui::vec2(output_size.x.max(0.0), output_size.y.max(0.0))
+}
+
 fn terminal_output_surface_size(output_size: Vec2, content_height: f32) -> Vec2 {
     egui::vec2(
         output_size.x.max(0.0),
@@ -4863,11 +4890,13 @@ fn normalize_terminal_background(color: TerminalColor) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_terminal_cursor_overlay, build_terminal_render, cursor_hidden_by_row_filter,
-        next_active_terminal_after_close, next_terminal_in_direction,
-        normalize_terminal_background, parse_branch_header, recover_config_state,
-        resolve_ctrl_c_action, terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect,
-        terminal_manager_actions_width, terminal_manager_row_widths, terminal_output_surface_size,
+        average_terminal_cell_width, build_terminal_cursor_overlay, build_terminal_render,
+        cursor_hidden_by_row_filter, force_terminal_pane_width, next_active_terminal_after_close,
+        next_terminal_in_direction, normalize_terminal_background, parse_branch_header,
+        recover_config_state, resolve_ctrl_c_action, terminal_cell_metric,
+        terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect,
+        terminal_grid_dimensions, terminal_manager_actions_width, terminal_manager_row_widths,
+        terminal_output_surface_size, terminal_output_viewport_size,
         terminal_selection_point_from_pointer, terminal_selection_text, to_egui_color,
         update_stable_cursor_row, visible_terminal_cursor, AdeApp, CtrlCAction,
         PendingConfigChanges, PendingCtrlC, TerminalCursorOverlay, TerminalEntry,
@@ -6630,6 +6659,93 @@ mod tests {
         let pasted = AdeApp::pasted_text("first\nsecond");
 
         assert_eq!(pasted, "first\nsecond");
+    }
+
+    #[test]
+    fn terminal_cell_metric_keeps_fractional_font_measurement() {
+        assert_eq!(terminal_cell_metric(7.25), 7.25);
+    }
+
+    #[test]
+    fn terminal_cell_metric_falls_back_for_invalid_measurement() {
+        assert_eq!(terminal_cell_metric(0.0), 1.0);
+        assert_eq!(terminal_cell_metric(f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn average_terminal_cell_width_preserves_fractional_width() {
+        let width = average_terminal_cell_width(464.0, 64);
+
+        assert_eq!(width, 7.25);
+    }
+
+    #[test]
+    fn average_terminal_cell_width_falls_back_when_sample_is_invalid() {
+        assert_eq!(average_terminal_cell_width(0.0, 64), 1.0);
+        assert_eq!(average_terminal_cell_width(f32::NAN, 64), 1.0);
+    }
+
+    #[test]
+    fn terminal_grid_dimensions_use_measured_cell_metrics_without_old_floor() {
+        let (cols, lines) = terminal_grid_dimensions(egui::vec2(912.0, 544.0), 7.25, 14.0);
+
+        assert_eq!(cols, 125);
+        assert_eq!(lines, 38);
+    }
+
+    #[test]
+    fn terminal_grid_dimensions_expand_when_average_width_is_narrower() {
+        let (cols, _) = terminal_grid_dimensions(egui::vec2(912.0, 544.0), 7.0, 14.0);
+
+        assert_eq!(cols, 130);
+    }
+
+    #[test]
+    fn force_terminal_pane_width_expands_ui_to_requested_right_edge() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let mut observed = None;
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(360.0, 220.0));
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                egui::Frame::none()
+                    .inner_margin(egui::Margin::same(2.0))
+                    .show(&mut child, |ui| {
+                        let pane_right = force_terminal_pane_width(ui, 320.0);
+                        observed = Some((pane_right, ui.min_rect().right()));
+                    });
+            });
+        });
+
+        let (pane_right, min_right) = observed.expect("pane width was not observed");
+        assert!(min_right >= pane_right);
+    }
+
+    #[test]
+    fn terminal_output_viewport_size_matches_requested_output() {
+        let viewport = terminal_output_viewport_size(egui::vec2(912.0, 544.0));
+
+        assert_eq!(viewport, egui::vec2(912.0, 544.0));
+    }
+
+    #[test]
+    fn terminal_output_surface_size_keeps_viewport_width_for_short_content() {
+        let surface = terminal_output_surface_size(egui::vec2(912.0, 544.0), 120.0);
+
+        assert_eq!(surface, egui::vec2(912.0, 544.0));
+    }
+
+    #[test]
+    fn terminal_output_surface_size_grows_only_for_tall_content() {
+        let surface = terminal_output_surface_size(egui::vec2(912.0, 544.0), 700.0);
+
+        assert_eq!(surface, egui::vec2(912.0, 700.0));
     }
 
     #[test]

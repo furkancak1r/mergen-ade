@@ -178,8 +178,8 @@ pub enum TerminalUiEventKind {
 pub struct TerminalDimensions {
     pub cols: u16,
     pub lines: u16,
-    pub cell_width: u16,
-    pub cell_height: u16,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
 }
 
 impl Default for TerminalDimensions {
@@ -187,8 +187,8 @@ impl Default for TerminalDimensions {
         Self {
             cols: 120,
             lines: 30,
-            cell_width: 8,
-            cell_height: 16,
+            pixel_width: 960,
+            pixel_height: 480,
         }
     }
 }
@@ -198,8 +198,8 @@ impl TerminalDimensions {
         PtySize {
             rows: self.lines.max(1),
             cols: self.cols.max(1),
-            pixel_width: self.cell_width.saturating_mul(self.cols.max(1)),
-            pixel_height: self.cell_height.saturating_mul(self.lines.max(1)),
+            pixel_width: self.pixel_width.max(1),
+            pixel_height: self.pixel_height.max(1),
         }
     }
 
@@ -207,8 +207,8 @@ impl TerminalDimensions {
         TerminalSize {
             rows: self.lines.max(1) as usize,
             cols: self.cols.max(1) as usize,
-            pixel_width: usize::from(self.cell_width.saturating_mul(self.cols.max(1))),
-            pixel_height: usize::from(self.cell_height.saturating_mul(self.lines.max(1))),
+            pixel_width: usize::from(self.pixel_width.max(1)),
+            pixel_height: usize::from(self.pixel_height.max(1)),
             dpi: 96,
         }
     }
@@ -402,7 +402,11 @@ impl TerminalRuntime {
             return false;
         }
 
-        if self.last_size.cols == dimensions.cols && self.last_size.lines == dimensions.lines {
+        if self.last_size.cols == dimensions.cols
+            && self.last_size.lines == dimensions.lines
+            && self.last_size.pixel_width == dimensions.pixel_width
+            && self.last_size.pixel_height == dimensions.pixel_height
+        {
             return true;
         }
 
@@ -1416,11 +1420,11 @@ mod tests {
         best_effort_terminate_entries, default_style, finish_termination,
         is_benign_process_exit_error, process_tree_kill_order, root_process_termination_plan,
         sanitize_cell_text, selection_snapshot_from_terminal, snapshot_from_terminal,
-        snapshots_from_terminal, trim_trailing_default_cells, verified_process_entry,
-        verified_process_tree_descendants, verified_snapshot_root_process, AdeTerminalConfig,
-        ProcessSnapshotEntry, RootProcessTerminationPlan, RuntimeCommand, TerminalColor,
-        TerminalCursor, TerminalCursorLine, TerminalCursorShape, TerminalStyle, TerminalStyledCell,
-        VerifiedProcessLookup,
+        snapshots_from_terminal, test_terminal_runtime, trim_trailing_default_cells,
+        verified_process_entry, verified_process_tree_descendants, verified_snapshot_root_process,
+        AdeTerminalConfig, ProcessSnapshotEntry, RootProcessTerminationPlan, RuntimeCommand,
+        TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape, TerminalDimensions,
+        TerminalStyle, TerminalStyledCell, VerifiedProcessLookup,
     };
     use std::{io, sync::Arc};
     use tattoy_wezterm_term::color::ColorPalette;
@@ -1497,6 +1501,50 @@ mod tests {
         };
 
         assert_eq!(cell.rendered_text(), "\u{4f60} ");
+    }
+
+    #[test]
+    fn terminal_dimensions_preserve_explicit_pixel_size() {
+        let dimensions = TerminalDimensions {
+            cols: 67,
+            lines: 31,
+            pixel_width: 596,
+            pixel_height: 551,
+        };
+
+        let pty_size = dimensions.to_pty_size();
+        assert_eq!(pty_size.cols, 67);
+        assert_eq!(pty_size.rows, 31);
+        assert_eq!(pty_size.pixel_width, 596);
+        assert_eq!(pty_size.pixel_height, 551);
+
+        let term_size = dimensions.to_term_size();
+        assert_eq!(term_size.cols, 67);
+        assert_eq!(term_size.rows, 31);
+        assert_eq!(term_size.pixel_width, 596);
+        assert_eq!(term_size.pixel_height, 551);
+    }
+
+    #[test]
+    fn resize_updates_when_only_pixel_size_changes() {
+        let mut runtime = test_terminal_runtime();
+        runtime.last_size = TerminalDimensions {
+            cols: 80,
+            lines: 24,
+            pixel_width: 640,
+            pixel_height: 384,
+        };
+
+        let applied = runtime.resize(TerminalDimensions {
+            cols: 80,
+            lines: 24,
+            pixel_width: 648,
+            pixel_height: 392,
+        });
+
+        assert!(!applied);
+        assert_eq!(runtime.last_size.pixel_width, 648);
+        assert_eq!(runtime.last_size.pixel_height, 392);
     }
 
     #[test]
