@@ -12,8 +12,8 @@ use arboard::Clipboard;
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{
-    self, Align, Color32, Event, FontData, FontFamily, FontId, Id, Key, Layout, RichText, Sense,
-    Stroke, TextWrapMode, Ui, Vec2, WidgetInfo, WidgetText, WidgetType,
+    self, Align, Color32, Event, FontData, FontFamily, FontId, Galley, Id, Key, Layout, RichText,
+    Sense, Stroke, TextWrapMode, Ui, Vec2, WidgetInfo, WidgetText, WidgetType,
 };
 use iconflow::{fonts as icon_fonts, try_icon, Pack, Size, Style};
 
@@ -1500,7 +1500,6 @@ impl AdeApp {
 
     fn clear_terminal_selection(terminal: &mut TerminalEntry) {
         terminal.selection = None;
-        terminal.selection_snapshot = None;
         terminal.selection_drag_active = false;
     }
 
@@ -2999,18 +2998,22 @@ impl AdeApp {
                                             galley.size().y,
                                             Sense::click_and_drag(),
                                         );
-                                        ui.painter().galley(rect.min, galley, TEXT_PRIMARY);
+                                        ui.painter().galley(rect.min, galley.clone(), TEXT_PRIMARY);
                                         if response.drag_started_by(egui::PointerButton::Primary) {
-                                            if let Some(point) =
-                                                terminal_selection_point_from_pointer(
-                                                    response.interact_pointer_pos(),
-                                                    rect.min,
-                                                    &terminal.render_cache,
-                                                    char_width,
-                                                    line_height,
-                                                )
+                                            Self::ensure_terminal_selection_snapshot(terminal);
+                                            if let Some(point) = terminal
+                                                .selection_snapshot
+                                                .as_ref()
+                                                .and_then(|selection_snapshot| {
+                                                    terminal_selection_point_from_pointer(
+                                                        response.interact_pointer_pos(),
+                                                        rect.min,
+                                                        selection_snapshot,
+                                                        char_width,
+                                                        &galley,
+                                                    )
+                                                })
                                             {
-                                                Self::ensure_terminal_selection_snapshot(terminal);
                                                 terminal.selection =
                                                     Some(TerminalSelection::collapsed(point));
                                                 terminal.selection_drag_active = true;
@@ -3021,18 +3024,20 @@ impl AdeApp {
                                         {
                                             pane_clicked = true;
                                             if terminal.selection.is_none() {
-                                                if let Some(point) =
-                                                    terminal_selection_point_from_pointer(
-                                                        response.interact_pointer_pos(),
-                                                        rect.min,
-                                                        &terminal.render_cache,
-                                                        char_width,
-                                                        line_height,
-                                                    )
+                                                Self::ensure_terminal_selection_snapshot(terminal);
+                                                if let Some(point) = terminal
+                                                    .selection_snapshot
+                                                    .as_ref()
+                                                    .and_then(|selection_snapshot| {
+                                                        terminal_selection_point_from_pointer(
+                                                            response.interact_pointer_pos(),
+                                                            rect.min,
+                                                            selection_snapshot,
+                                                            char_width,
+                                                            &galley,
+                                                        )
+                                                    })
                                                 {
-                                                    Self::ensure_terminal_selection_snapshot(
-                                                        terminal,
-                                                    );
                                                     terminal.selection =
                                                         Some(TerminalSelection::collapsed(point));
                                                     terminal.selection_drag_active = true;
@@ -3040,20 +3045,20 @@ impl AdeApp {
                                             }
                                         }
                                         if response.dragged_by(egui::PointerButton::Primary) {
-                                            if let Some(point) =
-                                                terminal_selection_point_from_pointer(
-                                                    response.interact_pointer_pos(),
-                                                    rect.min,
-                                                    &terminal.render_cache,
-                                                    char_width,
-                                                    line_height,
-                                                )
+                                            Self::ensure_terminal_selection_snapshot(terminal);
+                                            if let Some(point) = terminal
+                                                .selection_snapshot
+                                                .as_ref()
+                                                .and_then(|selection_snapshot| {
+                                                    terminal_selection_point_from_pointer(
+                                                        response.interact_pointer_pos(),
+                                                        rect.min,
+                                                        selection_snapshot,
+                                                        char_width,
+                                                        &galley,
+                                                    )
+                                                })
                                             {
-                                                if terminal.selection.is_none() {
-                                                    Self::ensure_terminal_selection_snapshot(
-                                                        terminal,
-                                                    );
-                                                }
                                                 let selection =
                                                     terminal.selection.get_or_insert_with(|| {
                                                         TerminalSelection::collapsed(point)
@@ -3125,13 +3130,19 @@ impl AdeApp {
                                                 Self::selected_terminal_text(terminal);
                                             Self::clear_terminal_selection(terminal);
                                         }
+                                        let empty_selection_snapshot =
+                                            TerminalSelectionSnapshot::default();
+                                        let selection_snapshot = terminal
+                                            .selection_snapshot
+                                            .as_ref()
+                                            .unwrap_or(&empty_selection_snapshot);
                                         paint_terminal_selection(
                                             ui,
                                             rect.min,
-                                            &terminal.render_cache,
+                                            selection_snapshot,
                                             terminal.selection.as_ref(),
                                             char_width,
-                                            line_height,
+                                            &galley,
                                         );
                                         if let Some(cursor_overlay) = cursor_overlay {
                                             paint_terminal_cursor(
@@ -4417,22 +4428,38 @@ fn resolve_ctrl_c_action(
 fn terminal_selection_point_from_pointer(
     pointer_pos: Option<egui::Pos2>,
     origin: egui::Pos2,
-    snapshot: &TerminalSnapshot,
+    snapshot: &TerminalSelectionSnapshot,
     char_width: f32,
-    line_height: f32,
+    galley: &Galley,
 ) -> Option<TerminalSelectionPoint> {
     let pointer_pos = pointer_pos?;
-    if snapshot.lines.is_empty() || char_width <= 0.0 || line_height <= 0.0 {
+    if snapshot.lines.is_empty() || galley.rows.is_empty() || char_width <= 0.0 {
         return None;
     }
 
-    let max_row = snapshot.lines.len().saturating_sub(1);
-    let row = (((pointer_pos.y - origin.y).max(0.0) / line_height).floor() as usize).min(max_row);
-    let line_width = terminal_snapshot_line_width(&snapshot.lines[row]);
+    let max_row = snapshot
+        .lines
+        .len()
+        .saturating_sub(1)
+        .min(galley.rows.len().saturating_sub(1));
+    let cursor = galley.cursor_from_pos(pointer_pos - origin);
+    let row = cursor.rcursor.row.min(max_row);
+    let line_width = terminal_selection_line_width(&snapshot.lines[row]);
     let column =
         (((pointer_pos.x - origin.x).max(0.0) / char_width).floor() as usize).min(line_width);
 
     Some(TerminalSelectionPoint { row, column })
+}
+
+fn terminal_selection_row_rect(
+    galley: &Galley,
+    origin: egui::Pos2,
+    row: usize,
+) -> Option<egui::Rect> {
+    galley
+        .rows
+        .get(row)
+        .map(|galley_row| galley_row.rect.translate(origin.to_vec2()))
 }
 
 fn terminal_output_surface_size(output_size: Vec2, content_height: f32) -> Vec2 {
@@ -4491,13 +4518,6 @@ fn terminal_selection_text(
     Some(rendered)
 }
 
-fn terminal_snapshot_line_width(line: &crate::terminal::TerminalStyledLine) -> usize {
-    line.runs
-        .last()
-        .map(|run| run.column.saturating_add(run.display_width.max(1)))
-        .unwrap_or(0)
-}
-
 fn terminal_selection_line_width(line: &TerminalSelectionLine) -> usize {
     line.width
 }
@@ -4537,12 +4557,12 @@ fn slice_terminal_line_columns(line: &TerminalSelectionLine, start: usize, end: 
 fn paint_terminal_selection(
     ui: &mut Ui,
     origin: egui::Pos2,
-    snapshot: &TerminalSnapshot,
+    snapshot: &TerminalSelectionSnapshot,
     selection: Option<&TerminalSelection>,
     char_width: f32,
-    line_height: f32,
+    galley: &Galley,
 ) {
-    if snapshot.lines.is_empty() {
+    if snapshot.lines.is_empty() || galley.rows.is_empty() {
         return;
     }
 
@@ -4553,8 +4573,13 @@ fn paint_terminal_selection(
     let (start, end) = selection.normalized();
     let fill = with_alpha(ui.visuals().selection.bg_fill, 92);
 
-    for row in start.row..=end.row.min(snapshot.lines.len().saturating_sub(1)) {
-        let line_width = terminal_snapshot_line_width(&snapshot.lines[row]);
+    let max_row = end
+        .row
+        .min(snapshot.lines.len().saturating_sub(1))
+        .min(galley.rows.len().saturating_sub(1));
+
+    for row in start.row.min(max_row)..=max_row {
+        let line_width = terminal_selection_line_width(&snapshot.lines[row]);
         let start_column = if row == start.row {
             start.column.min(line_width)
         } else {
@@ -4570,12 +4595,15 @@ fn paint_terminal_selection(
             continue;
         }
 
+        let Some(row_rect) = terminal_selection_row_rect(galley, origin, row) else {
+            continue;
+        };
         let rect = egui::Rect::from_min_size(
-            egui::pos2(
-                origin.x + start_column as f32 * char_width,
-                origin.y + row as f32 * line_height,
+            egui::pos2(origin.x + start_column as f32 * char_width, row_rect.top()),
+            egui::vec2(
+                (end_column - start_column) as f32 * char_width,
+                row_rect.height(),
             ),
-            egui::vec2((end_column - start_column) as f32 * char_width, line_height),
         );
         ui.painter().rect_filled(rect, 2.0, fill);
     }
@@ -4840,10 +4868,10 @@ mod tests {
         normalize_terminal_background, parse_branch_header, recover_config_state,
         resolve_ctrl_c_action, terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect,
         terminal_manager_actions_width, terminal_manager_row_widths, terminal_output_surface_size,
-        terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
-        AdeApp, CtrlCAction, PendingConfigChanges, PendingCtrlC, TerminalCursorOverlay,
-        TerminalEntry, TerminalNavigationDirection, TerminalSelection, TerminalSelectionPoint,
-        TERMINAL_OUTPUT_BG,
+        terminal_selection_point_from_pointer, terminal_selection_text, to_egui_color,
+        update_stable_cursor_row, visible_terminal_cursor, AdeApp, CtrlCAction,
+        PendingConfigChanges, PendingCtrlC, TerminalCursorOverlay, TerminalEntry,
+        TerminalNavigationDirection, TerminalSelection, TerminalSelectionPoint, TERMINAL_OUTPUT_BG,
     };
     use crate::layout;
     use crate::models::{
@@ -4854,11 +4882,14 @@ mod tests {
         TerminalCursorShape, TerminalSelectionLine, TerminalSelectionSnapshot, TerminalSnapshot,
         TerminalStyle, TerminalStyledCell, TerminalStyledLine, TerminalStyledRun,
     };
+    use eframe::egui::text::{LayoutJob, TextFormat};
     use eframe::egui::{
-        self, pos2, Color32, Context, Event, FontFamily, FontId, Id, Key, Modifiers, RawInput,
+        self, pos2, Color32, Context, Event, FontDefinitions, FontFamily, FontId, Galley, Id, Key,
+        Modifiers, RawInput,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     #[test]
     fn maps_navigation_keys_to_escape_sequences() {
@@ -5379,6 +5410,50 @@ mod tests {
     }
 
     #[test]
+    fn clearing_terminal_selection_preserves_cached_selection_snapshot() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.selection = Some(TerminalSelection {
+            anchor: TerminalSelectionPoint { row: 1, column: 0 },
+            focus: TerminalSelectionPoint { row: 1, column: 4 },
+        });
+        terminal.selection_snapshot = Some(TerminalSelectionSnapshot {
+            lines: vec![test_selection_line(&[("keep", 0, 4)], 4)],
+        });
+        terminal.selection_drag_active = true;
+
+        AdeApp::clear_terminal_selection(&mut terminal);
+
+        assert_eq!(terminal.selection, None);
+        assert!(!terminal.selection_drag_active);
+        assert_eq!(
+            terminal.selection_snapshot,
+            Some(TerminalSelectionSnapshot {
+                lines: vec![test_selection_line(&[("keep", 0, 4)], 4)],
+            })
+        );
+    }
+
+    #[test]
+    fn selected_terminal_text_uses_cached_selection_snapshot() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.selection = Some(TerminalSelection {
+            anchor: TerminalSelectionPoint { row: 1, column: 0 },
+            focus: TerminalSelectionPoint { row: 1, column: 4 },
+        });
+        terminal.selection_snapshot = Some(TerminalSelectionSnapshot {
+            lines: vec![
+                test_selection_line(&[("wrong", 0, 5)], 5),
+                test_selection_line(&[("pick", 0, 4)], 4),
+            ],
+        });
+
+        let text = AdeApp::selected_terminal_text(&mut terminal)
+            .expect("cached selection snapshot should be used");
+
+        assert_eq!(text, "pick");
+    }
+
+    #[test]
     fn applying_terminal_snapshot_replaces_cached_selection_snapshot() {
         let snapshot = TerminalSnapshot {
             lines: vec![TerminalStyledLine {
@@ -5516,6 +5591,23 @@ mod tests {
     }
 
     #[test]
+    fn terminal_selection_text_preserves_trailing_blank_columns() {
+        let snapshot = TerminalSelectionSnapshot {
+            lines: vec![test_selection_line(&[("a", 0, 1)], 5)],
+            ..TerminalSelectionSnapshot::default()
+        };
+        let selection = TerminalSelection {
+            anchor: TerminalSelectionPoint { row: 0, column: 0 },
+            focus: TerminalSelectionPoint { row: 0, column: 5 },
+        };
+
+        let text = terminal_selection_text(&snapshot, Some(&selection))
+            .expect("selection should produce text");
+
+        assert_eq!(text, "a    ");
+    }
+
+    #[test]
     fn terminal_selection_text_joins_soft_wrapped_rows_without_newline() {
         let snapshot = TerminalSelectionSnapshot {
             lines: vec![
@@ -5554,6 +5646,67 @@ mod tests {
             .expect("selection should produce text");
 
         assert_eq!(text, "hello world\nnext");
+    }
+
+    #[test]
+    fn selection_point_from_pointer_uses_full_selection_width() {
+        let snapshot = TerminalSelectionSnapshot {
+            lines: vec![test_selection_line(&[("a", 0, 1)], 5)],
+        };
+        let galley = test_selection_galley("a");
+
+        let point = terminal_selection_point_from_pointer(
+            Some(pos2(4.2, galley.rows[0].rect.center().y)),
+            pos2(0.0, 0.0),
+            &snapshot,
+            1.0,
+            &galley,
+        )
+        .expect("expected selection point");
+
+        assert_eq!(point, TerminalSelectionPoint { row: 0, column: 4 });
+    }
+
+    #[test]
+    fn selection_point_from_pointer_supports_empty_lines() {
+        let snapshot = TerminalSelectionSnapshot {
+            lines: vec![test_selection_line(&[], 5), test_selection_line(&[], 5)],
+        };
+        let galley = test_selection_galley("\n");
+
+        let point = terminal_selection_point_from_pointer(
+            Some(pos2(3.4, galley.rows[1].rect.center().y)),
+            pos2(0.0, 0.0),
+            &snapshot,
+            1.0,
+            &galley,
+        )
+        .expect("expected selection point");
+
+        assert_eq!(point, TerminalSelectionPoint { row: 1, column: 3 });
+    }
+
+    #[test]
+    fn selection_point_from_pointer_uses_galley_row_geometry() {
+        let snapshot = TerminalSelectionSnapshot {
+            lines: vec![
+                test_selection_line(&[("top", 0, 3)], 3),
+                test_selection_line(&[("middle", 0, 6)], 6),
+                test_selection_line(&[("bottom", 0, 6)], 6),
+            ],
+        };
+        let galley = test_selection_galley("top\nmiddle\nbottom");
+
+        let point = terminal_selection_point_from_pointer(
+            Some(pos2(0.2, galley.rows[1].rect.center().y)),
+            pos2(0.0, 0.0),
+            &snapshot,
+            1.0,
+            &galley,
+        )
+        .expect("expected selection point");
+
+        assert_eq!(point, TerminalSelectionPoint { row: 1, column: 0 });
     }
 
     #[test]
@@ -6354,6 +6507,23 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn test_selection_galley(text: &str) -> Arc<Galley> {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+        let _ = ctx.run(RawInput::default(), |_ctx| {});
+        let mut layout_job = LayoutJob::default();
+        layout_job.wrap.max_width = f32::INFINITY;
+        layout_job.append(
+            text,
+            0.0,
+            TextFormat {
+                font_id: FontId::new(14.0, FontFamily::Monospace),
+                ..TextFormat::default()
+            },
+        );
+        ctx.fonts(|fonts| fonts.layout_job(layout_job))
     }
 
     fn test_project(id: u64, name: &str, path: &str, saved_messages: &[&str]) -> ProjectRecord {

@@ -1069,9 +1069,8 @@ fn selection_snapshot_from_terminal(terminal: &Terminal) -> TerminalSelectionSna
         }
 
         while lines.len() < row_index {
-            let snapshot_row = lines.len();
             lines.push(TerminalSelectionLine {
-                width: cursor_columns_to_keep(cursor, snapshot_row, cols),
+                width: cols,
                 wraps_to_next: false,
                 cells: Vec::new(),
             });
@@ -1079,7 +1078,6 @@ fn selection_snapshot_from_terminal(terminal: &Terminal) -> TerminalSelectionSna
 
         let snapshot_row = lines.len();
         let min_columns_to_keep = cursor_columns_to_keep(cursor, snapshot_row, cols);
-        let mut width = min_columns_to_keep;
         let mut cells = Vec::new();
 
         for cell in line.visible_cells() {
@@ -1099,7 +1097,6 @@ fn selection_snapshot_from_terminal(terminal: &Terminal) -> TerminalSelectionSna
                 continue;
             }
 
-            width = width.max(col.saturating_add(display_width).min(cols));
             cells.push(TerminalStyledCell {
                 text,
                 style,
@@ -1110,16 +1107,15 @@ fn selection_snapshot_from_terminal(terminal: &Terminal) -> TerminalSelectionSna
 
         trim_trailing_default_cells(&mut cells, default_style, min_columns_to_keep);
         lines.push(TerminalSelectionLine {
-            width,
+            width: cols,
             wraps_to_next: line.last_cell_was_wrapped(),
             cells,
         });
     });
 
     while lines.len() < total_rows {
-        let snapshot_row = lines.len();
         lines.push(TerminalSelectionLine {
-            width: cursor_columns_to_keep(cursor, snapshot_row, cols),
+            width: cols,
             wraps_to_next: false,
             cells: Vec::new(),
         });
@@ -1788,6 +1784,23 @@ mod tests {
 
         assert!(!snapshot.lines[1].wraps_to_next);
         assert!(!snapshot.lines[2].wraps_to_next);
+    }
+
+    #[test]
+    fn selection_snapshot_expands_rows_to_full_terminal_width() {
+        let mut terminal = make_test_terminal(TerminalSize {
+            rows: 2,
+            cols: 5,
+            pixel_width: 40,
+            pixel_height: 32,
+            dpi: 96,
+        });
+        terminal.advance_bytes(b"a");
+
+        let snapshot = selection_snapshot_from_terminal(&terminal);
+
+        assert_eq!(snapshot.lines[0].width, 5);
+        assert_eq!(snapshot.lines[1].width, 5);
     }
 
     #[test]

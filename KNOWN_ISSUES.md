@@ -55,3 +55,32 @@
   - Render modelinde viewport-relative ve absolute row indekslerini karıştırma.
 - Files/Commands touched: `src/terminal.rs`, `cargo fmt`, `cargo test`
 - References: commit `2e332c7` - https://github.com/furkancak1r/mergen-ade/commit/2e332c73898bb54b972ae9b9f3774409da1f0927
+
+#### Terminal selection copied the row above the highlight {#terminal-selection-copied-the-row-above-the-highlight}
+- Date: 2026-03-11T13:35:12Z
+- Context: main/Windows local/egui 0.29.1, cargo 1.93.1
+- Error signature: `Selected status rows were highlighted correctly, but clipboard content came back as "Merhaba. Nasıl yardımcı olayım?" from the row above.`
+- Symptoms/Impact: Terminal users could drag-select one visual row and get a different row in the clipboard, making copy unreliable even when spaces and highlight looked correct.
+- Root cause: Selection hit-testing and highlight placement used manual `line_height` row math instead of the real `egui::Galley` row geometry, so visual rows and copied rows diverged vertically.
+- Resolution: Local workspace fix after baseline commit `d8e16b6` switched terminal selection hit-testing/highlighting to `Galley` row rects and kept cached selection snapshots aligned with copy output; validated with `cargo test` (134 passed).
+- Prevent recurrence:
+  - Base terminal row hit-testing on `Galley.rows[*].rect` or equivalent rendered row geometry, not estimated line spacing.
+  - Keep regression tests that assert pointer-to-row mapping for empty rows, multi-line galleys, and full-width selections.
+  - Re-check screenshot-backed copy bugs by comparing highlighted rows with actual clipboard output before closing the issue.
+- Files/Commands touched: `src/app.rs`, `cargo fmt`, `cargo test`, `view_image`
+- References: commit pending in local workspace after `d8e16b6`
+
+
+#### Terminal selection copied the row above the visual highlight {#terminal-selection-copied-the-row-above-the-visual-highlight}
+- Date: 2026-03-11T13:36:00Z
+- Context: main/Windows local PowerShell/mergen-ade 0.1.0, eframe 0.29
+- Error signature: `Seçili alt durum satırları kopyalanırken panoya "Merhaba. Nasıl yardımcı olayım?" gidiyordu.`
+- Symptoms/Impact: Kullanıcı terminalde alttaki satırları mavi highlight ile seçse bile panoya bir üst satır kopyalanıyordu; görsel seçim ile gerçek copy sonucu ayrışıyordu.
+- Root cause: Terminal seçim hit-test'i ve highlight'ı sentetik `line_height * row` hesabıyla yapılıyor, `egui` metni gerçek `Galley.rows[*].rect` geometrisiyle çizdiği için satır eşlemesi kayıyordu.
+- Resolution: Dikey seçim eşlemesi `Galley` row geometrisine taşındı ve regression testleri eklendi; düzeltme yerel çalışma alanında HEAD `d8e16b6` üstünde commit bekliyor.
+- Prevent recurrence:
+  - Pointer-to-row eşlemesini manuel satır yüksekliğiyle değil gerçek `Galley` row rect'leriyle yap.
+  - Görsel highlight ile panoya giden metni aynı geometri kaynağına bağlayan regression testlerini zorunlu tut.
+  - Ekran görüntüsüyle doğrulanan seçim/kopya sapmalarını issue log'una kaydetmeden kapatılmış sayma.
+- Files/Commands touched: `src/app.rs`, `cargo fmt`, `cargo test`
+- References: HEAD `d8e16b6` (`Terminal sağ kenarındaki ölü alanı kaldır`), local workspace fix commit pending
