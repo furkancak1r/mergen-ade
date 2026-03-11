@@ -6,22 +6,18 @@ use ico::{IconDir, IconDirEntry, IconImage, ResourceType};
 use image::imageops::{self, FilterType};
 use image::{Rgba, RgbaImage};
 
-const SOURCE_LOGO: &str = "logo.png";
+const SOURCE_ICON_LOGO: &str = "logo-icon.png";
 const OUTPUT_PNG: &str = "app-icon.png";
 const OUTPUT_ICO: &str = "app-icon.ico";
 const MASTER_ICON_SIZE: u32 = 1024;
-const PREVIEW_SIZE: u32 = 512;
-const MASK_THRESHOLD: u16 = 42;
-const CROP_EXPANSION_NUMERATOR: u32 = 18;
-const CROP_EXPANSION_DENOMINATOR: u32 = 100;
-const MASK_MARGIN_NUMERATOR: u32 = 3;
+const MASK_MARGIN_NUMERATOR: u32 = 1;
 const MASK_MARGIN_DENOMINATOR: u32 = 100;
 const CORNER_RADIUS_NUMERATOR: u32 = 18;
 const CORNER_RADIUS_DENOMINATOR: u32 = 100;
 const ICO_SIZES: [u32; 7] = [16, 24, 32, 48, 64, 128, 256];
 
 fn main() {
-    println!("cargo:rerun-if-changed={SOURCE_LOGO}");
+    println!("cargo:rerun-if-changed={SOURCE_ICON_LOGO}");
     println!("cargo:rerun-if-changed=.toolchain/llvm-mingw-20260224-ucrt-x86_64/bin/windres.exe");
     println!("cargo:rerun-if-changed=.toolchain/llvm-mingw-20260224-ucrt-x86_64/bin/ar.exe");
     println!("cargo:rerun-if-env-changed=WindowsSdkDir");
@@ -32,7 +28,7 @@ fn main() {
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing manifest dir"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("missing OUT_DIR"));
-    let source_logo = manifest_dir.join(SOURCE_LOGO);
+    let source_logo = manifest_dir.join(SOURCE_ICON_LOGO);
     let icon_png = out_dir.join(OUTPUT_PNG);
     let icon_ico = out_dir.join(OUTPUT_ICO);
 
@@ -53,8 +49,7 @@ fn prepare_icon(source_logo: &Path) -> RgbaImage {
     let source = image::open(source_logo)
         .unwrap_or_else(|err| panic!("failed to open {}: {err}", source_logo.display()))
         .into_rgba8();
-    let focus = detect_focus_bounds(&source);
-    let cropped = crop_focus_to_square(&source, focus);
+    let cropped = center_on_square_canvas(&source);
     let resized = imageops::resize(
         &cropped,
         MASTER_ICON_SIZE,
@@ -64,62 +59,13 @@ fn prepare_icon(source_logo: &Path) -> RgbaImage {
     apply_rounded_mask(&resized)
 }
 
-fn detect_focus_bounds(image: &RgbaImage) -> (u32, u32, u32, u32) {
-    let preview = imageops::resize(image, PREVIEW_SIZE, PREVIEW_SIZE, FilterType::Triangle);
-    let bg = average_corner_color(&preview);
-    let width = preview.width();
-    let height = preview.height();
-    let mut mask = vec![false; (width * height) as usize];
-
-    for y in 0..height {
-        for x in 0..width {
-            let pixel = preview.get_pixel(x, y);
-            let diff = color_distance(pixel, bg);
-            mask[(y * width + x) as usize] = diff > MASK_THRESHOLD;
-        }
-    }
-
-    let seed = find_seed_near_center(&mask, width, height).unwrap_or((width / 2, height / 2));
-    let bounds = flood_fill_bounds(&mask, width, height, seed);
-
-    let scale_x = image.width() as f32 / width as f32;
-    let scale_y = image.height() as f32 / height as f32;
-
-    let min_x = (bounds.0 as f32 * scale_x).floor() as u32;
-    let min_y = (bounds.1 as f32 * scale_y).floor() as u32;
-    let max_x = ((bounds.2 + 1) as f32 * scale_x).ceil() as u32;
-    let max_y = ((bounds.3 + 1) as f32 * scale_y).ceil() as u32;
-
-    (
-        min_x.min(image.width().saturating_sub(1)),
-        min_y.min(image.height().saturating_sub(1)),
-        max_x.min(image.width()),
-        max_y.min(image.height()),
-    )
-}
-
-fn crop_focus_to_square(image: &RgbaImage, bounds: (u32, u32, u32, u32)) -> RgbaImage {
-    let (min_x, min_y, max_x, max_y) = bounds;
-    let focus_w = max_x.saturating_sub(min_x).max(1);
-    let focus_h = max_y.saturating_sub(min_y).max(1);
-    let expanded_w = focus_w + focus_w * CROP_EXPANSION_NUMERATOR / CROP_EXPANSION_DENOMINATOR;
-    let expanded_h = focus_h + focus_h * CROP_EXPANSION_NUMERATOR / CROP_EXPANSION_DENOMINATOR;
-    let side = expanded_w
-        .max(expanded_h)
-        .min(image.width())
-        .min(image.height());
-    let center_x = min_x as i64 + focus_w as i64 / 2;
-    let center_y = min_y as i64 + focus_h as i64 / 2;
-    let half = side as i64 / 2;
-
-    let mut left = center_x - half;
-    let mut top = center_y - half;
-    let max_left = image.width() as i64 - side as i64;
-    let max_top = image.height() as i64 - side as i64;
-    left = left.clamp(0, max_left.max(0));
-    top = top.clamp(0, max_top.max(0));
-
-    imageops::crop_imm(image, left as u32, top as u32, side, side).to_image()
+fn center_on_square_canvas(image: &RgbaImage) -> RgbaImage {
+    let side = image.width().max(image.height()).max(1);
+    let mut canvas = RgbaImage::from_pixel(side, side, Rgba([0, 0, 0, 0]));
+    let x = (side - image.width()) / 2;
+    let y = (side - image.height()) / 2;
+    imageops::overlay(&mut canvas, image, i64::from(x), i64::from(y));
+    canvas
 }
 
 fn apply_rounded_mask(image: &RgbaImage) -> RgbaImage {
@@ -178,108 +124,6 @@ fn point_inside_rounded_rect(x: u32, y: u32, size: u32, margin: u32, radius: u32
     let dx = x - nearest_x;
     let dy = y - nearest_y;
     dx * dx + dy * dy <= radius * radius
-}
-
-fn average_corner_color(image: &RgbaImage) -> [u8; 3] {
-    let sample = (image.width().min(image.height()) / 10).max(8);
-    let corners = [
-        (0, 0),
-        (image.width().saturating_sub(sample), 0),
-        (0, image.height().saturating_sub(sample)),
-        (
-            image.width().saturating_sub(sample),
-            image.height().saturating_sub(sample),
-        ),
-    ];
-    let mut total = [0u64; 3];
-    let mut count = 0u64;
-
-    for (start_x, start_y) in corners {
-        for y in start_y..(start_y + sample).min(image.height()) {
-            for x in start_x..(start_x + sample).min(image.width()) {
-                let pixel = image.get_pixel(x, y);
-                total[0] += pixel[0] as u64;
-                total[1] += pixel[1] as u64;
-                total[2] += pixel[2] as u64;
-                count += 1;
-            }
-        }
-    }
-
-    [
-        (total[0] / count) as u8,
-        (total[1] / count) as u8,
-        (total[2] / count) as u8,
-    ]
-}
-
-fn color_distance(pixel: &Rgba<u8>, bg: [u8; 3]) -> u16 {
-    (pixel[0].abs_diff(bg[0]) as u16)
-        + (pixel[1].abs_diff(bg[1]) as u16)
-        + (pixel[2].abs_diff(bg[2]) as u16)
-}
-
-fn find_seed_near_center(mask: &[bool], width: u32, height: u32) -> Option<(u32, u32)> {
-    let center_x = width / 2;
-    let center_y = height / 2;
-
-    for radius in 0..(width.max(height) / 2) {
-        let min_x = center_x.saturating_sub(radius);
-        let max_x = (center_x + radius).min(width.saturating_sub(1));
-        let min_y = center_y.saturating_sub(radius);
-        let max_y = (center_y + radius).min(height.saturating_sub(1));
-
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                if mask[(y * width + x) as usize] {
-                    return Some((x, y));
-                }
-            }
-        }
-    }
-
-    None
-}
-
-fn flood_fill_bounds(
-    mask: &[bool],
-    width: u32,
-    height: u32,
-    seed: (u32, u32),
-) -> (u32, u32, u32, u32) {
-    let mut seen = vec![false; mask.len()];
-    let mut queue = std::collections::VecDeque::from([seed]);
-    let mut min_x = seed.0;
-    let mut min_y = seed.1;
-    let mut max_x = seed.0;
-    let mut max_y = seed.1;
-
-    while let Some((x, y)) = queue.pop_front() {
-        let index = (y * width + x) as usize;
-        if seen[index] || !mask[index] {
-            continue;
-        }
-        seen[index] = true;
-        min_x = min_x.min(x);
-        min_y = min_y.min(y);
-        max_x = max_x.max(x);
-        max_y = max_y.max(y);
-
-        if x > 0 {
-            queue.push_back((x - 1, y));
-        }
-        if x + 1 < width {
-            queue.push_back((x + 1, y));
-        }
-        if y > 0 {
-            queue.push_back((x, y - 1));
-        }
-        if y + 1 < height {
-            queue.push_back((x, y + 1));
-        }
-    }
-
-    (min_x, min_y, max_x, max_y)
 }
 
 fn write_ico(icon: &RgbaImage, output_path: &Path) {
