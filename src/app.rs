@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 #[cfg(target_os = "windows")]
@@ -3863,6 +3864,44 @@ fn open_in_file_explorer(path: &Path, select_file: bool) -> Result<(), String> {
     }
 }
 
+fn default_app_open_command(path: &Path) -> (&'static str, Vec<OsString>) {
+    #[cfg(target_os = "windows")]
+    {
+        (
+            "cmd",
+            vec![
+                OsString::from("/C"),
+                OsString::from("start"),
+                OsString::from(""),
+                path.as_os_str().to_owned(),
+            ],
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        ("open", vec![path.as_os_str().to_owned()])
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        ("xdg-open", vec![path.as_os_str().to_owned()])
+    }
+}
+
+fn open_path_with_default_app(path: &Path) -> Result<(), String> {
+    let (program, args) = default_app_open_command(path);
+    let mut command = Command::new(program);
+    command.args(args);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    match command.spawn() {
+        Ok(_) => Ok(()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
 fn draw_folder_tree(
     ui: &mut Ui,
     root: &DirectoryNode,
@@ -3922,8 +3961,36 @@ fn draw_folder_tree(
             }
             rendered_any = true;
 
-            draw_directory_file_row(ui, &item.name).context_menu(|ui| {
+            let response = draw_directory_file_row(ui, &item.name);
+            let double_clicked = response.double_clicked();
+            response.context_menu(|ui| {
                 with_minimal_button_chrome(ui, |ui| {
+                    if ui.button("Open").clicked() {
+                        match open_path_with_default_app(&item.path) {
+                            Ok(()) => {
+                                *status_line_update = Some(format!("Opened file: {}", item.name));
+                            }
+                            Err(err) => {
+                                *status_line_update = Some(format!("Open file failed: {err}"));
+                            }
+                        }
+                        ui.close_menu();
+                    }
+                    if ui
+                        .button(format!("{} Reveal in Folder", icons::FOLDER_OPEN))
+                        .clicked()
+                    {
+                        match open_in_file_explorer(&item.path, true) {
+                            Ok(()) => {
+                                *status_line_update =
+                                    Some(format!("Revealed file in folder: {}", item.name));
+                            }
+                            Err(err) => {
+                                *status_line_update = Some(format!("Open folder failed: {err}"));
+                            }
+                        }
+                        ui.close_menu();
+                    }
                     if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
                         let item_path_text = item.path.display().to_string();
                         ui.ctx().copy_text(item_path_text.clone());
@@ -3932,6 +3999,17 @@ fn draw_folder_tree(
                     }
                 });
             });
+
+            if double_clicked {
+                match open_path_with_default_app(&item.path) {
+                    Ok(()) => {
+                        *status_line_update = Some(format!("Opened file: {}", item.name));
+                    }
+                    Err(err) => {
+                        *status_line_update = Some(format!("Open file failed: {err}"));
+                    }
+                }
+            }
         }
     }
 
@@ -4890,12 +4968,12 @@ fn normalize_terminal_background(color: TerminalColor) -> Color32 {
 mod tests {
     use super::{
         average_terminal_cell_width, build_terminal_cursor_overlay, build_terminal_render,
-        cursor_hidden_by_row_filter, force_terminal_pane_width, next_active_terminal_after_close,
-        next_terminal_in_direction, normalize_terminal_background, parse_branch_header,
-        recover_config_state, resolve_ctrl_c_action, terminal_cell_metric,
-        terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect,
-        terminal_grid_dimensions, terminal_manager_actions_width, terminal_manager_row_widths,
-        terminal_output_surface_size, terminal_output_viewport_size,
+        cursor_hidden_by_row_filter, default_app_open_command, force_terminal_pane_width,
+        next_active_terminal_after_close, next_terminal_in_direction,
+        normalize_terminal_background, parse_branch_header, recover_config_state,
+        resolve_ctrl_c_action, terminal_cell_metric, terminal_cursor_blink_phase_visible,
+        terminal_cursor_overlay_rect, terminal_grid_dimensions, terminal_manager_actions_width,
+        terminal_manager_row_widths, terminal_output_surface_size, terminal_output_viewport_size,
         terminal_selection_point_from_pointer, terminal_selection_text, to_egui_color,
         update_stable_cursor_row, visible_terminal_cursor, AdeApp, CtrlCAction,
         PendingConfigChanges, PendingCtrlC, TerminalCursorOverlay, TerminalEntry,
@@ -6781,6 +6859,34 @@ mod tests {
             super::directory_file_row_hover_fill(true),
             Some(super::with_alpha(super::BTN_ICON_HOVER, 110))
         );
+    }
+
+    #[test]
+    fn default_app_open_command_matches_platform_convention() {
+        let path = PathBuf::from("C:\\temp\\notes.txt");
+        let (program, args) = default_app_open_command(&path);
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(program, "cmd");
+            assert_eq!(args, vec!["/C", "start", "", "C:\\temp\\notes.txt"]);
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(program, "open");
+            assert_eq!(args, vec!["C:\\temp\\notes.txt"]);
+        }
+
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        {
+            assert_eq!(program, "xdg-open");
+            assert_eq!(args, vec!["C:\\temp\\notes.txt"]);
+        }
     }
 
     #[test]
