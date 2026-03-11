@@ -60,6 +60,7 @@ const PROJECT_EXPLORER_WIDTH: f32 = 320.0;
 const ACTIVITY_RAIL_WIDTH: f32 = 48.0;
 const CONTROL_ROW_HEIGHT: f32 = 28.0;
 const TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH: f32 = 32.0;
+const TOP_BAR_HEIGHT: f32 = 54.0;
 const DIRECTORY_SEARCH_INPUT_ID: &str = "directory-search-input";
 const SAVED_MESSAGE_DRAFT_INPUT_ID: &str = "saved-message-draft-input";
 
@@ -218,6 +219,7 @@ pub struct AdeApp {
     selected_project: Option<u64>,
     active_terminal: Option<u64>,
     pending_ctrl_c: Option<PendingCtrlC>,
+    buffered_terminal_input: Vec<Event>,
     terminal_events_tx: Sender<TerminalUiEvent>,
     terminal_events_rx: Receiver<TerminalUiEvent>,
     show_settings_popup: bool,
@@ -306,6 +308,14 @@ enum CtrlCAction {
     CopySelection,
     ArmInterrupt,
     SendInterrupt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalNavigationDirection {
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -421,6 +431,7 @@ impl AdeApp {
             selected_project,
             active_terminal: None,
             pending_ctrl_c: None,
+            buffered_terminal_input: Vec::new(),
             terminal_events_tx,
             terminal_events_rx,
             show_settings_popup: false,
@@ -825,8 +836,31 @@ impl AdeApp {
         });
     }
 
-    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let _ = ctx;
+    fn handle_shortcuts(&mut self, ctx: &egui::Context, main_area_size: Vec2) {
+        if self.ui_owns_keyboard(ctx) {
+            return;
+        }
+
+        let mut changed = false;
+        for direction in self.take_terminal_navigation_shortcuts(ctx) {
+            let visible_ids = self.visible_terminal_ids_for_main();
+            let grid =
+                layout::compute_tile_grid(visible_ids.len(), main_area_size.x, main_area_size.y);
+            let next_terminal = next_terminal_in_direction(
+                self.active_terminal_accepts_input(),
+                &visible_ids,
+                grid,
+                direction,
+            );
+            if let Some(next_terminal) = next_terminal {
+                self.set_active_terminal(Some(next_terminal));
+                changed = true;
+            }
+        }
+
+        if changed {
+            ctx.request_repaint();
+        }
     }
 
     fn active_terminal_accepts_input(&self) -> Option<u64> {
@@ -892,8 +926,64 @@ impl AdeApp {
         )
     }
 
+    fn event_is_blocked_ui_reverse_focus_traversal(event: &Event) -> bool {
+        matches!(
+            event,
+            Event::Key {
+                key: Key::Tab,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.shift
+                && !modifiers.ctrl
+                && !modifiers.alt
+                && !modifiers.command
+        )
+    }
+
+    fn partition_blocked_ui_reverse_focus_traversal_events(
+        events: Vec<Event>,
+    ) -> (Vec<Event>, Vec<Event>) {
+        let mut blocked_events = Vec::new();
+        let mut remaining_events = Vec::new();
+
+        for event in events {
+            if Self::event_is_blocked_ui_reverse_focus_traversal(&event) {
+                blocked_events.push(event);
+            } else {
+                remaining_events.push(event);
+            }
+        }
+
+        (blocked_events, remaining_events)
+    }
+
     fn event_is_terminal_key(event: &Event) -> bool {
         matches!(event, Event::Key { .. })
+    }
+
+    fn event_terminal_navigation_direction(event: &Event) -> Option<TerminalNavigationDirection> {
+        match event {
+            Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.ctrl
+                && !modifiers.alt
+                && !modifiers.shift
+                && !modifiers.command =>
+            {
+                match key {
+                    Key::ArrowLeft => Some(TerminalNavigationDirection::Left),
+                    Key::ArrowRight => Some(TerminalNavigationDirection::Right),
+                    Key::ArrowUp => Some(TerminalNavigationDirection::Up),
+                    Key::ArrowDown => Some(TerminalNavigationDirection::Down),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     fn event_is_terminal_post_ui_input(event: &Event) -> bool {
@@ -908,7 +998,9 @@ impl AdeApp {
         let mut remaining_events = Vec::new();
 
         for event in events {
-            if Self::event_is_terminal_key(&event) {
+            if Self::event_is_terminal_key(&event)
+                && Self::event_terminal_navigation_direction(&event).is_none()
+            {
                 terminal_events.push(event);
             } else {
                 remaining_events.push(event);
@@ -928,6 +1020,32 @@ impl AdeApp {
             let (terminal_events, remaining_events) = Self::partition_terminal_key_events(events);
             input.events = remaining_events;
             terminal_events
+        })
+    }
+
+    fn take_buffered_terminal_input(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.buffered_terminal_input)
+    }
+
+    fn take_terminal_navigation_shortcuts(
+        &self,
+        ctx: &egui::Context,
+    ) -> Vec<TerminalNavigationDirection> {
+        ctx.input_mut(|input| {
+            let events = std::mem::take(&mut input.events);
+            let mut directions = Vec::new();
+            let mut remaining_events = Vec::new();
+
+            for event in events {
+                if let Some(direction) = Self::event_terminal_navigation_direction(&event) {
+                    directions.push(direction);
+                } else {
+                    remaining_events.push(event);
+                }
+            }
+
+            input.events = remaining_events;
+            directions
         })
     }
 
@@ -1524,9 +1642,9 @@ impl AdeApp {
             })
     }
 
-    fn draw_top_bar(&mut self, ctx: &egui::Context) {
+    fn draw_top_bar(&mut self, ctx: &egui::Context) -> egui::Rect {
         egui::TopBottomPanel::top("top_bar")
-            .exact_height(54.0)
+            .exact_height(TOP_BAR_HEIGHT)
             .frame(
                 egui::Frame::none()
                     .fill(SURFACE_BG)
@@ -1560,7 +1678,29 @@ impl AdeApp {
                         },
                     );
                 });
-            });
+            })
+            .response
+            .rect
+    }
+
+    fn main_area_size_from_chrome(
+        &self,
+        content_rect: egui::Rect,
+        top_bar_rect: egui::Rect,
+        activity_rect: Option<egui::Rect>,
+        explorer_rect: Option<egui::Rect>,
+    ) -> Vec2 {
+        let mut width = content_rect.width();
+        let height = content_rect.height() - top_bar_rect.height();
+
+        if let Some(activity_rect) = activity_rect {
+            width -= activity_rect.width();
+        }
+        if let Some(explorer_rect) = explorer_rect {
+            width -= explorer_rect.width();
+        }
+
+        egui::vec2(width.max(1.0), height.max(1.0))
     }
 
     fn draw_activity_rail(&mut self, ctx: &egui::Context) -> Option<egui::Rect> {
@@ -3283,6 +3423,21 @@ impl AdeApp {
 }
 
 impl eframe::App for AdeApp {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        let events = std::mem::take(&mut raw_input.events);
+
+        if self.should_capture_terminal_keyboard(ctx) {
+            let (terminal_events, remaining_events) = Self::partition_terminal_key_events(events);
+            self.buffered_terminal_input.extend(terminal_events);
+            raw_input.events = remaining_events;
+            return;
+        }
+
+        let (_, remaining_events) =
+            Self::partition_blocked_ui_reverse_focus_traversal_events(events);
+        raw_input.events = remaining_events;
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ensure_theme_initialized(ctx);
         self.apply_initial_window_bounds(ctx);
@@ -3290,12 +3445,18 @@ impl eframe::App for AdeApp {
         self.process_source_control_events(ctx);
         self.process_directory_index_events(ctx);
         self.schedule_terminal_refresh(ctx);
-        let terminal_events = self.capture_active_terminal_input(ctx);
-        self.handle_shortcuts(ctx);
-
-        self.draw_top_bar(ctx);
+        let mut terminal_events = self.take_buffered_terminal_input();
+        terminal_events.extend(self.capture_active_terminal_input(ctx));
+        let top_bar_rect = self.draw_top_bar(ctx);
         let activity_rect = self.draw_activity_rail(ctx);
         let explorer_rect = self.draw_project_explorer(ctx);
+        let main_area_size = self.main_area_size_from_chrome(
+            ctx.screen_rect(),
+            top_bar_rect,
+            activity_rect,
+            explorer_rect,
+        );
+        self.handle_shortcuts(ctx, main_area_size);
         self.draw_main_area(ctx);
         if let (Some(activity_rect), Some(explorer_rect)) = (activity_rect, explorer_rect) {
             self.draw_sidebar_seam_fix(ctx, activity_rect, explorer_rect);
@@ -3829,6 +3990,40 @@ fn next_active_terminal_after_close(
     } else {
         active_terminal
     }
+}
+
+fn next_terminal_in_direction(
+    active_terminal: Option<u64>,
+    visible_terminal_ids: &[u64],
+    grid: layout::TileGrid,
+    direction: TerminalNavigationDirection,
+) -> Option<u64> {
+    if visible_terminal_ids.is_empty() || grid.cols == 0 || grid.rows == 0 {
+        return None;
+    }
+
+    let active_terminal = active_terminal?;
+    let active_index = visible_terminal_ids
+        .iter()
+        .position(|terminal_id| *terminal_id == active_terminal)?;
+    let row = active_index / grid.cols;
+    let column = active_index % grid.cols;
+
+    let next_index = match direction {
+        TerminalNavigationDirection::Left if column > 0 => Some(active_index - 1),
+        TerminalNavigationDirection::Right => {
+            let candidate = active_index + 1;
+            (column + 1 < grid.cols && candidate < visible_terminal_ids.len()).then_some(candidate)
+        }
+        TerminalNavigationDirection::Up if row > 0 => Some(active_index - grid.cols),
+        TerminalNavigationDirection::Down => {
+            let candidate = active_index + grid.cols;
+            (candidate < visible_terminal_ids.len()).then_some(candidate)
+        }
+        _ => None,
+    }?;
+
+    visible_terminal_ids.get(next_index).copied()
 }
 
 fn terminal_display_label(title: &str, exited: bool) -> String {
@@ -4579,13 +4774,15 @@ fn normalize_terminal_background(color: TerminalColor) -> Color32 {
 mod tests {
     use super::{
         build_terminal_cursor_overlay, build_terminal_render, cursor_hidden_by_row_filter,
-        next_active_terminal_after_close, normalize_terminal_background, parse_branch_header,
-        recover_config_state, resolve_ctrl_c_action, terminal_cursor_blink_phase_visible,
-        terminal_cursor_overlay_rect, terminal_manager_actions_width, terminal_manager_row_widths,
-        terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
-        AdeApp, CtrlCAction, PendingConfigChanges, PendingCtrlC, TerminalCursorOverlay,
-        TerminalEntry, TerminalSelection, TerminalSelectionPoint, TERMINAL_OUTPUT_BG,
+        next_active_terminal_after_close, next_terminal_in_direction,
+        normalize_terminal_background, parse_branch_header, recover_config_state,
+        resolve_ctrl_c_action, terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect,
+        terminal_manager_actions_width, terminal_manager_row_widths, terminal_selection_text,
+        to_egui_color, update_stable_cursor_row, visible_terminal_cursor, AdeApp, CtrlCAction,
+        PendingConfigChanges, PendingCtrlC, TerminalCursorOverlay, TerminalEntry,
+        TerminalNavigationDirection, TerminalSelection, TerminalSelectionPoint, TERMINAL_OUTPUT_BG,
     };
+    use crate::layout;
     use crate::models::{
         AppConfig, AutoTileScope, MainVisibilityMode, ProjectRecord, ShellKind, TerminalKind,
     };
@@ -4594,7 +4791,9 @@ mod tests {
         TerminalCursorShape, TerminalSelectionLine, TerminalSelectionSnapshot, TerminalSnapshot,
         TerminalStyle, TerminalStyledCell, TerminalStyledLine, TerminalStyledRun,
     };
-    use eframe::egui::{pos2, Color32, Context, Event, FontFamily, FontId, Id, Key, Modifiers};
+    use eframe::egui::{
+        self, pos2, Color32, Context, Event, FontFamily, FontId, Id, Key, Modifiers, RawInput,
+    };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -4640,6 +4839,89 @@ mod tests {
             remaining_events,
             vec![focus_event, Event::Text("git status".to_owned())]
         );
+    }
+
+    #[test]
+    fn partitions_blocked_reverse_focus_events_out_of_raw_input() {
+        let shift_tab = Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        };
+        let plain_tab = Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::default(),
+        };
+        let ctrl_shift_tab = Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Modifiers::default()
+            },
+        };
+
+        let (blocked_events, remaining_events) =
+            AdeApp::partition_blocked_ui_reverse_focus_traversal_events(vec![
+                shift_tab.clone(),
+                plain_tab.clone(),
+                ctrl_shift_tab.clone(),
+            ]);
+
+        assert_eq!(blocked_events, vec![shift_tab]);
+        assert_eq!(remaining_events, vec![plain_tab, ctrl_shift_tab]);
+    }
+
+    #[test]
+    fn ctrl_arrow_shortcuts_stay_out_of_terminal_stream() {
+        let ctrl_right = Event::Key {
+            key: Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        };
+
+        let (terminal_events, remaining_events) =
+            AdeApp::partition_terminal_key_events(vec![ctrl_right.clone()]);
+
+        assert!(terminal_events.is_empty());
+        assert_eq!(remaining_events, vec![ctrl_right]);
+    }
+
+    #[test]
+    fn ctrl_shift_arrow_remains_terminal_input() {
+        let ctrl_shift_right = Event::Key {
+            key: Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Modifiers::default()
+            },
+        };
+
+        let (terminal_events, remaining_events) =
+            AdeApp::partition_terminal_key_events(vec![ctrl_shift_right.clone()]);
+
+        assert_eq!(terminal_events, vec![ctrl_shift_right]);
+        assert!(remaining_events.is_empty());
     }
 
     #[test]
@@ -4722,6 +5004,30 @@ mod tests {
                 Event::Text("echo hi".to_owned())
             ]
         );
+    }
+
+    #[test]
+    fn capture_active_terminal_input_leaves_ctrl_arrow_for_app_shortcuts() {
+        let ctx = Context::default();
+        let ctrl_right = Event::Key {
+            key: Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        };
+        ctx.input_mut(|input| {
+            input.events = vec![ctrl_right.clone()];
+        });
+
+        let app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let captured = app.capture_active_terminal_input(&ctx);
+
+        assert!(captured.is_empty());
+        assert_eq!(ctx.input(|input| input.events.clone()), vec![ctrl_right]);
     }
 
     #[test]
@@ -4810,6 +5116,88 @@ mod tests {
         let terminal = app.terminals.get(&1).expect("terminal 1");
         assert_eq!(terminal.pending_line_for_title, "git status");
         assert!(terminal.dirty);
+    }
+
+    #[test]
+    fn take_buffered_terminal_input_drains_pre_egui_events() {
+        let shift_tab = Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        };
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.buffered_terminal_input = vec![shift_tab.clone()];
+
+        let buffered_events = app.take_buffered_terminal_input();
+
+        assert_eq!(buffered_events, vec![shift_tab]);
+        assert!(app.buffered_terminal_input.is_empty());
+    }
+
+    #[test]
+    fn handle_shortcuts_moves_to_visual_neighbor() {
+        let ctx = Context::default();
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+                (3, test_terminal_entry(3, 7)),
+                (4, test_terminal_entry(4, 7)),
+            ],
+            Some(1),
+        );
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        app.handle_shortcuts(&ctx, egui::vec2(1600.0, 900.0));
+
+        assert_eq!(app.active_terminal, Some(2));
+        assert!(ctx.input(|input| input.events.is_empty()));
+    }
+
+    #[test]
+    fn handle_shortcuts_ignores_shortcuts_when_ui_owns_keyboard() {
+        let ctx = Context::default();
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(1),
+        );
+        ctx.memory_mut(|mem| mem.request_focus(AdeApp::directory_search_input_id()));
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        app.handle_shortcuts(&ctx, egui::vec2(1600.0, 900.0));
+
+        assert_eq!(app.active_terminal, Some(1));
+        assert_eq!(ctx.input(|input| input.events.len()), 1);
     }
 
     #[test]
@@ -5102,6 +5490,275 @@ mod tests {
         let next = next_active_terminal_after_close(Some(9), 7, &[3, 9]);
 
         assert_eq!(next, Some(9));
+    }
+
+    #[test]
+    fn next_terminal_in_direction_moves_between_visual_neighbors() {
+        let visible_ids = [1, 2, 3, 4];
+        let grid = crate::layout::TileGrid { rows: 2, cols: 2 };
+
+        let right = next_terminal_in_direction(
+            Some(1),
+            &visible_ids,
+            grid,
+            TerminalNavigationDirection::Right,
+        );
+        let down = next_terminal_in_direction(
+            Some(1),
+            &visible_ids,
+            grid,
+            TerminalNavigationDirection::Down,
+        );
+
+        assert_eq!(right, Some(2));
+        assert_eq!(down, Some(3));
+    }
+
+    #[test]
+    fn next_terminal_in_direction_blocks_moves_into_missing_last_row_cells() {
+        let visible_ids = [1, 2, 3];
+        let grid = crate::layout::TileGrid { rows: 2, cols: 2 };
+
+        let blocked = next_terminal_in_direction(
+            Some(2),
+            &visible_ids,
+            grid,
+            TerminalNavigationDirection::Down,
+        );
+
+        assert_eq!(blocked, None);
+    }
+
+    #[test]
+    fn next_terminal_in_direction_uses_visual_neighbors() {
+        let grid = layout::TileGrid { rows: 2, cols: 2 };
+
+        assert_eq!(
+            next_terminal_in_direction(
+                Some(1),
+                &[1, 2, 3, 4],
+                grid,
+                TerminalNavigationDirection::Right,
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            next_terminal_in_direction(
+                Some(1),
+                &[1, 2, 3, 4],
+                grid,
+                TerminalNavigationDirection::Down,
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            next_terminal_in_direction(
+                Some(4),
+                &[1, 2, 3, 4],
+                grid,
+                TerminalNavigationDirection::Left,
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            next_terminal_in_direction(
+                Some(4),
+                &[1, 2, 3, 4],
+                grid,
+                TerminalNavigationDirection::Up,
+            ),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn next_terminal_in_direction_ignores_edges_and_empty_cells() {
+        let grid = layout::TileGrid { rows: 2, cols: 2 };
+
+        assert_eq!(
+            next_terminal_in_direction(
+                Some(1),
+                &[1, 2, 3],
+                grid,
+                TerminalNavigationDirection::Left,
+            ),
+            None
+        );
+        assert_eq!(
+            next_terminal_in_direction(
+                Some(2),
+                &[1, 2, 3],
+                grid,
+                TerminalNavigationDirection::Down,
+            ),
+            None
+        );
+        assert_eq!(
+            next_terminal_in_direction(
+                Some(3),
+                &[1, 2, 3],
+                grid,
+                TerminalNavigationDirection::Right,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn handle_shortcuts_moves_active_terminal_with_ctrl_arrow() {
+        let ctx = Context::default();
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+                (3, test_terminal_entry(3, 7)),
+                (4, test_terminal_entry(4, 7)),
+            ],
+            Some(1),
+        );
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(app.active_terminal, Some(2));
+    }
+
+    #[test]
+    fn handle_shortcuts_respects_ui_keyboard_ownership() {
+        let ctx = Context::default();
+        ctx.memory_mut(|mem| mem.request_focus(AdeApp::directory_search_input_id()));
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(1),
+        );
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(app.active_terminal, Some(1));
+    }
+
+    #[test]
+    fn raw_input_hook_filters_shift_tab_when_terminal_wont_capture_keyboard() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        ctx.memory_mut(|mem| mem.request_focus(AdeApp::directory_search_input_id()));
+        let mut raw_input = RawInput {
+            events: vec![Event::Key {
+                key: Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    shift: true,
+                    ..Modifiers::default()
+                },
+            }],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(raw_input.events.is_empty());
+    }
+
+    #[test]
+    fn raw_input_hook_buffers_shift_tab_for_active_terminal() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let shift_tab = Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        };
+        let mut raw_input = RawInput {
+            events: vec![shift_tab.clone()],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(raw_input.events.is_empty());
+        assert_eq!(app.buffered_terminal_input, vec![shift_tab]);
+    }
+
+    #[test]
+    fn raw_input_hook_buffers_plain_tab_for_active_terminal() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let plain_tab = Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::default(),
+        };
+        let mut raw_input = RawInput {
+            events: vec![plain_tab.clone()],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(raw_input.events.is_empty());
+        assert_eq!(app.buffered_terminal_input, vec![plain_tab]);
+    }
+
+    #[test]
+    fn raw_input_hook_keeps_ctrl_shift_tab_available() {
+        let ctx = Context::default();
+        let mut app = test_app([], None);
+        let ctrl_shift_tab = Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Modifiers::default()
+            },
+        };
+        let mut raw_input = RawInput {
+            events: vec![ctrl_shift_tab.clone()],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert_eq!(raw_input.events, vec![ctrl_shift_tab]);
     }
 
     #[test]
@@ -5519,6 +6176,7 @@ mod tests {
             selected_project: None,
             active_terminal,
             pending_ctrl_c: None,
+            buffered_terminal_input: Vec::new(),
             terminal_events_tx,
             terminal_events_rx,
             show_settings_popup: false,
