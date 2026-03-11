@@ -4,20 +4,16 @@ use std::path::{Path, PathBuf};
 
 use ico::{IconDir, IconDirEntry, IconImage, ResourceType};
 use image::imageops::{self, FilterType};
-use image::{Rgba, RgbaImage};
+use image::RgbaImage;
 
-const SOURCE_ICON_LOGO: &str = "logo-icon.png";
+const SOURCE_LOGO: &str = "logo.png";
 const OUTPUT_PNG: &str = "app-icon.png";
 const OUTPUT_ICO: &str = "app-icon.ico";
 const MASTER_ICON_SIZE: u32 = 1024;
-const MASK_MARGIN_NUMERATOR: u32 = 1;
-const MASK_MARGIN_DENOMINATOR: u32 = 100;
-const CORNER_RADIUS_NUMERATOR: u32 = 18;
-const CORNER_RADIUS_DENOMINATOR: u32 = 100;
 const ICO_SIZES: [u32; 7] = [16, 24, 32, 48, 64, 128, 256];
 
 fn main() {
-    println!("cargo:rerun-if-changed={SOURCE_ICON_LOGO}");
+    println!("cargo:rerun-if-changed={SOURCE_LOGO}");
     println!("cargo:rerun-if-changed=.toolchain/llvm-mingw-20260224-ucrt-x86_64/bin/windres.exe");
     println!("cargo:rerun-if-changed=.toolchain/llvm-mingw-20260224-ucrt-x86_64/bin/ar.exe");
     println!("cargo:rerun-if-env-changed=WindowsSdkDir");
@@ -28,7 +24,7 @@ fn main() {
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing manifest dir"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("missing OUT_DIR"));
-    let source_logo = manifest_dir.join(SOURCE_ICON_LOGO);
+    let source_logo = manifest_dir.join(SOURCE_LOGO);
     let icon_png = out_dir.join(OUTPUT_PNG);
     let icon_ico = out_dir.join(OUTPUT_ICO);
 
@@ -49,81 +45,12 @@ fn prepare_icon(source_logo: &Path) -> RgbaImage {
     let source = image::open(source_logo)
         .unwrap_or_else(|err| panic!("failed to open {}: {err}", source_logo.display()))
         .into_rgba8();
-    let cropped = center_on_square_canvas(&source);
-    let resized = imageops::resize(
-        &cropped,
+    imageops::resize(
+        &source,
         MASTER_ICON_SIZE,
         MASTER_ICON_SIZE,
         FilterType::CatmullRom,
-    );
-    apply_rounded_mask(&resized)
-}
-
-fn center_on_square_canvas(image: &RgbaImage) -> RgbaImage {
-    let side = image.width().max(image.height()).max(1);
-    let mut canvas = RgbaImage::from_pixel(side, side, Rgba([0, 0, 0, 0]));
-    let x = (side - image.width()) / 2;
-    let y = (side - image.height()) / 2;
-    imageops::overlay(&mut canvas, image, i64::from(x), i64::from(y));
-    canvas
-}
-
-fn apply_rounded_mask(image: &RgbaImage) -> RgbaImage {
-    let size = image.width().min(image.height());
-    let margin = size * MASK_MARGIN_NUMERATOR / MASK_MARGIN_DENOMINATOR;
-    let radius = size * CORNER_RADIUS_NUMERATOR / CORNER_RADIUS_DENOMINATOR;
-    let mut masked = RgbaImage::new(image.width(), image.height());
-
-    for y in 0..image.height() {
-        for x in 0..image.width() {
-            let inside = point_inside_rounded_rect(x, y, size, margin, radius);
-            if inside {
-                masked.put_pixel(x, y, *image.get_pixel(x, y));
-            } else {
-                masked.put_pixel(x, y, Rgba([0, 0, 0, 0]));
-            }
-        }
-    }
-
-    masked
-}
-
-fn point_inside_rounded_rect(x: u32, y: u32, size: u32, margin: u32, radius: u32) -> bool {
-    let x = x as i64;
-    let y = y as i64;
-    let size = size as i64;
-    let margin = margin as i64;
-    let radius = radius.max(1) as i64;
-    let left = margin;
-    let top = margin;
-    let right = size - margin - 1;
-    let bottom = size - margin - 1;
-
-    if x < left || x > right || y < top || y > bottom {
-        return false;
-    }
-
-    if x >= left + radius && x <= right - radius {
-        return true;
-    }
-
-    if y >= top + radius && y <= bottom - radius {
-        return true;
-    }
-
-    let nearest_x = if x < left + radius {
-        left + radius
-    } else {
-        right - radius
-    };
-    let nearest_y = if y < top + radius {
-        top + radius
-    } else {
-        bottom - radius
-    };
-    let dx = x - nearest_x;
-    let dy = y - nearest_y;
-    dx * dx + dy * dy <= radius * radius
+    )
 }
 
 fn write_ico(icon: &RgbaImage, output_path: &Path) {
