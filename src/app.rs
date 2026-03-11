@@ -12,7 +12,7 @@ use arboard::Clipboard;
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{
-    self, Align, Color32, Event, FontData, FontFamily, FontId, Key, Layout, RichText, Sense,
+    self, Align, Color32, Event, FontData, FontFamily, FontId, Id, Key, Layout, RichText, Sense,
     Stroke, TextWrapMode, Ui, Vec2, WidgetInfo, WidgetText, WidgetType,
 };
 use iconflow::{fonts as icon_fonts, try_icon, Pack, Size, Style};
@@ -60,6 +60,8 @@ const PROJECT_EXPLORER_WIDTH: f32 = 320.0;
 const ACTIVITY_RAIL_WIDTH: f32 = 48.0;
 const CONTROL_ROW_HEIGHT: f32 = 28.0;
 const TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH: f32 = 32.0;
+const DIRECTORY_SEARCH_INPUT_ID: &str = "directory-search-input";
+const SAVED_MESSAGE_DRAFT_INPUT_ID: &str = "saved-message-draft-input";
 
 // Pill button palette
 const BTN_BLUE: Color32 = Color32::from_rgb(16, 64, 112);
@@ -827,6 +829,108 @@ impl AdeApp {
         let _ = ctx;
     }
 
+    fn active_terminal_accepts_input(&self) -> Option<u64> {
+        let active_terminal_id = self.active_terminal?;
+        self.terminals
+            .get(&active_terminal_id)
+            .is_some_and(|terminal| self.terminal_visible_in_main(terminal) && !terminal.exited)
+            .then_some(active_terminal_id)
+    }
+
+    fn should_capture_terminal_keyboard_state(
+        active_terminal_accepts_input: bool,
+        ui_owns_keyboard: bool,
+    ) -> bool {
+        active_terminal_accepts_input && !ui_owns_keyboard
+    }
+
+    fn directory_search_input_id() -> Id {
+        Id::new(DIRECTORY_SEARCH_INPUT_ID)
+    }
+
+    fn saved_message_draft_input_id(project_id: u64) -> Id {
+        Id::new((SAVED_MESSAGE_DRAFT_INPUT_ID, project_id))
+    }
+
+    fn text_input_has_focus(&self, ctx: &egui::Context) -> bool {
+        if ctx.memory(|mem| mem.has_focus(Self::directory_search_input_id())) {
+            return true;
+        }
+
+        self.selected_project.is_some_and(|project_id| {
+            ctx.memory(|mem| mem.has_focus(Self::saved_message_draft_input_id(project_id)))
+        })
+    }
+
+    fn ui_owns_keyboard_state(
+        text_input_has_focus: bool,
+        popup_open: bool,
+        context_menu_open: bool,
+        show_settings_popup: bool,
+        wants_keyboard_input: bool,
+    ) -> bool {
+        text_input_has_focus
+            || popup_open
+            || context_menu_open
+            || (show_settings_popup && wants_keyboard_input)
+    }
+
+    fn ui_owns_keyboard(&self, ctx: &egui::Context) -> bool {
+        Self::ui_owns_keyboard_state(
+            self.text_input_has_focus(ctx),
+            ctx.memory(|mem| mem.any_popup_open()),
+            ctx.is_context_menu_open(),
+            self.show_settings_popup,
+            ctx.wants_keyboard_input(),
+        )
+    }
+
+    fn should_capture_terminal_keyboard(&self, ctx: &egui::Context) -> bool {
+        Self::should_capture_terminal_keyboard_state(
+            self.active_terminal_accepts_input().is_some(),
+            self.ui_owns_keyboard(ctx),
+        )
+    }
+
+    fn event_is_terminal_key(event: &Event) -> bool {
+        matches!(event, Event::Key { .. })
+    }
+
+    fn event_is_terminal_post_ui_input(event: &Event) -> bool {
+        matches!(
+            event,
+            Event::Text(_) | Event::Paste(_) | Event::Copy | Event::Cut
+        )
+    }
+
+    fn partition_terminal_key_events(events: Vec<Event>) -> (Vec<Event>, Vec<Event>) {
+        let mut terminal_events = Vec::new();
+        let mut remaining_events = Vec::new();
+
+        for event in events {
+            if Self::event_is_terminal_key(&event) {
+                terminal_events.push(event);
+            } else {
+                remaining_events.push(event);
+            }
+        }
+
+        (terminal_events, remaining_events)
+    }
+
+    fn capture_active_terminal_input(&self, ctx: &egui::Context) -> Vec<Event> {
+        if !self.should_capture_terminal_keyboard(ctx) {
+            return Vec::new();
+        }
+
+        ctx.input_mut(|input| {
+            let events = std::mem::take(&mut input.events);
+            let (terminal_events, remaining_events) = Self::partition_terminal_key_events(events);
+            input.events = remaining_events;
+            terminal_events
+        })
+    }
+
     fn visible_terminal_ids_for_main(&self) -> Vec<u64> {
         let mut ids = self
             .terminals
@@ -838,8 +942,9 @@ impl AdeApp {
         ids
     }
 
-    fn route_active_terminal_input(&mut self, ctx: &egui::Context) {
-        if self.show_settings_popup && ctx.wants_keyboard_input() {
+    fn route_active_terminal_input(&mut self, ctx: &egui::Context, events: Vec<Event>) {
+        if self.ui_owns_keyboard(ctx) {
+            self.pending_ctrl_c = None;
             return;
         }
 
@@ -851,21 +956,17 @@ impl AdeApp {
             self.pending_ctrl_c = None;
         }
 
-        let Some(active_terminal_id) = self.active_terminal else {
+        let Some(active_terminal_id) = self.active_terminal_accepts_input() else {
             self.pending_ctrl_c = None;
             return;
         };
+        let mut events = events;
+        events.extend(
+            ctx.input(|input| input.events.clone())
+                .into_iter()
+                .filter(Self::event_is_terminal_post_ui_input),
+        );
 
-        let can_receive_input = self
-            .terminals
-            .get(&active_terminal_id)
-            .is_some_and(|terminal| self.terminal_visible_in_main(terminal) && !terminal.exited);
-        if !can_receive_input {
-            self.pending_ctrl_c = None;
-            return;
-        }
-
-        let events = ctx.input(|input| input.events.clone());
         if events.is_empty() {
             return;
         }
@@ -1738,6 +1839,7 @@ impl AdeApp {
                         ui.add_sized(
                             [ui.available_width(), CONTROL_ROW_HEIGHT],
                             egui::TextEdit::singleline(&mut self.directory_search_query)
+                                .id(Self::directory_search_input_id())
                                 .hint_text("Search files and folders")
                                 .vertical_align(Align::Center),
                         );
@@ -3120,7 +3222,10 @@ impl AdeApp {
 
                         ui.horizontal(|ui| {
                             let draft = self.saved_message_drafts.entry(project_id).or_default();
-                            ui.text_edit_singleline(draft);
+                            ui.add(
+                                egui::TextEdit::singleline(draft)
+                                    .id(Self::saved_message_draft_input_id(project_id)),
+                            );
                             if styled_icon_button(
                                 ui,
                                 icons::PLUS,
@@ -3185,6 +3290,7 @@ impl eframe::App for AdeApp {
         self.process_source_control_events(ctx);
         self.process_directory_index_events(ctx);
         self.schedule_terminal_refresh(ctx);
+        let terminal_events = self.capture_active_terminal_input(ctx);
         self.handle_shortcuts(ctx);
 
         self.draw_top_bar(ctx);
@@ -3196,7 +3302,7 @@ impl eframe::App for AdeApp {
         }
         self.draw_settings_popup(ctx);
 
-        self.route_active_terminal_input(ctx);
+        self.route_active_terminal_input(ctx, terminal_events);
     }
 
     fn persist_egui_memory(&self) -> bool {
@@ -4488,7 +4594,7 @@ mod tests {
         TerminalCursorShape, TerminalSelectionLine, TerminalSelectionSnapshot, TerminalSnapshot,
         TerminalStyle, TerminalStyledCell, TerminalStyledLine, TerminalStyledRun,
     };
-    use eframe::egui::{pos2, Color32, FontFamily, FontId, Key, Modifiers};
+    use eframe::egui::{pos2, Color32, Context, Event, FontFamily, FontId, Id, Key, Modifiers};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -4499,6 +4605,66 @@ mod tests {
 
         assert_eq!(up, Some(b"\x1b[A".to_vec()));
         assert_eq!(delete, Some(b"\x1b[3~".to_vec()));
+    }
+
+    #[test]
+    fn partitions_terminal_key_events_out_of_ui_stream() {
+        let shift_tab = Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        };
+        let plain_tab = Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::default(),
+        };
+        let focus_event = Event::WindowFocused(true);
+
+        let (terminal_events, remaining_events) = AdeApp::partition_terminal_key_events(vec![
+            focus_event.clone(),
+            shift_tab.clone(),
+            plain_tab.clone(),
+            Event::Text("git status".to_owned()),
+        ]);
+
+        assert_eq!(terminal_events, vec![shift_tab, plain_tab]);
+        assert_eq!(
+            remaining_events,
+            vec![focus_event, Event::Text("git status".to_owned())]
+        );
+    }
+
+    #[test]
+    fn ui_keyboard_ownership_blocks_terminal_capture() {
+        assert!(AdeApp::ui_owns_keyboard_state(
+            true, false, false, false, false
+        ));
+        assert!(AdeApp::ui_owns_keyboard_state(
+            false, true, false, false, false
+        ));
+        assert!(AdeApp::ui_owns_keyboard_state(
+            false, false, true, false, false
+        ));
+        assert!(AdeApp::ui_owns_keyboard_state(
+            false, false, false, true, true
+        ));
+        assert!(!AdeApp::ui_owns_keyboard_state(
+            false, false, false, false, false
+        ));
+
+        assert!(!AdeApp::should_capture_terminal_keyboard_state(true, true));
+        assert!(AdeApp::should_capture_terminal_keyboard_state(true, false));
+        assert!(!AdeApp::should_capture_terminal_keyboard_state(
+            false, false
+        ));
     }
 
     #[test]
@@ -4513,6 +4679,137 @@ mod tests {
 
         assert_eq!(ctrl_c, Some(vec![0x03]));
         assert_eq!(ctrl_z, Some(vec![0x1a]));
+    }
+
+    #[test]
+    fn capture_active_terminal_input_removes_keyboard_events_from_egui_queue() {
+        let ctx = Context::default();
+        ctx.input_mut(|input| {
+            input.events = vec![
+                Event::Key {
+                    key: Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers {
+                        shift: true,
+                        ..Modifiers::default()
+                    },
+                },
+                Event::PointerMoved(pos2(4.0, 8.0)),
+                Event::Text("echo hi".to_owned()),
+            ];
+        });
+
+        let app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let captured = app.capture_active_terminal_input(&ctx);
+
+        assert_eq!(captured.len(), 1);
+        assert!(matches!(
+            &captured[0],
+            Event::Key {
+                key: Key::Tab,
+                pressed: true,
+                ..
+            }
+        ));
+
+        let remaining_events = ctx.input(|input| input.events.clone());
+        assert_eq!(
+            remaining_events,
+            vec![
+                Event::PointerMoved(pos2(4.0, 8.0)),
+                Event::Text("echo hi".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn focused_directory_search_blocks_terminal_capture() {
+        let ctx = Context::default();
+        ctx.memory_mut(|mem| mem.request_focus(AdeApp::directory_search_input_id()));
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }];
+        });
+
+        let app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let captured = app.capture_active_terminal_input(&ctx);
+
+        assert!(captured.is_empty());
+        assert_eq!(ctx.input(|input| input.events.len()), 1);
+    }
+
+    #[test]
+    fn focused_saved_message_draft_blocks_terminal_capture() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.selected_project = Some(7);
+        ctx.memory_mut(|mem| mem.request_focus(AdeApp::saved_message_draft_input_id(7)));
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }];
+        });
+
+        let captured = app.capture_active_terminal_input(&ctx);
+
+        assert!(captured.is_empty());
+        assert_eq!(ctx.input(|input| input.events.len()), 1);
+    }
+
+    #[test]
+    fn open_popup_blocks_terminal_capture() {
+        let ctx = Context::default();
+        let app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        ctx.memory_mut(|mem| mem.open_popup(Id::new("test-popup")));
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }];
+        });
+
+        let captured = app.capture_active_terminal_input(&ctx);
+
+        assert!(captured.is_empty());
+        assert_eq!(ctx.input(|input| input.events.len()), 1);
+    }
+
+    #[test]
+    fn route_active_terminal_input_combines_buffered_keys_and_post_ui_text_events() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Text("git status".to_owned())];
+        });
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::ArrowUp,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.pending_line_for_title, "git status");
+        assert!(terminal.dirty);
     }
 
     #[test]
