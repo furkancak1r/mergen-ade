@@ -40,8 +40,7 @@ const POWERSHELL_CURSOR_ROW_STABLE_SECS: f64 = 0.06;
 const TERMINAL_CHAR_WIDTH_SAMPLE_CELLS: usize = 64;
 const CURSOR_BAR_WIDTH_PX: f32 = 2.0;
 const CURSOR_UNDERLINE_HEIGHT_PX: f32 = 2.0;
-const DIRECTORY_INDEX_MAX_DEPTH: usize = 8;
-const DIRECTORY_INDEX_MAX_NODES: usize = 20_000;
+const DIRECTORY_INDEX_LOADING_ANIMATION_STEP_SECS: f64 = 0.25;
 const TERMINAL_OUTPUT_BG: Color32 = Color32::from_rgb(26, 30, 36);
 const TERMINAL_HEADER_HEIGHT: f32 = 38.0;
 const TERMINAL_HEADER_GAP: f32 = 6.0;
@@ -367,7 +366,6 @@ struct DirectoryIndexSnapshot {
     root: DirectoryNode,
     loading: bool,
     last_error: Option<String>,
-    truncated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -816,13 +814,11 @@ impl AdeApp {
             .and_modify(|snapshot| {
                 snapshot.loading = true;
                 snapshot.last_error = None;
-                snapshot.truncated = false;
             })
             .or_insert_with(|| DirectoryIndexSnapshot {
                 root: build_directory_root_node(&project.path),
                 loading: true,
                 last_error: None,
-                truncated: false,
             });
 
         let tx = self.directory_index_events_tx.clone();
@@ -2023,7 +2019,15 @@ impl AdeApp {
                                             self.directory_index_state.get(&project_id)
                                         else {
                                             ui.label(
-                                                RichText::new("Indexing files...").color(TEXT_MUTED),
+                                                RichText::new(directory_index_loading_label(
+                                                    ui.ctx().input(|input| input.time),
+                                                ))
+                                                .color(TEXT_MUTED),
+                                            );
+                                            ui.ctx().request_repaint_after(
+                                                Duration::from_secs_f64(
+                                                    DIRECTORY_INDEX_LOADING_ANIMATION_STEP_SECS,
+                                                ),
                                             );
                                             return;
                                         };
@@ -2036,7 +2040,15 @@ impl AdeApp {
 
                                         if snapshot.loading {
                                             ui.label(
-                                                RichText::new("Indexing files...").color(TEXT_MUTED),
+                                                RichText::new(directory_index_loading_label(
+                                                    ui.ctx().input(|input| input.time),
+                                                ))
+                                                .color(TEXT_MUTED),
+                                            );
+                                            ui.ctx().request_repaint_after(
+                                                Duration::from_secs_f64(
+                                                    DIRECTORY_INDEX_LOADING_ANIMATION_STEP_SECS,
+                                                ),
                                             );
                                         }
 
@@ -2059,21 +2071,15 @@ impl AdeApp {
                                                 &mut status_line_update,
                                                 search_query.as_deref(),
                                                 false,
-                                                search_query.as_deref().map(|_| &matching_directories),
+                                                search_query
+                                                    .as_deref()
+                                                    .map(|_| &matching_directories),
                                             );
 
                                             if search_query.is_some() && !has_results {
                                                 ui.label(
                                                     RichText::new("No matching files or folders")
                                                         .color(TEXT_MUTED),
-                                                );
-                                            }
-                                            if snapshot.truncated {
-                                                ui.label(
-                                                    RichText::new(
-                                                        "Index truncated for performance. Refine search or refresh after narrowing scope.",
-                                                    )
-                                                    .color(TEXT_MUTED),
                                                 );
                                             }
                                         }
@@ -2083,236 +2089,215 @@ impl AdeApp {
                                         self.status_line = status_line;
                                     }
                                 } else {
-                                    ui.label(RichText::new("No project selected").color(TEXT_MUTED));
+                                    ui.label(
+                                        RichText::new("No project selected").color(TEXT_MUTED),
+                                    );
                                 }
                             });
                     }
                     LeftSidebarTab::SourceControl => {
-                                let project_rows = self
-                                    .projects
+                        let project_rows = self
+                            .projects
+                            .iter()
+                            .map(|(project_id, project)| (*project_id, project.name.clone()))
+                            .collect::<Vec<_>>();
+
+                        if project_rows.is_empty() {
+                            ui.label(RichText::new("No projects added").color(TEXT_MUTED));
+                            return;
+                        }
+
+                        let mut should_persist_selection = false;
+                        if self.selected_project.is_some_and(|selected_id| {
+                            !project_rows
+                                .iter()
+                                .any(|(project_id, _)| *project_id == selected_id)
+                        }) {
+                            self.selected_project = None;
+                            should_persist_selection = true;
+                        }
+
+                        let selected_project_label = self
+                            .selected_project
+                            .and_then(|selected_id| {
+                                project_rows
                                     .iter()
-                                    .map(|(project_id, project)| {
-                                        (*project_id, project.name.clone())
+                                    .find(|(project_id, _)| *project_id == selected_id)
+                                    .map(|(_, project_name)| {
+                                        format!("{} {}", icons::FOLDER_OPEN, project_name)
                                     })
-                                    .collect::<Vec<_>>();
+                            })
+                            .unwrap_or_else(|| "No project selected".to_owned());
 
-                                if project_rows.is_empty() {
-                                    ui.label(RichText::new("No projects added").color(TEXT_MUTED));
-                                    return;
-                                }
-
-                                let mut should_persist_selection = false;
-                                if self.selected_project.is_some_and(|selected_id| {
-                                    !project_rows
-                                        .iter()
-                                        .any(|(project_id, _)| *project_id == selected_id)
-                                }) {
-                                    self.selected_project = None;
-                                    should_persist_selection = true;
-                                }
-
-                                let selected_project_label = self
-                                    .selected_project
-                                    .and_then(|selected_id| {
-                                        project_rows
-                                            .iter()
-                                            .find(|(project_id, _)| *project_id == selected_id)
-                                            .map(|(_, project_name)| {
-                                                format!("{} {}", icons::FOLDER_OPEN, project_name)
-                                            })
-                                    })
-                                    .unwrap_or_else(|| "No project selected".to_owned());
-
-                                let selected_project_details =
-                                    self.selected_project.and_then(|selected_id| {
-                                        project_rows
-                                            .iter()
-                                            .find(|(project_id, _)| *project_id == selected_id)
-                                            .cloned()
-                                    });
-                                let previous_selected_project = self.selected_project;
-                                ui.label(RichText::new("Project").color(TEXT_MUTED));
-                                let mut refresh_status = false;
-                                let mut fetch_and_refresh = false;
-                                let mut open_project_folder = false;
-                                ui.scope(|ui| {
-                                    ui.spacing_mut().interact_size.y = CONTROL_ROW_HEIGHT;
-                                    ui.horizontal(|ui| {
-                                        let button_group_width =
-                                            30.0 * 3.0 + ui.spacing().item_spacing.x * 2.0;
-                                        let combo_width = (ui.available_width()
-                                            - button_group_width)
-                                            .clamp(96.0, 150.0);
-                                        with_minimal_button_chrome(ui, |ui| {
-                                            egui::ComboBox::from_id_salt(
-                                                "source-control-project-select",
-                                            )
-                                            .selected_text(selected_project_label)
-                                            .icon(paint_minimal_combo_icon)
-                                            .width(combo_width)
-                                            .show_ui(ui, |ui| {
-                                                for (project_id, project_name) in &project_rows {
-                                                    ui.selectable_value(
-                                                        &mut self.selected_project,
-                                                        Some(*project_id),
-                                                        format!(
-                                                            "{} {}",
-                                                            icons::FOLDER, project_name
-                                                        ),
-                                                    );
-                                                }
-                                            });
-                                        });
-
-                                        ui.add_enabled_ui(
-                                            selected_project_details.is_some(),
-                                            |ui| {
-                                                if styled_icon_button(
-                                                    ui,
-                                                    icons::ARROW_CLOCKWISE,
-                                                    BTN_ICON,
-                                                    BTN_ICON_HOVER,
-                                                    BTN_ICON_ACTIVE,
-                                                    "Refresh Status",
-                                                ) {
-                                                    refresh_status = true;
-                                                }
-                                                if styled_icon_button(
-                                                    ui,
-                                                    icons::DOWNLOAD,
-                                                    BTN_ICON,
-                                                    BTN_ICON_HOVER,
-                                                    BTN_ICON_ACTIVE,
-                                                    "Fetch and Refresh",
-                                                ) {
-                                                    fetch_and_refresh = true;
-                                                }
-                                                if styled_icon_button(
-                                                    ui,
-                                                    icons::FOLDER_OPEN,
-                                                    BTN_ICON,
-                                                    BTN_ICON_HOVER,
-                                                    BTN_ICON_ACTIVE,
-                                                    "Open Project Folder",
-                                                ) {
-                                                    open_project_folder = true;
-                                                }
-                                            },
-                                        );
-                                    });
-                                });
-                                if self.selected_project != previous_selected_project {
-                                    self.apply_selected_project_auto_tile_scope_and_refresh_layout(
-                                        ctx,
-                                    );
-                                    should_persist_selection = true;
-                                }
-                                if should_persist_selection {
-                                    self.note_selection_changed();
-                                    self.persist_config();
-                                }
-
-                                let Some(project_id) = self.selected_project else {
-                                    ui.label(
-                                        RichText::new("No project selected").color(TEXT_MUTED),
-                                    );
-                                    return;
-                                };
-                                let Some(project) = self.projects.get(&project_id).cloned() else {
-                                    ui.label(RichText::new("Project not found").color(TEXT_MUTED));
-                                    return;
-                                };
-
-                                if !self.source_control_state.contains_key(&project_id) {
-                                    self.request_source_control_refresh(project_id, false);
-                                }
-
-                                if refresh_status {
-                                    self.request_source_control_refresh(project_id, false);
-                                }
-                                if fetch_and_refresh {
-                                    self.request_source_control_refresh(project_id, true);
-                                }
-                                if open_project_folder {
-                                    match open_in_file_explorer(&project.path, false) {
-                                        Ok(()) => {
-                                            self.status_line =
-                                                "Opened project folder".to_owned();
-                                        }
-                                        Err(err) => {
-                                            self.status_line =
-                                                format!("Open folder failed: {err}");
-                                        }
-                                    }
-                                }
-                                ui.separator();
-
-                                egui::ScrollArea::vertical()
-                                    .id_salt("source-control-scroll")
-                                    .max_height(ui.available_height())
-                                    .auto_shrink([false, false])
-                                    .show(ui, |ui| {
-                                        let snapshot = self
-                                            .source_control_state
-                                            .entry(project_id)
-                                            .or_insert_with(SourceControlSnapshot::default)
-                                            .clone();
-
-                                        if snapshot.loading {
-                                            ui.label(
-                                                RichText::new("Refreshing source control...")
-                                                    .color(TEXT_MUTED),
-                                            );
-                                        }
-                                        if let Some(error) = &snapshot.last_error {
-                                            ui.colored_label(Color32::LIGHT_RED, error);
-                                        } else {
-                                            let mut branch_line = format!(
-                                                "{} {}",
-                                                icons::GIT_BRANCH,
-                                                snapshot.branch
-                                            );
-                                            if snapshot.ahead > 0 || snapshot.behind > 0 {
-                                                branch_line.push_str(&format!(
-                                                    "  ahead:{} behind:{}",
-                                                    snapshot.ahead, snapshot.behind
-                                                ));
-                                            }
-                                            ui.label(RichText::new(branch_line).color(TEXT_MUTED));
-                                        }
-
-                                        ui.separator();
-                                        if snapshot.files.is_empty()
-                                            && snapshot.last_error.is_none()
-                                            && !snapshot.loading
-                                        {
-                                            ui.label(
-                                                RichText::new("Working tree is clean")
-                                                    .color(TEXT_MUTED),
-                                            );
-                                        }
-
-                                        for file in snapshot.files {
-                                            let absolute = project.path.join(&file.path);
-                                            ui.horizontal(|ui| {
-                                                let status_icon = if file.staged {
-                                                    icons::CHECK_CIRCLE
-                                                } else {
-                                                    icons::CLOCK
-                                                };
-                                                ui.label(
-                                                    RichText::new(status_icon.to_string())
-                                                        .color(TEXT_MUTED),
+                        let selected_project_details =
+                            self.selected_project.and_then(|selected_id| {
+                                project_rows
+                                    .iter()
+                                    .find(|(project_id, _)| *project_id == selected_id)
+                                    .cloned()
+                            });
+                        let previous_selected_project = self.selected_project;
+                        ui.label(RichText::new("Project").color(TEXT_MUTED));
+                        let mut refresh_status = false;
+                        let mut fetch_and_refresh = false;
+                        let mut open_project_folder = false;
+                        ui.scope(|ui| {
+                            ui.spacing_mut().interact_size.y = CONTROL_ROW_HEIGHT;
+                            ui.horizontal(|ui| {
+                                let button_group_width =
+                                    30.0 * 3.0 + ui.spacing().item_spacing.x * 2.0;
+                                let combo_width =
+                                    (ui.available_width() - button_group_width).clamp(96.0, 150.0);
+                                with_minimal_button_chrome(ui, |ui| {
+                                    egui::ComboBox::from_id_salt("source-control-project-select")
+                                        .selected_text(selected_project_label)
+                                        .icon(paint_minimal_combo_icon)
+                                        .width(combo_width)
+                                        .show_ui(ui, |ui| {
+                                            for (project_id, project_name) in &project_rows {
+                                                ui.selectable_value(
+                                                    &mut self.selected_project,
+                                                    Some(*project_id),
+                                                    format!("{} {}", icons::FOLDER, project_name),
                                                 );
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "{} {}",
-                                                    file.status, file.path
-                                                ))
+                                            }
+                                        });
+                                });
+
+                                ui.add_enabled_ui(selected_project_details.is_some(), |ui| {
+                                    if styled_icon_button(
+                                        ui,
+                                        icons::ARROW_CLOCKWISE,
+                                        BTN_ICON,
+                                        BTN_ICON_HOVER,
+                                        BTN_ICON_ACTIVE,
+                                        "Refresh Status",
+                                    ) {
+                                        refresh_status = true;
+                                    }
+                                    if styled_icon_button(
+                                        ui,
+                                        icons::DOWNLOAD,
+                                        BTN_ICON,
+                                        BTN_ICON_HOVER,
+                                        BTN_ICON_ACTIVE,
+                                        "Fetch and Refresh",
+                                    ) {
+                                        fetch_and_refresh = true;
+                                    }
+                                    if styled_icon_button(
+                                        ui,
+                                        icons::FOLDER_OPEN,
+                                        BTN_ICON,
+                                        BTN_ICON_HOVER,
+                                        BTN_ICON_ACTIVE,
+                                        "Open Project Folder",
+                                    ) {
+                                        open_project_folder = true;
+                                    }
+                                });
+                            });
+                        });
+                        if self.selected_project != previous_selected_project {
+                            self.apply_selected_project_auto_tile_scope_and_refresh_layout(ctx);
+                            should_persist_selection = true;
+                        }
+                        if should_persist_selection {
+                            self.note_selection_changed();
+                            self.persist_config();
+                        }
+
+                        let Some(project_id) = self.selected_project else {
+                            ui.label(RichText::new("No project selected").color(TEXT_MUTED));
+                            return;
+                        };
+                        let Some(project) = self.projects.get(&project_id).cloned() else {
+                            ui.label(RichText::new("Project not found").color(TEXT_MUTED));
+                            return;
+                        };
+
+                        if !self.source_control_state.contains_key(&project_id) {
+                            self.request_source_control_refresh(project_id, false);
+                        }
+
+                        if refresh_status {
+                            self.request_source_control_refresh(project_id, false);
+                        }
+                        if fetch_and_refresh {
+                            self.request_source_control_refresh(project_id, true);
+                        }
+                        if open_project_folder {
+                            match open_in_file_explorer(&project.path, false) {
+                                Ok(()) => {
+                                    self.status_line = "Opened project folder".to_owned();
+                                }
+                                Err(err) => {
+                                    self.status_line = format!("Open folder failed: {err}");
+                                }
+                            }
+                        }
+                        ui.separator();
+
+                        egui::ScrollArea::vertical()
+                            .id_salt("source-control-scroll")
+                            .max_height(ui.available_height())
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let snapshot = self
+                                    .source_control_state
+                                    .entry(project_id)
+                                    .or_insert_with(SourceControlSnapshot::default)
+                                    .clone();
+
+                                if snapshot.loading {
+                                    ui.label(
+                                        RichText::new("Refreshing source control...")
+                                            .color(TEXT_MUTED),
+                                    );
+                                }
+                                if let Some(error) = &snapshot.last_error {
+                                    ui.colored_label(Color32::LIGHT_RED, error);
+                                } else {
+                                    let mut branch_line =
+                                        format!("{} {}", icons::GIT_BRANCH, snapshot.branch);
+                                    if snapshot.ahead > 0 || snapshot.behind > 0 {
+                                        branch_line.push_str(&format!(
+                                            "  ahead:{} behind:{}",
+                                            snapshot.ahead, snapshot.behind
+                                        ));
+                                    }
+                                    ui.label(RichText::new(branch_line).color(TEXT_MUTED));
+                                }
+
+                                ui.separator();
+                                if snapshot.files.is_empty()
+                                    && snapshot.last_error.is_none()
+                                    && !snapshot.loading
+                                {
+                                    ui.label(
+                                        RichText::new("Working tree is clean").color(TEXT_MUTED),
+                                    );
+                                }
+
+                                for file in snapshot.files {
+                                    let absolute = project.path.join(&file.path);
+                                    ui.horizontal(|ui| {
+                                        let status_icon = if file.staged {
+                                            icons::CHECK_CIRCLE
+                                        } else {
+                                            icons::CLOCK
+                                        };
+                                        ui.label(
+                                            RichText::new(status_icon.to_string())
+                                                .color(TEXT_MUTED),
+                                        );
+                                        ui.label(
+                                            RichText::new(format!("{} {}", file.status, file.path))
                                                 .monospace()
                                                 .small(),
-                                            )
-                                            .context_menu(|ui| {
+                                        )
+                                        .context_menu(
+                                            |ui| {
                                                 with_minimal_button_chrome(ui, |ui| {
                                                     if ui
                                                         .button(format!(
@@ -2349,10 +2334,11 @@ impl AdeApp {
                                                         ui.close_menu();
                                                     }
                                                 });
-                                                });
-                                            });
-                                        }
+                                            },
+                                        );
                                     });
+                                }
+                            });
                     }
                     LeftSidebarTab::TerminalManager => {
                         self.draw_terminal_manager_contents(ctx, ui);
@@ -3796,16 +3782,8 @@ fn build_directory_root_node(path: &Path) -> DirectoryNode {
 
 fn collect_directory_index_snapshot(project_path: &Path) -> DirectoryIndexSnapshot {
     let mut root = build_directory_root_node(project_path);
-    let mut node_budget = DIRECTORY_INDEX_MAX_NODES;
-    let mut truncated = false;
 
-    let snapshot_error = match read_directory_children(
-        project_path,
-        0,
-        DIRECTORY_INDEX_MAX_DEPTH,
-        &mut node_budget,
-        &mut truncated,
-    ) {
+    let snapshot_error = match read_directory_children(project_path) {
         Ok(children) => {
             root.children = children;
             None
@@ -3817,21 +3795,10 @@ fn collect_directory_index_snapshot(project_path: &Path) -> DirectoryIndexSnapsh
         root,
         loading: false,
         last_error: snapshot_error,
-        truncated,
     }
 }
 
-fn read_directory_children(
-    path: &Path,
-    depth: usize,
-    max_depth: usize,
-    node_budget: &mut usize,
-    truncated: &mut bool,
-) -> Result<Vec<DirectoryNode>, String> {
-    if depth >= max_depth || *node_budget == 0 {
-        return Ok(Vec::new());
-    }
-
+fn read_directory_children(path: &Path) -> Result<Vec<DirectoryNode>, String> {
     let entries = fs::read_dir(path).map_err(|err| err.to_string())?;
     let mut children_paths = entries
         .filter_map(|entry| entry.ok().map(|dir_entry| dir_entry.path()))
@@ -3840,13 +3807,7 @@ fn read_directory_children(
 
     let mut children = Vec::new();
     for child_path in children_paths {
-        if *node_budget == 0 {
-            *truncated = true;
-            break;
-        }
-        if let Some(node) =
-            build_directory_node(&child_path, depth + 1, max_depth, node_budget, truncated)
-        {
+        if let Some(node) = build_directory_node(&child_path) {
             children.push(node);
         }
     }
@@ -3854,23 +3815,13 @@ fn read_directory_children(
     Ok(children)
 }
 
-fn build_directory_node(
-    path: &Path,
-    depth: usize,
-    max_depth: usize,
-    node_budget: &mut usize,
-    truncated: &mut bool,
-) -> Option<DirectoryNode> {
-    if *node_budget == 0 {
-        *truncated = true;
-        return None;
-    }
-    *node_budget -= 1;
-
+fn build_directory_node(path: &Path) -> Option<DirectoryNode> {
     let name = path
         .file_name()
         .map(|segment| segment.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string());
+    let file_type = fs::symlink_metadata(path).ok()?.file_type();
+    let is_symlink = file_type.is_symlink();
     let is_dir = path.is_dir();
 
     let mut node = DirectoryNode {
@@ -3880,15 +3831,22 @@ fn build_directory_node(
         children: Vec::new(),
     };
 
-    if is_dir && depth < max_depth {
-        if let Ok(children) =
-            read_directory_children(path, depth, max_depth, node_budget, truncated)
-        {
+    if should_descend_into_directory(is_dir, is_symlink) {
+        if let Ok(children) = read_directory_children(path) {
             node.children = children;
         }
     }
 
     Some(node)
+}
+
+fn should_descend_into_directory(is_dir: bool, is_symlink: bool) -> bool {
+    is_dir && !is_symlink
+}
+
+fn directory_index_loading_label(time_secs: f64) -> String {
+    let phase = ((time_secs / DIRECTORY_INDEX_LOADING_ANIMATION_STEP_SECS).floor() as usize) % 4;
+    format!("Indexing files{}", ".".repeat(phase))
 }
 
 fn open_in_file_explorer(path: &Path, select_file: bool) -> Result<(), String> {
@@ -6683,6 +6641,31 @@ mod tests {
     fn average_terminal_cell_width_falls_back_when_sample_is_invalid() {
         assert_eq!(average_terminal_cell_width(0.0, 64), 1.0);
         assert_eq!(average_terminal_cell_width(f32::NAN, 64), 1.0);
+    }
+
+    #[test]
+    fn directory_index_loading_label_cycles_dot_animation() {
+        assert_eq!(super::directory_index_loading_label(0.0), "Indexing files");
+        assert_eq!(
+            super::directory_index_loading_label(0.25),
+            "Indexing files."
+        );
+        assert_eq!(
+            super::directory_index_loading_label(0.50),
+            "Indexing files.."
+        );
+        assert_eq!(
+            super::directory_index_loading_label(0.75),
+            "Indexing files..."
+        );
+        assert_eq!(super::directory_index_loading_label(1.0), "Indexing files");
+    }
+
+    #[test]
+    fn symlinked_directories_do_not_recurse() {
+        assert!(super::should_descend_into_directory(true, false));
+        assert!(!super::should_descend_into_directory(true, true));
+        assert!(!super::should_descend_into_directory(false, false));
     }
 
     #[test]
