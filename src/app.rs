@@ -3211,6 +3211,7 @@ impl AdeApp {
             .movable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .min_width(380.0)
+            .max_height((ctx.screen_rect().height() - 80.0).max(360.0))
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new("Application Settings")
@@ -3291,131 +3292,141 @@ impl AdeApp {
                 let mut project_ids = self.projects.keys().copied().collect::<Vec<_>>();
                 project_ids.sort_unstable();
 
-                if project_ids.is_empty() {
-                    ui.label(
-                        RichText::new("Add a project to manage saved messages.").color(TEXT_MUTED),
-                    );
-                }
-
-                for project_id in project_ids {
-                    let Some(project_snapshot) = self.projects.get(&project_id).cloned() else {
-                        continue;
-                    };
-
-                    let mut add_message: Option<String> = None;
-                    let mut remove_message_index: Option<usize> = None;
-                    let mut send_message_request: Option<String> = None;
-                    let send_target_terminal = self.preferred_terminal_for_project(project_id);
-
-                    egui::CollapsingHeader::new(format!(
-                        "{} {}",
-                        icons::FOLDER_OPEN,
-                        project_snapshot.name
-                    ))
-                    .id_salt(format!("settings-saved-messages-{project_id}"))
-                    .default_open(self.selected_project == Some(project_id))
-                    .icon(paint_minimal_disclosure_icon)
+                egui::ScrollArea::vertical()
+                    .id_salt("settings-saved-messages-scroll")
+                    .max_height(ui.available_height().max(180.0))
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        if project_snapshot.saved_messages.is_empty() {
+                        if project_ids.is_empty() {
                             ui.label(
-                                RichText::new("No saved messages for this project.")
+                                RichText::new("Add a project to manage saved messages.")
                                     .color(TEXT_MUTED),
-                            );
-                        } else if send_target_terminal.is_none() {
-                            ui.label(
-                                RichText::new(
-                                    "Open a live terminal in this project to send messages one by one.",
-                                )
-                                .color(TEXT_MUTED),
                             );
                         }
 
-                        for (index, message) in project_snapshot.saved_messages.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                let message_label = ui.add(
-                                    egui::Label::new(RichText::new(message).monospace().small())
-                                        .truncate(),
-                                );
-                                let _ = with_truncation_tooltip(
-                                    ui,
-                                    message_label,
-                                    message,
-                                    &egui::TextStyle::Monospace.resolve(ui.style()),
-                                    TEXT_PRIMARY,
-                                );
+                        for project_id in project_ids {
+                            let Some(project_snapshot) = self.projects.get(&project_id).cloned() else {
+                                continue;
+                            };
 
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let mut add_message: Option<String> = None;
+                            let mut remove_message_index: Option<usize> = None;
+                            let mut send_message_request: Option<String> = None;
+                            let send_target_terminal = self.preferred_terminal_for_project(project_id);
+
+                            egui::CollapsingHeader::new(format!(
+                                "{} {}",
+                                icons::FOLDER_OPEN,
+                                project_snapshot.name
+                            ))
+                            .id_salt(format!("settings-saved-messages-{project_id}"))
+                            .default_open(self.selected_project == Some(project_id))
+                            .icon(paint_minimal_disclosure_icon)
+                            .show(ui, |ui| {
+                                if project_snapshot.saved_messages.is_empty() {
+                                    ui.label(
+                                        RichText::new("No saved messages for this project.")
+                                            .color(TEXT_MUTED),
+                                    );
+                                } else if send_target_terminal.is_none() {
+                                    ui.label(
+                                        RichText::new(
+                                            "Open a live terminal in this project to send messages one by one.",
+                                        )
+                                        .color(TEXT_MUTED),
+                                    );
+                                }
+
+                                for (index, message) in project_snapshot.saved_messages.iter().enumerate()
+                                {
+                                    ui.horizontal(|ui| {
+                                        let message_label = ui.add(
+                                            egui::Label::new(
+                                                RichText::new(message).monospace().small(),
+                                            )
+                                            .truncate(),
+                                        );
+                                        let _ = with_truncation_tooltip(
+                                            ui,
+                                            message_label,
+                                            message,
+                                            &egui::TextStyle::Monospace.resolve(ui.style()),
+                                            TEXT_PRIMARY,
+                                        );
+
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            if styled_icon_button(
+                                                ui,
+                                                icons::TRASH,
+                                                BTN_RED,
+                                                BTN_RED_HOVER,
+                                                Color32::from_rgb(186, 58, 58),
+                                                "Remove message",
+                                            ) {
+                                                remove_message_index = Some(index);
+                                            }
+
+                                            if let Some(_terminal_id) = send_target_terminal {
+                                                if styled_icon_button(
+                                                    ui,
+                                                    icons::TERMINAL,
+                                                    BTN_BLUE,
+                                                    BTN_BLUE_HOVER,
+                                                    BTN_ICON_ACTIVE,
+                                                    "Send message",
+                                                ) {
+                                                    send_message_request = Some(message.clone());
+                                                }
+                                            }
+                                        });
+                                    });
+                                }
+
+                                ui.horizontal(|ui| {
+                                    let draft = self.saved_message_drafts.entry(project_id).or_default();
+                                    ui.add(
+                                        egui::TextEdit::singleline(draft)
+                                            .id(Self::saved_message_draft_input_id(project_id)),
+                                    );
                                     if styled_icon_button(
                                         ui,
-                                        icons::TRASH,
-                                        BTN_RED,
-                                        BTN_RED_HOVER,
-                                        Color32::from_rgb(186, 58, 58),
-                                        "Remove message",
+                                        icons::PLUS,
+                                        BTN_BLUE,
+                                        BTN_BLUE_HOVER,
+                                        BTN_ICON_ACTIVE,
+                                        "Add message",
                                     ) {
-                                        remove_message_index = Some(index);
-                                    }
-
-                                    if let Some(_terminal_id) = send_target_terminal {
-                                        if styled_icon_button(
-                                            ui,
-                                            icons::TERMINAL,
-                                            BTN_BLUE,
-                                            BTN_BLUE_HOVER,
-                                            BTN_ICON_ACTIVE,
-                                            "Send message",
-                                        ) {
-                                            send_message_request = Some(message.clone());
+                                        let text = draft.trim();
+                                        if !text.is_empty() {
+                                            add_message = Some(text.to_owned());
+                                            draft.clear();
                                         }
                                     }
                                 });
                             });
-                        }
 
-                        ui.horizontal(|ui| {
-                            let draft = self.saved_message_drafts.entry(project_id).or_default();
-                            ui.add(
-                                egui::TextEdit::singleline(draft)
-                                    .id(Self::saved_message_draft_input_id(project_id)),
-                            );
-                            if styled_icon_button(
-                                ui,
-                                icons::PLUS,
-                                BTN_BLUE,
-                                BTN_BLUE_HOVER,
-                                BTN_ICON_ACTIVE,
-                                "Add message",
-                            ) {
-                                let text = draft.trim();
-                                if !text.is_empty() {
-                                    add_message = Some(text.to_owned());
-                                    draft.clear();
+                            if let Some(project) = self.projects.get_mut(&project_id) {
+                                if let Some(message) = add_message {
+                                    project.saved_messages.push(message);
+                                    should_persist = true;
+                                    projects_changed = true;
+                                }
+                                if let Some(index) = remove_message_index {
+                                    if index < project.saved_messages.len() {
+                                        project.saved_messages.remove(index);
+                                        should_persist = true;
+                                        projects_changed = true;
+                                    }
                                 }
                             }
-                        });
-                    });
 
-                    if let Some(project) = self.projects.get_mut(&project_id) {
-                        if let Some(message) = add_message {
-                            project.saved_messages.push(message);
-                            should_persist = true;
-                            projects_changed = true;
-                        }
-                        if let Some(index) = remove_message_index {
-                            if index < project.saved_messages.len() {
-                                project.saved_messages.remove(index);
-                                should_persist = true;
-                                projects_changed = true;
+                            if let (Some(terminal_id), Some(message)) =
+                                (send_target_terminal, send_message_request)
+                            {
+                                self.send_saved_message_to_terminal(terminal_id, &message);
                             }
                         }
-                    }
-
-                    if let (Some(terminal_id), Some(message)) =
-                        (send_target_terminal, send_message_request)
-                    {
-                        self.send_saved_message_to_terminal(terminal_id, &message);
-                    }
-                }
+                    });
 
             });
 
