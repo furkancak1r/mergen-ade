@@ -100,7 +100,6 @@ if [[ "${sign_and_notarize}" == "1" ]]; then
     codesign --force --timestamp --options runtime --sign "${MACOS_CODESIGN_IDENTITY}" "${macos_dir}/Mergen ADE"
     codesign --force --timestamp --options runtime --sign "${MACOS_CODESIGN_IDENTITY}" "${app_dir}"
     codesign --verify --deep --strict --verbose=2 "${app_dir}"
-    spctl -a -vv --type exec "${app_dir}"
 fi
 
 cp -R "${app_dir}" "${dmg_root}/"

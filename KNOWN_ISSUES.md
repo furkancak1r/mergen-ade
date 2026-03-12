@@ -250,3 +250,17 @@
   - Upload notarization diagnostics on failure so rejected submissions can be debugged before the next tag.
 - Files/Commands touched: `.github/workflows/release.yml`, `scripts/package-macos-release.sh`, `README.md`, `AGENTS.md`, `KNOWN_ISSUES.md`
 - References: release `https://github.com/furkancak1r/mergen-ade/releases/tag/v0.1.4`; run `https://github.com/furkancak1r/mergen-ade/actions/runs/23000428561`
+
+#### Pre-notarization spctl check rejected the signed app bundle {#pre-notarization-spctl-check-rejected-the-signed-app-bundle}
+- Date: 2026-03-12T14:48:05Z
+- Context: main/local macOS release rerun after PKCS#12 import fix, GitHub Actions run `23005915477`
+- Error signature: `Mergen ADE.app: rejected` / `source=Unnotarized Developer ID`
+- Symptoms/Impact: After PKCS#12 import was fixed, the macOS job still failed before notarization, so `v0.1.5` could not publish a DMG even though signing credentials were valid.
+- Root cause: `scripts/package-macos-release.sh` ran `spctl` against the signed `.app` before `notarytool` submission, but Gatekeeper assessment at that point correctly sees an unnotarized Developer ID app and rejects it.
+- Resolution: Local workspace fix removes the pre-notarization `spctl` app check, keeps `codesign --verify` before notarization, and leaves the final Gatekeeper-style `spctl --type open` validation on the stapled DMG after notarization.
+- Prevent recurrence:
+  - Use `codesign --verify` for pre-notarization signature checks and reserve `spctl` for post-notarization validation.
+  - Keep the final Gatekeeper assessment on the distribution artifact that users download, not on a still-unnotarized intermediate app bundle.
+  - Treat each failed release rerun as a new diagnostic data point and append the exact Apple rejection string for future regressions.
+- Files/Commands touched: `scripts/package-macos-release.sh`, `README.md`, `KNOWN_ISSUES.md`, `gh run view 23005915477 --log-failed`
+- References: run `https://github.com/furkancak1r/mergen-ade/actions/runs/23005915477`; failed macOS job in attempt 3 for tag `v0.1.5`

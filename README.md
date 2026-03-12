@@ -130,7 +130,7 @@ Regression check:
 powershell -ExecutionPolicy Bypass -File .\scripts\__tests__\build-release.tests.ps1
 ```
 
-For macOS release packaging, GitHub Actions builds `aarch64-apple-darwin`, wraps the binary in a minimal `.app`, signs it with a Developer ID Application certificate, notarizes the DMG through `notarytool`, and staples the notarization ticket onto the DMG before publishing. The same script can still package locally without signing when the Apple credentials are not provided.
+For macOS release packaging, GitHub Actions builds `aarch64-apple-darwin`, wraps the binary in a minimal `.app`, signs it with a Developer ID Application certificate, notarizes the DMG through `notarytool`, staples the notarization ticket onto the DMG, and only then runs the final Gatekeeper-style DMG assessment before publishing. The same script can still package locally without signing when the Apple credentials are not provided.
 
 ## GitHub Releases
 
