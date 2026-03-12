@@ -27,14 +27,15 @@ pub fn load_config(path: &Path) -> io::Result<AppConfig> {
     }
 
     let text = fs::read_to_string(path)?;
-    if let Ok(parsed) = toml::from_str::<AppConfig>(&text) {
-        return Ok(parsed);
-    }
-
-    let legacy = toml::from_str::<LegacyAppConfig>(&text)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-
-    Ok(legacy.into())
+    let mut config = if let Ok(parsed) = toml::from_str::<AppConfig>(&text) {
+        parsed
+    } else {
+        let legacy = toml::from_str::<LegacyAppConfig>(&text)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        legacy.into()
+    };
+    normalize_config_for_current_platform(&mut config);
+    Ok(config)
 }
 
 pub fn save_config(path: &Path, config: &AppConfig) -> io::Result<()> {
@@ -107,10 +108,14 @@ const fn default_config_version() -> u32 {
     1
 }
 
+fn normalize_config_for_current_platform(config: &mut AppConfig) {
+    config.default_shell = config.default_shell.normalize_for_current_platform();
+}
+
 #[cfg(test)]
 mod tests {
     use super::load_config;
-    use crate::models::ShellKind;
+    use crate::models::{AppConfig, ShellKind};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -134,10 +139,52 @@ path = "C:/work/demo"
 
         let config = load_config(&path).expect("should load config");
 
-        assert_eq!(config.default_shell, ShellKind::PowerShell);
+        assert_eq!(
+            config.default_shell,
+            ShellKind::PowerShell.normalize_for_current_platform()
+        );
         assert_eq!(config.projects.len(), 1);
         assert_eq!(config.projects[0].name, "Demo");
         assert!(config.projects[0].saved_messages.is_empty());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn normalizes_default_shell_for_current_platform() {
+        let mut config = AppConfig {
+            default_shell: ShellKind::PowerShell,
+            ..AppConfig::default()
+        };
+
+        super::normalize_config_for_current_platform(&mut config);
+
+        #[cfg(target_os = "windows")]
+        assert_eq!(config.default_shell, ShellKind::PowerShell);
+
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(config.default_shell, ShellKind::Zsh);
+    }
+
+    #[test]
+    fn missing_default_shell_uses_platform_default() {
+        let path = unique_temp_path("missing-default-shell");
+        fs::write(
+            &path,
+            r#"
+version = 1
+
+[[projects]]
+id = 7
+name = "Demo"
+path = "C:/work/demo"
+"#,
+        )
+        .expect("should write config");
+
+        let config = load_config(&path).expect("should load config");
+
+        assert_eq!(config.default_shell, ShellKind::default());
 
         let _ = fs::remove_file(path);
     }

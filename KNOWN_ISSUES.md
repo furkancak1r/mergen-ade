@@ -194,3 +194,17 @@
   - Keep script tests that lock repo-local target pinning before `cargo clean` and `cargo build`.
 - Files/Commands touched: `KNOWN_ISSUES.md`, `scripts/build-release.ps1`, `scripts/__tests__/build-release.tests.ps1`, `powershell -ExecutionPolicy Bypass -File .\scripts\__tests__\build-release.tests.ps1`, `powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1`
 - References: commit `58e0593` (`Düzelt terminal kopyalama bildirimini ve sağ tık yapıştırma davranışını`); local workspace release-script follow-up fix pending
+
+#### macOS release packaging would have shipped a broken app experience {#macos-release-packaging-would-have-shipped-a-broken-app-experience}
+- Date: 2026-03-12T13:30:00Z
+- Context: main/local cross-platform release workflow review
+- Error signature: `A future macOS DMG could build, but the app would still try to spawn Windows shells and open Explorer.`
+- Symptoms/Impact: A published macOS asset would have launched into a partially unusable app: default terminal startup could fail because `powershell.exe`/`cmd.exe` do not exist on macOS, and file reveal actions would fail because `explorer.exe` is Windows-only.
+- Root cause: The repo was Windows-first in both CI and runtime assumptions. `ShellKind` only modeled Windows shells, and `open_in_file_explorer` hard-coded `explorer.exe` without platform branching.
+- Resolution: Local workspace fix added platform-aware shell defaults and shell normalization, switched macOS to `zsh`, made file reveal/open commands platform-specific, and reworked GitHub Releases into artifact-based Windows-plus-best-effort-macOS packaging with an unsigned ARM64 DMG path.
+- Prevent recurrence:
+  - Do not publish a new platform artifact unless the app's default runtime path is valid on that platform.
+  - Keep pure command-construction tests for platform-specific shell and explorer/open behavior.
+  - Keep optional release jobs artifact-based so experimental platform packaging can fail without blocking the primary release asset.
+- Files/Commands touched: `src/models.rs`, `src/config.rs`, `src/app.rs`, `.github/workflows/release.yml`, `scripts/package-macos-release.sh`, `README.md`, `KNOWN_ISSUES.md`
+- References: local workspace change on 2026-03-12; commit pending

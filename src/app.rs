@@ -3530,16 +3530,13 @@ impl AdeApp {
                     .selected_text(self.config.default_shell.label())
                     .width(200.0)
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.config.default_shell,
-                            ShellKind::PowerShell,
-                            ShellKind::PowerShell.label(),
-                        );
-                        ui.selectable_value(
-                            &mut self.config.default_shell,
-                            ShellKind::Cmd,
-                            ShellKind::Cmd.label(),
-                        );
+                        for shell in ShellKind::available_for_current_platform() {
+                            ui.selectable_value(
+                                &mut self.config.default_shell,
+                                *shell,
+                                shell.label(),
+                            );
+                        }
                     });
                 if self.config.default_shell != previous_shell {
                     should_persist = true;
@@ -4149,16 +4146,45 @@ fn directory_index_loading_label(time_secs: f64) -> String {
 }
 
 fn open_in_file_explorer(path: &Path, select_file: bool) -> Result<(), String> {
-    let mut command = Command::new("explorer.exe");
-    if select_file {
-        command.arg("/select,").arg(path);
-    } else {
-        command.arg(path);
-    }
+    let (program, args) = file_explorer_command(path, select_file);
+    let mut command = Command::new(program);
+    command.args(args);
 
     match command.spawn() {
         Ok(_) => Ok(()),
         Err(err) => Err(err.to_string()),
+    }
+}
+
+fn file_explorer_command(path: &Path, select_file: bool) -> (&'static str, Vec<OsString>) {
+    #[cfg(target_os = "windows")]
+    {
+        let args = if select_file {
+            vec![OsString::from("/select,"), path.as_os_str().to_owned()]
+        } else {
+            vec![path.as_os_str().to_owned()]
+        };
+        ("explorer.exe", args)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut args = Vec::new();
+        if select_file {
+            args.push(OsString::from("-R"));
+        }
+        args.push(path.as_os_str().to_owned());
+        ("open", args)
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        let target = if select_file {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        };
+        ("xdg-open", vec![target.as_os_str().to_owned()])
     }
 }
 
@@ -7064,7 +7090,7 @@ mod tests {
             },
         );
 
-        assert_eq!(recovered.default_shell, ShellKind::PowerShell);
+        assert_eq!(recovered.default_shell, ShellKind::default());
         assert_eq!(
             recovered.ui.auto_tile_scope,
             AutoTileScope::SelectedProjectOnly
@@ -7442,6 +7468,34 @@ mod tests {
         {
             assert_eq!(program, "xdg-open");
             assert_eq!(args, vec!["C:\\temp\\notes.txt"]);
+        }
+    }
+
+    #[test]
+    fn file_explorer_command_matches_platform_convention() {
+        let path = PathBuf::from("/tmp/notes.txt");
+        let (program, args) = super::file_explorer_command(&path, true);
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(program, "explorer.exe");
+            assert_eq!(args, vec!["/select,", "/tmp/notes.txt"]);
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(program, "open");
+            assert_eq!(args, vec!["-R", "/tmp/notes.txt"]);
+        }
+
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        {
+            assert_eq!(program, "xdg-open");
+            assert_eq!(args, vec!["/tmp"]);
         }
     }
 

@@ -2,15 +2,15 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShellKind {
-    #[default]
     #[serde(alias = "powershell")]
     #[serde(alias = "PowerShell")]
     #[serde(alias = "powerShell")]
     PowerShell,
     Cmd,
+    Zsh,
 }
 
 impl ShellKind {
@@ -18,6 +18,7 @@ impl ShellKind {
         match self {
             Self::PowerShell => "PowerShell",
             Self::Cmd => "CMD",
+            Self::Zsh => "zsh",
         }
     }
 
@@ -25,7 +26,58 @@ impl ShellKind {
         match self {
             Self::PowerShell => ("powershell.exe", &["-NoLogo"]),
             Self::Cmd => ("cmd.exe", &[]),
+            Self::Zsh => ("zsh", &["-l"]),
         }
+    }
+
+    pub const fn default_for_current_platform() -> Self {
+        #[cfg(target_os = "windows")]
+        {
+            Self::PowerShell
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            Self::Zsh
+        }
+    }
+
+    pub const fn supported_on_current_platform(self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            matches!(self, Self::PowerShell | Self::Cmd)
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            matches!(self, Self::Zsh)
+        }
+    }
+
+    pub const fn normalize_for_current_platform(self) -> Self {
+        if self.supported_on_current_platform() {
+            self
+        } else {
+            Self::default_for_current_platform()
+        }
+    }
+
+    pub fn available_for_current_platform() -> &'static [Self] {
+        #[cfg(target_os = "windows")]
+        {
+            &[Self::PowerShell, Self::Cmd]
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            &[Self::Zsh]
+        }
+    }
+}
+
+impl Default for ShellKind {
+    fn default() -> Self {
+        Self::default_for_current_platform()
     }
 }
 
@@ -132,9 +184,38 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             version: 1,
-            default_shell: ShellKind::PowerShell,
+            default_shell: ShellKind::default(),
             ui: UiConfig::default(),
             projects: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ShellKind;
+
+    #[test]
+    fn shell_kind_default_matches_platform() {
+        #[cfg(target_os = "windows")]
+        assert_eq!(ShellKind::default(), ShellKind::PowerShell);
+
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(ShellKind::default(), ShellKind::Zsh);
+    }
+
+    #[test]
+    fn shell_kind_available_list_matches_platform() {
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            ShellKind::available_for_current_platform(),
+            &[ShellKind::PowerShell, ShellKind::Cmd]
+        );
+
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            ShellKind::available_for_current_platform(),
+            &[ShellKind::Zsh]
+        );
     }
 }

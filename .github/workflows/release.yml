@@ -9,8 +9,8 @@ permissions:
   contents: write
 
 jobs:
-  release-windows:
-    name: Build and Publish Windows Release
+  build-windows:
+    name: Build Windows Release
     runs-on: windows-latest
 
     steps:
@@ -40,10 +40,74 @@ jobs:
           Compress-Archive -Path "$staging/*" -DestinationPath $assetName
           "asset_name=$assetName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: ${{ steps.package.outputs.asset_name }}
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS Release
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust (stable macOS host)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Build macOS ARM64 binary
+        id: build
+        continue-on-error: true
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Package unsigned DMG
+        id: package
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: bash ./scripts/package-macos-release.sh "${{ github.ref_name }}"
+
+      - name: Upload macOS release artifact
+        if: steps.package.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: ${{ steps.package.outputs.asset_path }}
+          if-no-files-found: error
+
+      - name: Summarize skipped macOS asset
+        if: steps.build.outcome != 'success' || steps.package.outcome == 'failure'
+        run: |
+          echo "macOS DMG was skipped; the Windows release remains publishable." >> "$GITHUB_STEP_SUMMARY"
+          echo "Unsigned notarization-free packaging is best-effort in this workflow." >> "$GITHUB_STEP_SUMMARY"
+
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - build-windows
+      - build-macos
+    if: needs.build-windows.result == 'success'
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Show packaged assets
+        run: ls -al release-assets
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.package.outputs.asset_name }}
+          files: release-assets/*
           generate_release_notes: true
           draft: false
           prerelease: false
