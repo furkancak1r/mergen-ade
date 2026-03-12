@@ -1,5 +1,19 @@
 ### Known Issues & Fix Log
 
+#### Source Control panel and terminal chrome could show stale git status until manual refresh {#source-control-panel-and-terminal-chrome-could-show-stale-git-status-until-manual-refresh}
+- Date: 2026-03-11T00:00:00Z
+- Context: main/Windows local source-control sidebar + terminal chrome status UX
+- Error signature: `Source Control`, terminal headers, and Terminal Manager rows only refreshed git state on first open or explicit button clicks.
+- Symptoms/Impact: Changed files, clean/dirty state, and branch indicators could remain stale across projects until the user manually pressed refresh, and there was no lightweight shared status signal in terminal chrome.
+- Root cause: Each source-control refresh spawned an ad hoc thread from the UI path, there was no central scheduler for background status updates, and terminal surfaces did not consume shared project-level git snapshots.
+- Resolution: Replaced per-refresh thread spawning with one shared source-control worker plus priority round-robin background scheduling, kept manual refresh/fetch buttons, and reused the same per-project snapshot cache for Source Control, terminal headers, and Terminal Manager git badges with lazy hover details.
+- Prevent recurrence:
+  - Keep source-control refresh orchestration centralized instead of spawning UI-driven one-off worker threads.
+  - Reuse project-level git snapshots across all surfaces that visualize repository state.
+  - Keep automatic background refresh limited to `git status`; leave `git fetch` manual unless a deliberate product change requires otherwise.
+  - Verify selected project priority and tooltip truncation with unit tests whenever source-control UI is changed.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo test`
+
 #### Portable release flow switched to single EXE MSVC output {#portable-release-flow-switched-to-single-exe-msvc-output}
 - Date: 2026-03-09T00:00:00Z
 - Context: main/Windows release packaging refresh

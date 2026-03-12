@@ -42,6 +42,10 @@ const TERMINAL_CHAR_WIDTH_SAMPLE_CELLS: usize = 64;
 const CURSOR_BAR_WIDTH_PX: f32 = 2.0;
 const CURSOR_UNDERLINE_HEIGHT_PX: f32 = 2.0;
 const DIRECTORY_INDEX_LOADING_ANIMATION_STEP_SECS: f64 = 0.25;
+const SOURCE_CONTROL_PRIORITY_REFRESH_SECS: f64 = 5.0;
+const SOURCE_CONTROL_BACKGROUND_REFRESH_SECS: f64 = 20.0;
+const SOURCE_CONTROL_POLL_TICK_MS: u64 = 250;
+const SOURCE_CONTROL_TOOLTIP_FILE_LIMIT: usize = 12;
 const TERMINAL_OUTPUT_BG: Color32 = Color32::from_rgb(26, 30, 36);
 const TERMINAL_HEADER_HEIGHT: f32 = 38.0;
 const TERMINAL_HEADER_GAP: f32 = 6.0;
@@ -231,9 +235,12 @@ pub struct AdeApp {
     window_hwnd: Option<isize>,
     #[cfg(target_os = "windows")]
     window_layout_passes_remaining: u8,
-    source_control_events_tx: Sender<SourceControlEvent>,
+    source_control_commands_tx: Sender<SourceControlCommand>,
     source_control_events_rx: Receiver<SourceControlEvent>,
     source_control_state: BTreeMap<u64, SourceControlSnapshot>,
+    source_control_refresh_state: BTreeMap<u64, SourceControlRefreshState>,
+    source_control_worker_busy: bool,
+    source_control_last_auto_refresh_project: Option<u64>,
     directory_index_events_tx: Sender<DirectoryIndexEvent>,
     directory_index_events_rx: Receiver<DirectoryIndexEvent>,
     directory_index_state: BTreeMap<u64, DirectoryIndexSnapshot>,
@@ -340,6 +347,45 @@ struct SourceControlEvent {
     snapshot: SourceControlSnapshot,
 }
 
+#[derive(Debug)]
+struct SourceControlCommand {
+    project_id: u64,
+    project_path: PathBuf,
+    run_fetch: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SourceControlRefreshState {
+    queued: bool,
+    queued_manual: bool,
+    queued_fetch: bool,
+    in_flight: bool,
+    last_completed_at: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SourceControlDispatchPriority {
+    ManualFetch,
+    ManualStatus,
+    PriorityAuto,
+    BackgroundAuto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceControlBadgeState {
+    Unknown,
+    Loading,
+    Dirty,
+    Clean,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct SourceControlBadgeModel {
+    state: SourceControlBadgeState,
+    tooltip_lines: Vec<String>,
+}
+
 struct TerminalRenderModel {
     layout_job: LayoutJob,
     cursor_overlay: Option<TerminalCursorOverlay>,
@@ -413,8 +459,11 @@ impl AdeApp {
             .or_else(|| projects.keys().next().copied());
 
         let (terminal_events_tx, terminal_events_rx) = crossbeam_channel::unbounded();
+        let (source_control_commands_tx, source_control_commands_rx) =
+            crossbeam_channel::unbounded();
         let (source_control_events_tx, source_control_events_rx) = crossbeam_channel::unbounded();
         let (directory_index_events_tx, directory_index_events_rx) = crossbeam_channel::unbounded();
+        spawn_source_control_worker(source_control_commands_rx, source_control_events_tx.clone());
 
         let app = Self {
             config_path,
@@ -445,9 +494,12 @@ impl AdeApp {
             window_hwnd,
             #[cfg(target_os = "windows")]
             window_layout_passes_remaining: 8,
-            source_control_events_tx,
+            source_control_commands_tx,
             source_control_events_rx,
             source_control_state: BTreeMap::new(),
+            source_control_refresh_state: BTreeMap::new(),
+            source_control_worker_busy: false,
+            source_control_last_auto_refresh_project: None,
             directory_index_events_tx,
             directory_index_events_rx,
             directory_index_state: BTreeMap::new(),
@@ -726,7 +778,13 @@ impl AdeApp {
 
     fn process_source_control_events(&mut self, ctx: &egui::Context) {
         let mut changed = false;
+        let completed_at = ctx.input(|input| input.time);
         while let Ok(event) = self.source_control_events_rx.try_recv() {
+            if let Some(state) = self.source_control_refresh_state.get_mut(&event.project_id) {
+                state.in_flight = false;
+                state.last_completed_at = Some(completed_at);
+            }
+            self.source_control_worker_busy = false;
             self.source_control_state
                 .insert(event.project_id, event.snapshot);
             changed = true;
@@ -736,10 +794,10 @@ impl AdeApp {
         }
     }
 
-    fn request_source_control_refresh(&mut self, project_id: u64, run_fetch: bool) {
-        let Some(project) = self.projects.get(&project_id).cloned() else {
+    fn request_source_control_refresh(&mut self, project_id: u64, run_fetch: bool, manual: bool) {
+        if !self.projects.contains_key(&project_id) {
             return;
-        };
+        }
 
         self.source_control_state
             .entry(project_id)
@@ -752,14 +810,205 @@ impl AdeApp {
                 ..SourceControlSnapshot::default()
             });
 
-        let tx = self.source_control_events_tx.clone();
-        std::thread::spawn(move || {
-            let snapshot = collect_source_control_snapshot(&project.path, run_fetch);
-            let _ = tx.send(SourceControlEvent {
-                project_id,
-                snapshot,
-            });
+        let state = self
+            .source_control_refresh_state
+            .entry(project_id)
+            .or_default();
+        state.queued = true;
+        state.queued_manual |= manual;
+        state.queued_fetch |= run_fetch;
+    }
+
+    fn source_control_refresh_priority(&self, project_id: u64) -> SourceControlDispatchPriority {
+        let Some(state) = self.source_control_refresh_state.get(&project_id) else {
+            return if self.is_priority_source_control_project(project_id) {
+                SourceControlDispatchPriority::PriorityAuto
+            } else {
+                SourceControlDispatchPriority::BackgroundAuto
+            };
+        };
+        if state.queued_fetch {
+            SourceControlDispatchPriority::ManualFetch
+        } else if state.queued_manual {
+            SourceControlDispatchPriority::ManualStatus
+        } else if self.is_priority_source_control_project(project_id) {
+            SourceControlDispatchPriority::PriorityAuto
+        } else {
+            SourceControlDispatchPriority::BackgroundAuto
+        }
+    }
+
+    fn is_priority_source_control_project(&self, project_id: u64) -> bool {
+        self.selected_project == Some(project_id)
+            || self
+                .terminals
+                .values()
+                .any(|terminal| terminal.project_id == project_id && !terminal.exited)
+    }
+
+    fn source_control_refresh_interval_secs(&self, project_id: u64) -> f64 {
+        if self.is_priority_source_control_project(project_id) {
+            SOURCE_CONTROL_PRIORITY_REFRESH_SECS
+        } else {
+            SOURCE_CONTROL_BACKGROUND_REFRESH_SECS
+        }
+    }
+
+    fn source_control_next_due_at(&self, project_id: u64) -> f64 {
+        self.source_control_refresh_state
+            .get(&project_id)
+            .and_then(|state| state.last_completed_at)
+            .map(|time| time + self.source_control_refresh_interval_secs(project_id))
+            .unwrap_or(0.0)
+    }
+
+    fn source_control_rotation_key(&self, project_id: u64) -> u64 {
+        match self.source_control_last_auto_refresh_project {
+            Some(last) if project_id > last => project_id,
+            Some(_) => project_id.saturating_add(u64::MAX / 2),
+            None => project_id,
+        }
+    }
+
+    fn next_due_auto_source_control_project(&self, now: f64) -> Option<u64> {
+        let mut priority_due = Vec::new();
+        let mut background_due = Vec::new();
+
+        for project_id in self.projects.keys().copied() {
+            let state = self
+                .source_control_refresh_state
+                .get(&project_id)
+                .copied()
+                .unwrap_or_default();
+            if state.queued || state.in_flight {
+                continue;
+            }
+
+            if self.source_control_next_due_at(project_id) > now {
+                continue;
+            }
+
+            if self.is_priority_source_control_project(project_id) {
+                priority_due.push(project_id);
+            } else {
+                background_due.push(project_id);
+            }
+        }
+
+        priority_due.sort_by_key(|project_id| self.source_control_rotation_key(*project_id));
+        background_due.sort_by_key(|project_id| self.source_control_rotation_key(*project_id));
+        priority_due
+            .into_iter()
+            .next()
+            .or_else(|| background_due.into_iter().next())
+    }
+
+    fn source_control_has_queued_requests(&self) -> bool {
+        self.source_control_refresh_state
+            .values()
+            .any(|state| state.queued)
+    }
+
+    fn prune_source_control_state(&mut self) {
+        self.source_control_state
+            .retain(|project_id, _| self.projects.contains_key(project_id));
+        self.source_control_refresh_state
+            .retain(|project_id, _| self.projects.contains_key(project_id));
+        if self
+            .source_control_last_auto_refresh_project
+            .is_some_and(|project_id| !self.projects.contains_key(&project_id))
+        {
+            self.source_control_last_auto_refresh_project = None;
+        }
+    }
+
+    fn dispatch_next_source_control_request(&mut self) {
+        if self.source_control_worker_busy {
+            return;
+        }
+
+        let mut candidates = self
+            .projects
+            .keys()
+            .copied()
+            .filter(|project_id| {
+                self.source_control_refresh_state
+                    .get(project_id)
+                    .is_some_and(|state| state.queued)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|project_id| {
+            (
+                self.source_control_refresh_priority(*project_id),
+                self.source_control_rotation_key(*project_id),
+            )
         });
+
+        let Some(project_id) = candidates.into_iter().next() else {
+            return;
+        };
+        let Some(project) = self.projects.get(&project_id).cloned() else {
+            return;
+        };
+        let Some(state) = self.source_control_refresh_state.get_mut(&project_id) else {
+            return;
+        };
+
+        let run_fetch = state.queued_fetch;
+        state.queued = false;
+        state.queued_manual = false;
+        state.queued_fetch = false;
+        state.in_flight = true;
+        self.source_control_worker_busy = true;
+
+        let _ = self.source_control_commands_tx.send(SourceControlCommand {
+            project_id,
+            project_path: project.path,
+            run_fetch,
+        });
+    }
+
+    fn schedule_source_control_refresh(&mut self, ctx: &egui::Context) {
+        self.prune_source_control_state();
+        let now = ctx.input(|input| input.time);
+
+        if !self.source_control_has_queued_requests() {
+            if let Some(project_id) = self.next_due_auto_source_control_project(now) {
+                self.request_source_control_refresh(project_id, false, false);
+                self.source_control_last_auto_refresh_project = Some(project_id);
+            }
+        }
+
+        self.dispatch_next_source_control_request();
+
+        if self.source_control_worker_busy || self.source_control_has_queued_requests() {
+            ctx.request_repaint_after(Duration::from_millis(SOURCE_CONTROL_POLL_TICK_MS));
+            return;
+        }
+
+        let mut next_due = None::<f64>;
+        for project_id in self.projects.keys().copied() {
+            let state = self
+                .source_control_refresh_state
+                .get(&project_id)
+                .copied()
+                .unwrap_or_default();
+            if state.in_flight || state.queued {
+                continue;
+            }
+
+            let due_at = self.source_control_next_due_at(project_id);
+            next_due = Some(match next_due {
+                Some(existing) => existing.min(due_at),
+                None => due_at,
+            });
+        }
+
+        let Some(next_due) = next_due else {
+            return;
+        };
+        let delay_secs = (next_due - now).max(0.0);
+        ctx.request_repaint_after(Duration::from_secs_f64(delay_secs));
     }
 
     fn process_directory_index_events(&mut self, ctx: &egui::Context) {
@@ -2218,14 +2467,14 @@ impl AdeApp {
                         };
 
                         if !self.source_control_state.contains_key(&project_id) {
-                            self.request_source_control_refresh(project_id, false);
+                            self.request_source_control_refresh(project_id, false, false);
                         }
 
                         if refresh_status {
-                            self.request_source_control_refresh(project_id, false);
+                            self.request_source_control_refresh(project_id, false, true);
                         }
                         if fetch_and_refresh {
-                            self.request_source_control_refresh(project_id, true);
+                            self.request_source_control_refresh(project_id, true, true);
                         }
                         if open_project_folder {
                             match open_in_file_explorer(&project.path, false) {
@@ -2487,6 +2736,8 @@ impl AdeApp {
             .map(|project| project.saved_messages.clone())
             .unwrap_or_default();
         let current_active = self.active_terminal;
+        let project_source_control_badge =
+            source_control_badge_model(self.source_control_state.get(&project_id));
 
         for terminal_id in ids {
             let mut set_active = false;
@@ -2521,15 +2772,19 @@ impl AdeApp {
                                 .max_rect(label_rect)
                                 .layout(Layout::left_to_right(Align::Center)),
                             |ui| {
+                                let badge_response =
+                                    draw_source_control_badge(ui, &project_source_control_badge);
+                                ui.add_space(4.0);
                                 let label_response =
                                     draw_truncated_selectable_label(ui, active, &label);
-                                with_truncation_tooltip(
+                                let label_response = with_truncation_tooltip(
                                     ui,
                                     label_response,
                                     &label,
                                     &title_font,
                                     TEXT_PRIMARY,
-                                )
+                                );
+                                label_response.union(badge_response)
                             },
                         )
                         .inner;
@@ -2744,12 +2999,25 @@ impl AdeApp {
     }
 
     fn draw_terminal_pane(&mut self, ui: &mut Ui, terminal_id: u64, pane_size: Vec2) {
-        let project_name = self
+        let (project_name, source_control_badge) = self
             .terminals
             .get(&terminal_id)
-            .and_then(|terminal| self.projects.get(&terminal.project_id))
-            .map(|project| project.name.clone())
-            .unwrap_or_else(|| "Unknown Project".to_owned());
+            .map(|terminal| {
+                let project_name = self
+                    .projects
+                    .get(&terminal.project_id)
+                    .map(|project| project.name.clone())
+                    .unwrap_or_else(|| "Unknown Project".to_owned());
+                let badge =
+                    source_control_badge_model(self.source_control_state.get(&terminal.project_id));
+                (project_name, badge)
+            })
+            .unwrap_or_else(|| {
+                (
+                    "Unknown Project".to_owned(),
+                    source_control_badge_model(None),
+                )
+            });
         let is_active = self.active_terminal == Some(terminal_id);
 
         let (clicked, close_requested, copied_selection, paste_requested) = {
@@ -2788,6 +3056,8 @@ impl AdeApp {
 
                         let indicator_color = if is_active { ACCENT } else { TEXT_MUTED };
                         draw_terminal_header_dot(ui, indicator_color);
+                        ui.add_space(4.0);
+                        draw_source_control_badge(ui, &source_control_badge);
                         ui.add_space(4.0);
                         let title = terminal_display_label(&terminal.title, terminal.exited);
                         let title_font = egui::TextStyle::Body.resolve(ui.style());
@@ -3461,6 +3731,7 @@ impl eframe::App for AdeApp {
         self.process_terminal_events(ctx);
         self.process_source_control_events(ctx);
         self.process_directory_index_events(ctx);
+        self.schedule_source_control_refresh(ctx);
         self.schedule_terminal_refresh(ctx);
         let mut terminal_events = self.take_buffered_terminal_input();
         terminal_events.extend(self.capture_active_terminal_input(ctx));
@@ -3620,6 +3891,24 @@ fn valid_selected_project(
     projects: &BTreeMap<u64, ProjectRecord>,
 ) -> Option<u64> {
     selected_project.filter(|project_id| projects.contains_key(project_id))
+}
+
+fn spawn_source_control_worker(rx: Receiver<SourceControlCommand>, tx: Sender<SourceControlEvent>) {
+    std::thread::spawn(move || {
+        while let Ok(command) = rx.recv() {
+            let snapshot =
+                collect_source_control_snapshot(&command.project_path, command.run_fetch);
+            if tx
+                .send(SourceControlEvent {
+                    project_id: command.project_id,
+                    snapshot,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
 }
 
 fn collect_source_control_snapshot(project_path: &Path, run_fetch: bool) -> SourceControlSnapshot {
@@ -4236,6 +4525,93 @@ fn with_truncation_tooltip(
     } else {
         response
     }
+}
+
+fn source_control_badge_state(snapshot: Option<&SourceControlSnapshot>) -> SourceControlBadgeState {
+    match snapshot {
+        None => SourceControlBadgeState::Unknown,
+        Some(snapshot) if snapshot.loading => SourceControlBadgeState::Loading,
+        Some(snapshot) if snapshot.last_error.is_some() => SourceControlBadgeState::Error,
+        Some(snapshot) if !snapshot.files.is_empty() => SourceControlBadgeState::Dirty,
+        Some(_) => SourceControlBadgeState::Clean,
+    }
+}
+
+fn source_control_badge_color(state: SourceControlBadgeState) -> Color32 {
+    match state {
+        SourceControlBadgeState::Unknown => TEXT_MUTED,
+        SourceControlBadgeState::Loading => ACCENT,
+        SourceControlBadgeState::Dirty => Color32::from_rgb(255, 184, 77),
+        SourceControlBadgeState::Clean => Color32::from_rgb(94, 196, 130),
+        SourceControlBadgeState::Error => Color32::from_rgb(224, 92, 92),
+    }
+}
+
+fn source_control_badge_model(snapshot: Option<&SourceControlSnapshot>) -> SourceControlBadgeModel {
+    match snapshot {
+        Some(snapshot) => SourceControlBadgeModel {
+            state: source_control_badge_state(Some(snapshot)),
+            tooltip_lines: source_control_tooltip_lines(
+                snapshot,
+                SOURCE_CONTROL_TOOLTIP_FILE_LIMIT,
+            ),
+        },
+        None => SourceControlBadgeModel {
+            state: SourceControlBadgeState::Unknown,
+            tooltip_lines: vec!["Status pending".to_owned()],
+        },
+    }
+}
+
+fn source_control_tooltip_lines(snapshot: &SourceControlSnapshot, max_files: usize) -> Vec<String> {
+    if let Some(error) = &snapshot.last_error {
+        return vec![error.clone()];
+    }
+    if snapshot.loading {
+        return vec!["Refreshing source control...".to_owned()];
+    }
+    if snapshot.files.is_empty() {
+        return vec!["Working tree is clean".to_owned()];
+    }
+
+    let mut lines = Vec::with_capacity(max_files.saturating_add(2));
+    let mut branch_line = snapshot.branch.clone();
+    if snapshot.ahead > 0 || snapshot.behind > 0 {
+        branch_line.push_str(&format!(
+            "  ahead:{} behind:{}",
+            snapshot.ahead, snapshot.behind
+        ));
+    }
+    lines.push(branch_line);
+
+    for file in snapshot.files.iter().take(max_files) {
+        let staged = if file.staged { " [staged]" } else { "" };
+        lines.push(format!("{}{}: {}", file.status, staged, file.path));
+    }
+
+    if snapshot.files.len() > max_files {
+        lines.push(format!("+{} more", snapshot.files.len() - max_files));
+    }
+
+    lines
+}
+
+fn draw_source_control_badge(ui: &mut Ui, badge: &SourceControlBadgeModel) -> egui::Response {
+    let icon = format!("{}", icons::GIT_BRANCH);
+    let response = ui.add(
+        egui::Label::new(
+            RichText::new(icon)
+                .color(source_control_badge_color(badge.state))
+                .small(),
+        )
+        .sense(Sense::hover()),
+    );
+
+    response.on_hover_ui(|ui| {
+        for line in &badge.tooltip_lines {
+            ui.label(line);
+        }
+    })
 }
 
 fn draw_terminal_header_dot(ui: &mut Ui, color: Color32) {
@@ -4971,12 +5347,14 @@ mod tests {
         cursor_hidden_by_row_filter, default_app_open_command, force_terminal_pane_width,
         next_active_terminal_after_close, next_terminal_in_direction,
         normalize_terminal_background, parse_branch_header, recover_config_state,
-        resolve_ctrl_c_action, terminal_cell_metric, terminal_cursor_blink_phase_visible,
-        terminal_cursor_overlay_rect, terminal_grid_dimensions, terminal_manager_actions_width,
-        terminal_manager_row_widths, terminal_output_surface_size, terminal_output_viewport_size,
+        resolve_ctrl_c_action, source_control_badge_state, source_control_tooltip_lines,
+        terminal_cell_metric, terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect,
+        terminal_grid_dimensions, terminal_manager_actions_width, terminal_manager_row_widths,
+        terminal_output_surface_size, terminal_output_viewport_size,
         terminal_selection_point_from_pointer, terminal_selection_text, to_egui_color,
         update_stable_cursor_row, visible_terminal_cursor, AdeApp, CtrlCAction,
-        PendingConfigChanges, PendingCtrlC, TerminalCursorOverlay, TerminalEntry,
+        PendingConfigChanges, PendingCtrlC, SourceControlBadgeState, SourceControlFile,
+        SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalNavigationDirection, TerminalSelection, TerminalSelectionPoint, TERMINAL_OUTPUT_BG,
     };
     use crate::layout;
@@ -5836,6 +6214,150 @@ mod tests {
     }
 
     #[test]
+    fn source_control_badge_state_covers_clean_dirty_loading_and_error() {
+        let clean = test_source_control_snapshot("main", &[]);
+        let dirty = test_source_control_snapshot("main", &[("src/app.rs", "Modified", false)]);
+        let mut loading = test_source_control_snapshot("main", &[]);
+        loading.loading = true;
+        let mut error = test_source_control_snapshot("main", &[]);
+        error.last_error = Some("Not a git repository".to_owned());
+
+        assert_eq!(
+            source_control_badge_state(None),
+            SourceControlBadgeState::Unknown
+        );
+        assert_eq!(
+            source_control_badge_state(Some(&clean)),
+            SourceControlBadgeState::Clean
+        );
+        assert_eq!(
+            source_control_badge_state(Some(&dirty)),
+            SourceControlBadgeState::Dirty
+        );
+        assert_eq!(
+            source_control_badge_state(Some(&loading)),
+            SourceControlBadgeState::Loading
+        );
+        assert_eq!(
+            source_control_badge_state(Some(&error)),
+            SourceControlBadgeState::Error
+        );
+    }
+
+    #[test]
+    fn source_control_tooltip_lines_cap_changed_files_and_show_overflow() {
+        let files = (0..15)
+            .map(|index| (format!("src/file-{index}.rs"), "Modified", index % 2 == 0))
+            .collect::<Vec<_>>();
+        let snapshot = SourceControlSnapshot {
+            branch: "main".to_owned(),
+            ahead: 2,
+            behind: 1,
+            files: files
+                .iter()
+                .map(|(path, status, staged)| SourceControlFile {
+                    path: path.clone(),
+                    status,
+                    staged: *staged,
+                })
+                .collect(),
+            loading: false,
+            last_error: None,
+        };
+
+        let lines = source_control_tooltip_lines(&snapshot, 12);
+
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("main  ahead:2 behind:1")
+        );
+        assert_eq!(lines.len(), 14);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Modified [staged]: src/file-0.rs"),
+            "expected staged file entry"
+        );
+        assert_eq!(lines.last().map(String::as_str), Some("+3 more"));
+    }
+
+    #[test]
+    fn next_due_auto_source_control_project_prefers_selected_or_live_terminal_projects() {
+        let mut app = test_app([(3, test_terminal_entry(3, 3))], None);
+        app.projects = BTreeMap::from([
+            (1, test_project(1, "Idle", "C:/idle", &[])),
+            (2, test_project(2, "Selected", "C:/selected", &[])),
+            (3, test_project(3, "Live", "C:/live", &[])),
+        ]);
+        app.selected_project = Some(2);
+        app.source_control_refresh_state
+            .insert(1, SourceControlRefreshState::default());
+        app.source_control_refresh_state
+            .insert(2, SourceControlRefreshState::default());
+        app.source_control_refresh_state
+            .insert(3, SourceControlRefreshState::default());
+
+        assert_eq!(app.next_due_auto_source_control_project(0.0), Some(2));
+    }
+
+    #[test]
+    fn next_due_auto_source_control_project_rotates_after_last_auto_refresh() {
+        let mut app = test_app([], None);
+        app.projects = BTreeMap::from([
+            (1, test_project(1, "One", "C:/one", &[])),
+            (2, test_project(2, "Two", "C:/two", &[])),
+            (3, test_project(3, "Three", "C:/three", &[])),
+        ]);
+        app.source_control_last_auto_refresh_project = Some(2);
+
+        assert_eq!(app.next_due_auto_source_control_project(0.0), Some(3));
+    }
+
+    #[test]
+    fn manual_fetch_upgrades_pending_source_control_refresh() {
+        let mut app = test_app([], None);
+        app.projects = BTreeMap::from([(7, test_project(7, "Demo", "C:/demo", &[]))]);
+
+        app.request_source_control_refresh(7, false, false);
+        app.request_source_control_refresh(7, true, true);
+
+        let state = app
+            .source_control_refresh_state
+            .get(&7)
+            .copied()
+            .expect("expected source control refresh state");
+        assert!(state.queued);
+        assert!(state.queued_manual);
+        assert!(state.queued_fetch);
+        assert!(app
+            .source_control_state
+            .get(&7)
+            .is_some_and(|snapshot| snapshot.loading));
+    }
+
+    #[test]
+    fn prune_source_control_state_removes_queued_entries_for_deleted_projects() {
+        let mut app = test_app([], None);
+        app.projects = BTreeMap::from([(1, test_project(1, "Keep", "C:/keep", &[]))]);
+        app.source_control_refresh_state.insert(
+            7,
+            SourceControlRefreshState {
+                queued: true,
+                ..SourceControlRefreshState::default()
+            },
+        );
+        app.source_control_state
+            .insert(7, test_source_control_snapshot("main", &[]));
+        app.source_control_last_auto_refresh_project = Some(7);
+
+        app.prune_source_control_state();
+
+        assert!(!app.source_control_refresh_state.contains_key(&7));
+        assert!(!app.source_control_state.contains_key(&7));
+        assert_eq!(app.source_control_last_auto_refresh_project, None);
+    }
+
+    #[test]
     fn terminal_output_surface_size_preserves_full_output_width() {
         let size = terminal_output_surface_size(egui::vec2(320.0, 180.0), 64.0);
 
@@ -6644,6 +7166,27 @@ mod tests {
         }
     }
 
+    fn test_source_control_snapshot(
+        branch: &str,
+        files: &[(&str, &'static str, bool)],
+    ) -> SourceControlSnapshot {
+        SourceControlSnapshot {
+            branch: branch.to_owned(),
+            ahead: 0,
+            behind: 0,
+            files: files
+                .iter()
+                .map(|(path, status, staged)| SourceControlFile {
+                    path: (*path).to_owned(),
+                    status,
+                    staged: *staged,
+                })
+                .collect(),
+            loading: false,
+            last_error: None,
+        }
+    }
+
     fn test_terminal_entry(id: u64, project_id: u64) -> TerminalEntry {
         TerminalEntry {
             id,
@@ -6674,7 +7217,9 @@ mod tests {
         active_terminal: Option<u64>,
     ) -> AdeApp {
         let (terminal_events_tx, terminal_events_rx) = crossbeam_channel::unbounded();
-        let (source_control_events_tx, source_control_events_rx) = crossbeam_channel::unbounded();
+        let (source_control_commands_tx, _source_control_commands_rx) =
+            crossbeam_channel::unbounded();
+        let (_source_control_events_tx, source_control_events_rx) = crossbeam_channel::unbounded();
         let (directory_index_events_tx, directory_index_events_rx) = crossbeam_channel::unbounded();
 
         AdeApp {
@@ -6704,9 +7249,12 @@ mod tests {
             window_hwnd: None,
             #[cfg(target_os = "windows")]
             window_layout_passes_remaining: 0,
-            source_control_events_tx,
+            source_control_commands_tx,
             source_control_events_rx,
             source_control_state: BTreeMap::new(),
+            source_control_refresh_state: BTreeMap::new(),
+            source_control_worker_busy: false,
+            source_control_last_auto_refresh_project: None,
             directory_index_events_tx,
             directory_index_events_rx,
             directory_index_state: BTreeMap::new(),
