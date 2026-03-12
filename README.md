@@ -18,6 +18,10 @@
   No release published yet? Use the one-command local build below.
 </p>
 
+<p align="center">
+  <img src="mergen-screenshot.png" alt="Mergen ADE screenshot" width="1100">
+</p>
+
 Mergen ADE is a desktop ADE focused on terminal orchestration, project context switching, and lightweight workspace management on Windows.
 
 It is not an IDE. There is no built-in editor, LSP, or debugger UI in this project.
