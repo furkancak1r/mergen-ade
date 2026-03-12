@@ -36,7 +36,8 @@ const TERMINAL_EVENT_BUDGET: usize = 4096;
 const TERMINAL_RETRY_MS: u64 = 8;
 const TERMINAL_FALLBACK_REFRESH_MS: u64 = 16;
 const CURSOR_BLINK_STEP_SECS: f64 = 0.6;
-const CTRL_C_DOUBLE_PRESS_WINDOW_SECS: f64 = 0.75;
+const TERMINAL_COPY_TOAST_SECS: f64 = 1.75;
+const TERMINAL_COPY_FEEDBACK_TEXT: &str = "Copied terminal selection";
 const POWERSHELL_CURSOR_ROW_STABLE_SECS: f64 = 0.06;
 const TERMINAL_CHAR_WIDTH_SAMPLE_CELLS: usize = 64;
 const CURSOR_BAR_WIDTH_PX: f32 = 2.0;
@@ -220,7 +221,6 @@ pub struct AdeApp {
     next_terminal_id: u64,
     selected_project: Option<u64>,
     active_terminal: Option<u64>,
-    pending_ctrl_c: Option<PendingCtrlC>,
     buffered_terminal_input: Vec<Event>,
     buffered_terminal_navigation: Vec<TerminalNavigationDirection>,
     terminal_events_tx: Sender<TerminalUiEvent>,
@@ -229,6 +229,7 @@ pub struct AdeApp {
     saved_message_drafts: BTreeMap<u64, String>,
     directory_search_query: String,
     status_line: String,
+    copy_toast: Option<TransientToast>,
     layout_epoch: u64,
     theme_initialized: bool,
     #[cfg(target_os = "windows")]
@@ -270,9 +271,9 @@ struct TerminalEntry {
     runtime: TerminalRuntime,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct PendingCtrlC {
-    terminal_id: u64,
+#[derive(Debug, Clone, PartialEq)]
+struct TransientToast {
+    message: String,
     expires_at: f64,
 }
 
@@ -312,8 +313,14 @@ impl TerminalSelection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CtrlCAction {
     CopySelection,
-    ArmInterrupt,
     SendInterrupt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalSecondaryClickAction {
+    OpenCopyMenu,
+    PasteImmediately,
+    None,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -477,7 +484,6 @@ impl AdeApp {
             next_terminal_id: 1,
             selected_project,
             active_terminal: None,
-            pending_ctrl_c: None,
             buffered_terminal_input: Vec::new(),
             buffered_terminal_navigation: Vec::new(),
             terminal_events_tx,
@@ -488,6 +494,7 @@ impl AdeApp {
             status_line: config_load_error
                 .map(|err| format!("Config load error: {err}. Existing config preserved."))
                 .unwrap_or_else(|| "Ready".to_owned()),
+            copy_toast: None,
             layout_epoch: 0,
             theme_initialized: false,
             #[cfg(target_os = "windows")]
@@ -1326,20 +1333,10 @@ impl AdeApp {
 
     fn route_active_terminal_input(&mut self, ctx: &egui::Context, events: Vec<Event>) {
         if self.ui_owns_keyboard(ctx) {
-            self.pending_ctrl_c = None;
             return;
         }
 
-        let now = ctx.input(|input| input.time);
-        if self
-            .pending_ctrl_c
-            .is_some_and(|pending| now > pending.expires_at)
-        {
-            self.pending_ctrl_c = None;
-        }
-
         let Some(active_terminal_id) = self.active_terminal_accepts_input() else {
-            self.pending_ctrl_c = None;
             return;
         };
         let mut events = events;
@@ -1353,117 +1350,93 @@ impl AdeApp {
             return;
         }
 
-        let Some(terminal) = self.terminals.get_mut(&active_terminal_id) else {
-            self.pending_ctrl_c = None;
-            return;
-        };
-
         let mut outbound = Vec::new();
         let mut copied_selection = None;
-        let mut armed_interrupt = false;
+        {
+            let Some(terminal) = self.terminals.get_mut(&active_terminal_id) else {
+                return;
+            };
 
-        for event in events {
-            match event {
-                Event::Copy => {
-                    let has_selection = terminal
-                        .selection
-                        .as_ref()
-                        .is_some_and(TerminalSelection::has_selection);
-                    let (next_pending, action) = resolve_ctrl_c_action(
-                        self.pending_ctrl_c,
-                        active_terminal_id,
-                        now,
-                        has_selection,
-                    );
-                    self.pending_ctrl_c = next_pending;
+            for event in events {
+                match event {
+                    Event::Copy => {
+                        let copied_text = terminal
+                            .selection
+                            .as_ref()
+                            .is_some_and(TerminalSelection::has_selection)
+                            .then(|| Self::selected_terminal_text(terminal))
+                            .flatten();
+                        let action = resolve_ctrl_c_action(copied_text.is_some());
 
-                    match action {
-                        CtrlCAction::CopySelection => {
-                            copied_selection = Self::selected_terminal_text(terminal);
+                        match action {
+                            CtrlCAction::CopySelection => {
+                                copied_selection = copied_text;
+                                Self::clear_terminal_selection(terminal);
+                            }
+                            CtrlCAction::SendInterrupt => {
+                                Self::clear_terminal_selection(terminal);
+                                outbound.push(0x03);
+                            }
+                        }
+                    }
+                    Event::Text(text) => {
+                        if text.is_empty() {
+                            continue;
+                        }
+                        Self::clear_terminal_selection(terminal);
+                        outbound.extend_from_slice(text.as_bytes());
+                        Self::append_pending_line(&mut terminal.pending_line_for_title, &text);
+                    }
+                    Event::Paste(text) => {
+                        if text.is_empty() {
+                            continue;
+                        }
+                        Self::clear_terminal_selection(terminal);
+                        let text = Self::pasted_text(&text);
+                        outbound.extend_from_slice(text.as_bytes());
+                        Self::append_pending_line(&mut terminal.pending_line_for_title, &text);
+                    }
+                    Event::Key {
+                        key,
+                        pressed,
+                        modifiers,
+                        ..
+                    } if pressed => {
+                        if key == Key::Enter {
                             Self::clear_terminal_selection(terminal);
-                            armed_interrupt = self.pending_ctrl_c.is_some();
+                            outbound.push(b'\r');
+                            let line = std::mem::take(&mut terminal.pending_line_for_title);
+                            terminal.full_title = terminal_title_text(&line, terminal.id as usize);
+                            terminal.title =
+                                update_terminal_title(&line, terminal.id as usize, TITLE_MAX_LEN);
+                            terminal.dirty = true;
+                            continue;
                         }
-                        CtrlCAction::ArmInterrupt => {
-                            armed_interrupt = true;
-                        }
-                        CtrlCAction::SendInterrupt => {
+
+                        if key == Key::Backspace {
                             Self::clear_terminal_selection(terminal);
-                            outbound.push(0x03);
+                            terminal.pending_line_for_title.pop();
+                        }
+
+                        if let Some(bytes) = Self::key_to_terminal_bytes(key, modifiers) {
+                            Self::clear_terminal_selection(terminal);
+                            outbound.extend_from_slice(&bytes);
                         }
                     }
+                    _ => {}
                 }
-                Event::Text(text) => {
-                    if text.is_empty() {
-                        continue;
-                    }
-                    self.pending_ctrl_c = None;
-                    Self::clear_terminal_selection(terminal);
-                    outbound.extend_from_slice(text.as_bytes());
-                    Self::append_pending_line(&mut terminal.pending_line_for_title, &text);
-                }
-                Event::Paste(text) => {
-                    if text.is_empty() {
-                        continue;
-                    }
-                    self.pending_ctrl_c = None;
-                    Self::clear_terminal_selection(terminal);
-                    let text = Self::pasted_text(&text);
-                    outbound.extend_from_slice(text.as_bytes());
-                    Self::append_pending_line(&mut terminal.pending_line_for_title, &text);
-                }
-                Event::Key {
-                    key,
-                    pressed,
-                    modifiers,
-                    ..
-                } if pressed => {
-                    if key == Key::Enter {
-                        self.pending_ctrl_c = None;
-                        Self::clear_terminal_selection(terminal);
-                        outbound.push(b'\r');
-                        let line = std::mem::take(&mut terminal.pending_line_for_title);
-                        terminal.full_title = terminal_title_text(&line, terminal.id as usize);
-                        terminal.title =
-                            update_terminal_title(&line, terminal.id as usize, TITLE_MAX_LEN);
-                        terminal.dirty = true;
-                        continue;
-                    }
+            }
 
-                    if key == Key::Backspace {
-                        self.pending_ctrl_c = None;
-                        Self::clear_terminal_selection(terminal);
-                        terminal.pending_line_for_title.pop();
-                    }
-
-                    if let Some(bytes) = Self::key_to_terminal_bytes(key, modifiers) {
-                        self.pending_ctrl_c = None;
-                        Self::clear_terminal_selection(terminal);
-                        outbound.extend_from_slice(&bytes);
-                    }
-                }
-                _ => {}
+            if !outbound.is_empty() {
+                terminal.runtime.send_bytes(outbound);
+                terminal.dirty = true;
+                ctx.request_repaint();
             }
         }
 
         if let Some(text) = copied_selection {
             ctx.copy_text(text);
-            if armed_interrupt {
-                self.status_line =
-                    "Copied terminal selection. Press Ctrl+C again to interrupt".to_owned();
-                ctx.request_repaint_after(Duration::from_secs_f64(CTRL_C_DOUBLE_PRESS_WINDOW_SECS));
-            } else {
-                self.status_line = "Copied terminal selection".to_owned();
-                ctx.request_repaint();
-            }
-        } else if armed_interrupt {
-            self.status_line = "Press Ctrl+C again to interrupt".to_owned();
-            ctx.request_repaint_after(Duration::from_secs_f64(CTRL_C_DOUBLE_PRESS_WINDOW_SECS));
-        }
-
-        if !outbound.is_empty() {
-            terminal.runtime.send_bytes(outbound);
-            terminal.dirty = true;
-            ctx.request_repaint();
+            self.show_terminal_copy_feedback(ctx);
         }
     }
 
@@ -1713,7 +1686,6 @@ impl AdeApp {
             Ok(()) => format!("Closed {title}"),
             Err(err) => format!("Closed {title} (cleanup failed: {err})"),
         };
-        self.pending_ctrl_c = None;
 
         let remaining_terminal_ids = self.terminals.keys().copied().collect::<Vec<_>>();
         self.set_active_terminal(next_active_terminal_after_close(
@@ -1731,7 +1703,6 @@ impl AdeApp {
         }
 
         self.active_terminal = terminal_id;
-        self.pending_ctrl_c = None;
         self.clear_terminal_selections_except(terminal_id);
     }
 
@@ -1827,8 +1798,6 @@ impl AdeApp {
     }
 
     fn paste_clipboard_to_terminal(&mut self, terminal_id: u64) {
-        self.pending_ctrl_c = None;
-
         let text = match Clipboard::new()
             .map_err(|err| err.to_string())
             .and_then(|mut clipboard| clipboard.get_text().map_err(|err| err.to_string()))
@@ -1846,7 +1815,6 @@ impl AdeApp {
     }
 
     fn send_saved_message_to_terminal(&mut self, terminal_id: u64, message: &str) {
-        self.pending_ctrl_c = None;
         let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
             self.status_line = "Target terminal not found".to_owned();
             return;
@@ -1870,12 +1838,59 @@ impl AdeApp {
         self.status_line = format!("Sent saved message to {}", destination_title);
     }
 
-    fn finalize_pointer_selection_copy(
-        pending_ctrl_c: &mut Option<PendingCtrlC>,
-        status_line: &mut String,
-    ) {
-        *pending_ctrl_c = None;
-        *status_line = "Copied terminal selection".to_owned();
+    fn finalize_pointer_selection_copy(&mut self, ctx: &egui::Context) {
+        self.show_terminal_copy_feedback(ctx);
+    }
+
+    fn show_terminal_copy_feedback(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|input| input.time);
+        self.status_line = TERMINAL_COPY_FEEDBACK_TEXT.to_owned();
+        self.copy_toast = Some(TransientToast {
+            message: TERMINAL_COPY_FEEDBACK_TEXT.to_owned(),
+            expires_at: now + TERMINAL_COPY_TOAST_SECS,
+        });
+        ctx.request_repaint();
+        ctx.request_repaint_after(Duration::from_secs_f64(TERMINAL_COPY_TOAST_SECS));
+    }
+
+    fn active_copy_toast_message(copy_toast: Option<&TransientToast>, now: f64) -> Option<&str> {
+        copy_toast.and_then(|toast| (now <= toast.expires_at).then_some(toast.message.as_str()))
+    }
+
+    fn draw_copy_toast(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|input| input.time);
+        let Some(message) =
+            Self::active_copy_toast_message(self.copy_toast.as_ref(), now).map(str::to_owned)
+        else {
+            self.copy_toast = None;
+            return;
+        };
+        let remaining = self
+            .copy_toast
+            .as_ref()
+            .map(|toast| (toast.expires_at - now).max(0.0))
+            .unwrap_or_default();
+        ctx.request_repaint_after(Duration::from_secs_f64(remaining));
+
+        egui::Area::new(Id::new("terminal_copy_toast"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-18.0, -18.0))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(SURFACE_BG_SOFT)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .rounding(10.0)
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(message)
+                                .color(TEXT_PRIMARY)
+                                .strong()
+                                .size(13.0),
+                        );
+                    });
+            });
     }
 
     fn preferred_terminal_for_project(&self, project_id: u64) -> Option<u64> {
@@ -3216,20 +3231,9 @@ impl AdeApp {
                                 pane_clicked = true;
                             }
                             let can_paste = !terminal.exited;
-                            response.context_menu(|ui| {
-                                with_minimal_button_chrome(ui, |ui| {
-                                    ui.add_enabled_ui(false, |ui| {
-                                        let _ = ui.button(format!("{} Copy", icons::COPY));
-                                    });
-                                    ui.add_enabled_ui(can_paste, |ui| {
-                                        if ui.button(format!("{} Paste", icons::DOWNLOAD)).clicked()
-                                        {
-                                            paste_requested = true;
-                                            ui.close_menu();
-                                        }
-                                    });
-                                });
-                            });
+                            if response.secondary_clicked() && can_paste {
+                                paste_requested = true;
+                            }
                         } else {
                             let render = build_terminal_render(
                                 &terminal.render_cache,
@@ -3330,37 +3334,42 @@ impl AdeApp {
                                 pane_clicked = true;
                                 Self::clear_terminal_selection(terminal);
                             }
-                            if response.secondary_clicked() {
-                                pane_clicked = true;
-                            }
 
-                            if terminal.selection.is_some() {
-                                Self::ensure_terminal_selection_snapshot(terminal);
-                            }
-                            let can_copy = terminal
+                            let has_selection = terminal
                                 .selection
                                 .as_ref()
-                                .is_some_and(TerminalSelection::has_selection)
-                                && terminal.selection_snapshot.is_some();
+                                .is_some_and(TerminalSelection::has_selection);
+                            if has_selection {
+                                Self::ensure_terminal_selection_snapshot(terminal);
+                            }
+                            let can_copy = has_selection && terminal.selection_snapshot.is_some();
                             let can_paste = !terminal.exited;
                             let mut copy_requested = false;
-                            response.context_menu(|ui| {
-                                with_minimal_button_chrome(ui, |ui| {
-                                    ui.add_enabled_ui(can_copy, |ui| {
-                                        if ui.button(format!("{} Copy", icons::COPY)).clicked() {
-                                            copy_requested = true;
-                                            ui.close_menu();
-                                        }
-                                    });
-                                    ui.add_enabled_ui(can_paste, |ui| {
-                                        if ui.button(format!("{} Paste", icons::DOWNLOAD)).clicked()
-                                        {
-                                            paste_requested = true;
-                                            ui.close_menu();
-                                        }
+                            let secondary_click_action = if response.secondary_clicked() {
+                                pane_clicked = true;
+                                terminal_secondary_click_action(has_selection, can_paste)
+                            } else {
+                                TerminalSecondaryClickAction::None
+                            };
+                            if matches!(
+                                secondary_click_action,
+                                TerminalSecondaryClickAction::PasteImmediately
+                            ) {
+                                paste_requested = true;
+                            }
+                            if has_selection {
+                                response.context_menu(|ui| {
+                                    with_minimal_button_chrome(ui, |ui| {
+                                        ui.add_enabled_ui(can_copy, |ui| {
+                                            if ui.button(format!("{} Copy", icons::COPY)).clicked()
+                                            {
+                                                copy_requested = true;
+                                                ui.close_menu();
+                                            }
+                                        });
                                     });
                                 });
-                            });
+                            }
                             if copy_requested {
                                 copied_selection = Self::selected_terminal_text(terminal);
                                 Self::clear_terminal_selection(terminal);
@@ -3407,7 +3416,6 @@ impl AdeApp {
 
         if clicked {
             self.surrender_ui_text_focus(ui.ctx());
-            self.pending_ctrl_c = None;
         }
 
         if clicked || copied_selection.is_some() || paste_requested {
@@ -3416,7 +3424,7 @@ impl AdeApp {
 
         if let Some(text) = copied_selection {
             ui.ctx().copy_text(text);
-            Self::finalize_pointer_selection_copy(&mut self.pending_ctrl_c, &mut self.status_line);
+            self.finalize_pointer_selection_copy(ui.ctx());
         }
 
         if paste_requested {
@@ -3752,6 +3760,7 @@ impl eframe::App for AdeApp {
         self.draw_settings_popup(ctx);
 
         self.route_active_terminal_input(ctx, terminal_events);
+        self.draw_copy_toast(ctx);
     }
 
     fn persist_egui_memory(&self) -> bool {
@@ -4823,35 +4832,25 @@ fn styled_icon_toggle(ui: &mut Ui, selected: bool, icon: AppIcon, tooltip: &str)
     response.clicked()
 }
 
-fn resolve_ctrl_c_action(
-    pending: Option<PendingCtrlC>,
-    terminal_id: u64,
-    time_seconds: f64,
+fn resolve_ctrl_c_action(can_copy_selection: bool) -> CtrlCAction {
+    if can_copy_selection {
+        CtrlCAction::CopySelection
+    } else {
+        CtrlCAction::SendInterrupt
+    }
+}
+
+fn terminal_secondary_click_action(
     has_selection: bool,
-) -> (Option<PendingCtrlC>, CtrlCAction) {
-    if pending.is_some_and(|pending| {
-        pending.terminal_id == terminal_id && time_seconds <= pending.expires_at
-    }) {
-        return (None, CtrlCAction::SendInterrupt);
-    }
-
+    can_paste: bool,
+) -> TerminalSecondaryClickAction {
     if has_selection {
-        return (
-            Some(PendingCtrlC {
-                terminal_id,
-                expires_at: time_seconds + CTRL_C_DOUBLE_PRESS_WINDOW_SECS,
-            }),
-            CtrlCAction::CopySelection,
-        );
+        TerminalSecondaryClickAction::OpenCopyMenu
+    } else if can_paste {
+        TerminalSecondaryClickAction::PasteImmediately
+    } else {
+        TerminalSecondaryClickAction::None
     }
-
-    (
-        Some(PendingCtrlC {
-            terminal_id,
-            expires_at: time_seconds + CTRL_C_DOUBLE_PRESS_WINDOW_SECS,
-        }),
-        CtrlCAction::ArmInterrupt,
-    )
 }
 
 fn terminal_selection_point_from_pointer(
@@ -5351,11 +5350,13 @@ mod tests {
         terminal_cell_metric, terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect,
         terminal_grid_dimensions, terminal_manager_actions_width, terminal_manager_row_widths,
         terminal_output_surface_size, terminal_output_viewport_size,
-        terminal_selection_point_from_pointer, terminal_selection_text, to_egui_color,
-        update_stable_cursor_row, visible_terminal_cursor, AdeApp, CtrlCAction,
-        PendingConfigChanges, PendingCtrlC, SourceControlBadgeState, SourceControlFile,
+        terminal_secondary_click_action, terminal_selection_point_from_pointer,
+        terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
+        AdeApp, CtrlCAction, PendingConfigChanges, SourceControlBadgeState, SourceControlFile,
         SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
-        TerminalNavigationDirection, TerminalSelection, TerminalSelectionPoint, TERMINAL_OUTPUT_BG,
+        TerminalNavigationDirection, TerminalSecondaryClickAction, TerminalSelection,
+        TerminalSelectionPoint, TransientToast, TERMINAL_COPY_FEEDBACK_TEXT,
+        TERMINAL_COPY_TOAST_SECS, TERMINAL_OUTPUT_BG,
     };
     use crate::layout;
     use crate::models::{
@@ -5814,47 +5815,44 @@ mod tests {
     }
 
     #[test]
-    fn first_ctrl_c_arms_interrupt_without_sending_signal() {
-        let (pending, action) = resolve_ctrl_c_action(None, 9, 2.0, false);
-
-        assert_eq!(action, CtrlCAction::ArmInterrupt);
-        let pending = pending.expect("expected pending ctrl+c state");
-        assert_eq!(pending.terminal_id, 9);
-        assert!((pending.expires_at - 2.75).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn second_ctrl_c_within_window_sends_interrupt() {
-        let pending = Some(PendingCtrlC {
-            terminal_id: 9,
-            expires_at: 2.75,
-        });
-        let (next_pending, action) = resolve_ctrl_c_action(pending, 9, 2.4, false);
+    fn ctrl_c_without_selection_sends_interrupt_immediately() {
+        let action = resolve_ctrl_c_action(false);
 
         assert_eq!(action, CtrlCAction::SendInterrupt);
-        assert_eq!(next_pending, None);
     }
 
     #[test]
-    fn ctrl_c_copies_selection_and_arms_interrupt_on_first_press() {
-        let (next_pending, action) = resolve_ctrl_c_action(None, 9, 2.0, true);
-
+    fn ctrl_c_with_selection_copies_selection() {
+        let action = resolve_ctrl_c_action(true);
         assert_eq!(action, CtrlCAction::CopySelection);
-        let pending = next_pending.expect("expected pending ctrl+c state");
-        assert_eq!(pending.terminal_id, 9);
-        assert!((pending.expires_at - 2.75).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn ctrl_c_sends_interrupt_on_second_press_even_when_selection_exists() {
-        let pending = Some(PendingCtrlC {
-            terminal_id: 9,
-            expires_at: 2.75,
-        });
-        let (next_pending, action) = resolve_ctrl_c_action(pending, 9, 2.4, true);
+    fn ctrl_c_interrupts_after_selection_is_cleared() {
+        let action = resolve_ctrl_c_action(false);
 
         assert_eq!(action, CtrlCAction::SendInterrupt);
-        assert_eq!(next_pending, None);
+    }
+
+    #[test]
+    fn secondary_click_without_selection_pastes_immediately() {
+        let action = terminal_secondary_click_action(false, true);
+
+        assert_eq!(action, TerminalSecondaryClickAction::PasteImmediately);
+    }
+
+    #[test]
+    fn secondary_click_with_selection_opens_copy_menu() {
+        let action = terminal_secondary_click_action(true, true);
+
+        assert_eq!(action, TerminalSecondaryClickAction::OpenCopyMenu);
+    }
+
+    #[test]
+    fn secondary_click_on_exited_terminal_without_selection_does_nothing() {
+        let action = terminal_secondary_click_action(false, false);
+
+        assert_eq!(action, TerminalSecondaryClickAction::None);
     }
 
     #[test]
@@ -5880,17 +5878,32 @@ mod tests {
     }
 
     #[test]
-    fn pointer_copy_clears_pending_ctrl_c_state() {
-        let mut pending_ctrl_c = Some(PendingCtrlC {
-            terminal_id: 9,
-            expires_at: 2.75,
-        });
-        let mut status_line = String::new();
+    fn show_terminal_copy_feedback_sets_status_line_and_toast() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let ctx = Context::default();
+        ctx.input_mut(|input| input.time = 2.5);
 
-        AdeApp::finalize_pointer_selection_copy(&mut pending_ctrl_c, &mut status_line);
+        app.show_terminal_copy_feedback(&ctx);
 
-        assert_eq!(pending_ctrl_c, None);
-        assert_eq!(status_line, "Copied terminal selection");
+        assert_eq!(app.status_line, TERMINAL_COPY_FEEDBACK_TEXT);
+        let toast = app.copy_toast.as_ref().expect("expected toast");
+        assert_eq!(toast.message, TERMINAL_COPY_FEEDBACK_TEXT);
+        assert!((toast.expires_at - (2.5 + TERMINAL_COPY_TOAST_SECS)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn active_copy_toast_message_hides_expired_toast() {
+        let toast = TransientToast {
+            message: TERMINAL_COPY_FEEDBACK_TEXT.to_owned(),
+            expires_at: 4.0,
+        };
+
+        assert_eq!(
+            AdeApp::active_copy_toast_message(Some(&toast), 3.5),
+            Some(TERMINAL_COPY_FEEDBACK_TEXT)
+        );
+        assert_eq!(AdeApp::active_copy_toast_message(Some(&toast), 4.1), None);
+        assert_eq!(AdeApp::active_copy_toast_message(None, 0.0), None);
     }
 
     #[test]
@@ -6781,7 +6794,7 @@ mod tests {
     }
 
     #[test]
-    fn close_terminal_removes_entry_and_clears_pending_interrupt_state() {
+    fn close_terminal_removes_entry_and_preserves_expected_app_state() {
         let mut app = test_app(
             [
                 (1, test_terminal_entry(1, 7)),
@@ -6789,17 +6802,12 @@ mod tests {
             ],
             Some(1),
         );
-        app.pending_ctrl_c = Some(PendingCtrlC {
-            terminal_id: 1,
-            expires_at: 4.0,
-        });
 
         let ctx = eframe::egui::Context::default();
         app.close_terminal(&ctx, 1);
 
         assert!(!app.terminals.contains_key(&1));
         assert_eq!(app.active_terminal, Some(2));
-        assert_eq!(app.pending_ctrl_c, None);
         assert_eq!(app.layout_epoch, 1);
         assert_eq!(app.status_line, "Closed Terminal 1");
     }
@@ -7234,7 +7242,6 @@ mod tests {
             next_terminal_id: 3,
             selected_project: None,
             active_terminal,
-            pending_ctrl_c: None,
             buffered_terminal_input: Vec::new(),
             buffered_terminal_navigation: Vec::new(),
             terminal_events_tx,
@@ -7243,6 +7250,7 @@ mod tests {
             saved_message_drafts: BTreeMap::new(),
             directory_search_query: String::new(),
             status_line: "Ready".to_owned(),
+            copy_toast: None,
             layout_epoch: 0,
             theme_initialized: false,
             #[cfg(target_os = "windows")]
