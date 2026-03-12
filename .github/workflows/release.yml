@@ -58,32 +58,23 @@ jobs:
       - name: Set up Rust (stable macOS host)
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: stable
           targets: aarch64-apple-darwin
 
       - name: Build macOS ARM64 binary
         id: build
-        continue-on-error: true
-        run: cargo build --release --target aarch64-apple-darwin
+        run: cargo +stable build --release --target aarch64-apple-darwin
 
       - name: Package unsigned DMG
         id: package
-        if: steps.build.outcome == 'success'
-        continue-on-error: true
         run: bash ./scripts/package-macos-release.sh "${{ github.ref_name }}"
 
       - name: Upload macOS release artifact
-        if: steps.package.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: release-macos
           path: ${{ steps.package.outputs.asset_path }}
           if-no-files-found: error
-
-      - name: Summarize skipped macOS asset
-        if: steps.build.outcome != 'success' || steps.package.outcome == 'failure'
-        run: |
-          echo "macOS DMG was skipped; the Windows release remains publishable." >> "$GITHUB_STEP_SUMMARY"
-          echo "Unsigned notarization-free packaging is best-effort in this workflow." >> "$GITHUB_STEP_SUMMARY"
 
   publish-release:
     name: Publish GitHub Release
@@ -91,7 +82,7 @@ jobs:
     needs:
       - build-windows
       - build-macos
-    if: needs.build-windows.result == 'success'
+    if: needs.build-windows.result == 'success' && needs.build-macos.result == 'success'
 
     steps:
       - name: Download release artifacts

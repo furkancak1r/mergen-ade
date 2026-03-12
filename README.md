@@ -22,7 +22,7 @@
   <img src="mergen-screenshot.png" alt="Mergen ADE screenshot" width="1100">
 </p>
 
-Mergen ADE is a desktop ADE focused on terminal orchestration, project context switching, and lightweight workspace management. The project is still Windows-first, with experimental macOS release packaging in GitHub Actions.
+Mergen ADE is a desktop ADE focused on terminal orchestration, project context switching, and lightweight workspace management. The project is still Windows-first, with an unsigned macOS ARM64 DMG now produced alongside official GitHub releases.
 
 It is not an IDE. There is no built-in editor, LSP, or debugger UI in this project.
 
@@ -44,7 +44,7 @@ The canonical download location is the GitHub Releases page:
 Published assets currently target:
 
 - Windows: portable ZIP containing `mergen-ade.exe`
-- macOS: best-effort unsigned ARM64 DMG
+- macOS: unsigned ARM64 DMG
 
 ### Local build
 
@@ -94,7 +94,7 @@ $env:USERPROFILE\.cargo\bin\cargo.exe test
 - ConPTY-backed shell sessions with responsive IO flow
 - Lightweight local TOML configuration
 - Portable Windows release pipeline through GitHub Actions
-- Experimental unsigned macOS ARM64 DMG packaging in GitHub Actions
+- Unsigned macOS ARM64 DMG packaging in GitHub Actions
 
 ## How It Works
 
@@ -140,14 +140,14 @@ When a tag starting with `v` is pushed, GitHub Actions will:
 
 1. Build the portable `mergen-ade.exe` for `x86_64-pc-windows-msvc`
 2. Package it as `mergen-ade-<tag>-windows-x64-portable.zip`
-3. Best-effort build an unsigned `mergen-ade-<tag>-macos-arm64.dmg`
+3. Build an unsigned `mergen-ade-<tag>-macos-arm64.dmg`
 4. Publish a GitHub Release and attach every packaged asset that was produced
 
 The macOS DMG is currently:
 
 - ARM64 only
 - unsigned and not notarized
-- best-effort only; if the macOS job cannot package a DMG, the Windows asset is still published
+- required for official tagged releases; if DMG packaging fails, the release workflow fails instead of publishing a Windows-only release
 - expected to show Gatekeeper warnings until signing and notarization are added
 
 Maintainer tag example:

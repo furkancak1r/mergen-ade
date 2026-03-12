@@ -208,3 +208,17 @@
   - Keep optional release jobs artifact-based so experimental platform packaging can fail without blocking the primary release asset.
 - Files/Commands touched: `src/models.rs`, `src/config.rs`, `src/app.rs`, `.github/workflows/release.yml`, `scripts/package-macos-release.sh`, `README.md`, `KNOWN_ISSUES.md`
 - References: local workspace change on 2026-03-12; commit pending
+
+#### macOS DMG release path skipped before packaging started {#macos-dmg-release-path-skipped-before-packaging-started}
+- Date: 2026-03-12T14:10:00Z
+- Context: main/local GitHub Actions release run `22999299197`, macos-15-arm64 runner
+- Error signature: `error: target triple in channel name 'stable-x86_64-pc-windows-gnullvm'`
+- Symptoms/Impact: The tagged `v0.1.3` release published only the Windows ZIP. The macOS job completed early, skipped `Package unsigned DMG`, and never uploaded a DMG artifact.
+- Root cause: `rust-toolchain.toml` pinned the repo to the Windows-specific channel name `stable-x86_64-pc-windows-gnullvm`. On the macOS runner, both `dtolnay/rust-toolchain@stable` and `cargo build --target aarch64-apple-darwin` still consulted that repo override and failed before the DMG packaging script could run.
+- Resolution: Local workspace fix switches the repo toolchain channel to host-agnostic `stable`, makes the macOS build invoke `cargo +stable build --target aarch64-apple-darwin`, and changes the release workflow so official tagged releases now require both the Windows ZIP and macOS DMG to succeed before publishing.
+- Prevent recurrence:
+  - Keep repo-level Rust toolchain names host-agnostic when CI must run on multiple operating systems.
+  - Explicitly invoke `cargo +stable` or another host-valid toolchain in cross-platform workflow steps when the repo keeps platform-specific target defaults elsewhere.
+  - Do not allow official release publish jobs to proceed after a skipped macOS packaging path if the release promise includes a DMG artifact.
+- Files/Commands touched: `rust-toolchain.toml`, `.github/workflows/release.yml`, `README.md`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `gh run view 22999299197 --job 66779525438 --log`
+- References: GitHub Actions run `22999299197` for tag `v0.1.3`; local fix commit pending

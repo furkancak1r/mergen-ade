@@ -7,7 +7,7 @@
 - `src/layout.rs`: auto-tiling grid math and related unit tests.
 - `src/title.rs`: terminal title update/truncation logic and unit tests.
 - `src/config.rs` + `src/models.rs`: persisted TOML config schema and load/save behavior.
-- `.github/workflows/release.yml`: GitHub release pipeline for Windows ZIP and best-effort macOS ARM64 DMG assets.
+- `.github/workflows/release.yml`: GitHub release pipeline for Windows ZIP and macOS ARM64 DMG assets.
 - Build artifacts are in `target/` (do not commit).
 
 ## Build, Test, and Development Commands
@@ -44,7 +44,7 @@ If `cargo` is not on PATH in PowerShell, use:
   1. What changed and why.
   2. Validation steps (`cargo test`, manual run notes).
   3. UI screenshots/GIFs for visible behavior changes.
-  4. Any platform-specific assumptions or limitations, especially Windows-only and experimental macOS behavior.
+  4. Any platform-specific assumptions or limitations, especially Windows-first behaviors and unsigned macOS release caveats.
 
 ## Security & Configuration Notes
 - Do not commit local paths, secrets, or generated executables.
