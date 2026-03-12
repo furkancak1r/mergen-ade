@@ -3,6 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
 #[cfg(target_os = "windows")]
 use std::os::windows::io::RawHandle;
+#[cfg(target_os = "windows")]
+use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -13,27 +15,36 @@ use tattoy_wezterm_surface::{CursorShape, CursorVisibility};
 use tattoy_wezterm_term::color::{ColorPalette, SrgbaTuple};
 use tattoy_wezterm_term::config::TerminalConfiguration;
 use tattoy_wezterm_term::{CellAttributes, Terminal, TerminalSize};
-#[cfg(all(target_os = "windows", test))]
-use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, FILETIME, HANDLE,
+    CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, ERROR_ACCESS_DENIED,
+    ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, FILETIME, HANDLE,
     INVALID_HANDLE_VALUE,
 };
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 #[cfg(target_os = "windows")]
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
+#[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_TERMINATE,
+    GetCurrentProcess, GetProcessTimes, OpenProcess, TerminateProcess, WaitForSingleObject,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 
 use crate::models::ShellKind;
 
 const DEFAULT_SCROLLBACK: usize = 1000;
 const IO_BUFFER_SIZE: usize = 16 * 1024;
+#[cfg(target_os = "windows")]
+const GRACEFUL_TERMINATION_TIMEOUT_MS: u32 = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalColor {
@@ -217,11 +228,16 @@ impl TerminalDimensions {
 pub struct TerminalRuntime {
     term: Arc<Mutex<Terminal>>,
     command_tx: Sender<RuntimeCommand>,
+    shared_writer: SharedWriterHandle,
     latest_seqno: Arc<AtomicUsize>,
     last_size: TerminalDimensions,
     child_killer: Arc<Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
     child_pid: Option<u32>,
     child_creation_time: Option<u64>,
+    #[cfg(target_os = "windows")]
+    child_process_handle: Mutex<Option<WinHandle>>,
+    #[cfg(target_os = "windows")]
+    job_handle: Mutex<Option<WinHandle>>,
 }
 
 enum RuntimeCommand {
@@ -243,8 +259,10 @@ impl TerminalConfiguration for AdeTerminalConfig {
     }
 }
 
+type SharedWriterHandle = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
+
 struct SharedWriter {
-    inner: Arc<Mutex<Box<dyn Write + Send>>>,
+    inner: SharedWriterHandle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,7 +288,7 @@ enum VerifiedProcessLookup {
 }
 
 impl SharedWriter {
-    fn new(inner: Arc<Mutex<Box<dyn Write + Send>>>) -> Self {
+    fn new(inner: SharedWriterHandle) -> Self {
         Self { inner }
     }
 }
@@ -281,6 +299,9 @@ impl Write for SharedWriter {
             .inner
             .lock()
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer lock poisoned"))?;
+        let writer = writer
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "writer closed"))?;
         writer.write(buf)
     }
 
@@ -289,6 +310,9 @@ impl Write for SharedWriter {
             .inner
             .lock()
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer lock poisoned"))?;
+        let writer = writer
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "writer closed"))?;
         writer.flush()
     }
 }
@@ -328,9 +352,23 @@ impl TerminalRuntime {
         let child_killer = Arc::new(Mutex::new(child.clone_killer()));
         let child_pid = child.process_id();
         #[cfg(target_os = "windows")]
-        let child_creation_time = child
-            .as_raw_handle()
-            .and_then(process_creation_time_from_raw_handle);
+        let child_process_handle = child.as_raw_handle().map(raw_handle_to_handle);
+        #[cfg(target_os = "windows")]
+        let child_creation_time = child_process_handle.and_then(process_creation_time);
+        #[cfg(target_os = "windows")]
+        let child_process_handle = child_process_handle
+            .and_then(|process_handle| duplicate_process_handle(process_handle).map_or_else(
+                |err| {
+                    log::warn!(
+                        "Terminal graceful wait handle unavailable; shutdown will use best-effort cleanup only: {err}"
+                    );
+                    None
+                },
+                Some,
+            ));
+        #[cfg(target_os = "windows")]
+        let job_handle =
+            try_configure_kill_on_close_job(child.as_raw_handle().map(raw_handle_to_handle));
         #[cfg(not(target_os = "windows"))]
         let child_creation_time = None;
 
@@ -342,7 +380,7 @@ impl TerminalRuntime {
             .master
             .take_writer()
             .map_err(io_error_from_anyhow)?;
-        let shared_writer = Arc::new(Mutex::new(writer));
+        let shared_writer = Arc::new(Mutex::new(Some(writer)));
 
         let mut terminal = Terminal::new(
             dimensions.to_term_size(),
@@ -371,7 +409,7 @@ impl TerminalRuntime {
             term.clone(),
             latest_seqno.clone(),
             pty_pair.master,
-            shared_writer,
+            shared_writer.clone(),
             command_rx,
             ui_event_tx.clone(),
             repaint_ctx.clone(),
@@ -381,11 +419,16 @@ impl TerminalRuntime {
         Ok(Self {
             term,
             command_tx,
+            shared_writer,
             latest_seqno,
             last_size: dimensions,
             child_killer,
             child_pid,
             child_creation_time,
+            #[cfg(target_os = "windows")]
+            child_process_handle: Mutex::new(child_process_handle),
+            #[cfg(target_os = "windows")]
+            job_handle: Mutex::new(job_handle),
         })
     }
 
@@ -417,27 +460,28 @@ impl TerminalRuntime {
     }
 
     pub fn terminate(&self) -> io::Result<()> {
+        begin_termination(&self.command_tx, &self.shared_writer);
+
+        #[cfg(target_os = "windows")]
+        if wait_for_process_exit(&self.child_process_handle, GRACEFUL_TERMINATION_TIMEOUT_MS)? {
+            return Ok(());
+        }
+
         #[cfg(target_os = "windows")]
         let snapshot = snapshot_processes().ok();
 
         #[cfg(target_os = "windows")]
-        if let Some(child_pid) = self.child_pid {
-            if let Some(snapshot) = snapshot.as_deref() {
-                if let Some(descendants) =
-                    verified_process_tree_descendants(snapshot, child_pid, self.child_creation_time)
-                {
-                    best_effort_terminate_snapshot_entries(&descendants);
-                }
-            }
+        if terminate_job_handle(&self.job_handle)? {
+            return Ok(());
         }
 
         #[cfg(target_os = "windows")]
         {
-            return finish_termination(&self.command_tx, self.kill_root_process_windows(snapshot));
+            return self.kill_root_process_windows(snapshot);
         }
 
         #[cfg(not(target_os = "windows"))]
-        finish_termination(&self.command_tx, self.kill_root_process())
+        self.kill_root_process()
     }
 
     pub fn latest_seqno(&self) -> usize {
@@ -462,6 +506,16 @@ impl TerminalRuntime {
         &self,
         snapshot: Option<Vec<ProcessSnapshotEntry>>,
     ) -> io::Result<()> {
+        if let Some(child_pid) = self.child_pid {
+            if let Some(snapshot) = snapshot.as_deref() {
+                if let Some(descendants) =
+                    verified_process_tree_descendants(snapshot, child_pid, self.child_creation_time)
+                {
+                    best_effort_terminate_snapshot_entries(&descendants);
+                }
+            }
+        }
+
         let plan = root_process_termination_plan(
             snapshot.as_deref(),
             self.child_pid,
@@ -523,12 +577,151 @@ pub(crate) fn test_terminal_runtime() -> TerminalRuntime {
     TerminalRuntime {
         term: Arc::new(Mutex::new(terminal)),
         command_tx: crossbeam_channel::unbounded().0,
+        shared_writer: Arc::new(Mutex::new(None)),
         latest_seqno,
         last_size: dimensions,
         child_killer: Arc::new(Mutex::new(Box::new(NoopChildKiller))),
         child_pid: None,
         child_creation_time: None,
+        #[cfg(target_os = "windows")]
+        child_process_handle: Mutex::new(None),
+        #[cfg(target_os = "windows")]
+        job_handle: Mutex::new(None),
     }
+}
+
+fn begin_termination(command_tx: &Sender<RuntimeCommand>, shared_writer: &SharedWriterHandle) {
+    let _ = command_tx.send(RuntimeCommand::Shutdown);
+    disconnect_shared_writer(shared_writer);
+}
+
+fn disconnect_shared_writer(shared_writer: &SharedWriterHandle) {
+    if let Ok(mut writer) = shared_writer.lock() {
+        let _ = writer.take();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn raw_handle_to_handle(raw_handle: RawHandle) -> HANDLE {
+    raw_handle as HANDLE
+}
+
+#[cfg(target_os = "windows")]
+fn duplicate_process_handle(process_handle: HANDLE) -> io::Result<WinHandle> {
+    unsafe {
+        let current_process = GetCurrentProcess();
+        let mut duplicated = ptr::null_mut();
+        if DuplicateHandle(
+            current_process,
+            process_handle,
+            current_process,
+            &mut duplicated,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(WinHandle(duplicated))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn try_configure_kill_on_close_job(process_handle: Option<HANDLE>) -> Option<WinHandle> {
+    let process_handle = process_handle?;
+    match configure_kill_on_close_job(process_handle) {
+        Ok(job_handle) => Some(job_handle),
+        Err(err) => {
+            if err.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
+                log::warn!(
+                    "Terminal job containment unavailable because the session denied job attachment; falling back to best-effort cleanup: {err}"
+                );
+            } else {
+                log::warn!(
+                    "Terminal job containment unavailable; falling back to best-effort cleanup: {err}"
+                );
+            }
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn configure_kill_on_close_job(process_handle: HANDLE) -> io::Result<WinHandle> {
+    unsafe {
+        let job = CreateJobObjectW(ptr::null(), ptr::null());
+        if job.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        let job = WinHandle(job);
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            job.0,
+            JobObjectExtendedLimitInformation,
+            (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+
+        if AssignProcessToJobObject(job.0, process_handle) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(job)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_process_exit(
+    process_handle: &Mutex<Option<WinHandle>>,
+    timeout_ms: u32,
+) -> io::Result<bool> {
+    let process_handle = process_handle
+        .lock()
+        .map_err(|_| io::Error::other("process handle lock poisoned"))?;
+    let Some(process_handle) = process_handle.as_ref() else {
+        return Ok(false);
+    };
+
+    unsafe {
+        match WaitForSingleObject(process_handle.0, timeout_ms) {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(ERROR_INVALID_HANDLE as i32) {
+                    Ok(true)
+                } else {
+                    Err(err)
+                }
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn terminate_job_handle(job_handle: &Mutex<Option<WinHandle>>) -> io::Result<bool> {
+    let job = job_handle
+        .lock()
+        .map_err(|_| io::Error::other("job handle lock poisoned"))?
+        .take();
+    let Some(job) = job else {
+        return Ok(false);
+    };
+
+    unsafe {
+        if TerminateJobObject(job.0, 1) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+
+    Ok(true)
 }
 
 #[cfg(target_os = "windows")]
@@ -742,7 +935,7 @@ fn spawn_io_thread(
     term: Arc<Mutex<Terminal>>,
     latest_seqno: Arc<AtomicUsize>,
     master: Box<dyn MasterPty + Send>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    writer: SharedWriterHandle,
     command_rx: Receiver<RuntimeCommand>,
     tx: Sender<TerminalUiEvent>,
     repaint_ctx: eframe::egui::Context,
@@ -758,6 +951,9 @@ fn spawn_io_thread(
                     });
 
                     let Ok(mut writer_guard) = write_result else {
+                        break;
+                    };
+                    let Some(writer_guard) = writer_guard.as_mut() else {
                         break;
                     };
 
@@ -809,14 +1005,6 @@ fn send_ui_event(
 ) {
     let _ = tx.send(TerminalUiEvent { terminal_id, kind });
     repaint_ctx.request_repaint();
-}
-
-fn finish_termination(
-    command_tx: &Sender<RuntimeCommand>,
-    kill_result: io::Result<()>,
-) -> io::Result<()> {
-    let _ = command_tx.send(RuntimeCommand::Shutdown);
-    kill_result
 }
 
 pub fn try_terminal_snapshots(
@@ -880,11 +1068,6 @@ fn process_creation_time_by_pid(pid: u32) -> Option<u64> {
         let handle = WinHandle(handle);
         process_creation_time(handle.0)
     }
-}
-
-#[cfg(target_os = "windows")]
-fn process_creation_time_from_raw_handle(raw_handle: RawHandle) -> Option<u64> {
-    process_creation_time(raw_handle as HANDLE)
 }
 
 #[cfg(target_os = "windows")]
@@ -1417,16 +1600,19 @@ fn io_error_from_anyhow(err: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        best_effort_terminate_entries, default_style, finish_termination,
+        begin_termination, best_effort_terminate_entries, default_style,
         is_benign_process_exit_error, process_tree_kill_order, root_process_termination_plan,
         sanitize_cell_text, selection_snapshot_from_terminal, snapshot_from_terminal,
         snapshots_from_terminal, test_terminal_runtime, trim_trailing_default_cells,
         verified_process_entry, verified_process_tree_descendants, verified_snapshot_root_process,
         AdeTerminalConfig, ProcessSnapshotEntry, RootProcessTerminationPlan, RuntimeCommand,
-        TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape, TerminalDimensions,
-        TerminalStyle, TerminalStyledCell, VerifiedProcessLookup,
+        SharedWriterHandle, TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape,
+        TerminalDimensions, TerminalStyle, TerminalStyledCell, VerifiedProcessLookup,
     };
-    use std::{io, sync::Arc};
+    use std::{
+        io,
+        sync::{Arc, Mutex},
+    };
     use tattoy_wezterm_term::color::ColorPalette;
     use tattoy_wezterm_term::{Terminal, TerminalSize};
 
@@ -1703,28 +1889,28 @@ mod tests {
     }
 
     #[test]
-    fn finish_termination_sends_shutdown_after_success() {
+    fn begin_termination_sends_shutdown_and_disconnects_writer() {
         let (command_tx, command_rx) = crossbeam_channel::unbounded();
+        let shared_writer: SharedWriterHandle = Arc::new(Mutex::new(Some(Box::new(io::sink()))));
 
-        assert!(finish_termination(&command_tx, Ok(())).is_ok());
+        begin_termination(&command_tx, &shared_writer);
         assert!(matches!(
             command_rx.try_recv(),
             Ok(RuntimeCommand::Shutdown)
         ));
+        assert!(shared_writer.lock().unwrap().is_none());
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
-    fn finish_termination_sends_shutdown_after_failure() {
-        let (command_tx, command_rx) = crossbeam_channel::unbounded();
-        let err = io::Error::other("kill failed");
+    fn wait_for_process_exit_without_handle_is_not_ready() {
+        assert!(!super::wait_for_process_exit(&Mutex::new(None), 1).unwrap());
+    }
 
-        let result = finish_termination(&command_tx, Err(err));
-
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Other);
-        assert!(matches!(
-            command_rx.try_recv(),
-            Ok(RuntimeCommand::Shutdown)
-        ));
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn terminate_job_handle_without_job_returns_false() {
+        assert!(!super::terminate_job_handle(&Mutex::new(None)).unwrap());
     }
 
     #[cfg(target_os = "windows")]

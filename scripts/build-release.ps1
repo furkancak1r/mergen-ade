@@ -1,8 +1,9 @@
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+$targetRoot = Join-Path $repoRoot "target"
 $target = "x86_64-pc-windows-msvc"
-$releaseDir = Join-Path $repoRoot "target\$target\release"
+$releaseDir = Join-Path $targetRoot "$target\release"
 $exePath = Join-Path $releaseDir "mergen-ade.exe"
 $toolchain = "stable-x86_64-pc-windows-msvc"
 $blockedDlls = @(
@@ -803,7 +804,18 @@ function Invoke-BuildRelease {
         Prepend-EnvPath -Name "Path" -Entries @($toolchainBin)
         Set-Item -Path "Env:RUSTC" -Value $rustc
         Set-Item -Path "Env:CARGO" -Value $cargo
+        $inheritedTargetDir = $env:CARGO_TARGET_DIR
+        if ($inheritedTargetDir -and ($inheritedTargetDir -ne $targetRoot)) {
+            Write-Host "Overriding inherited CARGO_TARGET_DIR for portable release build: $inheritedTargetDir -> $targetRoot"
+        }
+        Set-Item -Path "Env:CARGO_TARGET_DIR" -Value $targetRoot
+        Set-Item -Path "Env:CARGO_INCREMENTAL" -Value "0"
         Ensure-MsvcBuildEnvironment
+
+        & $cargo clean --target $target
+        if ($LASTEXITCODE -ne 0) {
+            throw "Portable release clean failed."
+        }
 
         & $cargo build --release --target $target -j 1
         if ($LASTEXITCODE -ne 0) {
@@ -821,8 +833,9 @@ function Invoke-BuildRelease {
             throw "Portable EXE still depends on blocked runtime DLLs: $joined"
         }
 
+        $finalHash = (Get-FileHash -Path $exePath -Algorithm SHA256).Hash
         Remove-UnsupportedConvenienceArtifacts
-        Write-Host "Portable release EXE ready: $exePath"
+        Write-Host "Portable release EXE ready: $exePath (SHA256: $finalHash)"
     }
     finally {
         Pop-Location

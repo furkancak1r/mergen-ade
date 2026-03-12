@@ -1021,17 +1021,29 @@ function Test-RemoveUnsupportedConvenienceArtifactsFailsWhenDeletionFails {
 
 function Test-CleanupRunsAfterSuccessfulBuildValidation {
     $scriptContent = Get-Content -Path (Join-Path $repoRoot "scripts\build-release.ps1") -Raw
+    $targetRootIndex = $scriptContent.IndexOf('$targetRoot = Join-Path $repoRoot "target"')
+    $targetDirOverrideIndex = $scriptContent.IndexOf('Set-Item -Path "Env:CARGO_TARGET_DIR" -Value $targetRoot')
+    $cleanIndex = $scriptContent.IndexOf('& $cargo clean --target $target')
     $buildIndex = $scriptContent.IndexOf('& $cargo build --release --target $target -j 1')
     $importValidationIndex = $scriptContent.IndexOf('$blockedImports = $imports | Where-Object { $blockedDlls -contains $_ }')
+    $hashIndex = $scriptContent.IndexOf('$finalHash = (Get-FileHash -Path $exePath -Algorithm SHA256).Hash')
     $cleanupIndex = $scriptContent.LastIndexOf('Remove-UnsupportedConvenienceArtifacts')
-    $successMessageIndex = $scriptContent.LastIndexOf('Write-Host "Portable release EXE ready: $exePath"')
+    $successMessageIndex = $scriptContent.LastIndexOf('Write-Host "Portable release EXE ready: $exePath (SHA256: $finalHash)"')
 
+    Assert-True -Condition ($targetRootIndex -ge 0) -Message "Expected the release script to derive a repo-local target root."
+    Assert-True -Condition ($targetDirOverrideIndex -ge 0) -Message "Expected the release script to pin CARGO_TARGET_DIR to the repo-local target root."
+    Assert-True -Condition ($cleanIndex -ge 0) -Message "Expected the release script to clean the MSVC target before building."
     Assert-True -Condition ($buildIndex -ge 0) -Message "Expected the release script to invoke the MSVC cargo build."
     Assert-True -Condition ($importValidationIndex -ge 0) -Message "Expected the release script to validate blocked DLL imports."
+    Assert-True -Condition ($hashIndex -ge 0) -Message "Expected the release script to compute the final EXE SHA256 hash."
     Assert-True -Condition ($cleanupIndex -ge 0) -Message "Expected the release script to clean unsupported convenience artifacts on the success path."
     Assert-True -Condition ($successMessageIndex -ge 0) -Message "Expected the release script to print a success message after cleanup."
+    Assert-True -Condition ($targetDirOverrideIndex -lt $cleanIndex) -Message "Expected CARGO_TARGET_DIR to be pinned before the clean step runs."
+    Assert-True -Condition ($cleanIndex -lt $buildIndex) -Message "Expected the MSVC target clean to run before the build command."
     Assert-True -Condition ($cleanupIndex -gt $buildIndex) -Message "Expected cleanup to run after the MSVC build command."
     Assert-True -Condition ($cleanupIndex -gt $importValidationIndex) -Message "Expected cleanup to run after import validation passes."
+    Assert-True -Condition ($hashIndex -gt $importValidationIndex) -Message "Expected the EXE SHA256 hash to be computed after import validation passes."
+    Assert-True -Condition ($hashIndex -lt $cleanupIndex) -Message "Expected the EXE SHA256 hash to be computed before cleanup and success reporting."
     Assert-True -Condition ($cleanupIndex -lt $successMessageIndex) -Message "Expected cleanup to finish before the success message is printed."
 }
 
