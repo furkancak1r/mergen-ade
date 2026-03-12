@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/furkancak1r/mergen-ade/releases/latest"><strong>Download for Windows</strong></a>
+  <a href="https://github.com/furkancak1r/mergen-ade/releases/latest"><strong>Download Releases</strong></a>
   |
   <a href="#build-from-source"><strong>Build from Source</strong></a>
 </p>
@@ -35,13 +35,16 @@ It is not an IDE. There is no built-in editor, LSP, or debugger UI in this proje
 
 ## Quick Start
 
-### Download the Windows build
+### Download release assets
 
 The canonical download location is the GitHub Releases page:
 
 - https://github.com/furkancak1r/mergen-ade/releases/latest
 
-As of March 10, 2026, this repository does not have a published GitHub Release yet. When the first release is published, the Windows portable ZIP will appear there.
+Published assets currently target:
+
+- Windows: portable ZIP containing `mergen-ade.exe`
+- macOS: best-effort unsigned ARM64 DMG
 
 ### Local build
 
@@ -70,6 +73,12 @@ For an experimental native macOS build, use an explicit target because the repo 
 cargo build --release --target aarch64-apple-darwin
 ```
 
+This produces the macOS binary at:
+
+```text
+target/aarch64-apple-darwin/release/mergen-ade
+```
+
 If `cargo` is not on PATH in PowerShell:
 
 ```powershell
@@ -79,7 +88,7 @@ $env:USERPROFILE\.cargo\bin\cargo.exe test
 
 ## Core Features
 
-- Native Windows desktop app built in Rust
+- Native Rust desktop app with a Windows-first release path
 - Embedded terminal panes with tiled layout management
 - Project-aware terminal grouping in the side panel
 - ConPTY-backed shell sessions with responsive IO flow
@@ -89,7 +98,7 @@ $env:USERPROFILE\.cargo\bin\cargo.exe test
 
 ## How It Works
 
-- Terminal sessions are created through `portable-pty` using the native Windows PTY system.
+- Terminal sessions are created through `portable-pty` using the native PTY backend of the current platform.
 - Terminal emulation and parsing are handled by `tattoy-wezterm-term`.
 - PTY reads, writes, and resize handling run off the UI thread to keep the app responsive.
 - The main window combines an activity rail, collapsible side panels, and tiled terminal panes.
@@ -121,6 +130,8 @@ Regression check:
 powershell -ExecutionPolicy Bypass -File .\scripts\__tests__\build-release.tests.ps1
 ```
 
+For macOS release packaging, GitHub Actions builds `aarch64-apple-darwin`, wraps the binary in a minimal `.app`, and then creates an unsigned DMG. There is no local repo script for notarized macOS packaging yet.
+
 ## GitHub Releases
 
 This repository includes a release workflow at `.github/workflows/release.yml`.
@@ -137,6 +148,7 @@ The macOS DMG is currently:
 - ARM64 only
 - unsigned and not notarized
 - best-effort only; if the macOS job cannot package a DMG, the Windows asset is still published
+- expected to show Gatekeeper warnings until signing and notarization are added
 
 Maintainer tag example:
 
@@ -152,6 +164,8 @@ Config is stored in platform app data via `ProjectDirs`.
 On Windows the current path is:
 
 - `%APPDATA%\Mergen\MergenADE\config\config.toml`
+
+On macOS, `ProjectDirs` resolves under the user's Library application support/config directories.
 
 Persisted data includes:
 
@@ -171,6 +185,7 @@ The project currently includes unit tests for:
 
 - tiling grid calculation in `src/layout.rs`
 - terminal title update logic in `src/title.rs`
+- platform-specific shell/config and file-open command behavior
 - Windows release helper regressions in `scripts/__tests__/build-release.tests.ps1`
 
 Run checks:

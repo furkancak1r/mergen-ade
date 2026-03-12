@@ -7,11 +7,13 @@
 - `src/layout.rs`: auto-tiling grid math and related unit tests.
 - `src/title.rs`: terminal title update/truncation logic and unit tests.
 - `src/config.rs` + `src/models.rs`: persisted TOML config schema and load/save behavior.
-- `.github/workflows/release.yml`: Windows release build/publish pipeline.
+- `.github/workflows/release.yml`: GitHub release pipeline for Windows ZIP and best-effort macOS ARM64 DMG assets.
 - Build artifacts are in `target/` (do not commit).
 
 ## Build, Test, and Development Commands
-- `cargo build --release`: production build (`target/x86_64-pc-windows-gnullvm/release/mergen-ade.exe`).
+- `cargo build --release`: default local production build using the repo target configuration.
+- `cargo build --release --target x86_64-pc-windows-msvc`: supported Windows release binary (`target/x86_64-pc-windows-msvc/release/mergen-ade.exe`).
+- `cargo build --release --target aarch64-apple-darwin`: experimental native macOS build used by the release workflow.
 - `cargo run --release`: run optimized build locally.
 - `cargo test`: run unit tests (layout, title, terminal helpers).
 - `cargo fmt`: format Rust sources before commit.
@@ -42,11 +44,11 @@ If `cargo` is not on PATH in PowerShell, use:
   1. What changed and why.
   2. Validation steps (`cargo test`, manual run notes).
   3. UI screenshots/GIFs for visible behavior changes.
-  4. Any Windows-specific assumptions or limitations.
+  4. Any platform-specific assumptions or limitations, especially Windows-only and experimental macOS behavior.
 
 ## Security & Configuration Notes
 - Do not commit local paths, secrets, or generated executables.
-- Config is user-local in `%APPDATA%` via `ProjectDirs`; treat it as runtime data, not source-controlled state.
+- Config is user-local via `ProjectDirs`; on Windows this maps under `%APPDATA%`. Treat it as runtime data, not source-controlled state.
 
 ## Known Issues Maintenance
 - Keep `KNOWN_ISSUES.md` up to date whenever a bug is diagnosed and fixed or a recurring failure mode is identified.
