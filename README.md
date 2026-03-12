@@ -22,7 +22,7 @@
   <img src="mergen-screenshot.png" alt="Mergen ADE screenshot" width="1100">
 </p>
 
-Mergen ADE is a desktop ADE focused on terminal orchestration, project context switching, and lightweight workspace management. The project is still Windows-first, with an unsigned macOS ARM64 DMG now produced alongside official GitHub releases.
+Mergen ADE is a desktop ADE focused on terminal orchestration, project context switching, and lightweight workspace management. The project is still Windows-first, with a signed and notarized macOS ARM64 DMG now produced alongside official GitHub releases.
 
 It is not an IDE. There is no built-in editor, LSP, or debugger UI in this project.
 
@@ -44,7 +44,7 @@ The canonical download location is the GitHub Releases page:
 Published assets currently target:
 
 - Windows: portable ZIP containing `mergen-ade.exe`
-- macOS: unsigned ARM64 DMG
+- macOS: signed and notarized ARM64 DMG
 
 ### Local build
 
@@ -94,7 +94,7 @@ $env:USERPROFILE\.cargo\bin\cargo.exe test
 - ConPTY-backed shell sessions with responsive IO flow
 - Lightweight local TOML configuration
 - Portable Windows release pipeline through GitHub Actions
-- Unsigned macOS ARM64 DMG packaging in GitHub Actions
+- Signed and notarized macOS ARM64 DMG packaging in GitHub Actions
 
 ## How It Works
 
@@ -130,7 +130,7 @@ Regression check:
 powershell -ExecutionPolicy Bypass -File .\scripts\__tests__\build-release.tests.ps1
 ```
 
-For macOS release packaging, GitHub Actions builds `aarch64-apple-darwin`, wraps the binary in a minimal `.app`, and then creates an unsigned DMG. There is no local repo script for notarized macOS packaging yet.
+For macOS release packaging, GitHub Actions builds `aarch64-apple-darwin`, wraps the binary in a minimal `.app`, signs it with a Developer ID Application certificate, notarizes the DMG through `notarytool`, and staples the notarization ticket onto the DMG before publishing. The same script can still package locally without signing when the Apple credentials are not provided.
 
 ## GitHub Releases
 
@@ -140,15 +140,23 @@ When a tag starting with `v` is pushed, GitHub Actions will:
 
 1. Build the portable `mergen-ade.exe` for `x86_64-pc-windows-msvc`
 2. Package it as `mergen-ade-<tag>-windows-x64-portable.zip`
-3. Build an unsigned `mergen-ade-<tag>-macos-arm64.dmg`
+3. Build, sign, notarize, and staple `mergen-ade-<tag>-macos-arm64.dmg`
 4. Publish a GitHub Release and attach every packaged asset that was produced
 
 The macOS DMG is currently:
 
 - ARM64 only
-- unsigned and not notarized
-- required for official tagged releases; if DMG packaging fails, the release workflow fails instead of publishing a Windows-only release
-- expected to show Gatekeeper warnings until signing and notarization are added
+- signed with a Developer ID Application certificate and notarized through Apple
+- required for official tagged releases; if signing, notarization, or DMG packaging fails, the release workflow fails instead of publishing a broken Windows-only release
+- expected to open without the prior "damaged" Gatekeeper warning on a clean supported macOS installation
+
+Maintainer release prerequisites:
+
+- GitHub repository secrets: `APPLE_DEVELOPER_ID_APP_CERT_BASE64`, `APPLE_DEVELOPER_ID_APP_CERT_PASSWORD`, `APPLE_DEVELOPER_IDENTITY`, `APPLE_NOTARY_API_KEY_ID`, `APPLE_NOTARY_API_ISSUER_ID`, `APPLE_NOTARY_API_PRIVATE_KEY_BASE64`
+- Apple Developer membership with a Developer ID Application certificate exported as `.p12`
+- App Store Connect API key with notarization access
+
+This is safe for a public repository because the signing material stays in GitHub Actions secrets and the release workflow runs only on tag pushes in the base repository.
 
 Maintainer tag example:
 

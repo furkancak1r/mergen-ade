@@ -222,3 +222,31 @@
   - Do not allow official release publish jobs to proceed after a skipped macOS packaging path if the release promise includes a DMG artifact.
 - Files/Commands touched: `rust-toolchain.toml`, `.github/workflows/release.yml`, `README.md`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `gh run view 22999299197 --job 66779525438 --log`
 - References: GitHub Actions run `22999299197` for tag `v0.1.3`; local fix commit pending
+
+#### macOS DMG release path restored for official tags {#macos-dmg-release-path-restored-for-official-tags}
+- Date: 2026-03-12T12:01:42Z
+- Context: main/GitHub Actions release run `23000428561` on `macos-15-arm64` and `windows-latest`/Rust stable 1.94.0
+- Error signature: `Package unsigned DMG`
+- Symptoms/Impact: After the fix, the `v0.1.4` release produced both `mergen-ade-v0.1.4-macos-arm64.dmg` and `mergen-ade-v0.1.4-windows-x64-portable.zip` instead of silently publishing a Windows-only release.
+- Root cause: The prior Windows-specific repo toolchain override was removed and the macOS workflow now builds with a host-valid stable toolchain before packaging the `.app` into a DMG.
+- Resolution: Fixed by commit `2cc883d` (`macOS release toolchain kilidini kaldır ve DMG yayınını zorunlu yap`), validated by successful GitHub release run `23000428561` and published tag `v0.1.4`.
+- Prevent recurrence:
+  - Keep official release workflows fail-fast when a promised platform artifact cannot be produced.
+  - Re-check release asset lists after each tagged run to confirm both DMG and ZIP uploads.
+  - Avoid repo-level Rust channel names that encode a single host triple unless every CI runner matches that host.
+- Files/Commands touched: `rust-toolchain.toml`, `.github/workflows/release.yml`, `README.md`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `gh run watch 23000428561 --exit-status`, `gh release view v0.1.4 --json assets,url,name`
+- References: commit `2cc883d`; release `https://github.com/furkancak1r/mergen-ade/releases/tag/v0.1.4`; run `https://github.com/furkancak1r/mergen-ade/actions/runs/23000428561`
+
+#### macOS notarized release flow replaced the damaged DMG experience {#macos-notarized-release-flow-replaced-the-damaged-dmg-experience}
+- Date: 2026-03-12T13:06:02Z
+- Context: main/local release workflow hardening for GitHub Actions macOS runner and Apple Developer notarization
+- Error signature: `"<app>" is damaged and can't be opened. You should move it to the Trash.`
+- Symptoms/Impact: The published macOS DMG could download successfully but still be blocked by Gatekeeper on a clean Mac, making the official release effectively unusable for normal end users.
+- Root cause: The release pipeline packaged an unsigned, unstapled macOS app and DMG, so Gatekeeper treated the downloaded artifact as untrusted and potentially tampered with.
+- Resolution: Local workspace fix updates the macOS release flow to import a Developer ID Application certificate from GitHub secrets, sign the `.app`, notarize the DMG with `notarytool` via App Store Connect API key, staple the results, and fail the release if any Apple verification step fails.
+- Prevent recurrence:
+  - Never publish an official macOS DMG without successful `codesign`, `notarytool`, `stapler`, and `spctl` verification in CI.
+  - Keep Apple signing material only in GitHub Actions secrets; do not commit or echo certificate or API key contents.
+  - Upload notarization diagnostics on failure so rejected submissions can be debugged before the next tag.
+- Files/Commands touched: `.github/workflows/release.yml`, `scripts/package-macos-release.sh`, `README.md`, `AGENTS.md`, `KNOWN_ISSUES.md`
+- References: release `https://github.com/furkancak1r/mergen-ade/releases/tag/v0.1.4`; run `https://github.com/furkancak1r/mergen-ade/actions/runs/23000428561`
