@@ -1,0 +1,52 @@
+{
+  "$schema": "https://wvw.dev/apps.schema.json",
+  "store": {
+    "name": "Mergen ADE",
+    "developer": "Furkan Cakir",
+    "tagline": "Native terminal workspace for running and organizing multiple project contexts.",
+    "github": "https://github.com/furkancak1r"
+  },
+  "categories": [
+    {
+      "id": "macos",
+      "name": "macOS Apps"
+    },
+    {
+      "id": "developer-tools",
+      "name": "Developer Tools"
+    },
+    {
+      "id": "productivity",
+      "name": "Productivity"
+    }
+  ],
+  "apps": [
+    {
+      "id": "mergen-ade",
+      "name": "Mergen ADE",
+      "subtitle": "Organize multiple project terminals in one native workspace",
+      "description": "Native Rust terminal workspace for keeping multiple project contexts visible and easy to switch on macOS.",
+      "longDescription": "Mergen ADE is a desktop terminal workspace for running and organizing multiple project contexts. It keeps multiple terminals visible in a native Rust UI with tiled panes, project grouping, and lightweight persisted state. The project is still Windows-first, but official releases now include a signed and notarized macOS ARM64 DMG.",
+      "icon": "https://raw.githubusercontent.com/furkancak1r/mergen-ade/main/logo.png",
+      "category": [
+        "macos",
+        "developer-tools",
+        "productivity"
+      ],
+      "platform": "macOS",
+      "price": "Free",
+      "github": "https://github.com/furkancak1r/mergen-ade",
+      "homepage": "https://github.com/furkancak1r/mergen-ade/releases/latest",
+      "language": "Rust",
+      "features": [
+        "Embedded terminal panes with tiled layout management",
+        "Project-aware terminal grouping for fast context switches",
+        "Native PTY-backed shell sessions in a lightweight Rust desktop app",
+        "Small persisted config that restores useful workspace state"
+      ],
+      "screenshots": [
+        "https://raw.githubusercontent.com/furkancak1r/mergen-ade/main/mergen-screenshot.png"
+      ]
+    }
+  ]
+}
