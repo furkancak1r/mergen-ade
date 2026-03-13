@@ -1,0 +1,110 @@
+Mergen ADE
+
+Purpose
+- Native Rust desktop app for managing multiple terminal sessions in a tiled workspace.
+- Windows-first runtime and release flow, with macOS ARM64 packaging in CI.
+- Not an IDE: no built-in editor, LSP, debugger UI, accounts, or telemetry.
+
+Tech Stack
+- Rust 2021
+- eframe/egui for the native UI
+- portable-pty for PTY/session management
+- tattoy-wezterm-term + tattoy-wezterm-surface for terminal emulation/render data
+- TOML config stored in user-local app data via directories::ProjectDirs
+
+Product Surface
+- Multi-project terminal workspace with embedded tiled terminal panes.
+- Left activity rail switches between Project Explorer and Terminal Manager.
+- Project Explorer includes project picker, directory tree/index, search, and source control view.
+- Terminal Manager groups terminals by project and by kind (`foreground` / `background`).
+- Per-project saved messages/snippets can be stored and reused from the UI.
+- Main terminal visibility can switch between global view and selected-project view.
+- Auto-tiling can operate on all visible terminals or only the selected project's terminals.
+- Terminal headers and manager rows surface shared git status badges.
+
+Terminal Features
+- PTY-backed interactive shells with platform-aware defaults.
+- Terminal snapshots include styled runs/cells, cursor shape/state, and scrollback history.
+- Selection/copy logic is custom and tested for wrapped lines, wide cells, and empty rows.
+- `Ctrl+C` copies when a selection exists; otherwise it sends interrupt immediately.
+- Secondary click pastes immediately when no selection exists, or opens copy behavior when one does.
+- Child-process shutdown is handled explicitly; Windows code includes job/process-tree cleanup paths.
+- Terminal titles are sanitized, whitespace-compacted, and truncated for chrome display.
+
+Repo Map
+- src/main.rs: app entrypoint and native window startup
+- src/app.rs: main UI composition and app state orchestration
+- src/terminal.rs: PTY runtime, terminal snapshots, child process lifecycle
+- src/layout.rs: terminal tiling/grid calculation
+- src/title.rs: terminal title normalization/truncation
+- src/config.rs: config path resolution and load/save logic
+- src/models.rs: persisted config and shared enums/types
+- scripts/build-release.ps1: supported Windows release build path
+- scripts/package-macos-release.sh: local/CI macOS packaging helper
+- .github/workflows/release.yml: tagged release pipeline
+- KNOWN_ISSUES.md: append-only issue history and regression context
+
+Architecture Notes
+- UI state lives primarily in src/app.rs and drives panels, project selection, and visible terminals.
+- Terminal sessions are created off the UI thread and communicate through channels/events.
+- Terminal rendering uses snapshot-style data structures instead of embedding a full external terminal widget.
+- Persisted config is intentionally small: project list, shell preference, saved messages, and UI state.
+- Live sessions and scrollback are runtime-only and are not persisted.
+- Source control refresh runs through a shared worker/scheduler, not ad hoc UI-thread fetches.
+- Directory indexing is snapshot-based and asynchronous, keyed by project/generation.
+- The main window defaults to a large native viewport and does not persist window geometry.
+
+Important Behaviors
+- Windows is the primary target; PowerShell/CMD are the supported shells there.
+- Non-Windows currently normalizes to zsh.
+- The repo keeps a lightweight, native-first design; avoid heavy dependencies and browser-style abstractions.
+- UI controls should stay visually light and icon-first unless emphasis is required.
+- Keep KNOWN_ISSUES.md updated when diagnosing or fixing recurring problems.
+- Config migrations should preserve existing user state where possible; app.rs includes recovery/merge logic.
+- Source control auto-refresh is lightweight status polling; fetch remains a more deliberate/manual path.
+
+Release And Packaging
+- Official tagged releases publish two assets together: Windows portable ZIP and macOS ARM64 DMG.
+- The release workflow is in `.github/workflows/release.yml` and only publishes when both Windows and macOS jobs succeed.
+- Windows packaging produces `mergen-ade-<tag>-windows-x64-portable.zip` containing `mergen-ade.exe`.
+- macOS packaging script builds a minimal `.app`, generates an `.icns` from `logo.png`, places `/Applications` symlink in the DMG, and outputs `mergen-ade-<tag>-macos-arm64.dmg`.
+- Official macOS DMGs are signed with a Developer ID Application certificate, submitted with `notarytool`, then stapled and validated.
+- On notarization failure, CI uploads diagnostics from `release-staging/macos/notary-submit.json` and `notary-detail.json`.
+- The local macOS packaging script can still create a DMG without signing when Apple credentials are absent.
+
+Safe Starting Points For Changes
+- Layout issues: start in src/layout.rs, then verify callers in src/app.rs
+- Terminal lifecycle, IO, resize, selection, or child exit behavior: start in src/terminal.rs
+- Title formatting or truncation: start in src/title.rs
+- Config persistence or migration behavior: start in src/config.rs and src/models.rs
+- Sidebar/panel/workspace UI behavior: start in src/app.rs
+- Source control badges, branch/ahead-behind parsing, refresh cadence: start in src/app.rs around source control snapshot/worker code
+- Directory tree/search/index behavior: start in src/app.rs around directory snapshot/index code
+- Release asset or DMG behavior: start in `.github/workflows/release.yml` and `scripts/package-macos-release.sh`
+
+Build And Test
+- cargo build --release
+- cargo run --release
+- cargo test
+- cargo fmt
+- Windows release binary: cargo build --release --target x86_64-pc-windows-msvc
+- If cargo is missing in PowerShell: %USERPROFILE%\\.cargo\\bin\\cargo.exe <command>
+
+Validation Expectations
+- Add or update inline unit tests in the affected module when changing logic.
+- At minimum, run cargo test after feature or bug-fix work.
+- Run cargo fmt before finishing edits.
+- For release-path changes, also inspect `scripts/__tests__/build-release.tests.ps1` and the macOS packaging script.
+
+Constraints
+- Do not commit target/ or generated executables.
+- Do not write local paths, signing secrets, or runtime app-data artifacts into tracked files.
+- Preserve existing low-memory/native-first approach.
+- Keep commits scoped and avoid unrelated refactors.
+- Do not weaken the macOS release guarantees by allowing official tags to publish without the promised DMG.
+
+Useful Context For Agents
+- Read AGENTS.md for repo-specific workflow constraints and subagent expectations.
+- Read README.md for user-facing product and release context.
+- Read KNOWN_ISSUES.md before large debugging work or when touching fragile behavior.
+- If working on release reliability, read the macOS-related entries in KNOWN_ISSUES.md before changing the workflow.
