@@ -139,7 +139,6 @@ if [[ "${sign_and_notarize}" == "1" ]]; then
 
     xcrun stapler staple "${asset_path}"
     xcrun stapler validate "${asset_path}"
-    spctl -a -vv --type open "${asset_path}"
 fi
 
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then

@@ -264,3 +264,17 @@
   - Treat each failed release rerun as a new diagnostic data point and append the exact Apple rejection string for future regressions.
 - Files/Commands touched: `scripts/package-macos-release.sh`, `README.md`, `KNOWN_ISSUES.md`, `gh run view 23005915477 --log-failed`
 - References: run `https://github.com/furkancak1r/mergen-ade/actions/runs/23005915477`; failed macOS job in attempt 3 for tag `v0.1.5`
+
+#### Headless spctl DMG assessment blocked a notarized release in CI {#headless-spctl-dmg-assessment-blocked-a-notarized-release-in-ci}
+- Date: 2026-03-13T05:12:34Z
+- Context: main/local release fix after `v0.1.6` GitHub Actions run `23008045783` on `macos-15-arm64`
+- Error signature: `mergen-ade-v0.1.6-macos-arm64.dmg: rejected` / `source=Insufficient Context`
+- Symptoms/Impact: The macOS release job completed signing, notarization, stapling, and `stapler validate`, but still failed at the last CI gate, so the notarized DMG never uploaded and `v0.1.6` was not published.
+- Root cause: `spctl -a -vv --type open` on a GitHub-hosted headless runner required runtime context that the CI environment did not provide, so it returned a false-negative even after Apple notarization had already been accepted.
+- Resolution: Local workspace fix removes the blocking headless `spctl --type open` DMG gate from CI, keeps `notarytool` acceptance and `stapler validate` as release blockers, and documents the runner-context limitation.
+- Prevent recurrence:
+  - Do not make headless `spctl --type open` a blocking publish gate when notarization and stapler validation have already passed.
+  - Treat `notarytool Accepted` plus `stapler validate` as the canonical CI release signal for DMG trust.
+  - Reserve end-user Gatekeeper behavior checks for manual download testing on a real macOS desktop context.
+- Files/Commands touched: `scripts/package-macos-release.sh`, `README.md`, `KNOWN_ISSUES.md`, `gh run view 23008045783 --job 66844593832 --log-failed`, `gh run download 23008045783 -n macos-notarization-diagnostics`
+- References: run `https://github.com/furkancak1r/mergen-ade/actions/runs/23008045783`; failed tag `v0.1.6`; notary diagnostics artifact `macos-notarization-diagnostics`
