@@ -47,6 +47,7 @@ const SOURCE_CONTROL_PRIORITY_REFRESH_SECS: f64 = 5.0;
 const SOURCE_CONTROL_BACKGROUND_REFRESH_SECS: f64 = 20.0;
 const SOURCE_CONTROL_POLL_TICK_MS: u64 = 250;
 const SOURCE_CONTROL_TOOLTIP_FILE_LIMIT: usize = 12;
+const DIRECTORY_ENTRY_TOOLTIP_MAX_CHARS: usize = 500;
 const TERMINAL_OUTPUT_BG: Color32 = Color32::from_rgb(26, 30, 36);
 const TERMINAL_HEADER_HEIGHT: f32 = 38.0;
 const TERMINAL_HEADER_GAP: f32 = 6.0;
@@ -60,7 +61,7 @@ const BORDER_COLOR: Color32 = Color32::from_rgb(46, 60, 78);
 const ACCENT: Color32 = Color32::from_rgb(26, 179, 255);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(225, 233, 245);
 const TEXT_MUTED: Color32 = Color32::from_rgb(148, 167, 191);
-const PROJECT_EXPLORER_WIDTH: f32 = 320.0;
+const PROJECT_EXPLORER_WIDTH: f32 = 352.0;
 const ACTIVITY_RAIL_WIDTH: f32 = 48.0;
 const CONTROL_ROW_HEIGHT: f32 = 28.0;
 const TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH: f32 = 32.0;
@@ -228,6 +229,7 @@ pub struct AdeApp {
     show_settings_popup: bool,
     saved_message_drafts: BTreeMap<u64, String>,
     directory_search_query: String,
+    directory_pending_tree_open_state_by_project: BTreeMap<u64, bool>,
     status_line: String,
     copy_toast: Option<TransientToast>,
     layout_epoch: u64,
@@ -245,6 +247,7 @@ pub struct AdeApp {
     directory_index_events_tx: Sender<DirectoryIndexEvent>,
     directory_index_events_rx: Receiver<DirectoryIndexEvent>,
     directory_index_state: BTreeMap<u64, DirectoryIndexSnapshot>,
+    directory_tree_has_collapsed_cache_by_project: BTreeMap<u64, bool>,
     directory_index_generation: BTreeMap<u64, u64>,
 }
 
@@ -491,6 +494,7 @@ impl AdeApp {
             show_settings_popup: false,
             saved_message_drafts: BTreeMap::new(),
             directory_search_query: String::new(),
+            directory_pending_tree_open_state_by_project: BTreeMap::new(),
             status_line: config_load_error
                 .map(|err| format!("Config load error: {err}. Existing config preserved."))
                 .unwrap_or_else(|| "Ready".to_owned()),
@@ -510,6 +514,7 @@ impl AdeApp {
             directory_index_events_tx,
             directory_index_events_rx,
             directory_index_state: BTreeMap::new(),
+            directory_tree_has_collapsed_cache_by_project: BTreeMap::new(),
             directory_index_generation: BTreeMap::new(),
         };
         app
@@ -711,7 +716,11 @@ impl AdeApp {
         }
         self.directory_index_state.remove(&project_id);
         self.directory_index_generation.remove(&project_id);
+        self.directory_tree_has_collapsed_cache_by_project
+            .remove(&project_id);
         self.saved_message_drafts.remove(&project_id);
+        self.directory_pending_tree_open_state_by_project
+            .remove(&project_id);
 
         self.bump_layout_epoch();
         if close_failures == 0 {
@@ -1088,6 +1097,8 @@ impl AdeApp {
 
             self.directory_index_state
                 .insert(event.project_id, event.snapshot);
+            self.directory_tree_has_collapsed_cache_by_project
+                .remove(&event.project_id);
             changed = true;
         }
         if changed {
@@ -1143,6 +1154,41 @@ impl AdeApp {
                 snapshot,
             });
         });
+    }
+
+    fn cached_directory_tree_has_collapsed_folders(
+        &mut self,
+        project_id: u64,
+        ctx: &egui::Context,
+    ) -> bool {
+        if let Some(cached) = self
+            .directory_tree_has_collapsed_cache_by_project
+            .get(&project_id)
+            .copied()
+        {
+            return cached;
+        }
+
+        let collapsed = self
+            .directory_index_state
+            .get(&project_id)
+            .map(|snapshot| {
+                if snapshot.loading || snapshot.last_error.is_some() {
+                    true
+                } else {
+                    directory_tree_has_collapsed_folders(ctx, &snapshot.root)
+                }
+            })
+            .unwrap_or(true);
+
+        self.directory_tree_has_collapsed_cache_by_project
+            .insert(project_id, collapsed);
+        collapsed
+    }
+
+    fn invalidate_directory_tree_collapsed_cache(&mut self, project_id: u64) {
+        self.directory_tree_has_collapsed_cache_by_project
+            .remove(&project_id);
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context, main_area_size: Vec2) {
@@ -2230,7 +2276,7 @@ impl AdeApp {
                             ui.spacing_mut().interact_size.y = CONTROL_ROW_HEIGHT;
                             ui.horizontal(|ui| {
                                 let button_group_width =
-                                    30.0 * 4.0 + ui.spacing().item_spacing.x * 3.0;
+                                    30.0 * 5.0 + ui.spacing().item_spacing.x * 4.0;
                                 let combo_width =
                                     (ui.available_width() - button_group_width).clamp(96.0, 150.0);
                                 with_minimal_button_chrome(ui, |ui| {
@@ -2303,6 +2349,44 @@ impl AdeApp {
                                     ) {
                                         refresh_index = true;
                                     }
+                                    let search_active =
+                                        !self.directory_search_query.trim().is_empty();
+                                    ui.add_enabled_ui(!search_active, |ui| {
+                                        let open_all = selected_project_details
+                                            .as_ref()
+                                            .map(|(project_id, _, _, _)| {
+                                                self.cached_directory_tree_has_collapsed_folders(
+                                                    *project_id,
+                                                    ui.ctx(),
+                                                )
+                                            })
+                                            .unwrap_or(true);
+                                        if styled_icon_button(
+                                            ui,
+                                            if open_all {
+                                                icons::EYE
+                                            } else {
+                                                icons::EYE_OFF
+                                            },
+                                            BTN_ICON,
+                                            BTN_ICON_HOVER,
+                                            BTN_ICON_ACTIVE,
+                                            if open_all {
+                                                "Expand All Folders"
+                                            } else {
+                                                "Collapse All Folders"
+                                            },
+                                        ) {
+                                            if let Some((project_id, _, _, _)) =
+                                                selected_project_details.as_ref()
+                                            {
+                                                self.directory_tree_has_collapsed_cache_by_project
+                                                    .insert(*project_id, open_all);
+                                                self.directory_pending_tree_open_state_by_project
+                                                    .insert(*project_id, open_all);
+                                            }
+                                        }
+                                    });
                                     if styled_icon_button(
                                         ui,
                                         icons::TRASH,
@@ -2376,6 +2460,15 @@ impl AdeApp {
                                                 .strong(),
                                         );
 
+                                        let pending_open_all = search_query
+                                            .is_none()
+                                            .then(|| {
+                                                self.directory_pending_tree_open_state_by_project
+                                                    .get(&project_id)
+                                                    .copied()
+                                            })
+                                            .flatten();
+
                                         if snapshot.loading {
                                             ui.label(
                                                 RichText::new(directory_index_loading_label(
@@ -2392,7 +2485,32 @@ impl AdeApp {
 
                                         if let Some(error) = &snapshot.last_error {
                                             ui.colored_label(Color32::LIGHT_RED, error);
+                                            if pending_open_all.is_some() {
+                                                self.directory_pending_tree_open_state_by_project
+                                                    .remove(&project_id);
+                                                status_line_update = Some(
+                                                    "Could not update folder visibility because directory index is unavailable"
+                                                        .to_owned(),
+                                                );
+                                            }
                                         } else if !snapshot.loading {
+                                            if let Some(open_all) = pending_open_all {
+                                                apply_directory_tree_open_state(
+                                                    ui.ctx(),
+                                                    &snapshot.root,
+                                                    open_all,
+                                                );
+                                                self.directory_pending_tree_open_state_by_project
+                                                    .remove(&project_id);
+                                                self.directory_tree_has_collapsed_cache_by_project
+                                                    .insert(project_id, !open_all);
+                                                status_line_update = Some(if open_all {
+                                                    "Expanded all folders".to_owned()
+                                                } else {
+                                                    "Collapsed all folders".to_owned()
+                                                });
+                                            }
+
                                             let mut matching_directories = HashSet::new();
                                             if let Some(query) = search_query.as_deref() {
                                                 let _ = collect_matching_directory_paths(
@@ -2403,7 +2521,8 @@ impl AdeApp {
                                                 );
                                             }
 
-                                            let has_results = draw_folder_tree(
+                                            let (has_results, folder_state_changed) =
+                                                draw_folder_tree(
                                                 ui,
                                                 &snapshot.root,
                                                 &mut status_line_update,
@@ -2413,6 +2532,12 @@ impl AdeApp {
                                                     .as_deref()
                                                     .map(|_| &matching_directories),
                                             );
+
+                                            if folder_state_changed {
+                                                self.invalidate_directory_tree_collapsed_cache(
+                                                    project_id,
+                                                );
+                                            }
 
                                             if search_query.is_some() && !has_results {
                                                 ui.label(
@@ -4306,8 +4431,9 @@ fn draw_folder_tree(
     search_query: Option<&str>,
     force_show_all_descendants: bool,
     matching_directories: Option<&HashSet<PathBuf>>,
-) -> bool {
+) -> (bool, bool) {
     let mut rendered_any = false;
+    let mut folder_state_changed = false;
     for item in &root.children {
         let item_name_lower = item.name.to_lowercase();
         let item_matches = search_query.is_some_and(|query| item_name_lower.contains(query));
@@ -4324,12 +4450,24 @@ fn draw_folder_tree(
 
             let show_all_descendants =
                 force_show_all_descendants || search_query.is_some() && item_matches;
-            let header = egui::CollapsingHeader::new(item.name.clone())
-                .id_salt(item.path.display().to_string())
-                .open(search_query.map(|_| true))
-                .icon(paint_minimal_disclosure_icon)
-                .show(ui, |ui| {
-                    let _ = draw_folder_tree(
+            let mut header_state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                directory_tree_folder_state_id(&item.path),
+                false,
+            );
+            let search_active = search_query.is_some();
+            let initial_open_state = (!search_active).then(|| header_state.is_open());
+            let previous_open_state = search_active.then(|| header_state.is_open());
+            if search_active {
+                header_state.set_open(true);
+            }
+
+            let (_, header_response, _) = header_state
+                .show_header(ui, |ui| {
+                    draw_directory_folder_row(ui, &item.name)
+                })
+                .body(|ui| {
+                    let (_, child_state_changed) = draw_folder_tree(
                         ui,
                         item,
                         status_line_update,
@@ -4337,8 +4475,44 @@ fn draw_folder_tree(
                         show_all_descendants,
                         matching_directories,
                     );
+                    folder_state_changed |= child_state_changed;
                 });
-            header.header_response.context_menu(|ui| {
+            if search_active {
+                if let Some(previous_open_state) = previous_open_state {
+                    let mut restore_state =
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ui.ctx(),
+                            directory_tree_folder_state_id(&item.path),
+                            false,
+                        );
+                    restore_state.set_open(previous_open_state);
+                    restore_state.store(ui.ctx());
+                }
+            }
+
+            if !search_active && header_response.inner.clicked() {
+                let mut clicked_state =
+                    egui::collapsing_header::CollapsingState::load_with_default_open(
+                        ui.ctx(),
+                        directory_tree_folder_state_id(&item.path),
+                        false,
+                    );
+                clicked_state.toggle(ui);
+                clicked_state.store(ui.ctx());
+            }
+
+            if let Some(initial_open_state) = initial_open_state {
+                let current_open_state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    directory_tree_folder_state_id(&item.path),
+                    false,
+                )
+                .is_open();
+                if current_open_state != initial_open_state {
+                    folder_state_changed = true;
+                }
+            }
+            header_response.response.context_menu(|ui| {
                 with_minimal_button_chrome(ui, |ui| {
                     if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
                         let item_path_text = item.path.display().to_string();
@@ -4410,7 +4584,7 @@ fn draw_folder_tree(
         }
     }
 
-    rendered_any
+    (rendered_any, folder_state_changed)
 }
 
 fn collect_matching_directory_paths(
@@ -4436,6 +4610,45 @@ fn collect_matching_directory_paths(
     }
 
     has_match
+}
+
+fn apply_directory_tree_open_state(ctx: &egui::Context, root: &DirectoryNode, open: bool) {
+    for item in &root.children {
+        if !item.is_dir {
+            continue;
+        }
+
+        let header_id = directory_tree_folder_state_id(&item.path);
+        let mut header_state =
+            egui::collapsing_header::CollapsingState::load_with_default_open(ctx, header_id, open);
+        header_state.set_open(open);
+        header_state.store(ctx);
+
+        apply_directory_tree_open_state(ctx, item, open);
+    }
+}
+
+fn directory_tree_has_collapsed_folders(ctx: &egui::Context, root: &DirectoryNode) -> bool {
+    for item in &root.children {
+        if !item.is_dir {
+            continue;
+        }
+
+        let header_state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            ctx,
+            directory_tree_folder_state_id(&item.path),
+            false,
+        );
+        if !header_state.is_open() || directory_tree_has_collapsed_folders(ctx, item) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn directory_tree_folder_state_id(path: &Path) -> Id {
+    Id::new(("directory-tree-folder", path.display().to_string()))
 }
 
 fn with_alpha(color: Color32, alpha: u8) -> Color32 {
@@ -4558,7 +4771,39 @@ fn draw_directory_file_row(ui: &mut Ui, text: &str) -> egui::Response {
             .galley(text_pos, galley, ui.visuals().text_color());
     }
 
-    response
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    with_truncation_tooltip(ui, response, text, &font_id, ui.visuals().text_color())
+}
+
+fn draw_directory_folder_row(ui: &mut Ui, text: &str) -> egui::Response {
+    let button_padding = ui.spacing().button_padding;
+    let available_width = ui.available_width().max(0.0);
+    let wrap_width = (available_width - (button_padding.x * 2.0)).max(0.0);
+    let galley = WidgetText::from(text.to_owned()).into_galley(
+        ui,
+        Some(TextWrapMode::Truncate),
+        wrap_width,
+        egui::TextStyle::Body,
+    );
+    let desired_height = ui
+        .spacing()
+        .interact_size
+        .y
+        .max(galley.size().y + (button_padding.y * 2.0));
+    let desired_size = egui::vec2(available_width, desired_height);
+    let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
+
+    if ui.is_rect_visible(rect) {
+        let text_pos = ui
+            .layout()
+            .align_size_within_rect(galley.size(), rect.shrink2(button_padding))
+            .min;
+        ui.painter()
+            .galley(text_pos, galley, ui.visuals().text_color());
+    }
+
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    with_truncation_tooltip(ui, response, text, &font_id, ui.visuals().text_color())
 }
 
 fn directory_file_row_hover_fill(is_hovered: bool) -> Option<Color32> {
@@ -4629,7 +4874,7 @@ fn with_truncation_tooltip(
     _color: Color32,
 ) -> egui::Response {
     if !text.trim().is_empty() {
-        response.on_hover_text(capped_hover_text(text, 500))
+        response.on_hover_text(capped_hover_text(text, DIRECTORY_ENTRY_TOOLTIP_MAX_CHARS))
     } else {
         response
     }
@@ -7423,6 +7668,7 @@ mod tests {
             show_settings_popup: false,
             saved_message_drafts: BTreeMap::new(),
             directory_search_query: String::new(),
+            directory_pending_tree_open_state_by_project: BTreeMap::new(),
             status_line: "Ready".to_owned(),
             copy_toast: None,
             layout_epoch: 0,
@@ -7440,6 +7686,7 @@ mod tests {
             directory_index_events_tx,
             directory_index_events_rx,
             directory_index_state: BTreeMap::new(),
+            directory_tree_has_collapsed_cache_by_project: BTreeMap::new(),
             directory_index_generation: BTreeMap::new(),
         }
     }

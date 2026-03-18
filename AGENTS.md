@@ -13,6 +13,7 @@
 ## Build, Test, and Development Commands
 - `cargo build --release`: default local production build using the repo target configuration.
 - `cargo build --release --target x86_64-pc-windows-msvc`: supported Windows release binary (`target/x86_64-pc-windows-msvc/release/mergen-ade.exe`).
+- `cargo build --release --target x86_64-pc-windows-gnullvm`: optional local build via repo-local LLVM-MinGW linker.
 - `cargo build --release --target aarch64-apple-darwin`: native macOS build used by the release workflow before signing/notarization packaging.
 - `cargo run --release`: run optimized build locally.
 - `cargo test`: run unit tests (layout, title, terminal helpers).

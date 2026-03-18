@@ -278,3 +278,59 @@
   - Reserve end-user Gatekeeper behavior checks for manual download testing on a real macOS desktop context.
 - Files/Commands touched: `scripts/package-macos-release.sh`, `README.md`, `KNOWN_ISSUES.md`, `gh run view 23008045783 --job 66844593832 --log-failed`, `gh run download 23008045783 -n macos-notarization-diagnostics`
 - References: run `https://github.com/furkancak1r/mergen-ade/actions/runs/23008045783`; failed tag `v0.1.6`; notary diagnostics artifact `macos-notarization-diagnostics`
+
+#### cargo build --release did not refresh the repo-path MSVC EXE {#cargo-build-release-did-not-refresh-the-repo-path-msvc-exe}
+- Date: 2026-03-18T00:00:00Z
+- Context: main/Windows local PowerShell, default cargo target selection
+- Error signature: `cargo run` reflected the latest code, but `target\x86_64-pc-windows-msvc\release\mergen-ade.exe` stayed stale after plain `cargo build --release`.
+- Symptoms/Impact: Contributors expected `cargo build --release` to refresh the MSVC EXE and launched an older binary from the repo target path.
+- Root cause: `/.cargo/config.toml` defaulted to `x86_64-pc-windows-gnullvm`, so plain release builds updated the gnullvm output while the MSVC path only changed with an explicit `--target x86_64-pc-windows-msvc` build or release script.
+- Resolution: Switched the repo default build target to `x86_64-pc-windows-msvc`, updated build documentation to match, and kept gnullvm available as an explicit optional target.
+- Prevent recurrence:
+  - Keep the default target and documented default output path aligned.
+  - When troubleshooting stale binaries, confirm which target triple the last build used.
+  - Reserve gnullvm builds for explicit `--target x86_64-pc-windows-gnullvm` invocations.
+- Files/Commands touched: `.cargo\config.toml`, `AGENTS.md`, `README.md`, `KNOWN_ISSUES.md`, `cargo build --release`
+- References: local workspace change on 2026-03-18; commit pending
+
+#### Expand/Collapse All action drifted from real folder open state {#expand-collapse-all-action-drifted-from-real-folder-open-state}
+- Date: 2026-03-18T00:00:00Z
+- Context: main/Windows local directory tree toolbar behavior
+- Error signature: Toolbar action text could show `Collapse All Folders` after folders were manually collapsed, and clicking it had no visible effect.
+- Symptoms/Impact: The remediation control felt misleading because button intent followed prior toolbar clicks instead of the current folder tree state.
+- Root cause: `src/app.rs` derived the next action from cached per-project toggle intent (`directory_toggle_next_collapses_by_project`) rather than reading actual `CollapsingState` values from the tree.
+- Resolution: Removed cached toggle-intent state, derived action label/intent from live folder header open state, and kept pending apply behavior for explicit bulk operations.
+- Prevent recurrence:
+  - Derive bulk tree actions from current UI state, not from last-click memory.
+  - Keep toolbar labels/action text and executable behavior tied to the same source of truth.
+  - Re-check manual folder toggles before accepting tree toolbar changes.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo check`
+- References: local workspace fix on 2026-03-18; commit pending
+
+#### Default MSVC local target broke contributor builds without Visual Studio toolchain {#default-msvc-local-target-broke-contributor-builds-without-visual-studio-toolchain}
+- Date: 2026-03-18T00:00:00Z
+- Context: main/Windows local contributor onboarding and plain cargo workflows
+- Error signature: `cargo build --release` / `cargo run --release` failed before linking on machines that only had the repo-local LLVM-MinGW setup.
+- Symptoms/Impact: Contributors who previously relied on the repo-local gnullvm linker could no longer run default local builds unless MSVC Build Tools and Windows SDK were preconfigured in shell environment.
+- Root cause: `/.cargo/config.toml` default target was switched from `x86_64-pc-windows-gnullvm` to `x86_64-pc-windows-msvc`, making default local cargo flows depend on MSVC prerequisites.
+- Resolution: Restored default target to `x86_64-pc-windows-gnullvm`, kept MSVC as explicit release target, and re-aligned docs/tests with the gnullvm default local flow.
+- Prevent recurrence:
+  - Keep plain local `cargo` defaults aligned with the lowest-friction contributor toolchain.
+  - Treat MSVC release output as explicit (`--target x86_64-pc-windows-msvc`) or script-driven (`scripts/build-release.ps1`).
+  - Update release tests and docs in the same change whenever default target behavior changes.
+- Files/Commands touched: `.cargo\config.toml`, `scripts\__tests__\build-release.tests.ps1`, `AGENTS.md`, `README.md`, `KNOWN_ISSUES.md`, `cargo check`, `powershell -ExecutionPolicy Bypass -File .\scripts\__tests__\build-release.tests.ps1`
+- References: local workspace fix on 2026-03-18; commit pending
+
+#### Directory tree toolbar and row truncation introduced hot-path repaint overhead {#directory-tree-toolbar-and-row-truncation-introduced-hot-path-repaint-overhead}
+- Date: 2026-03-18T00:00:00Z
+- Context: main/Windows local project explorer performance under continuous repaint
+- Error signature: Explorer toolbar state check traversed entire directory trees each frame, and row truncation repeatedly re-laid out text per visible entry.
+- Symptoms/Impact: Large repositories showed noticeable explorer stalls and degraded scrolling responsiveness while terminal activity and loading animations kept the pane repainting.
+- Root cause: `src/app.rs` computed bulk action state with a full `directory_tree_has_collapsed_folders` traversal on every repaint, and truncation logic performed multiple galley layouts per row (full-width check + binary search passes).
+- Resolution: Added per-project collapsed-state caching with explicit invalidation on index updates and manual folder toggles, and simplified directory row rendering to a single `TextWrapMode::Truncate` galley layout per row.
+- Prevent recurrence:
+  - Avoid O(total_directories) scans in per-frame UI paths; use cache + targeted invalidation.
+  - Keep explorer row rendering to one text layout pass per row where possible.
+  - Treat directory tree repaint-heavy views as performance-sensitive in code review.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo check`
+- References: local workspace fix on 2026-03-18; commit pending
