@@ -671,6 +671,62 @@ impl AdeApp {
         self.persist_config();
     }
 
+    fn remove_project(&mut self, ctx: &egui::Context, project_id: u64) {
+        let Some(project) = self.projects.remove(&project_id) else {
+            return;
+        };
+
+        let terminal_ids = self
+            .terminals
+            .iter()
+            .filter_map(|(terminal_id, terminal)| {
+                (terminal.project_id == project_id).then_some(*terminal_id)
+            })
+            .collect::<Vec<_>>();
+        let mut close_failures = 0usize;
+        for terminal_id in terminal_ids {
+            if let Some(terminal) = self.terminals.remove(&terminal_id) {
+                if terminal.runtime.terminate().is_err() {
+                    close_failures += 1;
+                }
+            }
+        }
+
+        let next_active_terminal = self
+            .active_terminal
+            .filter(|terminal_id| self.terminals.contains_key(terminal_id))
+            .or_else(|| self.first_visible_terminal_for_main());
+        self.set_active_terminal(next_active_terminal);
+
+        if self.selected_project == Some(project_id) {
+            self.selected_project = self.projects.keys().copied().next();
+            self.apply_selected_project_auto_tile_scope_and_refresh_layout(ctx);
+            self.note_selection_changed();
+        }
+
+        self.source_control_state.remove(&project_id);
+        self.source_control_refresh_state.remove(&project_id);
+        if self.source_control_last_auto_refresh_project == Some(project_id) {
+            self.source_control_last_auto_refresh_project = None;
+        }
+        self.directory_index_state.remove(&project_id);
+        self.directory_index_generation.remove(&project_id);
+        self.saved_message_drafts.remove(&project_id);
+
+        self.bump_layout_epoch();
+        if close_failures == 0 {
+            self.status_line = format!("Removed project '{}'", project.name);
+        } else {
+            self.status_line = format!(
+                "Removed project '{}' ({close_failures} terminal(s) failed to close cleanly)",
+                project.name
+            );
+        }
+        self.note_projects_changed();
+        self.persist_config();
+        ctx.request_repaint();
+    }
+
     fn spawn_terminal_for_project(
         &mut self,
         ctx: &egui::Context,
@@ -2160,6 +2216,7 @@ impl AdeApp {
                             .unwrap_or_else(|| "No project selected".to_owned());
 
                         let mut refresh_index = false;
+                        let mut remove_selected_project = false;
                         let selected_project_details =
                             self.selected_project.and_then(|selected_id| {
                                 project_rows
@@ -2173,7 +2230,7 @@ impl AdeApp {
                             ui.spacing_mut().interact_size.y = CONTROL_ROW_HEIGHT;
                             ui.horizontal(|ui| {
                                 let button_group_width =
-                                    30.0 * 3.0 + ui.spacing().item_spacing.x * 2.0;
+                                    30.0 * 4.0 + ui.spacing().item_spacing.x * 3.0;
                                 let combo_width =
                                     (ui.available_width() - button_group_width).clamp(96.0, 150.0);
                                 with_minimal_button_chrome(ui, |ui| {
@@ -2246,9 +2303,25 @@ impl AdeApp {
                                     ) {
                                         refresh_index = true;
                                     }
+                                    if styled_icon_button(
+                                        ui,
+                                        icons::TRASH,
+                                        BTN_RED,
+                                        BTN_RED_HOVER,
+                                        Color32::from_rgb(186, 58, 58),
+                                        "Remove Project",
+                                    ) {
+                                        remove_selected_project = true;
+                                    }
                                 });
                             });
                         });
+                        if remove_selected_project {
+                            if let Some((project_id, _, _, _)) = selected_project_details {
+                                self.remove_project(ctx, project_id);
+                                return;
+                            }
+                        }
                         if self.selected_project != previous_selected_project {
                             self.apply_selected_project_auto_tile_scope_and_refresh_layout(ctx);
                             self.note_selection_changed();
@@ -5378,11 +5451,11 @@ mod tests {
         terminal_output_surface_size, terminal_output_viewport_size,
         terminal_secondary_click_action, terminal_selection_point_from_pointer,
         terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
-        AdeApp, CtrlCAction, PendingConfigChanges, SourceControlBadgeState, SourceControlFile,
-        SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
-        TerminalNavigationDirection, TerminalSecondaryClickAction, TerminalSelection,
-        TerminalSelectionPoint, TransientToast, TERMINAL_COPY_FEEDBACK_TEXT,
-        TERMINAL_COPY_TOAST_SECS, TERMINAL_OUTPUT_BG,
+        AdeApp, CtrlCAction, DirectoryIndexSnapshot, DirectoryNode, PendingConfigChanges,
+        SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
+        SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry, TerminalNavigationDirection,
+        TerminalSecondaryClickAction, TerminalSelection, TerminalSelectionPoint, TransientToast,
+        TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_COPY_TOAST_SECS, TERMINAL_OUTPUT_BG,
     };
     use crate::layout;
     use crate::models::{
@@ -6394,6 +6467,81 @@ mod tests {
         assert!(!app.source_control_refresh_state.contains_key(&7));
         assert!(!app.source_control_state.contains_key(&7));
         assert_eq!(app.source_control_last_auto_refresh_project, None);
+    }
+
+    #[test]
+    fn remove_project_cleans_related_state_and_project_terminals() {
+        let ctx = Context::default();
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 9)),
+            ],
+            Some(1),
+        );
+        app.projects = BTreeMap::from([
+            (7, test_project(7, "Remove", "C:/remove", &[])),
+            (9, test_project(9, "Keep", "C:/keep", &[])),
+        ]);
+        app.selected_project = Some(7);
+        app.source_control_state
+            .insert(7, test_source_control_snapshot("main", &[]));
+        app.source_control_refresh_state.insert(
+            7,
+            SourceControlRefreshState {
+                queued: true,
+                ..SourceControlRefreshState::default()
+            },
+        );
+        app.source_control_last_auto_refresh_project = Some(7);
+        app.directory_index_state.insert(
+            7,
+            DirectoryIndexSnapshot {
+                root: DirectoryNode {
+                    name: "remove".to_owned(),
+                    path: PathBuf::from("C:/remove"),
+                    is_dir: true,
+                    children: Vec::new(),
+                },
+                loading: false,
+                last_error: None,
+            },
+        );
+        app.directory_index_generation.insert(7, 2);
+        app.saved_message_drafts.insert(7, "draft".to_owned());
+        app.config_load_error = Some("simulated config reload error".to_owned());
+        app.config_save_requires_reload = true;
+        app.config_path = PathBuf::from("C:/path/that/does/not/exist/config.toml");
+
+        app.remove_project(&ctx, 7);
+
+        assert!(!app.projects.contains_key(&7));
+        assert_eq!(app.selected_project, Some(9));
+        assert!(!app.terminals.contains_key(&1));
+        assert!(app.terminals.contains_key(&2));
+        assert_eq!(app.active_terminal, Some(2));
+        assert!(!app.source_control_state.contains_key(&7));
+        assert!(!app.source_control_refresh_state.contains_key(&7));
+        assert_eq!(app.source_control_last_auto_refresh_project, None);
+        assert!(!app.directory_index_state.contains_key(&7));
+        assert!(!app.directory_index_generation.contains_key(&7));
+        assert!(!app.saved_message_drafts.contains_key(&7));
+    }
+
+    #[test]
+    fn remove_project_ignores_unknown_project_id() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects = BTreeMap::from([(7, test_project(7, "Keep", "C:/keep", &[]))]);
+        app.selected_project = Some(7);
+
+        app.remove_project(&ctx, 99);
+
+        assert_eq!(app.projects.len(), 1);
+        assert!(app.projects.contains_key(&7));
+        assert!(app.terminals.contains_key(&1));
+        assert_eq!(app.selected_project, Some(7));
+        assert_eq!(app.active_terminal, Some(1));
     }
 
     #[test]

@@ -2,7 +2,7 @@ Mergen ADE
 
 Purpose
 - Native Rust desktop app for managing multiple terminal sessions in a tiled workspace.
-- Windows-first runtime and release flow, with macOS ARM64 packaging in CI.
+- Windows-first runtime and release flow, with Windows portable ZIP assets and signed/notarized macOS ARM64 DMG assets in CI.
 - Not an IDE: no built-in editor, LSP, debugger UI, accounts, or telemetry.
 
 Tech Stack
@@ -30,6 +30,13 @@ Terminal Features
 - Secondary click pastes immediately when no selection exists, or opens copy behavior when one does.
 - Child-process shutdown is handled explicitly; Windows code includes job/process-tree cleanup paths.
 - Terminal titles are sanitized, whitespace-compacted, and truncated for chrome display.
+
+Persisted Config
+- Config is stored as TOML in user-local app data via `directories::ProjectDirs`.
+- Persisted project records include `id`, `name`, `path`, and `saved_messages`.
+- Persisted UI state includes selected project, panel visibility, expanded/collapsed state, left sidebar tab, project filter mode, auto-tile scope, and main visibility mode.
+- Persisted shell state stores only the default shell and normalizes it for the current platform during load.
+- Live terminal sessions and scrollback are intentionally not restored.
 
 Repo Map
 - src/main.rs: app entrypoint and native window startup
@@ -71,6 +78,7 @@ Release And Packaging
 - Official macOS DMGs are signed with a Developer ID Application certificate, submitted with `notarytool`, then stapled and validated.
 - On notarization failure, CI uploads diagnostics from `release-staging/macos/notary-submit.json` and `notary-detail.json`.
 - The local macOS packaging script can still create a DMG without signing when Apple credentials are absent.
+- The CI release is intentionally all-or-nothing: a broken macOS notarization path should block the tagged release instead of silently shipping Windows-only assets.
 
 Safe Starting Points For Changes
 - Layout issues: start in src/layout.rs, then verify callers in src/app.rs
