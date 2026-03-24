@@ -334,3 +334,17 @@
   - Treat directory tree repaint-heavy views as performance-sensitive in code review.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo check`
 - References: local workspace fix on 2026-03-18; commit pending
+
+#### Directory tree folder labels drifted away from the disclosure triangle {#directory-tree-folder-labels-drifted-away-from-the-disclosure-triangle}
+- Date: 2026-03-24T00:00:00Z
+- Context: main/Windows local project explorer directory tree rows
+- Error signature: Folder rows rendered with a visible gap after the disclosure triangle and the folder label appeared centered within the remaining row width.
+- Symptoms/Impact: The project explorer hierarchy became harder to scan because the folder name looked detached from its expand/collapse affordance.
+- Root cause: `src/app.rs` positioned directory row text with the parent `Ui` layout alignment, so `CollapsingHeader` header layout influenced folder-label placement instead of keeping it anchored to the left edge of the row content area.
+- Resolution: Added a shared left-anchored directory row text-position helper, applied it to both folder and file rows, added regression tests for full-width folder rows and left-aligned text placement, and released the fix in `v0.1.8`.
+- Prevent recurrence:
+  - Keep directory tree row text placement independent of parent `Ui` alignment.
+  - Share folder/file row alignment logic so fixes land in one place.
+  - Add regression coverage whenever `CollapsingHeader`-backed row layout changes.
+- Files/Commands touched: `src/app.rs`, `Cargo.toml`, `KNOWN_ISSUES.md`, `cargo test`
+- References: local workspace fix on 2026-03-24; release `https://github.com/furkancak1r/mergen-ade/releases/tag/v0.1.8`; commit pending

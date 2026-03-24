@@ -4463,9 +4463,7 @@ fn draw_folder_tree(
             }
 
             let (_, header_response, _) = header_state
-                .show_header(ui, |ui| {
-                    draw_directory_folder_row(ui, &item.name)
-                })
+                .show_header(ui, |ui| draw_directory_folder_row(ui, &item.name))
                 .body(|ui| {
                     let (_, child_state_changed) = draw_folder_tree(
                         ui,
@@ -4502,12 +4500,13 @@ fn draw_folder_tree(
             }
 
             if let Some(initial_open_state) = initial_open_state {
-                let current_open_state = egui::collapsing_header::CollapsingState::load_with_default_open(
-                    ui.ctx(),
-                    directory_tree_folder_state_id(&item.path),
-                    false,
-                )
-                .is_open();
+                let current_open_state =
+                    egui::collapsing_header::CollapsingState::load_with_default_open(
+                        ui.ctx(),
+                        directory_tree_folder_state_id(&item.path),
+                        false,
+                    )
+                    .is_open();
                 if current_open_state != initial_open_state {
                     folder_state_changed = true;
                 }
@@ -4737,6 +4736,18 @@ fn terminal_manager_row_widths(
     (label_width, actions_width)
 }
 
+fn directory_row_text_position(
+    rect: egui::Rect,
+    button_padding: Vec2,
+    galley_size: Vec2,
+) -> egui::Pos2 {
+    let content_rect = rect.shrink2(button_padding);
+    egui::pos2(
+        content_rect.min.x,
+        content_rect.center().y - (galley_size.y * 0.5),
+    )
+}
+
 fn draw_directory_file_row(ui: &mut Ui, text: &str) -> egui::Response {
     let button_padding = ui.spacing().button_padding;
     let available_width = ui.available_width().max(0.0);
@@ -4763,10 +4774,7 @@ fn draw_directory_file_row(ui: &mut Ui, text: &str) -> egui::Response {
                 .rect_filled(rect.shrink2(egui::vec2(1.0, 1.0)), 8.0, fill);
         }
 
-        let text_pos = ui
-            .layout()
-            .align_size_within_rect(galley.size(), rect.shrink2(button_padding))
-            .min;
+        let text_pos = directory_row_text_position(rect, button_padding, galley.size());
         ui.painter()
             .galley(text_pos, galley, ui.visuals().text_color());
     }
@@ -4794,10 +4802,7 @@ fn draw_directory_folder_row(ui: &mut Ui, text: &str) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
 
     if ui.is_rect_visible(rect) {
-        let text_pos = ui
-            .layout()
-            .align_size_within_rect(galley.size(), rect.shrink2(button_padding))
-            .min;
+        let text_pos = directory_row_text_position(rect, button_padding, galley.size());
         ui.painter()
             .galley(text_pos, galley, ui.visuals().text_color());
     }
@@ -7827,6 +7832,42 @@ mod tests {
 
         let observed_width = observed_width.expect("directory row width was not observed");
         assert_eq!(observed_width, 320.0);
+    }
+
+    #[test]
+    fn directory_folder_row_uses_full_available_width() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let mut observed_width = None;
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(320.0, 80.0));
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(egui::Align::Center)),
+                );
+                let response = super::draw_directory_folder_row(&mut child, "src");
+                observed_width = Some(response.rect.width());
+            });
+        });
+
+        let observed_width = observed_width.expect("directory row width was not observed");
+        assert_eq!(observed_width, 320.0);
+    }
+
+    #[test]
+    fn directory_row_text_position_left_aligns_with_padding() {
+        let rect = egui::Rect::from_min_size(pos2(32.0, 10.0), egui::vec2(240.0, 28.0));
+        let button_padding = egui::vec2(8.0, 4.0);
+        let galley_size = egui::vec2(56.0, 12.0);
+
+        let text_pos = super::directory_row_text_position(rect, button_padding, galley_size);
+        let content_rect = rect.shrink2(button_padding);
+
+        assert_eq!(text_pos.x, content_rect.min.x);
+        assert_eq!(text_pos.y, content_rect.center().y - (galley_size.y * 0.5));
     }
 
     #[test]
