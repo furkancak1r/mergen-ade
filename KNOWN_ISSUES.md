@@ -348,3 +348,46 @@
   - Add regression coverage whenever `CollapsingHeader`-backed row layout changes.
 - Files/Commands touched: `src/app.rs`, `Cargo.toml`, `KNOWN_ISSUES.md`, `cargo test`
 - References: local workspace fix on 2026-03-24; release `https://github.com/furkancak1r/mergen-ade/releases/tag/v0.1.8`; commit pending
+
+#### Droid interactive spinner glyphs rendered as static boxes in integrated terminal {#droid-interactive-spinner-glyphs-rendered-as-static-boxes-in-integrated-terminal}
+- Date: 2026-03-25T00:00:00Z
+- Context: main/Windows local `droid` interactive mode inside Mergen-ADE
+- Error signature: Fresh `droid` sessions showed a static square/box where the normal animated dots/spinner should appear, and the terminal looked like it was constantly refreshing without visible animation.
+- Symptoms/Impact: Droid interactive mode looked visually broken even in new sessions, making progress indicators unreadable and exaggerating repaint churn.
+- Root cause: `src/app.rs` rendered terminal content with the generic egui monospace family backed only by bundled default fonts, so Droid's braille-style spinner frames lacked glyph coverage and collapsed into the same fallback box each frame.
+- Resolution: Added a dedicated terminal font family, prioritized Windows terminal fallbacks (`Cascadia Mono`, `Consolas`, `Segoe UI Symbol`) ahead of the bundled egui monospace fonts, switched terminal measurement/rendering to that family, and added regression coverage for terminal font ordering and icon-font exclusion.
+- Prevent recurrence:
+  - Keep terminal font fallback configuration separate from the app UI monospace family.
+  - Measure terminal cell width and row height with the exact font family used for terminal painting.
+  - Re-check fresh-session TUI glyphs such as braille spinners before blaming repaint scheduling.
+  - Treat classic `powershell.exe` command parsing issues such as `&&` failures as a separate shell-compatibility follow-up, not as evidence that spinner animation bytes are missing.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: local workspace fix on 2026-03-25; Droid local logs in `%USERPROFILE%\.factory\logs\droid-log-single.log`
+
+#### Droid braille spinner glyphs collapsed into tofu boxes {#droid-braille-spinner-glyphs-collapsed-into-tofu-boxes}
+- Date: 2026-03-25T13:15:00Z
+- Context: main/Windows local/`droid` 0.85.0/`eframe` 0.29.1/`cargo test` (175 passed)
+- Error signature: `Fresh droid sessions showed a static square/box where the animated spinner dots should appear.`
+- Symptoms/Impact: Droid interactive mode looked like it was constantly refreshing without visible animation, so progress indicators were unreadable even in new sessions.
+- Root cause: The integrated terminal used the bundled egui monospace font stack without a terminal-specific Windows fallback chain, so Droid's braille spinner frames rendered as the same missing-glyph box.
+- Resolution: Local workspace fix after `392d377` added a dedicated terminal font family, loaded Windows fallbacks (`Cascadia Mono`, `Consolas`, `Segoe UI Symbol`), switched terminal measurement/rendering to that family, and validated the change with `cargo test`.
+- Prevent recurrence:
+  - Keep a terminal-only font family instead of sharing the generic app monospace family.
+  - Measure terminal width and line height from the same font family used to paint terminal content.
+  - Re-check fresh-session TUI glyph coverage before attributing animation failures to repaint timing.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: commit `392d377` (`Fix directory tree row alignment`); local workspace fix pending
+
+#### Terminal symbol fallback misaligned the Windows grid {#terminal-symbol-fallback-misaligned-the-windows-grid}
+- Date: 2026-03-25T14:00:00Z
+- Context: main/Windows local terminal font fallback follow-up after the Droid glyph fix
+- Error signature: Terminal box-drawing and symbol-heavy output could render with cursor/selection drift even though the pane still measured columns from a fixed-width font.
+- Symptoms/Impact: Windows terminal panes could show misaligned cursor overlays, incorrect selection rectangles, and shifted grid columns when output resolved through the newly added symbol fallback.
+- Root cause: The dedicated terminal family inserted `Segoe UI Symbol` into the primary Windows fallback chain, but that font is proportional for several glyphs while terminal measurement, hit-testing, and cursor placement still assume fixed-width cells.
+- Resolution: Removed `Segoe UI Symbol` from the Windows terminal fallback candidates, kept the dedicated terminal family on fixed-width fonts only, updated the Windows candidate-order regression test, and revalidated with `cargo test`.
+- Prevent recurrence:
+  - Do not add proportional fonts to terminal rendering fallback chains.
+  - Keep terminal measurement and terminal paint paths locked to the same fixed-width family.
+  - Re-check cursor and selection alignment whenever terminal font fallback coverage changes.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: local workspace fix on 2026-03-25; follow-up to the Droid glyph fallback change, commit pending

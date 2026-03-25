@@ -40,6 +40,7 @@ const TERMINAL_COPY_TOAST_SECS: f64 = 1.75;
 const TERMINAL_COPY_FEEDBACK_TEXT: &str = "Copied terminal selection";
 const POWERSHELL_CURSOR_ROW_STABLE_SECS: f64 = 0.06;
 const TERMINAL_CHAR_WIDTH_SAMPLE_CELLS: usize = 64;
+const TERMINAL_FONT_FAMILY_NAME: &str = "terminal-mono";
 const CURSOR_BAR_WIDTH_PX: f32 = 2.0;
 const CURSOR_UNDERLINE_HEIGHT_PX: f32 = 2.0;
 const DIRECTORY_INDEX_LOADING_ANIMATION_STEP_SECS: f64 = 0.25;
@@ -82,6 +83,11 @@ const BTN_ICON_HOVER: Color32 = Color32::from_rgb(31, 98, 144);
 const BTN_ICON_ACTIVE: Color32 = Color32::from_rgb(24, 118, 172);
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(target_os = "windows")]
+const WINDOWS_TERMINAL_FONT_CANDIDATES: [(&str, &str); 2] = [
+    ("terminal-cascadia-mono", "CascadiaMono.ttf"),
+    ("terminal-consolas", "consola.ttf"),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum AppIcon {
@@ -1586,6 +1592,7 @@ impl AdeApp {
                 }
             }
         }
+        configure_terminal_font_family(&mut fonts);
         ctx.set_fonts(fonts);
 
         let mut style = (*ctx.style()).clone();
@@ -3329,10 +3336,9 @@ impl AdeApp {
             if !close_requested {
                 ui.add_space(TERMINAL_HEADER_GAP);
 
-                let monospace = egui::TextStyle::Monospace;
-                let font_id = monospace.resolve(ui.style());
+                let font_id = terminal_font_id(ui.style());
                 let char_width = terminal_char_width(ui, &font_id);
-                let line_height = terminal_cell_metric(ui.text_style_height(&monospace));
+                let line_height = terminal_line_height(ui, &font_id);
 
                 let output_height = (pane_height - TERMINAL_HEADER_HEIGHT - TERMINAL_HEADER_GAP)
                     .max(line_height * 2.0);
@@ -3406,15 +3412,18 @@ impl AdeApp {
                         ui.set_min_width(output_size.x);
                         ui.set_min_height(output_size.y);
                         if terminal.render_cache.lines.is_empty() {
-                            let placeholder = WidgetText::from(
-                                RichText::new("Terminal is resizing...").color(TEXT_MUTED),
+                            let mut layout_job = LayoutJob::default();
+                            layout_job.wrap.max_width = f32::INFINITY;
+                            layout_job.append(
+                                "Terminal is resizing...",
+                                0.0,
+                                TextFormat {
+                                    font_id: font_id.clone(),
+                                    color: TEXT_MUTED,
+                                    ..TextFormat::default()
+                                },
                             );
-                            let galley = placeholder.into_galley(
-                                ui,
-                                Some(TextWrapMode::Extend),
-                                output_size.x,
-                                egui::TextStyle::Monospace,
-                            );
+                            let galley = ui.painter().layout_job(layout_job);
                             let (rect, response) = allocate_terminal_output_surface(
                                 ui,
                                 output_size,
@@ -5252,6 +5261,20 @@ fn average_terminal_cell_width(sample_width: f32, sample_cells: usize) -> f32 {
     terminal_cell_metric(sample_width / sample_cells)
 }
 
+fn terminal_font_family() -> FontFamily {
+    FontFamily::Name(TERMINAL_FONT_FAMILY_NAME.into())
+}
+
+fn terminal_font_id(style: &egui::Style) -> FontId {
+    let mut font_id = egui::TextStyle::Monospace.resolve(style);
+    font_id.family = terminal_font_family();
+    font_id
+}
+
+fn terminal_line_height(ui: &Ui, font_id: &FontId) -> f32 {
+    terminal_cell_metric(ui.fonts(|fonts| fonts.row_height(font_id)))
+}
+
 fn terminal_char_width(ui: &Ui, font_id: &FontId) -> f32 {
     let sample_width = ui.fonts(|fonts| {
         let mut layout_job = LayoutJob::default();
@@ -5267,6 +5290,73 @@ fn terminal_char_width(ui: &Ui, font_id: &FontId) -> f32 {
         fonts.layout_job(layout_job).size().x
     });
     average_terminal_cell_width(sample_width, TERMINAL_CHAR_WIDTH_SAMPLE_CELLS)
+}
+
+fn configure_terminal_font_family(fonts: &mut egui::FontDefinitions) {
+    let fallback_font_names = load_terminal_fallback_font_names(fonts);
+    install_terminal_font_family(fonts, &fallback_font_names);
+}
+
+fn install_terminal_font_family(fonts: &mut egui::FontDefinitions, fallback_font_names: &[String]) {
+    let icon_font_names = icon_fonts()
+        .iter()
+        .map(|asset| asset.family.to_owned())
+        .collect::<HashSet<_>>();
+    let mut terminal_family = Vec::new();
+    let mut seen_font_names = HashSet::new();
+
+    for font_name in fallback_font_names.iter().chain(
+        fonts
+            .families
+            .get(&FontFamily::Monospace)
+            .into_iter()
+            .flatten(),
+    ) {
+        if icon_font_names.contains(font_name) || !fonts.font_data.contains_key(font_name) {
+            continue;
+        }
+
+        if seen_font_names.insert(font_name.clone()) {
+            terminal_family.push(font_name.clone());
+        }
+    }
+
+    fonts
+        .families
+        .insert(terminal_font_family(), terminal_family);
+}
+
+#[cfg(target_os = "windows")]
+fn windows_terminal_font_candidates() -> &'static [(&'static str, &'static str)] {
+    &WINDOWS_TERMINAL_FONT_CANDIDATES
+}
+
+#[cfg(target_os = "windows")]
+fn load_terminal_fallback_font_names(fonts: &mut egui::FontDefinitions) -> Vec<String> {
+    let fonts_dir = std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .map(|windir| windir.join("Fonts"))
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows\Fonts"));
+    let mut loaded_font_names = Vec::new();
+
+    for (font_name, file_name) in windows_terminal_font_candidates() {
+        let font_path = fonts_dir.join(file_name);
+        let Ok(font_bytes) = fs::read(&font_path) else {
+            continue;
+        };
+
+        fonts
+            .font_data
+            .insert((*font_name).to_owned(), FontData::from_owned(font_bytes));
+        loaded_font_names.push((*font_name).to_owned());
+    }
+
+    loaded_font_names
+}
+
+#[cfg(not(target_os = "windows"))]
+fn load_terminal_fallback_font_names(_fonts: &mut egui::FontDefinitions) -> Vec<String> {
+    Vec::new()
 }
 
 fn terminal_grid_dimensions(output_size: Vec2, char_width: f32, line_height: f32) -> (u16, u16) {
@@ -5692,13 +5782,14 @@ fn normalize_terminal_background(color: TerminalColor) -> Color32 {
 mod tests {
     use super::{
         average_terminal_cell_width, build_terminal_cursor_overlay, build_terminal_render,
-        cursor_hidden_by_row_filter, default_app_open_command, force_terminal_pane_width,
-        next_active_terminal_after_close, next_terminal_in_direction,
-        normalize_terminal_background, parse_branch_header, recover_config_state,
-        resolve_ctrl_c_action, source_control_badge_state, source_control_tooltip_lines,
-        terminal_cell_metric, terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect,
-        terminal_grid_dimensions, terminal_manager_actions_width, terminal_manager_row_widths,
-        terminal_output_surface_size, terminal_output_viewport_size,
+        configure_terminal_font_family, cursor_hidden_by_row_filter, default_app_open_command,
+        force_terminal_pane_width, install_terminal_font_family, next_active_terminal_after_close,
+        next_terminal_in_direction, normalize_terminal_background, parse_branch_header,
+        recover_config_state, resolve_ctrl_c_action, source_control_badge_state,
+        source_control_tooltip_lines, terminal_cell_metric, terminal_cursor_blink_phase_visible,
+        terminal_cursor_overlay_rect, terminal_font_family, terminal_font_id,
+        terminal_grid_dimensions, terminal_line_height, terminal_manager_actions_width,
+        terminal_manager_row_widths, terminal_output_surface_size, terminal_output_viewport_size,
         terminal_secondary_click_action, terminal_selection_point_from_pointer,
         terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
         AdeApp, CtrlCAction, DirectoryIndexSnapshot, DirectoryNode, PendingConfigChanges,
@@ -5718,7 +5809,7 @@ mod tests {
     };
     use eframe::egui::text::{LayoutJob, TextFormat};
     use eframe::egui::{
-        self, pos2, Color32, Context, Event, FontDefinitions, FontFamily, FontId, Galley, Id, Key,
+        self, pos2, Color32, Context, Event, FontDefinitions, FontFamily, Galley, Id, Key,
         Modifiers, RawInput,
     };
     use std::collections::BTreeMap;
@@ -7571,7 +7662,9 @@ mod tests {
 
     fn test_selection_galley(text: &str) -> Arc<Galley> {
         let ctx = Context::default();
-        ctx.set_fonts(FontDefinitions::default());
+        let mut fonts = FontDefinitions::default();
+        configure_terminal_font_family(&mut fonts);
+        ctx.set_fonts(fonts);
         let _ = ctx.run(RawInput::default(), |_ctx| {});
         let mut layout_job = LayoutJob::default();
         layout_job.wrap.max_width = f32::INFINITY;
@@ -7579,7 +7672,7 @@ mod tests {
             text,
             0.0,
             TextFormat {
-                font_id: FontId::new(14.0, FontFamily::Monospace),
+                font_id: terminal_font_id(&egui::Style::default()),
                 ..TextFormat::default()
             },
         );
@@ -7742,6 +7835,99 @@ mod tests {
     fn average_terminal_cell_width_falls_back_when_sample_is_invalid() {
         assert_eq!(average_terminal_cell_width(0.0, 64), 1.0);
         assert_eq!(average_terminal_cell_width(f32::NAN, 64), 1.0);
+    }
+
+    #[test]
+    fn terminal_font_id_uses_dedicated_named_family() {
+        let font_id = terminal_font_id(&egui::Style::default());
+
+        assert_eq!(font_id.family, terminal_font_family());
+    }
+
+    #[test]
+    fn terminal_font_family_prioritizes_fallbacks_and_excludes_icons() {
+        let mut fonts = FontDefinitions::default();
+        let seed_font = fonts
+            .font_data
+            .values()
+            .next()
+            .cloned()
+            .expect("expected default font data");
+        let fallback_font_names = vec![
+            "terminal-cascadia-mono".to_owned(),
+            "terminal-consolas".to_owned(),
+        ];
+
+        for font_name in &fallback_font_names {
+            fonts.font_data.insert(font_name.clone(), seed_font.clone());
+        }
+
+        let icon_font_names = super::icon_fonts()
+            .iter()
+            .map(|asset| asset.family.to_owned())
+            .collect::<Vec<_>>();
+        for font_name in &icon_font_names {
+            fonts.font_data.insert(font_name.clone(), seed_font.clone());
+        }
+        if let Some(monospace_family) = fonts.families.get_mut(&FontFamily::Monospace) {
+            for font_name in icon_font_names.iter().rev() {
+                monospace_family.insert(0, font_name.clone());
+            }
+        }
+
+        install_terminal_font_family(&mut fonts, &fallback_font_names);
+
+        let terminal_family = fonts
+            .families
+            .get(&terminal_font_family())
+            .expect("expected terminal family");
+        assert_eq!(
+            &terminal_family[..fallback_font_names.len()],
+            fallback_font_names.as_slice()
+        );
+        assert!(icon_font_names
+            .iter()
+            .all(|font_name| !terminal_family.contains(font_name)));
+        assert!(terminal_family.iter().any(|font_name| font_name == "Hack"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_terminal_font_candidates_stay_in_priority_order() {
+        assert_eq!(
+            super::windows_terminal_font_candidates(),
+            &[
+                ("terminal-cascadia-mono", "CascadiaMono.ttf"),
+                ("terminal-consolas", "consola.ttf"),
+            ]
+        );
+    }
+
+    #[test]
+    fn configure_terminal_font_family_installs_named_family() {
+        let mut fonts = FontDefinitions::default();
+
+        configure_terminal_font_family(&mut fonts);
+
+        assert!(fonts.families.contains_key(&terminal_font_family()));
+    }
+
+    #[test]
+    fn terminal_line_height_uses_terminal_font_family_metrics() {
+        let ctx = Context::default();
+        let mut fonts = FontDefinitions::default();
+        configure_terminal_font_family(&mut fonts);
+        ctx.set_fonts(fonts);
+
+        let mut observed = None;
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let font_id = terminal_font_id(ui.style());
+                observed = Some(terminal_line_height(ui, &font_id));
+            });
+        });
+
+        assert!(observed.is_some_and(|height| height >= 1.0));
     }
 
     #[test]
@@ -8013,7 +8199,7 @@ mod tests {
 
         let render = build_terminal_render(
             &snapshot,
-            &FontId::new(14.0, FontFamily::Monospace),
+            &terminal_font_id(&egui::Style::default()),
             false,
             ShellKind::PowerShell,
             Some(0),
