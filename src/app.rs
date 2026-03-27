@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
+use std::ops::Range;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,9 @@ use eframe::egui::{
     Sense, Stroke, TextWrapMode, Ui, Vec2, WidgetInfo, WidgetText, WidgetType,
 };
 use iconflow::{fonts as icon_fonts, try_icon, Pack, Size, Style};
+use tattoy_wezterm_surface::hyperlink::{
+    Rule, CLOSING_PARENTHESIS_HYPERLINK_PATTERN, GENERIC_HYPERLINK_PATTERN,
+};
 
 use crate::config;
 use crate::layout;
@@ -274,6 +278,7 @@ struct TerminalEntry {
     render_cache: TerminalSnapshot,
     selection: Option<TerminalSelection>,
     selection_snapshot: Option<TerminalSelectionSnapshot>,
+    pending_link_click: Option<PendingTerminalLinkClick>,
     selection_drag_active: bool,
     snapshot_refresh_deferred: bool,
     exited: bool,
@@ -317,6 +322,26 @@ impl TerminalSelection {
             (self.focus, self.anchor)
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingTerminalLinkClick {
+    anchor: TerminalSelectionPoint,
+    url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalLinkSegment {
+    row: usize,
+    start_column: usize,
+    end_column: usize,
+    byte_range: Range<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct TerminalLogicalLine {
+    text: String,
+    segments: Vec<TerminalLinkSegment>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -791,6 +816,7 @@ impl AdeApp {
             render_cache: TerminalSnapshot::default(),
             selection: None,
             selection_snapshot: None,
+            pending_link_click: None,
             selection_drag_active: false,
             snapshot_refresh_deferred: false,
             exited: false,
@@ -1826,6 +1852,77 @@ impl AdeApp {
     fn clear_terminal_selection(terminal: &mut TerminalEntry) {
         terminal.selection = None;
         terminal.selection_drag_active = false;
+    }
+
+    fn clear_collapsed_terminal_selection(terminal: &mut TerminalEntry) {
+        if terminal
+            .selection
+            .as_ref()
+            .is_some_and(|selection| !selection.has_selection())
+        {
+            Self::clear_terminal_selection(terminal);
+        }
+    }
+
+    fn clear_pending_terminal_link_click(terminal: &mut TerminalEntry) {
+        terminal.pending_link_click = None;
+    }
+
+    fn begin_terminal_primary_interaction(
+        terminal: &mut TerminalEntry,
+        point: TerminalSelectionPoint,
+        link_under_pointer: Option<String>,
+    ) {
+        terminal.selection = Some(TerminalSelection::collapsed(point));
+        terminal.selection_drag_active = true;
+        if let Some(url) = link_under_pointer {
+            terminal.pending_link_click = Some(PendingTerminalLinkClick { anchor: point, url });
+        } else {
+            Self::clear_pending_terminal_link_click(terminal);
+        }
+    }
+
+    fn update_terminal_primary_drag(terminal: &mut TerminalEntry, point: TerminalSelectionPoint) {
+        if terminal
+            .pending_link_click
+            .as_ref()
+            .is_some_and(|pending| pending.anchor == point)
+        {
+            return;
+        }
+
+        let anchor = terminal
+            .pending_link_click
+            .take()
+            .map(|pending| pending.anchor)
+            .or_else(|| {
+                terminal
+                    .selection
+                    .as_ref()
+                    .map(|selection| selection.anchor)
+            })
+            .unwrap_or(point);
+        let selection = terminal
+            .selection
+            .get_or_insert_with(|| TerminalSelection::collapsed(anchor));
+        selection.focus = point;
+        terminal.selection_drag_active = true;
+    }
+
+    fn take_terminal_primary_clicked_link(
+        terminal: &mut TerminalEntry,
+        link_under_pointer: Option<&str>,
+        link_activation_active: bool,
+    ) -> Option<String> {
+        let pending = terminal.pending_link_click.take()?;
+        if link_activation_active && link_under_pointer == Some(pending.url.as_str()) {
+            Self::clear_collapsed_terminal_selection(terminal);
+            terminal.selection_drag_active = false;
+            return Some(pending.url);
+        }
+
+        terminal.selection_drag_active = false;
+        None
     }
 
     fn should_defer_terminal_snapshot(selection: Option<&TerminalSelection>) -> bool {
@@ -3240,7 +3337,7 @@ impl AdeApp {
             });
         let is_active = self.active_terminal == Some(terminal_id);
 
-        let (clicked, close_requested, copied_selection, paste_requested) = {
+        let (clicked, close_requested, copied_selection, paste_requested, link_to_open) = {
             let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
                 return;
             };
@@ -3249,90 +3346,85 @@ impl AdeApp {
             let mut pane_clicked = false;
             let mut copied_selection = None;
             let mut paste_requested = false;
-            let header_fill = if is_active {
-                Color32::from_rgb(24, 36, 50)
-            } else {
-                Color32::from_rgb(22, 32, 46)
-            };
-            let header_stroke = if is_active {
-                Stroke::new(1.0, Color32::from_rgb(58, 72, 90))
-            } else {
-                Stroke::new(1.0, BORDER_COLOR)
-            };
+            let mut link_to_open = None;
+            let header_chrome = terminal_header_chrome(is_active);
             let pane_width = pane_size.x.max(96.0);
             let pane_height = pane_size.y.max(124.0);
             let pane_right = force_terminal_pane_width(ui, pane_width);
 
             let header_size = Vec2::new(pane_width, TERMINAL_HEADER_HEIGHT);
-            ui.allocate_ui_with_layout(header_size, Layout::left_to_right(Align::Center), |ui| {
-                ui.set_min_size(header_size);
-                egui::Frame::none()
-                    .fill(header_fill)
-                    .stroke(header_stroke)
-                    .rounding(8.0)
-                    .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-                    .show(ui, |ui| {
-                        ui.set_min_height(TERMINAL_HEADER_HEIGHT - 12.0);
+            let _header_response = ui.allocate_ui_with_layout(
+                header_size,
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.set_min_size(header_size);
+                    egui::Frame::none()
+                        .fill(header_chrome.fill)
+                        .stroke(header_chrome.stroke)
+                        .rounding(8.0)
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.set_min_height(TERMINAL_HEADER_HEIGHT - 12.0);
 
-                        let indicator_color = if is_active { ACCENT } else { TEXT_MUTED };
-                        draw_terminal_header_dot(ui, indicator_color);
-                        ui.add_space(4.0);
-                        draw_source_control_badge(ui, &source_control_badge);
-                        ui.add_space(4.0);
-                        let title = terminal_display_label(&terminal.title, terminal.exited);
-                        let title_font = egui::TextStyle::Body.resolve(ui.style());
-                        let title_response = ui.add(
-                            egui::Label::new(RichText::new(title).color(TEXT_PRIMARY))
+                            draw_source_control_badge(ui, &source_control_badge);
+                            ui.add_space(4.0);
+                            let title = terminal_display_label(&terminal.title, terminal.exited);
+                            let title_font = egui::TextStyle::Body.resolve(ui.style());
+                            let title_response = ui.add(
+                                egui::Label::new(
+                                    RichText::new(title).color(header_chrome.title_color),
+                                )
                                 .truncate()
                                 .sense(Sense::click()),
-                        );
-                        let title_response = with_truncation_tooltip(
-                            ui,
-                            title_response,
-                            &terminal.full_title,
-                            &title_font,
-                            TEXT_PRIMARY,
-                        );
-                        if title_response.clicked() {
-                            pane_clicked = true;
-                        }
-
-                        ui.add_space(6.0);
-                        draw_terminal_header_separator(ui);
-                        ui.add_space(4.0);
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(format!("{} {}", icons::FOLDER, project_name))
-                                    .color(TEXT_MUTED),
-                            )
-                            .truncate(),
-                        );
-                        ui.add_space(4.0);
-                        draw_terminal_header_separator(ui);
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(terminal.kind.label())
-                                .small()
-                                .strong()
-                                .color(with_alpha(TEXT_MUTED, 230)),
-                        );
-                        if terminal.exited {
-                            ui.colored_label(Color32::LIGHT_RED, "Exited");
-                        }
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if styled_icon_button(
+                            );
+                            let title_response = with_truncation_tooltip(
                                 ui,
-                                icons::X,
-                                BTN_RED,
-                                BTN_RED_HOVER,
-                                Color32::from_rgb(186, 58, 58),
-                                "Close",
-                            ) {
-                                close_requested = true;
+                                title_response,
+                                &terminal.full_title,
+                                &title_font,
+                                TEXT_PRIMARY,
+                            );
+                            if title_response.clicked() {
+                                pane_clicked = true;
                             }
+
+                            ui.add_space(6.0);
+                            draw_terminal_header_separator(ui);
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("{} {}", icons::FOLDER, project_name))
+                                        .color(header_chrome.detail_color),
+                                )
+                                .truncate(),
+                            );
+                            ui.add_space(4.0);
+                            draw_terminal_header_separator(ui);
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(terminal.kind.label())
+                                    .small()
+                                    .strong()
+                                    .color(header_chrome.detail_color),
+                            );
+                            if terminal.exited {
+                                ui.colored_label(Color32::LIGHT_RED, "Exited");
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if styled_icon_button(
+                                    ui,
+                                    icons::X,
+                                    BTN_RED,
+                                    BTN_RED_HOVER,
+                                    Color32::from_rgb(186, 58, 58),
+                                    "Close",
+                                ) {
+                                    close_requested = true;
+                                }
+                            });
                         });
-                    });
-            });
+                },
+            );
             if !close_requested {
                 ui.add_space(TERMINAL_HEADER_GAP);
 
@@ -3461,70 +3553,92 @@ impl AdeApp {
                                 galley.size().y,
                                 Sense::click_and_drag(),
                             );
-                            ui.painter().galley(rect.min, galley.clone(), TEXT_PRIMARY);
-                            if response.drag_started_by(egui::PointerButton::Primary) {
+                            let (primary_pressed, primary_down, primary_released) =
+                                ui.ctx().input(|input| {
+                                    (
+                                        input.pointer.primary_pressed(),
+                                        input.pointer.primary_down(),
+                                        input.pointer.primary_released(),
+                                    )
+                                });
+                            let link_activation_modifiers_active = ui
+                                .ctx()
+                                .input(|input| terminal_link_activation_modifiers(input.modifiers));
+                            let primary_drag_started =
+                                response.drag_started_by(egui::PointerButton::Primary);
+                            let primary_dragged = response.dragged_by(egui::PointerButton::Primary);
+                            let primary_clicked = response.clicked_by(egui::PointerButton::Primary);
+                            let primary_pressed_on_terminal =
+                                response.is_pointer_button_down_on() && primary_pressed;
+                            let should_resolve_link = should_resolve_terminal_link(
+                                link_activation_modifiers_active,
+                                primary_pressed_on_terminal,
+                                terminal.pending_link_click.is_some(),
+                            );
+                            let should_track_pointer =
+                                primary_drag_started || primary_dragged || should_resolve_link;
+                            if should_track_pointer || terminal.selection.is_some() {
                                 Self::ensure_terminal_selection_snapshot(terminal);
-                                if let Some(point) = terminal.selection_snapshot.as_ref().and_then(
-                                    |selection_snapshot| {
-                                        terminal_selection_point_from_pointer(
-                                            response.interact_pointer_pos(),
-                                            rect.min,
-                                            selection_snapshot,
-                                            char_width,
-                                            &galley,
-                                        )
-                                    },
-                                ) {
-                                    terminal.selection = Some(TerminalSelection::collapsed(point));
-                                    terminal.selection_drag_active = true;
-                                }
                             }
-                            if response.is_pointer_button_down_on()
-                                && ui.ctx().input(|input| input.pointer.primary_down())
-                            {
-                                pane_clicked = true;
-                                if terminal.selection.is_none() {
-                                    Self::ensure_terminal_selection_snapshot(terminal);
-                                    if let Some(point) = terminal
-                                        .selection_snapshot
-                                        .as_ref()
-                                        .and_then(|selection_snapshot| {
+                            let pointer_pos =
+                                response.hover_pos().or(response.interact_pointer_pos());
+                            let pointer_point = should_track_pointer
+                                .then(|| {
+                                    terminal.selection_snapshot.as_ref().and_then(
+                                        |selection_snapshot| {
                                             terminal_selection_point_from_pointer(
-                                                response.interact_pointer_pos(),
+                                                pointer_pos,
                                                 rect.min,
                                                 selection_snapshot,
                                                 char_width,
                                                 &galley,
                                             )
-                                        })
-                                    {
-                                        terminal.selection =
-                                            Some(TerminalSelection::collapsed(point));
-                                        terminal.selection_drag_active = true;
-                                    }
-                                }
-                            }
-                            if response.dragged_by(egui::PointerButton::Primary) {
-                                Self::ensure_terminal_selection_snapshot(terminal);
-                                if let Some(point) = terminal.selection_snapshot.as_ref().and_then(
-                                    |selection_snapshot| {
-                                        terminal_selection_point_from_pointer(
-                                            response.interact_pointer_pos(),
-                                            rect.min,
-                                            selection_snapshot,
-                                            char_width,
-                                            &galley,
+                                        },
+                                    )
+                                })
+                                .flatten();
+                            let link_under_pointer = should_resolve_link
+                                .then(|| {
+                                    pointer_point.and_then(|point| {
+                                        terminal.selection_snapshot.as_ref().and_then(
+                                            |selection_snapshot| {
+                                                terminal_link_at_point(selection_snapshot, point)
+                                            },
                                         )
-                                    },
-                                ) {
-                                    let selection = terminal
-                                        .selection
-                                        .get_or_insert_with(|| TerminalSelection::collapsed(point));
-                                    selection.focus = point;
-                                    terminal.selection_drag_active = true;
+                                    })
+                                })
+                                .flatten();
+                            let link_activation_active =
+                                link_activation_modifiers_active && link_under_pointer.is_some();
+                            let response = if link_activation_active {
+                                response.on_hover_cursor(egui::CursorIcon::PointingHand)
+                            } else {
+                                response
+                            };
+                            ui.painter().galley(rect.min, galley.clone(), TEXT_PRIMARY);
+                            if response.is_pointer_button_down_on() && primary_down {
+                                pane_clicked = true;
+                            }
+                            if primary_pressed_on_terminal {
+                                if let Some(point) = pointer_point {
+                                    Self::begin_terminal_primary_interaction(
+                                        terminal,
+                                        point,
+                                        link_under_pointer.clone(),
+                                    );
                                 }
                             }
-                            if !ui.ctx().input(|input| input.pointer.primary_down()) {
+                            if primary_drag_started {
+                                if let Some(point) = pointer_point {
+                                    Self::update_terminal_primary_drag(terminal, point);
+                                }
+                            }
+                            if primary_dragged {
+                                if let Some(point) = pointer_point {
+                                    Self::update_terminal_primary_drag(terminal, point);
+                                }
+                            }
+                            if !primary_down {
                                 terminal.selection_drag_active = false;
                             }
                             if response.drag_stopped_by(egui::PointerButton::Primary)
@@ -3537,9 +3651,22 @@ impl AdeApp {
                             } else if response.drag_stopped_by(egui::PointerButton::Primary) {
                                 terminal.selection_drag_active = false;
                             }
-                            if response.clicked() {
+                            if primary_clicked {
+                                pane_clicked = true;
+                                link_to_open = Self::take_terminal_primary_clicked_link(
+                                    terminal,
+                                    link_under_pointer.as_deref(),
+                                    link_activation_active,
+                                );
+                                if link_to_open.is_none() {
+                                    Self::clear_terminal_selection(terminal);
+                                }
+                            } else if response.clicked() {
                                 pane_clicked = true;
                                 Self::clear_terminal_selection(terminal);
+                            }
+                            if primary_released {
+                                Self::clear_pending_terminal_link_click(terminal);
                             }
 
                             let has_selection = terminal
@@ -3613,6 +3740,7 @@ impl AdeApp {
                 close_requested,
                 copied_selection,
                 paste_requested,
+                link_to_open,
             )
         };
 
@@ -3636,6 +3764,10 @@ impl AdeApp {
 
         if paste_requested {
             self.paste_clipboard_to_terminal(terminal_id);
+        }
+
+        if let Some(url) = link_to_open {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
         }
 
         if clicked {
@@ -4868,6 +5000,32 @@ fn draw_truncated_selectable_label(ui: &mut Ui, selected: bool, text: &str) -> e
     response
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TerminalHeaderChrome {
+    fill: Color32,
+    stroke: Stroke,
+    title_color: Color32,
+    detail_color: Color32,
+}
+
+fn terminal_header_chrome(is_active: bool) -> TerminalHeaderChrome {
+    if is_active {
+        TerminalHeaderChrome {
+            fill: Color32::from_rgb(28, 52, 72),
+            stroke: Stroke::NONE,
+            title_color: Color32::from_rgb(244, 251, 255),
+            detail_color: with_alpha(TEXT_MUTED, 238),
+        }
+    } else {
+        TerminalHeaderChrome {
+            fill: Color32::from_rgb(22, 32, 46),
+            stroke: Stroke::new(1.0, BORDER_COLOR),
+            title_color: TEXT_PRIMARY,
+            detail_color: with_alpha(TEXT_MUTED, 230),
+        }
+    }
+}
+
 fn capped_hover_text(text: &str, max_chars: usize) -> String {
     let mut result = String::new();
     for (index, ch) in text.chars().enumerate() {
@@ -4979,11 +5137,6 @@ fn draw_source_control_badge(ui: &mut Ui, badge: &SourceControlBadgeModel) -> eg
             ui.label(line);
         }
     })
-}
-
-fn draw_terminal_header_dot(ui: &mut Ui, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 12.0), Sense::hover());
-    ui.painter().circle_filled(rect.center(), 3.0, color);
 }
 
 fn draw_terminal_header_separator(ui: &mut Ui) {
@@ -5209,6 +5362,244 @@ fn terminal_secondary_click_action(
     } else {
         TerminalSecondaryClickAction::None
     }
+}
+
+fn terminal_link_activation_modifiers(modifiers: egui::Modifiers) -> bool {
+    (modifiers.ctrl || modifiers.command) && !modifiers.alt && !modifiers.shift
+}
+
+fn terminal_link_rules() -> &'static [Rule] {
+    static RULES: OnceLock<Vec<Rule>> = OnceLock::new();
+    RULES
+        .get_or_init(|| {
+            vec![
+                Rule::new(CLOSING_PARENTHESIS_HYPERLINK_PATTERN, "$0")
+                    .expect("valid closing-parenthesis terminal hyperlink regex"),
+                Rule::new(GENERIC_HYPERLINK_PATTERN, "$0")
+                    .expect("valid generic terminal hyperlink regex"),
+            ]
+        })
+        .as_slice()
+}
+
+fn terminal_link_at_point(
+    snapshot: &TerminalSelectionSnapshot,
+    point: TerminalSelectionPoint,
+) -> Option<String> {
+    terminal_explicit_link_at_point(snapshot, point)
+        .or_else(|| terminal_text_link_at_point(snapshot, point))
+}
+
+fn terminal_explicit_link_at_point(
+    snapshot: &TerminalSelectionSnapshot,
+    point: TerminalSelectionPoint,
+) -> Option<String> {
+    terminal_selection_hyperlink_at_point(snapshot, point)
+        .filter(|uri| terminal_link_uri_allowed(uri))
+        .map(str::to_owned)
+}
+
+fn terminal_text_link_at_point(
+    snapshot: &TerminalSelectionSnapshot,
+    point: TerminalSelectionPoint,
+) -> Option<String> {
+    let logical_line = terminal_logical_line(snapshot, point.row)?;
+    let byte_index = terminal_logical_line_byte_index(&logical_line, point)?;
+    Rule::match_hyperlinks(&logical_line.text, terminal_link_rules())
+        .into_iter()
+        .find(|matched| {
+            matched.range.contains(&byte_index) && terminal_link_uri_allowed(matched.link.uri())
+        })
+        .map(|matched| matched.link.uri().to_owned())
+}
+
+fn terminal_link_uri_allowed(uri: &str) -> bool {
+    terminal_link_has_ascii_case_insensitive_prefix(uri, "http://")
+        || terminal_link_has_ascii_case_insensitive_prefix(uri, "https://")
+}
+
+fn terminal_link_has_ascii_case_insensitive_prefix(uri: &str, prefix: &str) -> bool {
+    uri.get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+}
+
+fn terminal_selection_hyperlink_at_point(
+    snapshot: &TerminalSelectionSnapshot,
+    point: TerminalSelectionPoint,
+) -> Option<&str> {
+    snapshot
+        .lines
+        .get(point.row)?
+        .hyperlinks
+        .iter()
+        .find(|hyperlink| {
+            point.column >= hyperlink.start_column && point.column < hyperlink.end_column
+        })
+        .map(|hyperlink| hyperlink.uri.as_str())
+}
+
+fn should_resolve_terminal_link(
+    link_activation_modifiers_active: bool,
+    primary_pressed_on_terminal: bool,
+    has_pending_link_click: bool,
+) -> bool {
+    link_activation_modifiers_active || primary_pressed_on_terminal || has_pending_link_click
+}
+
+fn terminal_logical_line(
+    snapshot: &TerminalSelectionSnapshot,
+    row: usize,
+) -> Option<TerminalLogicalLine> {
+    let (start_row, end_row) = terminal_logical_line_row_range(snapshot, row)?;
+    let mut logical_line = TerminalLogicalLine::default();
+
+    for row in start_row..=end_row {
+        append_terminal_logical_line_row(
+            &mut logical_line.text,
+            &mut logical_line.segments,
+            row,
+            &snapshot.lines[row],
+        );
+    }
+
+    Some(logical_line)
+}
+
+fn terminal_logical_line_row_range(
+    snapshot: &TerminalSelectionSnapshot,
+    row: usize,
+) -> Option<(usize, usize)> {
+    if row >= snapshot.lines.len() {
+        return None;
+    }
+
+    let mut start_row = row;
+    while start_row > 0 && snapshot.lines[start_row - 1].wraps_to_next {
+        start_row -= 1;
+    }
+
+    let mut end_row = row;
+    while end_row + 1 < snapshot.lines.len() && snapshot.lines[end_row].wraps_to_next {
+        end_row += 1;
+    }
+
+    Some((start_row, end_row))
+}
+
+fn append_terminal_logical_line_row(
+    text: &mut String,
+    segments: &mut Vec<TerminalLinkSegment>,
+    row: usize,
+    line: &TerminalSelectionLine,
+) {
+    let mut column = 0;
+
+    for cell in &line.cells {
+        if cell.column > column {
+            append_terminal_logical_segment(
+                text,
+                segments,
+                row,
+                column,
+                cell.column.min(line.width),
+                &" ".repeat(cell.column.min(line.width).saturating_sub(column)),
+            );
+            column = cell.column.min(line.width);
+        }
+
+        let end_column = cell
+            .column
+            .saturating_add(cell.display_width.max(1))
+            .min(line.width);
+        if end_column <= cell.column {
+            continue;
+        }
+
+        append_terminal_logical_segment(
+            text,
+            segments,
+            row,
+            cell.column,
+            end_column,
+            &cell.rendered_text(),
+        );
+        column = end_column;
+    }
+
+    if column < line.width {
+        append_terminal_logical_segment(
+            text,
+            segments,
+            row,
+            column,
+            line.width,
+            &" ".repeat(line.width - column),
+        );
+    }
+}
+
+fn append_terminal_logical_segment(
+    text: &mut String,
+    segments: &mut Vec<TerminalLinkSegment>,
+    row: usize,
+    start_column: usize,
+    end_column: usize,
+    segment_text: &str,
+) {
+    if end_column <= start_column || segment_text.is_empty() {
+        return;
+    }
+
+    let byte_start = text.len();
+    text.push_str(segment_text);
+    segments.push(TerminalLinkSegment {
+        row,
+        start_column,
+        end_column,
+        byte_range: byte_start..text.len(),
+    });
+}
+
+fn terminal_logical_line_byte_index(
+    logical_line: &TerminalLogicalLine,
+    point: TerminalSelectionPoint,
+) -> Option<usize> {
+    let segment = logical_line.segments.iter().find(|segment| {
+        segment.row == point.row
+            && point.column >= segment.start_column
+            && point.column < segment.end_column
+    })?;
+    let segment_text = &logical_line.text[segment.byte_range.clone()];
+    let byte_offset =
+        byte_index_for_display_column(segment_text, point.column - segment.start_column);
+    Some(segment.byte_range.start + byte_offset)
+}
+
+fn byte_index_for_display_column(text: &str, column_offset: usize) -> usize {
+    if column_offset == 0 {
+        return 0;
+    }
+
+    let mut seen_columns = 0;
+    for (byte_index, ch) in text.char_indices() {
+        if seen_columns >= column_offset {
+            return byte_index;
+        }
+
+        let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width == 0 {
+            continue;
+        }
+
+        let next_columns = seen_columns.saturating_add(width);
+        if next_columns > column_offset {
+            return byte_index;
+        }
+
+        seen_columns = next_columns;
+    }
+
+    text.len()
 }
 
 fn terminal_selection_point_from_pointer(
@@ -5785,18 +6176,21 @@ mod tests {
         configure_terminal_font_family, cursor_hidden_by_row_filter, default_app_open_command,
         force_terminal_pane_width, install_terminal_font_family, next_active_terminal_after_close,
         next_terminal_in_direction, normalize_terminal_background, parse_branch_header,
-        recover_config_state, resolve_ctrl_c_action, source_control_badge_state,
-        source_control_tooltip_lines, terminal_cell_metric, terminal_cursor_blink_phase_visible,
-        terminal_cursor_overlay_rect, terminal_font_family, terminal_font_id,
-        terminal_grid_dimensions, terminal_line_height, terminal_manager_actions_width,
+        recover_config_state, resolve_ctrl_c_action, should_resolve_terminal_link,
+        source_control_badge_state, source_control_tooltip_lines, terminal_cell_metric,
+        terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect, terminal_font_family,
+        terminal_font_id, terminal_grid_dimensions, terminal_line_height,
+        terminal_link_activation_modifiers, terminal_link_at_point, terminal_logical_line,
+        terminal_logical_line_byte_index, terminal_manager_actions_width,
         terminal_manager_row_widths, terminal_output_surface_size, terminal_output_viewport_size,
         terminal_secondary_click_action, terminal_selection_point_from_pointer,
         terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
         AdeApp, CtrlCAction, DirectoryIndexSnapshot, DirectoryNode, PendingConfigChanges,
-        SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
-        SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry, TerminalNavigationDirection,
-        TerminalSecondaryClickAction, TerminalSelection, TerminalSelectionPoint, TransientToast,
-        TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_COPY_TOAST_SECS, TERMINAL_OUTPUT_BG,
+        PendingTerminalLinkClick, SourceControlBadgeState, SourceControlFile,
+        SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
+        TerminalNavigationDirection, TerminalSecondaryClickAction, TerminalSelection,
+        TerminalSelectionPoint, TransientToast, TERMINAL_COPY_FEEDBACK_TEXT,
+        TERMINAL_COPY_TOAST_SECS, TERMINAL_OUTPUT_BG,
     };
     use crate::layout;
     use crate::models::{
@@ -5804,13 +6198,14 @@ mod tests {
     };
     use crate::terminal::{
         test_terminal_runtime, TerminalColor, TerminalCursor, TerminalCursorLine,
-        TerminalCursorShape, TerminalSelectionLine, TerminalSelectionSnapshot, TerminalSnapshot,
-        TerminalStyle, TerminalStyledCell, TerminalStyledLine, TerminalStyledRun,
+        TerminalCursorShape, TerminalSelectionHyperlink, TerminalSelectionLine,
+        TerminalSelectionSnapshot, TerminalSnapshot, TerminalStyle, TerminalStyledCell,
+        TerminalStyledLine, TerminalStyledRun,
     };
     use eframe::egui::text::{LayoutJob, TextFormat};
     use eframe::egui::{
         self, pos2, Color32, Context, Event, FontDefinitions, FontFamily, Galley, Id, Key,
-        Modifiers, RawInput,
+        Modifiers, RawInput, Stroke,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -6371,6 +6766,207 @@ mod tests {
     }
 
     #[test]
+    fn beginning_primary_interaction_tracks_link_candidate_with_collapsed_selection() {
+        let mut terminal = test_terminal_entry(1, 7);
+        let anchor = TerminalSelectionPoint { row: 0, column: 3 };
+        let url = "https://example.com/docs".to_owned();
+
+        AdeApp::begin_terminal_primary_interaction(&mut terminal, anchor, Some(url.clone()));
+
+        assert_eq!(
+            terminal.pending_link_click,
+            Some(PendingTerminalLinkClick { anchor, url })
+        );
+        assert_eq!(
+            terminal.selection,
+            Some(TerminalSelection::collapsed(anchor))
+        );
+        assert!(terminal.selection_drag_active);
+    }
+
+    #[test]
+    fn primary_drag_keeps_link_candidate_when_pointer_stays_on_anchor_cell() {
+        let mut terminal = test_terminal_entry(1, 7);
+        let anchor = TerminalSelectionPoint { row: 0, column: 2 };
+        let url = "https://example.com/docs".to_owned();
+
+        AdeApp::begin_terminal_primary_interaction(&mut terminal, anchor, Some(url.clone()));
+        AdeApp::update_terminal_primary_drag(&mut terminal, anchor);
+
+        assert_eq!(
+            terminal.pending_link_click,
+            Some(PendingTerminalLinkClick { anchor, url })
+        );
+        assert_eq!(
+            terminal.selection,
+            Some(TerminalSelection::collapsed(anchor))
+        );
+        assert!(terminal.selection_drag_active);
+    }
+
+    #[test]
+    fn primary_drag_uses_pending_link_anchor_for_selection() {
+        let mut terminal = test_terminal_entry(1, 7);
+        let anchor = TerminalSelectionPoint { row: 0, column: 2 };
+        let focus = TerminalSelectionPoint { row: 1, column: 5 };
+
+        AdeApp::begin_terminal_primary_interaction(
+            &mut terminal,
+            anchor,
+            Some("https://example.com/docs".to_owned()),
+        );
+        AdeApp::update_terminal_primary_drag(&mut terminal, focus);
+
+        assert_eq!(terminal.pending_link_click, None);
+        assert_eq!(
+            terminal.selection,
+            Some(TerminalSelection { anchor, focus })
+        );
+        assert!(terminal.selection_drag_active);
+    }
+
+    #[test]
+    fn beginning_primary_interaction_replaces_existing_selection() {
+        let mut terminal = test_terminal_entry(1, 7);
+        let point = TerminalSelectionPoint { row: 2, column: 4 };
+        terminal.selection = Some(TerminalSelection {
+            anchor: TerminalSelectionPoint { row: 0, column: 1 },
+            focus: TerminalSelectionPoint { row: 1, column: 5 },
+        });
+
+        AdeApp::begin_terminal_primary_interaction(&mut terminal, point, None);
+
+        assert_eq!(
+            terminal.selection,
+            Some(TerminalSelection::collapsed(point))
+        );
+        assert_eq!(terminal.pending_link_click, None);
+        assert!(terminal.selection_drag_active);
+    }
+
+    #[test]
+    fn plain_primary_drag_restarts_selection_from_new_press_point() {
+        let mut terminal = test_terminal_entry(1, 7);
+        let anchor = TerminalSelectionPoint { row: 2, column: 4 };
+        let focus = TerminalSelectionPoint { row: 3, column: 6 };
+        terminal.selection = Some(TerminalSelection {
+            anchor: TerminalSelectionPoint { row: 0, column: 1 },
+            focus: TerminalSelectionPoint { row: 1, column: 5 },
+        });
+
+        AdeApp::begin_terminal_primary_interaction(&mut terminal, anchor, None);
+        AdeApp::update_terminal_primary_drag(&mut terminal, focus);
+
+        assert_eq!(
+            terminal.selection,
+            Some(TerminalSelection { anchor, focus })
+        );
+        assert_eq!(terminal.pending_link_click, None);
+        assert!(terminal.selection_drag_active);
+    }
+
+    #[test]
+    fn link_candidate_can_open_after_modifier_added_before_release() {
+        let mut terminal = test_terminal_entry(1, 7);
+        let anchor = TerminalSelectionPoint { row: 2, column: 4 };
+        let url = "https://example.com/docs".to_owned();
+
+        AdeApp::begin_terminal_primary_interaction(&mut terminal, anchor, Some(url.clone()));
+
+        let opened =
+            AdeApp::take_terminal_primary_clicked_link(&mut terminal, Some(url.as_str()), true);
+
+        assert_eq!(opened.as_deref(), Some(url.as_str()));
+        assert_eq!(terminal.pending_link_click, None);
+        assert_eq!(terminal.selection, None);
+        assert!(!terminal.selection_drag_active);
+    }
+
+    #[test]
+    fn clicked_link_opens_same_url_and_clears_collapsed_selection() {
+        let mut terminal = test_terminal_entry(1, 7);
+        let point = TerminalSelectionPoint { row: 2, column: 4 };
+        let url = "https://example.com/docs".to_owned();
+        terminal.selection = Some(TerminalSelection::collapsed(point));
+        terminal.selection_drag_active = true;
+        terminal.pending_link_click = Some(PendingTerminalLinkClick {
+            anchor: point,
+            url: url.clone(),
+        });
+
+        let opened =
+            AdeApp::take_terminal_primary_clicked_link(&mut terminal, Some(url.as_str()), true);
+
+        assert_eq!(opened.as_deref(), Some(url.as_str()));
+        assert_eq!(terminal.pending_link_click, None);
+        assert_eq!(terminal.selection, None);
+        assert!(!terminal.selection_drag_active);
+    }
+
+    #[test]
+    fn clicked_link_preserves_existing_selection_range() {
+        let mut terminal = test_terminal_entry(1, 7);
+        let selection = TerminalSelection {
+            anchor: TerminalSelectionPoint { row: 0, column: 1 },
+            focus: TerminalSelectionPoint { row: 0, column: 5 },
+        };
+        let url = "https://example.com/docs".to_owned();
+        terminal.selection = Some(selection);
+        terminal.pending_link_click = Some(PendingTerminalLinkClick {
+            anchor: TerminalSelectionPoint { row: 0, column: 2 },
+            url: url.clone(),
+        });
+
+        let opened =
+            AdeApp::take_terminal_primary_clicked_link(&mut terminal, Some(url.as_str()), true);
+
+        assert_eq!(opened.as_deref(), Some(url.as_str()));
+        assert_eq!(terminal.selection, Some(selection));
+        assert!(!terminal.selection_drag_active);
+    }
+
+    #[test]
+    fn plain_text_press_does_not_open_link_on_release() {
+        let mut terminal = test_terminal_entry(1, 7);
+        let point = TerminalSelectionPoint { row: 0, column: 2 };
+
+        AdeApp::begin_terminal_primary_interaction(&mut terminal, point, None);
+
+        let opened = AdeApp::take_terminal_primary_clicked_link(
+            &mut terminal,
+            Some("https://example.com/docs"),
+            true,
+        );
+        if opened.is_none() {
+            AdeApp::clear_terminal_selection(&mut terminal);
+        }
+
+        assert_eq!(opened, None);
+        assert_eq!(terminal.selection, None);
+        assert!(!terminal.selection_drag_active);
+    }
+
+    #[test]
+    fn clicked_link_ignores_different_release_url() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.pending_link_click = Some(PendingTerminalLinkClick {
+            anchor: TerminalSelectionPoint { row: 0, column: 2 },
+            url: "https://example.com/docs".to_owned(),
+        });
+        terminal.selection_drag_active = true;
+
+        let opened = AdeApp::take_terminal_primary_clicked_link(
+            &mut terminal,
+            Some("https://example.com/other"),
+            true,
+        );
+
+        assert_eq!(opened, None);
+        assert_eq!(terminal.pending_link_click, None);
+        assert!(!terminal.selection_drag_active);
+    }
+
+    #[test]
     fn selected_terminal_text_uses_cached_selection_snapshot() {
         let mut terminal = test_terminal_entry(1, 7);
         terminal.selection = Some(TerminalSelection {
@@ -6455,6 +7051,7 @@ mod tests {
             lines: vec![TerminalSelectionLine {
                 width: 3,
                 wraps_to_next: false,
+                hyperlinks: Vec::new(),
                 cells: vec![
                     TerminalStyledCell {
                         text: "你".to_owned(),
@@ -6490,6 +7087,7 @@ mod tests {
             lines: vec![TerminalSelectionLine {
                 width: 2,
                 wraps_to_next: false,
+                hyperlinks: Vec::new(),
                 cells: vec![TerminalStyledCell {
                     text: "你".to_owned(),
                     style,
@@ -6644,6 +7242,178 @@ mod tests {
         .expect("expected selection point");
 
         assert_eq!(point, TerminalSelectionPoint { row: 1, column: 0 });
+    }
+
+    #[test]
+    fn terminal_link_activation_requires_command_alias() {
+        assert!(!terminal_link_activation_modifiers(Modifiers::default()));
+        assert!(terminal_link_activation_modifiers(Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        }));
+        assert!(terminal_link_activation_modifiers(Modifiers {
+            command: true,
+            ..Modifiers::default()
+        }));
+        assert!(!terminal_link_activation_modifiers(Modifiers {
+            ctrl: true,
+            alt: true,
+            ..Modifiers::default()
+        }));
+        assert!(!should_resolve_terminal_link(false, false, false));
+        assert!(should_resolve_terminal_link(true, false, false));
+        assert!(should_resolve_terminal_link(false, true, false));
+        assert!(should_resolve_terminal_link(false, false, true));
+    }
+
+    #[test]
+    fn terminal_logical_line_flattens_soft_wrapped_rows_for_byte_mapping() {
+        let snapshot = TerminalSelectionSnapshot {
+            lines: vec![
+                test_selection_line_with_wrap(&[("https://example.", 0, 16)], 16, true),
+                test_selection_line(&[("com/path", 0, 8)], 8),
+            ],
+        };
+
+        let logical_line = terminal_logical_line(&snapshot, 1).expect("expected logical line");
+        let byte_index = terminal_logical_line_byte_index(
+            &logical_line,
+            TerminalSelectionPoint { row: 1, column: 3 },
+        )
+        .expect("expected byte index");
+
+        assert_eq!(logical_line.text, "https://example.com/path");
+        assert_eq!(byte_index, 19);
+    }
+
+    #[test]
+    fn terminal_logical_line_byte_index_accounts_for_wide_prefix_columns() {
+        let snapshot = TerminalSelectionSnapshot {
+            lines: vec![test_selection_line(
+                &[("你好https://example.com", 0, 22)],
+                22,
+            )],
+        };
+
+        let logical_line = terminal_logical_line(&snapshot, 0).expect("expected logical line");
+        let byte_index = terminal_logical_line_byte_index(
+            &logical_line,
+            TerminalSelectionPoint { row: 0, column: 4 },
+        )
+        .expect("expected byte index");
+
+        assert_eq!(byte_index, logical_line.text.find("https").unwrap());
+    }
+
+    #[test]
+    fn terminal_link_at_point_matches_wrapped_http_url() {
+        let snapshot = TerminalSelectionSnapshot {
+            lines: vec![
+                test_selection_line_with_wrap(&[("https://example.", 0, 16)], 16, true),
+                test_selection_line(&[("com/path", 0, 8)], 8),
+            ],
+        };
+
+        let link = terminal_link_at_point(&snapshot, TerminalSelectionPoint { row: 1, column: 2 });
+
+        assert_eq!(link.as_deref(), Some("https://example.com/path"));
+    }
+
+    #[test]
+    fn terminal_link_at_point_prefers_explicit_hyperlink_metadata() {
+        let snapshot = TerminalSelectionSnapshot {
+            lines: vec![test_selection_line_with_wrap_and_links(
+                &[("https://shown.example", 0, 20)],
+                20,
+                false,
+                &[(0, 20, "https://target.example/docs")],
+            )],
+        };
+
+        let link = terminal_link_at_point(&snapshot, TerminalSelectionPoint { row: 0, column: 5 });
+
+        assert_eq!(link.as_deref(), Some("https://target.example/docs"));
+    }
+
+    #[test]
+    fn terminal_link_at_point_matches_wrapped_explicit_hyperlink() {
+        let snapshot = TerminalSelectionSnapshot {
+            lines: vec![
+                test_selection_line_with_wrap_and_links(
+                    &[("shown-", 0, 6)],
+                    6,
+                    true,
+                    &[(0, 6, "https://target.example/docs")],
+                ),
+                test_selection_line_with_wrap_and_links(
+                    &[("docs", 0, 4)],
+                    4,
+                    false,
+                    &[(0, 4, "https://target.example/docs")],
+                ),
+            ],
+        };
+
+        let link = terminal_link_at_point(&snapshot, TerminalSelectionPoint { row: 1, column: 2 });
+
+        assert_eq!(link.as_deref(), Some("https://target.example/docs"));
+    }
+
+    #[test]
+    fn terminal_link_at_point_rejects_non_http_explicit_hyperlinks() {
+        let snapshot = TerminalSelectionSnapshot {
+            lines: vec![test_selection_line_with_wrap_and_links(
+                &[("docs", 0, 4)],
+                4,
+                false,
+                &[(0, 4, "file://server/share")],
+            )],
+        };
+
+        let link = terminal_link_at_point(&snapshot, TerminalSelectionPoint { row: 0, column: 1 });
+
+        assert_eq!(link, None);
+    }
+
+    #[test]
+    fn terminal_link_at_point_accepts_mixed_case_explicit_http_scheme() {
+        let snapshot = TerminalSelectionSnapshot {
+            lines: vec![test_selection_line_with_wrap_and_links(
+                &[("docs", 0, 4)],
+                4,
+                false,
+                &[(0, 4, "HTTPS://target.example/docs")],
+            )],
+        };
+
+        let link = terminal_link_at_point(&snapshot, TerminalSelectionPoint { row: 0, column: 2 });
+
+        assert_eq!(link.as_deref(), Some("HTTPS://target.example/docs"));
+    }
+
+    #[test]
+    fn terminal_link_at_point_accepts_mixed_case_plain_text_http_scheme() {
+        let snapshot = TerminalSelectionSnapshot {
+            lines: vec![test_selection_line(
+                &[("HTTPS://example.com/path", 0, 24)],
+                24,
+            )],
+        };
+
+        let link = terminal_link_at_point(&snapshot, TerminalSelectionPoint { row: 0, column: 10 });
+
+        assert_eq!(link.as_deref(), Some("HTTPS://example.com/path"));
+    }
+
+    #[test]
+    fn terminal_link_at_point_ignores_non_http_plain_text_schemes() {
+        let snapshot = TerminalSelectionSnapshot {
+            lines: vec![test_selection_line(&[("file://server/share", 0, 19)], 19)],
+        };
+
+        let link = terminal_link_at_point(&snapshot, TerminalSelectionPoint { row: 0, column: 5 });
+
+        assert_eq!(link, None);
     }
 
     #[test]
@@ -7629,10 +8399,27 @@ mod tests {
         width: usize,
         wraps_to_next: bool,
     ) -> TerminalSelectionLine {
+        test_selection_line_with_wrap_and_links(segments, width, wraps_to_next, &[])
+    }
+
+    fn test_selection_line_with_wrap_and_links(
+        segments: &[(&str, usize, usize)],
+        width: usize,
+        wraps_to_next: bool,
+        hyperlinks: &[(usize, usize, &str)],
+    ) -> TerminalSelectionLine {
         let style = test_terminal_style();
         TerminalSelectionLine {
             width,
             wraps_to_next,
+            hyperlinks: hyperlinks
+                .iter()
+                .map(|(column, display_width, uri)| TerminalSelectionHyperlink {
+                    start_column: *column,
+                    end_column: column + display_width,
+                    uri: (*uri).to_owned(),
+                })
+                .collect(),
             cells: segments
                 .iter()
                 .flat_map(|(text, column, display_width)| {
@@ -7730,6 +8517,7 @@ mod tests {
             render_cache: TerminalSnapshot::default(),
             selection: None,
             selection_snapshot: None,
+            pending_link_click: None,
             selection_drag_active: false,
             snapshot_refresh_deferred: false,
             exited: false,
@@ -8062,6 +8850,32 @@ mod tests {
         assert_eq!(
             super::directory_file_row_hover_fill(true),
             Some(super::with_alpha(super::BTN_ICON_HOVER, 110))
+        );
+    }
+
+    #[test]
+    fn terminal_header_chrome_emphasizes_active_terminal() {
+        let chrome = super::terminal_header_chrome(true);
+
+        assert_eq!(chrome.fill, Color32::from_rgb(28, 52, 72));
+        assert_eq!(chrome.stroke, Stroke::NONE);
+        assert_eq!(chrome.title_color, Color32::from_rgb(244, 251, 255));
+        assert_eq!(
+            chrome.detail_color,
+            super::with_alpha(super::TEXT_MUTED, 238)
+        );
+    }
+
+    #[test]
+    fn terminal_header_chrome_keeps_inactive_terminal_subtle() {
+        let chrome = super::terminal_header_chrome(false);
+
+        assert_eq!(chrome.fill, Color32::from_rgb(22, 32, 46));
+        assert_eq!(chrome.stroke, Stroke::new(1.0, super::BORDER_COLOR));
+        assert_eq!(chrome.title_color, super::TEXT_PRIMARY);
+        assert_eq!(
+            chrome.detail_color,
+            super::with_alpha(super::TEXT_MUTED, 230)
         );
     }
 

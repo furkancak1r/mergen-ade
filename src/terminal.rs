@@ -161,10 +161,18 @@ pub struct TerminalSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TerminalSelectionHyperlink {
+    pub start_column: usize,
+    pub end_column: usize,
+    pub uri: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TerminalSelectionLine {
     pub width: usize,
     pub wraps_to_next: bool,
     pub cells: Vec<TerminalStyledCell>,
+    pub hyperlinks: Vec<TerminalSelectionHyperlink>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1260,12 +1268,14 @@ fn selection_snapshot_from_terminal(terminal: &Terminal) -> TerminalSelectionSna
                 width: cols,
                 wraps_to_next: false,
                 cells: Vec::new(),
+                hyperlinks: Vec::new(),
             });
         }
 
         let snapshot_row = lines.len();
         let min_columns_to_keep = cursor_columns_to_keep(cursor, snapshot_row, cols);
         let mut cells = Vec::new();
+        let mut hyperlinks = Vec::new();
 
         for cell in line.visible_cells() {
             let col = cell.cell_index();
@@ -1283,13 +1293,20 @@ fn selection_snapshot_from_terminal(terminal: &Terminal) -> TerminalSelectionSna
             if display_width == 0 {
                 continue;
             }
-
             cells.push(TerminalStyledCell {
                 text,
                 style,
                 column: col,
                 display_width,
             });
+            if let Some(uri) = cell.attrs().hyperlink().map(|link| link.uri()) {
+                append_selection_hyperlink(
+                    &mut hyperlinks,
+                    col,
+                    col.saturating_add(display_width).min(cols),
+                    uri,
+                );
+            }
         }
 
         trim_trailing_default_cells(&mut cells, default_style, min_columns_to_keep);
@@ -1297,6 +1314,7 @@ fn selection_snapshot_from_terminal(terminal: &Terminal) -> TerminalSelectionSna
             width: cols,
             wraps_to_next: line.last_cell_was_wrapped(),
             cells,
+            hyperlinks,
         });
     });
 
@@ -1305,6 +1323,7 @@ fn selection_snapshot_from_terminal(terminal: &Terminal) -> TerminalSelectionSna
             width: cols,
             wraps_to_next: false,
             cells: Vec::new(),
+            hyperlinks: Vec::new(),
         });
     }
 
@@ -1503,6 +1522,30 @@ fn trim_trailing_default_cells(
     }
 }
 
+fn append_selection_hyperlink(
+    hyperlinks: &mut Vec<TerminalSelectionHyperlink>,
+    start_column: usize,
+    end_column: usize,
+    uri: &str,
+) {
+    if end_column <= start_column {
+        return;
+    }
+
+    if let Some(existing) = hyperlinks.last_mut() {
+        if existing.end_column == start_column && existing.uri == uri {
+            existing.end_column = end_column;
+            return;
+        }
+    }
+
+    hyperlinks.push(TerminalSelectionHyperlink {
+        start_column,
+        end_column,
+        uri: uri.to_owned(),
+    });
+}
+
 fn rendered_cell_text(text: &str, display_width: usize) -> String {
     let mut rendered = if text.is_empty() {
         " ".to_owned()
@@ -1607,7 +1650,8 @@ mod tests {
         verified_process_entry, verified_process_tree_descendants, verified_snapshot_root_process,
         AdeTerminalConfig, ProcessSnapshotEntry, RootProcessTerminationPlan, RuntimeCommand,
         SharedWriterHandle, TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape,
-        TerminalDimensions, TerminalStyle, TerminalStyledCell, VerifiedProcessLookup,
+        TerminalDimensions, TerminalSelectionHyperlink, TerminalStyle, TerminalStyledCell,
+        VerifiedProcessLookup,
     };
     use std::{
         io,
@@ -2055,6 +2099,53 @@ mod tests {
         assert!(selection_snapshot.lines[0].wraps_to_next);
         assert_eq!(selection_snapshot.lines[0].width, 5);
         assert_eq!(selection_snapshot.lines[1].cells[0].text, "f");
+    }
+
+    #[test]
+    fn selection_snapshot_preserves_hyperlink_uri() {
+        let mut terminal = make_test_terminal(TerminalSize {
+            rows: 2,
+            cols: 32,
+            pixel_width: 256,
+            pixel_height: 32,
+            dpi: 96,
+        });
+        terminal.advance_bytes(b"\x1b]8;;https://example.com/docs\x07docs\x1b]8;;\x07");
+
+        let snapshot = selection_snapshot_from_terminal(&terminal);
+
+        assert_eq!(
+            snapshot.lines[0].hyperlinks,
+            vec![TerminalSelectionHyperlink {
+                start_column: 0,
+                end_column: 4,
+                uri: "https://example.com/docs".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn selection_snapshot_merges_adjacent_cells_for_same_hyperlink() {
+        let mut terminal = make_test_terminal(TerminalSize {
+            rows: 2,
+            cols: 32,
+            pixel_width: 256,
+            pixel_height: 32,
+            dpi: 96,
+        });
+        terminal
+            .advance_bytes(b"\x1b]8;;https://example.com/docs\x07ab\x1b[31mcd\x1b[0m\x1b]8;;\x07");
+
+        let snapshot = selection_snapshot_from_terminal(&terminal);
+
+        assert_eq!(
+            snapshot.lines[0].hyperlinks,
+            vec![TerminalSelectionHyperlink {
+                start_column: 0,
+                end_column: 4,
+                uri: "https://example.com/docs".to_owned(),
+            }]
+        );
     }
 
     #[test]

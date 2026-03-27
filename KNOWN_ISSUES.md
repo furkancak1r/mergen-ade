@@ -391,3 +391,45 @@
   - Re-check cursor and selection alignment whenever terminal font fallback coverage changes.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: local workspace fix on 2026-03-25; follow-up to the Droid glyph fallback change, commit pending
+
+#### Terminal links ignored Ctrl+Click activation in integrated panes {#terminal-links-ignored-ctrl-click-activation-in-integrated-panes}
+- Date: 2026-03-25T15:30:00Z
+- Context: main/Windows local integrated terminal link activation
+- Error signature: Visible terminal URLs and OSC8 hyperlinks stayed inert when clicked inside the pane.
+- Symptoms/Impact: Operators could not open links directly from terminal output, and plain left-click kept starting or clearing selection instead of activating the target.
+- Root cause: `src/app.rs` treated every primary click in terminal output as selection/focus input, while `src/terminal.rs` snapshot cells discarded hyperlink metadata and the app had no wrapped-line URL hit-testing for plain `http/https` text.
+- Resolution: Carried hyperlink URIs into terminal cell snapshots, added wrapped logical-line URL resolution for plain `http/https` links, gated link activation behind `Ctrl+Click`/primary-command click so selection behavior stays intact, and added regression coverage for modifier detection plus explicit and wrapped-link resolution.
+- Prevent recurrence:
+  - Keep terminal pointer hit-testing separate from selection drag behavior when new interactive terminal affordances are added.
+  - Preserve cell-level terminal metadata that the UI may need later instead of collapsing it during snapshot generation.
+  - Re-test soft-wrapped terminal output whenever click-target resolution depends on logical line reconstruction.
+- Files/Commands touched: `src/app.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: local workspace fix on 2026-03-25; commit pending
+
+#### Terminal Ctrl+Click links accepted unsafe schemes and rejected mixed-case HTTP(S) {#terminal-ctrl-click-links-accepted-unsafe-schemes-and-rejected-mixed-case-https}
+- Date: 2026-03-25T16:00:00Z
+- Context: main/Windows local integrated terminal hyperlink follow-up
+- Error signature: `Ctrl+Click could open explicit OSC8 links with non-web schemes, while plain-text URLs such as HTTPS://example.com stayed inert.`
+- Symptoms/Impact: Untrusted terminal output could hand `file:`, `mailto:`, or custom-scheme targets to the OS/browser opener, and valid mixed-case HTTP(S) links failed to open even though they looked clickable.
+- Root cause: The explicit hyperlink path in `src/app.rs` forwarded cell metadata directly to `open_url` without the `http/https` allowlist used for plain text, and that plain-text allowlist compared schemes case-sensitively.
+- Resolution: Follow-up local workspace fix applies one shared ASCII-case-insensitive `http/https` allowlist to both explicit OSC8 hyperlinks and plain-text URL matches, with regression coverage for rejected non-web schemes plus accepted mixed-case HTTP(S).
+- Prevent recurrence:
+  - Route every terminal link source through the same URI allowlist before calling the platform opener.
+  - Treat URI schemes as case-insensitive when validating terminal links.
+  - Keep regression tests for explicit OSC8 metadata and plain-text wrapped links in the same suite.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: local workspace follow-up fix on 2026-03-25; commit pending
+
+#### Terminal Ctrl+Click link gesture could leave a stale deferred selection {#terminal-ctrl-click-link-gesture-could-leave-a-stale-deferred-selection}
+- Date: 2026-03-25T17:00:00Z
+- Context: main/Windows local integrated terminal hyperlink follow-up after Ctrl+Click activation shipped
+- Error signature: `Pressing Ctrl/Cmd after mouse-down on a terminal link could open the URL but leave terminal output visually stuck until another click.`
+- Symptoms/Impact: Link activation worked, but some clicks left a hidden collapsed selection behind, so terminal snapshot refresh stayed deferred and the pane appeared frozen even though the PTY was still running.
+- Root cause: `src/app.rs` reused the text-selection state machine for link clicks, created collapsed selection state on primary press, and only cleared it in the normal click/drag-stop path; when the gesture switched into link activation before release, that cleanup path was skipped.
+- Resolution: Added dedicated pending link-click state for terminal presses, converted only real drags into text selection anchored at the original press point, required the same resolved URL on press/release for link open, and added regression tests covering modifier-toggle open, drag fallback, preserved existing selections, and mismatched release targets.
+- Prevent recurrence:
+  - Treat interactive terminal link gestures as their own transient state instead of piggybacking on collapsed text selection.
+  - Clear pending link state on primary release even when the click does not open a link.
+  - Add helper-level tests for pointer-state transitions whenever terminal click handling mixes selection and activation behaviors.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: local workspace follow-up fix on 2026-03-25; commit pending
