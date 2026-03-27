@@ -2989,15 +2989,33 @@ impl AdeApp {
                 });
 
                 if foreground_count > 0 {
-                    ui.separator();
-                    draw_meta_kicker(ui, icons::TERMINAL, "Foreground");
-                    self.draw_terminal_rows(ctx, ui, project_id, TerminalKind::Foreground);
+                    let section_open = draw_terminal_manager_section_header(
+                        ui,
+                        icons::TERMINAL,
+                        "Foreground",
+                        project_id,
+                        TerminalKind::Foreground,
+                        foreground_count > 0,
+                    );
+                    if section_open {
+                        ui.separator();
+                        self.draw_terminal_rows(ctx, ui, project_id, TerminalKind::Foreground);
+                    }
                 }
 
                 if background_count > 0 {
-                    ui.separator();
-                    draw_meta_kicker(ui, icons::LIST, "Background");
-                    self.draw_terminal_rows(ctx, ui, project_id, TerminalKind::Background);
+                    let section_open = draw_terminal_manager_section_header(
+                        ui,
+                        icons::LIST,
+                        "Background",
+                        project_id,
+                        TerminalKind::Background,
+                        background_count > 0,
+                    );
+                    if section_open {
+                        ui.separator();
+                        self.draw_terminal_rows(ctx, ui, project_id, TerminalKind::Background);
+                    }
                 }
             });
 
@@ -5270,14 +5288,67 @@ fn styled_flat_section_header(ui: &mut Ui, label: &str, open: bool) -> egui::Res
     response
 }
 
-fn draw_meta_kicker(ui: &mut Ui, icon: AppIcon, label: &str) {
-    let text = format!("{icon} {label}");
-    ui.label(
-        RichText::new(text)
-            .small()
-            .strong()
-            .color(with_alpha(TEXT_MUTED, 230)),
+fn terminal_manager_section_id(project_id: u64, kind: TerminalKind) -> Id {
+    Id::new(("terminal-manager-section", project_id, kind.label()))
+}
+
+fn terminal_manager_section_text_color(open: bool, has_items: bool) -> Color32 {
+    if open {
+        with_alpha(TEXT_PRIMARY, 232)
+    } else if has_items {
+        with_alpha(ACCENT, 230)
+    } else {
+        with_alpha(TEXT_MUTED, 220)
+    }
+}
+
+fn draw_terminal_manager_section_header(
+    ui: &mut Ui,
+    icon: AppIcon,
+    label: &str,
+    project_id: u64,
+    kind: TerminalKind,
+    has_items: bool,
+) -> bool {
+    let header_id = terminal_manager_section_id(project_id, kind);
+    let mut header_state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), header_id, true);
+    let open = header_state.is_open();
+
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), CONTROL_ROW_HEIGHT),
+        Sense::click(),
     );
+
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect.shrink(1.0), 6.0, with_alpha(BTN_ICON_HOVER, 70));
+    }
+
+    let text_color = if response.is_pointer_button_down_on() {
+        Color32::from_rgb(244, 249, 255)
+    } else if response.hovered() && !open && has_items {
+        with_alpha(ACCENT, 245)
+    } else if response.hovered() {
+        with_alpha(TEXT_PRIMARY, 214)
+    } else {
+        terminal_manager_section_text_color(open, has_items)
+    };
+
+    ui.painter().text(
+        egui::pos2(rect.left() + 6.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!("{icon} {label}"),
+        egui::FontId::proportional(14.0),
+        text_color,
+    );
+
+    if response.clicked() {
+        header_state.toggle(ui);
+        header_state.store(ui.ctx());
+    }
+
+    header_state.is_open()
 }
 
 fn styled_icon_button(
@@ -6185,12 +6256,12 @@ mod tests {
         terminal_manager_row_widths, terminal_output_surface_size, terminal_output_viewport_size,
         terminal_secondary_click_action, terminal_selection_point_from_pointer,
         terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
-        AdeApp, CtrlCAction, DirectoryIndexSnapshot, DirectoryNode, PendingConfigChanges,
-        PendingTerminalLinkClick, SourceControlBadgeState, SourceControlFile,
+        with_alpha, AdeApp, CtrlCAction, DirectoryIndexSnapshot, DirectoryNode,
+        PendingConfigChanges, PendingTerminalLinkClick, SourceControlBadgeState, SourceControlFile,
         SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalNavigationDirection, TerminalSecondaryClickAction, TerminalSelection,
-        TerminalSelectionPoint, TransientToast, TERMINAL_COPY_FEEDBACK_TEXT,
-        TERMINAL_COPY_TOAST_SECS, TERMINAL_OUTPUT_BG,
+        TerminalSelectionPoint, TransientToast, ACCENT, TERMINAL_COPY_FEEDBACK_TEXT,
+        TERMINAL_COPY_TOAST_SECS, TERMINAL_OUTPUT_BG, TEXT_MUTED, TEXT_PRIMARY,
     };
     use crate::layout;
     use crate::models::{
@@ -7434,6 +7505,22 @@ mod tests {
 
         assert_eq!(label_width, 0.0);
         assert_eq!(actions_area_width, 70.0);
+    }
+
+    #[test]
+    fn terminal_manager_section_text_color_distinguishes_open_closed_and_empty_states() {
+        assert_eq!(
+            super::terminal_manager_section_text_color(true, true),
+            with_alpha(TEXT_PRIMARY, 232)
+        );
+        assert_eq!(
+            super::terminal_manager_section_text_color(false, true),
+            with_alpha(ACCENT, 230)
+        );
+        assert_eq!(
+            super::terminal_manager_section_text_color(false, false),
+            with_alpha(TEXT_MUTED, 220)
+        );
     }
 
     #[test]
