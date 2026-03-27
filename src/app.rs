@@ -1540,9 +1540,15 @@ impl AdeApp {
                             Self::clear_terminal_selection(terminal);
                             outbound.push(b'\r');
                             let line = std::mem::take(&mut terminal.pending_line_for_title);
-                            terminal.full_title = terminal_title_text(&line, terminal.id as usize);
-                            terminal.title =
-                                update_terminal_title(&line, terminal.id as usize, TITLE_MAX_LEN);
+                            if !line.trim().is_empty() {
+                                terminal.full_title =
+                                    terminal_title_text(&line, terminal.id as usize);
+                                terminal.title = update_terminal_title(
+                                    &line,
+                                    terminal.id as usize,
+                                    TITLE_MAX_LEN,
+                                );
+                            }
                             terminal.dirty = true;
                             continue;
                         }
@@ -2038,8 +2044,10 @@ impl AdeApp {
         Self::clear_terminal_selection(terminal);
         Self::append_pending_line(&mut terminal.pending_line_for_title, message);
         let line = std::mem::take(&mut terminal.pending_line_for_title);
-        terminal.full_title = terminal_title_text(&line, terminal.id as usize);
-        terminal.title = update_terminal_title(&line, terminal.id as usize, TITLE_MAX_LEN);
+        if !line.trim().is_empty() {
+            terminal.full_title = terminal_title_text(&line, terminal.id as usize);
+            terminal.title = update_terminal_title(&line, terminal.id as usize, TITLE_MAX_LEN);
+        }
         terminal.dirty = true;
         self.status_line = format!("Sent saved message to {}", destination_title);
     }
@@ -6624,6 +6632,48 @@ mod tests {
 
         let terminal = app.terminals.get(&1).expect("terminal 1");
         assert_eq!(terminal.pending_line_for_title, "git status");
+        assert!(terminal.dirty);
+    }
+
+    #[test]
+    fn enter_on_empty_pending_line_keeps_previous_title() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+        terminal.title = "git status".to_owned();
+        terminal.full_title = "git status".to_owned();
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.title, "git status");
+        assert_eq!(terminal.full_title, "git status");
+        assert!(terminal.pending_line_for_title.is_empty());
+        assert!(terminal.dirty);
+    }
+
+    #[test]
+    fn empty_saved_message_keeps_previous_title() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+        terminal.title = "git status".to_owned();
+        terminal.full_title = "git status".to_owned();
+
+        app.send_saved_message_to_terminal(1, "   ");
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.title, "git status");
+        assert_eq!(terminal.full_title, "git status");
+        assert!(terminal.pending_line_for_title.is_empty());
         assert!(terminal.dirty);
     }
 
