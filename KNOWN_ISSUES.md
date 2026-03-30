@@ -1,5 +1,18 @@
 ### Known Issues & Fix Log
 
+#### Empty project terminal-group clicks did not reopen the project body {#empty-project-terminal-group-clicks-did-not-reopen-the-project-body}
+- Date: 2026-03-30T00:00:00Z
+- Context: main/Windows local terminal manager project-group headers
+- Error signature: Clicking `New Foreground Terminal` or `New Background Terminal` on an empty project spawned the terminal but left the project group collapsed.
+- Symptoms/Impact: The terminal existed but stayed hidden until the user manually expanded the project section, making the button feel unresponsive.
+- Root cause: The render path decided whether to open the collapsing header only after mutating terminal state, so it lost the true pre-click empty-state signal.
+- Resolution: Open the project group after any successful inline foreground or background spawn, so the newly created terminal is visible whether the project was empty or already had terminals.
+- Prevent recurrence:
+  - Treat inline spawn success as the visibility signal for the project group.
+  - Keep the auto-open decision localized to the inline spawn path.
+  - Add unit tests that cover successful and failed inline spawn behavior.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo test`
+
 #### Source Control panel and terminal chrome could show stale git status until manual refresh {#source-control-panel-and-terminal-chrome-could-show-stale-git-status-until-manual-refresh}
 - Date: 2026-03-11T00:00:00Z
 - Context: main/Windows local source-control sidebar + terminal chrome status UX

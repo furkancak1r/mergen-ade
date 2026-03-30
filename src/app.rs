@@ -772,9 +772,9 @@ impl AdeApp {
         ctx: &egui::Context,
         project_id: u64,
         kind: TerminalKind,
-    ) {
+    ) -> bool {
         let Some(project) = self.projects.get(&project_id).cloned() else {
-            return;
+            return false;
         };
 
         let shell = self.config.default_shell;
@@ -794,7 +794,7 @@ impl AdeApp {
             Ok(runtime) => runtime,
             Err(err) => {
                 self.status_line = format!("Failed to create terminal: {err}");
-                return;
+                return false;
             }
         };
 
@@ -828,6 +828,30 @@ impl AdeApp {
         self.bump_layout_epoch();
 
         self.status_line = "Terminal created".to_owned();
+        true
+    }
+
+    fn terminal_counts_for_project(&self, project_id: u64) -> (usize, usize) {
+        let foreground_count = self
+            .terminals
+            .values()
+            .filter(|terminal| {
+                terminal.project_id == project_id && terminal.kind == TerminalKind::Foreground
+            })
+            .count();
+        let background_count = self
+            .terminals
+            .values()
+            .filter(|terminal| {
+                terminal.project_id == project_id && terminal.kind == TerminalKind::Background
+            })
+            .count();
+
+        (foreground_count, background_count)
+    }
+
+    fn should_auto_open_project_terminal_group(spawn_succeeded: bool) -> bool {
+        spawn_succeeded
     }
 
     fn process_terminal_events(&mut self, ctx: &egui::Context) {
@@ -2946,56 +2970,29 @@ impl AdeApp {
 
             let project_path = project_snapshot.path.display().to_string();
 
-            let header_label = format!("{} {}", icons::FOLDER_OPEN, project_snapshot.name);
             let header_id = ui.make_persistent_id(format!("project-group-{project_id}"));
             let mut header_state = egui::collapsing_header::CollapsingState::load_with_default_open(
                 ui.ctx(),
                 header_id,
                 false,
             );
-            let header_response =
-                styled_flat_section_header(ui, &header_label, header_state.is_open());
-            if header_response.clicked() {
+            let header_open = header_state.is_open();
+            let (header_response, foreground_clicked, background_clicked, header_clicked) =
+                draw_project_group_header(ui, &project_snapshot.name, header_open);
+            let foreground_spawned = foreground_clicked
+                && self.spawn_terminal_for_project(ctx, project_id, TerminalKind::Foreground);
+            let background_spawned = background_clicked
+                && self.spawn_terminal_for_project(ctx, project_id, TerminalKind::Background);
+            if header_clicked {
                 header_state.toggle(ui);
+                header_state.store(ui.ctx());
             }
-            let foreground_count = self
-                .terminals
-                .values()
-                .filter(|terminal| {
-                    terminal.project_id == project_id && terminal.kind == TerminalKind::Foreground
-                })
-                .count();
-            let background_count = self
-                .terminals
-                .values()
-                .filter(|terminal| {
-                    terminal.project_id == project_id && terminal.kind == TerminalKind::Background
-                })
-                .count();
+            if foreground_spawned || background_spawned {
+                header_state.set_open(true);
+                header_state.store(ui.ctx());
+            }
+            let (foreground_count, background_count) = self.terminal_counts_for_project(project_id);
             let _ = header_state.show_body_unindented(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if styled_icon_button(
-                        ui,
-                        icons::TERMINAL,
-                        BTN_BLUE,
-                        BTN_BLUE_HOVER,
-                        BTN_ICON_ACTIVE,
-                        "New Foreground Terminal",
-                    ) {
-                        self.spawn_terminal_for_project(ctx, project_id, TerminalKind::Foreground);
-                    }
-                    if styled_icon_button(
-                        ui,
-                        icons::LIST,
-                        BTN_TEAL,
-                        BTN_TEAL_HOVER,
-                        BTN_ICON_ACTIVE,
-                        "New Background Terminal",
-                    ) {
-                        self.spawn_terminal_for_project(ctx, project_id, TerminalKind::Background);
-                    }
-                });
-
                 if foreground_count > 0 {
                     let section_open = draw_terminal_manager_section_header(
                         ui,
@@ -5270,30 +5267,98 @@ fn with_minimal_button_chrome<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)
     .inner
 }
 
-fn styled_flat_section_header(ui: &mut Ui, label: &str, open: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), CONTROL_ROW_HEIGHT),
-        Sense::click(),
-    );
+fn project_group_header_actions_width(section_gap: f32) -> f32 {
+    (CONTROL_ROW_HEIGHT * 2.0) + section_gap
+}
 
-    let text_color = if response.is_pointer_button_down_on() {
-        Color32::from_rgb(244, 249, 255)
-    } else if open {
+fn project_group_header_row_layout(total_width: f32, section_gap: f32) -> (f32, f32) {
+    let total_width = total_width.max(0.0);
+    let section_gap = section_gap.max(0.0);
+    let actions_width = project_group_header_actions_width(section_gap).min(total_width);
+    let label_width = (((total_width - actions_width) * 0.5) - section_gap).max(0.0);
+    (label_width, actions_width)
+}
+
+fn draw_project_group_header(
+    ui: &mut Ui,
+    project_name: &str,
+    open: bool,
+) -> (egui::Response, bool, bool, bool) {
+    let row_width = ui.available_width();
+    let section_gap = ui.spacing().item_spacing.x;
+    let (label_width, actions_width) = project_group_header_row_layout(row_width, section_gap);
+    let row_height = ui.spacing().interact_size.y.max(CONTROL_ROW_HEIGHT);
+    let (row_rect, response) =
+        ui.allocate_exact_size(egui::vec2(row_width, row_height), Sense::click());
+
+    if ui.rect_contains_pointer(row_rect) {
+        ui.painter()
+            .rect_filled(row_rect.shrink(1.0), 6.0, with_alpha(BTN_ICON_HOVER, 70));
+    }
+
+    let text_color = if open {
         with_alpha(TEXT_PRIMARY, 232)
-    } else if response.hovered() {
+    } else if ui.rect_contains_pointer(row_rect) {
         with_alpha(TEXT_PRIMARY, 214)
     } else {
         with_alpha(TEXT_MUTED, 220)
     };
-    ui.painter().text(
-        egui::pos2(rect.left() + 6.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        label,
-        egui::FontId::proportional(14.0),
-        text_color,
+
+    let mut foreground_clicked = false;
+    let mut background_clicked = false;
+    let label_rect = egui::Rect::from_min_size(row_rect.min, egui::vec2(label_width, row_height));
+    if label_width > 0.0 && ui.is_rect_visible(label_rect) {
+        let button_padding = ui.spacing().button_padding;
+        let label = format!("{} {}", icons::FOLDER_OPEN, project_name);
+        let label_wrap_width = (label_rect.width() - (button_padding.x * 2.0)).max(0.0);
+        let galley = WidgetText::from(label).into_galley(
+            ui,
+            Some(TextWrapMode::Truncate),
+            label_wrap_width,
+            egui::TextStyle::Body,
+        );
+        let text_pos = directory_row_text_position(label_rect, button_padding, galley.size());
+        ui.painter().galley(text_pos, galley, text_color);
+    }
+
+    let actions_rect =
+        egui::Rect::from_center_size(row_rect.center(), egui::vec2(actions_width, row_height));
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(actions_rect)
+            .layout(Layout::right_to_left(Align::Center)),
+        |ui| {
+            if styled_icon_button(
+                ui,
+                icons::LIST,
+                BTN_TEAL,
+                BTN_TEAL_HOVER,
+                BTN_ICON_ACTIVE,
+                "New Background Terminal",
+            ) {
+                background_clicked = true;
+            }
+            if styled_icon_button(
+                ui,
+                icons::TERMINAL,
+                BTN_BLUE,
+                BTN_BLUE_HOVER,
+                BTN_ICON_ACTIVE,
+                "New Foreground Terminal",
+            ) {
+                foreground_clicked = true;
+            }
+        },
     );
 
-    response
+    let header_clicked = response.clicked() && !foreground_clicked && !background_clicked;
+
+    (
+        response,
+        foreground_clicked,
+        background_clicked,
+        header_clicked,
+    )
 }
 
 fn terminal_manager_section_id(project_id: u64, kind: TerminalKind) -> Id {
@@ -7558,6 +7623,43 @@ mod tests {
     }
 
     #[test]
+    fn project_group_header_row_reserves_space_for_inline_actions() {
+        let (label_width, actions_width) = super::project_group_header_row_layout(160.0, 8.0);
+
+        assert_eq!(
+            actions_width,
+            super::project_group_header_actions_width(8.0)
+        );
+        assert!(((label_width as f32) - 40.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn project_group_header_row_clamps_actions_when_space_is_tight() {
+        let (label_width, actions_width) = super::project_group_header_row_layout(40.0, 8.0);
+
+        assert_eq!(label_width, 0.0);
+        assert_eq!(actions_width, 40.0);
+    }
+
+    #[test]
+    fn project_group_header_actions_width_matches_two_buttons_and_gap() {
+        assert_eq!(
+            super::project_group_header_actions_width(8.0),
+            (super::CONTROL_ROW_HEIGHT * 2.0) + 8.0
+        );
+    }
+
+    #[test]
+    fn project_group_header_row_layout_centers_actions_area() {
+        let total_width = 160.0;
+        let section_gap = 8.0;
+        let (_, actions_width) = super::project_group_header_row_layout(total_width, section_gap);
+        let actions_left = ((total_width - actions_width) * 0.5).max(0.0);
+
+        assert_eq!(actions_left, 48.0);
+    }
+
+    #[test]
     fn terminal_manager_section_text_color_distinguishes_open_closed_and_empty_states() {
         assert_eq!(
             super::terminal_manager_section_text_color(true, true),
@@ -7571,6 +7673,23 @@ mod tests {
             super::terminal_manager_section_text_color(false, false),
             with_alpha(TEXT_MUTED, 220)
         );
+    }
+
+    #[test]
+    fn successful_foreground_spawn_auto_opens_terminal_group() {
+        assert!(super::AdeApp::should_auto_open_project_terminal_group(true));
+    }
+
+    #[test]
+    fn successful_background_spawn_auto_opens_terminal_group() {
+        assert!(super::AdeApp::should_auto_open_project_terminal_group(true));
+    }
+
+    #[test]
+    fn failed_spawn_does_not_auto_open_terminal_group() {
+        assert!(!super::AdeApp::should_auto_open_project_terminal_group(
+            false
+        ));
     }
 
     #[test]
