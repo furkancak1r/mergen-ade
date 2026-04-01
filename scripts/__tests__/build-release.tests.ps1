@@ -31,11 +31,11 @@ function Assert-Equal {
     }
 }
 
-function Test-CargoConfigRetainsRepoLocalGnullvmLinker {
+function Test-CargoConfigPinsRepoLocalMsvcDefaultAndKeepsGnullvmLinker {
     $configPath = Join-Path $repoRoot ".cargo\config.toml"
     $config = Get-Content -Path $configPath -Raw
 
-    Assert-True -Condition $config.Contains('target = "x86_64-pc-windows-gnullvm"') -Message "Expected .cargo/config.toml to keep the gnullvm default target."
+    Assert-True -Condition $config.Contains('target = "x86_64-pc-windows-msvc"') -Message "Expected .cargo/config.toml to pin the MSVC default target."
     Assert-True -Condition $config.Contains('[target.x86_64-pc-windows-gnullvm]') -Message "Expected .cargo/config.toml to keep the gnullvm target section."
     Assert-True -Condition $config.Contains('linker = ".toolchain/llvm-mingw-20260224-ucrt-x86_64/bin/x86_64-w64-mingw32-clang.exe"') -Message "Expected .cargo/config.toml to pin the repo-local gnullvm linker."
     Assert-True -Condition $config.Contains('[target.x86_64-pc-windows-msvc]') -Message "Expected .cargo/config.toml to keep the MSVC target section."
@@ -1066,7 +1066,7 @@ function Test-WindowsIconPipelineIsConfigured {
     Assert-True -Condition $buildContent.Contains('cargo:rerun-if-env-changed=ProgramFiles(x86)') -Message "Expected build.rs to rerun when ProgramFiles(x86) changes."
     Assert-True -Condition $buildContent.Contains('cargo:rerun-if-env-changed=PATH') -Message "Expected build.rs to rerun when PATH changes."
     Assert-True -Condition $buildContent.Contains('if target_os == "windows" && !is_test_build {') -Message "Expected build.rs to compile the icon resource for all non-test Windows targets."
-    Assert-True -Condition $buildContent.Contains('if target.contains("-windows-gnu") {') -Message "Expected build.rs to configure a GNU resource compiler path for the default gnullvm build."
+    Assert-True -Condition $buildContent.Contains('if target.contains("-windows-gnu") {') -Message "Expected build.rs to configure a GNU resource compiler path for explicit gnullvm builds."
     Assert-True -Condition $buildContent.Contains('.toolchain/llvm-mingw-20260224-ucrt-x86_64/bin') -Message "Expected build.rs to use the repo-local LLVM-MinGW toolkit for GNU resource compilation."
     Assert-True -Condition $buildContent.Contains('.set_windres_path(') -Message "Expected build.rs to explicitly set the GNU windres path."
     Assert-True -Condition $buildContent.Contains('.set_ar_path(') -Message "Expected build.rs to explicitly set the GNU ar path."
@@ -1080,7 +1080,7 @@ function Test-WindowsIconPipelineIsConfigured {
     Assert-True -Condition $mainContent.Contains('include_bytes!(concat!(') -Message "Expected src/main.rs to load the generated runtime icon at compile time."
 }
 
-Test-CargoConfigRetainsRepoLocalGnullvmLinker
+Test-CargoConfigPinsRepoLocalMsvcDefaultAndKeepsGnullvmLinker
 Test-SortVsInstallationsPrefersHealthyBuildTools
 Test-FindDumpbinUnderRootsFallsBackToProgramFilesSearch
 Test-ResolveVsDevCmdSkipsInstallsWithoutMsvcTools

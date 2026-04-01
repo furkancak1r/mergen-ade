@@ -32,8 +32,9 @@ use crate::terminal::{
     try_terminal_selection_snapshot, try_terminal_snapshots, TerminalColor, TerminalCursor,
     TerminalCursorShape, TerminalDimensions, TerminalRuntime, TerminalSelectionLine,
     TerminalSelectionSnapshot, TerminalSnapshot, TerminalUiEvent, TerminalUiEventKind,
+    TerminalWheelEvent, WheelDirection,
 };
-use crate::title::{terminal_title_text, update_terminal_title};
+use crate::title::{terminal_title_candidate, update_terminal_title};
 
 const TITLE_MAX_LEN: usize = 40;
 const TERMINAL_EVENT_BUDGET: usize = 4096;
@@ -234,6 +235,7 @@ pub struct AdeApp {
     active_terminal: Option<u64>,
     buffered_terminal_input: Vec<Event>,
     buffered_terminal_navigation: Vec<TerminalNavigationDirection>,
+    pending_terminal_pastes: Vec<PendingTerminalPaste>,
     terminal_events_tx: Sender<TerminalUiEvent>,
     terminal_events_rx: Receiver<TerminalUiEvent>,
     show_settings_popup: bool,
@@ -328,6 +330,13 @@ impl TerminalSelection {
 struct PendingTerminalLinkClick {
     anchor: TerminalSelectionPoint,
     url: String,
+}
+
+#[derive(Debug)]
+struct PendingTerminalPaste {
+    terminal_id: u64,
+    text: String,
+    bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -520,6 +529,7 @@ impl AdeApp {
             active_terminal: None,
             buffered_terminal_input: Vec::new(),
             buffered_terminal_navigation: Vec::new(),
+            pending_terminal_pastes: Vec::new(),
             terminal_events_tx,
             terminal_events_rx,
             show_settings_popup: false,
@@ -850,6 +860,7 @@ impl AdeApp {
         (foreground_count, background_count)
     }
 
+    #[cfg(test)]
     fn should_auto_open_project_terminal_group(spawn_succeeded: bool) -> bool {
         spawn_succeeded
     }
@@ -1550,9 +1561,8 @@ impl AdeApp {
                             continue;
                         }
                         Self::clear_terminal_selection(terminal);
-                        let text = Self::pasted_text(&text);
-                        outbound.extend_from_slice(text.as_bytes());
-                        Self::append_pending_line(&mut terminal.pending_line_for_title, &text);
+                        Self::flush_terminal_outbound(terminal, ctx, &mut outbound);
+                        Self::deliver_pasted_text_to_terminal(terminal, &text, ctx);
                     }
                     Event::Key {
                         key,
@@ -1564,11 +1574,10 @@ impl AdeApp {
                             Self::clear_terminal_selection(terminal);
                             outbound.push(b'\r');
                             let line = std::mem::take(&mut terminal.pending_line_for_title);
-                            if !line.trim().is_empty() {
-                                terminal.full_title =
-                                    terminal_title_text(&line, terminal.id as usize);
+                            if let Some(sanitized) = terminal_title_candidate(&line) {
+                                terminal.full_title = sanitized.clone();
                                 terminal.title = update_terminal_title(
-                                    &line,
+                                    &sanitized,
                                     terminal.id as usize,
                                     TITLE_MAX_LEN,
                                 );
@@ -1591,11 +1600,7 @@ impl AdeApp {
                 }
             }
 
-            if !outbound.is_empty() {
-                terminal.runtime.send_bytes(outbound);
-                terminal.dirty = true;
-                ctx.request_repaint();
-            }
+            Self::flush_terminal_outbound(terminal, ctx, &mut outbound);
         }
 
         if let Some(text) = copied_selection {
@@ -1770,8 +1775,92 @@ impl AdeApp {
         }
     }
 
-    fn pasted_text(text: &str) -> &str {
-        text
+    fn flush_terminal_outbound(
+        terminal: &mut TerminalEntry,
+        ctx: &egui::Context,
+        outbound: &mut Vec<u8>,
+    ) {
+        if outbound.is_empty() {
+            return;
+        }
+
+        terminal.runtime.send_bytes(std::mem::take(outbound));
+        terminal.dirty = true;
+        ctx.request_repaint();
+    }
+
+    fn deliver_pasted_bytes_to_terminal(
+        terminal: &mut TerminalEntry,
+        text: &str,
+        paste_bytes: Vec<u8>,
+        ctx: &egui::Context,
+    ) {
+        Self::clear_terminal_selection(terminal);
+        terminal.runtime.send_paste_bytes(paste_bytes);
+        Self::append_pending_line(&mut terminal.pending_line_for_title, text);
+        terminal.dirty = true;
+        ctx.request_repaint();
+    }
+
+    fn deliver_pasted_text_to_terminal(
+        terminal: &mut TerminalEntry,
+        text: &str,
+        ctx: &egui::Context,
+    ) {
+        let Some(paste_bytes) = terminal.runtime.capture_paste_bytes(text) else {
+            return;
+        };
+
+        Self::deliver_pasted_bytes_to_terminal(terminal, text, paste_bytes, ctx);
+    }
+
+    fn queue_pasted_text_to_terminal(&mut self, terminal_id: u64, text: &str) -> bool {
+        let Some(terminal) = self.terminals.get(&terminal_id) else {
+            self.status_line = "Target terminal not found".to_owned();
+            return false;
+        };
+
+        if terminal.exited {
+            self.status_line = format!("{} is exited", terminal.title);
+            return false;
+        }
+
+        if text.is_empty() {
+            return false;
+        }
+
+        let Some(paste_bytes) = terminal.runtime.capture_paste_bytes(text) else {
+            self.status_line = "Paste failed".to_owned();
+            return false;
+        };
+
+        self.pending_terminal_pastes.push(PendingTerminalPaste {
+            terminal_id,
+            text: text.to_owned(),
+            bytes: paste_bytes,
+        });
+        true
+    }
+
+    fn flush_pending_terminal_pastes(&mut self, ctx: &egui::Context) {
+        let pending_pastes = std::mem::take(&mut self.pending_terminal_pastes);
+        if pending_pastes.is_empty() {
+            return;
+        }
+
+        for paste in pending_pastes {
+            let Some(terminal) = self.terminals.get_mut(&paste.terminal_id) else {
+                self.status_line = "Target terminal not found".to_owned();
+                continue;
+            };
+
+            if terminal.exited {
+                self.status_line = format!("{} is exited", terminal.title);
+                continue;
+            }
+
+            Self::deliver_pasted_bytes_to_terminal(terminal, &paste.text, paste.bytes, ctx);
+        }
     }
 
     fn key_to_terminal_bytes(key: Key, modifiers: egui::Modifiers) -> Option<Vec<u8>> {
@@ -1786,7 +1875,7 @@ impl AdeApp {
         }
 
         let sequence = match (key, modifiers.shift) {
-            (Key::Backspace, _) => b"\x08".as_slice(),
+            (Key::Backspace, _) => b"\x7f".as_slice(),
             (Key::Tab, true) => b"\x1b[Z".as_slice(),
             (Key::Tab, false) => b"\t".as_slice(),
             (Key::Escape, _) => b"\x1b".as_slice(),
@@ -2010,29 +2099,6 @@ impl AdeApp {
             .and_then(|snapshot| terminal_selection_text(snapshot, terminal.selection.as_ref()))
     }
 
-    fn send_pasted_text_to_terminal(&mut self, terminal_id: u64, text: &str) -> bool {
-        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
-            self.status_line = "Target terminal not found".to_owned();
-            return false;
-        };
-
-        if terminal.exited {
-            self.status_line = format!("{} is exited", terminal.title);
-            return false;
-        }
-
-        let text = Self::pasted_text(text);
-        if text.is_empty() {
-            return false;
-        }
-
-        terminal.runtime.send_bytes(text.as_bytes().to_vec());
-        Self::append_pending_line(&mut terminal.pending_line_for_title, &text);
-        Self::clear_terminal_selection(terminal);
-        terminal.dirty = true;
-        true
-    }
-
     fn paste_clipboard_to_terminal(&mut self, terminal_id: u64) {
         let text = match Clipboard::new()
             .map_err(|err| err.to_string())
@@ -2045,7 +2111,7 @@ impl AdeApp {
             }
         };
 
-        if self.send_pasted_text_to_terminal(terminal_id, &text) {
+        if self.queue_pasted_text_to_terminal(terminal_id, &text) {
             self.status_line = "Pasted clipboard into terminal".to_owned();
         }
     }
@@ -2068,8 +2134,8 @@ impl AdeApp {
         Self::clear_terminal_selection(terminal);
         Self::append_pending_line(&mut terminal.pending_line_for_title, message);
         let line = std::mem::take(&mut terminal.pending_line_for_title);
-        if !line.trim().is_empty() {
-            terminal.full_title = terminal_title_text(&line, terminal.id as usize);
+        if let Some(sanitized) = terminal_title_candidate(&line) {
+            terminal.full_title = sanitized;
             terminal.title = update_terminal_title(&line, terminal.id as usize, TITLE_MAX_LEN);
         }
         terminal.dirty = true;
@@ -3753,6 +3819,42 @@ impl AdeApp {
                                     cursor_overlay,
                                 );
                             }
+                            let wheel_delta = ui.ctx().input(|input| input.smooth_scroll_delta);
+                            if wheel_delta != Vec2::ZERO {
+                                if let Some(pointer_pos) =
+                                    ui.ctx().input(|input| input.pointer.interact_pos())
+                                {
+                                    if rect.contains(pointer_pos)
+                                        && terminal.runtime.is_mouse_reporting_active()
+                                    {
+                                        let direction = if wheel_delta.y > 0.0 {
+                                            WheelDirection::Up
+                                        } else if wheel_delta.y < 0.0 {
+                                            WheelDirection::Down
+                                        } else if wheel_delta.x > 0.0 {
+                                            WheelDirection::Right
+                                        } else {
+                                            WheelDirection::Left
+                                        };
+                                        let cell_x = ((pointer_pos.x - rect.min.x) / char_width)
+                                            .floor()
+                                            as usize;
+                                        let cell_y = ((pointer_pos.y - rect.min.y) / line_height)
+                                            .floor()
+                                            as usize;
+                                        terminal.runtime.send_mouse_wheel(TerminalWheelEvent {
+                                            direction,
+                                            x: cell_x,
+                                            y: cell_y,
+                                            x_pixel_offset: 0,
+                                            y_pixel_offset: 0,
+                                        });
+                                        ui.ctx().input_mut(|input| {
+                                            input.smooth_scroll_delta = Vec2::ZERO;
+                                        });
+                                    }
+                                }
+                            }
                         }
                     });
                 ui.expand_to_include_x(pane_right);
@@ -4119,6 +4221,7 @@ impl eframe::App for AdeApp {
         self.draw_settings_popup(ctx);
 
         self.route_active_terminal_input(ctx, terminal_events);
+        self.flush_pending_terminal_pastes(ctx);
         self.draw_copy_toast(ctx);
     }
 
@@ -6365,6 +6468,12 @@ mod tests {
     }
 
     #[test]
+    fn maps_backspace_to_delete_byte() {
+        let backspace = AdeApp::key_to_terminal_bytes(Key::Backspace, Modifiers::default());
+        assert_eq!(backspace, Some(b"\x7f".to_vec()));
+    }
+
+    #[test]
     fn partitions_terminal_key_events_out_of_ui_stream() {
         let shift_tab = Event::Key {
             key: Key::Tab,
@@ -6701,6 +6810,48 @@ mod tests {
     }
 
     #[test]
+    fn queued_paste_flushes_after_buffered_text_input() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.buffered_terminal_input = vec![Event::Text("before".to_owned())];
+
+        assert!(app.queue_pasted_text_to_terminal(1, "paste"));
+
+        let buffered_events = app.take_buffered_terminal_input();
+        app.route_active_terminal_input(&ctx, buffered_events);
+        app.flush_pending_terminal_pastes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.pending_line_for_title, "beforepaste");
+        assert!(app.pending_terminal_pastes.is_empty());
+    }
+
+    #[test]
+    fn queued_paste_captures_terminal_state_before_flush() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+
+        {
+            let terminal = app.terminals.get(&1).expect("terminal 1");
+            terminal
+                .runtime
+                .advance_terminal_bytes_for_test(b"\x1b[?2004l");
+        }
+
+        assert!(app.queue_pasted_text_to_terminal(1, "paste"));
+
+        {
+            let terminal = app.terminals.get(&1).expect("terminal 1");
+            terminal
+                .runtime
+                .advance_terminal_bytes_for_test(b"\x1b[?2004h");
+        }
+
+        let paste = app.pending_terminal_pastes.first().expect("queued paste");
+        assert_eq!(paste.bytes, b"paste".to_vec());
+        assert_eq!(paste.text, "paste");
+    }
+
+    #[test]
     fn enter_on_empty_pending_line_keeps_previous_title() {
         let ctx = Context::default();
         let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
@@ -6740,6 +6891,111 @@ mod tests {
         assert_eq!(terminal.full_title, "git status");
         assert!(terminal.pending_line_for_title.is_empty());
         assert!(terminal.dirty);
+    }
+
+    #[test]
+    fn enter_on_slash_prefix_keeps_previous_title() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+        terminal.title = "git status".to_owned();
+        terminal.full_title = "git status".to_owned();
+
+        app.route_active_terminal_input(&ctx, vec![Event::Text("/foo".to_owned())]);
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.title, "git status");
+        assert_eq!(terminal.full_title, "git status");
+    }
+
+    #[test]
+    fn enter_on_dollar_prefix_keeps_previous_title() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+        terminal.title = "git status".to_owned();
+        terminal.full_title = "git status".to_owned();
+
+        app.route_active_terminal_input(&ctx, vec![Event::Text("$ git status".to_owned())]);
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.title, "git status");
+        assert_eq!(terminal.full_title, "git status");
+    }
+
+    #[test]
+    fn enter_on_prefix_with_leading_whitespace_keeps_previous_title() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+        terminal.title = "git status".to_owned();
+        terminal.full_title = "git status".to_owned();
+
+        app.route_active_terminal_input(&ctx, vec![Event::Text("   /foo".to_owned())]);
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.title, "git status");
+        assert_eq!(terminal.full_title, "git status");
+    }
+
+    #[test]
+    fn saved_message_slash_prefix_keeps_previous_title() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+        terminal.title = "git status".to_owned();
+        terminal.full_title = "git status".to_owned();
+
+        app.send_saved_message_to_terminal(1, "/foo");
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.title, "git status");
+        assert_eq!(terminal.full_title, "git status");
+        assert!(terminal.pending_line_for_title.is_empty());
+    }
+
+    #[test]
+    fn saved_message_dollar_prefix_keeps_previous_title() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+        terminal.title = "git status".to_owned();
+        terminal.full_title = "git status".to_owned();
+
+        app.send_saved_message_to_terminal(1, "$ git status");
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.title, "git status");
+        assert_eq!(terminal.full_title, "git status");
+        assert!(terminal.pending_line_for_title.is_empty());
     }
 
     #[test]
@@ -8805,6 +9061,7 @@ mod tests {
             active_terminal,
             buffered_terminal_input: Vec::new(),
             buffered_terminal_navigation: Vec::new(),
+            pending_terminal_pastes: Vec::new(),
             terminal_events_tx,
             terminal_events_rx,
             show_settings_popup: false,
@@ -8844,17 +9101,12 @@ mod tests {
     }
 
     #[test]
-    fn pasted_text_preserves_windows_newlines() {
-        let pasted = AdeApp::pasted_text("first\r\nsecond\rthird");
+    fn append_pending_line_keeps_only_last_pasted_line() {
+        let mut pending = String::new();
 
-        assert_eq!(pasted, "first\r\nsecond\rthird");
-    }
+        AdeApp::append_pending_line(&mut pending, "first\r\n\r\nthird");
 
-    #[test]
-    fn pasted_text_preserves_unix_newlines() {
-        let pasted = AdeApp::pasted_text("first\nsecond");
-
-        assert_eq!(pasted, "first\nsecond");
+        assert_eq!(pending, "third");
     }
 
     #[test]

@@ -13,8 +13,10 @@ use crossbeam_channel::{Receiver, Sender};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tattoy_wezterm_surface::{CursorShape, CursorVisibility};
 use tattoy_wezterm_term::color::{ColorPalette, SrgbaTuple};
-use tattoy_wezterm_term::config::TerminalConfiguration;
-use tattoy_wezterm_term::{CellAttributes, Terminal, TerminalSize};
+use tattoy_wezterm_term::config::{NewlineCanon, TerminalConfiguration};
+use tattoy_wezterm_term::{
+    CellAttributes, KeyModifiers, MouseButton, MouseEvent, MouseEventKind, Terminal, TerminalSize,
+};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, ERROR_ACCESS_DENIED,
@@ -250,8 +252,27 @@ pub struct TerminalRuntime {
 
 enum RuntimeCommand {
     Input(Vec<u8>),
+    Paste(Vec<u8>),
     Resize(TerminalDimensions),
+    MouseWheel(TerminalWheelEvent),
     Shutdown,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalWheelEvent {
+    pub direction: WheelDirection,
+    pub x: usize,
+    pub y: usize,
+    pub x_pixel_offset: isize,
+    pub y_pixel_offset: isize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheelDirection {
+    Up,
+    Down,
+    Left,
+    Right,
 }
 
 #[derive(Debug)]
@@ -448,6 +469,32 @@ impl TerminalRuntime {
         let _ = self.command_tx.send(RuntimeCommand::Input(bytes));
     }
 
+    pub(crate) fn capture_paste_bytes(&self, text: &str) -> Option<Vec<u8>> {
+        let terminal = self.term.lock().ok()?;
+        Some(format_paste_bytes(&terminal, text))
+    }
+
+    #[cfg(test)]
+    pub fn send_paste(&self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+
+        let Some(bytes) = self.capture_paste_bytes(&text) else {
+            return;
+        };
+
+        self.send_paste_bytes(bytes);
+    }
+
+    pub(crate) fn send_paste_bytes(&self, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+
+        let _ = self.command_tx.send(RuntimeCommand::Paste(bytes));
+    }
+
     pub fn resize(&mut self, dimensions: TerminalDimensions) -> bool {
         if dimensions.cols == 0 || dimensions.lines == 0 {
             return false;
@@ -465,6 +512,18 @@ impl TerminalRuntime {
         self.command_tx
             .send(RuntimeCommand::Resize(dimensions))
             .is_ok()
+    }
+
+    pub fn is_mouse_reporting_active(&self) -> bool {
+        let terminal = self.term.lock().ok();
+        let Some(terminal) = terminal else {
+            return false;
+        };
+        terminal.is_mouse_grabbed() || terminal.is_alt_screen_active()
+    }
+
+    pub fn send_mouse_wheel(&self, event: TerminalWheelEvent) {
+        let _ = self.command_tx.send(RuntimeCommand::MouseWheel(event));
     }
 
     pub fn terminate(&self) -> io::Result<()> {
@@ -596,6 +655,54 @@ pub(crate) fn test_terminal_runtime() -> TerminalRuntime {
         #[cfg(target_os = "windows")]
         job_handle: Mutex::new(None),
     }
+}
+
+#[cfg(test)]
+impl TerminalRuntime {
+    pub(crate) fn advance_terminal_bytes_for_test(&self, bytes: &[u8]) {
+        if let Ok(mut terminal) = self.term.lock() {
+            terminal.advance_bytes(bytes);
+        }
+    }
+}
+
+fn write_runtime_bytes(writer: &SharedWriterHandle, bytes: &[u8]) -> io::Result<()> {
+    let mut writer_guard = match writer.lock() {
+        Ok(writer_guard) => writer_guard,
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "writer lock poisoned",
+            ));
+        }
+    };
+    let Some(writer_guard) = writer_guard.as_mut() else {
+        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "writer closed"));
+    };
+
+    writer_guard.write_all(bytes)?;
+    writer_guard.flush()
+}
+
+fn format_paste_bytes(terminal: &Terminal, text: &str) -> Vec<u8> {
+    let bracketed_paste = terminal.bracketed_paste_enabled();
+    let canon = if bracketed_paste {
+        NewlineCanon::None
+    } else {
+        terminal.get_config().canonicalize_pasted_newlines()
+    };
+    let canon = canon.canonicalize(text);
+    let de_fanged = canon.replace("\x1b[200~", "").replace("\x1b[201~", "");
+
+    let mut buf = Vec::new();
+    if bracketed_paste {
+        buf.extend_from_slice(b"\x1b[200~");
+    }
+    buf.extend_from_slice(de_fanged.as_bytes());
+    if bracketed_paste {
+        buf.extend_from_slice(b"\x1b[201~");
+    }
+    buf
 }
 
 fn begin_termination(command_tx: &Sender<RuntimeCommand>, shared_writer: &SharedWriterHandle) {
@@ -954,29 +1061,44 @@ fn spawn_io_thread(
         while let Ok(command) = command_rx.recv() {
             match command {
                 RuntimeCommand::Input(bytes) => {
-                    let write_result = writer.lock().map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "writer lock poisoned")
-                    });
-
-                    let Ok(mut writer_guard) = write_result else {
-                        break;
-                    };
-                    let Some(writer_guard) = writer_guard.as_mut() else {
-                        break;
-                    };
-
-                    if writer_guard.write_all(&bytes).is_err() {
+                    if write_runtime_bytes(&writer, &bytes).is_err() {
                         break;
                     }
-                    if writer_guard.flush().is_err() {
+                    send_ui_event(terminal_id, TerminalUiEventKind::Wakeup, &tx, &repaint_ctx);
+                }
+                RuntimeCommand::Paste(bytes) => {
+                    if write_runtime_bytes(&writer, &bytes).is_err() {
                         break;
                     }
+
                     send_ui_event(terminal_id, TerminalUiEventKind::Wakeup, &tx, &repaint_ctx);
                 }
                 RuntimeCommand::Resize(dimensions) => {
                     let _ = master.resize(dimensions.to_pty_size());
                     if let Ok(mut terminal) = term.lock() {
                         terminal.resize(dimensions.to_term_size());
+                        latest_seqno.store(terminal.current_seqno(), Ordering::Relaxed);
+                    }
+                    send_ui_event(terminal_id, TerminalUiEventKind::Wakeup, &tx, &repaint_ctx);
+                }
+                RuntimeCommand::MouseWheel(event) => {
+                    if let Ok(mut terminal) = term.lock() {
+                        let button = match event.direction {
+                            WheelDirection::Up => MouseButton::WheelUp(1),
+                            WheelDirection::Down => MouseButton::WheelDown(1),
+                            WheelDirection::Left => MouseButton::WheelLeft(1),
+                            WheelDirection::Right => MouseButton::WheelRight(1),
+                        };
+                        let mouse_event = MouseEvent {
+                            kind: MouseEventKind::Press,
+                            x: event.x,
+                            y: event.y as i64,
+                            x_pixel_offset: event.x_pixel_offset,
+                            y_pixel_offset: event.y_pixel_offset,
+                            button,
+                            modifiers: KeyModifiers::default(),
+                        };
+                        let _ = terminal.mouse_event(mouse_event);
                         latest_seqno.store(terminal.current_seqno(), Ordering::Relaxed);
                     }
                     send_ui_event(terminal_id, TerminalUiEventKind::Wakeup, &tx, &repaint_ctx);
@@ -1649,12 +1771,12 @@ mod tests {
         snapshots_from_terminal, test_terminal_runtime, trim_trailing_default_cells,
         verified_process_entry, verified_process_tree_descendants, verified_snapshot_root_process,
         AdeTerminalConfig, ProcessSnapshotEntry, RootProcessTerminationPlan, RuntimeCommand,
-        SharedWriterHandle, TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape,
-        TerminalDimensions, TerminalSelectionHyperlink, TerminalStyle, TerminalStyledCell,
-        VerifiedProcessLookup,
+        SharedWriter, SharedWriterHandle, TerminalColor, TerminalCursor, TerminalCursorLine,
+        TerminalCursorShape, TerminalDimensions, TerminalRuntime, TerminalSelectionHyperlink,
+        TerminalStyle, TerminalStyledCell, VerifiedProcessLookup,
     };
     use std::{
-        io,
+        io::{self, Write},
         sync::{Arc, Mutex},
     };
     use tattoy_wezterm_term::color::ColorPalette;
@@ -1669,6 +1791,89 @@ mod tests {
             pid,
             parent_pid,
             creation_time,
+        }
+    }
+
+    #[derive(Clone)]
+    struct CaptureWriter {
+        captured: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.captured
+                .lock()
+                .map_err(|_| io::Error::other("capture lock poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn captured_test_runtime() -> (
+        TerminalRuntime,
+        crossbeam_channel::Receiver<RuntimeCommand>,
+        SharedWriterHandle,
+        Arc<Mutex<Vec<u8>>>,
+    ) {
+        let dimensions = TerminalDimensions::default();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let shared_writer: SharedWriterHandle =
+            Arc::new(Mutex::new(Some(Box::new(CaptureWriter {
+                captured: captured.clone(),
+            }))));
+        let terminal = Terminal::new(
+            dimensions.to_term_size(),
+            Arc::new(AdeTerminalConfig),
+            "test",
+            "0",
+            Box::new(SharedWriter::new(shared_writer.clone())),
+        );
+        let latest_seqno = Arc::new(std::sync::atomic::AtomicUsize::new(
+            terminal.current_seqno(),
+        ));
+        let (command_tx, command_rx) = crossbeam_channel::unbounded();
+
+        (
+            TerminalRuntime {
+                term: Arc::new(Mutex::new(terminal)),
+                command_tx,
+                shared_writer: shared_writer.clone(),
+                latest_seqno,
+                last_size: dimensions,
+                child_killer: Arc::new(Mutex::new(Box::new(super::NoopChildKiller))),
+                child_pid: None,
+                child_creation_time: None,
+                #[cfg(target_os = "windows")]
+                child_process_handle: Mutex::new(None),
+                #[cfg(target_os = "windows")]
+                job_handle: Mutex::new(None),
+            },
+            command_rx,
+            shared_writer,
+            captured,
+        )
+    }
+
+    fn drain_test_runtime_commands(
+        command_rx: &crossbeam_channel::Receiver<RuntimeCommand>,
+        shared_writer: &SharedWriterHandle,
+    ) {
+        while let Ok(command) = command_rx.try_recv() {
+            match command {
+                RuntimeCommand::Input(bytes) => {
+                    super::write_runtime_bytes(shared_writer, &bytes).unwrap();
+                }
+                RuntimeCommand::Paste(bytes) => {
+                    super::write_runtime_bytes(shared_writer, &bytes).unwrap();
+                }
+                RuntimeCommand::Resize(_) => {}
+                RuntimeCommand::MouseWheel(_) => {}
+                RuntimeCommand::Shutdown => break,
+            }
         }
     }
 
@@ -1775,6 +1980,65 @@ mod tests {
         assert!(!applied);
         assert_eq!(runtime.last_size.pixel_width, 648);
         assert_eq!(runtime.last_size.pixel_height, 392);
+    }
+
+    #[test]
+    fn format_paste_bytes_wraps_text_when_bracketed_paste_is_enabled() {
+        let (runtime, _command_rx, _shared_writer, _captured) = captured_test_runtime();
+        runtime.term.lock().unwrap().advance_bytes(b"\x1b[?2004h");
+
+        let paste_bytes = {
+            let terminal = runtime.term.lock().unwrap();
+            super::format_paste_bytes(&terminal, "first\n\nsecond")
+        };
+
+        assert_eq!(
+            String::from_utf8(paste_bytes).unwrap(),
+            "\x1b[200~first\n\nsecond\x1b[201~"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn format_paste_bytes_canonicalizes_newlines_without_bracketed_paste() {
+        let (runtime, _command_rx, _shared_writer, _captured) = captured_test_runtime();
+
+        let paste_bytes = {
+            let terminal = runtime.term.lock().unwrap();
+            super::format_paste_bytes(&terminal, "first\n\nsecond")
+        };
+
+        assert_eq!(
+            String::from_utf8(paste_bytes).unwrap(),
+            "first\r\n\r\nsecond"
+        );
+    }
+
+    #[test]
+    fn runtime_command_paste_preserves_input_order() {
+        let (runtime, command_rx, shared_writer, captured) = captured_test_runtime();
+        runtime.term.lock().unwrap().advance_bytes(b"\x1b[?2004h");
+
+        runtime.send_bytes(b"before".to_vec());
+        runtime.send_paste("paste".to_owned());
+        runtime.send_bytes(b"after".to_vec());
+        drain_test_runtime_commands(&command_rx, &shared_writer);
+
+        let captured = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert_eq!(captured, "before\x1b[200~paste\x1b[201~after");
+    }
+
+    #[test]
+    fn runtime_command_paste_snapshots_terminal_state_when_queued() {
+        let (runtime, command_rx, shared_writer, captured) = captured_test_runtime();
+        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004l");
+
+        runtime.send_paste("paste".to_owned());
+        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
+        drain_test_runtime_commands(&command_rx, &shared_writer);
+
+        let captured = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert_eq!(captured, "paste");
     }
 
     #[test]

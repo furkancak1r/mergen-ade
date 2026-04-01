@@ -1,5 +1,18 @@
 ### Known Issues & Fix Log
 
+#### Plain cargo release builds now refresh the same MSVC EXE as cargo run {#plain-cargo-release-builds-now-refresh-the-same-msvc-exe-as-cargo-run}
+- Date: 2026-03-30T00:00:00Z
+- Context: main/Windows local cargo workflows
+- Error signature: `cargo run` showed current behavior, but contributors could still be pointed at a different executable path when the repo default target and release target disagreed.
+- Symptoms/Impact: The MSVC release EXE path was not guaranteed to reflect the same build configuration as the plain local cargo flow, so developers had to remember which target triple produced the binary they were testing.
+- Root cause: The repository default target was still set to `x86_64-pc-windows-gnullvm`, which split the common local build path from the portable MSVC EXE path.
+- Resolution: Switched the repo default build target to `x86_64-pc-windows-msvc` so `cargo build --release` and `cargo run --release` both refresh the same MSVC output path, while keeping `x86_64-pc-windows-gnullvm` available only as an explicit alternative target.
+- Prevent recurrence:
+  - Keep the repo default target aligned with the executable path contributors are expected to run.
+  - Treat gnullvm as an explicit opt-in build target, not the default local path.
+  - Update build docs and regression tests whenever the default target changes.
+- Files/Commands touched: `.cargo\config.toml`, `AGENTS.md`, `README.md`, `scripts\__tests__\build-release.tests.ps1`, `cargo build --release`
+
 #### Empty project terminal-group clicks did not reopen the project body {#empty-project-terminal-group-clicks-did-not-reopen-the-project-body}
 - Date: 2026-03-30T00:00:00Z
 - Context: main/Windows local terminal manager project-group headers

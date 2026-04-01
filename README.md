@@ -67,6 +67,8 @@ cargo build --release
 cargo test
 ```
 
+`cargo build --release` and `cargo run --release` both use the repo's default Windows MSVC target, so they update the same portable EXE path shown above.
+
 For an experimental native macOS build, use an explicit target because the repo default target remains Windows-oriented:
 
 ```bash
@@ -222,7 +224,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\__tests__\build-release.tests
 - `dependency tool not found`
   - The release script first checks repo-local `llvm-objdump.exe`, then resolves `dumpbin.exe` from Visual Studio or Build Tools even outside Developer PowerShell.
 - `x86_64-w64-mingw32-clang.exe not found`
-  - Plain local `cargo` builds still depend on the repo-local LLVM-MinGW linker configured in `.cargo\config.toml`; make sure `.toolchain\llvm-mingw-20260224-ucrt-x86_64\bin` exists.
+  - This only affects explicit `--target x86_64-pc-windows-gnullvm` builds. Plain local `cargo` builds now use the default MSVC target from `.cargo\config.toml`; make sure Visual Studio Build Tools and the Windows SDK are installed if the MSVC toolchain is missing.
 
 ## License
 
