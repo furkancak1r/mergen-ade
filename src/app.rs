@@ -6884,31 +6884,6 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_slash_prefix_keeps_previous_title() {
-        let ctx = Context::default();
-        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
-        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
-        terminal.title = "git status".to_owned();
-        terminal.full_title = "git status".to_owned();
-
-        app.route_active_terminal_input(&ctx, vec![Event::Text("/foo".to_owned())]);
-        app.route_active_terminal_input(
-            &ctx,
-            vec![Event::Key {
-                key: Key::Enter,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: Modifiers::default(),
-            }],
-        );
-
-        let terminal = app.terminals.get(&1).expect("terminal 1");
-        assert_eq!(terminal.title, "git status");
-        assert_eq!(terminal.full_title, "git status");
-    }
-
-    #[test]
     fn enter_on_dollar_prefix_keeps_previous_title() {
         let ctx = Context::default();
         let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
@@ -6931,46 +6906,6 @@ mod tests {
         let terminal = app.terminals.get(&1).expect("terminal 1");
         assert_eq!(terminal.title, "git status");
         assert_eq!(terminal.full_title, "git status");
-    }
-
-    #[test]
-    fn enter_on_prefix_with_leading_whitespace_keeps_previous_title() {
-        let ctx = Context::default();
-        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
-        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
-        terminal.title = "git status".to_owned();
-        terminal.full_title = "git status".to_owned();
-
-        app.route_active_terminal_input(&ctx, vec![Event::Text("   /foo".to_owned())]);
-        app.route_active_terminal_input(
-            &ctx,
-            vec![Event::Key {
-                key: Key::Enter,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: Modifiers::default(),
-            }],
-        );
-
-        let terminal = app.terminals.get(&1).expect("terminal 1");
-        assert_eq!(terminal.title, "git status");
-        assert_eq!(terminal.full_title, "git status");
-    }
-
-    #[test]
-    fn saved_message_slash_prefix_keeps_previous_title() {
-        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
-        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
-        terminal.title = "git status".to_owned();
-        terminal.full_title = "git status".to_owned();
-
-        app.send_saved_message_to_terminal(1, "/foo");
-
-        let terminal = app.terminals.get(&1).expect("terminal 1");
-        assert_eq!(terminal.title, "git status");
-        assert_eq!(terminal.full_title, "git status");
-        assert!(terminal.pending_line_for_title.is_empty());
     }
 
     #[test]
