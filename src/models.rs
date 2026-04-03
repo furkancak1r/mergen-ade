@@ -100,23 +100,6 @@ impl TerminalKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum AutoTileScope {
-    #[default]
-    AllVisible,
-    SelectedProjectOnly,
-}
-
-impl AutoTileScope {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::AllVisible => "All visible terminals",
-            Self::SelectedProjectOnly => "Selected project only",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
 pub enum MainVisibilityMode {
     #[default]
     Global,
@@ -140,8 +123,6 @@ pub struct UiConfig {
     pub show_terminal_manager: bool,
     pub terminal_manager_expanded: bool,
     pub last_selected_project_id: Option<u64>,
-    pub project_filter_mode: bool,
-    pub auto_tile_scope: AutoTileScope,
     pub main_visibility_mode: MainVisibilityMode,
     pub left_sidebar_tab: LeftSidebarTab,
 }
@@ -154,8 +135,6 @@ impl Default for UiConfig {
             show_terminal_manager: true,
             terminal_manager_expanded: true,
             last_selected_project_id: None,
-            project_filter_mode: false,
-            auto_tile_scope: AutoTileScope::AllVisible,
             main_visibility_mode: MainVisibilityMode::Global,
             left_sidebar_tab: LeftSidebarTab::Directory,
         }
