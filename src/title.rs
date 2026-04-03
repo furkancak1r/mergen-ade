@@ -12,6 +12,16 @@ pub fn terminal_title_text(input: &str, fallback_index: usize) -> String {
     }
 }
 
+pub fn terminal_title_candidate(input: &str) -> Option<String> {
+    let sanitized = sanitize_input(input);
+    let trimmed = sanitized.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.starts_with('$') {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
 pub fn truncate_terminal_title(input: &str, max_len: usize) -> String {
     truncate_readable(input, max_len)
 }
@@ -83,5 +93,47 @@ mod tests {
     fn keeps_full_terminal_title_text_without_truncation() {
         let title = terminal_title_text("abcdefghijklmnopqrstuvwxyz0123456789XYZ", 1);
         assert_eq!(title, "abcdefghijklmnopqrstuvwxyz0123456789XYZ");
+    }
+
+    #[test]
+    fn title_candidate_returns_none_for_slash_prefix() {
+        assert!(terminal_title_candidate("/foo").is_none());
+    }
+
+    #[test]
+    fn title_candidate_returns_none_for_dollar_prefix() {
+        assert!(terminal_title_candidate("$ git status").is_none());
+    }
+
+    #[test]
+    fn title_candidate_returns_none_for_whitespace_then_slash() {
+        assert!(terminal_title_candidate("   /foo").is_none());
+    }
+
+    #[test]
+    fn title_candidate_returns_none_for_whitespace_then_dollar() {
+        assert!(terminal_title_candidate("   $ git status").is_none());
+    }
+
+    #[test]
+    fn title_candidate_returns_some_for_normal_text() {
+        assert_eq!(
+            terminal_title_candidate("git status"),
+            Some("git status".to_owned())
+        );
+    }
+
+    #[test]
+    fn title_candidate_returns_some_for_text_with_leading_whitespace() {
+        assert_eq!(
+            terminal_title_candidate("   git status"),
+            Some("git status".to_owned())
+        );
+    }
+
+    #[test]
+    fn title_candidate_returns_none_for_empty() {
+        assert!(terminal_title_candidate("").is_none());
+        assert!(terminal_title_candidate("   ").is_none());
     }
 }

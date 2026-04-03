@@ -1,5 +1,18 @@
 ### Known Issues & Fix Log
 
+#### Multiline paste in opencode CLI submitted blank lines as live Enter keys {#multiline-paste-in-opencode-cli-submitted-blank-lines-as-live-enter-keys}
+- Date: 2026-04-01T00:00:00Z
+- Context: main/Windows local terminal paste path with opencode CLI/readline-style TUIs
+- Error signature: `Pasting text with blank lines into opencode CLI caused the terminal to submit early instead of treating the paste as one block.`
+- Symptoms/Impact: Multiline clipboard content, especially with empty lines, was delivered as raw input bytes, so apps that expected bracketed paste interpreted embedded newlines as immediate Enter presses and broke the pasted command or prompt state.
+- Root cause: `src/app.rs` deferred paste payload construction until the I/O thread, so bracketed-paste state could change between user action and write; the earlier raw-byte route also bypassed the terminal model's tracked bracketed-paste state and newline canonicalization logic from `tattoy-wezterm-term`.
+- Resolution: Local workspace fix snapshots paste bytes at request time in `src/terminal.rs` before queuing the runtime command, and `src/app.rs` now flushes pending typed bytes before queueing paste to preserve input ordering and keep later terminal mode changes from altering the payload.
+- Prevent recurrence:
+  - Keep paste delivery on a dedicated runtime path instead of merging it into generic keyboard byte streams.
+  - Cover both bracketed and non-bracketed paste behavior with regression tests at the terminal runtime layer.
+  - When a TUI paste bug mentions blank lines or premature submit, verify whether DECSET 2004 state is being honored before changing newline normalization.
+- Files/Commands touched: `src/app.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo test --target-dir target_test_paste`
+
 #### Plain cargo release builds now refresh the same MSVC EXE as cargo run {#plain-cargo-release-builds-now-refresh-the-same-msvc-exe-as-cargo-run}
 - Date: 2026-03-30T00:00:00Z
 - Context: main/Windows local cargo workflows

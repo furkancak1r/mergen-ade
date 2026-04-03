@@ -1358,6 +1358,13 @@ impl AdeApp {
         )
     }
 
+    fn toggle_main_visibility_mode(&mut self) {
+        self.config.ui.main_visibility_mode = match self.config.ui.main_visibility_mode {
+            MainVisibilityMode::Global => MainVisibilityMode::SelectedProject,
+            MainVisibilityMode::SelectedProject => MainVisibilityMode::Global,
+        };
+    }
+
     fn event_is_blocked_ui_reverse_focus_traversal(event: &Event) -> bool {
         matches!(
             event,
@@ -1390,8 +1397,11 @@ impl AdeApp {
         (blocked_events, remaining_events)
     }
 
-    fn event_is_terminal_key(event: &Event) -> bool {
-        matches!(event, Event::Key { .. })
+    fn event_is_terminal_input(event: &Event) -> bool {
+        matches!(
+            event,
+            Event::Key { .. } | Event::Text(_) | Event::Paste(_) | Event::Copy | Event::Cut
+        )
     }
 
     fn event_terminal_navigation_direction(event: &Event) -> Option<TerminalNavigationDirection> {
@@ -1412,19 +1422,52 @@ impl AdeApp {
         }
     }
 
-    fn event_is_terminal_post_ui_input(event: &Event) -> bool {
-        matches!(
-            event,
-            Event::Text(_) | Event::Paste(_) | Event::Copy | Event::Cut
-        )
+    fn event_is_alt_m_shortcut(event: &Event, global_modifiers: egui::Modifiers) -> bool {
+        match event {
+            Event::Key {
+                key: Key::M,
+                pressed: true,
+                modifiers,
+                ..
+            } if (modifiers.alt || global_modifiers.alt)
+                && !modifiers.ctrl
+                && !global_modifiers.ctrl
+                && !modifiers.shift
+                && !global_modifiers.shift
+                && !modifiers.command
+                && !global_modifiers.command =>
+            {
+                true
+            }
+            Event::Text(ref text) if text == "m" && global_modifiers.alt => true,
+            _ => false,
+        }
     }
 
-    fn partition_terminal_key_events(events: Vec<Event>) -> (Vec<Event>, Vec<Event>) {
+    fn partition_alt_m_shortcut(
+        events: Vec<Event>,
+        global_modifiers: egui::Modifiers,
+    ) -> (Vec<Event>, Vec<Event>) {
+        let mut alt_m_events = Vec::new();
+        let mut remaining_events = Vec::new();
+
+        for event in events {
+            if Self::event_is_alt_m_shortcut(&event, global_modifiers) {
+                alt_m_events.push(event);
+            } else {
+                remaining_events.push(event);
+            }
+        }
+
+        (alt_m_events, remaining_events)
+    }
+
+    fn partition_terminal_input_events(events: Vec<Event>) -> (Vec<Event>, Vec<Event>) {
         let mut terminal_events = Vec::new();
         let mut remaining_events = Vec::new();
 
         for event in events {
-            if Self::event_is_terminal_key(&event)
+            if Self::event_is_terminal_input(&event)
                 && Self::event_terminal_navigation_direction(&event).is_none()
             {
                 terminal_events.push(event);
@@ -1460,7 +1503,7 @@ impl AdeApp {
 
         ctx.input_mut(|input| {
             let events = std::mem::take(&mut input.events);
-            let (terminal_events, remaining_events) = Self::partition_terminal_key_events(events);
+            let (terminal_events, remaining_events) = Self::partition_terminal_input_events(events);
             input.events = remaining_events;
             terminal_events
         })
@@ -1508,12 +1551,6 @@ impl AdeApp {
         let Some(active_terminal_id) = self.active_terminal_accepts_input() else {
             return;
         };
-        let mut events = events;
-        events.extend(
-            ctx.input(|input| input.events.clone())
-                .into_iter()
-                .filter(Self::event_is_terminal_post_ui_input),
-        );
 
         if events.is_empty() {
             return;
@@ -1521,6 +1558,7 @@ impl AdeApp {
 
         let mut outbound = Vec::new();
         let mut copied_selection = None;
+        let mut last_key_was_alt_m = false;
         {
             let Some(terminal) = self.terminals.get_mut(&active_terminal_id) else {
                 return;
@@ -1552,6 +1590,11 @@ impl AdeApp {
                         if text.is_empty() {
                             continue;
                         }
+                        // Suppress duplicate Text("m") that follows Alt+M key event
+                        if last_key_was_alt_m && text == "m" {
+                            last_key_was_alt_m = false;
+                            continue;
+                        }
                         Self::clear_terminal_selection(terminal);
                         outbound.extend_from_slice(text.as_bytes());
                         Self::append_pending_line(&mut terminal.pending_line_for_title, &text);
@@ -1570,6 +1613,8 @@ impl AdeApp {
                         modifiers,
                         ..
                     } if pressed => {
+                        last_key_was_alt_m = false;
+
                         if key == Key::Enter {
                             Self::clear_terminal_selection(terminal);
                             outbound.push(b'\r');
@@ -1589,6 +1634,15 @@ impl AdeApp {
                         if key == Key::Backspace {
                             Self::clear_terminal_selection(terminal);
                             terminal.pending_line_for_title.pop();
+                        }
+
+                        // Encode Alt+M as ESC+m for terminal
+                        if modifiers.alt && key == Key::M && !modifiers.ctrl && !modifiers.command {
+                            Self::clear_terminal_selection(terminal);
+                            outbound.push(b'\x1b');
+                            outbound.push(b'm');
+                            last_key_was_alt_m = true;
+                            continue;
                         }
 
                         if let Some(bytes) = Self::key_to_terminal_bytes(key, modifiers) {
@@ -3043,13 +3097,15 @@ impl AdeApp {
                 false,
             );
             let header_open = header_state.is_open();
+            let (foreground_count, background_count) = self.terminal_counts_for_project(project_id);
+            let has_children = foreground_count > 0 || background_count > 0;
             let (header_response, foreground_clicked, background_clicked, header_clicked) =
-                draw_project_group_header(ui, &project_snapshot.name, header_open);
+                draw_project_group_header(ui, &project_snapshot.name, header_open, has_children);
             let foreground_spawned = foreground_clicked
                 && self.spawn_terminal_for_project(ctx, project_id, TerminalKind::Foreground);
             let background_spawned = background_clicked
                 && self.spawn_terminal_for_project(ctx, project_id, TerminalKind::Background);
-            if header_clicked {
+            if header_clicked && has_children {
                 header_state.toggle(ui);
                 header_state.store(ui.ctx());
             }
@@ -3057,37 +3113,49 @@ impl AdeApp {
                 header_state.set_open(true);
                 header_state.store(ui.ctx());
             }
-            let (foreground_count, background_count) = self.terminal_counts_for_project(project_id);
             let _ = header_state.show_body_unindented(ui, |ui| {
-                if foreground_count > 0 {
-                    let section_open = draw_terminal_manager_section_header(
-                        ui,
-                        icons::TERMINAL,
-                        "Foreground",
-                        project_id,
-                        TerminalKind::Foreground,
-                        foreground_count > 0,
-                    );
-                    if section_open {
-                        ui.separator();
-                        self.draw_terminal_rows(ctx, ui, project_id, TerminalKind::Foreground);
+                ui.indent(Id::new(("terminal-manager-body", project_id)), |ui| {
+                    ui.add_space(2.0);
+                    if foreground_count > 0 {
+                        let section_open = draw_terminal_manager_section_header(
+                            ui,
+                            icons::TERMINAL,
+                            project_id,
+                            TerminalKind::Foreground,
+                        );
+                        if section_open {
+                            ui.add_space(2.0);
+                            ui.indent(Id::new(("terminal-rows", project_id, "fg")), |ui| {
+                                self.draw_terminal_rows(
+                                    ctx,
+                                    ui,
+                                    project_id,
+                                    TerminalKind::Foreground,
+                                );
+                            });
+                        }
                     }
-                }
 
-                if background_count > 0 {
-                    let section_open = draw_terminal_manager_section_header(
-                        ui,
-                        icons::LIST,
-                        "Background",
-                        project_id,
-                        TerminalKind::Background,
-                        background_count > 0,
-                    );
-                    if section_open {
-                        ui.separator();
-                        self.draw_terminal_rows(ctx, ui, project_id, TerminalKind::Background);
+                    if background_count > 0 {
+                        let section_open = draw_terminal_manager_section_header(
+                            ui,
+                            icons::LIST,
+                            project_id,
+                            TerminalKind::Background,
+                        );
+                        if section_open {
+                            ui.add_space(2.0);
+                            ui.indent(Id::new(("terminal-rows", project_id, "bg")), |ui| {
+                                self.draw_terminal_rows(
+                                    ctx,
+                                    ui,
+                                    project_id,
+                                    TerminalKind::Background,
+                                );
+                            });
+                        }
                     }
-                }
+                });
             });
 
             header_response.context_menu(|ui| {
@@ -3157,15 +3225,21 @@ impl AdeApp {
                 let terminal_entry_id = terminal.id;
                 let active = current_active == Some(terminal_entry_id);
                 let label = terminal_display_label(&terminal.full_title, terminal.exited);
-                let title_font = egui::TextStyle::Button.resolve(ui.style());
                 let section_gap = ui.spacing().item_spacing.x;
                 let actions_width = terminal_manager_actions_width(section_gap);
                 let row_width = ui.available_width().max(0.0);
                 let (row_label_width, row_actions_width) =
                     terminal_manager_row_widths(row_width, actions_width, section_gap);
                 let row_height = ui.spacing().interact_size.y.max(CONTROL_ROW_HEIGHT);
-                let (row_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(row_width, row_height), Sense::hover());
+                let (row_rect, row_response) =
+                    ui.allocate_exact_size(egui::vec2(row_width, row_height), Sense::click());
+
+                let hover_text = if terminal.exited {
+                    format!("{} (Exited)", label)
+                } else {
+                    label.clone()
+                };
+                row_response.on_hover_text(hover_text);
 
                 if row_label_width > 0.0 {
                     let label_rect = egui::Rect::from_min_size(
@@ -3181,16 +3255,54 @@ impl AdeApp {
                                 let badge_response =
                                     draw_source_control_badge(ui, &project_source_control_badge);
                                 ui.add_space(4.0);
-                                let label_response =
-                                    draw_truncated_selectable_label(ui, active, &label);
-                                let label_response = with_truncation_tooltip(
-                                    ui,
-                                    label_response,
-                                    &label,
-                                    &title_font,
-                                    TEXT_PRIMARY,
+
+                                let term_icon_color = if terminal.exited {
+                                    Color32::from_rgb(200, 100, 100)
+                                } else {
+                                    with_alpha(TEXT_MUTED, 200)
+                                };
+                                let (icon_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(16.0, row_height),
+                                    Sense::hover(),
                                 );
-                                label_response.union(badge_response)
+                                ui.painter().text(
+                                    icon_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    icons::TERMINAL.to_string(),
+                                    egui::FontId::proportional(12.0),
+                                    term_icon_color,
+                                );
+
+                                ui.add_space(3.0);
+
+                                let text_color = if terminal.exited {
+                                    with_alpha(TEXT_MUTED, 160)
+                                } else if active {
+                                    TEXT_PRIMARY
+                                } else {
+                                    with_alpha(TEXT_PRIMARY, 210)
+                                };
+                                let title_label = egui::Label::new(
+                                    RichText::new(label.clone()).color(text_color),
+                                )
+                                .truncate()
+                                .sense(Sense::click());
+                                let title_response = ui.add(title_label);
+                                {
+                                    let info = WidgetInfo::selected(
+                                        WidgetType::SelectableLabel,
+                                        ui.is_enabled(),
+                                        active,
+                                        &label,
+                                    );
+                                    title_response.widget_info(|| info.clone());
+                                }
+                                title_response
+                                    .clone()
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .on_hover_text(&label);
+
+                                badge_response.union(title_response)
                             },
                         )
                         .inner;
@@ -3457,11 +3569,14 @@ impl AdeApp {
 
                             draw_source_control_badge(ui, &source_control_badge);
                             ui.add_space(4.0);
+
                             let title = terminal_display_label(&terminal.title, terminal.exited);
                             let title_font = egui::TextStyle::Body.resolve(ui.style());
                             let title_response = ui.add(
                                 egui::Label::new(
-                                    RichText::new(title).color(header_chrome.title_color),
+                                    RichText::new(title)
+                                        .color(header_chrome.title_color)
+                                        .strong(),
                                 )
                                 .truncate()
                                 .sense(Sense::click()),
@@ -3477,28 +3592,25 @@ impl AdeApp {
                                 pane_clicked = true;
                             }
 
-                            ui.add_space(6.0);
-                            draw_terminal_header_separator(ui);
-                            ui.add_space(4.0);
+                            ui.add_space(8.0);
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(format!("{} {}", icons::FOLDER, project_name))
+                                    RichText::new(format!("{}  {}", icons::FOLDER, project_name))
+                                        .small()
                                         .color(header_chrome.detail_color),
                                 )
                                 .truncate(),
                             );
-                            ui.add_space(4.0);
-                            draw_terminal_header_separator(ui);
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new(terminal.kind.label())
-                                    .small()
-                                    .strong()
-                                    .color(header_chrome.detail_color),
+                            ui.add_space(6.0);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(terminal.kind.label())
+                                        .small()
+                                        .color(header_chrome.detail_color),
+                                )
+                                .truncate(),
                             );
-                            if terminal.exited {
-                                ui.colored_label(Color32::LIGHT_RED, "Exited");
-                            }
+
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if styled_icon_button(
                                     ui,
@@ -4176,21 +4288,33 @@ impl AdeApp {
 impl eframe::App for AdeApp {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         let events = std::mem::take(&mut raw_input.events);
+        let global_modifiers = raw_input.modifiers;
+
         let capture_keyboard = self.should_capture_terminal_keyboard(ctx);
 
-        if capture_keyboard {
-            let (terminal_events, remaining_events) = Self::partition_terminal_key_events(events);
-            let (navigation_directions, remaining_events) =
-                Self::partition_terminal_navigation_shortcuts(remaining_events);
-            self.buffered_terminal_input.extend(terminal_events);
-            self.buffered_terminal_navigation
-                .extend(navigation_directions);
+        // Only handle Alt+M shortcut when terminal is NOT capturing keyboard
+        if !capture_keyboard {
+            let (alt_m_events, remaining_events) =
+                Self::partition_alt_m_shortcut(events, global_modifiers);
+            if !alt_m_events.is_empty() {
+                self.toggle_main_visibility_mode();
+                raw_input.events = remaining_events;
+                return;
+            }
+            // Terminal capture not active — fall through to normal UI event processing
+            let (_, remaining_events) =
+                Self::partition_blocked_ui_reverse_focus_traversal_events(remaining_events);
             raw_input.events = remaining_events;
             return;
         }
 
-        let (_, remaining_events) =
-            Self::partition_blocked_ui_reverse_focus_traversal_events(events);
+        // Terminal is capturing keyboard — let Alt+M through to terminal
+        let (terminal_events, remaining_events) = Self::partition_terminal_input_events(events);
+        let (navigation_directions, remaining_events) =
+            Self::partition_terminal_navigation_shortcuts(remaining_events);
+        self.buffered_terminal_input.extend(terminal_events);
+        self.buffered_terminal_navigation
+            .extend(navigation_directions);
         raw_input.events = remaining_events;
     }
 
@@ -5082,50 +5206,6 @@ fn directory_file_row_hover_fill(is_hovered: bool) -> Option<Color32> {
     is_hovered.then(|| with_alpha(BTN_ICON_HOVER, 110))
 }
 
-fn draw_truncated_selectable_label(ui: &mut Ui, selected: bool, text: &str) -> egui::Response {
-    let button_padding = ui.spacing().button_padding;
-    let available_width = ui.available_width().max(0.0);
-    let wrap_width = (available_width - (button_padding.x * 2.0)).max(0.0);
-    let galley = WidgetText::from(text.to_owned()).into_galley(
-        ui,
-        Some(TextWrapMode::Truncate),
-        wrap_width,
-        egui::TextStyle::Button,
-    );
-    let galley_text = galley.text().to_owned();
-    let desired_size = egui::vec2(available_width, ui.spacing().interact_size.y);
-    let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
-    response.widget_info(|| {
-        WidgetInfo::selected(
-            WidgetType::SelectableLabel,
-            ui.is_enabled(),
-            selected,
-            &galley_text,
-        )
-    });
-
-    if ui.is_rect_visible(response.rect) {
-        let visuals = ui.style().interact_selectable(&response, selected);
-        if selected || response.hovered() || response.highlighted() || response.has_focus() {
-            let rect = rect.expand(visuals.expansion);
-            ui.painter().rect(
-                rect,
-                visuals.rounding,
-                visuals.weak_bg_fill,
-                visuals.bg_stroke,
-            );
-        }
-
-        let text_pos = ui
-            .layout()
-            .align_size_within_rect(galley.size(), rect.shrink2(button_padding))
-            .min;
-        ui.painter().galley(text_pos, galley, visuals.text_color());
-    }
-
-    response
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TerminalHeaderChrome {
     fill: Color32,
@@ -5265,17 +5345,6 @@ fn draw_source_control_badge(ui: &mut Ui, badge: &SourceControlBadgeModel) -> eg
     })
 }
 
-fn draw_terminal_header_separator(ui: &mut Ui) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(6.0, 14.0), Sense::hover());
-    ui.painter().line_segment(
-        [
-            egui::pos2(rect.center().x, rect.top()),
-            egui::pos2(rect.center().x, rect.bottom()),
-        ],
-        Stroke::new(1.0, with_alpha(BORDER_COLOR, 180)),
-    );
-}
-
 fn lerp_pos(a: egui::Pos2, b: egui::Pos2, t: f32) -> egui::Pos2 {
     egui::pos2(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
 }
@@ -5378,7 +5447,7 @@ fn project_group_header_row_layout(total_width: f32, section_gap: f32) -> (f32, 
     let total_width = total_width.max(0.0);
     let section_gap = section_gap.max(0.0);
     let actions_width = project_group_header_actions_width(section_gap).min(total_width);
-    let label_width = (((total_width - actions_width) * 0.5) - section_gap).max(0.0);
+    let label_width = (total_width - actions_width - section_gap).max(0.0);
     (label_width, actions_width)
 }
 
@@ -5386,35 +5455,40 @@ fn draw_project_group_header(
     ui: &mut Ui,
     project_name: &str,
     open: bool,
+    can_expand: bool,
 ) -> (egui::Response, bool, bool, bool) {
     let row_width = ui.available_width();
     let section_gap = ui.spacing().item_spacing.x;
     let (label_width, actions_width) = project_group_header_row_layout(row_width, section_gap);
-    let row_height = ui.spacing().interact_size.y.max(CONTROL_ROW_HEIGHT);
+    let row_height = CONTROL_ROW_HEIGHT;
     let (row_rect, response) =
         ui.allocate_exact_size(egui::vec2(row_width, row_height), Sense::click());
 
-    if ui.rect_contains_pointer(row_rect) {
-        ui.painter()
-            .rect_filled(row_rect.shrink(1.0), 6.0, with_alpha(BTN_ICON_HOVER, 70));
-    }
+    let response = if can_expand {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    };
 
     let text_color = if open {
-        with_alpha(TEXT_PRIMARY, 232)
-    } else if ui.rect_contains_pointer(row_rect) {
-        with_alpha(TEXT_PRIMARY, 214)
+        TEXT_PRIMARY
+    } else if response.hovered() && can_expand {
+        with_alpha(TEXT_PRIMARY, 180)
+    } else if response.hovered() {
+        with_alpha(TEXT_MUTED, 180)
     } else {
-        with_alpha(TEXT_MUTED, 220)
+        with_alpha(TEXT_MUTED, 180)
     };
 
     let mut foreground_clicked = false;
     let mut background_clicked = false;
+
     let label_rect = egui::Rect::from_min_size(row_rect.min, egui::vec2(label_width, row_height));
     if label_width > 0.0 && ui.is_rect_visible(label_rect) {
         let button_padding = ui.spacing().button_padding;
         let label = format!("{} {}", icons::FOLDER_OPEN, project_name);
         let label_wrap_width = (label_rect.width() - (button_padding.x * 2.0)).max(0.0);
-        let galley = WidgetText::from(label).into_galley(
+        let galley = WidgetText::from(label).strong().into_galley(
             ui,
             Some(TextWrapMode::Truncate),
             label_wrap_width,
@@ -5424,8 +5498,15 @@ fn draw_project_group_header(
         ui.painter().galley(text_pos, galley, text_color);
     }
 
-    let actions_rect =
-        egui::Rect::from_center_size(row_rect.center(), egui::vec2(actions_width, row_height));
+    if label_width > 0.0 {
+        let full_text = format!("Project: {}", project_name);
+        response.clone().on_hover_text(full_text);
+    }
+
+    let actions_rect = egui::Rect::from_min_size(
+        egui::pos2(row_rect.right() - actions_width, row_rect.top()),
+        egui::vec2(actions_width, row_height),
+    );
     ui.scope_builder(
         egui::UiBuilder::new()
             .max_rect(actions_rect)
@@ -5468,55 +5549,36 @@ fn terminal_manager_section_id(project_id: u64, kind: TerminalKind) -> Id {
     Id::new(("terminal-manager-section", project_id, kind.label()))
 }
 
-fn terminal_manager_section_text_color(open: bool, has_items: bool) -> Color32 {
-    if open {
-        with_alpha(TEXT_PRIMARY, 232)
-    } else if has_items {
-        with_alpha(ACCENT, 230)
-    } else {
-        with_alpha(TEXT_MUTED, 220)
-    }
-}
-
 fn draw_terminal_manager_section_header(
     ui: &mut Ui,
     icon: AppIcon,
-    label: &str,
     project_id: u64,
     kind: TerminalKind,
-    has_items: bool,
 ) -> bool {
     let header_id = terminal_manager_section_id(project_id, kind);
     let mut header_state =
         egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), header_id, true);
-    let open = header_state.is_open();
+    let _open = header_state.is_open();
 
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), CONTROL_ROW_HEIGHT),
         Sense::click(),
     );
 
-    if response.hovered() {
-        ui.painter()
-            .rect_filled(rect.shrink(1.0), 6.0, with_alpha(BTN_ICON_HOVER, 70));
-    }
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
 
-    let text_color = if response.is_pointer_button_down_on() {
-        Color32::from_rgb(244, 249, 255)
-    } else if response.hovered() && !open && has_items {
-        with_alpha(ACCENT, 245)
-    } else if response.hovered() {
-        with_alpha(TEXT_PRIMARY, 214)
-    } else {
-        terminal_manager_section_text_color(open, has_items)
+    let kind_color = match kind {
+        TerminalKind::Foreground => ACCENT,
+        TerminalKind::Background => Color32::from_rgb(100, 180, 160),
     };
+    let label_text = format!("{}  {}", icon, kind.label());
 
     ui.painter().text(
-        egui::pos2(rect.left() + 6.0, rect.center().y),
+        egui::pos2(rect.left() + 4.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
-        format!("{icon} {label}"),
-        egui::FontId::proportional(14.0),
-        text_color,
+        label_text,
+        egui::FontId::proportional(12.5),
+        kind_color,
     );
 
     if response.clicked() {
@@ -5539,7 +5601,9 @@ fn styled_icon_button(
         egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT),
         Sense::click(),
     );
-    let response = response.on_hover_text(tooltip);
+    let response = response
+        .on_hover_text(tooltip)
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
 
     if response.hovered() {
         ui.painter()
@@ -5567,7 +5631,9 @@ fn styled_icon_toggle(ui: &mut Ui, selected: bool, icon: AppIcon, tooltip: &str)
         egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT),
         Sense::click(),
     );
-    let response = response.on_hover_text(tooltip);
+    let response = response
+        .on_hover_text(tooltip)
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
 
     if response.hovered() {
         ui.painter()
@@ -6185,6 +6251,32 @@ fn build_terminal_render(
     let mut job = LayoutJob::default();
     job.wrap.max_width = f32::INFINITY;
 
+    // DEBUG: Log backslash-related content in snapshot
+    {
+        let mut has_backslash = false;
+        let mut debug_info = String::new();
+        for (line_index, line) in snapshot.lines.iter().enumerate() {
+            let line_text: String = line.runs.iter().map(|r| r.text.as_str()).collect();
+            if line_text.contains('\\') {
+                has_backslash = true;
+                debug_info.push_str(&format!(
+                    "Line {}: {:?} (cursor_row={:?})\n",
+                    line_index,
+                    line_text,
+                    snapshot.cursor_line.as_ref().map(|cl| cl.row)
+                ));
+            }
+        }
+        if has_backslash {
+            log::warn!(
+                "DEBUG backslash in snapshot: cursor={:?}, cursor_line={:?}\n{}",
+                snapshot.cursor,
+                snapshot.cursor_line.as_ref().map(|cl| cl.row),
+                debug_info
+            );
+        }
+    }
+
     for (line_index, line) in snapshot.lines.iter().enumerate() {
         let block_cursor = visible_cursor
             .filter(|cursor| cursor.y == line_index && cursor.shape == TerminalCursorShape::Block);
@@ -6198,6 +6290,16 @@ fn build_terminal_render(
                         cell.style
                     };
                     append_terminal_text(&mut job, &cell.rendered_text(), style, font_id);
+                }
+            } else {
+                for run in &line.runs {
+                    append_terminal_text(&mut job, &run.text, run.style, font_id);
+                }
+            }
+        } else if let Some(cursor_line) = snapshot.cursor_line.as_ref() {
+            if cursor_line.row == line_index {
+                for cell in &cursor_line.cells {
+                    append_terminal_text(&mut job, &cell.rendered_text(), cell.style, font_id);
                 }
             } else {
                 for run in &line.runs {
@@ -6432,12 +6534,12 @@ mod tests {
         terminal_manager_row_widths, terminal_output_surface_size, terminal_output_viewport_size,
         terminal_secondary_click_action, terminal_selection_point_from_pointer,
         terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
-        with_alpha, AdeApp, CtrlCAction, DirectoryIndexSnapshot, DirectoryNode,
-        PendingConfigChanges, PendingTerminalLinkClick, SourceControlBadgeState, SourceControlFile,
+        AdeApp, CtrlCAction, DirectoryIndexSnapshot, DirectoryNode, PendingConfigChanges,
+        PendingTerminalLinkClick, SourceControlBadgeState, SourceControlFile,
         SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalNavigationDirection, TerminalSecondaryClickAction, TerminalSelection,
-        TerminalSelectionPoint, TransientToast, ACCENT, TERMINAL_COPY_FEEDBACK_TEXT,
-        TERMINAL_COPY_TOAST_SECS, TERMINAL_OUTPUT_BG, TEXT_MUTED, TEXT_PRIMARY,
+        TerminalSelectionPoint, TransientToast, TERMINAL_COPY_FEEDBACK_TEXT,
+        TERMINAL_COPY_TOAST_SECS, TERMINAL_OUTPUT_BG,
     };
     use crate::layout;
     use crate::models::{
@@ -6474,7 +6576,7 @@ mod tests {
     }
 
     #[test]
-    fn partitions_terminal_key_events_out_of_ui_stream() {
+    fn partitions_terminal_input_events_out_of_ui_stream() {
         let shift_tab = Event::Key {
             key: Key::Tab,
             physical_key: None,
@@ -6494,18 +6596,18 @@ mod tests {
         };
         let focus_event = Event::WindowFocused(true);
 
-        let (terminal_events, remaining_events) = AdeApp::partition_terminal_key_events(vec![
+        let (terminal_events, remaining_events) = AdeApp::partition_terminal_input_events(vec![
             focus_event.clone(),
             shift_tab.clone(),
             plain_tab.clone(),
             Event::Text("git status".to_owned()),
         ]);
 
-        assert_eq!(terminal_events, vec![shift_tab, plain_tab]);
         assert_eq!(
-            remaining_events,
-            vec![focus_event, Event::Text("git status".to_owned())]
+            terminal_events,
+            vec![shift_tab, plain_tab, Event::Text("git status".to_owned())]
         );
+        assert_eq!(remaining_events, vec![focus_event]);
     }
 
     #[test]
@@ -6565,7 +6667,7 @@ mod tests {
         };
 
         let (terminal_events, remaining_events) =
-            AdeApp::partition_terminal_key_events(vec![ctrl_right.clone()]);
+            AdeApp::partition_terminal_input_events(vec![ctrl_right.clone()]);
 
         assert!(terminal_events.is_empty());
         assert_eq!(remaining_events, vec![ctrl_right]);
@@ -6586,7 +6688,7 @@ mod tests {
         };
 
         let (terminal_events, remaining_events) =
-            AdeApp::partition_terminal_key_events(vec![ctrl_shift_right.clone()]);
+            AdeApp::partition_terminal_input_events(vec![ctrl_shift_right.clone()]);
 
         assert_eq!(terminal_events, vec![ctrl_shift_right]);
         assert!(remaining_events.is_empty());
@@ -6654,7 +6756,7 @@ mod tests {
         let app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
         let captured = app.capture_active_terminal_input(&ctx);
 
-        assert_eq!(captured.len(), 1);
+        assert_eq!(captured.len(), 2);
         assert!(matches!(
             &captured[0],
             Event::Key {
@@ -6663,15 +6765,10 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(&captured[1], Event::Text(t) if t == "echo hi"));
 
         let remaining_events = ctx.input(|input| input.events.clone());
-        assert_eq!(
-            remaining_events,
-            vec![
-                Event::PointerMoved(pos2(4.0, 8.0)),
-                Event::Text("echo hi".to_owned())
-            ]
-        );
+        assert_eq!(remaining_events, vec![Event::PointerMoved(pos2(4.0, 8.0))]);
     }
 
     #[test]
@@ -6786,22 +6883,22 @@ mod tests {
     }
 
     #[test]
-    fn route_active_terminal_input_combines_buffered_keys_and_post_ui_text_events() {
+    fn route_active_terminal_input_combines_keys_and_text_from_single_event_list() {
         let ctx = Context::default();
         let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
-        ctx.input_mut(|input| {
-            input.events = vec![Event::Text("git status".to_owned())];
-        });
 
         app.route_active_terminal_input(
             &ctx,
-            vec![Event::Key {
-                key: Key::ArrowUp,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: Modifiers::default(),
-            }],
+            vec![
+                Event::Text("git status".to_owned()),
+                Event::Key {
+                    key: Key::ArrowUp,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::default(),
+                },
+            ],
         );
 
         let terminal = app.terminals.get(&1).expect("terminal 1");
@@ -7886,7 +7983,7 @@ mod tests {
             actions_width,
             super::project_group_header_actions_width(8.0)
         );
-        assert!(((label_width as f32) - 40.0).abs() < f32::EPSILON);
+        assert!(((label_width as f32) - 88.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -7902,32 +7999,6 @@ mod tests {
         assert_eq!(
             super::project_group_header_actions_width(8.0),
             (super::CONTROL_ROW_HEIGHT * 2.0) + 8.0
-        );
-    }
-
-    #[test]
-    fn project_group_header_row_layout_centers_actions_area() {
-        let total_width = 160.0;
-        let section_gap = 8.0;
-        let (_, actions_width) = super::project_group_header_row_layout(total_width, section_gap);
-        let actions_left = ((total_width - actions_width) * 0.5).max(0.0);
-
-        assert_eq!(actions_left, 48.0);
-    }
-
-    #[test]
-    fn terminal_manager_section_text_color_distinguishes_open_closed_and_empty_states() {
-        assert_eq!(
-            super::terminal_manager_section_text_color(true, true),
-            with_alpha(TEXT_PRIMARY, 232)
-        );
-        assert_eq!(
-            super::terminal_manager_section_text_color(false, true),
-            with_alpha(ACCENT, 230)
-        );
-        assert_eq!(
-            super::terminal_manager_section_text_color(false, false),
-            with_alpha(TEXT_MUTED, 220)
         );
     }
 

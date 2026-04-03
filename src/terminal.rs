@@ -371,8 +371,9 @@ impl TerminalRuntime {
         command.env("FORCE_COLOR", "1");
         command.env("TERM_PROGRAM", "MergenADE");
         command.env("WT_SESSION", "MergenADE");
-        command.env("ConEmuANSI", "ON");
-        command.env("ANSICON", "1");
+        // ConEmuANSI and ANSICON removed - they can interfere with ConPTY emulation
+        // command.env("ConEmuANSI", "ON");
+        // command.env("ANSICON", "1");
 
         let child = pty_pair
             .slave
@@ -1032,8 +1033,17 @@ fn spawn_reader_thread(
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read_bytes) => {
+                    // DEBUG: Log bytes that contain backslash
+                    let bytes = &buffer[..read_bytes];
+                    if bytes.contains(&b'\\') {
+                        log::warn!(
+                            "DEBUG PTY read bytes containing backslash ({} bytes): {:?}",
+                            read_bytes,
+                            String::from_utf8_lossy(bytes)
+                        );
+                    }
                     if let Ok(mut terminal) = term.lock() {
-                        terminal.advance_bytes(&buffer[..read_bytes]);
+                        terminal.advance_bytes(bytes);
                         latest_seqno.store(terminal.current_seqno(), Ordering::Relaxed);
                     }
                     send_ui_event(terminal_id, TerminalUiEventKind::Wakeup, &tx, &repaint_ctx);
@@ -2564,6 +2574,67 @@ mod tests {
             .expect("expected wide cell");
         assert_eq!(cell.column, 1);
         assert_eq!(cell.display_width, 2);
+    }
+
+    #[test]
+    fn st_terminated_osc_does_not_leak_backslash_in_snapshot() {
+        let mut terminal = make_test_terminal(TerminalSize {
+            rows: 2,
+            cols: 32,
+            pixel_width: 256,
+            pixel_height: 32,
+            dpi: 96,
+        });
+        terminal.advance_bytes(b"hello");
+        terminal.advance_bytes(b"\x1b]8;;https://example.com/docs\x1b\\");
+        terminal.advance_bytes(b"world");
+
+        let snapshot = snapshot_from_terminal(&terminal);
+        let first_line = &snapshot.lines[0];
+        let line_text = snapshot_line_text(first_line);
+        assert!(
+            !line_text.contains('\\'),
+            "ST terminator ESC \\ should not appear in snapshot, got: {line_text:?}"
+        );
+    }
+
+    #[test]
+    fn bell_terminated_osc_does_not_leak_backslash_in_snapshot() {
+        let mut terminal = make_test_terminal(TerminalSize {
+            rows: 2,
+            cols: 32,
+            pixel_width: 256,
+            pixel_height: 32,
+            dpi: 96,
+        });
+        terminal.advance_bytes(b"hello");
+        terminal.advance_bytes(b"\x1b]8;;https://example.com/docs\x07");
+        terminal.advance_bytes(b"world");
+
+        let snapshot = snapshot_from_terminal(&terminal);
+        let first_line = &snapshot.lines[0];
+        let line_text = snapshot_line_text(first_line);
+        assert!(
+            !line_text.contains('\\'),
+            "BEL should not appear in snapshot, got: {line_text:?}"
+        );
+    }
+
+    #[test]
+    fn plain_text_with_backslash_renders_correctly() {
+        let mut terminal = make_test_terminal(TerminalSize {
+            rows: 2,
+            cols: 32,
+            pixel_width: 256,
+            pixel_height: 32,
+            dpi: 96,
+        });
+        terminal.advance_bytes(b"path\\to\\file");
+
+        let snapshot = snapshot_from_terminal(&terminal);
+        let first_line = &snapshot.lines[0];
+        let line_text = snapshot_line_text(first_line);
+        assert_eq!(line_text, "path\\to\\file");
     }
 
     fn make_test_terminal(size: TerminalSize) -> Terminal {
