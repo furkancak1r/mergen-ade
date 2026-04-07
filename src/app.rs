@@ -88,7 +88,10 @@ const TEXT_MUTED: Color32 = Color32::from_rgb(148, 167, 191);
 const PROJECT_EXPLORER_WIDTH: f32 = 352.0;
 const ACTIVITY_RAIL_WIDTH: f32 = 48.0;
 const CONTROL_ROW_HEIGHT: f32 = 28.0;
+const SIDEBAR_ROW_LEADING_INSET: f32 = 6.0;
 const TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH: f32 = 32.0;
+const SOURCE_CONTROL_FILE_ICON_WIDTH: f32 = 16.0;
+const SOURCE_CONTROL_FILE_ICON_GAP: f32 = 6.0;
 const TOP_BAR_HEIGHT: f32 = 54.0;
 const DIRECTORY_SEARCH_INPUT_ID: &str = "directory-search-input";
 const SAVED_MESSAGE_DRAFT_INPUT_ID: &str = "saved-message-draft-input";
@@ -4116,13 +4119,21 @@ impl AdeApp {
                                     .clone();
 
                                 if snapshot.loading {
-                                    ui.label(
+                                    draw_sidebar_text_row(
+                                        ui,
                                         RichText::new("Refreshing source control...")
                                             .color(TEXT_MUTED),
+                                        TEXT_MUTED,
+                                        "Refreshing source control...",
                                     );
                                 }
                                 if let Some(error) = &snapshot.last_error {
-                                    ui.colored_label(Color32::LIGHT_RED, error);
+                                    draw_sidebar_text_row(
+                                        ui,
+                                        RichText::new(error).color(Color32::LIGHT_RED),
+                                        Color32::LIGHT_RED,
+                                        error,
+                                    );
                                 } else {
                                     let mut branch_line =
                                         format!("{} {}", icons::GIT_BRANCH, snapshot.branch);
@@ -4132,7 +4143,12 @@ impl AdeApp {
                                             snapshot.ahead, snapshot.behind
                                         ));
                                     }
-                                    ui.label(RichText::new(branch_line).color(TEXT_MUTED));
+                                    draw_sidebar_text_row(
+                                        ui,
+                                        RichText::new(&branch_line).color(TEXT_MUTED),
+                                        TEXT_MUTED,
+                                        &branch_line,
+                                    );
                                 }
 
                                 ui.separator();
@@ -4140,69 +4156,60 @@ impl AdeApp {
                                     && snapshot.last_error.is_none()
                                     && !snapshot.loading
                                 {
-                                    ui.label(
+                                    draw_sidebar_text_row(
+                                        ui,
                                         RichText::new("Working tree is clean").color(TEXT_MUTED),
+                                        TEXT_MUTED,
+                                        "Working tree is clean",
                                     );
                                 }
 
                                 for file in snapshot.files {
                                     let absolute = project.path.join(&file.path);
-                                    ui.horizontal(|ui| {
-                                        let status_icon = if file.staged {
-                                            icons::CHECK_CIRCLE
-                                        } else {
-                                            icons::CLOCK
-                                        };
-                                        ui.label(
-                                            RichText::new(status_icon.to_string())
-                                                .color(TEXT_MUTED),
-                                        );
-                                        ui.label(
-                                            RichText::new(format!("{} {}", file.status, file.path))
-                                                .monospace()
-                                                .small(),
-                                        )
-                                        .context_menu(
-                                            |ui| {
-                                                with_minimal_button_chrome(ui, |ui| {
-                                                    if ui
-                                                        .button(format!(
-                                                            "{} Open in Folder",
-                                                            icons::FOLDER_OPEN
-                                                        ))
-                                                        .clicked()
-                                                    {
-                                                        match open_in_file_explorer(&absolute, true)
-                                                        {
-                                                            Ok(()) => {
-                                                                self.status_line =
-                                                                    "Opened containing folder"
-                                                                        .to_owned();
-                                                            }
-                                                            Err(err) => {
-                                                                self.status_line = format!(
-                                                                    "Open folder failed: {err}"
-                                                                );
-                                                            }
+                                    let status_icon = if file.staged {
+                                        icons::CHECK_CIRCLE
+                                    } else {
+                                        icons::CLOCK
+                                    };
+                                    let file_line = format!("{} {}", file.status, file.path);
+                                    draw_source_control_file_row(ui, status_icon, &file_line)
+                                        .context_menu(|ui| {
+                                            with_minimal_button_chrome(ui, |ui| {
+                                                if ui
+                                                    .button(format!(
+                                                        "{} Open in Folder",
+                                                        icons::FOLDER_OPEN
+                                                    ))
+                                                    .clicked()
+                                                {
+                                                    match open_in_file_explorer(&absolute, true) {
+                                                        Ok(()) => {
+                                                            self.status_line =
+                                                                "Opened containing folder"
+                                                                    .to_owned();
                                                         }
-                                                        ui.close_menu();
+                                                        Err(err) => {
+                                                            self.status_line = format!(
+                                                                "Open folder failed: {err}"
+                                                            );
+                                                        }
                                                     }
-                                                    if ui
-                                                        .button(format!(
-                                                            "{} Copy Relative Path",
-                                                            icons::COPY
-                                                        ))
-                                                        .clicked()
-                                                    {
-                                                        ui.ctx().copy_text(file.path.clone());
-                                                        self.status_line =
-                                                            "Copied relative path".to_owned();
-                                                        ui.close_menu();
-                                                    }
-                                                });
-                                            },
-                                        );
-                                    });
+                                                    ui.close_menu();
+                                                }
+                                                if ui
+                                                    .button(format!(
+                                                        "{} Copy Relative Path",
+                                                        icons::COPY
+                                                    ))
+                                                    .clicked()
+                                                {
+                                                    ui.ctx().copy_text(file.path.clone());
+                                                    self.status_line =
+                                                        "Copied relative path".to_owned();
+                                                    ui.close_menu();
+                                                }
+                                            });
+                                        });
                                 }
                             });
                     }
@@ -4402,6 +4409,8 @@ impl AdeApp {
                                 .max_rect(label_rect)
                                 .layout(Layout::left_to_right(Align::Center)),
                             |ui| {
+                                ui.add_space(SIDEBAR_ROW_LEADING_INSET);
+
                                 let badge_response =
                                     draw_source_control_badge(ui, &project_source_control_badge);
                                 ui.add_space(4.0);
@@ -6363,12 +6372,29 @@ fn terminal_manager_row_widths(
     (label_width, actions_width)
 }
 
+fn sidebar_row_content_rect(rect: egui::Rect, button_padding: Vec2) -> egui::Rect {
+    let mut content_rect = rect.shrink2(button_padding);
+    content_rect.min.x = (content_rect.min.x + SIDEBAR_ROW_LEADING_INSET).min(content_rect.max.x);
+    content_rect
+}
+
+fn sidebar_row_wrap_width(available_width: f32, button_padding: Vec2) -> f32 {
+    (available_width - (button_padding.x * 2.0) - SIDEBAR_ROW_LEADING_INSET).max(0.0)
+}
+
+fn sidebar_row_desired_height(ui: &Ui, content_height: f32, button_padding: Vec2) -> f32 {
+    ui.spacing()
+        .interact_size
+        .y
+        .max(content_height + (button_padding.y * 2.0))
+}
+
 fn directory_row_text_position(
     rect: egui::Rect,
     button_padding: Vec2,
     galley_size: Vec2,
 ) -> egui::Pos2 {
-    let content_rect = rect.shrink2(button_padding);
+    let content_rect = sidebar_row_content_rect(rect, button_padding);
     egui::pos2(
         content_rect.min.x,
         content_rect.center().y - (galley_size.y * 0.5),
@@ -6378,18 +6404,14 @@ fn directory_row_text_position(
 fn draw_directory_file_row(ui: &mut Ui, text: &str) -> egui::Response {
     let button_padding = ui.spacing().button_padding;
     let available_width = ui.available_width().max(0.0);
-    let wrap_width = (available_width - (button_padding.x * 2.0)).max(0.0);
+    let wrap_width = sidebar_row_wrap_width(available_width, button_padding);
     let galley = WidgetText::from(text.to_owned()).into_galley(
         ui,
         Some(TextWrapMode::Truncate),
         wrap_width,
         egui::TextStyle::Body,
     );
-    let desired_height = ui
-        .spacing()
-        .interact_size
-        .y
-        .max(galley.size().y + (button_padding.y * 2.0));
+    let desired_height = sidebar_row_desired_height(ui, galley.size().y, button_padding);
     let desired_size = egui::vec2(available_width, desired_height);
     let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
 
@@ -6413,18 +6435,14 @@ fn draw_directory_file_row(ui: &mut Ui, text: &str) -> egui::Response {
 fn draw_directory_folder_row(ui: &mut Ui, text: &str) -> egui::Response {
     let button_padding = ui.spacing().button_padding;
     let available_width = ui.available_width().max(0.0);
-    let wrap_width = (available_width - (button_padding.x * 2.0)).max(0.0);
+    let wrap_width = sidebar_row_wrap_width(available_width, button_padding);
     let galley = WidgetText::from(text.to_owned()).into_galley(
         ui,
         Some(TextWrapMode::Truncate),
         wrap_width,
         egui::TextStyle::Body,
     );
-    let desired_height = ui
-        .spacing()
-        .interact_size
-        .y
-        .max(galley.size().y + (button_padding.y * 2.0));
+    let desired_height = sidebar_row_desired_height(ui, galley.size().y, button_padding);
     let desired_size = egui::vec2(available_width, desired_height);
     let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
 
@@ -6435,6 +6453,97 @@ fn draw_directory_folder_row(ui: &mut Ui, text: &str) -> egui::Response {
     }
 
     let font_id = egui::TextStyle::Body.resolve(ui.style());
+    with_truncation_tooltip(ui, response, text, &font_id, ui.visuals().text_color())
+}
+
+fn draw_sidebar_text_row<T>(
+    ui: &mut Ui,
+    text: T,
+    fallback_color: Color32,
+    tooltip: &str,
+) -> egui::Response
+where
+    T: Into<WidgetText>,
+{
+    let button_padding = ui.spacing().button_padding;
+    let available_width = ui.available_width().max(0.0);
+    let wrap_width = sidebar_row_wrap_width(available_width, button_padding);
+    let galley = text.into().into_galley(
+        ui,
+        Some(TextWrapMode::Truncate),
+        wrap_width,
+        egui::TextStyle::Body,
+    );
+    let desired_height = sidebar_row_desired_height(ui, galley.size().y, button_padding);
+    let desired_size = egui::vec2(available_width, desired_height);
+    let (rect, response) = ui.allocate_exact_size(desired_size, Sense::hover());
+
+    if ui.is_rect_visible(rect) {
+        let text_pos = directory_row_text_position(rect, button_padding, galley.size());
+        ui.painter().galley(text_pos, galley, fallback_color);
+    }
+
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    with_truncation_tooltip(ui, response, tooltip, &font_id, fallback_color)
+}
+
+fn draw_source_control_file_row(ui: &mut Ui, status_icon: AppIcon, text: &str) -> egui::Response {
+    let button_padding = ui.spacing().button_padding;
+    let available_width = ui.available_width().max(0.0);
+    let wrap_width = (sidebar_row_wrap_width(available_width, button_padding)
+        - SOURCE_CONTROL_FILE_ICON_WIDTH
+        - SOURCE_CONTROL_FILE_ICON_GAP)
+        .max(0.0);
+    let galley = WidgetText::from(RichText::new(text).monospace().small()).into_galley(
+        ui,
+        Some(TextWrapMode::Truncate),
+        wrap_width,
+        egui::TextStyle::Small,
+    );
+    let desired_height = sidebar_row_desired_height(ui, galley.size().y, button_padding);
+    let desired_size = egui::vec2(available_width, desired_height);
+    let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
+
+    if ui.is_rect_visible(rect) {
+        if let Some(fill) = directory_file_row_hover_fill(
+            response.hovered() || response.highlighted() || response.has_focus(),
+        ) {
+            ui.painter()
+                .rect_filled(rect.shrink2(egui::vec2(1.0, 1.0)), 8.0, fill);
+        }
+
+        let content_rect = sidebar_row_content_rect(rect, button_padding);
+        let icon_rect = egui::Rect::from_min_size(
+            content_rect.min,
+            egui::vec2(
+                SOURCE_CONTROL_FILE_ICON_WIDTH.min(content_rect.width()),
+                content_rect.height(),
+            ),
+        );
+        ui.painter().text(
+            icon_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            status_icon.to_string(),
+            egui::FontId::proportional(12.0),
+            TEXT_MUTED,
+        );
+
+        let text_rect = egui::Rect::from_min_max(
+            egui::pos2(
+                (icon_rect.max.x + SOURCE_CONTROL_FILE_ICON_GAP).min(content_rect.max.x),
+                content_rect.min.y,
+            ),
+            content_rect.max,
+        );
+        let text_pos = egui::pos2(
+            text_rect.min.x,
+            content_rect.center().y - (galley.size().y * 0.5),
+        );
+        ui.painter()
+            .galley(text_pos, galley, ui.visuals().text_color());
+    }
+
+    let font_id = egui::TextStyle::Small.resolve(ui.style());
     with_truncation_tooltip(ui, response, text, &font_id, ui.visuals().text_color())
 }
 
@@ -6756,7 +6865,7 @@ fn draw_project_group_header(
     if label_width > 0.0 && ui.is_rect_visible(label_rect) {
         let button_padding = ui.spacing().button_padding;
         let label = format!("{} {}", icons::FOLDER_OPEN, project_name);
-        let label_wrap_width = (label_rect.width() - (button_padding.x * 2.0)).max(0.0);
+        let label_wrap_width = sidebar_row_wrap_width(label_rect.width(), button_padding);
         let galley = WidgetText::from(label).strong().into_galley(
             ui,
             Some(TextWrapMode::Truncate),
@@ -6843,7 +6952,10 @@ fn draw_terminal_manager_section_header(
     let label_text = format!("{}  {}", icon, kind.label());
 
     ui.painter().text(
-        egui::pos2(rect.left() + 4.0, rect.center().y),
+        egui::pos2(
+            rect.left() + 4.0 + SIDEBAR_ROW_LEADING_INSET,
+            rect.center().y,
+        ),
         egui::Align2::LEFT_CENTER,
         label_text,
         egui::FontId::proportional(12.5),
@@ -7526,32 +7638,6 @@ fn build_terminal_render(
         visible_cursor.and_then(|cursor| build_terminal_cursor_overlay(snapshot, cursor));
     let mut job = LayoutJob::default();
     job.wrap.max_width = f32::INFINITY;
-
-    // DEBUG: Log backslash-related content in snapshot
-    {
-        let mut has_backslash = false;
-        let mut debug_info = String::new();
-        for (line_index, line) in snapshot.lines.iter().enumerate() {
-            let line_text: String = line.runs.iter().map(|r| r.text.as_str()).collect();
-            if line_text.contains('\\') {
-                has_backslash = true;
-                debug_info.push_str(&format!(
-                    "Line {}: {:?} (cursor_row={:?})\n",
-                    line_index,
-                    line_text,
-                    snapshot.cursor_line.as_ref().map(|cl| cl.row)
-                ));
-            }
-        }
-        if has_backslash {
-            log::warn!(
-                "DEBUG backslash in snapshot: cursor={:?}, cursor_line={:?}\n{}",
-                snapshot.cursor,
-                snapshot.cursor_line.as_ref().map(|cl| cl.row),
-                debug_info
-            );
-        }
-    }
 
     for (line_index, line) in snapshot.lines.iter().enumerate() {
         let block_cursor = visible_cursor
@@ -11573,6 +11659,43 @@ mod tests {
     }
 
     #[test]
+    fn source_control_file_row_uses_full_available_width() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let mut observed_width = None;
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(320.0, 80.0));
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(egui::Align::Center)),
+                );
+                let response = super::draw_source_control_file_row(
+                    &mut child,
+                    super::icons::CHECK_CIRCLE,
+                    "Modified src/app.rs",
+                );
+                observed_width = Some(response.rect.width());
+            });
+        });
+
+        let observed_width = observed_width.expect("source control row width was not observed");
+        assert_eq!(observed_width, 320.0);
+    }
+
+    #[test]
+    fn sidebar_row_wrap_width_reserves_shared_leading_inset() {
+        let wrap_width = super::sidebar_row_wrap_width(160.0, egui::vec2(8.0, 4.0));
+
+        assert_eq!(
+            wrap_width,
+            160.0 - (8.0 * 2.0) - super::SIDEBAR_ROW_LEADING_INSET
+        );
+    }
+
+    #[test]
     fn directory_row_text_position_left_aligns_with_padding() {
         let rect = egui::Rect::from_min_size(pos2(32.0, 10.0), egui::vec2(240.0, 28.0));
         let button_padding = egui::vec2(8.0, 4.0);
@@ -11581,7 +11704,10 @@ mod tests {
         let text_pos = super::directory_row_text_position(rect, button_padding, galley_size);
         let content_rect = rect.shrink2(button_padding);
 
-        assert_eq!(text_pos.x, content_rect.min.x);
+        assert_eq!(
+            text_pos.x,
+            content_rect.min.x + super::SIDEBAR_ROW_LEADING_INSET
+        );
         assert_eq!(text_pos.y, content_rect.center().y - (galley_size.y * 0.5));
     }
 

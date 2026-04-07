@@ -700,3 +700,17 @@
   - Preserve a byte-capture test path so terminal input regressions can assert PTY output directly instead of inferring behavior from UI state.
 - Files/Commands touched: `src/app.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: local user reproduction on 2026-04-07; regression tests `first_backspace_press_arms_terminal_held_key_repeat`, `held_backspace_synthesizes_repeat_events_after_delay`, and `held_backspace_repeat_writes_multiple_delete_bytes_to_terminal`
+
+#### Terminal render path emitted fake backslash warnings for normal Windows prompt lines because a temporary snapshot debug logger was left enabled {#terminal-render-path-emitted-fake-backslash-warnings-for-normal-windows-prompt-lines-because-a-temporary-snapshot-debug-logger-was-left-enabled}
+- Date: 2026-04-07T08:24:42Z
+- Context: main/Windows local integrated terminal rendering while PowerShell prompt lines included standard `C:\...` paths
+- Error signature: Repeated `[WARN  mergen_ade::app] DEBUG backslash in snapshot` lines appeared while the terminal showed ordinary Windows paths such as `PS C:\Users\...`
+- Symptoms/Impact: The app logged noisy warnings during normal terminal rendering even though the snapshot content was valid. This obscured real problems and made backslashes in standard Windows prompt output look like rendering errors.
+- Root cause: `src/app.rs` contained a temporary render-path debug block that scanned every terminal snapshot line for `\` and emitted a `warn!` whenever one was found. Because Windows prompt paths legitimately contain backslashes, the logger produced false-positive warnings on healthy output.
+- Resolution: Removed the temporary `DEBUG backslash in snapshot` warning block from the terminal render path and kept the existing snapshot tests as the guardrail for real OSC/ST backslash leakage behavior.
+- Prevent recurrence:
+  - Do not treat plain `\` characters as a warning condition in Windows terminal output.
+  - Keep temporary snapshot diagnostics out of the render hot path unless they are gated behind an explicit debug-only mechanism.
+  - Rely on targeted snapshot tests for OSC/ST leakage instead of broad runtime warning heuristics.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test backslash`, `cargo test`
+- References: local user reproduction on 2026-04-07 with repeated `DEBUG backslash in snapshot` warnings for `PS C:\Users\...`; regression tests `st_terminated_osc_does_not_leak_backslash_in_snapshot`, `bell_terminated_osc_does_not_leak_backslash_in_snapshot`, and `plain_text_with_backslash_renders_correctly`
