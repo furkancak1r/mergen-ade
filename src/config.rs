@@ -126,7 +126,7 @@ fn normalize_config_for_current_platform(config: &mut AppConfig) {
 
 #[cfg(test)]
 mod tests {
-    use super::load_config;
+    use super::{load_config, save_config};
     use crate::models::{AppConfig, ShellKind};
     use std::fs;
     use std::path::PathBuf;
@@ -197,6 +197,46 @@ path = "C:/work/demo"
         let config = load_config(&path).expect("should load config");
 
         assert_eq!(config.default_shell, ShellKind::default());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn missing_multi_terminal_setting_defaults_to_single_terminal_view() {
+        let path = unique_temp_path("missing-multi-terminal-setting");
+        fs::write(
+            &path,
+            r#"
+version = 1
+default_shell = "powershell"
+
+[ui]
+show_project_explorer = true
+project_explorer_expanded = true
+show_terminal_manager = true
+terminal_manager_expanded = true
+"#,
+        )
+        .expect("should write config");
+
+        let config = load_config(&path).expect("should load config");
+
+        assert!(!config.ui.multi_terminal_view_enabled);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_and_load_preserves_multi_terminal_setting() {
+        let path = unique_temp_path("preserve-multi-terminal-setting");
+        let mut config = AppConfig::default();
+        config.ui.multi_terminal_view_enabled = true;
+
+        save_config(&path, &config).expect("should save config");
+
+        let loaded = load_config(&path).expect("should load config");
+
+        assert!(loaded.ui.multi_terminal_view_enabled);
 
         let _ = fs::remove_file(path);
     }

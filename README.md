@@ -11,6 +11,8 @@
 <p align="center">
   <a href="https://github.com/furkancak1r/mergen-ade/releases/latest"><strong>Download Releases</strong></a>
   |
+  <a href="#factory-droid-setup-windows-first"><strong>Factory Droid Setup</strong></a>
+  |
   <a href="#build-from-source"><strong>Build from Source</strong></a>
 </p>
 
@@ -45,6 +47,8 @@ Published assets currently target:
 
 - Windows: portable ZIP containing `mergen-ade.exe`
 - macOS: signed and notarized ARM64 DMG
+
+> The Windows release ZIP currently contains only `mergen-ade.exe`. Factory Droid status badges are a separate one-time setup because Factory hooks and permissions still need to be configured on the machine that runs Mergen ADE.
 
 ### Local build
 
@@ -87,6 +91,60 @@ If `cargo` is not on PATH in PowerShell:
 $env:USERPROFILE\.cargo\bin\cargo.exe build --release
 $env:USERPROFILE\.cargo\bin\cargo.exe test
 ```
+
+### Factory Droid Setup (Windows-first)
+
+Factory Droid integration is supported, but it is not enabled just by launching `mergen-ade.exe`.
+
+Mergen ADE only supports `Factory Droid` for this flow. It listens for official `droid-hook:*` and `factory-droid-hook:*` signals, turns the badge green on `UserPromptSubmit`, turns it yellow on `Stop` plus actionable `Notification` events, and also recognizes the standard Droid title patterns `[Working...]` and `[Idle]`.
+
+Use the installer-based path below. Manual `settings.json` editing should be treated as a fallback for inspection only, not the primary setup path.
+
+1. Choose your starting point.
+   Repo checkout already on disk:
+   Use the existing repo checkout and run the installer from the repository root.
+   Release ZIP only:
+   Keep using the downloaded `mergen-ade.exe`, but clone or download this repository once so you also have the `scripts/` folder. The release ZIP does not ship the installer or hook source files.
+2. Run the supported installer from the repo root.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-factory-droid-hooks.ps1
+```
+
+3. Let the installer manage the Factory hook registration.
+   It copies `scripts\factory-droid-status-hook.ps1` into `%USERPROFILE%\.factory\hooks\mergen-ade-droid-status.ps1`.
+   It backs up the previous `%USERPROFILE%\.factory\settings.json` before rewriting it.
+   It registers exactly one managed command for `UserPromptSubmit`, `Notification`, and `Stop`.
+   It preserves unrelated Factory hooks that are already present in your settings.
+   It writes the canonical quote-safe launcher command, so do not hand-edit the managed entry back to a `-File` variant.
+4. Restart or refresh Factory Droid after installation.
+   Restart the `droid` or `factory` session, or revisit `/hooks`, because Factory snapshots hook settings when the session starts.
+5. Verify the hook registration.
+   Open `/hooks` in Factory Droid or inspect `%USERPROFILE%\.factory\settings.json`.
+   Confirm that `UserPromptSubmit`, `Notification`, and `Stop` each contain one managed command entry for the Mergen ADE hook.
+6. Verify the badge behavior inside Mergen ADE.
+   Open Mergen ADE, start a terminal, and launch `droid` or `factory` inside that terminal.
+   Submit a prompt and confirm the badge switches to green `Running`.
+   Finish a response, trigger a permission prompt, or wait for an input-needed notification and confirm the badge switches to yellow `Attention`.
+
+#### Diagnostics and Troubleshooting
+
+- Check Mergen ADE first: in Settings, review `Factory Droid Primary`, `Factory Droid Fallback`, `Factory Droid Inbox`, and `Droid Session Active` before debugging Factory itself.
+- Keep `ai_hooks.global_enabled` enabled in `%APPDATA%\Mergen\MergenADE\config\config.toml`. If that flag is set to `false`, Mergen ADE disables the Factory Droid integration path.
+- Do not use legacy `~/.claude/hooks/*` guidance. Mergen ADE supports only Factory Droid and only the official Factory hook configuration.
+- Do not replace the managed command with a relative path or a hand-written launcher. The supported command is installed automatically and is intentionally normalized to avoid Windows quoting failures.
+- Do not manually set `MERGEN_ADE_*` environment variables. Mergen ADE injects its own runtime context when it launches the integrated terminal.
+- If `/hooks` shows the correct entries but the badge still does not react, confirm you are testing with the current Mergen ADE build and not an older copied executable elsewhere on disk.
+
+#### Brief Unix/macOS Note
+
+The bundled installer in this repository is PowerShell-based and is currently the supported Windows-first setup path. On Unix-like systems, Factory hook commands still need absolute paths, and custom scripts still need executable permission, for example:
+
+```bash
+chmod +x ~/.factory/hooks/your-hook.sh
+```
+
+Do not assume the Windows installer flow is available unchanged outside Windows.
 
 ## Core Features
 

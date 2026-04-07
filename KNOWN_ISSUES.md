@@ -686,3 +686,17 @@
   - Treat Factory `session_id` as metadata rather than the sole acceptance key because one terminal can host multiple Droid sessions over time.
 - Files/Commands touched: `src/app.rs`, `src/hooks.rs`, `src/terminal.rs`, `scripts/factory-droid-status-hook.ps1`, `scripts/__tests__/factory-droid-hooks.tests.ps1`, `KNOWN_ISSUES.md`, `cargo test`, `powershell -ExecutionPolicy Bypass -File .\scripts\__tests__\factory-droid-hooks.tests.ps1`
 - References: 2026-04-07 code review finding for `src/app.rs`; local regression tests `factory_droid_hook_inbox_ignores_stale_token_records` and PowerShell inbox-token preservation coverage
+
+#### Held `Backspace` in the integrated terminal could stop deleting because terminal routing depended on platform repeat events instead of a stable held-key repeat path {#held-backspace-in-the-integrated-terminal-could-stop-deleting-because-terminal-routing-depended-on-platform-repeat-events-instead-of-a-stable-held-key-repeat-path}
+- Date: 2026-04-07T00:00:00Z
+- Context: main/Windows local integrated terminal text editing in Mergen-ADE
+- Error signature: `Backspace'a uzun basinca bir sure sonra silmeyi birakiyor; normal terminal gibi kesintisiz silmiyor.`
+- Symptoms/Impact: While editing shell input inside the embedded terminal, holding `Backspace` could delete a few characters and then stall until the user released and pressed again. This made integrated terminal editing feel inconsistent with standard Windows terminals.
+- Root cause: The app forwarded raw `Event::Key` presses to the PTY but had no deterministic held-key repeat layer of its own. Once platform repeat delivery became sparse or stopped reaching the routed event list, `Backspace` no longer generated additional `0x7f` bytes even though the key was still physically held.
+- Resolution: Added terminal-scoped held-key repeat state in `src/app.rs`, keyed by active terminal plus key/modifiers, and preprocess terminal events before routing so duplicate OS repeat presses are suppressed while synthetic repeat presses are emitted frame-by-frame until release. On Windows the repeat timing is seeded from `SystemParametersInfoW(SPI_GETKEYBOARDDELAY/SPI_GETKEYBOARDSPEED)` with a safe fallback; repeat state is cleared on terminal switch/close or whenever the terminal stops owning keyboard capture. Regression tests now cover arming, duplicate suppression, timed repeat synthesis, release/capture-loss cleanup, active-terminal cleanup, and PTY byte output via a test capture runtime in `src/terminal.rs`.
+- Prevent recurrence:
+  - Keep held-key repeat state scoped to active terminal input routing; do not hide this logic in unrelated UI focus paths.
+  - Do not depend on platform autorepeat events alone for destructive terminal editing keys like `Backspace` and `Delete`.
+  - Preserve a byte-capture test path so terminal input regressions can assert PTY output directly instead of inferring behavior from UI state.
+- Files/Commands touched: `src/app.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: local user reproduction on 2026-04-07; regression tests `first_backspace_press_arms_terminal_held_key_repeat`, `held_backspace_synthesizes_repeat_events_after_delay`, and `held_backspace_repeat_writes_multiple_delete_bytes_to_terminal`

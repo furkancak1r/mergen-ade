@@ -704,6 +704,23 @@ impl TerminalRuntime {
 struct NoopChildKiller;
 
 #[cfg(test)]
+struct CaptureWriter {
+    captured: Arc<Mutex<Vec<u8>>>,
+}
+
+#[cfg(test)]
+impl Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.captured.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 impl portable_pty::ChildKiller for NoopChildKiller {
     fn kill(&mut self) -> io::Result<()> {
         Ok(())
@@ -742,6 +759,75 @@ pub(crate) fn test_terminal_runtime() -> TerminalRuntime {
         #[cfg(test)]
         forced_factory_droid_process_active: None,
     }
+}
+
+#[cfg(test)]
+pub(crate) struct TestTerminalRuntimeCapture {
+    command_rx: Receiver<RuntimeCommand>,
+    shared_writer: SharedWriterHandle,
+    captured: Arc<Mutex<Vec<u8>>>,
+}
+
+#[cfg(test)]
+impl TestTerminalRuntimeCapture {
+    pub(crate) fn drain(&self) {
+        while let Ok(command) = self.command_rx.try_recv() {
+            match command {
+                RuntimeCommand::Input(bytes) | RuntimeCommand::Paste(bytes) => {
+                    write_runtime_bytes(&self.shared_writer, &bytes).unwrap();
+                }
+                RuntimeCommand::Resize(_) | RuntimeCommand::MouseWheel(_) => {}
+                RuntimeCommand::Shutdown => break,
+            }
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> Vec<u8> {
+        self.captured.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_terminal_runtime_with_capture() -> (TerminalRuntime, TestTerminalRuntimeCapture)
+{
+    let dimensions = TerminalDimensions::default();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let shared_writer: SharedWriterHandle = Arc::new(Mutex::new(Some(Box::new(CaptureWriter {
+        captured: captured.clone(),
+    }))));
+    let terminal = Terminal::new(
+        dimensions.to_term_size(),
+        Arc::new(AdeTerminalConfig),
+        "test",
+        "0",
+        Box::new(SharedWriter::new(shared_writer.clone())),
+    );
+    let latest_seqno = Arc::new(AtomicUsize::new(terminal.current_seqno()));
+    let (command_tx, command_rx) = crossbeam_channel::unbounded();
+
+    (
+        TerminalRuntime {
+            term: Arc::new(Mutex::new(terminal)),
+            command_tx,
+            shared_writer: shared_writer.clone(),
+            latest_seqno,
+            last_size: dimensions,
+            child_killer: Arc::new(Mutex::new(Box::new(NoopChildKiller))),
+            child_pid: None,
+            child_creation_time: None,
+            #[cfg(target_os = "windows")]
+            child_process_handle: Mutex::new(None),
+            #[cfg(target_os = "windows")]
+            job_handle: Mutex::new(None),
+            #[cfg(test)]
+            forced_factory_droid_process_active: None,
+        },
+        TestTerminalRuntimeCapture {
+            command_rx,
+            shared_writer,
+            captured,
+        },
+    )
 }
 
 #[cfg(test)]

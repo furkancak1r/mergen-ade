@@ -24,6 +24,10 @@ use serde::{Deserialize, Serialize};
 use tattoy_wezterm_surface::hyperlink::{
     Rule, CLOSING_PARENTHESIS_HYPERLINK_PATTERN, GENERIC_HYPERLINK_PATTERN,
 };
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    SystemParametersInfoW, SPI_GETKEYBOARDDELAY, SPI_GETKEYBOARDSPEED,
+};
 
 use crate::config;
 use crate::hooks::{AiCliSession, AiCliStatus, AiCliTool, AiHookManager};
@@ -55,6 +59,9 @@ const TERMINAL_CHAR_WIDTH_SAMPLE_CELLS: usize = 64;
 const TERMINAL_FONT_FAMILY_NAME: &str = "terminal-mono";
 const CURSOR_BAR_WIDTH_PX: f32 = 2.0;
 const CURSOR_UNDERLINE_HEIGHT_PX: f32 = 2.0;
+const TERMINAL_HELD_KEY_REPEAT_FALLBACK_INITIAL_DELAY_SECS: f64 = 0.5;
+const TERMINAL_HELD_KEY_REPEAT_FALLBACK_INTERVAL_SECS: f64 = 1.0 / 30.0;
+const TERMINAL_HELD_KEY_REPEAT_MAX_SYNTHETIC_EVENTS_PER_FRAME: usize = 16;
 
 // Embedded Nerd Font for terminal icon support
 const NERD_FONT_DATA: &[u8] = include_bytes!("../assets/fonts/CaskaydiaCoveNerdFont-Regular.ttf");
@@ -327,11 +334,11 @@ impl FactoryDroidTransportDiagnostics {
     }
 
     fn warning_message(&self) -> Option<String> {
-        self.hooks_enabled
-            .then_some(())
-            .and(self.hooks_runtime_error
-            .as_ref()
-            .map(|err| format!("Factory Droid inbox fallback unavailable: {err}")))
+        self.hooks_enabled.then_some(()).and(
+            self.hooks_runtime_error
+                .as_ref()
+                .map(|err| format!("Factory Droid inbox fallback unavailable: {err}")),
+        )
     }
 }
 
@@ -355,6 +362,7 @@ pub struct AdeApp {
     active_terminal: Option<u64>,
     buffered_terminal_input: Vec<Event>,
     buffered_terminal_navigation: Vec<TerminalNavigationDirection>,
+    terminal_held_key_repeat: Option<TerminalHeldKeyRepeat>,
     allow_attention_terminal_input_routing_once: bool,
     pending_terminal_pastes: Vec<PendingTerminalPaste>,
     terminal_events_tx: Sender<TerminalUiEvent>,
@@ -414,6 +422,21 @@ struct TerminalEntry {
     factory_droid_last_process_seen_at: Option<Instant>,
     factory_droid_process_missing_since: Option<Instant>,
     factory_droid_last_status_source: Option<FactoryDroidStatusSource>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TerminalHeldKeyRepeat {
+    terminal_id: u64,
+    key: Key,
+    modifiers: egui::Modifiers,
+    first_pressed_at: f64,
+    last_repeat_at: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TerminalHeldKeyRepeatTiming {
+    initial_delay_secs: f64,
+    interval_secs: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -589,50 +612,53 @@ impl AiBadgeModel {
     }
 }
 
-fn draw_ai_badge(ui: &mut Ui, badge: &AiBadgeModel) -> egui::Response {
-    // Sadece Running veya Attention durumlarında göster
-    if badge.status == AiCliStatus::Inactive {
-        return ui.allocate_at_least(egui::vec2(0.0, 0.0), Sense::hover()).1;
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AiBadgeVisual {
+    Spinner(Color32),
+    Pulse(Color32),
+}
 
-    let time_seconds = ui.ctx().input(|i| i.time);
+fn ai_badge_visual(status: AiCliStatus) -> Option<AiBadgeVisual> {
+    match status {
+        AiCliStatus::Inactive => None,
+        AiCliStatus::Running => Some(AiBadgeVisual::Spinner(Color32::from_rgb(76, 209, 114))),
+        AiCliStatus::Attention => Some(AiBadgeVisual::Pulse(Color32::from_rgb(209, 186, 46))),
+    }
+}
+
+fn draw_ai_badge(ui: &mut Ui, badge: &AiBadgeModel) -> egui::Response {
+    let Some(visual) = ai_badge_visual(badge.status) else {
+        return ui.allocate_at_least(egui::vec2(0.0, 0.0), Sense::hover()).1;
+    };
+
     let (rect, response) = ui.allocate_at_least(egui::vec2(16.0, 16.0), Sense::hover());
 
     if ui.is_rect_visible(rect) {
-        let center = rect.center();
-
-        // Pulse animasyonu (büyüyüp küçülen daire)
-        let pulse = ((time_seconds * 4.0).sin() + 1.0) * 0.25 + 2.5; // 2.5 - 5 arası yarıçap
-        let radius = pulse as f32;
-
-        let (r, g, b, alpha_multiplier) = match badge.status {
-            AiCliStatus::Running => {
-                // Yeşil pulse (Droid çalışıyor)
-                (76u8, 209u8, 114u8, 1.0)
+        match visual {
+            AiBadgeVisual::Spinner(color) => {
+                egui::Spinner::new().color(color).paint_at(ui, rect);
             }
-            AiCliStatus::Attention => {
-                // Sarı pulse (Droid dikkatinizi bekliyor)
-                (209u8, 186u8, 46u8, 1.0)
+            AiBadgeVisual::Pulse(color) => {
+                let time_seconds = ui.ctx().input(|i| i.time);
+                let center = rect.center();
+
+                // Pulse animasyonu (büyüyüp küçülen daire)
+                let pulse = ((time_seconds * 4.0).sin() + 1.0) * 0.25 + 2.5; // 2.5 - 5 arası yarıçap
+                let radius = pulse as f32;
+                let alpha = ((time_seconds * 4.0).sin() * 0.3 + 0.7) * 255.0;
+                let color =
+                    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha as u8);
+
+                ui.painter().circle(
+                    center,
+                    radius,
+                    color,
+                    egui::Stroke::new(0.0, Color32::TRANSPARENT),
+                );
+
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
             }
-            AiCliStatus::Inactive => {
-                // Bu durumda zaten üstte çıktık
-                unreachable!();
-            }
-        };
-
-        let alpha = ((time_seconds * 4.0).sin() * 0.3 + 0.7) * 255.0 * alpha_multiplier;
-        let color = Color32::from_rgba_unmultiplied(r, g, b, alpha as u8);
-
-        ui.painter().circle(
-            center,
-            radius,
-            color,
-            egui::Stroke::new(0.0, Color32::TRANSPARENT),
-        );
-
-        // Ensure animation continues: request repaint every 100ms
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(100));
+        }
     }
 
     response.on_hover_ui(|ui| {
@@ -781,6 +807,7 @@ impl AdeApp {
             active_terminal: None,
             buffered_terminal_input: Vec::new(),
             buffered_terminal_navigation: Vec::new(),
+            terminal_held_key_repeat: None,
             allow_attention_terminal_input_routing_once: false,
             pending_terminal_pastes: Vec::new(),
             terminal_events_tx,
@@ -883,15 +910,28 @@ impl AdeApp {
         self.layout_epoch = self.layout_epoch.wrapping_add(1);
     }
 
+    fn single_terminal_id_for_main(&self) -> Option<u64> {
+        self.active_terminal
+            .filter(|terminal_id| self.terminals.contains_key(terminal_id))
+            .or_else(|| self.terminals.keys().next().copied())
+    }
+
     fn first_visible_terminal_for_main(&self) -> Option<u64> {
-        self.terminals
-            .iter()
-            .filter_map(|(id, terminal)| self.terminal_visible_in_main(terminal).then_some(*id))
-            .min()
+        if self.config.ui.multi_terminal_view_enabled {
+            self.terminals
+                .iter()
+                .find_map(|(id, terminal)| self.terminal_visible_in_main(terminal).then_some(*id))
+        } else {
+            self.single_terminal_id_for_main()
+        }
     }
 
     fn terminal_visible_in_main(&self, terminal: &TerminalEntry) -> bool {
-        terminal.in_main_view
+        if self.config.ui.multi_terminal_view_enabled {
+            terminal.in_main_view
+        } else {
+            self.single_terminal_id_for_main() == Some(terminal.id)
+        }
     }
 
     fn add_project(&mut self, path: PathBuf) {
@@ -2008,7 +2048,11 @@ impl AdeApp {
     }
 
     fn active_terminal_accepts_input(&self) -> Option<u64> {
-        let active_terminal_id = self.active_terminal?;
+        let active_terminal_id = if self.config.ui.multi_terminal_view_enabled {
+            self.active_terminal?
+        } else {
+            self.single_terminal_id_for_main()?
+        };
         self.terminals
             .get(&active_terminal_id)
             .is_some_and(|terminal| self.terminal_visible_in_main(terminal) && !terminal.exited)
@@ -2259,6 +2303,223 @@ impl AdeApp {
         (directions, remaining_events)
     }
 
+    fn is_repeatable_terminal_key(key: Key, modifiers: egui::Modifiers) -> bool {
+        matches!(key, Key::Backspace | Key::Delete)
+            && Self::key_to_terminal_bytes(key, modifiers).is_some()
+    }
+
+    fn clear_terminal_held_key_repeat(&mut self) {
+        self.terminal_held_key_repeat = None;
+    }
+
+    fn clear_terminal_held_key_repeat_for_terminal(&mut self, terminal_id: u64) {
+        if self
+            .terminal_held_key_repeat
+            .is_some_and(|state| state.terminal_id == terminal_id)
+        {
+            self.clear_terminal_held_key_repeat();
+        }
+    }
+
+    fn terminal_held_key_repeat_timing() -> TerminalHeldKeyRepeatTiming {
+        #[cfg(target_os = "windows")]
+        {
+            static TIMING: OnceLock<TerminalHeldKeyRepeatTiming> = OnceLock::new();
+            *TIMING.get_or_init(Self::load_windows_terminal_held_key_repeat_timing)
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            TerminalHeldKeyRepeatTiming {
+                initial_delay_secs: TERMINAL_HELD_KEY_REPEAT_FALLBACK_INITIAL_DELAY_SECS,
+                interval_secs: TERMINAL_HELD_KEY_REPEAT_FALLBACK_INTERVAL_SECS,
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn load_windows_terminal_held_key_repeat_timing() -> TerminalHeldKeyRepeatTiming {
+        let fallback = TerminalHeldKeyRepeatTiming {
+            initial_delay_secs: TERMINAL_HELD_KEY_REPEAT_FALLBACK_INITIAL_DELAY_SECS,
+            interval_secs: TERMINAL_HELD_KEY_REPEAT_FALLBACK_INTERVAL_SECS,
+        };
+
+        let mut keyboard_delay = 0u32;
+        let mut keyboard_speed = 0u32;
+        let delay_ok = unsafe {
+            SystemParametersInfoW(
+                SPI_GETKEYBOARDDELAY,
+                0,
+                (&mut keyboard_delay as *mut u32).cast(),
+                0,
+            )
+        } != 0;
+        let speed_ok = unsafe {
+            SystemParametersInfoW(
+                SPI_GETKEYBOARDSPEED,
+                0,
+                (&mut keyboard_speed as *mut u32).cast(),
+                0,
+            )
+        } != 0;
+        if !delay_ok || !speed_ok {
+            return fallback;
+        }
+
+        keyboard_delay = keyboard_delay.min(3);
+        keyboard_speed = keyboard_speed.min(31);
+
+        let repeats_per_second = 2.5 + (f64::from(keyboard_speed) * (27.5 / 31.0));
+        if repeats_per_second <= 0.0 {
+            return fallback;
+        }
+
+        TerminalHeldKeyRepeatTiming {
+            initial_delay_secs: 0.25 * f64::from(keyboard_delay + 1),
+            interval_secs: (1.0 / repeats_per_second).max(0.001),
+        }
+    }
+
+    fn due_terminal_held_key_repeat_events(
+        &mut self,
+        active_terminal_id: u64,
+        now: f64,
+    ) -> Vec<Event> {
+        let Some(state) = self.terminal_held_key_repeat.as_mut() else {
+            return Vec::new();
+        };
+        if state.terminal_id != active_terminal_id {
+            self.clear_terminal_held_key_repeat();
+            return Vec::new();
+        }
+
+        let timing = Self::terminal_held_key_repeat_timing();
+        let mut due_events = Vec::new();
+        let mut next_repeat_at = state
+            .last_repeat_at
+            .map(|last_repeat_at| last_repeat_at + timing.interval_secs)
+            .unwrap_or(state.first_pressed_at + timing.initial_delay_secs);
+
+        while now + f64::EPSILON >= next_repeat_at
+            && due_events.len() < TERMINAL_HELD_KEY_REPEAT_MAX_SYNTHETIC_EVENTS_PER_FRAME
+        {
+            state.last_repeat_at = Some(next_repeat_at);
+            due_events.push(Event::Key {
+                key: state.key,
+                physical_key: None,
+                pressed: true,
+                repeat: true,
+                modifiers: state.modifiers,
+            });
+            next_repeat_at += timing.interval_secs;
+        }
+
+        due_events
+    }
+
+    fn preprocess_terminal_input_with_held_repeat(
+        &mut self,
+        ctx: &egui::Context,
+        events: Vec<Event>,
+    ) -> Vec<Event> {
+        let active_terminal_id = self.active_terminal_accepts_input();
+        let should_capture_terminal_keyboard = self.should_capture_terminal_keyboard(ctx);
+        let now = ctx.input(|input| input.time);
+
+        self.preprocess_terminal_input_with_held_repeat_state(
+            active_terminal_id,
+            should_capture_terminal_keyboard,
+            now,
+            events,
+        )
+    }
+
+    fn preprocess_terminal_input_with_held_repeat_state(
+        &mut self,
+        active_terminal_id: Option<u64>,
+        should_capture_terminal_keyboard: bool,
+        now: f64,
+        events: Vec<Event>,
+    ) -> Vec<Event> {
+        if !should_capture_terminal_keyboard {
+            self.clear_terminal_held_key_repeat();
+            return events;
+        }
+
+        let Some(active_terminal_id) = active_terminal_id else {
+            self.clear_terminal_held_key_repeat();
+            return events;
+        };
+
+        if self
+            .terminal_held_key_repeat
+            .is_some_and(|state| state.terminal_id != active_terminal_id)
+        {
+            self.clear_terminal_held_key_repeat();
+        }
+
+        let mut processed_events = Vec::with_capacity(events.len() + 1);
+        for event in events {
+            match event {
+                Event::Key {
+                    key,
+                    physical_key,
+                    pressed,
+                    repeat,
+                    modifiers,
+                } if Self::is_repeatable_terminal_key(key, modifiers) => {
+                    if pressed {
+                        let is_existing_repeat =
+                            self.terminal_held_key_repeat.is_some_and(|state| {
+                                state.terminal_id == active_terminal_id
+                                    && state.key == key
+                                    && state.modifiers == modifiers
+                            });
+                        if is_existing_repeat {
+                            continue;
+                        }
+
+                        self.terminal_held_key_repeat = Some(TerminalHeldKeyRepeat {
+                            terminal_id: active_terminal_id,
+                            key,
+                            modifiers,
+                            first_pressed_at: now,
+                            last_repeat_at: None,
+                        });
+                    } else if self.terminal_held_key_repeat.is_some_and(|state| {
+                        state.terminal_id == active_terminal_id
+                            && state.key == key
+                            && state.modifiers == modifiers
+                    }) {
+                        self.clear_terminal_held_key_repeat();
+                    }
+
+                    processed_events.push(Event::Key {
+                        key,
+                        physical_key,
+                        pressed,
+                        repeat,
+                        modifiers,
+                    });
+                }
+                Event::Key { pressed: true, .. }
+                | Event::Text(_)
+                | Event::Paste(_)
+                | Event::Copy
+                | Event::Cut => {
+                    self.clear_terminal_held_key_repeat();
+                    processed_events.push(event);
+                }
+                _ => {
+                    processed_events.push(event);
+                }
+            }
+        }
+
+        processed_events.extend(self.due_terminal_held_key_repeat_events(active_terminal_id, now));
+        processed_events
+    }
+
     fn capture_active_terminal_input(&self, ctx: &egui::Context) -> Vec<Event> {
         if !self.should_capture_terminal_keyboard(ctx) {
             return Vec::new();
@@ -2296,6 +2557,10 @@ impl AdeApp {
     }
 
     fn visible_terminal_ids_for_main(&self) -> Vec<u64> {
+        if !self.config.ui.multi_terminal_view_enabled {
+            return self.single_terminal_id_for_main().into_iter().collect();
+        }
+
         let mut ids = self
             .terminals
             .iter()
@@ -2803,6 +3068,7 @@ impl AdeApp {
         };
 
         self.terminals.remove(&terminal_id);
+        self.clear_terminal_held_key_repeat_for_terminal(terminal_id);
         self.clear_factory_droid_state(terminal_id);
         self.reset_factory_droid_hook_inbox(terminal_id);
         self.status_line = match close_result {
@@ -2837,6 +3103,7 @@ impl AdeApp {
         }
 
         self.active_terminal = terminal_id;
+        self.clear_terminal_held_key_repeat();
         self.clear_terminal_selections_except(terminal_id);
 
         // Repaint to update AI badge state
@@ -4082,6 +4349,7 @@ impl AdeApp {
             .map(|project| project.saved_messages.clone())
             .unwrap_or_default();
         let current_active = self.active_terminal;
+        let show_visibility_toggle = self.config.ui.multi_terminal_view_enabled;
         let project_source_control_badge =
             source_control_badge_model(self.source_control_state.get(&project_id));
 
@@ -4098,20 +4366,30 @@ impl AdeApp {
                 let active = current_active == Some(terminal_entry_id);
                 let label = terminal_display_label(&terminal.full_title, terminal.exited);
                 let section_gap = ui.spacing().item_spacing.x;
-                let actions_width = terminal_manager_actions_width(section_gap);
+                let actions_width =
+                    terminal_manager_actions_width(section_gap, show_visibility_toggle);
                 let row_width = ui.available_width().max(0.0);
                 let (row_label_width, row_actions_width) =
                     terminal_manager_row_widths(row_width, actions_width, section_gap);
                 let row_height = ui.spacing().interact_size.y.max(CONTROL_ROW_HEIGHT);
                 let (row_rect, row_response) =
                     ui.allocate_exact_size(egui::vec2(row_width, row_height), Sense::click());
-
-                let hover_text = if terminal.exited {
+                let row_response = row_response.on_hover_text(if terminal.exited {
                     format!("{} (Exited)", label)
                 } else {
                     label.clone()
-                };
-                row_response.on_hover_text(hover_text);
+                });
+                let row_chrome = terminal_manager_row_chrome(active, row_response.hovered());
+
+                if ui.is_rect_visible(row_rect) {
+                    let paint_rect = row_rect.shrink2(egui::vec2(1.0, 1.0));
+                    if let Some(fill) = row_chrome.fill {
+                        ui.painter().rect_filled(paint_rect, 8.0, fill);
+                    }
+                    if row_chrome.stroke != Stroke::NONE {
+                        ui.painter().rect_stroke(paint_rect, 8.0, row_chrome.stroke);
+                    }
+                }
 
                 if row_label_width > 0.0 {
                     let label_rect = egui::Rect::from_min_size(
@@ -4135,7 +4413,7 @@ impl AdeApp {
                                 let term_icon_color = if terminal.exited {
                                     Color32::from_rgb(200, 100, 100)
                                 } else {
-                                    with_alpha(TEXT_MUTED, 200)
+                                    row_chrome.icon_color
                                 };
                                 let (icon_rect, _) = ui.allocate_exact_size(
                                     egui::vec2(16.0, row_height),
@@ -4153,10 +4431,8 @@ impl AdeApp {
 
                                 let text_color = if terminal.exited {
                                     with_alpha(TEXT_MUTED, 160)
-                                } else if active {
-                                    TEXT_PRIMARY
                                 } else {
-                                    with_alpha(TEXT_PRIMARY, 210)
+                                    row_chrome.title_color
                                 };
                                 let title_label = egui::Label::new(
                                     RichText::new(label.clone()).color(text_color),
@@ -4207,24 +4483,26 @@ impl AdeApp {
                             close_terminal = true;
                         }
 
-                        let visibility_icon = if terminal.in_main_view {
-                            icons::EYE
-                        } else {
-                            icons::EYE_OFF
-                        };
-                        let visibility_tooltip = if terminal.in_main_view {
-                            "Hide from main area"
-                        } else {
-                            "Show in main area"
-                        };
-                        if styled_icon_toggle(
-                            ui,
-                            terminal.in_main_view,
-                            visibility_icon,
-                            visibility_tooltip,
-                        ) {
-                            terminal.in_main_view = !terminal.in_main_view;
-                            visibility_changed = true;
+                        if show_visibility_toggle {
+                            let visibility_icon = if terminal.in_main_view {
+                                icons::EYE
+                            } else {
+                                icons::EYE_OFF
+                            };
+                            let visibility_tooltip = if terminal.in_main_view {
+                                "Hide from main area"
+                            } else {
+                                "Show in main area"
+                            };
+                            if styled_icon_toggle(
+                                ui,
+                                terminal.in_main_view,
+                                visibility_icon,
+                                visibility_tooltip,
+                            ) {
+                                terminal.in_main_view = !terminal.in_main_view;
+                                visibility_changed = true;
+                            }
                         }
 
                         let message_menu = with_minimal_button_chrome(ui, |ui| {
@@ -4898,7 +5176,7 @@ impl AdeApp {
         }
 
         let mut should_persist = false;
-        let ui_config_changed = false;
+        let mut ui_config_changed = false;
         let mut default_shell_changed = false;
         let mut projects_changed = false;
 
@@ -4958,6 +5236,27 @@ impl AdeApp {
                 if self.config.default_shell != previous_shell {
                     should_persist = true;
                     default_shell_changed = true;
+                }
+
+                let previous_multi_terminal_view_enabled =
+                    self.config.ui.multi_terminal_view_enabled;
+                let multi_terminal_toggle = ui.checkbox(
+                    &mut self.config.ui.multi_terminal_view_enabled,
+                    "Show multiple terminals at once",
+                );
+                multi_terminal_toggle.on_hover_text(
+                    "When disabled, only the active terminal stays visible in the main area.",
+                );
+                if self.config.ui.multi_terminal_view_enabled != previous_multi_terminal_view_enabled
+                {
+                    should_persist = true;
+                    ui_config_changed = true;
+                    self.bump_layout_epoch();
+                    if !self.config.ui.multi_terminal_view_enabled {
+                        self.set_active_terminal(ctx, self.single_terminal_id_for_main());
+                    } else {
+                        ctx.request_repaint();
+                    }
                 }
 
                 ui.separator();
@@ -5256,6 +5555,7 @@ impl eframe::App for AdeApp {
         self.schedule_terminal_refresh(ctx);
         let mut terminal_events = self.take_buffered_terminal_input();
         terminal_events.extend(self.capture_active_terminal_input(ctx));
+        terminal_events = self.preprocess_terminal_input_with_held_repeat(ctx, terminal_events);
         let top_bar_rect = self.draw_top_bar(ctx);
         let activity_rect = self.draw_activity_rail(ctx);
         let explorer_rect = self.draw_project_explorer(ctx);
@@ -5314,6 +5614,7 @@ fn recover_config_state(
     if pending_config_changes.ui {
         config.ui.project_explorer_expanded = current_config.ui.project_explorer_expanded;
         config.ui.terminal_manager_expanded = current_config.ui.terminal_manager_expanded;
+        config.ui.multi_terminal_view_enabled = current_config.ui.multi_terminal_view_enabled;
         config.ui.left_sidebar_tab = current_config.ui.left_sidebar_tab;
     }
 
@@ -6037,8 +6338,13 @@ fn terminal_display_label(title: &str, exited: bool) -> String {
     }
 }
 
-fn terminal_manager_actions_width(section_gap: f32) -> f32 {
-    (CONTROL_ROW_HEIGHT * 2.0) + TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH + (section_gap * 2.0)
+fn terminal_manager_actions_width(section_gap: f32, show_visibility_toggle: bool) -> f32 {
+    let visibility_width = if show_visibility_toggle {
+        CONTROL_ROW_HEIGHT + section_gap
+    } else {
+        0.0
+    };
+    CONTROL_ROW_HEIGHT + TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH + section_gap + visibility_width
 }
 
 fn terminal_manager_row_widths(
@@ -6144,6 +6450,14 @@ struct TerminalHeaderChrome {
     detail_color: Color32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TerminalManagerRowChrome {
+    fill: Option<Color32>,
+    stroke: Stroke,
+    title_color: Color32,
+    icon_color: Color32,
+}
+
 fn terminal_header_chrome(is_active: bool) -> TerminalHeaderChrome {
     if is_active {
         TerminalHeaderChrome {
@@ -6158,6 +6472,31 @@ fn terminal_header_chrome(is_active: bool) -> TerminalHeaderChrome {
             stroke: Stroke::new(1.0, BORDER_COLOR),
             title_color: TEXT_PRIMARY,
             detail_color: with_alpha(TEXT_MUTED, 230),
+        }
+    }
+}
+
+fn terminal_manager_row_chrome(is_active: bool, is_hovered: bool) -> TerminalManagerRowChrome {
+    if is_active {
+        TerminalManagerRowChrome {
+            fill: Some(Color32::from_rgb(24, 48, 68)),
+            stroke: Stroke::new(1.0, with_alpha(ACCENT, 220)),
+            title_color: Color32::from_rgb(244, 251, 255),
+            icon_color: Color32::from_rgb(132, 214, 255),
+        }
+    } else if is_hovered {
+        TerminalManagerRowChrome {
+            fill: Some(with_alpha(SURFACE_BG_SOFT, 180)),
+            stroke: Stroke::new(1.0, with_alpha(BORDER_COLOR, 210)),
+            title_color: with_alpha(TEXT_PRIMARY, 230),
+            icon_color: with_alpha(TEXT_MUTED, 220),
+        }
+    } else {
+        TerminalManagerRowChrome {
+            fill: None,
+            stroke: Stroke::NONE,
+            title_color: with_alpha(TEXT_PRIMARY, 210),
+            icon_color: with_alpha(TEXT_MUTED, 200),
         }
     }
 }
@@ -7458,20 +7797,21 @@ fn normalize_terminal_background(color: TerminalColor) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        average_terminal_cell_width, build_terminal_cursor_overlay, build_terminal_render,
-        configure_terminal_font_family, cursor_hidden_by_row_filter, default_app_open_command,
-        force_terminal_pane_width, install_terminal_font_family, next_active_terminal_after_close,
-        next_terminal_in_direction, normalize_terminal_background, parse_branch_header,
-        recover_config_state, resolve_ctrl_c_action, should_resolve_terminal_link,
-        source_control_badge_state, source_control_tooltip_lines, terminal_cell_metric,
-        terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect, terminal_font_family,
-        terminal_font_id, terminal_grid_dimensions, terminal_line_height,
-        terminal_link_activation_modifiers, terminal_link_at_point, terminal_logical_line,
-        terminal_logical_line_byte_index, terminal_manager_actions_width,
-        terminal_manager_row_widths, terminal_output_surface_size, terminal_output_viewport_size,
+        ai_badge_visual, average_terminal_cell_width, build_terminal_cursor_overlay,
+        build_terminal_render, configure_terminal_font_family, cursor_hidden_by_row_filter,
+        default_app_open_command, draw_ai_badge, force_terminal_pane_width,
+        install_terminal_font_family, next_active_terminal_after_close, next_terminal_in_direction,
+        normalize_terminal_background, parse_branch_header, recover_config_state,
+        resolve_ctrl_c_action, should_resolve_terminal_link, source_control_badge_state,
+        source_control_tooltip_lines, terminal_cell_metric, terminal_cursor_blink_phase_visible,
+        terminal_cursor_overlay_rect, terminal_font_family, terminal_font_id,
+        terminal_grid_dimensions, terminal_line_height, terminal_link_activation_modifiers,
+        terminal_link_at_point, terminal_logical_line, terminal_logical_line_byte_index,
+        terminal_manager_actions_width, terminal_manager_row_chrome, terminal_manager_row_widths,
+        terminal_output_surface_size, terminal_output_viewport_size,
         terminal_secondary_click_action, terminal_selection_point_from_pointer,
         terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
-        AdeApp, AiBadgeModel, CtrlCAction, DirectoryIndexSnapshot, DirectoryNode,
+        AdeApp, AiBadgeModel, AiBadgeVisual, CtrlCAction, DirectoryIndexSnapshot, DirectoryNode,
         FactoryDroidHookInboxEvent, FactoryDroidStatusSource, FactoryDroidTransportDiagnostics,
         PendingConfigChanges, PendingTerminalLinkClick, SourceControlBadgeState, SourceControlFile,
         SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
@@ -7486,10 +7826,11 @@ mod tests {
     use crate::layout;
     use crate::models::{AppConfig, MainVisibilityMode, ProjectRecord, ShellKind, TerminalKind};
     use crate::terminal::{
-        test_terminal_runtime, TerminalColor, TerminalCursor, TerminalCursorLine,
-        TerminalCursorShape, TerminalSelectionHyperlink, TerminalSelectionLine,
-        TerminalSelectionSnapshot, TerminalSnapshot, TerminalStyle, TerminalStyledCell,
-        TerminalStyledLine, TerminalStyledRun, TerminalUiEvent, TerminalUiEventKind,
+        test_terminal_runtime, test_terminal_runtime_with_capture, TerminalColor, TerminalCursor,
+        TerminalCursorLine, TerminalCursorShape, TerminalRuntime, TerminalSelectionHyperlink,
+        TerminalSelectionLine, TerminalSelectionSnapshot, TerminalSnapshot, TerminalStyle,
+        TerminalStyledCell, TerminalStyledLine, TerminalStyledRun, TerminalUiEvent,
+        TerminalUiEventKind,
     };
     use eframe::egui::text::{LayoutJob, TextFormat};
     use eframe::egui::{
@@ -7515,6 +7856,185 @@ mod tests {
     fn maps_backspace_to_delete_byte() {
         let backspace = AdeApp::key_to_terminal_bytes(Key::Backspace, Modifiers::default());
         assert_eq!(backspace, Some(b"\x7f".to_vec()));
+    }
+
+    #[test]
+    fn first_backspace_press_arms_terminal_held_key_repeat() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+
+        let processed = app.preprocess_terminal_input_with_held_repeat_state(
+            Some(1),
+            true,
+            1.0,
+            vec![test_repeatable_key_event(Key::Backspace, true)],
+        );
+
+        assert_eq!(
+            processed,
+            vec![test_repeatable_key_event(Key::Backspace, true)]
+        );
+        let held = app
+            .terminal_held_key_repeat
+            .expect("held repeat should be armed");
+        assert_eq!(held.terminal_id, 1);
+        assert_eq!(held.key, Key::Backspace);
+        assert_eq!(held.modifiers, Modifiers::default());
+        assert_eq!(held.first_pressed_at, 1.0);
+        assert_eq!(held.last_repeat_at, None);
+    }
+
+    #[test]
+    fn repeated_backspace_press_is_suppressed_while_key_is_held() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+
+        let first = app.preprocess_terminal_input_with_held_repeat_state(
+            Some(1),
+            true,
+            0.0,
+            vec![test_repeatable_key_event(Key::Backspace, true)],
+        );
+        let repeated = app.preprocess_terminal_input_with_held_repeat_state(
+            Some(1),
+            true,
+            0.1,
+            vec![test_repeatable_key_event(Key::Backspace, true)],
+        );
+
+        assert_eq!(first, vec![test_repeatable_key_event(Key::Backspace, true)]);
+        assert!(repeated.is_empty());
+        assert!(app.terminal_held_key_repeat.is_some());
+    }
+
+    #[test]
+    fn held_backspace_synthesizes_repeat_events_after_delay() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let timing = AdeApp::terminal_held_key_repeat_timing();
+
+        app.preprocess_terminal_input_with_held_repeat_state(
+            Some(1),
+            true,
+            0.0,
+            vec![test_repeatable_key_event(Key::Backspace, true)],
+        );
+        let repeated = app.preprocess_terminal_input_with_held_repeat_state(
+            Some(1),
+            true,
+            timing.initial_delay_secs + (timing.interval_secs * 2.5),
+            Vec::new(),
+        );
+
+        assert_eq!(repeated.len(), 3);
+        assert!(repeated.iter().all(
+            |event| *event == test_repeatable_key_event_with_repeat(Key::Backspace, true, true)
+        ));
+        assert_eq!(
+            app.terminal_held_key_repeat
+                .expect("held repeat should remain armed")
+                .last_repeat_at,
+            Some(timing.initial_delay_secs + (timing.interval_secs * 2.0))
+        );
+    }
+
+    #[test]
+    fn backspace_release_clears_held_repeat_and_stops_synthesis() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let timing = AdeApp::terminal_held_key_repeat_timing();
+
+        app.preprocess_terminal_input_with_held_repeat_state(
+            Some(1),
+            true,
+            0.0,
+            vec![test_repeatable_key_event(Key::Backspace, true)],
+        );
+        let released = app.preprocess_terminal_input_with_held_repeat_state(
+            Some(1),
+            true,
+            0.2,
+            vec![test_repeatable_key_event(Key::Backspace, false)],
+        );
+        let after_release = app.preprocess_terminal_input_with_held_repeat_state(
+            Some(1),
+            true,
+            timing.initial_delay_secs + (timing.interval_secs * 4.0),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            released,
+            vec![test_repeatable_key_event(Key::Backspace, false)]
+        );
+        assert!(after_release.is_empty());
+        assert!(app.terminal_held_key_repeat.is_none());
+    }
+
+    #[test]
+    fn losing_terminal_capture_clears_held_repeat_state() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+
+        app.preprocess_terminal_input_with_held_repeat_state(
+            Some(1),
+            true,
+            0.0,
+            vec![test_repeatable_key_event(Key::Backspace, true)],
+        );
+        let processed =
+            app.preprocess_terminal_input_with_held_repeat_state(Some(1), false, 0.1, Vec::new());
+
+        assert!(processed.is_empty());
+        assert!(app.terminal_held_key_repeat.is_none());
+    }
+
+    #[test]
+    fn changing_active_terminal_clears_held_repeat_state() {
+        let ctx = Context::default();
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(1),
+        );
+
+        app.preprocess_terminal_input_with_held_repeat_state(
+            Some(1),
+            true,
+            0.0,
+            vec![test_repeatable_key_event(Key::Backspace, true)],
+        );
+        app.set_active_terminal(&ctx, Some(2));
+
+        assert!(app.terminal_held_key_repeat.is_none());
+    }
+
+    #[test]
+    fn held_backspace_repeat_writes_multiple_delete_bytes_to_terminal() {
+        let ctx = Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        let timing = AdeApp::terminal_held_key_repeat_timing();
+
+        let initial = app.preprocess_terminal_input_with_held_repeat_state(
+            Some(1),
+            true,
+            0.0,
+            vec![test_repeatable_key_event(Key::Backspace, true)],
+        );
+        app.route_active_terminal_input(&ctx, initial);
+        capture.drain();
+
+        let repeated = app.preprocess_terminal_input_with_held_repeat_state(
+            Some(1),
+            true,
+            timing.initial_delay_secs + (timing.interval_secs * 2.5),
+            Vec::new(),
+        );
+        app.route_active_terminal_input(&ctx, repeated);
+        capture.drain();
+
+        assert_eq!(capture.bytes(), vec![0x7f, 0x7f, 0x7f, 0x7f]);
     }
 
     #[test]
@@ -8016,6 +8536,7 @@ mod tests {
             ],
             Some(1),
         );
+        app.config.ui.multi_terminal_view_enabled = true;
         ctx.input_mut(|input| {
             input.events = vec![Event::Key {
                 key: Key::ArrowRight,
@@ -8834,7 +9355,7 @@ mod tests {
 
     #[test]
     fn terminal_manager_row_reserves_gap_and_actions_width() {
-        let actions_width = terminal_manager_actions_width(8.0);
+        let actions_width = terminal_manager_actions_width(8.0, true);
         let (label_width, actions_area_width) =
             terminal_manager_row_widths(160.0, actions_width, 8.0);
 
@@ -8844,12 +9365,22 @@ mod tests {
 
     #[test]
     fn terminal_manager_row_gives_actions_full_width_when_space_is_tight() {
-        let actions_width = terminal_manager_actions_width(8.0);
+        let actions_width = terminal_manager_actions_width(8.0, true);
         let (label_width, actions_area_width) =
             terminal_manager_row_widths(70.0, actions_width, 8.0);
 
         assert_eq!(label_width, 0.0);
         assert_eq!(actions_area_width, 70.0);
+    }
+
+    #[test]
+    fn terminal_manager_row_actions_shrink_when_visibility_toggle_is_hidden() {
+        let actions_width = terminal_manager_actions_width(8.0, false);
+
+        assert_eq!(
+            actions_width,
+            super::CONTROL_ROW_HEIGHT + super::TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH + 8.0
+        );
     }
 
     #[test]
@@ -9283,6 +9814,7 @@ mod tests {
             ],
             Some(1),
         );
+        app.config.ui.multi_terminal_view_enabled = true;
 
         app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
 
@@ -9299,6 +9831,7 @@ mod tests {
             ],
             Some(1),
         );
+        app.config.ui.multi_terminal_view_enabled = true;
         app.buffered_terminal_navigation = vec![TerminalNavigationDirection::Right];
 
         app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
@@ -9598,6 +10131,75 @@ mod tests {
     }
 
     #[test]
+    fn single_terminal_mode_shows_only_active_terminal() {
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(2),
+        );
+        app.terminals.get_mut(&2).expect("terminal 2").in_main_view = false;
+
+        assert_eq!(app.visible_terminal_ids_for_main(), vec![2]);
+    }
+
+    #[test]
+    fn single_terminal_mode_falls_back_to_first_terminal_when_active_terminal_missing() {
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            None,
+        );
+        app.terminals.get_mut(&1).expect("terminal 1").in_main_view = false;
+        app.terminals.get_mut(&2).expect("terminal 2").in_main_view = false;
+
+        assert_eq!(app.visible_terminal_ids_for_main(), vec![1]);
+    }
+
+    #[test]
+    fn multi_terminal_mode_restores_previous_visible_set_after_single_mode() {
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+                (3, test_terminal_entry(3, 7)),
+            ],
+            Some(3),
+        );
+        app.config.ui.multi_terminal_view_enabled = true;
+        app.terminals.get_mut(&2).expect("terminal 2").in_main_view = false;
+
+        assert_eq!(app.visible_terminal_ids_for_main(), vec![1, 3]);
+
+        app.config.ui.multi_terminal_view_enabled = false;
+        assert_eq!(app.visible_terminal_ids_for_main(), vec![3]);
+
+        app.config.ui.multi_terminal_view_enabled = true;
+        assert_eq!(app.visible_terminal_ids_for_main(), vec![1, 3]);
+    }
+
+    #[test]
+    fn single_terminal_mode_switches_visible_terminal_without_closing_previous_session() {
+        let ctx = Context::default();
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(1),
+        );
+
+        app.set_active_terminal(&ctx, Some(2));
+
+        assert_eq!(app.visible_terminal_ids_for_main(), vec![2]);
+        assert!(app.terminals.contains_key(&1));
+        assert!(app.terminals.contains_key(&2));
+    }
+
+    #[test]
     fn ai_status_change_event_updates_badge_without_debug_ui_state() {
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
@@ -9747,7 +10349,7 @@ mod tests {
                 &test_factory_droid_inbox_token(1),
                 "attention",
             ))
-                .expect("serialize attention event")
+            .expect("serialize attention event")
         )
         .expect("append attention event");
 
@@ -9799,7 +10401,11 @@ mod tests {
         write_test_factory_droid_hook_events(
             &hook_dir.path,
             1,
-            &[test_factory_droid_hook_event(1, "stale-inbox-token", "attention")],
+            &[test_factory_droid_hook_event(
+                1,
+                "stale-inbox-token",
+                "attention",
+            )],
         );
 
         app.poll_factory_droid_hook_inboxes(&ctx);
@@ -10224,6 +10830,7 @@ mod tests {
             default_shell: ShellKind::Cmd,
             ui: crate::models::UiConfig {
                 project_explorer_expanded: false,
+                multi_terminal_view_enabled: true,
                 last_selected_project_id: Some(loaded_project.id),
                 ..boot_failed_current_config().ui
             },
@@ -10241,6 +10848,7 @@ mod tests {
 
         assert_eq!(recovered.default_shell, ShellKind::Cmd);
         assert!(!recovered.ui.project_explorer_expanded);
+        assert!(recovered.ui.multi_terminal_view_enabled);
         assert_eq!(
             recovered.ui.last_selected_project_id,
             Some(loaded_project.id)
@@ -10249,6 +10857,32 @@ mod tests {
         assert_eq!(recovered.projects[0].id, loaded_project.id);
         assert_eq!(recovered.projects[0].name, loaded_project.name);
         assert_eq!(recovered.projects[0].path, loaded_project.path);
+    }
+
+    #[test]
+    fn recovered_config_uses_session_multi_terminal_setting_when_ui_changed() {
+        let loaded_config = AppConfig {
+            ui: crate::models::UiConfig {
+                multi_terminal_view_enabled: true,
+                ..crate::models::UiConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        let mut current_config = boot_failed_current_config();
+        current_config.ui.multi_terminal_view_enabled = false;
+
+        let recovered = recover_config_state(
+            &current_config,
+            &BTreeMap::new(),
+            None,
+            loaded_config,
+            PendingConfigChanges {
+                ui: true,
+                ..PendingConfigChanges::default()
+            },
+        );
+
+        assert!(!recovered.ui.multi_terminal_view_enabled);
     }
 
     #[test]
@@ -10480,6 +11114,14 @@ mod tests {
     }
 
     fn test_terminal_entry(id: u64, project_id: u64) -> TerminalEntry {
+        test_terminal_entry_with_runtime(id, project_id, test_terminal_runtime())
+    }
+
+    fn test_terminal_entry_with_runtime(
+        id: u64,
+        project_id: u64,
+        runtime: TerminalRuntime,
+    ) -> TerminalEntry {
         TerminalEntry {
             id,
             project_id,
@@ -10501,7 +11143,7 @@ mod tests {
             selection_drag_active: false,
             snapshot_refresh_deferred: false,
             exited: false,
-            runtime: test_terminal_runtime(),
+            runtime,
             ai_session: AiCliSession::default(),
             factory_droid_inbox_token: Some(test_factory_droid_inbox_token(id)),
             factory_droid_launch_pending_since: None,
@@ -10509,6 +11151,20 @@ mod tests {
             factory_droid_last_process_seen_at: None,
             factory_droid_process_missing_since: None,
             factory_droid_last_status_source: None,
+        }
+    }
+
+    fn test_repeatable_key_event(key: Key, pressed: bool) -> Event {
+        test_repeatable_key_event_with_repeat(key, pressed, false)
+    }
+
+    fn test_repeatable_key_event_with_repeat(key: Key, pressed: bool, repeat: bool) -> Event {
+        Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat,
+            modifiers: Modifiers::default(),
         }
     }
 
@@ -10542,6 +11198,7 @@ mod tests {
             active_terminal,
             buffered_terminal_input: Vec::new(),
             buffered_terminal_navigation: Vec::new(),
+            terminal_held_key_repeat: None,
             allow_attention_terminal_input_routing_once: false,
             pending_terminal_pastes: Vec::new(),
             terminal_events_tx,
@@ -10964,6 +11621,32 @@ mod tests {
     }
 
     #[test]
+    fn terminal_manager_row_chrome_emphasizes_active_terminal() {
+        let chrome = terminal_manager_row_chrome(true, false);
+
+        assert_eq!(chrome.fill, Some(Color32::from_rgb(24, 48, 68)));
+        assert_eq!(
+            chrome.stroke,
+            Stroke::new(1.0, super::with_alpha(super::ACCENT, 220))
+        );
+        assert_eq!(chrome.title_color, Color32::from_rgb(244, 251, 255));
+        assert_eq!(chrome.icon_color, Color32::from_rgb(132, 214, 255));
+    }
+
+    #[test]
+    fn terminal_manager_row_chrome_keeps_inactive_terminal_subtle() {
+        let chrome = terminal_manager_row_chrome(false, false);
+
+        assert_eq!(chrome.fill, None);
+        assert_eq!(chrome.stroke, Stroke::NONE);
+        assert_eq!(
+            chrome.title_color,
+            super::with_alpha(super::TEXT_PRIMARY, 210)
+        );
+        assert_eq!(chrome.icon_color, super::with_alpha(super::TEXT_MUTED, 200));
+    }
+
+    #[test]
     fn default_app_open_command_matches_platform_convention() {
         let path = PathBuf::from("C:\\temp\\notes.txt");
         let (program, args) = default_app_open_command(&path);
@@ -11335,23 +12018,53 @@ mod tests {
     }
 
     #[test]
-    fn ai_badge_only_shows_when_running() {
-        use crate::hooks::{AiCliStatus, AiCliTool};
-        // Badge should only be visible when Running
+    fn ai_badge_visuals_match_status() {
+        assert_eq!(
+            ai_badge_visual(AiCliStatus::Running),
+            Some(AiBadgeVisual::Spinner(Color32::from_rgb(76, 209, 114)))
+        );
+        assert_eq!(
+            ai_badge_visual(AiCliStatus::Attention),
+            Some(AiBadgeVisual::Pulse(Color32::from_rgb(209, 186, 46)))
+        );
+        assert_eq!(ai_badge_visual(AiCliStatus::Inactive), None);
+    }
+
+    #[test]
+    fn draw_ai_badge_hides_inactive_and_reserves_space_for_active_states() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
         let running_badge = AiBadgeModel {
             tool: Some(AiCliTool::FactoryDroid),
             status: AiCliStatus::Running,
             tooltip_lines: vec!["Factory Droid - Working...".to_string()],
         };
-        assert_eq!(running_badge.status, AiCliStatus::Running);
-
-        // Inactive should not show badge
+        let attention_badge = AiBadgeModel {
+            tool: Some(AiCliTool::FactoryDroid),
+            status: AiCliStatus::Attention,
+            tooltip_lines: vec!["Factory Droid - Waiting for you...".to_string()],
+        };
         let inactive_badge = AiBadgeModel {
             tool: Some(AiCliTool::FactoryDroid),
             status: AiCliStatus::Inactive,
             tooltip_lines: vec!["Factory Droid - Idle".to_string()],
         };
-        assert_eq!(inactive_badge.status, AiCliStatus::Inactive);
+
+        let mut running_size = None;
+        let mut attention_size = None;
+        let mut inactive_size = None;
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                running_size = Some(draw_ai_badge(ui, &running_badge).rect.size());
+                attention_size = Some(draw_ai_badge(ui, &attention_badge).rect.size());
+                inactive_size = Some(draw_ai_badge(ui, &inactive_badge).rect.size());
+            });
+        });
+
+        assert_eq!(running_size, Some(egui::vec2(16.0, 16.0)));
+        assert_eq!(attention_size, Some(egui::vec2(16.0, 16.0)));
+        assert_eq!(inactive_size, Some(egui::vec2(0.0, 0.0)));
     }
 
     #[test]
