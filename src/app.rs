@@ -2,11 +2,12 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
+use std::io::Write;
 use std::ops::Range;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -541,6 +542,8 @@ struct SourceControlSnapshot {
     ahead: usize,
     behind: usize,
     files: Vec<SourceControlFile>,
+    added_lines: Option<usize>,
+    removed_lines: Option<usize>,
     loading: bool,
     last_error: Option<String>,
 }
@@ -595,6 +598,37 @@ enum SourceControlBadgeState {
 struct SourceControlBadgeModel {
     state: SourceControlBadgeState,
     tooltip_lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalManagerDiffSummaryState {
+    Unknown,
+    Loading,
+    Ready,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalManagerDiffSummaryModel {
+    state: TerminalManagerDiffSummaryState,
+    added_lines: usize,
+    removed_lines: usize,
+    tooltip_lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalManagerDiffSummaryVisual {
+    Totals {
+        added_text: String,
+        removed_text: String,
+        added_color: Color32,
+        removed_color: Color32,
+        separator_color: Color32,
+    },
+    Placeholder {
+        text: &'static str,
+        color: Color32,
+    },
 }
 
 #[allow(dead_code)]
@@ -678,11 +712,18 @@ fn draw_ai_badge(ui: &mut Ui, badge: &AiBadgeModel) -> egui::Response {
 }
 
 struct TerminalStatusBadgeLayout {
-    response: egui::Response,
     #[cfg(test)]
     ai_rect: Option<egui::Rect>,
     #[cfg(test)]
     source_control_rect: egui::Rect,
+}
+
+struct TerminalManagerTitleSummaryLayout {
+    response: egui::Response,
+    #[cfg(test)]
+    title_rect: egui::Rect,
+    #[cfg(test)]
+    diff_summary_rect: egui::Rect,
 }
 
 fn draw_terminal_status_badges(
@@ -700,13 +741,12 @@ fn draw_terminal_status_badges(
     let source_control_rect = source_control_response.rect;
     ui.add_space(4.0);
 
-    let response = match ai_response {
+    let _response = match ai_response {
         Some(response) => response.union(source_control_response),
         None => source_control_response,
     };
 
     TerminalStatusBadgeLayout {
-        response,
         #[cfg(test)]
         ai_rect,
         #[cfg(test)]
@@ -4483,8 +4523,8 @@ impl AdeApp {
             .unwrap_or_default();
         let current_active = self.active_terminal;
         let show_visibility_toggle = self.config.ui.multi_terminal_view_enabled;
-        let project_source_control_badge =
-            source_control_badge_model(self.source_control_state.get(&project_id));
+        let project_source_control_diff_summary =
+            terminal_manager_diff_summary_model(self.source_control_state.get(&project_id));
 
         for terminal_id in ids {
             let mut set_active = false;
@@ -4538,11 +4578,11 @@ impl AdeApp {
                                 ui.add_space(SIDEBAR_ROW_LEADING_INSET);
 
                                 let ai_badge = AiBadgeModel::from_session(&terminal.ai_session);
-                                let badge_layout = draw_terminal_status_badges(
-                                    ui,
-                                    &ai_badge,
-                                    &project_source_control_badge,
-                                );
+                                let ai_response = ai_badge_visual(ai_badge.status)
+                                    .map(|_| draw_ai_badge(ui, &ai_badge));
+                                if ai_response.is_some() {
+                                    ui.add_space(4.0);
+                                }
 
                                 let term_icon_color = if terminal.exited {
                                     Color32::from_rgb(200, 100, 100)
@@ -4568,27 +4608,19 @@ impl AdeApp {
                                 } else {
                                     row_chrome.title_color
                                 };
-                                let title_label = egui::Label::new(
-                                    RichText::new(label.clone()).color(text_color),
-                                )
-                                .truncate()
-                                .sense(Sense::click());
-                                let title_response = ui.add(title_label);
-                                {
-                                    let info = WidgetInfo::selected(
-                                        WidgetType::SelectableLabel,
-                                        ui.is_enabled(),
-                                        active,
-                                        &label,
-                                    );
-                                    title_response.widget_info(|| info.clone());
-                                }
-                                title_response
-                                    .clone()
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                    .on_hover_text(&label);
+                                let title_layout = draw_terminal_manager_title_and_diff_summary(
+                                    ui,
+                                    &label,
+                                    text_color,
+                                    active,
+                                    row_height,
+                                    &project_source_control_diff_summary,
+                                );
 
-                                badge_layout.response.union(title_response)
+                                match ai_response {
+                                    Some(response) => response.union(title_layout.response),
+                                    None => title_layout.response,
+                                }
                             },
                         )
                         .inner;
@@ -5977,17 +6009,263 @@ fn collect_source_control_snapshot(project_path: &Path, run_fetch: bool) -> Sour
     snapshot
         .files
         .sort_by(|left, right| left.path.cmp(&right.path));
+
+    if let Some((added_lines, removed_lines)) = collect_source_control_line_totals(project_path) {
+        snapshot.added_lines = Some(added_lines);
+        snapshot.removed_lines = Some(removed_lines);
+    }
+
     snapshot
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextLineEncoding {
+    Bytes,
+    Utf16Le,
+    Utf16Be,
+}
+
+fn collect_source_control_line_totals(project_path: &Path) -> Option<(usize, usize)> {
+    let diff_base = resolve_git_tracked_diff_base(project_path).ok()?;
+    let (tracked_added, tracked_removed) =
+        run_git_numstat_totals(project_path, &["diff", diff_base.as_str(), "--numstat"]).ok()?;
+    let untracked_added = count_untracked_text_file_lines(project_path).ok()?;
+
+    Some((
+        tracked_added.saturating_add(untracked_added),
+        tracked_removed,
+    ))
+}
+
+fn resolve_git_tracked_diff_base(project_path: &Path) -> std::io::Result<String> {
+    let output = run_git_command(project_path, &["rev-parse", "--verify", "HEAD"])?;
+    if output.status.success() {
+        Ok("HEAD".to_owned())
+    } else {
+        git_empty_tree_oid(project_path)
+    }
+}
+
+fn git_empty_tree_oid(project_path: &Path) -> std::io::Result<String> {
+    let args = ["hash-object", "-t", "tree", "--stdin"];
+    let output = run_git_command_with_input(project_path, &args, Some(&[]))?;
+    if !output.status.success() {
+        return Err(git_command_status_error(&args, &output.stderr));
+    }
+
+    let oid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if oid.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "git hash-object returned an empty tree id",
+        ));
+    }
+
+    Ok(oid)
+}
+
+fn run_git_numstat_totals(project_path: &Path, args: &[&str]) -> std::io::Result<(usize, usize)> {
+    let output = run_git_command(project_path, args)?;
+    if !output.status.success() {
+        return Err(git_command_status_error(args, &output.stderr));
+    }
+
+    Ok(parse_git_numstat_totals(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn parse_git_numstat_totals(stdout: &str) -> (usize, usize) {
+    let mut added_lines = 0usize;
+    let mut removed_lines = 0usize;
+
+    for line in stdout.lines() {
+        let mut columns = line.splitn(3, '\t');
+        let Some(added_text) = columns.next() else {
+            continue;
+        };
+        let Some(removed_text) = columns.next() else {
+            continue;
+        };
+
+        let Ok(added) = added_text.parse::<usize>() else {
+            continue;
+        };
+        let Ok(removed) = removed_text.parse::<usize>() else {
+            continue;
+        };
+
+        added_lines = added_lines.saturating_add(added);
+        removed_lines = removed_lines.saturating_add(removed);
+    }
+
+    (added_lines, removed_lines)
+}
+
+fn count_untracked_text_file_lines(project_path: &Path) -> std::io::Result<usize> {
+    let args = ["ls-files", "--others", "--exclude-standard", "-z"];
+    let output = run_git_command(project_path, &args)?;
+    if !output.status.success() {
+        return Err(git_command_status_error(&args, &output.stderr));
+    }
+
+    Ok(parse_git_path_list(&output.stdout)
+        .into_iter()
+        .filter_map(|path| count_text_file_lines(&project_path.join(path)))
+        .fold(0usize, usize::saturating_add))
+}
+
+fn parse_git_path_list(stdout: &[u8]) -> Vec<PathBuf> {
+    stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| PathBuf::from(String::from_utf8_lossy(path).into_owned()))
+        .collect()
+}
+
+fn count_text_file_lines(path: &Path) -> Option<usize> {
+    if !path.is_file() {
+        return None;
+    }
+
+    let bytes = fs::read(path).ok()?;
+    count_text_line_bytes(&bytes)
+}
+
+fn count_text_line_bytes(bytes: &[u8]) -> Option<usize> {
+    let (encoding, offset) = detect_text_line_encoding(bytes)?;
+    let data = &bytes[offset..];
+
+    match encoding {
+        TextLineEncoding::Bytes => Some(count_byte_lines(data, b'\n')),
+        TextLineEncoding::Utf16Le => count_utf16_lines(data, true),
+        TextLineEncoding::Utf16Be => count_utf16_lines(data, false),
+    }
+}
+
+fn detect_text_line_encoding(bytes: &[u8]) -> Option<(TextLineEncoding, usize)> {
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return Some((TextLineEncoding::Utf16Le, 2));
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return Some((TextLineEncoding::Utf16Be, 2));
+    }
+    if bytes.contains(&0) {
+        return detect_bomless_utf16_encoding(bytes).map(|encoding| (encoding, 0));
+    }
+
+    Some((TextLineEncoding::Bytes, 0))
+}
+
+fn detect_bomless_utf16_encoding(bytes: &[u8]) -> Option<TextLineEncoding> {
+    if bytes.len() < 2 || bytes.len() % 2 != 0 {
+        return None;
+    }
+
+    let mut little_endian_pairs = 0usize;
+    let mut big_endian_pairs = 0usize;
+    for chunk in bytes.chunks_exact(2) {
+        match (chunk[0] == 0, chunk[1] == 0) {
+            (false, true) => {
+                little_endian_pairs = little_endian_pairs.saturating_add(1);
+            }
+            (true, false) => {
+                big_endian_pairs = big_endian_pairs.saturating_add(1);
+            }
+            _ => return None,
+        }
+    }
+
+    if little_endian_pairs > 0 && big_endian_pairs == 0 {
+        Some(TextLineEncoding::Utf16Le)
+    } else if big_endian_pairs > 0 && little_endian_pairs == 0 {
+        Some(TextLineEncoding::Utf16Be)
+    } else {
+        None
+    }
+}
+
+fn count_byte_lines(bytes: &[u8], newline_byte: u8) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+
+    let line_breaks = bytes.iter().filter(|byte| **byte == newline_byte).count();
+    if bytes.last() == Some(&newline_byte) {
+        line_breaks
+    } else {
+        line_breaks.saturating_add(1)
+    }
+}
+
+fn count_utf16_lines(bytes: &[u8], little_endian: bool) -> Option<usize> {
+    if bytes.is_empty() {
+        return Some(0);
+    }
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+
+    let mut line_breaks = 0usize;
+    let mut last_code_unit = None;
+    for chunk in bytes.chunks_exact(2) {
+        let code_unit = if little_endian {
+            u16::from_le_bytes([chunk[0], chunk[1]])
+        } else {
+            u16::from_be_bytes([chunk[0], chunk[1]])
+        };
+        if code_unit == 0x000A {
+            line_breaks = line_breaks.saturating_add(1);
+        }
+        last_code_unit = Some(code_unit);
+    }
+
+    if last_code_unit == Some(0x000A) {
+        Some(line_breaks)
+    } else {
+        Some(line_breaks.saturating_add(1))
+    }
+}
+
+fn git_command_status_error(args: &[&str], stderr: &[u8]) -> std::io::Error {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
+    let message = if stderr.is_empty() {
+        format!("git {} failed", args.join(" "))
+    } else {
+        stderr
+    };
+    std::io::Error::new(std::io::ErrorKind::Other, message)
+}
+
 fn run_git_command(project_path: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    run_git_command_with_input(project_path, args, None)
+}
+
+fn run_git_command_with_input(
+    project_path: &Path,
+    args: &[&str],
+    stdin_bytes: Option<&[u8]>,
+) -> std::io::Result<std::process::Output> {
     let mut command = Command::new("git");
     command.arg("-C").arg(project_path).args(args);
     #[cfg(target_os = "windows")]
     {
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    command.output()
+
+    if let Some(stdin_bytes) = stdin_bytes {
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+
+        let mut child = command.spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(stdin_bytes)?;
+        }
+        child.wait_with_output()
+    } else {
+        command.output()
+    }
 }
 
 fn parse_branch_header(header: &str) -> (String, usize, usize) {
@@ -6828,6 +7106,81 @@ fn source_control_badge_model(snapshot: Option<&SourceControlSnapshot>) -> Sourc
     }
 }
 
+fn terminal_manager_diff_summary_model(
+    snapshot: Option<&SourceControlSnapshot>,
+) -> TerminalManagerDiffSummaryModel {
+    match snapshot {
+        Some(snapshot) if snapshot.loading => TerminalManagerDiffSummaryModel {
+            state: TerminalManagerDiffSummaryState::Loading,
+            added_lines: 0,
+            removed_lines: 0,
+            tooltip_lines: source_control_tooltip_lines(
+                snapshot,
+                SOURCE_CONTROL_TOOLTIP_FILE_LIMIT,
+            ),
+        },
+        Some(snapshot) if snapshot.last_error.is_some() => TerminalManagerDiffSummaryModel {
+            state: TerminalManagerDiffSummaryState::Error,
+            added_lines: 0,
+            removed_lines: 0,
+            tooltip_lines: source_control_tooltip_lines(
+                snapshot,
+                SOURCE_CONTROL_TOOLTIP_FILE_LIMIT,
+            ),
+        },
+        Some(snapshot) => match (snapshot.added_lines, snapshot.removed_lines) {
+            (Some(added_lines), Some(removed_lines)) => TerminalManagerDiffSummaryModel {
+                state: TerminalManagerDiffSummaryState::Ready,
+                added_lines,
+                removed_lines,
+                tooltip_lines: source_control_tooltip_lines(
+                    snapshot,
+                    SOURCE_CONTROL_TOOLTIP_FILE_LIMIT,
+                ),
+            },
+            _ => TerminalManagerDiffSummaryModel {
+                state: TerminalManagerDiffSummaryState::Unknown,
+                added_lines: 0,
+                removed_lines: 0,
+                tooltip_lines: source_control_tooltip_lines(
+                    snapshot,
+                    SOURCE_CONTROL_TOOLTIP_FILE_LIMIT,
+                ),
+            },
+        },
+        None => TerminalManagerDiffSummaryModel {
+            state: TerminalManagerDiffSummaryState::Unknown,
+            added_lines: 0,
+            removed_lines: 0,
+            tooltip_lines: vec!["Status pending".to_owned()],
+        },
+    }
+}
+
+fn terminal_manager_diff_summary_visual(
+    summary: &TerminalManagerDiffSummaryModel,
+) -> TerminalManagerDiffSummaryVisual {
+    match summary.state {
+        TerminalManagerDiffSummaryState::Ready => TerminalManagerDiffSummaryVisual::Totals {
+            added_text: format!("+{}", summary.added_lines),
+            removed_text: format!("-{}", summary.removed_lines),
+            added_color: source_control_badge_color(SourceControlBadgeState::Clean),
+            removed_color: source_control_badge_color(SourceControlBadgeState::Error),
+            separator_color: TEXT_MUTED,
+        },
+        TerminalManagerDiffSummaryState::Loading => TerminalManagerDiffSummaryVisual::Placeholder {
+            text: "...",
+            color: TEXT_MUTED,
+        },
+        TerminalManagerDiffSummaryState::Unknown | TerminalManagerDiffSummaryState::Error => {
+            TerminalManagerDiffSummaryVisual::Placeholder {
+                text: "--",
+                color: TEXT_MUTED,
+            }
+        }
+    }
+}
+
 fn source_control_tooltip_lines(snapshot: &SourceControlSnapshot, max_files: usize) -> Vec<String> {
     if let Some(error) = &snapshot.last_error {
         return vec![error.clone()];
@@ -6877,6 +7230,133 @@ fn draw_source_control_badge(ui: &mut Ui, badge: &SourceControlBadgeModel) -> eg
             ui.label(line);
         }
     })
+}
+
+fn terminal_manager_diff_summary_layout_job(
+    ui: &Ui,
+    summary: &TerminalManagerDiffSummaryModel,
+) -> LayoutJob {
+    let visual = terminal_manager_diff_summary_visual(summary);
+    let mut layout_job = LayoutJob::default();
+    layout_job.wrap.max_width = f32::INFINITY;
+    let font_id = egui::TextStyle::Small.resolve(ui.style());
+
+    match visual {
+        TerminalManagerDiffSummaryVisual::Totals {
+            added_text,
+            removed_text,
+            added_color,
+            removed_color,
+            separator_color,
+        } => {
+            layout_job.append(
+                &added_text,
+                0.0,
+                TextFormat {
+                    font_id: font_id.clone(),
+                    color: added_color,
+                    ..TextFormat::default()
+                },
+            );
+            layout_job.append(
+                " ",
+                0.0,
+                TextFormat {
+                    font_id: font_id.clone(),
+                    color: separator_color,
+                    ..TextFormat::default()
+                },
+            );
+            layout_job.append(
+                &removed_text,
+                0.0,
+                TextFormat {
+                    font_id,
+                    color: removed_color,
+                    ..TextFormat::default()
+                },
+            );
+        }
+        TerminalManagerDiffSummaryVisual::Placeholder { text, color } => {
+            layout_job.append(
+                text,
+                0.0,
+                TextFormat {
+                    font_id,
+                    color,
+                    ..TextFormat::default()
+                },
+            );
+        }
+    }
+
+    layout_job
+}
+
+fn draw_terminal_manager_diff_summary(
+    ui: &mut Ui,
+    summary: &TerminalManagerDiffSummaryModel,
+) -> egui::Response {
+    let response = ui.add(
+        egui::Label::new(WidgetText::from(terminal_manager_diff_summary_layout_job(
+            ui, summary,
+        )))
+        .sense(Sense::hover()),
+    );
+
+    response.on_hover_ui(|ui| {
+        for line in &summary.tooltip_lines {
+            ui.label(line);
+        }
+    })
+}
+
+fn draw_terminal_manager_title_and_diff_summary(
+    ui: &mut Ui,
+    title: &str,
+    text_color: Color32,
+    is_active: bool,
+    row_height: f32,
+    diff_summary: &TerminalManagerDiffSummaryModel,
+) -> TerminalManagerTitleSummaryLayout {
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width().max(0.0), row_height),
+        Layout::right_to_left(Align::Center),
+        |ui| {
+            let diff_summary_response = draw_terminal_manager_diff_summary(ui, diff_summary);
+            ui.add_space(6.0);
+
+            let title_label = egui::Label::new(RichText::new(title).color(text_color))
+                .truncate()
+                .sense(Sense::click());
+            let title_response = ui.add_sized(
+                egui::vec2(ui.available_width().max(0.0), row_height),
+                title_label,
+            );
+            {
+                let info = WidgetInfo::selected(
+                    WidgetType::SelectableLabel,
+                    ui.is_enabled(),
+                    is_active,
+                    title,
+                );
+                title_response.widget_info(|| info.clone());
+            }
+            title_response
+                .clone()
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(title);
+
+            TerminalManagerTitleSummaryLayout {
+                response: diff_summary_response.union(title_response.clone()),
+                #[cfg(test)]
+                title_rect: title_response.rect,
+                #[cfg(test)]
+                diff_summary_rect: diff_summary_response.rect,
+            }
+        },
+    )
+    .inner
 }
 
 fn lerp_pos(a: egui::Pos2, b: egui::Pos2, t: f32) -> egui::Pos2 {
@@ -8040,29 +8520,33 @@ fn normalize_terminal_background(color: TerminalColor) -> Color32 {
 mod tests {
     use super::{
         ai_badge_visual, average_terminal_cell_width, build_terminal_cursor_overlay,
-        build_terminal_render, configure_terminal_font_family, cursor_hidden_by_row_filter,
+        build_terminal_render, collect_source_control_line_totals, collect_source_control_snapshot,
+        configure_terminal_font_family, count_text_line_bytes, cursor_hidden_by_row_filter,
         default_app_open_command, draw_ai_badge, draw_source_control_badge,
-        draw_terminal_status_badges, force_terminal_pane_width, install_terminal_font_family,
-        next_active_terminal_after_close, next_terminal_in_direction,
-        next_terminal_in_linear_direction, normalize_terminal_background, parse_branch_header,
+        draw_terminal_manager_title_and_diff_summary, draw_terminal_status_badges,
+        force_terminal_pane_width, install_terminal_font_family, next_active_terminal_after_close,
+        next_terminal_in_direction, next_terminal_in_linear_direction,
+        normalize_terminal_background, parse_branch_header, parse_git_numstat_totals,
         recover_config_state, resolve_ctrl_c_action, should_resolve_terminal_link,
-        source_control_badge_model, source_control_badge_state, source_control_tooltip_lines,
-        terminal_cell_metric, terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect,
-        terminal_font_family, terminal_font_id, terminal_grid_dimensions, terminal_line_height,
-        terminal_link_activation_modifiers, terminal_link_at_point, terminal_logical_line,
-        terminal_logical_line_byte_index, terminal_manager_actions_width,
-        terminal_manager_row_chrome, terminal_manager_row_widths, terminal_output_surface_size,
-        terminal_output_viewport_size, terminal_secondary_click_action,
-        terminal_selection_point_from_pointer, terminal_selection_text, to_egui_color,
-        update_stable_cursor_row, visible_terminal_cursor, AdeApp, AiBadgeModel, AiBadgeVisual,
-        CtrlCAction, DirectoryIndexSnapshot, DirectoryNode, FactoryDroidHookInboxEvent,
-        FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, PendingConfigChanges,
-        PendingTerminalLinkClick, SourceControlBadgeState, SourceControlFile,
+        source_control_badge_color, source_control_badge_model, source_control_badge_state,
+        source_control_tooltip_lines, terminal_cell_metric, terminal_cursor_blink_phase_visible,
+        terminal_cursor_overlay_rect, terminal_font_family, terminal_font_id,
+        terminal_grid_dimensions, terminal_line_height, terminal_link_activation_modifiers,
+        terminal_link_at_point, terminal_logical_line, terminal_logical_line_byte_index,
+        terminal_manager_actions_width, terminal_manager_diff_summary_model,
+        terminal_manager_diff_summary_visual, terminal_manager_row_chrome,
+        terminal_manager_row_widths, terminal_output_surface_size, terminal_output_viewport_size,
+        terminal_secondary_click_action, terminal_selection_point_from_pointer,
+        terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
+        AdeApp, AiBadgeModel, AiBadgeVisual, CtrlCAction, DirectoryIndexSnapshot, DirectoryNode,
+        FactoryDroidHookInboxEvent, FactoryDroidStatusSource, FactoryDroidTransportDiagnostics,
+        PendingConfigChanges, PendingTerminalLinkClick, SourceControlBadgeState, SourceControlFile,
         SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
-        TerminalNavigationDirection, TerminalNavigationShortcut, TerminalSecondaryClickAction,
-        TerminalSelection, TerminalSelectionPoint, TransientToast, FACTORY_DROID_HOOK_POLL_MS,
-        FACTORY_DROID_PROCESS_POLL_MS, FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS,
-        TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_COPY_TOAST_SECS, TERMINAL_OUTPUT_BG,
+        TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
+        TerminalSecondaryClickAction, TerminalSelection, TerminalSelectionPoint, TransientToast,
+        FACTORY_DROID_HOOK_POLL_MS, FACTORY_DROID_PROCESS_POLL_MS,
+        FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS, TERMINAL_COPY_FEEDBACK_TEXT,
+        TERMINAL_COPY_TOAST_SECS, TERMINAL_OUTPUT_BG,
     };
     use crate::hooks::{
         AiCliSession, AiCliStatus, AiCliTool, AiHookManager, AiHooksConfig, ProjectAiConfig,
@@ -8083,7 +8567,7 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -9659,6 +10143,42 @@ mod tests {
     }
 
     #[test]
+    fn terminal_manager_title_layout_keeps_diff_summary_right_aligned() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let mut snapshot =
+            test_source_control_snapshot("main", &[("src/app.rs", "Modified", false)]);
+        snapshot.added_lines = Some(24);
+        snapshot.removed_lines = Some(7);
+        let diff_summary = terminal_manager_diff_summary_model(Some(&snapshot));
+
+        let mut observed = None;
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(180.0, super::CONTROL_ROW_HEIGHT),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        let layout = draw_terminal_manager_title_and_diff_summary(
+                            ui,
+                            "terminal command title that should truncate",
+                            super::TEXT_PRIMARY,
+                            false,
+                            super::CONTROL_ROW_HEIGHT,
+                            &diff_summary,
+                        );
+                        observed = Some((layout.title_rect, layout.diff_summary_rect));
+                    },
+                );
+            });
+        });
+
+        let (title_rect, diff_summary_rect) = observed.expect("expected title layout");
+        assert!(title_rect.max.x <= diff_summary_rect.min.x);
+    }
+
+    #[test]
     fn project_group_header_row_reserves_space_for_inline_actions() {
         let (label_width, actions_width) = super::project_group_header_row_layout(160.0, 8.0);
 
@@ -9750,6 +10270,8 @@ mod tests {
                     staged: *staged,
                 })
                 .collect(),
+            added_lines: Some(0),
+            removed_lines: Some(0),
             loading: false,
             last_error: None,
         };
@@ -9768,6 +10290,133 @@ mod tests {
             "expected staged file entry"
         );
         assert_eq!(lines.last().map(String::as_str), Some("+3 more"));
+    }
+
+    #[test]
+    fn parse_git_numstat_totals_skips_binary_rows() {
+        let totals = parse_git_numstat_totals(
+            "2\t1\tsrc/app.rs\n-\t-\tassets/logo.png\n4\t0\tsrc/layout.rs\n",
+        );
+
+        assert_eq!(totals, (6, 1));
+    }
+
+    #[test]
+    fn count_text_line_bytes_supports_utf8_and_utf16_variants() {
+        assert_eq!(count_text_line_bytes(b"alpha\nbeta\n"), Some(2));
+        assert_eq!(
+            count_text_line_bytes(&[0xFF, 0xFE, b'a', 0, b'\r', 0, b'\n', 0, b'b', 0]),
+            Some(2)
+        );
+        assert_eq!(
+            count_text_line_bytes(&[0xFE, 0xFF, 0, b'a', 0, b'\n', 0, b'b']),
+            Some(2)
+        );
+        assert_eq!(
+            count_text_line_bytes(&[b'a', 0, b'\n', 0, b'b', 0]),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn count_text_line_bytes_skips_binary_content_with_embedded_nuls() {
+        assert_eq!(count_text_line_bytes(&[0_u8, 159, 146, 150]), None);
+    }
+
+    #[test]
+    fn source_control_line_totals_use_head_diff_without_double_counting() {
+        let temp_dir = TestTempDir::new("source-control-head-diff");
+        init_test_git_repo(&temp_dir);
+
+        fs::write(temp_dir.path.join("tracked.txt"), "old\n").expect("write tracked file");
+        assert_git_success(&temp_dir.path, &["add", "tracked.txt"]);
+        assert_git_success(&temp_dir.path, &["commit", "--quiet", "-m", "init"]);
+
+        fs::write(temp_dir.path.join("tracked.txt"), "mid\n").expect("write staged change");
+        assert_git_success(&temp_dir.path, &["add", "tracked.txt"]);
+        fs::write(temp_dir.path.join("tracked.txt"), "new\n").expect("write unstaged change");
+
+        assert_eq!(
+            collect_source_control_line_totals(&temp_dir.path),
+            Some((1, 1))
+        );
+    }
+
+    #[test]
+    fn source_control_line_totals_use_empty_tree_for_unborn_repos() {
+        let temp_dir = TestTempDir::new("source-control-empty-tree");
+        init_test_git_repo(&temp_dir);
+
+        fs::write(temp_dir.path.join("tracked.txt"), "one\ntwo\n").expect("write staged file");
+        assert_git_success(&temp_dir.path, &["add", "tracked.txt"]);
+        fs::write(temp_dir.path.join("tracked.txt"), "one\ntwo\nthree\n")
+            .expect("write working tree update");
+
+        assert_eq!(
+            collect_source_control_line_totals(&temp_dir.path),
+            Some((3, 0))
+        );
+    }
+
+    #[test]
+    fn source_control_snapshot_counts_untracked_files_inside_collapsed_directory() {
+        let temp_dir = TestTempDir::new("source-control-untracked-directory");
+        init_test_git_repo(&temp_dir);
+        assert_git_success(
+            &temp_dir.path,
+            &["commit", "--allow-empty", "--quiet", "-m", "init"],
+        );
+
+        fs::create_dir_all(temp_dir.path.join("nested/deep")).expect("create nested directory");
+        fs::write(temp_dir.path.join("nested/deep/a.txt"), "one\ntwo\n")
+            .expect("write nested text file");
+        fs::write(temp_dir.path.join("nested/b.txt"), "three").expect("write sibling text file");
+
+        let snapshot = collect_source_control_snapshot(&temp_dir.path, false);
+
+        assert_eq!(snapshot.files.len(), 1);
+        assert_eq!(snapshot.files[0].path, "nested/");
+        assert_eq!(snapshot.added_lines, Some(3));
+        assert_eq!(snapshot.removed_lines, Some(0));
+    }
+
+    #[test]
+    fn terminal_manager_diff_summary_visuals_cover_ready_loading_and_error_states() {
+        let clean =
+            terminal_manager_diff_summary_model(Some(&test_source_control_snapshot("main", &[])));
+        let loading = terminal_manager_diff_summary_model(Some(&SourceControlSnapshot {
+            loading: true,
+            ..test_source_control_snapshot("main", &[])
+        }));
+        let error = terminal_manager_diff_summary_model(Some(&SourceControlSnapshot {
+            last_error: Some("git status failed".to_owned()),
+            ..test_source_control_snapshot("main", &[])
+        }));
+
+        assert_eq!(
+            terminal_manager_diff_summary_visual(&clean),
+            TerminalManagerDiffSummaryVisual::Totals {
+                added_text: "+0".to_owned(),
+                removed_text: "-0".to_owned(),
+                added_color: source_control_badge_color(SourceControlBadgeState::Clean),
+                removed_color: source_control_badge_color(SourceControlBadgeState::Error),
+                separator_color: super::TEXT_MUTED,
+            }
+        );
+        assert_eq!(
+            terminal_manager_diff_summary_visual(&loading),
+            TerminalManagerDiffSummaryVisual::Placeholder {
+                text: "...",
+                color: super::TEXT_MUTED,
+            }
+        );
+        assert_eq!(
+            terminal_manager_diff_summary_visual(&error),
+            TerminalManagerDiffSummaryVisual::Placeholder {
+                text: "--",
+                color: super::TEXT_MUTED,
+            }
+        );
     }
 
     #[test]
@@ -11840,6 +12489,8 @@ mod tests {
                     staged: *staged,
                 })
                 .collect(),
+            added_lines: Some(0),
+            removed_lines: Some(0),
             loading: false,
             last_error: None,
         }
@@ -11992,6 +12643,51 @@ mod tests {
 
     fn test_factory_droid_inbox_token(terminal_id: u64) -> String {
         format!("test-inbox-token-{terminal_id}")
+    }
+
+    struct TestTempDir {
+        path: PathBuf,
+    }
+
+    impl TestTempDir {
+        fn new(prefix: &str) -> Self {
+            let unique_suffix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "mergen-ade-{prefix}-{}-{unique_suffix}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create temp test dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn assert_git_success(project_path: &Path, args: &[&str]) -> String {
+        let output = super::run_git_command(project_path, args).expect("run git command");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn init_test_git_repo(temp_dir: &TestTempDir) {
+        assert_git_success(&temp_dir.path, &["init", "--quiet"]);
+        assert_git_success(&temp_dir.path, &["config", "user.name", "Test User"]);
+        assert_git_success(
+            &temp_dir.path,
+            &["config", "user.email", "test@example.com"],
+        );
     }
 
     fn test_factory_droid_hook_event(
