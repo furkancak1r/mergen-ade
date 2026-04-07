@@ -770,3 +770,17 @@
   - Keep exited-active recovery tests alongside edge/no-op tests so future shortcut changes do not reintroduce the dead-end.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: 2026-04-07 review finding for `src/app.rs`; regression tests `handle_shortcuts_recovers_from_exited_active_single_view_terminal_with_ctrl_alt_down`, `handle_shortcuts_recovers_from_exited_active_single_view_terminal_with_ctrl_alt_up`, and `handle_shortcuts_keeps_exited_single_view_terminal_when_no_live_neighbor_exists`
+
+#### Push to `origin/main` could fail after local agent/build artifacts were committed into an unpushed history slice {#push-to-originmain-could-fail-after-local-agentbuild-artifacts-were-committed-into-an-unpushed-history-slice}
+- Date: 2026-04-07T13:20:00Z
+- Context: main/Windows local git push recovery after several unpushed commits accidentally included local tool output and alternate Cargo target artifacts
+- Error signature: `git push` disconnected with `Read from remote host ssh.github.com: Connection reset by peer`, `send-pack: unexpected disconnect while reading sideband packet`, and `fatal: the remote end hung up unexpectedly`.
+- Symptoms/Impact: Publishing local work could fail even though SSH authentication itself succeeded. The outgoing history slice carried thousands of non-source files such as `.firecrawl/*`, `.claude/settings.local.json`, and `target_test/*`, inflating the object set and polluting the repo with machine-local artifacts.
+- Root cause: `.gitignore` excluded only `/target/` and missed alternate Cargo output directories plus repo-local agent scratch directories, so a broad local commit captured generated build output and local research/config artifacts into the unpushed commit chain.
+- Resolution: Rebuilt a clean branch from `origin/main`, replayed only the real source changes, dropped `.claude/`, `.firecrawl/`, and `target_test/` from the replayed history, and added ignore rules for those paths so future commits keep them local-only.
+- Prevent recurrence:
+  - Ignore all alternate local Cargo target directories used for ad hoc test runs, not just `/target/`.
+  - Keep repo-local agent scratch/config directories such as `.claude/` and `.firecrawl/` out of version control unless the project explicitly standardizes them.
+  - When a broad "save pending changes" commit includes unusually large file counts, inspect the path list before pushing.
+- Files/Commands touched: `.gitignore`, `KNOWN_ISSUES.md`, `git cherry-pick --no-commit`, `git restore --source=HEAD --staged --worktree .claude .firecrawl target_test`
+- References: local push recovery on 2026-04-07 after `git diff --name-only origin/main..HEAD` exposed `target_test/`, `.firecrawl/`, and `.claude/settings.local.json` in the unpushed history

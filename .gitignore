@@ -1,6 +1,12 @@
 # Rust build artifacts
 /target/
+/target_test/
+/target_test_*/
 /.toolchain/
+
+# Local tool artifacts
+/.claude/
+/.firecrawl/
 
 # Cargo
 **/*.rs.bk
