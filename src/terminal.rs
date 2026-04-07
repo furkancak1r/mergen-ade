@@ -615,28 +615,28 @@ impl TerminalRuntime {
         self.latest_seqno.load(Ordering::Relaxed)
     }
 
-    pub fn has_factory_droid_descendant_process(&self) -> bool {
+    pub fn has_factory_droid_descendant_process(&self) -> Option<bool> {
         #[cfg(test)]
         if let Some(forced_active) = self.forced_factory_droid_process_active {
-            return forced_active;
+            return Some(forced_active);
         }
 
         #[cfg(target_os = "windows")]
         {
             let Ok(snapshot) = snapshot_processes() else {
-                return false;
+                return Some(false);
             };
-            return has_named_descendant_process(
+            return Some(has_named_descendant_process(
                 &snapshot,
                 self.child_pid,
                 self.child_creation_time,
                 &["droid.exe", "factory.exe"],
-            );
+            ));
         }
 
         #[cfg(not(target_os = "windows"))]
         {
-            false
+            None
         }
     }
 
@@ -1252,15 +1252,31 @@ struct PendingOscTitle {
 
 impl PendingOscTitle {
     fn extract_from_bytes(&mut self, bytes: &[u8]) -> Option<String> {
+        self.extract_from_bytes_with_end_offset(bytes)
+            .map(|(title, _)| title)
+    }
+
+    fn extract_from_bytes_with_end_offset(&mut self, bytes: &[u8]) -> Option<(String, usize)> {
         if !self.buffer.is_empty() {
+            let previous_buffer_len = String::from_utf8_lossy(&self.buffer).len();
             self.buffer.extend_from_slice(bytes);
-            let title = extract_complete_title_from_bytes(&self.buffer);
+            let title = extract_complete_title_from_bytes_with_end_offset(&self.buffer).map(
+                |(title, end_offset)| {
+                    (
+                        title,
+                        end_offset
+                            .saturating_sub(previous_buffer_len)
+                            .min(String::from_utf8_lossy(bytes).len()),
+                    )
+                },
+            );
             self.retain_incomplete_suffix();
             return title;
         }
 
-        if let Some(title) = extract_complete_title_from_bytes(bytes) {
-            return Some(title);
+        if let Some((title, end_offset)) = extract_complete_title_from_bytes_with_end_offset(bytes)
+        {
+            return Some((title, end_offset.min(String::from_utf8_lossy(bytes).len())));
         }
 
         if let Some(suffix_start) = find_incomplete_osc_title_start(bytes) {
@@ -1291,24 +1307,29 @@ impl PendingOscTitle {
 }
 
 fn extract_complete_title_from_bytes(bytes: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(bytes);
-
-    extract_osc_title(&text, "\x1b]0;").or_else(|| extract_osc_title(&text, "\x1b]2;"))
+    extract_complete_title_from_bytes_with_end_offset(bytes).map(|(title, _)| title)
 }
 
-fn extract_osc_title(text: &str, prefix: &str) -> Option<String> {
+fn extract_complete_title_from_bytes_with_end_offset(bytes: &[u8]) -> Option<(String, usize)> {
+    let text = String::from_utf8_lossy(bytes);
+
+    extract_osc_title_with_end_offset(&text, "\x1b]0;")
+        .or_else(|| extract_osc_title_with_end_offset(&text, "\x1b]2;"))
+}
+
+fn extract_osc_title_with_end_offset(text: &str, prefix: &str) -> Option<(String, usize)> {
     let start_pos = text.find(prefix)?;
     let after_type = &text[start_pos + prefix.len()..];
 
     if let Some(end_pos) = after_type.find('\x07') {
         let title = &after_type[..end_pos];
         if !title.is_empty() {
-            return Some(title.to_string());
+            return Some((title.to_string(), start_pos + prefix.len() + end_pos + 1));
         }
     } else if let Some(end_pos) = after_type.find("\x1b\\") {
         let title = &after_type[..end_pos];
         if !title.is_empty() {
-            return Some(title.to_string());
+            return Some((title.to_string(), start_pos + prefix.len() + end_pos + 2));
         }
     }
 
@@ -1342,21 +1363,24 @@ fn find_incomplete_osc_title_start(bytes: &[u8]) -> Option<usize> {
 }
 
 fn official_ai_debug_chunk(text: &str) -> Option<String> {
-    let trimmed = text.trim();
+    official_ai_debug_chunk_with_end_offset(text).map(|(chunk, _)| chunk)
+}
+
+fn official_ai_debug_chunk_with_end_offset(text: &str) -> Option<(String, usize)> {
+    let offset = [
+        complete_official_hook_end_offset(text),
+        extract_complete_title_from_bytes_with_end_offset(text.as_bytes()).map(|(_, end)| end),
+    ]
+    .into_iter()
+    .flatten()
+    .min()?;
+
+    let trimmed = text[..offset].trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    let lower = trimmed.to_ascii_lowercase();
-    let has_official_hook =
-        lower.contains("[droid-hook:") || lower.contains("[factory-droid-hook:");
-    let has_official_title = trimmed.contains("\x1b]0;") || trimmed.contains("\x1b]2;");
-
-    if has_official_hook || has_official_title {
-        Some(trimmed.to_string())
-    } else {
-        None
-    }
+    Some((trimmed.to_string(), offset))
 }
 
 #[derive(Debug, Default)]
@@ -1366,17 +1390,30 @@ struct PendingVisibleFactoryStatus {
 
 impl PendingVisibleFactoryStatus {
     fn extract_from_text(&mut self, text: &str) -> Option<String> {
-        let normalized = normalize_visible_factory_status_text(text);
-        if normalized.is_empty() {
+        self.extract_from_text_with_end_offset(text)
+            .map(|(status, _)| status)
+    }
+
+    fn extract_from_text_with_end_offset(&mut self, text: &str) -> Option<(String, usize)> {
+        if text.is_empty() {
             return None;
         }
 
-        self.buffer.push_str(&normalized);
-        self.truncate_to_limit();
+        let previous_buffer_len = self.buffer.len();
+        self.buffer.push_str(text);
 
-        let detected = detect_visible_factory_status(&self.buffer)?;
-        self.buffer.clear();
-        Some(detected.to_string())
+        if let Some((detected, end_offset)) = detect_visible_factory_status_with_end(&self.buffer) {
+            self.buffer.clear();
+            return Some((
+                detected.to_string(),
+                end_offset
+                    .saturating_sub(previous_buffer_len)
+                    .min(text.len()),
+            ));
+        }
+
+        self.truncate_to_limit();
+        None
     }
 
     fn truncate_to_limit(&mut self) {
@@ -1398,37 +1435,60 @@ impl PendingVisibleFactoryStatus {
     }
 }
 
-fn normalize_visible_factory_status_text(text: &str) -> String {
-    let stripped = strip_ansi_sequences(text);
-    stripped.replace("\r\n", "\n").replace('\r', "\n")
+fn detect_visible_factory_status_with_end(text: &str) -> Option<(&'static str, usize)> {
+    let (projection, projection_offsets) = build_visible_status_projection(text);
+    let (collapsed, collapsed_offsets) =
+        collapse_projection_whitespace(&projection, &projection_offsets);
+
+    for (display, needle) in [
+        ("HOOKS Stop", "hooks stop"),
+        ("needs your permission", "needs your permission"),
+        ("waiting for your input", "waiting for your input"),
+    ] {
+        if let Some(start) = collapsed.find(needle) {
+            let end = start + needle.len();
+            let end_char_index = collapsed[..end].chars().count().saturating_sub(1);
+            if let Some(end_offset) = collapsed_offsets.get(end_char_index).copied() {
+                return Some((display, end_offset));
+            }
+        }
+    }
+
+    None
 }
 
-fn strip_ansi_sequences(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
+fn build_visible_status_projection(text: &str) -> (String, Vec<usize>) {
+    let mut projection = String::with_capacity(text.len());
+    let mut offsets = Vec::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut cursor = 0;
 
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            match chars.peek().copied() {
-                Some('[') => {
-                    chars.next();
-                    while let Some(next) = chars.next() {
-                        if ('@'..='~').contains(&next) {
+    while cursor < bytes.len() {
+        if bytes[cursor] == 0x1b {
+            match bytes.get(cursor + 1).copied() {
+                Some(b'[') => {
+                    cursor += 2;
+                    while cursor < bytes.len() {
+                        let byte = bytes[cursor];
+                        cursor += 1;
+                        if (b'@'..=b'~').contains(&byte) {
                             break;
                         }
                     }
                     continue;
                 }
-                Some(']') => {
-                    chars.next();
-                    while let Some(next) = chars.next() {
-                        if next == '\x07' {
+                Some(b']') => {
+                    cursor += 2;
+                    while cursor < bytes.len() {
+                        if bytes[cursor] == 0x07 {
+                            cursor += 1;
                             break;
                         }
-                        if next == '\x1b' && chars.peek() == Some(&'\\') {
-                            chars.next();
+                        if bytes[cursor] == 0x1b && bytes.get(cursor + 1).copied() == Some(b'\\') {
+                            cursor += 2;
                             break;
                         }
+                        cursor += 1;
                     }
                     continue;
                 }
@@ -1436,32 +1496,139 @@ fn strip_ansi_sequences(text: &str) -> String {
             }
         }
 
-        result.push(ch);
+        let next = text[cursor..].chars().next().expect("cursor within string");
+        let mut next_cursor = cursor + next.len_utf8();
+        if next == '\r' {
+            if bytes.get(next_cursor).copied() == Some(b'\n') {
+                next_cursor += 1;
+            }
+            projection.push('\n');
+            offsets.push(next_cursor);
+            cursor = next_cursor;
+            continue;
+        }
+
+        projection.push(next);
+        offsets.push(next_cursor);
+        cursor = next_cursor;
     }
 
-    result
+    (projection, offsets)
 }
 
-fn detect_visible_factory_status(text: &str) -> Option<&'static str> {
-    let collapsed = text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
+fn collapse_projection_whitespace(text: &str, offsets: &[usize]) -> (String, Vec<usize>) {
+    let mut collapsed = String::with_capacity(text.len());
+    let mut collapsed_offsets = Vec::with_capacity(offsets.len());
+    let mut pending_space_offset = None;
 
-    if collapsed.contains("hooks stop") {
-        return Some("HOOKS Stop");
+    for (index, ch) in text.chars().enumerate() {
+        if ch.is_whitespace() {
+            pending_space_offset = offsets.get(index).copied();
+            continue;
+        }
+
+        if let Some(space_offset) = pending_space_offset.take() {
+            if !collapsed.is_empty() {
+                collapsed.push(' ');
+                collapsed_offsets.push(space_offset);
+            }
+        }
+
+        for lower in ch.to_lowercase() {
+            collapsed.push(lower);
+            collapsed_offsets.push(offsets[index]);
+        }
     }
 
-    if collapsed.contains("needs your permission") {
-        return Some("needs your permission");
+    (collapsed, collapsed_offsets)
+}
+
+fn complete_official_hook_end_offset(text: &str) -> Option<usize> {
+    let lower = text.to_ascii_lowercase();
+
+    ["[droid-hook:", "[factory-droid-hook:"]
+        .iter()
+        .filter_map(|prefix| {
+            let start = lower.find(prefix)?;
+            let end = lower[start..].find(']')?;
+            Some(start + end + 1)
+        })
+        .min()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingAiReadSignalKind {
+    StatusChange {
+        tool: AiCliTool,
+        status: AiCliStatus,
+        event: Option<AiHookEvent>,
+        from_title: bool,
+    },
+    RawChunk {
+        chunk: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingAiReadSignal {
+    text_offset: usize,
+    kind: PendingAiReadSignalKind,
+}
+
+fn collect_ai_read_signals(
+    terminal_id: u64,
+    bytes: &[u8],
+    manager: &AiHookManager,
+    pending_osc_title: &mut PendingOscTitle,
+    pending_visible_factory_status: &mut PendingVisibleFactoryStatus,
+) -> Vec<PendingAiReadSignal> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut signals = manager
+        .update_with_text_offsets(terminal_id, &text)
+        .into_iter()
+        .map(|transition| PendingAiReadSignal {
+            text_offset: transition.text_offset.min(text.len()),
+            kind: PendingAiReadSignalKind::StatusChange {
+                tool: transition.tool,
+                status: transition.status,
+                event: transition.event,
+                from_title: false,
+            },
+        })
+        .collect::<Vec<_>>();
+
+    if let Some((title, end_offset)) = pending_osc_title.extract_from_bytes_with_end_offset(bytes) {
+        if let Some((tool, status, event)) = manager.update_from_title(terminal_id, &title) {
+            signals.push(PendingAiReadSignal {
+                text_offset: end_offset.min(text.len()),
+                kind: PendingAiReadSignalKind::StatusChange {
+                    tool,
+                    status,
+                    event,
+                    from_title: true,
+                },
+            });
+        }
     }
 
-    if collapsed.contains("waiting for your input") {
-        return Some("waiting for your input");
+    if let Some((chunk, end_offset)) = official_ai_debug_chunk_with_end_offset(&text) {
+        signals.push(PendingAiReadSignal {
+            text_offset: end_offset.min(text.len()),
+            kind: PendingAiReadSignalKind::RawChunk { chunk },
+        });
     }
 
-    None
+    if let Some((chunk, end_offset)) =
+        pending_visible_factory_status.extract_from_text_with_end_offset(&text)
+    {
+        signals.push(PendingAiReadSignal {
+            text_offset: end_offset.min(text.len()),
+            kind: PendingAiReadSignalKind::RawChunk { chunk },
+        });
+    }
+
+    signals.sort_by_key(|signal| signal.text_offset);
+    signals
 }
 
 fn spawn_reader_thread(
@@ -1490,59 +1657,42 @@ fn spawn_reader_thread(
                     send_ui_event(terminal_id, TerminalUiEventKind::Wakeup, &tx, &repaint_ctx);
 
                     if let Some(manager) = &ai_hook_manager {
-                        let text = String::from_utf8_lossy(bytes);
-
-                        if let Some((tool, status, event)) = manager.update(terminal_id, &text) {
-                            send_ui_event(
-                                terminal_id,
-                                TerminalUiEventKind::AiStatusChange {
-                                    terminal_id,
-                                    tool: Some(tool),
+                        for signal in collect_ai_read_signals(
+                            terminal_id,
+                            bytes,
+                            manager,
+                            &mut pending_osc_title,
+                            &mut pending_visible_factory_status,
+                        ) {
+                            match signal.kind {
+                                PendingAiReadSignalKind::StatusChange {
+                                    tool,
                                     status,
                                     event,
-                                    from_title: false,
-                                },
-                                &tx,
-                                &repaint_ctx,
-                            );
-                        }
-
-                        if let Some(title) = pending_osc_title.extract_from_bytes(bytes) {
-                            if let Some((tool, status, event)) =
-                                manager.update_from_title(terminal_id, &title)
-                            {
-                                send_ui_event(
-                                    terminal_id,
-                                    TerminalUiEventKind::AiStatusChange {
+                                    from_title,
+                                } => {
+                                    send_ui_event(
                                         terminal_id,
-                                        tool: Some(tool),
-                                        status,
-                                        event,
-                                        from_title: true,
-                                    },
-                                    &tx,
-                                    &repaint_ctx,
-                                );
+                                        TerminalUiEventKind::AiStatusChange {
+                                            terminal_id,
+                                            tool: Some(tool),
+                                            status,
+                                            event,
+                                            from_title,
+                                        },
+                                        &tx,
+                                        &repaint_ctx,
+                                    );
+                                }
+                                PendingAiReadSignalKind::RawChunk { chunk } => {
+                                    send_ui_event(
+                                        terminal_id,
+                                        TerminalUiEventKind::AiRawChunk { terminal_id, chunk },
+                                        &tx,
+                                        &repaint_ctx,
+                                    );
+                                }
                             }
-                        }
-
-                        if let Some(chunk) = official_ai_debug_chunk(&text) {
-                            send_ui_event(
-                                terminal_id,
-                                TerminalUiEventKind::AiRawChunk { terminal_id, chunk },
-                                &tx,
-                                &repaint_ctx,
-                            );
-                        }
-
-                        if let Some(chunk) = pending_visible_factory_status.extract_from_text(&text)
-                        {
-                            send_ui_event(
-                                terminal_id,
-                                TerminalUiEventKind::AiRawChunk { terminal_id, chunk },
-                                &tx,
-                                &repaint_ctx,
-                            );
                         }
                     }
                 }
@@ -2273,22 +2423,22 @@ fn io_error_from_anyhow(err: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        begin_termination, best_effort_terminate_entries, default_style,
+        begin_termination, best_effort_terminate_entries, collect_ai_read_signals, default_style,
         extract_complete_title_from_bytes, factory_droid_hook_env_pairs,
         has_named_descendant_process, is_benign_process_exit_error, official_ai_debug_chunk,
         process_tree_kill_order, root_process_termination_plan, sanitize_cell_text,
         selection_snapshot_from_terminal, snapshot_from_terminal, snapshots_from_terminal,
         test_terminal_runtime, trim_trailing_default_cells, verified_process_entry,
         verified_process_tree_descendants, verified_snapshot_root_process, AdeTerminalConfig,
-        PendingOscTitle, PendingVisibleFactoryStatus, ProcessSnapshotEntry,
-        RootProcessTerminationPlan, RuntimeCommand, SharedWriter, SharedWriterHandle,
-        TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape, TerminalDimensions,
-        TerminalRuntime, TerminalSelectionHyperlink, TerminalStyle, TerminalStyledCell,
-        VerifiedProcessLookup, MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS,
+        PendingAiReadSignalKind, PendingOscTitle, PendingVisibleFactoryStatus,
+        ProcessSnapshotEntry, RootProcessTerminationPlan, RuntimeCommand, SharedWriter,
+        SharedWriterHandle, TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape,
+        TerminalDimensions, TerminalRuntime, TerminalSelectionHyperlink, TerminalStyle,
+        TerminalStyledCell, VerifiedProcessLookup, MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS,
     };
     use crate::hooks::{
-        FACTORY_DROID_HOOKS_DIR_ENV_VAR, FACTORY_DROID_HOOK_INBOX_TOKEN_ENV_VAR,
-        FACTORY_DROID_TERMINAL_ID_ENV_VAR,
+        AiCliStatus, AiHooksConfig, FACTORY_DROID_HOOKS_DIR_ENV_VAR,
+        FACTORY_DROID_HOOK_INBOX_TOKEN_ENV_VAR, FACTORY_DROID_TERMINAL_ID_ENV_VAR,
     };
     use std::{
         ffi::OsString,
@@ -2430,6 +2580,99 @@ mod tests {
 
         assert_eq!(pending.extract_from_bytes(b"[Work"), None);
         assert_eq!(pending.extract_from_bytes(b"ing...]"), None);
+    }
+
+    #[test]
+    fn collect_ai_read_signals_orders_hook_before_later_title_signal_without_newline() {
+        let manager =
+            crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let mut pending_osc_title = PendingOscTitle::default();
+        let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let bytes = b"[droid-hook:event=UserPromptSubmit]\x1b]0;[Idle]\x07";
+
+        let signals = collect_ai_read_signals(
+            1,
+            bytes,
+            &manager,
+            &mut pending_osc_title,
+            &mut pending_visible_factory_status,
+        );
+
+        let status_changes = signals
+            .iter()
+            .filter_map(|signal| match &signal.kind {
+                PendingAiReadSignalKind::StatusChange {
+                    status, from_title, ..
+                } => Some((*status, *from_title)),
+                PendingAiReadSignalKind::RawChunk { .. } => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            status_changes,
+            vec![
+                (AiCliStatus::Running, false),
+                (AiCliStatus::Attention, true)
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_ai_read_signals_orders_hook_before_later_visible_attention() {
+        let manager =
+            crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let mut pending_osc_title = PendingOscTitle::default();
+        let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let bytes = b"[droid-hook:event=UserPromptSubmit]HOOKS  Stop";
+
+        let signals = collect_ai_read_signals(
+            1,
+            bytes,
+            &manager,
+            &mut pending_osc_title,
+            &mut pending_visible_factory_status,
+        );
+
+        let ordered_kinds = signals
+            .iter()
+            .map(|signal| match &signal.kind {
+                PendingAiReadSignalKind::StatusChange { status, .. } => {
+                    format!("status:{status:?}")
+                }
+                PendingAiReadSignalKind::RawChunk { chunk } => format!("raw:{chunk}"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ordered_kinds,
+            vec![
+                "status:Running".to_string(),
+                "raw:[droid-hook:event=UserPromptSubmit]".to_string(),
+                "raw:HOOKS Stop".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_ai_read_signals_keeps_offsets_clamped_with_non_ascii_trailing_bytes() {
+        let manager =
+            crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let mut pending_osc_title = PendingOscTitle::default();
+        let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let hook = "[droid-hook:event=UserPromptSubmit]";
+        let bytes = b"[droid-hook:event=UserPromptSubmit]\xF0\x9F\x94\x94";
+
+        let signals = collect_ai_read_signals(
+            1,
+            bytes,
+            &manager,
+            &mut pending_osc_title,
+            &mut pending_visible_factory_status,
+        );
+
+        assert_eq!(signals.len(), 2);
+        assert_eq!(signals[0].text_offset, hook.len());
+        assert_eq!(signals[1].text_offset, hook.len());
     }
 
     #[test]

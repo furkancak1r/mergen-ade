@@ -234,12 +234,16 @@ fn extract_complete_lines(buffer: &str) -> (Vec<&str>, &str) {
             complete_lines.push(line);
             search_start = line_end + 1;
         } else {
-            // No more newlines - check if the remaining text is a complete hook pattern
+            // No more newlines - split at the first complete official hook if present.
             let tail = &buffer[search_start..];
-            if is_complete_hook_pattern(tail) {
-                // Include this as a complete line
-                complete_lines.push(tail);
-                return (complete_lines, "");
+            if let Some(line_end) = complete_hook_pattern_end(tail) {
+                let line_end = search_start + line_end;
+                let line = &buffer[search_start..line_end];
+                complete_lines.push(line);
+                search_start = line_end;
+                if search_start >= buffer.len() {
+                    return (complete_lines, "");
+                }
             } else {
                 // Keep as incomplete tail
                 return (complete_lines, tail);
@@ -248,24 +252,26 @@ fn extract_complete_lines(buffer: &str) -> (Vec<&str>, &str) {
     }
 }
 
-/// Check if text contains a potentially complete hook event pattern.
-/// This prevents discarding chunks that have partial bracket patterns.
-fn is_complete_hook_pattern(text: &str) -> bool {
-    let text_lower = text.to_lowercase();
+fn complete_hook_pattern_end(text: &str) -> Option<usize> {
+    let text_lower = text.to_ascii_lowercase();
+    let mut match_end = None;
 
-    // Check for complete bracket patterns (Droid formats only)
-    let bracket_patterns = ["[droid-hook:", "[factory-droid-hook:"];
-
-    for pattern in &bracket_patterns {
+    for pattern in ["[droid-hook:", "[factory-droid-hook:"] {
         if let Some(start) = text_lower.find(pattern) {
-            let after_start = &text_lower[start + pattern.len()..];
-            if after_start.contains(']') {
-                return true;
+            let end = text_lower[start + pattern.len()..]
+                .find(']')
+                .map(|end| start + pattern.len() + end + 1);
+            match (match_end, end) {
+                (None, Some(end)) => match_end = Some((start, end)),
+                (Some((best_start, _)), Some(end)) if start < best_start => {
+                    match_end = Some((start, end))
+                }
+                _ => {}
             }
         }
     }
 
-    false
+    match_end.map(|(_, end)| end)
 }
 
 fn title_status_for_config(
@@ -302,7 +308,7 @@ fn detect_tool_from_hook_text(text: &str, config: &AiHooksConfig) -> Option<AiCl
 
 fn parse_hook_event(text: &str, config: &AiHooksConfig) -> Option<(AiCliTool, String, bool)> {
     let clean = strip_ansi(text);
-    let text_lower = clean.to_lowercase();
+    let text_lower = clean.to_ascii_lowercase();
 
     let extract_name = |value: &str| -> String { normalize_hook_name(value) };
 
@@ -330,6 +336,41 @@ fn parse_hook_event(text: &str, config: &AiHooksConfig) -> Option<(AiCliTool, St
 
 fn names_match(left: &str, right: &str) -> bool {
     normalize_hook_name(left) == normalize_hook_name(right)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AiHookTransition {
+    pub tool: AiCliTool,
+    pub status: AiCliStatus,
+    pub event: Option<AiHookEvent>,
+    pub text_offset: usize,
+}
+
+fn extract_complete_lines_with_end_offsets(buffer: &str) -> (Vec<(&str, usize)>, &str) {
+    let mut complete_lines = Vec::new();
+    let mut search_start = 0;
+
+    loop {
+        if let Some(newline_pos) = buffer[search_start..].find('\n') {
+            let line_end = search_start + newline_pos;
+            let line = &buffer[search_start..line_end];
+            complete_lines.push((line, line_end));
+            search_start = line_end + 1;
+        } else {
+            let tail = &buffer[search_start..];
+            if let Some(line_end) = complete_hook_pattern_end(tail) {
+                let line_end = search_start + line_end;
+                let line = &buffer[search_start..line_end];
+                complete_lines.push((line, line_end));
+                search_start = line_end;
+                if search_start >= buffer.len() {
+                    return (complete_lines, "");
+                }
+            } else {
+                return (complete_lines, tail);
+            }
+        }
+    }
 }
 
 pub struct AiHookManager {
@@ -409,29 +450,41 @@ impl AiHookManager {
         terminal_id: u64,
         text: &str,
     ) -> Option<(AiCliTool, AiCliStatus, Option<AiHookEvent>)> {
+        self.update_with_text_offsets(terminal_id, text)
+            .pop()
+            .map(|transition| (transition.tool, transition.status, transition.event))
+    }
+
+    pub(crate) fn update_with_text_offsets(
+        &self,
+        terminal_id: u64,
+        text: &str,
+    ) -> Vec<AiHookTransition> {
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions.entry(terminal_id).or_default();
 
         // Step 1: Detect tool if not already detected
         if session.tool.is_none() {
             if !session.detect_tool(text, &self.config) {
-                return None;
+                return Vec::new();
             }
             // Tool detected - fall through to check for hook events
         }
 
-        let tool = session.tool?;
-        let config = self.config.config_for(tool)?;
+        let Some(tool) = session.tool else {
+            return Vec::new();
+        };
+        let Some(config) = self.config.config_for(tool) else {
+            return Vec::new();
+        };
 
-        // Step 2: Accumulate text into pending_line buffer
+        let prior_pending_len = session.pending_line.len();
         session.pending_line.push_str(text);
-
-        // Step 3: Process complete lines from the buffer
-        // A complete line is one that ends with newline, or contains a full bracket pattern
         let buffer = session.pending_line.clone();
-        let (complete_lines, incomplete_tail) = extract_complete_lines(&buffer);
+        let (complete_lines, incomplete_tail) = extract_complete_lines_with_end_offsets(&buffer);
+        let mut transitions = Vec::new();
 
-        for line in complete_lines {
+        for (line, end_offset) in complete_lines {
             if let Some((parsed_tool, event_name, is_notification)) =
                 parse_hook_event(&line, &self.config)
             {
@@ -451,24 +504,30 @@ impl AiHookManager {
                 if is_running_event {
                     session.status = AiCliStatus::Running;
                     session.last_event = Some(AiHookEvent::Running);
-                    session.pending_line = incomplete_tail.to_string();
-                    return Some((tool, AiCliStatus::Running, Some(AiHookEvent::Running)));
+                    transitions.push(AiHookTransition {
+                        tool,
+                        status: AiCliStatus::Running,
+                        event: Some(AiHookEvent::Running),
+                        text_offset: end_offset.saturating_sub(prior_pending_len).min(text.len()),
+                    });
+                    continue;
                 }
 
                 if is_attention_event {
                     session.status = AiCliStatus::Attention;
                     session.last_event = Some(AiHookEvent::Attention);
-                    session.pending_line = incomplete_tail.to_string();
-                    return Some((tool, AiCliStatus::Attention, Some(AiHookEvent::Attention)));
+                    transitions.push(AiHookTransition {
+                        tool,
+                        status: AiCliStatus::Attention,
+                        event: Some(AiHookEvent::Attention),
+                        text_offset: end_offset.saturating_sub(prior_pending_len).min(text.len()),
+                    });
                 }
             }
         }
 
-        // Keep incomplete tail for next chunk
         session.pending_line = incomplete_tail.to_string();
-
-        // Tool was just detected, but no hook event in this chunk - status stays Inactive
-        None
+        transitions
     }
 
     /// Update AI status based on terminal title changes.
@@ -584,6 +643,60 @@ mod tests {
                 AiCliStatus::Running,
                 Some(AiHookEvent::Running)
             ))
+        );
+    }
+
+    #[test]
+    fn update_uses_last_actionable_event_in_chunk() {
+        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let terminal_id = 1;
+
+        assert_eq!(
+            manager.update(terminal_id, "[droid-hook:event=SessionStart]\n"),
+            None
+        );
+
+        assert_eq!(
+            manager.update(
+                terminal_id,
+                "[droid-hook:event=UserPromptSubmit]\n[droid-hook:event=Stop]\n"
+            ),
+            Some((
+                AiCliTool::FactoryDroid,
+                AiCliStatus::Attention,
+                Some(AiHookEvent::Attention)
+            ))
+        );
+        assert_eq!(
+            manager.session(terminal_id).unwrap().status,
+            AiCliStatus::Attention
+        );
+    }
+
+    #[test]
+    fn update_uses_last_actionable_notification_in_chunk() {
+        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let terminal_id = 1;
+
+        assert_eq!(
+            manager.update(terminal_id, "[droid-hook:event=SessionStart]\n"),
+            None
+        );
+
+        assert_eq!(
+            manager.update(
+                terminal_id,
+                "[droid-hook:event=UserPromptSubmit]\n[droid-hook:notification=permission_prompt]\n"
+            ),
+            Some((
+                AiCliTool::FactoryDroid,
+                AiCliStatus::Attention,
+                Some(AiHookEvent::Attention)
+            ))
+        );
+        assert_eq!(
+            manager.session(terminal_id).unwrap().status,
+            AiCliStatus::Attention
         );
     }
 
@@ -856,10 +969,59 @@ mod tests {
     }
 
     #[test]
+    fn extract_complete_lines_stops_at_hook_closing_bracket() {
+        let text = "some text [droid-hook:event=Stop] trailing";
+        let (complete, tail) = extract_complete_lines(text);
+
+        assert_eq!(complete, vec!["some text [droid-hook:event=Stop]"]);
+        assert_eq!(tail, " trailing");
+    }
+
+    #[test]
+    fn extract_complete_lines_with_end_offsets_keeps_trailing_bytes_available() {
+        let line = "noise [droid-hook:event=Stop]";
+        let text = format!("{line} trailing");
+        let (complete, tail) = extract_complete_lines_with_end_offsets(text.as_str());
+
+        assert_eq!(complete, vec![(line, line.len())]);
+        assert_eq!(tail, " trailing");
+    }
+
+    #[test]
     fn extract_complete_lines_keeps_partial_hook_pattern_buffered() {
         let (complete, tail) = extract_complete_lines("some text [droid-hook:event=User");
         assert!(complete.is_empty());
         assert_eq!(tail, "some text [droid-hook:event=User");
+    }
+
+    #[test]
+    fn update_with_text_offsets_processes_back_to_back_hook_markers_without_newlines() {
+        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let running_prefix = "[droid-hook:event=SessionStart][droid-hook:event=UserPromptSubmit]";
+        let full_text = format!("{running_prefix}[droid-hook:event=Stop]");
+        let transitions = manager.update_with_text_offsets(1, full_text.as_str());
+
+        assert_eq!(
+            transitions,
+            vec![
+                AiHookTransition {
+                    tool: AiCliTool::FactoryDroid,
+                    status: AiCliStatus::Running,
+                    event: Some(AiHookEvent::Running),
+                    text_offset: running_prefix.len(),
+                },
+                AiHookTransition {
+                    tool: AiCliTool::FactoryDroid,
+                    status: AiCliStatus::Attention,
+                    event: Some(AiHookEvent::Attention),
+                    text_offset: full_text.len(),
+                },
+            ]
+        );
+        assert_eq!(
+            manager.session(1).expect("session").status,
+            AiCliStatus::Attention
+        );
     }
 
     #[test]

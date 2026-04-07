@@ -364,7 +364,7 @@ pub struct AdeApp {
     selected_project: Option<u64>,
     active_terminal: Option<u64>,
     buffered_terminal_input: Vec<Event>,
-    buffered_terminal_navigation: Vec<TerminalNavigationDirection>,
+    buffered_terminal_navigation: Vec<TerminalNavigationShortcut>,
     terminal_held_key_repeat: Option<TerminalHeldKeyRepeat>,
     allow_attention_terminal_input_routing_once: bool,
     pending_terminal_pastes: Vec<PendingTerminalPaste>,
@@ -529,6 +529,12 @@ enum TerminalNavigationDirection {
     Down,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalNavigationShortcut {
+    Grid(TerminalNavigationDirection),
+    SingleViewLinear(TerminalNavigationDirection),
+}
+
 #[derive(Debug, Clone, Default)]
 struct SourceControlSnapshot {
     branch: String,
@@ -669,6 +675,43 @@ fn draw_ai_badge(ui: &mut Ui, badge: &AiBadgeModel) -> egui::Response {
             ui.label(line);
         }
     })
+}
+
+struct TerminalStatusBadgeLayout {
+    response: egui::Response,
+    #[cfg(test)]
+    ai_rect: Option<egui::Rect>,
+    #[cfg(test)]
+    source_control_rect: egui::Rect,
+}
+
+fn draw_terminal_status_badges(
+    ui: &mut Ui,
+    ai_badge: &AiBadgeModel,
+    source_control_badge: &SourceControlBadgeModel,
+) -> TerminalStatusBadgeLayout {
+    let ai_response = ai_badge_visual(ai_badge.status).map(|_| draw_ai_badge(ui, ai_badge));
+    let ai_rect = ai_response.as_ref().map(|response| response.rect);
+    if ai_response.is_some() {
+        ui.add_space(4.0);
+    }
+
+    let source_control_response = draw_source_control_badge(ui, source_control_badge);
+    let source_control_rect = source_control_response.rect;
+    ui.add_space(4.0);
+
+    let response = match ai_response {
+        Some(response) => response.union(source_control_response),
+        None => source_control_response,
+    };
+
+    TerminalStatusBadgeLayout {
+        response,
+        #[cfg(test)]
+        ai_rect,
+        #[cfg(test)]
+        source_control_rect,
+    }
 }
 
 struct TerminalRenderModel {
@@ -1361,8 +1404,11 @@ impl AdeApp {
             let Some(entry) = self.terminals.get(&terminal_id) else {
                 continue;
             };
-            let process_active =
-                !entry.exited && entry.runtime.has_factory_droid_descendant_process();
+            let process_state = if entry.exited {
+                Some(false)
+            } else {
+                entry.runtime.has_factory_droid_descendant_process()
+            };
             let launch_expired =
                 entry
                     .factory_droid_launch_pending_since
@@ -1374,41 +1420,42 @@ impl AdeApp {
             let tool_is_factory = entry.ai_session.tool == Some(AiCliTool::FactoryDroid);
             let status = entry.ai_session.status;
 
-            if process_active {
-                changed |= self.note_factory_droid_session_active(terminal_id);
-                continue;
-            }
-
-            if is_candidate && !tool_is_factory && launch_expired {
+            if is_candidate && launch_expired && process_state != Some(true) {
                 changed |= self.clear_factory_droid_state(terminal_id);
                 continue;
             }
 
-            if is_candidate && launch_expired {
-                changed |= self.clear_factory_droid_state(terminal_id);
-                continue;
-            }
+            match process_state {
+                Some(true) => {
+                    changed |= self.note_factory_droid_session_active(terminal_id);
+                    continue;
+                }
+                Some(false) => {
+                    if tool_is_factory {
+                        changed |= self.note_factory_droid_process_missing(terminal_id);
 
-            if tool_is_factory {
-                changed |= self.note_factory_droid_process_missing(terminal_id);
-
-                match status {
-                    AiCliStatus::Attention => {}
-                    AiCliStatus::Running => {
-                        if self
-                            .terminals
-                            .get(&terminal_id)
-                            .is_some_and(Self::factory_droid_trailing_grace_elapsed)
-                        {
-                            changed |= self.clear_factory_droid_state(terminal_id);
+                        match status {
+                            AiCliStatus::Attention => {}
+                            AiCliStatus::Running => {
+                                if self
+                                    .terminals
+                                    .get(&terminal_id)
+                                    .is_some_and(Self::factory_droid_trailing_grace_elapsed)
+                                {
+                                    changed |= self.clear_factory_droid_state(terminal_id);
+                                }
+                            }
+                            AiCliStatus::Inactive => {
+                                changed |= self.clear_factory_droid_state(terminal_id);
+                            }
                         }
-                    }
-                    AiCliStatus::Inactive => {
+                    } else if session_active {
                         changed |= self.clear_factory_droid_state(terminal_id);
                     }
                 }
-            } else if session_active {
-                changed |= self.clear_factory_droid_state(terminal_id);
+                None => {
+                    continue;
+                }
             }
         }
 
@@ -2028,17 +2075,40 @@ impl AdeApp {
         }
 
         let mut changed = false;
-        let directions = self.take_terminal_navigation_shortcuts(ctx);
-        for direction in directions {
-            let visible_ids = self.visible_terminal_ids_for_main();
-            let grid =
-                layout::compute_tile_grid(visible_ids.len(), main_area_size.x, main_area_size.y);
-            let next_terminal = next_terminal_in_direction(
-                self.active_terminal_accepts_input(),
-                &visible_ids,
-                grid,
-                direction,
-            );
+        let shortcuts = self.take_terminal_navigation_shortcuts(ctx);
+        for shortcut in shortcuts {
+            let next_terminal = match shortcut {
+                TerminalNavigationShortcut::Grid(direction) => {
+                    let visible_ids = self.visible_terminal_ids_for_main();
+                    let grid = layout::compute_tile_grid(
+                        visible_ids.len(),
+                        main_area_size.x,
+                        main_area_size.y,
+                    );
+                    next_terminal_in_direction(
+                        self.active_terminal_accepts_input(),
+                        &visible_ids,
+                        grid,
+                        direction,
+                    )
+                }
+                TerminalNavigationShortcut::SingleViewLinear(direction)
+                    if !self.config.ui.multi_terminal_view_enabled =>
+                {
+                    let terminal_ids = self.terminal_ids_for_single_view_navigation();
+                    next_terminal_in_linear_direction(
+                        self.single_view_navigation_anchor(),
+                        &terminal_ids,
+                        |terminal_id| {
+                            self.terminals
+                                .get(&terminal_id)
+                                .is_some_and(|terminal| !terminal.exited)
+                        },
+                        direction,
+                    )
+                }
+                TerminalNavigationShortcut::SingleViewLinear(_) => None,
+            };
             if let Some(next_terminal) = next_terminal {
                 self.set_active_terminal(ctx, Some(next_terminal));
                 changed = true;
@@ -2060,6 +2130,10 @@ impl AdeApp {
             .get(&active_terminal_id)
             .is_some_and(|terminal| self.terminal_visible_in_main(terminal) && !terminal.exited)
             .then_some(active_terminal_id)
+    }
+
+    fn single_view_navigation_anchor(&self) -> Option<u64> {
+        self.single_terminal_id_for_main()
     }
 
     fn should_capture_terminal_keyboard_state(
@@ -2214,7 +2288,7 @@ impl AdeApp {
             && events.iter().any(Self::event_is_terminal_text_entry)
     }
 
-    fn event_terminal_navigation_direction(event: &Event) -> Option<TerminalNavigationDirection> {
+    fn event_terminal_navigation_shortcut(event: &Event) -> Option<TerminalNavigationShortcut> {
         match event {
             Event::Key {
                 key,
@@ -2222,13 +2296,49 @@ impl AdeApp {
                 modifiers,
                 ..
             } if modifiers.ctrl && !modifiers.alt && !modifiers.shift => match key {
-                Key::ArrowLeft => Some(TerminalNavigationDirection::Left),
-                Key::ArrowRight => Some(TerminalNavigationDirection::Right),
-                Key::ArrowUp => Some(TerminalNavigationDirection::Up),
-                Key::ArrowDown => Some(TerminalNavigationDirection::Down),
+                Key::ArrowLeft => Some(TerminalNavigationShortcut::Grid(
+                    TerminalNavigationDirection::Left,
+                )),
+                Key::ArrowRight => Some(TerminalNavigationShortcut::Grid(
+                    TerminalNavigationDirection::Right,
+                )),
+                Key::ArrowUp => Some(TerminalNavigationShortcut::Grid(
+                    TerminalNavigationDirection::Up,
+                )),
+                Key::ArrowDown => Some(TerminalNavigationShortcut::Grid(
+                    TerminalNavigationDirection::Down,
+                )),
+                _ => None,
+            },
+            Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.ctrl && modifiers.alt && !modifiers.shift => match key {
+                Key::ArrowUp => Some(TerminalNavigationShortcut::SingleViewLinear(
+                    TerminalNavigationDirection::Up,
+                )),
+                Key::ArrowDown => Some(TerminalNavigationShortcut::SingleViewLinear(
+                    TerminalNavigationDirection::Down,
+                )),
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    fn active_terminal_navigation_shortcut(
+        event: &Event,
+        single_view_shortcuts_enabled: bool,
+    ) -> Option<TerminalNavigationShortcut> {
+        match Self::event_terminal_navigation_shortcut(event) {
+            Some(TerminalNavigationShortcut::SingleViewLinear(_))
+                if !single_view_shortcuts_enabled =>
+            {
+                None
+            }
+            shortcut => shortcut,
         }
     }
 
@@ -2272,13 +2382,17 @@ impl AdeApp {
         (alt_m_events, remaining_events)
     }
 
-    fn partition_terminal_input_events(events: Vec<Event>) -> (Vec<Event>, Vec<Event>) {
+    fn partition_terminal_input_events(
+        events: Vec<Event>,
+        single_view_shortcuts_enabled: bool,
+    ) -> (Vec<Event>, Vec<Event>) {
         let mut terminal_events = Vec::new();
         let mut remaining_events = Vec::new();
 
         for event in events {
             if Self::event_is_terminal_input(&event)
-                && Self::event_terminal_navigation_direction(&event).is_none()
+                && Self::active_terminal_navigation_shortcut(&event, single_view_shortcuts_enabled)
+                    .is_none()
             {
                 terminal_events.push(event);
             } else {
@@ -2291,19 +2405,22 @@ impl AdeApp {
 
     fn partition_terminal_navigation_shortcuts(
         events: Vec<Event>,
-    ) -> (Vec<TerminalNavigationDirection>, Vec<Event>) {
-        let mut directions = Vec::new();
+        single_view_shortcuts_enabled: bool,
+    ) -> (Vec<TerminalNavigationShortcut>, Vec<Event>) {
+        let mut shortcuts = Vec::new();
         let mut remaining_events = Vec::new();
 
         for event in events {
-            if let Some(direction) = Self::event_terminal_navigation_direction(&event) {
-                directions.push(direction);
+            if let Some(shortcut) =
+                Self::active_terminal_navigation_shortcut(&event, single_view_shortcuts_enabled)
+            {
+                shortcuts.push(shortcut);
             } else {
                 remaining_events.push(event);
             }
         }
 
-        (directions, remaining_events)
+        (shortcuts, remaining_events)
     }
 
     fn is_repeatable_terminal_key(key: Key, modifiers: egui::Modifiers) -> bool {
@@ -2528,9 +2645,11 @@ impl AdeApp {
             return Vec::new();
         }
 
+        let single_view_shortcuts_enabled = !self.config.ui.multi_terminal_view_enabled;
         ctx.input_mut(|input| {
             let events = std::mem::take(&mut input.events);
-            let (terminal_events, remaining_events) = Self::partition_terminal_input_events(events);
+            let (terminal_events, remaining_events) =
+                Self::partition_terminal_input_events(events, single_view_shortcuts_enabled);
             input.events = remaining_events;
             terminal_events
         })
@@ -2540,23 +2659,26 @@ impl AdeApp {
         std::mem::take(&mut self.buffered_terminal_input)
     }
 
-    fn take_buffered_terminal_navigation_shortcuts(&mut self) -> Vec<TerminalNavigationDirection> {
+    fn take_buffered_terminal_navigation_shortcuts(&mut self) -> Vec<TerminalNavigationShortcut> {
         std::mem::take(&mut self.buffered_terminal_navigation)
     }
 
     fn take_terminal_navigation_shortcuts(
         &mut self,
         ctx: &egui::Context,
-    ) -> Vec<TerminalNavigationDirection> {
-        let mut directions = self.take_buffered_terminal_navigation_shortcuts();
-        directions.extend(ctx.input_mut(|input| {
+    ) -> Vec<TerminalNavigationShortcut> {
+        let single_view_shortcuts_enabled = !self.config.ui.multi_terminal_view_enabled;
+        let mut shortcuts = self.take_buffered_terminal_navigation_shortcuts();
+        shortcuts.extend(ctx.input_mut(|input| {
             let events = std::mem::take(&mut input.events);
-            let (directions, remaining_events) =
-                Self::partition_terminal_navigation_shortcuts(events);
+            let (shortcuts, remaining_events) = Self::partition_terminal_navigation_shortcuts(
+                events,
+                single_view_shortcuts_enabled,
+            );
             input.events = remaining_events;
-            directions
+            shortcuts
         }));
-        directions
+        shortcuts
     }
 
     fn visible_terminal_ids_for_main(&self) -> Vec<u64> {
@@ -2572,6 +2694,10 @@ impl AdeApp {
 
         ids.sort_unstable();
         ids
+    }
+
+    fn terminal_ids_for_single_view_navigation(&self) -> Vec<u64> {
+        self.terminals.keys().copied().collect()
     }
 
     fn route_active_terminal_input(&mut self, ctx: &egui::Context, events: Vec<Event>) {
@@ -4411,13 +4537,12 @@ impl AdeApp {
                             |ui| {
                                 ui.add_space(SIDEBAR_ROW_LEADING_INSET);
 
-                                let badge_response =
-                                    draw_source_control_badge(ui, &project_source_control_badge);
-                                ui.add_space(4.0);
-
                                 let ai_badge = AiBadgeModel::from_session(&terminal.ai_session);
-                                draw_ai_badge(ui, &ai_badge);
-                                ui.add_space(4.0);
+                                let badge_layout = draw_terminal_status_badges(
+                                    ui,
+                                    &ai_badge,
+                                    &project_source_control_badge,
+                                );
 
                                 let term_icon_color = if terminal.exited {
                                     Color32::from_rgb(200, 100, 100)
@@ -4463,7 +4588,7 @@ impl AdeApp {
                                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                                     .on_hover_text(&label);
 
-                                badge_response.union(title_response)
+                                badge_layout.response.union(title_response)
                             },
                         )
                         .inner;
@@ -4730,12 +4855,8 @@ impl AdeApp {
                         .show(ui, |ui| {
                             ui.set_min_height(TERMINAL_HEADER_HEIGHT - 12.0);
 
-                            draw_source_control_badge(ui, &source_control_badge);
-                            ui.add_space(4.0);
-
                             let ai_badge = AiBadgeModel::from_session(&terminal.ai_session);
-                            draw_ai_badge(ui, &ai_badge);
-                            ui.add_space(4.0);
+                            draw_terminal_status_badges(ui, &ai_badge, &source_control_badge);
 
                             let title = terminal_display_label(&terminal.title, terminal.exited);
                             let title_font = egui::TextStyle::Body.resolve(ui.style());
@@ -5508,6 +5629,7 @@ impl eframe::App for AdeApp {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         let events = std::mem::take(&mut raw_input.events);
         let global_modifiers = raw_input.modifiers;
+        let single_view_shortcuts_enabled = !self.config.ui.multi_terminal_view_enabled;
 
         let capture_keyboard = self.should_capture_terminal_keyboard(ctx);
 
@@ -5524,13 +5646,18 @@ impl eframe::App for AdeApp {
             if self.should_steal_attention_terminal_input(ctx, &remaining_events) {
                 self.surrender_ui_text_focus(ctx);
                 self.allow_attention_terminal_input_routing_once = true;
-                let (terminal_events, remaining_events) =
-                    Self::partition_terminal_input_events(remaining_events);
-                let (navigation_directions, remaining_events) =
-                    Self::partition_terminal_navigation_shortcuts(remaining_events);
+                let (terminal_events, remaining_events) = Self::partition_terminal_input_events(
+                    remaining_events,
+                    single_view_shortcuts_enabled,
+                );
+                let (navigation_shortcuts, remaining_events) =
+                    Self::partition_terminal_navigation_shortcuts(
+                        remaining_events,
+                        single_view_shortcuts_enabled,
+                    );
                 self.buffered_terminal_input.extend(terminal_events);
                 self.buffered_terminal_navigation
-                    .extend(navigation_directions);
+                    .extend(navigation_shortcuts);
                 raw_input.events = remaining_events;
                 return;
             }
@@ -5543,12 +5670,16 @@ impl eframe::App for AdeApp {
         }
 
         // Terminal is capturing keyboard — let Alt+M through to terminal
-        let (terminal_events, remaining_events) = Self::partition_terminal_input_events(events);
-        let (navigation_directions, remaining_events) =
-            Self::partition_terminal_navigation_shortcuts(remaining_events);
+        let (terminal_events, remaining_events) =
+            Self::partition_terminal_input_events(events, single_view_shortcuts_enabled);
+        let (navigation_shortcuts, remaining_events) =
+            Self::partition_terminal_navigation_shortcuts(
+                remaining_events,
+                single_view_shortcuts_enabled,
+            );
         self.buffered_terminal_input.extend(terminal_events);
         self.buffered_terminal_navigation
-            .extend(navigation_directions);
+            .extend(navigation_shortcuts);
         raw_input.events = remaining_events;
     }
 
@@ -6330,6 +6461,31 @@ fn next_terminal_in_direction(
     }?;
 
     visible_terminal_ids.get(next_index).copied()
+}
+
+fn next_terminal_in_linear_direction(
+    active_terminal: Option<u64>,
+    terminal_ids: &[u64],
+    is_selectable: impl Fn(u64) -> bool,
+    direction: TerminalNavigationDirection,
+) -> Option<u64> {
+    let active_terminal = active_terminal?;
+    let active_index = terminal_ids
+        .iter()
+        .position(|terminal_id| *terminal_id == active_terminal)?;
+
+    match direction {
+        TerminalNavigationDirection::Up => terminal_ids[..active_index]
+            .iter()
+            .rev()
+            .copied()
+            .find(|terminal_id| is_selectable(*terminal_id)),
+        TerminalNavigationDirection::Down => terminal_ids[active_index + 1..]
+            .iter()
+            .copied()
+            .find(|terminal_id| is_selectable(*terminal_id)),
+        _ => None,
+    }
 }
 
 fn terminal_display_label(title: &str, exited: bool) -> String {
@@ -7885,24 +8041,26 @@ mod tests {
     use super::{
         ai_badge_visual, average_terminal_cell_width, build_terminal_cursor_overlay,
         build_terminal_render, configure_terminal_font_family, cursor_hidden_by_row_filter,
-        default_app_open_command, draw_ai_badge, force_terminal_pane_width,
-        install_terminal_font_family, next_active_terminal_after_close, next_terminal_in_direction,
-        normalize_terminal_background, parse_branch_header, recover_config_state,
-        resolve_ctrl_c_action, should_resolve_terminal_link, source_control_badge_state,
-        source_control_tooltip_lines, terminal_cell_metric, terminal_cursor_blink_phase_visible,
-        terminal_cursor_overlay_rect, terminal_font_family, terminal_font_id,
-        terminal_grid_dimensions, terminal_line_height, terminal_link_activation_modifiers,
-        terminal_link_at_point, terminal_logical_line, terminal_logical_line_byte_index,
-        terminal_manager_actions_width, terminal_manager_row_chrome, terminal_manager_row_widths,
-        terminal_output_surface_size, terminal_output_viewport_size,
-        terminal_secondary_click_action, terminal_selection_point_from_pointer,
-        terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
-        AdeApp, AiBadgeModel, AiBadgeVisual, CtrlCAction, DirectoryIndexSnapshot, DirectoryNode,
-        FactoryDroidHookInboxEvent, FactoryDroidStatusSource, FactoryDroidTransportDiagnostics,
-        PendingConfigChanges, PendingTerminalLinkClick, SourceControlBadgeState, SourceControlFile,
+        default_app_open_command, draw_ai_badge, draw_source_control_badge,
+        draw_terminal_status_badges, force_terminal_pane_width, install_terminal_font_family,
+        next_active_terminal_after_close, next_terminal_in_direction,
+        next_terminal_in_linear_direction, normalize_terminal_background, parse_branch_header,
+        recover_config_state, resolve_ctrl_c_action, should_resolve_terminal_link,
+        source_control_badge_model, source_control_badge_state, source_control_tooltip_lines,
+        terminal_cell_metric, terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect,
+        terminal_font_family, terminal_font_id, terminal_grid_dimensions, terminal_line_height,
+        terminal_link_activation_modifiers, terminal_link_at_point, terminal_logical_line,
+        terminal_logical_line_byte_index, terminal_manager_actions_width,
+        terminal_manager_row_chrome, terminal_manager_row_widths, terminal_output_surface_size,
+        terminal_output_viewport_size, terminal_secondary_click_action,
+        terminal_selection_point_from_pointer, terminal_selection_text, to_egui_color,
+        update_stable_cursor_row, visible_terminal_cursor, AdeApp, AiBadgeModel, AiBadgeVisual,
+        CtrlCAction, DirectoryIndexSnapshot, DirectoryNode, FactoryDroidHookInboxEvent,
+        FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, PendingConfigChanges,
+        PendingTerminalLinkClick, SourceControlBadgeState, SourceControlFile,
         SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
-        TerminalNavigationDirection, TerminalSecondaryClickAction, TerminalSelection,
-        TerminalSelectionPoint, TransientToast, FACTORY_DROID_HOOK_POLL_MS,
+        TerminalNavigationDirection, TerminalNavigationShortcut, TerminalSecondaryClickAction,
+        TerminalSelection, TerminalSelectionPoint, TransientToast, FACTORY_DROID_HOOK_POLL_MS,
         FACTORY_DROID_PROCESS_POLL_MS, FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS,
         TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_COPY_TOAST_SECS, TERMINAL_OUTPUT_BG,
     };
@@ -8144,12 +8302,15 @@ mod tests {
         };
         let focus_event = Event::WindowFocused(true);
 
-        let (terminal_events, remaining_events) = AdeApp::partition_terminal_input_events(vec![
-            focus_event.clone(),
-            shift_tab.clone(),
-            plain_tab.clone(),
-            Event::Text("git status".to_owned()),
-        ]);
+        let (terminal_events, remaining_events) = AdeApp::partition_terminal_input_events(
+            vec![
+                focus_event.clone(),
+                shift_tab.clone(),
+                plain_tab.clone(),
+                Event::Text("git status".to_owned()),
+            ],
+            true,
+        );
 
         assert_eq!(
             terminal_events,
@@ -8215,7 +8376,7 @@ mod tests {
         };
 
         let (terminal_events, remaining_events) =
-            AdeApp::partition_terminal_input_events(vec![ctrl_right.clone()]);
+            AdeApp::partition_terminal_input_events(vec![ctrl_right.clone()], true);
 
         assert!(terminal_events.is_empty());
         assert_eq!(remaining_events, vec![ctrl_right]);
@@ -8236,9 +8397,30 @@ mod tests {
         };
 
         let (terminal_events, remaining_events) =
-            AdeApp::partition_terminal_input_events(vec![ctrl_shift_right.clone()]);
+            AdeApp::partition_terminal_input_events(vec![ctrl_shift_right.clone()], true);
 
         assert_eq!(terminal_events, vec![ctrl_shift_right]);
+        assert!(remaining_events.is_empty());
+    }
+
+    #[test]
+    fn ctrl_alt_arrow_remains_terminal_input_when_single_view_shortcuts_disabled() {
+        let ctrl_alt_down = Event::Key {
+            key: Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                alt: true,
+                ..Modifiers::default()
+            },
+        };
+
+        let (terminal_events, remaining_events) =
+            AdeApp::partition_terminal_input_events(vec![ctrl_alt_down.clone()], false);
+
+        assert_eq!(terminal_events, vec![ctrl_alt_down]);
         assert!(remaining_events.is_empty());
     }
 
@@ -8602,11 +8784,18 @@ mod tests {
     #[test]
     fn take_buffered_terminal_navigation_shortcuts_drains_pre_egui_shortcuts() {
         let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
-        app.buffered_terminal_navigation = vec![TerminalNavigationDirection::Right];
+        app.buffered_terminal_navigation = vec![TerminalNavigationShortcut::Grid(
+            TerminalNavigationDirection::Right,
+        )];
 
-        let directions = app.take_buffered_terminal_navigation_shortcuts();
+        let shortcuts = app.take_buffered_terminal_navigation_shortcuts();
 
-        assert_eq!(directions, vec![TerminalNavigationDirection::Right]);
+        assert_eq!(
+            shortcuts,
+            vec![TerminalNavigationShortcut::Grid(
+                TerminalNavigationDirection::Right,
+            )]
+        );
         assert!(app.buffered_terminal_navigation.is_empty());
     }
 
@@ -9800,6 +9989,75 @@ mod tests {
     }
 
     #[test]
+    fn next_terminal_in_linear_direction_moves_between_neighbors() {
+        let ids = [1, 2, 3];
+
+        let up = next_terminal_in_linear_direction(
+            Some(3),
+            &ids,
+            |_| true,
+            TerminalNavigationDirection::Up,
+        );
+        let down = next_terminal_in_linear_direction(
+            Some(1),
+            &ids,
+            |_| true,
+            TerminalNavigationDirection::Down,
+        );
+
+        assert_eq!(up, Some(2));
+        assert_eq!(down, Some(2));
+    }
+
+    #[test]
+    fn next_terminal_in_linear_direction_stops_at_edges() {
+        let ids = [1, 2, 3];
+
+        assert_eq!(
+            next_terminal_in_linear_direction(
+                Some(1),
+                &ids,
+                |_| true,
+                TerminalNavigationDirection::Up
+            ),
+            None
+        );
+        assert_eq!(
+            next_terminal_in_linear_direction(
+                Some(3),
+                &ids,
+                |_| true,
+                TerminalNavigationDirection::Down,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn next_terminal_in_linear_direction_skips_non_selectable_neighbors() {
+        let ids = [1, 2, 3, 4];
+
+        assert_eq!(
+            next_terminal_in_linear_direction(
+                Some(1),
+                &ids,
+                |terminal_id| terminal_id != 2,
+                TerminalNavigationDirection::Down,
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            next_terminal_in_linear_direction(
+                Some(4),
+                &ids,
+                |terminal_id| terminal_id != 3,
+                TerminalNavigationDirection::Up,
+            ),
+            Some(2)
+        );
+    }
+
+    #[test]
     fn next_terminal_in_direction_uses_visual_neighbors() {
         let grid = layout::TileGrid { rows: 2, cols: 2 };
 
@@ -9908,6 +10166,262 @@ mod tests {
     }
 
     #[test]
+    fn handle_shortcuts_moves_single_view_terminal_with_ctrl_alt_down() {
+        let ctx = Context::default();
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowDown,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+                (3, test_terminal_entry(3, 7)),
+            ],
+            Some(1),
+        );
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(app.active_terminal, Some(2));
+        assert_eq!(app.visible_terminal_ids_for_main(), vec![2]);
+        assert!(app.terminals.contains_key(&1));
+        assert!(app.terminals.contains_key(&2));
+    }
+
+    #[test]
+    fn handle_shortcuts_moves_single_view_terminal_with_ctrl_alt_up() {
+        let ctx = Context::default();
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowUp,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+                (3, test_terminal_entry(3, 7)),
+            ],
+            Some(3),
+        );
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(app.active_terminal, Some(2));
+        assert_eq!(app.visible_terminal_ids_for_main(), vec![2]);
+    }
+
+    #[test]
+    fn handle_shortcuts_skips_exited_single_view_terminal_with_ctrl_alt_down() {
+        let ctx = Context::default();
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowDown,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        let mut exited_terminal = test_terminal_entry(2, 7);
+        exited_terminal.exited = true;
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, exited_terminal),
+                (3, test_terminal_entry(3, 7)),
+            ],
+            Some(1),
+        );
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(app.active_terminal, Some(3));
+        assert_eq!(app.visible_terminal_ids_for_main(), vec![3]);
+        assert_eq!(app.active_terminal_accepts_input(), Some(3));
+    }
+
+    #[test]
+    fn handle_shortcuts_skips_exited_single_view_terminal_with_ctrl_alt_up() {
+        let ctx = Context::default();
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowUp,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        let mut exited_terminal = test_terminal_entry(2, 7);
+        exited_terminal.exited = true;
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, exited_terminal),
+                (3, test_terminal_entry(3, 7)),
+            ],
+            Some(3),
+        );
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(app.active_terminal, Some(1));
+        assert_eq!(app.visible_terminal_ids_for_main(), vec![1]);
+        assert_eq!(app.active_terminal_accepts_input(), Some(1));
+    }
+
+    #[test]
+    fn handle_shortcuts_recovers_from_exited_active_single_view_terminal_with_ctrl_alt_down() {
+        let ctx = Context::default();
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowDown,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        let mut exited_terminal = test_terminal_entry(2, 7);
+        exited_terminal.exited = true;
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, exited_terminal),
+                (3, test_terminal_entry(3, 7)),
+            ],
+            Some(2),
+        );
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(app.active_terminal, Some(3));
+        assert_eq!(app.visible_terminal_ids_for_main(), vec![3]);
+        assert_eq!(app.active_terminal_accepts_input(), Some(3));
+    }
+
+    #[test]
+    fn handle_shortcuts_recovers_from_exited_active_single_view_terminal_with_ctrl_alt_up() {
+        let ctx = Context::default();
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowUp,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        let mut exited_terminal = test_terminal_entry(2, 7);
+        exited_terminal.exited = true;
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, exited_terminal),
+                (3, test_terminal_entry(3, 7)),
+            ],
+            Some(2),
+        );
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(app.active_terminal, Some(1));
+        assert_eq!(app.visible_terminal_ids_for_main(), vec![1]);
+        assert_eq!(app.active_terminal_accepts_input(), Some(1));
+    }
+
+    #[test]
+    fn handle_shortcuts_keeps_single_view_terminal_at_navigation_edges() {
+        let ctx = Context::default();
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+                (3, test_terminal_entry(3, 7)),
+            ],
+            Some(1),
+        );
+        app.buffered_terminal_navigation = vec![TerminalNavigationShortcut::SingleViewLinear(
+            TerminalNavigationDirection::Up,
+        )];
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(app.active_terminal, Some(1));
+
+        app.set_active_terminal(&ctx, Some(3));
+        app.buffered_terminal_navigation = vec![TerminalNavigationShortcut::SingleViewLinear(
+            TerminalNavigationDirection::Down,
+        )];
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(app.active_terminal, Some(3));
+        assert_eq!(app.visible_terminal_ids_for_main(), vec![3]);
+    }
+
+    #[test]
+    fn handle_shortcuts_keeps_exited_single_view_terminal_when_no_live_neighbor_exists() {
+        let ctx = Context::default();
+        let mut exited_terminal = test_terminal_entry(2, 7);
+        exited_terminal.exited = true;
+        let mut app = test_app(
+            [(1, test_terminal_entry(1, 7)), (2, exited_terminal)],
+            Some(2),
+        );
+        app.buffered_terminal_navigation = vec![TerminalNavigationShortcut::SingleViewLinear(
+            TerminalNavigationDirection::Down,
+        )];
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(app.active_terminal, Some(2));
+        assert_eq!(app.visible_terminal_ids_for_main(), vec![2]);
+        assert_eq!(app.active_terminal_accepts_input(), None);
+    }
+
+    #[test]
     fn handle_shortcuts_uses_buffered_navigation_shortcuts() {
         let ctx = Context::default();
         let mut app = test_app(
@@ -9918,7 +10432,9 @@ mod tests {
             Some(1),
         );
         app.config.ui.multi_terminal_view_enabled = true;
-        app.buffered_terminal_navigation = vec![TerminalNavigationDirection::Right];
+        app.buffered_terminal_navigation = vec![TerminalNavigationShortcut::Grid(
+            TerminalNavigationDirection::Right,
+        )];
 
         app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
 
@@ -10052,7 +10568,9 @@ mod tests {
         assert!(raw_input.events.is_empty());
         assert_eq!(
             app.buffered_terminal_navigation,
-            vec![TerminalNavigationDirection::Right]
+            vec![TerminalNavigationShortcut::Grid(
+                TerminalNavigationDirection::Right,
+            )]
         );
     }
 
@@ -10085,7 +10603,40 @@ mod tests {
         assert!(raw_input.events.is_empty());
         assert_eq!(
             app.buffered_terminal_navigation,
-            vec![TerminalNavigationDirection::Right]
+            vec![TerminalNavigationShortcut::Grid(
+                TerminalNavigationDirection::Right,
+            )]
+        );
+    }
+
+    #[test]
+    fn raw_input_hook_buffers_ctrl_alt_arrow_for_single_view_navigation() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let ctrl_alt_down = Event::Key {
+            key: Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                alt: true,
+                ..Modifiers::default()
+            },
+        };
+        let mut raw_input = RawInput {
+            events: vec![ctrl_alt_down],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(raw_input.events.is_empty());
+        assert_eq!(
+            app.buffered_terminal_navigation,
+            vec![TerminalNavigationShortcut::SingleViewLinear(
+                TerminalNavigationDirection::Down,
+            )]
         );
     }
 
@@ -10794,6 +11345,57 @@ mod tests {
         assert!(terminal.factory_droid_process_missing_since.is_none());
     }
 
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn factory_droid_process_poll_keeps_running_state_when_process_probe_is_unsupported() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.factory_droid_session_active = true;
+            entry.factory_droid_process_missing_since = Some(
+                Instant::now() - Duration::from_millis(FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS + 25),
+            );
+        }
+
+        app.factory_droid_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(FACTORY_DROID_PROCESS_POLL_MS + 1));
+        app.poll_factory_droid_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::FactoryDroid));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+        assert!(terminal.factory_droid_session_active);
+        assert!(terminal.factory_droid_process_missing_since.is_some());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn factory_droid_process_poll_clears_expired_launch_when_process_probe_is_unsupported() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            entry.ai_session.status = AiCliStatus::Inactive;
+            entry.factory_droid_launch_pending_since =
+                Some(Instant::now() - Duration::from_millis(FACTORY_DROID_LAUNCH_GRACE_MS + 25));
+        }
+
+        app.factory_droid_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(FACTORY_DROID_PROCESS_POLL_MS + 1));
+        app.poll_factory_droid_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, None);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(terminal.factory_droid_launch_pending_since.is_none());
+        assert!(!terminal.factory_droid_session_active);
+        assert!(terminal.factory_droid_process_missing_since.is_none());
+    }
+
     #[test]
     fn process_terminal_events_clears_factory_droid_state_on_exit() {
         let ctx = Context::default();
@@ -10823,8 +11425,8 @@ mod tests {
     }
 
     #[test]
-    fn event_terminal_navigation_direction_accepts_egui_command_alias_for_ctrl() {
-        let direction = AdeApp::event_terminal_navigation_direction(&Event::Key {
+    fn event_terminal_navigation_shortcut_accepts_egui_command_alias_for_ctrl() {
+        let shortcut = AdeApp::event_terminal_navigation_shortcut(&Event::Key {
             key: Key::ArrowDown,
             physical_key: None,
             pressed: true,
@@ -10836,7 +11438,51 @@ mod tests {
             },
         });
 
-        assert_eq!(direction, Some(TerminalNavigationDirection::Down));
+        assert_eq!(
+            shortcut,
+            Some(TerminalNavigationShortcut::Grid(
+                TerminalNavigationDirection::Down,
+            ))
+        );
+    }
+
+    #[test]
+    fn event_terminal_navigation_shortcut_recognizes_ctrl_alt_up_down() {
+        let down = AdeApp::event_terminal_navigation_shortcut(&Event::Key {
+            key: Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                alt: true,
+                ..Modifiers::default()
+            },
+        });
+        let up = AdeApp::event_terminal_navigation_shortcut(&Event::Key {
+            key: Key::ArrowUp,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                alt: true,
+                ..Modifiers::default()
+            },
+        });
+
+        assert_eq!(
+            down,
+            Some(TerminalNavigationShortcut::SingleViewLinear(
+                TerminalNavigationDirection::Down,
+            ))
+        );
+        assert_eq!(
+            up,
+            Some(TerminalNavigationShortcut::SingleViewLinear(
+                TerminalNavigationDirection::Up,
+            ))
+        );
     }
 
     #[test]
@@ -12191,6 +12837,79 @@ mod tests {
         assert_eq!(running_size, Some(egui::vec2(16.0, 16.0)));
         assert_eq!(attention_size, Some(egui::vec2(16.0, 16.0)));
         assert_eq!(inactive_size, Some(egui::vec2(0.0, 0.0)));
+    }
+
+    #[test]
+    fn draw_terminal_status_badges_places_ai_before_source_control_when_active() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let source_control_badge =
+            source_control_badge_model(Some(&test_source_control_snapshot("main", &[])));
+        let running_badge = AiBadgeModel {
+            tool: Some(AiCliTool::FactoryDroid),
+            status: AiCliStatus::Running,
+            tooltip_lines: vec!["Factory Droid - Working...".to_string()],
+        };
+
+        let mut observed = None;
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let layout =
+                        draw_terminal_status_badges(ui, &running_badge, &source_control_badge);
+                    observed = Some((
+                        layout.ai_rect.expect("expected visible ai badge"),
+                        layout.source_control_rect,
+                    ));
+                });
+            });
+        });
+
+        let (ai_rect, source_control_rect) = observed.expect("expected badge layout");
+        assert!(ai_rect.center().x < source_control_rect.center().x);
+    }
+
+    #[test]
+    fn draw_terminal_status_badges_does_not_leave_leading_gap_when_ai_is_inactive() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let source_control_badge =
+            source_control_badge_model(Some(&test_source_control_snapshot("main", &[])));
+        let inactive_badge = AiBadgeModel {
+            tool: Some(AiCliTool::FactoryDroid),
+            status: AiCliStatus::Inactive,
+            tooltip_lines: vec!["Factory Droid - Idle".to_string()],
+        };
+
+        let mut observed = None;
+        let mut direct_x = None;
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let layout =
+                        draw_terminal_status_badges(ui, &inactive_badge, &source_control_badge);
+                    observed = Some((layout.ai_rect, layout.source_control_rect.min.x));
+                });
+            });
+        });
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    direct_x = Some(
+                        draw_source_control_badge(ui, &source_control_badge)
+                            .rect
+                            .min
+                            .x,
+                    );
+                });
+            });
+        });
+
+        let (ai_rect, source_control_x) = observed.expect("expected badge layout");
+        assert_eq!(ai_rect, None);
+        assert!((source_control_x - direct_x.expect("expected source control badge")).abs() < 0.5);
     }
 
     #[test]

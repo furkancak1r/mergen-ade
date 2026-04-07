@@ -714,3 +714,59 @@
   - Rely on targeted snapshot tests for OSC/ST leakage instead of broad runtime warning heuristics.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test backslash`, `cargo test`
 - References: local user reproduction on 2026-04-07 with repeated `DEBUG backslash in snapshot` warnings for `PS C:\Users\...`; regression tests `st_terminated_osc_does_not_leak_backslash_in_snapshot`, `bell_terminated_osc_does_not_leak_backslash_in_snapshot`, and `plain_text_with_backslash_renders_correctly`
+
+#### Single-terminal view ignored `Ctrl+Alt+ArrowUp/ArrowDown` because navigation only considered the currently visible terminal and the shortcut was not routed as app navigation {#single-terminal-view-ignored-ctrl-alt-arrowup-arrowdown-because-navigation-only-considered-the-currently-visible-terminal-and-the-shortcut-was-not-routed-as-app-navigation}
+- Date: 2026-04-07T00:00:00Z
+- Context: main/Windows local keyboard navigation while `multi_terminal_view_enabled = false`
+- Error signature: In single-terminal view, `Ctrl+Alt+Yukarı/Aşağı` did nothing even when multiple terminal sessions were open.
+- Symptoms/Impact: Users could not switch between open terminals from the keyboard while the main area showed only one terminal. Existing grid navigation only operated on the visible tile set, which collapses to a single terminal in single-view mode.
+- Root cause: `src/app.rs` treated terminal navigation as a grid-only concept backed by `visible_terminal_ids_for_main()`. In single-terminal mode that list contains only the active terminal, so no neighbor existed to move to. At the same time, `Ctrl+Alt+ArrowUp/ArrowDown` was not represented as a distinct app shortcut, so there was no dedicated single-view navigation path.
+- Resolution: Added a distinct internal `TerminalNavigationShortcut` representation that separates grid navigation from single-view linear navigation. `raw_input_hook()` and terminal input partitioning now recognize `Ctrl+Alt+ArrowUp/ArrowDown` only when single-view mode is active, preventing multi-view regressions. `handle_shortcuts()` now routes those shortcuts through a linear helper that walks all terminal ids in ascending order without wraparound, while rendering still shows only the active terminal in single-view mode. Regression tests cover parsing, buffering, no-wrap edges, direct helper behavior, and active visible-terminal switching.
+- Prevent recurrence:
+  - Keep shortcut parsing mode-aware when a key combination is intended for only one layout mode.
+  - Do not reuse visible-tile navigation lists for single-view terminal switching; single-view needs its own navigable terminal list.
+  - Keep `raw_input_hook()` and `handle_shortcuts()` covered together so shortcut interception and active-terminal changes stay in sync.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: local user report on 2026-04-07; regression tests `event_terminal_navigation_shortcut_recognizes_ctrl_alt_up_down`, `raw_input_hook_buffers_ctrl_alt_arrow_for_single_view_navigation`, and `handle_shortcuts_moves_single_view_terminal_with_ctrl_alt_down`
+
+#### Factory Droid launch timeout cleanup and single-view terminal navigation could get stuck on unsupported process probes or exited terminals {#factory-droid-launch-timeout-cleanup-and-single-view-terminal-navigation-could-get-stuck-on-unsupported-process-probes-or-exited-terminals}
+- Date: 2026-04-07T09:00:00Z
+- Context: main/cross-platform Factory Droid polling plus single-terminal keyboard navigation after the initial single-view shortcut rollout
+- Error signature: `Factory Droid launch-pending state never cleared on non-Windows, and Ctrl+Alt+Arrow navigation in single-view could land on an exited terminal.`
+- Symptoms/Impact: On platforms where descendant-process probing is unsupported, expired Factory Droid launch attempts could remain stuck in pending state because process polling skipped cleanup entirely. Separately, single-view keyboard navigation could activate an exited terminal entry, leaving the main terminal view on a dead session that no longer accepted input.
+- Root cause: `src/app.rs` treated `has_factory_droid_descendant_process() == None` as a full early-exit from process polling, so launch-timeout cleanup never ran on those platforms. The same file built single-view navigation candidates from all terminal ids instead of filtering out exited terminals.
+- Resolution: Launch-timeout cleanup now runs before missing-process inference whenever launch grace has expired and no active descendant process was positively detected, so unsupported probes still clear stale pending Factory Droid state without fabricating a missing-process signal. Single-view `Ctrl+Alt+ArrowUp/ArrowDown` navigation now walks only live terminal ids, preserving sorted order while skipping exited entries. Regression tests cover the non-Windows expired-launch path and both up/down skip-over-exited navigation paths.
+- Prevent recurrence:
+  - Keep launch-pending timeout cleanup independent from platform-specific descendant-process probing support.
+  - Only infer missing Factory Droid processes from explicit negative probes, not from unsupported probes.
+  - Filter exited terminals out of single-view keyboard navigation lists and lock the behavior with mixed live/exited regression tests.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-07 review findings for `src/app.rs`; regression tests `factory_droid_process_poll_clears_expired_launch_when_process_probe_is_unsupported`, `handle_shortcuts_skips_exited_single_view_terminal_with_ctrl_alt_down`, and `handle_shortcuts_skips_exited_single_view_terminal_with_ctrl_alt_up`
+
+#### Mixed Factory Droid hook/title/status reads could apply signals out of byte order because hook parsing consumed the whole PTY tail instead of the hook boundary {#mixed-factory-droid-hook-title-status-reads-could-apply-signals-out-of-byte-order-because-hook-parsing-consumed-the-whole-pty-tail-instead-of-the-hook-boundary}
+- Date: 2026-04-07T10:00:00Z
+- Context: main/Windows local Factory Droid PTY parsing when official hook markers shared a read with later OSC titles or visible status text
+- Error signature: `A UserPromptSubmit hook followed by later Idle/title or HOOKS Stop bytes in the same PTY read could be applied in the wrong order.`
+- Symptoms/Impact: The AI badge and session state could briefly or permanently land on the wrong state for mixed reads. In the worst case, later `Idle`/attention bytes were sorted ahead of or collapsed into the earlier hook event, so the final state no longer reflected the actual byte order emitted by Factory Droid.
+- Root cause: `src/hooks.rs` treated any tail containing a complete official hook as fully consumed, so `AiHookTransition.text_offset` pointed at the end of the whole PTY tail rather than the closing `]`. Separately, `src/terminal.rs` emitted an "official raw chunk" containing trailing bytes after the earliest hook/title boundary, allowing later `HOOKS Stop` text in the same read to be interpreted too early.
+- Resolution: Hook splitting now stops at the first complete official hook boundary and keeps trailing bytes buffered for the same pass, including back-to-back official hook markers without newlines. The terminal reader now trims official raw chunks to the earliest complete hook/title span so later visible-status text is emitted by its own later signal. Regression tests cover trailing-byte buffering, back-to-back hook markers, hook-plus-title without newline, hook-plus-`HOOKS Stop` without newline, and clamped offsets with trailing non-ASCII bytes.
+- Prevent recurrence:
+  - Treat official hook boundaries as exact parsing spans, not as permission to consume the rest of the PTY tail.
+  - Keep offset-based signal ordering tests for mixed hook/title/visible-status reads without relying on newline separators.
+  - Bound debug/raw signal payloads to the actual signal span when downstream logic also interprets those chunks.
+- Files/Commands touched: `src/hooks.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-07 review finding for `src/hooks.rs`; regression tests `extract_complete_lines_with_end_offsets_keeps_trailing_bytes_available`, `update_with_text_offsets_processes_back_to_back_hook_markers_without_newlines`, `collect_ai_read_signals_orders_hook_before_later_title_signal_without_newline`, and `collect_ai_read_signals_orders_hook_before_later_visible_attention`
+
+#### Single-view `Ctrl+Alt+ArrowUp/ArrowDown` recovery could fail after the active terminal exited because navigation anchored on "accepts input" instead of the current selection {#single-view-ctrlaltarrowupctrlaltarrowdown-recovery-could-fail-after-the-active-terminal-exited-because-navigation-anchored-on-accepts-input-instead-of-the-current-selection}
+- Date: 2026-04-07T10:05:00Z
+- Context: main/Windows local single-terminal keyboard navigation after the initial single-view shortcut rollout
+- Error signature: `If the currently shown single-view terminal had already exited, Ctrl+Alt+ArrowUp/ArrowDown no longer recovered to a live terminal until the user clicked manually.`
+- Symptoms/Impact: Single-view mode could stay stuck on a dead terminal entry that no longer accepted input. Keyboard-only users lost the intended recovery path because the navigation shortcut resolved its anchor from `active_terminal_accepts_input()`, which returns `None` for exited terminals.
+- Root cause: `src/app.rs` built single-view linear navigation from only live terminal ids while also using the "accepts input" terminal as the active anchor. Once the selected terminal exited, the anchor disappeared from the navigation list and the shortcut had no starting position to scan from.
+- Resolution: Single-view navigation now anchors on the current selected terminal if it still exists, even when it has exited, walks the full sorted terminal order, and skips exited terminals while scanning in the requested direction. Regression tests cover recovery from an exited active terminal in both directions, skip-over-exited neighbors, and no-op behavior when no live neighbor exists.
+- Prevent recurrence:
+  - Separate "currently selected terminal" from "terminal that can currently receive PTY input" in keyboard-navigation logic.
+  - Build single-view navigation from full terminal ordering, then filter/select live targets during directional scanning.
+  - Keep exited-active recovery tests alongside edge/no-op tests so future shortcut changes do not reintroduce the dead-end.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-07 review finding for `src/app.rs`; regression tests `handle_shortcuts_recovers_from_exited_active_single_view_terminal_with_ctrl_alt_down`, `handle_shortcuts_recovers_from_exited_active_single_view_terminal_with_ctrl_alt_up`, and `handle_shortcuts_keeps_exited_single_view_terminal_when_no_live_neighbor_exists`
