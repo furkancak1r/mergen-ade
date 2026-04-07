@@ -7,8 +7,10 @@ use std::ops::Range;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arboard::Clipboard;
 use crossbeam_channel::{Receiver, Sender};
@@ -18,15 +20,16 @@ use eframe::egui::{
     Sense, Stroke, TextWrapMode, Ui, Vec2, WidgetInfo, WidgetText, WidgetType,
 };
 use iconflow::{fonts as icon_fonts, try_icon, Pack, Size, Style};
+use serde::{Deserialize, Serialize};
 use tattoy_wezterm_surface::hyperlink::{
     Rule, CLOSING_PARENTHESIS_HYPERLINK_PATTERN, GENERIC_HYPERLINK_PATTERN,
 };
 
 use crate::config;
+use crate::hooks::{AiCliSession, AiCliStatus, AiCliTool, AiHookManager};
 use crate::layout;
 use crate::models::{
-    AppConfig, LeftSidebarTab, MainVisibilityMode, ProjectRecord, ShellKind,
-    TerminalKind,
+    AppConfig, LeftSidebarTab, MainVisibilityMode, ProjectRecord, ShellKind, TerminalKind,
 };
 use crate::terminal::{
     try_terminal_selection_snapshot, try_terminal_snapshots, TerminalColor, TerminalCursor,
@@ -40,6 +43,10 @@ const TITLE_MAX_LEN: usize = 40;
 const TERMINAL_EVENT_BUDGET: usize = 4096;
 const TERMINAL_RETRY_MS: u64 = 8;
 const TERMINAL_FALLBACK_REFRESH_MS: u64 = 16;
+const FACTORY_DROID_HOOK_POLL_MS: u64 = 75;
+const FACTORY_DROID_PROCESS_POLL_MS: u64 = 75;
+const FACTORY_DROID_LAUNCH_GRACE_MS: u64 = 5_000;
+const FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS: u64 = 750;
 const CURSOR_BLINK_STEP_SECS: f64 = 0.6;
 const TERMINAL_COPY_TOAST_SECS: f64 = 1.75;
 const TERMINAL_COPY_FEEDBACK_TEXT: &str = "Copied terminal selection";
@@ -48,6 +55,10 @@ const TERMINAL_CHAR_WIDTH_SAMPLE_CELLS: usize = 64;
 const TERMINAL_FONT_FAMILY_NAME: &str = "terminal-mono";
 const CURSOR_BAR_WIDTH_PX: f32 = 2.0;
 const CURSOR_UNDERLINE_HEIGHT_PX: f32 = 2.0;
+
+// Embedded Nerd Font for terminal icon support
+const NERD_FONT_DATA: &[u8] = include_bytes!("../assets/fonts/CaskaydiaCoveNerdFont-Regular.ttf");
+const NERD_FONT_NAME: &str = "caskaydia-cove-nerd";
 const DIRECTORY_INDEX_LOADING_ANIMATION_STEP_SECS: f64 = 0.25;
 const SOURCE_CONTROL_PRIORITY_REFRESH_SECS: f64 = 5.0;
 const SOURCE_CONTROL_BACKGROUND_REFRESH_SECS: f64 = 20.0;
@@ -93,6 +104,8 @@ const WINDOWS_TERMINAL_FONT_CANDIDATES: [(&str, &str); 2] = [
     ("terminal-cascadia-mono", "CascadiaMono.ttf"),
     ("terminal-consolas", "consola.ttf"),
 ];
+
+static FACTORY_DROID_INBOX_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum AppIcon {
@@ -221,8 +234,115 @@ mod icons {
     pub const X: AppIcon = AppIcon::X;
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FactoryDroidHookInboxState {
+    offset: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct FactoryDroidHookInboxEvent {
+    terminal_id: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    inbox_token: Option<String>,
+    hook_event_name: String,
+    status: String,
+    #[serde(default)]
+    notification_kind: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    timestamp_utc: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FactoryDroidStatusSource {
+    PromptSubmit,
+    PtyHookEvent,
+    PtyStop,
+    PtyNotification,
+    TerminalTitle,
+    Inbox,
+}
+
+impl FactoryDroidStatusSource {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::PromptSubmit => "prompt_submit",
+            Self::PtyHookEvent => "pty_hook_event",
+            Self::PtyStop => "pty_stop",
+            Self::PtyNotification => "pty_notification",
+            Self::TerminalTitle => "terminal_title",
+            Self::Inbox => "inbox",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FactoryDroidTransportDiagnostics {
+    hooks_enabled: bool,
+    executable_path: PathBuf,
+    hooks_runtime_dir: Option<PathBuf>,
+    hooks_runtime_error: Option<String>,
+    active_session: Option<bool>,
+    process_state: Option<String>,
+    last_status_source: Option<FactoryDroidStatusSource>,
+}
+
+impl FactoryDroidTransportDiagnostics {
+    const PRIMARY_TRANSPORT_LABEL: &'static str = "PTY/process (primary)";
+    const FALLBACK_TRANSPORT_LABEL: &'static str = "Inbox JSONL (fallback)";
+
+    fn runtime_status_text(&self) -> String {
+        if !self.hooks_enabled {
+            "Disabled".to_owned()
+        } else if let Some(dir) = &self.hooks_runtime_dir {
+            format!("Ready: {}", dir.display())
+        } else if let Some(err) = &self.hooks_runtime_error {
+            format!("Unavailable: {err}")
+        } else {
+            "Unavailable: unknown error".to_owned()
+        }
+    }
+
+    fn active_session_text(&self) -> &'static str {
+        match self.active_session {
+            Some(true) => "Yes",
+            Some(false) => "No",
+            None => "No active terminal",
+        }
+    }
+
+    fn process_state_text(&self) -> &str {
+        self.process_state
+            .as_deref()
+            .unwrap_or("No active terminal")
+    }
+
+    fn last_status_source_text(&self) -> &'static str {
+        self.last_status_source
+            .map(FactoryDroidStatusSource::label)
+            .unwrap_or("none")
+    }
+
+    fn warning_message(&self) -> Option<String> {
+        self.hooks_enabled
+            .then_some(())
+            .and(self.hooks_runtime_error
+            .as_ref()
+            .map(|err| format!("Factory Droid inbox fallback unavailable: {err}")))
+    }
+}
+
 pub struct AdeApp {
     config_path: PathBuf,
+    current_executable_path: PathBuf,
+    factory_droid_hooks_dir: Option<PathBuf>,
+    factory_droid_hooks_dir_error: Option<String>,
+    factory_droid_hook_inboxes: BTreeMap<u64, FactoryDroidHookInboxState>,
+    factory_droid_hook_last_poll_at: Option<Instant>,
+    factory_droid_process_last_poll_at: Option<Instant>,
     config: AppConfig,
     config_load_error: Option<String>,
     config_save_requires_reload: bool,
@@ -235,9 +355,11 @@ pub struct AdeApp {
     active_terminal: Option<u64>,
     buffered_terminal_input: Vec<Event>,
     buffered_terminal_navigation: Vec<TerminalNavigationDirection>,
+    allow_attention_terminal_input_routing_once: bool,
     pending_terminal_pastes: Vec<PendingTerminalPaste>,
     terminal_events_tx: Sender<TerminalUiEvent>,
     terminal_events_rx: Receiver<TerminalUiEvent>,
+    ai_hook_manager: Option<Arc<AiHookManager>>,
     show_settings_popup: bool,
     saved_message_drafts: BTreeMap<u64, String>,
     directory_search_query: String,
@@ -285,6 +407,13 @@ struct TerminalEntry {
     snapshot_refresh_deferred: bool,
     exited: bool,
     runtime: TerminalRuntime,
+    ai_session: AiCliSession,
+    factory_droid_inbox_token: Option<String>,
+    factory_droid_launch_pending_since: Option<Instant>,
+    factory_droid_session_active: bool,
+    factory_droid_last_process_seen_at: Option<Instant>,
+    factory_droid_process_missing_since: Option<Instant>,
+    factory_droid_last_status_source: Option<FactoryDroidStatusSource>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -436,6 +565,83 @@ struct SourceControlBadgeModel {
     tooltip_lines: Vec<String>,
 }
 
+#[allow(dead_code)]
+struct AiBadgeModel {
+    tool: Option<AiCliTool>,
+    status: AiCliStatus,
+    tooltip_lines: Vec<String>,
+}
+
+impl AiBadgeModel {
+    fn from_session(session: &AiCliSession) -> Self {
+        let tool = session.tool;
+        let status = session.status;
+        let tooltip_lines = if let Some(t) = tool {
+            vec![status.tooltip(t)]
+        } else {
+            vec!["AI: Not detected".to_string()]
+        };
+        Self {
+            tool,
+            status,
+            tooltip_lines,
+        }
+    }
+}
+
+fn draw_ai_badge(ui: &mut Ui, badge: &AiBadgeModel) -> egui::Response {
+    // Sadece Running veya Attention durumlarında göster
+    if badge.status == AiCliStatus::Inactive {
+        return ui.allocate_at_least(egui::vec2(0.0, 0.0), Sense::hover()).1;
+    }
+
+    let time_seconds = ui.ctx().input(|i| i.time);
+    let (rect, response) = ui.allocate_at_least(egui::vec2(16.0, 16.0), Sense::hover());
+
+    if ui.is_rect_visible(rect) {
+        let center = rect.center();
+
+        // Pulse animasyonu (büyüyüp küçülen daire)
+        let pulse = ((time_seconds * 4.0).sin() + 1.0) * 0.25 + 2.5; // 2.5 - 5 arası yarıçap
+        let radius = pulse as f32;
+
+        let (r, g, b, alpha_multiplier) = match badge.status {
+            AiCliStatus::Running => {
+                // Yeşil pulse (Droid çalışıyor)
+                (76u8, 209u8, 114u8, 1.0)
+            }
+            AiCliStatus::Attention => {
+                // Sarı pulse (Droid dikkatinizi bekliyor)
+                (209u8, 186u8, 46u8, 1.0)
+            }
+            AiCliStatus::Inactive => {
+                // Bu durumda zaten üstte çıktık
+                unreachable!();
+            }
+        };
+
+        let alpha = ((time_seconds * 4.0).sin() * 0.3 + 0.7) * 255.0 * alpha_multiplier;
+        let color = Color32::from_rgba_unmultiplied(r, g, b, alpha as u8);
+
+        ui.painter().circle(
+            center,
+            radius,
+            color,
+            egui::Stroke::new(0.0, Color32::TRANSPARENT),
+        );
+
+        // Ensure animation continues: request repaint every 100ms
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    response.on_hover_ui(|ui| {
+        for line in &badge.tooltip_lines {
+            ui.label(line);
+        }
+    })
+}
+
 struct TerminalRenderModel {
     layout_job: LayoutJob,
     cursor_overlay: Option<TerminalCursorOverlay>,
@@ -481,6 +687,43 @@ struct PendingConfigChanges {
 }
 
 impl AdeApp {
+    fn ai_hook_manager_from_config(config: &AppConfig) -> Option<Arc<AiHookManager>> {
+        config
+            .ai_hooks
+            .global_enabled
+            .then(|| Arc::new(AiHookManager::new(config.ai_hooks.clone())))
+    }
+
+    fn factory_droid_hook_runtime_state(
+        config: &AppConfig,
+    ) -> (Option<Arc<AiHookManager>>, Option<PathBuf>, Option<String>) {
+        let ai_hook_manager = Self::ai_hook_manager_from_config(config);
+        if ai_hook_manager.is_none() {
+            return (None, None, None);
+        }
+
+        match config::factory_droid_hook_runtime_dir() {
+            Ok(dir) => (ai_hook_manager, Some(dir), None),
+            Err(err) => {
+                log::warn!("Factory Droid inbox runtime directory unavailable: {err}");
+                (ai_hook_manager, None, Some(err.to_string()))
+            }
+        }
+    }
+
+    fn next_factory_droid_inbox_token(terminal_id: u64) -> String {
+        let counter = FACTORY_DROID_INBOX_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let timestamp_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+
+        format!(
+            "{terminal_id:016x}-{:08x}-{timestamp_nanos:032x}-{counter:016x}",
+            std::process::id()
+        )
+    }
+
     pub fn bootstrap(cc: &eframe::CreationContext<'_>) -> Self {
         let config_path = config::config_path().unwrap_or_else(|_| PathBuf::from("config.toml"));
         let (mut config, config_load_error) = match config::load_config(&config_path) {
@@ -506,6 +749,10 @@ impl AdeApp {
             .last_selected_project_id
             .filter(|project_id| projects.contains_key(project_id))
             .or_else(|| projects.keys().next().copied());
+        let current_executable_path =
+            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("unknown"));
+        let (ai_hook_manager, factory_droid_hooks_dir, factory_droid_hooks_dir_error) =
+            Self::factory_droid_hook_runtime_state(&config);
 
         let (terminal_events_tx, terminal_events_rx) = crossbeam_channel::unbounded();
         let (source_control_commands_tx, source_control_commands_rx) =
@@ -516,6 +763,12 @@ impl AdeApp {
 
         let app = Self {
             config_path,
+            current_executable_path,
+            factory_droid_hooks_dir,
+            factory_droid_hooks_dir_error: factory_droid_hooks_dir_error.clone(),
+            factory_droid_hook_inboxes: BTreeMap::new(),
+            factory_droid_hook_last_poll_at: None,
+            factory_droid_process_last_poll_at: None,
             config,
             config_load_error: config_load_error.clone(),
             config_save_requires_reload: config_load_error.is_some(),
@@ -528,15 +781,22 @@ impl AdeApp {
             active_terminal: None,
             buffered_terminal_input: Vec::new(),
             buffered_terminal_navigation: Vec::new(),
+            allow_attention_terminal_input_routing_once: false,
             pending_terminal_pastes: Vec::new(),
             terminal_events_tx,
             terminal_events_rx,
+            ai_hook_manager,
             show_settings_popup: false,
             saved_message_drafts: BTreeMap::new(),
             directory_search_query: String::new(),
             directory_pending_tree_open_state_by_project: BTreeMap::new(),
             status_line: config_load_error
                 .map(|err| format!("Config load error: {err}. Existing config preserved."))
+                .or_else(|| {
+                    factory_droid_hooks_dir_error
+                        .as_ref()
+                        .map(|err| format!("Factory Droid inbox fallback unavailable: {err}"))
+                })
                 .unwrap_or_else(|| "Ready".to_owned()),
             copy_toast: None,
             layout_epoch: 0,
@@ -651,6 +911,7 @@ impl AdeApp {
             name,
             path,
             saved_messages: Vec::new(),
+            ai_config: crate::hooks::ProjectAiConfig::default(),
         };
 
         self.selected_project = Some(project.id);
@@ -680,6 +941,8 @@ impl AdeApp {
                 if terminal.runtime.terminate().is_err() {
                     close_failures += 1;
                 }
+                self.clear_factory_droid_state(terminal_id);
+                self.reset_factory_droid_hook_inbox(terminal_id);
             }
         }
 
@@ -687,7 +950,7 @@ impl AdeApp {
             .active_terminal
             .filter(|terminal_id| self.terminals.contains_key(terminal_id))
             .or_else(|| self.first_visible_terminal_for_main());
-        self.set_active_terminal(next_active_terminal);
+        self.set_active_terminal(ctx, next_active_terminal);
 
         if self.selected_project == Some(project_id) {
             self.selected_project = self.projects.keys().copied().next();
@@ -735,6 +998,11 @@ impl AdeApp {
 
         let terminal_id = self.next_terminal_id;
         self.next_terminal_id += 1;
+        self.reset_factory_droid_hook_inbox(terminal_id);
+        let factory_droid_inbox_token = self
+            .ai_hook_manager
+            .as_ref()
+            .map(|_| Self::next_factory_droid_inbox_token(terminal_id));
 
         let dimensions = TerminalDimensions::default();
         let runtime = match TerminalRuntime::spawn(
@@ -744,6 +1012,9 @@ impl AdeApp {
             self.terminal_events_tx.clone(),
             ctx.clone(),
             dimensions,
+            self.ai_hook_manager.clone(),
+            self.factory_droid_hooks_dir.clone(),
+            factory_droid_inbox_token.clone(),
         ) {
             Ok(runtime) => runtime,
             Err(err) => {
@@ -775,14 +1046,470 @@ impl AdeApp {
             snapshot_refresh_deferred: false,
             exited: false,
             runtime,
+            ai_session: AiCliSession::default(),
+            factory_droid_inbox_token,
+            factory_droid_launch_pending_since: None,
+            factory_droid_session_active: false,
+            factory_droid_last_process_seen_at: None,
+            factory_droid_process_missing_since: None,
+            factory_droid_last_status_source: None,
         };
 
         self.terminals.insert(terminal_id, entry);
-        self.set_active_terminal(Some(terminal_id));
+        self.set_active_terminal(ctx, Some(terminal_id));
         self.bump_layout_epoch();
 
         self.status_line = "Terminal created".to_owned();
         true
+    }
+
+    fn factory_droid_hook_inbox_path_for_dir(dir: &Path, terminal_id: u64) -> PathBuf {
+        dir.join(format!("{terminal_id}.jsonl"))
+    }
+
+    fn factory_droid_hook_inbox_path(&self, terminal_id: u64) -> Option<PathBuf> {
+        self.factory_droid_hooks_dir
+            .as_deref()
+            .map(|dir| Self::factory_droid_hook_inbox_path_for_dir(dir, terminal_id))
+    }
+
+    fn is_factory_droid_launch_command(line: &str) -> bool {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        let command = trimmed
+            .split_whitespace()
+            .next()
+            .map(|token| token.trim_matches(|ch| ch == '"' || ch == '\''))
+            .unwrap_or_default();
+        if command.is_empty() {
+            return false;
+        }
+
+        let command_path = Path::new(command);
+        let Some(stem) = command_path.file_stem().and_then(|stem| stem.to_str()) else {
+            return false;
+        };
+
+        matches!(stem.to_ascii_lowercase().as_str(), "droid" | "factory")
+    }
+
+    fn factory_droid_attention_source_from_chunk(chunk: &str) -> Option<FactoryDroidStatusSource> {
+        let lower = chunk.to_ascii_lowercase();
+        if lower.contains("hooks  stop") || lower.contains("hooks stop") {
+            return Some(FactoryDroidStatusSource::PtyStop);
+        }
+
+        if lower.contains("needs your permission") || lower.contains("waiting for your input") {
+            return Some(FactoryDroidStatusSource::PtyNotification);
+        }
+
+        None
+    }
+
+    fn factory_droid_process_state_text(terminal: &TerminalEntry) -> &'static str {
+        if terminal.factory_droid_session_active {
+            "active"
+        } else if terminal.factory_droid_process_missing_since.is_some() {
+            "missing (grace)"
+        } else {
+            "none"
+        }
+    }
+
+    fn mark_factory_droid_launch_pending(&mut self, terminal_id: u64) -> bool {
+        if self.ai_hook_manager.is_none() {
+            return false;
+        }
+
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        if let Some(manager) = &self.ai_hook_manager {
+            manager.set_tool(terminal_id, AiCliTool::FactoryDroid);
+        }
+
+        let mut changed = false;
+        if entry.ai_session.tool != Some(AiCliTool::FactoryDroid) {
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            changed = true;
+        }
+        if entry.ai_session.status != AiCliStatus::Inactive {
+            entry.ai_session.status = AiCliStatus::Inactive;
+            changed = true;
+        }
+        if entry.factory_droid_launch_pending_since.is_none() {
+            changed = true;
+        }
+        entry.factory_droid_launch_pending_since = Some(Instant::now());
+        entry.factory_droid_session_active = false;
+        entry.factory_droid_last_process_seen_at = None;
+        entry.factory_droid_process_missing_since = None;
+        entry.dirty = true;
+        changed
+    }
+
+    fn clear_factory_droid_state(&mut self, terminal_id: u64) -> bool {
+        if let Some(manager) = &self.ai_hook_manager {
+            manager.reset_session(terminal_id);
+        }
+
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        let changed = entry.ai_session.tool == Some(AiCliTool::FactoryDroid)
+            || entry.ai_session.status != AiCliStatus::Inactive
+            || entry.factory_droid_launch_pending_since.is_some()
+            || entry.factory_droid_session_active;
+
+        entry.ai_session = AiCliSession::default();
+        entry.factory_droid_launch_pending_since = None;
+        entry.factory_droid_session_active = false;
+        entry.factory_droid_last_process_seen_at = None;
+        entry.factory_droid_process_missing_since = None;
+        entry.factory_droid_last_status_source = None;
+        entry.dirty = true;
+        changed
+    }
+
+    fn note_factory_droid_session_active(&mut self, terminal_id: u64) -> bool {
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        if let Some(manager) = &self.ai_hook_manager {
+            manager.set_tool(terminal_id, AiCliTool::FactoryDroid);
+        }
+
+        let mut changed = false;
+        if entry.ai_session.tool != Some(AiCliTool::FactoryDroid) {
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            changed = true;
+        }
+        if !entry.factory_droid_session_active {
+            entry.factory_droid_session_active = true;
+            changed = true;
+        }
+        if entry.factory_droid_process_missing_since.take().is_some() {
+            changed = true;
+        }
+        if entry.factory_droid_launch_pending_since.take().is_some() {
+            changed = true;
+        }
+        entry.factory_droid_last_process_seen_at = Some(Instant::now());
+        entry.dirty = true;
+        changed
+    }
+
+    fn note_factory_droid_process_missing(&mut self, terminal_id: u64) -> bool {
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        let mut changed = false;
+        if entry.factory_droid_session_active {
+            entry.factory_droid_session_active = false;
+            changed = true;
+        }
+        if entry.factory_droid_process_missing_since.is_none() {
+            entry.factory_droid_process_missing_since = Some(Instant::now());
+            changed = true;
+        }
+        entry.dirty = true;
+        changed
+    }
+
+    fn factory_droid_trailing_grace_elapsed(entry: &TerminalEntry) -> bool {
+        entry
+            .factory_droid_process_missing_since
+            .is_some_and(|missing_since| {
+                missing_since.elapsed()
+                    >= Duration::from_millis(FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS)
+            })
+    }
+
+    fn apply_factory_droid_status(
+        &mut self,
+        terminal_id: u64,
+        status: AiCliStatus,
+        source: FactoryDroidStatusSource,
+    ) -> bool {
+        let Some(manager) = self.ai_hook_manager.as_ref().cloned() else {
+            return false;
+        };
+
+        manager.set_tool(terminal_id, AiCliTool::FactoryDroid);
+
+        let update = match status {
+            AiCliStatus::Running => manager.ai_activity_started(terminal_id),
+            AiCliStatus::Attention => manager.ai_waiting_for_user(terminal_id),
+            AiCliStatus::Inactive => None,
+        };
+
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        let mut changed = false;
+        if entry.ai_session.tool != Some(AiCliTool::FactoryDroid) {
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            changed = true;
+        }
+        if let Some((tool, next_status)) = update {
+            if entry.ai_session.tool != Some(tool) || entry.ai_session.status != next_status {
+                entry.ai_session.tool = Some(tool);
+                entry.ai_session.status = next_status;
+                changed = true;
+            }
+        } else if entry.ai_session.status != status {
+            entry.ai_session.status = status;
+            changed = true;
+        }
+        if entry.factory_droid_last_status_source != Some(source) {
+            entry.factory_droid_last_status_source = Some(source);
+            changed = true;
+        }
+        if !entry.factory_droid_session_active {
+            entry.factory_droid_session_active = true;
+            changed = true;
+        }
+        if entry.factory_droid_process_missing_since.take().is_some() {
+            changed = true;
+        }
+        entry.factory_droid_last_process_seen_at = Some(Instant::now());
+        if entry.factory_droid_launch_pending_since.take().is_some() {
+            changed = true;
+        }
+        entry.dirty = true;
+        changed
+    }
+
+    fn reset_factory_droid_hook_inbox(&mut self, terminal_id: u64) {
+        self.factory_droid_hook_inboxes.remove(&terminal_id);
+
+        if let Some(path) = self.factory_droid_hook_inbox_path(terminal_id) {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    fn poll_factory_droid_processes(&mut self, ctx: &egui::Context) {
+        if self.ai_hook_manager.is_none() || self.terminals.is_empty() {
+            return;
+        }
+
+        if self
+            .factory_droid_process_last_poll_at
+            .is_some_and(|last_poll| {
+                last_poll.elapsed() < Duration::from_millis(FACTORY_DROID_PROCESS_POLL_MS)
+            })
+        {
+            return;
+        }
+
+        self.factory_droid_process_last_poll_at = Some(Instant::now());
+
+        let mut changed = false;
+        let terminal_ids = self.terminals.keys().copied().collect::<Vec<_>>();
+        for terminal_id in terminal_ids {
+            let Some(entry) = self.terminals.get(&terminal_id) else {
+                continue;
+            };
+            let process_active =
+                !entry.exited && entry.runtime.has_factory_droid_descendant_process();
+            let launch_expired =
+                entry
+                    .factory_droid_launch_pending_since
+                    .is_some_and(|started_at| {
+                        started_at.elapsed() >= Duration::from_millis(FACTORY_DROID_LAUNCH_GRACE_MS)
+                    });
+            let session_active = entry.factory_droid_session_active;
+            let is_candidate = entry.factory_droid_launch_pending_since.is_some();
+            let tool_is_factory = entry.ai_session.tool == Some(AiCliTool::FactoryDroid);
+            let status = entry.ai_session.status;
+
+            if process_active {
+                changed |= self.note_factory_droid_session_active(terminal_id);
+                continue;
+            }
+
+            if is_candidate && !tool_is_factory && launch_expired {
+                changed |= self.clear_factory_droid_state(terminal_id);
+                continue;
+            }
+
+            if is_candidate && launch_expired {
+                changed |= self.clear_factory_droid_state(terminal_id);
+                continue;
+            }
+
+            if tool_is_factory {
+                changed |= self.note_factory_droid_process_missing(terminal_id);
+
+                match status {
+                    AiCliStatus::Attention => {}
+                    AiCliStatus::Running => {
+                        if self
+                            .terminals
+                            .get(&terminal_id)
+                            .is_some_and(Self::factory_droid_trailing_grace_elapsed)
+                        {
+                            changed |= self.clear_factory_droid_state(terminal_id);
+                        }
+                    }
+                    AiCliStatus::Inactive => {
+                        changed |= self.clear_factory_droid_state(terminal_id);
+                    }
+                }
+            } else if session_active {
+                changed |= self.clear_factory_droid_state(terminal_id);
+            }
+        }
+
+        if changed {
+            ctx.request_repaint();
+        }
+    }
+
+    fn poll_factory_droid_hook_inboxes(&mut self, ctx: &egui::Context) {
+        if self.ai_hook_manager.is_none()
+            || self.factory_droid_hooks_dir.is_none()
+            || self.terminals.is_empty()
+        {
+            return;
+        }
+
+        if self
+            .factory_droid_hook_last_poll_at
+            .is_some_and(|last_poll| {
+                last_poll.elapsed() < Duration::from_millis(FACTORY_DROID_HOOK_POLL_MS)
+            })
+        {
+            return;
+        }
+
+        self.factory_droid_hook_last_poll_at = Some(Instant::now());
+
+        let terminal_ids = self.terminals.keys().copied().collect::<Vec<_>>();
+        let mut changed = false;
+        for terminal_id in terminal_ids {
+            changed |= self.process_factory_droid_hook_inbox(terminal_id);
+        }
+
+        if changed {
+            ctx.request_repaint();
+        }
+    }
+
+    fn process_factory_droid_hook_inbox(&mut self, terminal_id: u64) -> bool {
+        let Some(path) = self.factory_droid_hook_inbox_path(terminal_id) else {
+            return false;
+        };
+
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.factory_droid_hook_inboxes
+                    .entry(terminal_id)
+                    .or_default()
+                    .offset = 0;
+                return false;
+            }
+            Err(err) => {
+                log::warn!(
+                    "Failed to read Factory Droid hook inbox for terminal {terminal_id} at {}: {err}",
+                    path.display()
+                );
+                return false;
+            }
+        };
+
+        let previous_offset = self
+            .factory_droid_hook_inboxes
+            .get(&terminal_id)
+            .map(|state| state.offset)
+            .unwrap_or(0);
+        let start = if previous_offset as usize <= bytes.len() {
+            previous_offset as usize
+        } else {
+            0
+        };
+        let unread = &bytes[start..];
+        let Some(last_newline) = unread.iter().rposition(|byte| *byte == b'\n') else {
+            if previous_offset as usize > bytes.len() {
+                self.factory_droid_hook_inboxes
+                    .entry(terminal_id)
+                    .or_default()
+                    .offset = 0;
+            }
+            return false;
+        };
+
+        let processed_end = start + last_newline + 1;
+        let mut changed = false;
+        for line in bytes[start..processed_end].split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+
+            match serde_json::from_slice::<FactoryDroidHookInboxEvent>(line) {
+                Ok(event) => {
+                    changed |= self.apply_factory_droid_hook_inbox_event(terminal_id, &event);
+                }
+                Err(err) => {
+                    log::warn!(
+                        "Ignoring malformed Factory Droid hook inbox event for terminal {terminal_id} at {}: {err}",
+                        path.display()
+                    );
+                }
+            }
+        }
+
+        self.factory_droid_hook_inboxes
+            .entry(terminal_id)
+            .or_default()
+            .offset = processed_end as u64;
+
+        changed
+    }
+
+    fn apply_factory_droid_hook_inbox_event(
+        &mut self,
+        terminal_id: u64,
+        event: &FactoryDroidHookInboxEvent,
+    ) -> bool {
+        if event.terminal_id != terminal_id.to_string() {
+            return false;
+        }
+
+        let Some(expected_inbox_token) = self
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.factory_droid_inbox_token.as_deref())
+        else {
+            return false;
+        };
+
+        if event.inbox_token.as_deref() != Some(expected_inbox_token) {
+            return false;
+        }
+
+        match event.status.as_str() {
+            "running" => self.apply_factory_droid_status(
+                terminal_id,
+                AiCliStatus::Running,
+                FactoryDroidStatusSource::Inbox,
+            ),
+            "attention" => self.apply_factory_droid_status(
+                terminal_id,
+                AiCliStatus::Attention,
+                FactoryDroidStatusSource::Inbox,
+            ),
+            _ => false,
+        }
     }
 
     fn terminal_counts_for_project(&self, project_id: u64) -> (usize, usize) {
@@ -828,6 +1555,52 @@ impl AdeApp {
                     exited_ids.insert(event.terminal_id);
                     dirty_ids.insert(event.terminal_id);
                 }
+                TerminalUiEventKind::AiStatusChange {
+                    terminal_id,
+                    tool,
+                    status,
+                    event: _,
+                    from_title,
+                } => {
+                    if tool == Some(AiCliTool::FactoryDroid) {
+                        let source = if from_title {
+                            FactoryDroidStatusSource::TerminalTitle
+                        } else {
+                            FactoryDroidStatusSource::PtyHookEvent
+                        };
+                        if self.apply_factory_droid_status(terminal_id, status, source) {
+                            dirty_ids.insert(terminal_id);
+                        }
+                    } else if let Some(entry) = self.terminals.get_mut(&terminal_id) {
+                        if tool.is_some() {
+                            entry.ai_session.tool = tool;
+                        }
+                        entry.ai_session.status = status;
+                        dirty_ids.insert(terminal_id);
+                    }
+                }
+                TerminalUiEventKind::AiRawChunk { terminal_id, chunk } => {
+                    let should_apply = self.terminals.get(&terminal_id).is_some_and(|entry| {
+                        !entry.exited
+                            && (entry.factory_droid_session_active
+                                || entry.factory_droid_launch_pending_since.is_some()
+                                || entry.ai_session.tool == Some(AiCliTool::FactoryDroid))
+                    });
+
+                    if should_apply {
+                        if let Some(source) =
+                            Self::factory_droid_attention_source_from_chunk(&chunk)
+                        {
+                            if self.apply_factory_droid_status(
+                                terminal_id,
+                                AiCliStatus::Attention,
+                                source,
+                            ) {
+                                dirty_ids.insert(terminal_id);
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -841,13 +1614,17 @@ impl AdeApp {
             changed = true;
         }
 
-        for terminal_id in exited_ids {
+        for &terminal_id in &exited_ids {
             let Some(entry) = self.terminals.get_mut(&terminal_id) else {
                 continue;
             };
             entry.exited = true;
             entry.dirty = true;
             changed = true;
+        }
+
+        for terminal_id in exited_ids {
+            changed |= self.clear_factory_droid_state(terminal_id);
         }
 
         if changed {
@@ -1220,7 +1997,7 @@ impl AdeApp {
                 direction,
             );
             if let Some(next_terminal) = next_terminal {
-                self.set_active_terminal(Some(next_terminal));
+                self.set_active_terminal(ctx, Some(next_terminal));
                 changed = true;
             }
         }
@@ -1346,6 +2123,48 @@ impl AdeApp {
             event,
             Event::Key { .. } | Event::Text(_) | Event::Paste(_) | Event::Copy | Event::Cut
         )
+    }
+
+    fn event_is_terminal_text_entry(event: &Event) -> bool {
+        match event {
+            Event::Text(text) => !text.is_empty(),
+            Event::Paste(text) => !text.is_empty(),
+            Event::Key {
+                key: Key::Enter | Key::Backspace,
+                pressed: true,
+                ..
+            } => true,
+            _ => false,
+        }
+    }
+
+    fn should_steal_attention_terminal_input(&self, ctx: &egui::Context, events: &[Event]) -> bool {
+        if self.ai_hook_manager.is_none() {
+            return false;
+        }
+
+        if !self.text_input_has_focus(ctx) {
+            return false;
+        }
+
+        if ctx.memory(|mem| mem.any_popup_open()) || ctx.is_context_menu_open() {
+            return false;
+        }
+
+        if self.show_settings_popup && ctx.wants_keyboard_input() {
+            return false;
+        }
+
+        let Some(active_terminal_id) = self.active_terminal_accepts_input() else {
+            return false;
+        };
+
+        let Some(terminal) = self.terminals.get(&active_terminal_id) else {
+            return false;
+        };
+
+        terminal.ai_session.status == AiCliStatus::Attention
+            && events.iter().any(Self::event_is_terminal_text_entry)
     }
 
     fn event_terminal_navigation_direction(event: &Event) -> Option<TerminalNavigationDirection> {
@@ -1488,7 +2307,10 @@ impl AdeApp {
     }
 
     fn route_active_terminal_input(&mut self, ctx: &egui::Context, events: Vec<Event>) {
-        if self.ui_owns_keyboard(ctx) {
+        let allow_attention_override =
+            std::mem::take(&mut self.allow_attention_terminal_input_routing_once);
+
+        if self.ui_owns_keyboard(ctx) && !allow_attention_override {
             return;
         }
 
@@ -1503,6 +2325,9 @@ impl AdeApp {
         let mut outbound = Vec::new();
         let mut copied_selection = None;
         let mut last_key_was_alt_m = false;
+        let mut launched_factory_droid = false;
+        let mut submitted_factory_prompt = false;
+        let mut sent_terminal_input = false;
         {
             let Some(terminal) = self.terminals.get_mut(&active_terminal_id) else {
                 return;
@@ -1541,6 +2366,7 @@ impl AdeApp {
                         }
                         Self::clear_terminal_selection(terminal);
                         outbound.extend_from_slice(text.as_bytes());
+                        sent_terminal_input = true;
                         Self::append_pending_line(&mut terminal.pending_line_for_title, &text);
                     }
                     Event::Paste(text) => {
@@ -1550,6 +2376,7 @@ impl AdeApp {
                         Self::clear_terminal_selection(terminal);
                         Self::flush_terminal_outbound(terminal, ctx, &mut outbound);
                         Self::deliver_pasted_text_to_terminal(terminal, &text, ctx);
+                        sent_terminal_input = true;
                     }
                     Event::Key {
                         key,
@@ -1562,8 +2389,20 @@ impl AdeApp {
                         if key == Key::Enter {
                             Self::clear_terminal_selection(terminal);
                             outbound.push(b'\r');
+                            sent_terminal_input = true;
                             let line = std::mem::take(&mut terminal.pending_line_for_title);
-                            if let Some(sanitized) = terminal_title_candidate(&line) {
+                            if Self::is_factory_droid_launch_command(&line) {
+                                launched_factory_droid = true;
+                            }
+                            let sanitized_line = terminal_title_candidate(&line);
+                            if terminal.factory_droid_session_active
+                                && sanitized_line
+                                    .as_ref()
+                                    .is_some_and(|candidate| !candidate.trim().is_empty())
+                            {
+                                submitted_factory_prompt = true;
+                            }
+                            if let Some(sanitized) = sanitized_line {
                                 terminal.full_title = sanitized.clone();
                                 terminal.title = update_terminal_title(
                                     &sanitized,
@@ -1585,6 +2424,7 @@ impl AdeApp {
                             Self::clear_terminal_selection(terminal);
                             outbound.push(b'\x1b');
                             outbound.push(b'm');
+                            sent_terminal_input = true;
                             last_key_was_alt_m = true;
                             continue;
                         }
@@ -1592,6 +2432,7 @@ impl AdeApp {
                         if let Some(bytes) = Self::key_to_terminal_bytes(key, modifiers) {
                             Self::clear_terminal_selection(terminal);
                             outbound.extend_from_slice(&bytes);
+                            sent_terminal_input = true;
                         }
                     }
                     _ => {}
@@ -1601,9 +2442,37 @@ impl AdeApp {
             Self::flush_terminal_outbound(terminal, ctx, &mut outbound);
         }
 
-        if let Some(text) = copied_selection {
-            ctx.copy_text(text);
+        if launched_factory_droid {
+            self.mark_factory_droid_launch_pending(active_terminal_id);
+        }
+
+        if let Some(ref text) = copied_selection {
+            ctx.copy_text(text.clone());
             self.show_terminal_copy_feedback(ctx);
+        }
+
+        // Clear AI attention status when user types input
+        if let Some(manager) = &self.ai_hook_manager {
+            let has_copied = copied_selection.is_some();
+            if sent_terminal_input || has_copied {
+                if let Some((tool, status)) = manager.user_interacted(active_terminal_id) {
+                    if let Some(entry) = self.terminals.get_mut(&active_terminal_id) {
+                        entry.ai_session.tool = Some(tool);
+                        entry.ai_session.status = status;
+                    }
+                    ctx.request_repaint();
+                }
+            }
+        }
+
+        if submitted_factory_prompt {
+            if self.apply_factory_droid_status(
+                active_terminal_id,
+                AiCliStatus::Running,
+                FactoryDroidStatusSource::PromptSubmit,
+            ) {
+                ctx.request_repaint();
+            }
         }
     }
 
@@ -1934,28 +2803,57 @@ impl AdeApp {
         };
 
         self.terminals.remove(&terminal_id);
+        self.clear_factory_droid_state(terminal_id);
+        self.reset_factory_droid_hook_inbox(terminal_id);
         self.status_line = match close_result {
             Ok(()) => format!("Closed {title}"),
             Err(err) => format!("Closed {title} (cleanup failed: {err})"),
         };
 
         let remaining_terminal_ids = self.terminals.keys().copied().collect::<Vec<_>>();
-        self.set_active_terminal(next_active_terminal_after_close(
-            self.active_terminal,
-            terminal_id,
-            &remaining_terminal_ids,
-        ));
+        self.set_active_terminal(
+            ctx,
+            next_active_terminal_after_close(
+                self.active_terminal,
+                terminal_id,
+                &remaining_terminal_ids,
+            ),
+        );
         self.bump_layout_epoch();
         ctx.request_repaint();
     }
 
-    fn set_active_terminal(&mut self, terminal_id: Option<u64>) {
+    fn set_active_terminal(&mut self, ctx: &egui::Context, terminal_id: Option<u64>) {
         if self.active_terminal == terminal_id {
+            if let Some(terminal_id) = terminal_id {
+                self.acknowledge_terminal_attention(terminal_id);
+            }
+            ctx.request_repaint();
             return;
+        }
+
+        if let Some(terminal_id) = terminal_id {
+            self.acknowledge_terminal_attention(terminal_id);
         }
 
         self.active_terminal = terminal_id;
         self.clear_terminal_selections_except(terminal_id);
+
+        // Repaint to update AI badge state
+        ctx.request_repaint();
+    }
+
+    fn acknowledge_terminal_attention(&mut self, terminal_id: u64) {
+        let Some(manager) = &self.ai_hook_manager else {
+            return;
+        };
+
+        if let Some((tool, status)) = manager.user_interacted(terminal_id) {
+            if let Some(entry) = self.terminals.get_mut(&terminal_id) {
+                entry.ai_session.tool = Some(tool);
+                entry.ai_session.status = status;
+            }
+        }
     }
 
     fn clear_terminal_selections_except(&mut self, keep_terminal_id: Option<u64>) {
@@ -2222,6 +3120,34 @@ impl AdeApp {
             })
     }
 
+    fn factory_droid_transport_diagnostics(&self) -> FactoryDroidTransportDiagnostics {
+        let active_terminal = self
+            .active_terminal
+            .and_then(|terminal_id| self.terminals.get(&terminal_id));
+        FactoryDroidTransportDiagnostics {
+            hooks_enabled: self.ai_hook_manager.is_some(),
+            executable_path: self.current_executable_path.clone(),
+            hooks_runtime_dir: self.factory_droid_hooks_dir.clone(),
+            hooks_runtime_error: self.factory_droid_hooks_dir_error.clone(),
+            active_session: active_terminal.map(|terminal| terminal.factory_droid_session_active),
+            process_state: active_terminal
+                .map(Self::factory_droid_process_state_text)
+                .map(str::to_owned),
+            last_status_source: active_terminal
+                .and_then(|terminal| terminal.factory_droid_last_status_source),
+        }
+    }
+
+    fn draw_settings_diagnostic_row(ui: &mut Ui, label: &str, value: &str, value_color: Color32) {
+        ui.label(RichText::new(label).strong().color(TEXT_PRIMARY));
+        ui.add(
+            egui::Label::new(RichText::new(value).monospace().small().color(value_color))
+                .truncate(),
+        )
+        .on_hover_text(value);
+        ui.add_space(4.0);
+    }
+
     fn draw_top_bar(&mut self, ctx: &egui::Context) -> egui::Rect {
         egui::TopBottomPanel::top("top_bar")
             .exact_height(TOP_BAR_HEIGHT)
@@ -2245,6 +3171,7 @@ impl AdeApp {
                         egui::vec2(remaining_width, 28.0),
                         Layout::right_to_left(Align::Center),
                         |ui| {
+                            let diagnostics = self.factory_droid_transport_diagnostics();
                             if styled_icon_button(
                                 ui,
                                 icons::GEAR,
@@ -2254,6 +3181,17 @@ impl AdeApp {
                                 "Settings",
                             ) {
                                 self.show_settings_popup = true;
+                            }
+
+                            if let Some(warning_message) = diagnostics.warning_message() {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new("Factory Droid inbox fallback unavailable")
+                                        .small()
+                                        .strong()
+                                        .color(Color32::from_rgb(232, 184, 76)),
+                                )
+                                .on_hover_text(warning_message);
                             }
                         },
                     );
@@ -3190,6 +4128,10 @@ impl AdeApp {
                                     draw_source_control_badge(ui, &project_source_control_badge);
                                 ui.add_space(4.0);
 
+                                let ai_badge = AiBadgeModel::from_session(&terminal.ai_session);
+                                draw_ai_badge(ui, &ai_badge);
+                                ui.add_space(4.0);
+
                                 let term_icon_color = if terminal.exited {
                                     Color32::from_rgb(200, 100, 100)
                                 } else {
@@ -3319,7 +4261,7 @@ impl AdeApp {
                 self.bump_layout_epoch();
             }
             if set_active {
-                self.set_active_terminal(Some(terminal_entry_id));
+                self.set_active_terminal(ctx, Some(terminal_entry_id));
             }
             if close_terminal {
                 self.close_terminal(ctx, terminal_entry_id);
@@ -3502,6 +4444,10 @@ impl AdeApp {
                             ui.set_min_height(TERMINAL_HEADER_HEIGHT - 12.0);
 
                             draw_source_control_badge(ui, &source_control_badge);
+                            ui.add_space(4.0);
+
+                            let ai_badge = AiBadgeModel::from_session(&terminal.ai_session);
+                            draw_ai_badge(ui, &ai_badge);
                             ui.add_space(4.0);
 
                             let title = terminal_display_label(&terminal.title, terminal.exited);
@@ -3925,7 +4871,7 @@ impl AdeApp {
         }
 
         if clicked || copied_selection.is_some() || paste_requested {
-            self.set_active_terminal(Some(terminal_id));
+            self.set_active_terminal(ui.ctx(), Some(terminal_id));
         }
 
         if let Some(text) = copied_selection {
@@ -4012,6 +4958,76 @@ impl AdeApp {
                 if self.config.default_shell != previous_shell {
                     should_persist = true;
                     default_shell_changed = true;
+                }
+
+                ui.separator();
+                let diagnostics = self.factory_droid_transport_diagnostics();
+                ui.label(
+                    RichText::new(format!("{} Diagnostics", icons::EYE))
+                        .strong()
+                        .size(15.0)
+                        .color(TEXT_PRIMARY),
+                );
+                ui.label(
+                    RichText::new(
+                        "Factory Droid status uses PTY/process detection first. Inbox JSONL remains a best-effort fallback.",
+                    )
+                    .color(TEXT_MUTED)
+                    .small(),
+                );
+                ui.add_space(4.0);
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Executable Path",
+                    &diagnostics.executable_path.display().to_string(),
+                    TEXT_PRIMARY,
+                );
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Factory Droid Primary",
+                    FactoryDroidTransportDiagnostics::PRIMARY_TRANSPORT_LABEL,
+                    TEXT_PRIMARY,
+                );
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Factory Droid Fallback",
+                    FactoryDroidTransportDiagnostics::FALLBACK_TRANSPORT_LABEL,
+                    TEXT_PRIMARY,
+                );
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Factory Droid Inbox",
+                    &diagnostics.runtime_status_text(),
+                    if diagnostics.hooks_runtime_dir.is_some() {
+                        Color32::from_rgb(114, 209, 152)
+                    } else {
+                        Color32::from_rgb(232, 184, 76)
+                    },
+                );
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Droid Session Active",
+                    diagnostics.active_session_text(),
+                    TEXT_PRIMARY,
+                );
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Factory Droid Process State",
+                    diagnostics.process_state_text(),
+                    TEXT_PRIMARY,
+                );
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Last Status Source",
+                    diagnostics.last_status_source_text(),
+                    TEXT_PRIMARY,
+                );
+                if let Some(warning_message) = diagnostics.warning_message() {
+                    ui.label(
+                        RichText::new(warning_message)
+                            .small()
+                            .color(Color32::from_rgb(232, 184, 76)),
+                    );
                 }
 
                 ui.separator();
@@ -4196,6 +5212,21 @@ impl eframe::App for AdeApp {
                 raw_input.events = remaining_events;
                 return;
             }
+
+            if self.should_steal_attention_terminal_input(ctx, &remaining_events) {
+                self.surrender_ui_text_focus(ctx);
+                self.allow_attention_terminal_input_routing_once = true;
+                let (terminal_events, remaining_events) =
+                    Self::partition_terminal_input_events(remaining_events);
+                let (navigation_directions, remaining_events) =
+                    Self::partition_terminal_navigation_shortcuts(remaining_events);
+                self.buffered_terminal_input.extend(terminal_events);
+                self.buffered_terminal_navigation
+                    .extend(navigation_directions);
+                raw_input.events = remaining_events;
+                return;
+            }
+
             // Terminal capture not active — fall through to normal UI event processing
             let (_, remaining_events) =
                 Self::partition_blocked_ui_reverse_focus_traversal_events(remaining_events);
@@ -4217,6 +5248,8 @@ impl eframe::App for AdeApp {
         self.ensure_theme_initialized(ctx);
         self.apply_initial_window_bounds(ctx);
         self.process_terminal_events(ctx);
+        self.poll_factory_droid_hook_inboxes(ctx);
+        self.poll_factory_droid_processes(ctx);
         self.process_source_control_events(ctx);
         self.process_directory_index_events(ctx);
         self.schedule_source_control_refresh(ctx);
@@ -4251,6 +5284,10 @@ impl eframe::App for AdeApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         for terminal in self.terminals.values() {
             let _ = terminal.runtime.terminate();
+        }
+        let terminal_ids = self.terminals.keys().copied().collect::<Vec<_>>();
+        for terminal_id in terminal_ids {
+            self.reset_factory_droid_hook_inbox(terminal_id);
         }
 
         self.persist_config();
@@ -5936,6 +6973,13 @@ fn load_terminal_fallback_font_names(fonts: &mut egui::FontDefinitions) -> Vec<S
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows\Fonts"));
     let mut loaded_font_names = Vec::new();
 
+    // Load embedded Nerd Font for terminal icon support
+    fonts.font_data.insert(
+        NERD_FONT_NAME.to_owned(),
+        FontData::from_owned(NERD_FONT_DATA.to_vec()),
+    );
+    loaded_font_names.push(NERD_FONT_NAME.to_owned());
+
     for (font_name, file_name) in windows_terminal_font_candidates() {
         let font_path = fonts_dir.join(file_name);
         let Ok(font_bytes) = fs::read(&font_path) else {
@@ -6427,22 +7471,25 @@ mod tests {
         terminal_manager_row_widths, terminal_output_surface_size, terminal_output_viewport_size,
         terminal_secondary_click_action, terminal_selection_point_from_pointer,
         terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
-        AdeApp, CtrlCAction, DirectoryIndexSnapshot, DirectoryNode, PendingConfigChanges,
-        PendingTerminalLinkClick, SourceControlBadgeState, SourceControlFile,
+        AdeApp, AiBadgeModel, CtrlCAction, DirectoryIndexSnapshot, DirectoryNode,
+        FactoryDroidHookInboxEvent, FactoryDroidStatusSource, FactoryDroidTransportDiagnostics,
+        PendingConfigChanges, PendingTerminalLinkClick, SourceControlBadgeState, SourceControlFile,
         SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalNavigationDirection, TerminalSecondaryClickAction, TerminalSelection,
-        TerminalSelectionPoint, TransientToast, TERMINAL_COPY_FEEDBACK_TEXT,
-        TERMINAL_COPY_TOAST_SECS, TERMINAL_OUTPUT_BG,
+        TerminalSelectionPoint, TransientToast, FACTORY_DROID_HOOK_POLL_MS,
+        FACTORY_DROID_PROCESS_POLL_MS, FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS,
+        TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_COPY_TOAST_SECS, TERMINAL_OUTPUT_BG,
+    };
+    use crate::hooks::{
+        AiCliSession, AiCliStatus, AiCliTool, AiHookManager, AiHooksConfig, ProjectAiConfig,
     };
     use crate::layout;
-    use crate::models::{
-        AppConfig, MainVisibilityMode, ProjectRecord, ShellKind, TerminalKind,
-    };
+    use crate::models::{AppConfig, MainVisibilityMode, ProjectRecord, ShellKind, TerminalKind};
     use crate::terminal::{
         test_terminal_runtime, TerminalColor, TerminalCursor, TerminalCursorLine,
         TerminalCursorShape, TerminalSelectionHyperlink, TerminalSelectionLine,
         TerminalSelectionSnapshot, TerminalSnapshot, TerminalStyle, TerminalStyledCell,
-        TerminalStyledLine, TerminalStyledRun,
+        TerminalStyledLine, TerminalStyledRun, TerminalUiEvent, TerminalUiEventKind,
     };
     use eframe::egui::text::{LayoutJob, TextFormat};
     use eframe::egui::{
@@ -6450,8 +7497,10 @@ mod tests {
         Modifiers, RawInput, Stroke,
     };
     use std::collections::BTreeMap;
+    use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn maps_navigation_keys_to_escape_sequences() {
@@ -8422,6 +9471,666 @@ mod tests {
     }
 
     #[test]
+    fn raw_input_hook_steals_directory_search_text_for_attention_terminal() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_ai_attention(&mut app, 1);
+        ctx.memory_mut(|mem| mem.request_focus(AdeApp::directory_search_input_id()));
+
+        let mut raw_input = RawInput {
+            events: vec![Event::Text("hello".to_owned())],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(raw_input.events.is_empty());
+        assert_eq!(
+            app.buffered_terminal_input,
+            vec![Event::Text("hello".to_owned())]
+        );
+        assert!(!ctx.memory(|mem| mem.has_focus(AdeApp::directory_search_input_id())));
+
+        let buffered_events = app.take_buffered_terminal_input();
+        app.route_active_terminal_input(&ctx, buffered_events);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert_eq!(terminal.pending_line_for_title, "hello");
+    }
+
+    #[test]
+    fn raw_input_hook_steals_saved_message_text_for_attention_terminal() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.selected_project = Some(7);
+        seed_ai_attention(&mut app, 1);
+        ctx.memory_mut(|mem| mem.request_focus(AdeApp::saved_message_draft_input_id(7)));
+
+        let mut raw_input = RawInput {
+            events: vec![Event::Text("reply".to_owned())],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(raw_input.events.is_empty());
+        assert_eq!(
+            app.buffered_terminal_input,
+            vec![Event::Text("reply".to_owned())]
+        );
+        assert!(!ctx.memory(|mem| mem.has_focus(AdeApp::saved_message_draft_input_id(7))));
+    }
+
+    #[test]
+    fn raw_input_hook_keeps_text_input_focus_when_terminal_is_not_attention() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        ctx.memory_mut(|mem| mem.request_focus(AdeApp::directory_search_input_id()));
+
+        let mut raw_input = RawInput {
+            events: vec![Event::Text("hello".to_owned())],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert_eq!(raw_input.events, vec![Event::Text("hello".to_owned())]);
+        assert!(app.buffered_terminal_input.is_empty());
+        assert!(ctx.memory(|mem| mem.has_focus(AdeApp::directory_search_input_id())));
+    }
+
+    #[test]
+    fn raw_input_hook_preserves_popup_keyboard_ownership_during_attention() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_ai_attention(&mut app, 1);
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::directory_search_input_id());
+            mem.open_popup(Id::new("test-popup"));
+        });
+
+        let mut raw_input = RawInput {
+            events: vec![Event::Text("hello".to_owned())],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert_eq!(raw_input.events, vec![Event::Text("hello".to_owned())]);
+        assert!(app.buffered_terminal_input.is_empty());
+        assert!(ctx.memory(|mem| mem.has_focus(AdeApp::directory_search_input_id())));
+    }
+
+    #[test]
+    fn same_terminal_focus_clears_attention() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_ai_attention(&mut app, 1);
+
+        app.set_active_terminal(&ctx, Some(1));
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert_eq!(app.active_terminal, Some(1));
+    }
+
+    #[test]
+    fn switching_terminals_preserves_previous_attention() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(1),
+        );
+        seed_ai_attention(&mut app, 1);
+        seed_ai_attention(&mut app, 2);
+
+        app.set_active_terminal(&ctx, Some(2));
+
+        let terminal_one = app.terminals.get(&1).expect("terminal 1");
+        let terminal_two = app.terminals.get(&2).expect("terminal 2");
+        assert_eq!(terminal_one.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(terminal_two.ai_session.status, AiCliStatus::Inactive);
+        assert_eq!(app.active_terminal, Some(2));
+    }
+
+    #[test]
+    fn ai_status_change_event_updates_badge_without_debug_ui_state() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiStatusChange {
+                    terminal_id: 1,
+                    tool: Some(AiCliTool::FactoryDroid),
+                    status: AiCliStatus::Running,
+                    event: None,
+                    from_title: false,
+                },
+            })
+            .expect("send ai status change");
+
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::FactoryDroid));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::PtyHookEvent)
+        );
+    }
+
+    #[test]
+    fn ai_status_change_event_from_title_records_terminal_title_source() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiStatusChange {
+                    terminal_id: 1,
+                    tool: Some(AiCliTool::FactoryDroid),
+                    status: AiCliStatus::Attention,
+                    event: None,
+                    from_title: true,
+                },
+            })
+            .expect("send ai title-derived status change");
+
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::TerminalTitle)
+        );
+    }
+
+    #[test]
+    fn ai_raw_chunk_event_is_ignored_without_affecting_status() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "factory-droid-hook:test".to_owned(),
+                },
+            })
+            .expect("send ai raw chunk");
+
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, None);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+    }
+
+    #[test]
+    fn ai_raw_chunk_event_sets_attention_for_active_factory_droid_session() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            entry.factory_droid_session_active = true;
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "HOOKS  Stop\n └─ Script: mergen-ade-droid-status.ps1".to_owned(),
+                },
+            })
+            .expect("send ai raw stop chunk");
+
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::PtyStop)
+        );
+    }
+
+    #[test]
+    fn factory_droid_hook_inbox_poll_updates_terminal_status() {
+        let ctx = Context::default();
+        let hook_dir = TestFactoryDroidHookDir::new();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.factory_droid_hooks_dir = Some(hook_dir.path.clone());
+
+        write_test_factory_droid_hook_events(
+            &hook_dir.path,
+            1,
+            &[test_factory_droid_hook_event(
+                1,
+                &test_factory_droid_inbox_token(1),
+                "running",
+            )],
+        );
+
+        app.poll_factory_droid_hook_inboxes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::FactoryDroid));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+        assert!(terminal.factory_droid_session_active);
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::Inbox)
+        );
+
+        let inbox_path = AdeApp::factory_droid_hook_inbox_path_for_dir(&hook_dir.path, 1);
+        let mut inbox_file = fs::OpenOptions::new()
+            .append(true)
+            .open(&inbox_path)
+            .expect("open hook inbox for append");
+        use std::io::Write as _;
+        writeln!(
+            inbox_file,
+            "{}",
+            serde_json::to_string(&test_factory_droid_hook_event(
+                1,
+                &test_factory_droid_inbox_token(1),
+                "attention",
+            ))
+                .expect("serialize attention event")
+        )
+        .expect("append attention event");
+
+        app.factory_droid_hook_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(FACTORY_DROID_HOOK_POLL_MS + 1));
+        app.poll_factory_droid_hook_inboxes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+    }
+
+    #[test]
+    fn factory_droid_hook_inbox_ignores_partial_trailing_lines_until_completed() {
+        let hook_dir = TestFactoryDroidHookDir::new();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.factory_droid_hooks_dir = Some(hook_dir.path.clone());
+
+        let inbox_path = AdeApp::factory_droid_hook_inbox_path_for_dir(&hook_dir.path, 1);
+        let partial = serde_json::to_string(&test_factory_droid_hook_event(
+            1,
+            &test_factory_droid_inbox_token(1),
+            "running",
+        ))
+        .expect("serialize running event");
+        fs::write(&inbox_path, &partial).expect("write partial hook inbox");
+
+        assert!(!app.process_factory_droid_hook_inbox(1));
+        assert_eq!(
+            app.terminals.get(&1).expect("terminal 1").ai_session.status,
+            AiCliStatus::Inactive
+        );
+
+        fs::write(&inbox_path, format!("{partial}\n")).expect("complete hook inbox line");
+
+        assert!(app.process_factory_droid_hook_inbox(1));
+        assert_eq!(
+            app.terminals.get(&1).expect("terminal 1").ai_session.status,
+            AiCliStatus::Running
+        );
+    }
+
+    #[test]
+    fn factory_droid_hook_inbox_ignores_stale_token_records() {
+        let ctx = Context::default();
+        let hook_dir = TestFactoryDroidHookDir::new();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.factory_droid_hooks_dir = Some(hook_dir.path.clone());
+
+        write_test_factory_droid_hook_events(
+            &hook_dir.path,
+            1,
+            &[test_factory_droid_hook_event(1, "stale-inbox-token", "attention")],
+        );
+
+        app.poll_factory_droid_hook_inboxes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert_eq!(terminal.factory_droid_last_status_source, None);
+    }
+
+    #[test]
+    fn route_active_terminal_input_sets_running_when_factory_droid_prompt_is_submitted() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            entry.factory_droid_session_active = true;
+        }
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![
+                Event::Text("write a changelog".to_owned()),
+                Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::default(),
+                },
+            ],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::FactoryDroid));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+        assert!(terminal.pending_line_for_title.is_empty());
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::PromptSubmit)
+        );
+    }
+
+    #[test]
+    fn route_active_terminal_input_marks_factory_droid_launch_pending_without_running() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![
+                Event::Text("droid".to_owned()),
+                Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::default(),
+                },
+            ],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::FactoryDroid));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(terminal.factory_droid_launch_pending_since.is_some());
+        assert!(!terminal.factory_droid_session_active);
+    }
+
+    #[test]
+    fn factory_droid_process_poll_marks_session_active_for_matching_terminal_only() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(1),
+        );
+        app.terminals
+            .get_mut(&1)
+            .expect("terminal 1")
+            .runtime
+            .set_factory_droid_process_active_for_test(Some(true));
+        app.terminals
+            .get_mut(&2)
+            .expect("terminal 2")
+            .runtime
+            .set_factory_droid_process_active_for_test(Some(false));
+
+        app.poll_factory_droid_processes(&ctx);
+
+        let terminal_one = app.terminals.get(&1).expect("terminal 1");
+        let terminal_two = app.terminals.get(&2).expect("terminal 2");
+        assert!(terminal_one.factory_droid_session_active);
+        assert_eq!(terminal_one.ai_session.tool, Some(AiCliTool::FactoryDroid));
+        assert!(!terminal_two.factory_droid_session_active);
+        assert_eq!(terminal_two.ai_session.tool, None);
+    }
+
+    #[test]
+    fn factory_droid_process_poll_clears_stale_session_before_shell_commands_resume() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry
+                .runtime
+                .set_factory_droid_process_active_for_test(Some(true));
+        }
+        app.poll_factory_droid_processes(&ctx);
+
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry
+                .runtime
+                .set_factory_droid_process_active_for_test(Some(false));
+        }
+        app.factory_droid_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(FACTORY_DROID_PROCESS_POLL_MS + 1));
+        app.poll_factory_droid_processes(&ctx);
+
+        let cleared_terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(cleared_terminal.ai_session.tool, None);
+        assert_eq!(cleared_terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(!cleared_terminal.factory_droid_session_active);
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![
+                Event::Text("git status".to_owned()),
+                Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::default(),
+                },
+            ],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, None);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+    }
+
+    #[test]
+    fn factory_droid_stop_chunk_applies_before_process_cleanup_in_update_order() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.factory_droid_session_active = true;
+            entry
+                .runtime
+                .set_factory_droid_process_active_for_test(Some(false));
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "HOOKS  Stop".to_owned(),
+                },
+            })
+            .expect("send stop chunk");
+
+        app.process_terminal_events(&ctx);
+        app.factory_droid_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(FACTORY_DROID_PROCESS_POLL_MS + 1));
+        app.poll_factory_droid_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::FactoryDroid));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert!(!terminal.factory_droid_session_active);
+        assert!(terminal.factory_droid_process_missing_since.is_some());
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::PtyStop)
+        );
+    }
+
+    #[test]
+    fn factory_droid_stop_chunk_sets_attention_after_process_exit_race() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.factory_droid_session_active = true;
+            entry
+                .runtime
+                .set_factory_droid_process_active_for_test(Some(false));
+        }
+
+        app.factory_droid_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(FACTORY_DROID_PROCESS_POLL_MS + 1));
+        app.poll_factory_droid_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::FactoryDroid));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+        assert!(!terminal.factory_droid_session_active);
+        assert!(terminal.factory_droid_process_missing_since.is_some());
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "HOOKS  Stop".to_owned(),
+                },
+            })
+            .expect("send stop chunk");
+
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::FactoryDroid));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert!(terminal.factory_droid_session_active);
+        assert!(terminal.factory_droid_process_missing_since.is_none());
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::PtyStop)
+        );
+    }
+
+    #[test]
+    fn factory_droid_process_poll_keeps_attention_after_process_exit() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            entry.ai_session.status = AiCliStatus::Attention;
+            entry.factory_droid_session_active = true;
+            entry
+                .runtime
+                .set_factory_droid_process_active_for_test(Some(false));
+        }
+
+        app.factory_droid_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(FACTORY_DROID_PROCESS_POLL_MS + 1));
+        app.poll_factory_droid_processes(&ctx);
+
+        {
+            let terminal = app.terminals.get(&1).expect("terminal 1");
+            assert_eq!(terminal.ai_session.tool, Some(AiCliTool::FactoryDroid));
+            assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+            assert!(!terminal.factory_droid_session_active);
+            assert!(terminal.factory_droid_process_missing_since.is_some());
+        }
+
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.factory_droid_process_missing_since = Some(
+                Instant::now() - Duration::from_millis(FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS + 25),
+            );
+        }
+        app.factory_droid_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(FACTORY_DROID_PROCESS_POLL_MS + 1));
+        app.poll_factory_droid_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::FactoryDroid));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert!(!terminal.factory_droid_session_active);
+        assert!(terminal.factory_droid_process_missing_since.is_some());
+    }
+
+    #[test]
+    fn factory_droid_process_poll_clears_running_after_trailing_grace() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.factory_droid_session_active = true;
+            entry
+                .runtime
+                .set_factory_droid_process_active_for_test(Some(false));
+            entry.factory_droid_process_missing_since = Some(
+                Instant::now() - Duration::from_millis(FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS + 25),
+            );
+        }
+
+        app.factory_droid_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(FACTORY_DROID_PROCESS_POLL_MS + 1));
+        app.poll_factory_droid_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, None);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(!terminal.factory_droid_session_active);
+        assert!(terminal.factory_droid_process_missing_since.is_none());
+    }
+
+    #[test]
+    fn process_terminal_events_clears_factory_droid_state_on_exit() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            entry.ai_session.status = AiCliStatus::Attention;
+            entry.factory_droid_session_active = true;
+            entry.factory_droid_launch_pending_since = Some(Instant::now());
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::Exit,
+            })
+            .expect("send exit event");
+
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(terminal.exited);
+        assert_eq!(terminal.ai_session.tool, None);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(!terminal.factory_droid_session_active);
+        assert!(terminal.factory_droid_launch_pending_since.is_none());
+    }
+
+    #[test]
     fn event_terminal_navigation_direction_accepts_egui_command_alias_for_ctrl() {
         let direction = AdeApp::event_terminal_navigation_direction(&Event::Key {
             key: Key::ArrowDown,
@@ -8745,6 +10454,7 @@ mod tests {
                 .iter()
                 .map(|message| (*message).to_owned())
                 .collect(),
+            ai_config: ProjectAiConfig::default(),
         }
     }
 
@@ -8792,6 +10502,13 @@ mod tests {
             snapshot_refresh_deferred: false,
             exited: false,
             runtime: test_terminal_runtime(),
+            ai_session: AiCliSession::default(),
+            factory_droid_inbox_token: Some(test_factory_droid_inbox_token(id)),
+            factory_droid_launch_pending_since: None,
+            factory_droid_session_active: false,
+            factory_droid_last_process_seen_at: None,
+            factory_droid_process_missing_since: None,
+            factory_droid_last_status_source: None,
         }
     }
 
@@ -8807,6 +10524,12 @@ mod tests {
 
         AdeApp {
             config_path: PathBuf::new(),
+            current_executable_path: PathBuf::from(r"C:\tests\mergen-ade.exe"),
+            factory_droid_hooks_dir: None,
+            factory_droid_hooks_dir_error: None,
+            factory_droid_hook_inboxes: BTreeMap::new(),
+            factory_droid_hook_last_poll_at: None,
+            factory_droid_process_last_poll_at: None,
             config: AppConfig::default(),
             config_load_error: None,
             config_save_requires_reload: false,
@@ -8819,6 +10542,7 @@ mod tests {
             active_terminal,
             buffered_terminal_input: Vec::new(),
             buffered_terminal_navigation: Vec::new(),
+            allow_attention_terminal_input_routing_once: false,
             pending_terminal_pastes: Vec::new(),
             terminal_events_tx,
             terminal_events_rx,
@@ -8845,7 +10569,101 @@ mod tests {
             directory_index_state: BTreeMap::new(),
             directory_tree_has_collapsed_cache_by_project: BTreeMap::new(),
             directory_index_generation: BTreeMap::new(),
+            ai_hook_manager: None,
         }
+    }
+
+    fn test_app_with_ai_hooks(
+        terminals: impl IntoIterator<Item = (u64, TerminalEntry)>,
+        active_terminal: Option<u64>,
+    ) -> AdeApp {
+        let mut app = test_app(terminals, active_terminal);
+        app.ai_hook_manager = Some(Arc::new(AiHookManager::new(
+            AiHooksConfig::with_factory_droid_defaults(),
+        )));
+        app
+    }
+
+    fn seed_ai_attention(app: &mut AdeApp, terminal_id: u64) {
+        let Some(manager) = app.ai_hook_manager.as_ref().cloned() else {
+            panic!("expected ai hook manager");
+        };
+
+        manager.set_tool(terminal_id, AiCliTool::FactoryDroid);
+        let _ = manager.ai_waiting_for_user(terminal_id);
+
+        if let Some(entry) = app.terminals.get_mut(&terminal_id) {
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            entry.ai_session.status = AiCliStatus::Attention;
+            entry.factory_droid_session_active = true;
+            entry.factory_droid_last_status_source =
+                Some(FactoryDroidStatusSource::PtyNotification);
+        }
+    }
+
+    fn test_factory_droid_inbox_token(terminal_id: u64) -> String {
+        format!("test-inbox-token-{terminal_id}")
+    }
+
+    fn test_factory_droid_hook_event(
+        terminal_id: u64,
+        inbox_token: &str,
+        status: &str,
+    ) -> FactoryDroidHookInboxEvent {
+        FactoryDroidHookInboxEvent {
+            terminal_id: terminal_id.to_string(),
+            session_id: Some("session-1".to_owned()),
+            inbox_token: Some(inbox_token.to_owned()),
+            hook_event_name: match status {
+                "running" => "UserPromptSubmit".to_owned(),
+                _ => "Stop".to_owned(),
+            },
+            status: status.to_owned(),
+            notification_kind: (status == "attention").then(|| "idle_prompt".to_owned()),
+            message: Some("Droid is waiting for your input".to_owned()),
+            timestamp_utc: Some("2026-04-06T00:00:00Z".to_owned()),
+        }
+    }
+
+    struct TestFactoryDroidHookDir {
+        path: PathBuf,
+    }
+
+    impl TestFactoryDroidHookDir {
+        fn new() -> Self {
+            let unique_suffix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "mergen-ade-factory-droid-hook-tests-{}-{unique_suffix}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create temp hook dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TestFactoryDroidHookDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_test_factory_droid_hook_events(
+        dir: &std::path::Path,
+        terminal_id: u64,
+        events: &[FactoryDroidHookInboxEvent],
+    ) {
+        let path = AdeApp::factory_droid_hook_inbox_path_for_dir(dir, terminal_id);
+        let mut payload = String::new();
+        for event in events {
+            payload.push_str(
+                &serde_json::to_string(event).expect("serialize factory droid hook event"),
+            );
+            payload.push('\n');
+        }
+        fs::write(path, payload).expect("write hook inbox");
     }
 
     #[test]
@@ -9514,5 +11332,98 @@ mod tests {
             underline: false,
             strike: false,
         }
+    }
+
+    #[test]
+    fn ai_badge_only_shows_when_running() {
+        use crate::hooks::{AiCliStatus, AiCliTool};
+        // Badge should only be visible when Running
+        let running_badge = AiBadgeModel {
+            tool: Some(AiCliTool::FactoryDroid),
+            status: AiCliStatus::Running,
+            tooltip_lines: vec!["Factory Droid - Working...".to_string()],
+        };
+        assert_eq!(running_badge.status, AiCliStatus::Running);
+
+        // Inactive should not show badge
+        let inactive_badge = AiBadgeModel {
+            tool: Some(AiCliTool::FactoryDroid),
+            status: AiCliStatus::Inactive,
+            tooltip_lines: vec!["Factory Droid - Idle".to_string()],
+        };
+        assert_eq!(inactive_badge.status, AiCliStatus::Inactive);
+    }
+
+    #[test]
+    fn factory_droid_transport_diagnostics_report_ready_runtime_dir() {
+        let diagnostics = FactoryDroidTransportDiagnostics {
+            hooks_enabled: true,
+            executable_path: PathBuf::from(r"C:\Users\furkan.cakir\Desktop\mergen-ade-new.exe"),
+            hooks_runtime_dir: Some(PathBuf::from(
+                r"C:\Users\furkan.cakir\AppData\Roaming\Mergen\MergenADE\config\runtime\factory-droid-hooks",
+            )),
+            hooks_runtime_error: None,
+            active_session: Some(true),
+            process_state: Some("active".to_owned()),
+            last_status_source: Some(FactoryDroidStatusSource::PromptSubmit),
+        };
+
+        assert_eq!(
+            diagnostics.runtime_status_text(),
+            "Ready: C:\\Users\\furkan.cakir\\AppData\\Roaming\\Mergen\\MergenADE\\config\\runtime\\factory-droid-hooks"
+        );
+        assert_eq!(diagnostics.active_session_text(), "Yes");
+        assert_eq!(diagnostics.process_state_text(), "active");
+        assert_eq!(diagnostics.last_status_source_text(), "prompt_submit");
+        assert_eq!(diagnostics.warning_message(), None);
+    }
+
+    #[test]
+    fn factory_droid_transport_diagnostics_warn_when_runtime_dir_is_unavailable() {
+        let diagnostics = FactoryDroidTransportDiagnostics {
+            hooks_enabled: true,
+            executable_path: PathBuf::from(r"C:\Users\furkan.cakir\Desktop\mergen-ade-new.exe"),
+            hooks_runtime_dir: None,
+            hooks_runtime_error: Some("Access denied".to_owned()),
+            active_session: Some(false),
+            process_state: Some("missing (grace)".to_owned()),
+            last_status_source: None,
+        };
+
+        assert_eq!(
+            diagnostics.runtime_status_text(),
+            "Unavailable: Access denied"
+        );
+        assert_eq!(diagnostics.active_session_text(), "No");
+        assert_eq!(diagnostics.process_state_text(), "missing (grace)");
+        assert_eq!(diagnostics.last_status_source_text(), "none");
+        assert_eq!(
+            diagnostics.warning_message(),
+            Some("Factory Droid inbox fallback unavailable: Access denied".to_owned())
+        );
+    }
+
+    #[test]
+    fn factory_droid_transport_diagnostics_hide_warnings_when_hooks_are_disabled() {
+        let diagnostics = FactoryDroidTransportDiagnostics {
+            hooks_enabled: false,
+            executable_path: PathBuf::from(r"C:\Users\furkan.cakir\Desktop\mergen-ade-new.exe"),
+            hooks_runtime_dir: None,
+            hooks_runtime_error: Some("Access denied".to_owned()),
+            active_session: None,
+            process_state: None,
+            last_status_source: None,
+        };
+
+        assert_eq!(diagnostics.runtime_status_text(), "Disabled");
+        assert_eq!(diagnostics.warning_message(), None);
+    }
+
+    #[test]
+    fn disabled_ai_hooks_do_not_create_manager() {
+        let mut config = AppConfig::default();
+        config.ai_hooks.global_enabled = false;
+
+        assert!(AdeApp::ai_hook_manager_from_config(&config).is_none());
     }
 }

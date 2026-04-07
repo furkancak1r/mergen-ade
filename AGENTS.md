@@ -65,3 +65,10 @@ If `cargo` is not on PATH in PowerShell, use:
 - Respect the configured concurrency limit and do not exceed 4 parallel subagent threads.
 - Keep urgent critical-path edits local only when delegation would block progress; otherwise prefer delegation first.
 - In handoff/final notes, summarize which subagents were used and what each one produced.
+
+## Factory Droid Integration
+- **Supported AI tool:** Only Factory Droid is supported. Claude Code, cc, and other AI CLI integrations are not supported.
+- **Hook format:** Only `droid-hook:*` and `factory-droid-hook:*` format patterns are recognized. The `claude-hook:*` format is not supported.
+- **Detection commands:** Only `droid` and `factory` trigger AI session detection. Do not add `cc`, `claude`, or other AI CLI commands.
+- **UI labels:** Use "Droid" and "Factory Droid" terminology. Do not use "Claude" or "claude" references in user-facing text.
+- **Event triggers:** `UserPromptSubmit` → Running (green pulse), `Stop`/notification → Attention (yellow pulse).

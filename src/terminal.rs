@@ -1,14 +1,21 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::io::{self, Read, Write};
 #[cfg(target_os = "windows")]
 use std::os::windows::io::RawHandle;
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "windows")]
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::hooks::{AiCliStatus, AiCliTool, AiHookEvent};
+use crate::hooks::{
+    AiHookManager, FACTORY_DROID_HOOKS_DIR_ENV_VAR, FACTORY_DROID_HOOK_INBOX_TOKEN_ENV_VAR,
+    FACTORY_DROID_TERMINAL_ID_ENV_VAR,
+};
 use crossbeam_channel::{Receiver, Sender};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tattoy_wezterm_surface::{CursorShape, CursorVisibility};
@@ -193,6 +200,20 @@ pub enum TerminalUiEventKind {
     Wakeup,
     ChildExit,
     Exit,
+    #[allow(dead_code)]
+    AiStatusChange {
+        terminal_id: u64,
+        tool: Option<AiCliTool>,
+        status: AiCliStatus,
+        event: Option<AiHookEvent>,
+        from_title: bool,
+    },
+    /// Raw AI-related PTY chunk for debugging - sent for all chunks containing AI keywords
+    #[allow(dead_code)]
+    AiRawChunk {
+        terminal_id: u64,
+        chunk: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -248,6 +269,8 @@ pub struct TerminalRuntime {
     child_process_handle: Mutex<Option<WinHandle>>,
     #[cfg(target_os = "windows")]
     job_handle: Mutex<Option<WinHandle>>,
+    #[cfg(test)]
+    forced_factory_droid_process_active: Option<bool>,
 }
 
 enum RuntimeCommand {
@@ -294,14 +317,15 @@ struct SharedWriter {
     inner: SharedWriterHandle,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ProcessSnapshotEntry {
     pid: u32,
     parent_pid: u32,
     creation_time: Option<u64>,
+    executable_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RootProcessTerminationPlan {
     VerifiedProcess(ProcessSnapshotEntry),
     DirectProcess(ProcessSnapshotEntry),
@@ -309,7 +333,7 @@ enum RootProcessTerminationPlan {
     AlreadyExited,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum VerifiedProcessLookup {
     Verified(ProcessSnapshotEntry),
     Missing,
@@ -320,6 +344,27 @@ impl SharedWriter {
     fn new(inner: SharedWriterHandle) -> Self {
         Self { inner }
     }
+}
+
+fn factory_droid_hook_env_pairs(
+    terminal_id: u64,
+    hooks_dir: &Path,
+    inbox_token: &str,
+) -> [(String, OsString); 3] {
+    [
+        (
+            FACTORY_DROID_TERMINAL_ID_ENV_VAR.to_owned(),
+            OsString::from(terminal_id.to_string()),
+        ),
+        (
+            FACTORY_DROID_HOOKS_DIR_ENV_VAR.to_owned(),
+            hooks_dir.as_os_str().to_owned(),
+        ),
+        (
+            FACTORY_DROID_HOOK_INBOX_TOKEN_ENV_VAR.to_owned(),
+            OsString::from(inbox_token),
+        ),
+    ]
 }
 
 impl Write for SharedWriter {
@@ -350,10 +395,13 @@ impl TerminalRuntime {
     pub fn spawn(
         terminal_id: u64,
         shell: ShellKind,
-        working_directory: std::path::PathBuf,
+        working_directory: PathBuf,
         ui_event_tx: Sender<TerminalUiEvent>,
         repaint_ctx: eframe::egui::Context,
         dimensions: TerminalDimensions,
+        ai_hook_manager: Option<Arc<AiHookManager>>,
+        factory_droid_hooks_dir: Option<PathBuf>,
+        factory_droid_inbox_token: Option<String>,
     ) -> io::Result<Self> {
         let pty_system = native_pty_system();
         let pty_pair = pty_system
@@ -370,7 +418,15 @@ impl TerminalRuntime {
         command.env("CLICOLOR_FORCE", "1");
         command.env("FORCE_COLOR", "1");
         command.env("TERM_PROGRAM", "MergenADE");
-        command.env("WT_SESSION", "MergenADE");
+        if let (Some(_), Some(hooks_dir), Some(inbox_token)) = (
+            &ai_hook_manager,
+            factory_droid_hooks_dir.as_deref(),
+            factory_droid_inbox_token.as_deref(),
+        ) {
+            for (name, value) in factory_droid_hook_env_pairs(terminal_id, hooks_dir, inbox_token) {
+                command.env(name, value);
+            }
+        }
         // ConEmuANSI and ANSICON removed - they can interfere with ConPTY emulation
         // command.env("ConEmuANSI", "ON");
         // command.env("ANSICON", "1");
@@ -433,6 +489,7 @@ impl TerminalRuntime {
             reader,
             ui_event_tx.clone(),
             repaint_ctx.clone(),
+            ai_hook_manager,
         );
         spawn_io_thread(
             terminal_id,
@@ -459,6 +516,8 @@ impl TerminalRuntime {
             child_process_handle: Mutex::new(child_process_handle),
             #[cfg(target_os = "windows")]
             job_handle: Mutex::new(job_handle),
+            #[cfg(test)]
+            forced_factory_droid_process_active: None,
         })
     }
 
@@ -554,6 +613,31 @@ impl TerminalRuntime {
 
     pub fn latest_seqno(&self) -> usize {
         self.latest_seqno.load(Ordering::Relaxed)
+    }
+
+    pub fn has_factory_droid_descendant_process(&self) -> bool {
+        #[cfg(test)]
+        if let Some(forced_active) = self.forced_factory_droid_process_active {
+            return forced_active;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let Ok(snapshot) = snapshot_processes() else {
+                return false;
+            };
+            return has_named_descendant_process(
+                &snapshot,
+                self.child_pid,
+                self.child_creation_time,
+                &["droid.exe", "factory.exe"],
+            );
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            false
+        }
     }
 
     fn kill_root_process_with_child_killer(&self) -> io::Result<()> {
@@ -655,6 +739,8 @@ pub(crate) fn test_terminal_runtime() -> TerminalRuntime {
         child_process_handle: Mutex::new(None),
         #[cfg(target_os = "windows")]
         job_handle: Mutex::new(None),
+        #[cfg(test)]
+        forced_factory_droid_process_active: None,
     }
 }
 
@@ -664,6 +750,10 @@ impl TerminalRuntime {
         if let Ok(mut terminal) = self.term.lock() {
             terminal.advance_bytes(bytes);
         }
+    }
+
+    pub(crate) fn set_factory_droid_process_active_for_test(&mut self, active: Option<bool>) {
+        self.forced_factory_droid_process_active = active;
     }
 }
 
@@ -877,6 +967,7 @@ fn root_process_termination_plan(
         pid: child_pid,
         parent_pid: 0,
         creation_time: Some(child_creation_time),
+        executable_name: None,
     })
 }
 
@@ -886,7 +977,7 @@ fn verified_process_entry(
     expected_creation_time: Option<u64>,
 ) -> Option<ProcessSnapshotEntry> {
     let expected_creation_time = expected_creation_time?;
-    let entry = entries.iter().find(|entry| entry.pid == pid).copied()?;
+    let entry = entries.iter().find(|entry| entry.pid == pid).cloned()?;
     if entry.creation_time != Some(expected_creation_time) {
         return None;
     }
@@ -898,7 +989,7 @@ fn verified_snapshot_root_process(
     pid: u32,
     expected_creation_time: u64,
 ) -> VerifiedProcessLookup {
-    let Some(entry) = entries.iter().find(|entry| entry.pid == pid).copied() else {
+    let Some(entry) = entries.iter().find(|entry| entry.pid == pid).cloned() else {
         return VerifiedProcessLookup::Missing;
     };
 
@@ -919,7 +1010,7 @@ fn verified_process_tree_descendants(
     let root_entry = verified_process_entry(entries, root_pid, expected_root_creation_time)?;
     let entries_by_pid = entries
         .iter()
-        .copied()
+        .cloned()
         .map(|entry| (entry.pid, entry))
         .collect::<BTreeMap<_, _>>();
     if entries_by_pid.get(&root_pid) != Some(&root_entry) {
@@ -931,9 +1022,36 @@ fn verified_process_tree_descendants(
         kill_order
             .into_iter()
             .filter(|pid| *pid != root_pid)
-            .filter_map(|pid| entries_by_pid.get(&pid).copied())
+            .filter_map(|pid| entries_by_pid.get(&pid).cloned())
             .collect(),
     )
+}
+
+fn has_named_descendant_process(
+    entries: &[ProcessSnapshotEntry],
+    root_pid: Option<u32>,
+    expected_root_creation_time: Option<u64>,
+    expected_names: &[&str],
+) -> bool {
+    let Some(root_pid) = root_pid else {
+        return false;
+    };
+
+    let Some(descendants) =
+        verified_process_tree_descendants(entries, root_pid, expected_root_creation_time)
+    else {
+        return false;
+    };
+
+    descendants.iter().any(|entry| {
+        let Some(executable_name) = entry.executable_name.as_deref() else {
+            return false;
+        };
+
+        expected_names
+            .iter()
+            .any(|candidate| executable_name.eq_ignore_ascii_case(candidate))
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -954,10 +1072,12 @@ fn snapshot_processes() -> io::Result<Vec<ProcessSnapshotEntry>> {
 
         let mut entries = Vec::new();
         loop {
+            let executable_name = process_entry_executable_name(&entry);
             entries.push(ProcessSnapshotEntry {
                 pid: entry.th32ProcessID,
                 parent_pid: entry.th32ParentProcessID,
                 creation_time: process_creation_time_by_pid(entry.th32ProcessID),
+                executable_name,
             });
 
             if Process32NextW(snapshot.0, &mut entry) == 0 {
@@ -974,6 +1094,20 @@ fn snapshot_processes() -> io::Result<Vec<ProcessSnapshotEntry>> {
 }
 
 #[cfg(target_os = "windows")]
+fn process_entry_executable_name(entry: &PROCESSENTRY32W) -> Option<String> {
+    let len = entry
+        .szExeFile
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(entry.szExeFile.len());
+    if len == 0 {
+        return None;
+    }
+
+    Some(String::from_utf16_lossy(&entry.szExeFile[..len]))
+}
+
+#[cfg(target_os = "windows")]
 fn best_effort_terminate_snapshot_entries(entries: &[ProcessSnapshotEntry]) {
     best_effort_terminate_entries(entries, terminate_snapshot_process);
 }
@@ -983,7 +1117,7 @@ where
     F: FnMut(ProcessSnapshotEntry) -> io::Result<()>,
 {
     for entry in entries {
-        let _ = terminate_entry(*entry);
+        let _ = terminate_entry(entry.clone());
     }
 }
 
@@ -1018,6 +1152,232 @@ fn terminate_snapshot_process(entry: ProcessSnapshotEntry) -> io::Result<()> {
 
     Ok(())
 }
+
+/// Extract terminal title from PTY bytes by parsing OSC (Operating System Command) sequences.
+/// Factory Droid hooks set terminal title to "[Working...]" or "[Idle]".
+/// The escape sequence format is: ESC ] 0 ; title BEL (or ESC \)
+const MAX_PENDING_OSC_TITLE_BYTES: usize = 512;
+const MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS: usize = 512;
+
+#[derive(Debug, Default)]
+struct PendingOscTitle {
+    buffer: Vec<u8>,
+}
+
+impl PendingOscTitle {
+    fn extract_from_bytes(&mut self, bytes: &[u8]) -> Option<String> {
+        if !self.buffer.is_empty() {
+            self.buffer.extend_from_slice(bytes);
+            let title = extract_complete_title_from_bytes(&self.buffer);
+            self.retain_incomplete_suffix();
+            return title;
+        }
+
+        if let Some(title) = extract_complete_title_from_bytes(bytes) {
+            return Some(title);
+        }
+
+        if let Some(suffix_start) = find_incomplete_osc_title_start(bytes) {
+            self.buffer.extend_from_slice(&bytes[suffix_start..]);
+            self.truncate_to_limit();
+        }
+
+        None
+    }
+
+    fn retain_incomplete_suffix(&mut self) {
+        if let Some(suffix_start) = find_incomplete_osc_title_start(&self.buffer) {
+            if suffix_start > 0 {
+                self.buffer.drain(..suffix_start);
+            }
+            self.truncate_to_limit();
+        } else {
+            self.buffer.clear();
+        }
+    }
+
+    fn truncate_to_limit(&mut self) {
+        if self.buffer.len() > MAX_PENDING_OSC_TITLE_BYTES {
+            let overflow = self.buffer.len() - MAX_PENDING_OSC_TITLE_BYTES;
+            self.buffer.drain(..overflow);
+        }
+    }
+}
+
+fn extract_complete_title_from_bytes(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+
+    extract_osc_title(&text, "\x1b]0;").or_else(|| extract_osc_title(&text, "\x1b]2;"))
+}
+
+fn extract_osc_title(text: &str, prefix: &str) -> Option<String> {
+    let start_pos = text.find(prefix)?;
+    let after_type = &text[start_pos + prefix.len()..];
+
+    if let Some(end_pos) = after_type.find('\x07') {
+        let title = &after_type[..end_pos];
+        if !title.is_empty() {
+            return Some(title.to_string());
+        }
+    } else if let Some(end_pos) = after_type.find("\x1b\\") {
+        let title = &after_type[..end_pos];
+        if !title.is_empty() {
+            return Some(title.to_string());
+        }
+    }
+
+    None
+}
+
+fn find_incomplete_osc_title_start(bytes: &[u8]) -> Option<usize> {
+    let mut index = bytes.len();
+    while index > 0 {
+        index -= 1;
+        if bytes.get(index) != Some(&0x1b) {
+            continue;
+        }
+
+        let Some(marker) = bytes.get(index + 1) else {
+            return Some(index);
+        };
+        let Some(kind) = bytes.get(index + 2) else {
+            return Some(index);
+        };
+        let Some(separator) = bytes.get(index + 3) else {
+            return Some(index);
+        };
+
+        if *marker == b']' && (*kind == b'0' || *kind == b'2') && *separator == b';' {
+            return Some(index);
+        }
+    }
+
+    None
+}
+
+fn official_ai_debug_chunk(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let has_official_hook =
+        lower.contains("[droid-hook:") || lower.contains("[factory-droid-hook:");
+    let has_official_title = trimmed.contains("\x1b]0;") || trimmed.contains("\x1b]2;");
+
+    if has_official_hook || has_official_title {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Default)]
+struct PendingVisibleFactoryStatus {
+    buffer: String,
+}
+
+impl PendingVisibleFactoryStatus {
+    fn extract_from_text(&mut self, text: &str) -> Option<String> {
+        let normalized = normalize_visible_factory_status_text(text);
+        if normalized.is_empty() {
+            return None;
+        }
+
+        self.buffer.push_str(&normalized);
+        self.truncate_to_limit();
+
+        let detected = detect_visible_factory_status(&self.buffer)?;
+        self.buffer.clear();
+        Some(detected.to_string())
+    }
+
+    fn truncate_to_limit(&mut self) {
+        let overflow = self
+            .buffer
+            .chars()
+            .count()
+            .saturating_sub(MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS);
+        if overflow == 0 {
+            return;
+        }
+
+        let mut char_indices = self.buffer.char_indices();
+        let split_at = char_indices
+            .nth(overflow - 1)
+            .map(|(index, ch)| index + ch.len_utf8())
+            .unwrap_or(0);
+        self.buffer.drain(..split_at);
+    }
+}
+
+fn normalize_visible_factory_status_text(text: &str) -> String {
+    let stripped = strip_ansi_sequences(text);
+    stripped.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn strip_ansi_sequences(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if next == '\x07' {
+                            break;
+                        }
+                        if next == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        result.push(ch);
+    }
+
+    result
+}
+
+fn detect_visible_factory_status(text: &str) -> Option<&'static str> {
+    let collapsed = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+
+    if collapsed.contains("hooks stop") {
+        return Some("HOOKS Stop");
+    }
+
+    if collapsed.contains("needs your permission") {
+        return Some("needs your permission");
+    }
+
+    if collapsed.contains("waiting for your input") {
+        return Some("waiting for your input");
+    }
+
+    None
+}
+
 fn spawn_reader_thread(
     terminal_id: u64,
     term: Arc<Mutex<Terminal>>,
@@ -1025,28 +1385,80 @@ fn spawn_reader_thread(
     mut reader: Box<dyn Read + Send>,
     tx: Sender<TerminalUiEvent>,
     repaint_ctx: eframe::egui::Context,
+    ai_hook_manager: Option<Arc<AiHookManager>>,
 ) {
     thread::spawn(move || {
         let mut buffer = vec![0u8; IO_BUFFER_SIZE];
+        let mut pending_osc_title = PendingOscTitle::default();
+        let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
 
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read_bytes) => {
-                    // DEBUG: Log bytes that contain backslash
                     let bytes = &buffer[..read_bytes];
-                    if bytes.contains(&b'\\') {
-                        log::warn!(
-                            "DEBUG PTY read bytes containing backslash ({} bytes): {:?}",
-                            read_bytes,
-                            String::from_utf8_lossy(bytes)
-                        );
-                    }
                     if let Ok(mut terminal) = term.lock() {
                         terminal.advance_bytes(bytes);
                         latest_seqno.store(terminal.current_seqno(), Ordering::Relaxed);
                     }
                     send_ui_event(terminal_id, TerminalUiEventKind::Wakeup, &tx, &repaint_ctx);
+
+                    if let Some(manager) = &ai_hook_manager {
+                        let text = String::from_utf8_lossy(bytes);
+
+                        if let Some((tool, status, event)) = manager.update(terminal_id, &text) {
+                            send_ui_event(
+                                terminal_id,
+                                TerminalUiEventKind::AiStatusChange {
+                                    terminal_id,
+                                    tool: Some(tool),
+                                    status,
+                                    event,
+                                    from_title: false,
+                                },
+                                &tx,
+                                &repaint_ctx,
+                            );
+                        }
+
+                        if let Some(title) = pending_osc_title.extract_from_bytes(bytes) {
+                            if let Some((tool, status, event)) =
+                                manager.update_from_title(terminal_id, &title)
+                            {
+                                send_ui_event(
+                                    terminal_id,
+                                    TerminalUiEventKind::AiStatusChange {
+                                        terminal_id,
+                                        tool: Some(tool),
+                                        status,
+                                        event,
+                                        from_title: true,
+                                    },
+                                    &tx,
+                                    &repaint_ctx,
+                                );
+                            }
+                        }
+
+                        if let Some(chunk) = official_ai_debug_chunk(&text) {
+                            send_ui_event(
+                                terminal_id,
+                                TerminalUiEventKind::AiRawChunk { terminal_id, chunk },
+                                &tx,
+                                &repaint_ctx,
+                            );
+                        }
+
+                        if let Some(chunk) = pending_visible_factory_status.extract_from_text(&text)
+                        {
+                            send_ui_event(
+                                terminal_id,
+                                TerminalUiEventKind::AiRawChunk { terminal_id, chunk },
+                                &tx,
+                                &repaint_ctx,
+                            );
+                        }
+                    }
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
@@ -1759,7 +2171,7 @@ fn dim_color(color: TerminalColor) -> TerminalColor {
 fn sanitize_cell_text(text: &str) -> String {
     text.chars()
         .map(|ch| {
-            if ch == '\0' || ch == '\u{fe0f}' || ch.is_control() {
+            if ch == '\0' || ch.is_control() {
                 ' '
             } else {
                 ch
@@ -1776,21 +2188,178 @@ fn io_error_from_anyhow(err: impl std::fmt::Display) -> io::Error {
 mod tests {
     use super::{
         begin_termination, best_effort_terminate_entries, default_style,
-        is_benign_process_exit_error, process_tree_kill_order, root_process_termination_plan,
-        sanitize_cell_text, selection_snapshot_from_terminal, snapshot_from_terminal,
-        snapshots_from_terminal, test_terminal_runtime, trim_trailing_default_cells,
-        verified_process_entry, verified_process_tree_descendants, verified_snapshot_root_process,
-        AdeTerminalConfig, ProcessSnapshotEntry, RootProcessTerminationPlan, RuntimeCommand,
-        SharedWriter, SharedWriterHandle, TerminalColor, TerminalCursor, TerminalCursorLine,
-        TerminalCursorShape, TerminalDimensions, TerminalRuntime, TerminalSelectionHyperlink,
-        TerminalStyle, TerminalStyledCell, VerifiedProcessLookup,
+        extract_complete_title_from_bytes, factory_droid_hook_env_pairs,
+        has_named_descendant_process, is_benign_process_exit_error, official_ai_debug_chunk,
+        process_tree_kill_order, root_process_termination_plan, sanitize_cell_text,
+        selection_snapshot_from_terminal, snapshot_from_terminal, snapshots_from_terminal,
+        test_terminal_runtime, trim_trailing_default_cells, verified_process_entry,
+        verified_process_tree_descendants, verified_snapshot_root_process, AdeTerminalConfig,
+        PendingOscTitle, PendingVisibleFactoryStatus, ProcessSnapshotEntry,
+        RootProcessTerminationPlan, RuntimeCommand, SharedWriter, SharedWriterHandle,
+        TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape, TerminalDimensions,
+        TerminalRuntime, TerminalSelectionHyperlink, TerminalStyle, TerminalStyledCell,
+        VerifiedProcessLookup, MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS,
+    };
+    use crate::hooks::{
+        FACTORY_DROID_HOOKS_DIR_ENV_VAR, FACTORY_DROID_HOOK_INBOX_TOKEN_ENV_VAR,
+        FACTORY_DROID_TERMINAL_ID_ENV_VAR,
     };
     use std::{
+        ffi::OsString,
         io::{self, Write},
+        path::Path,
         sync::{Arc, Mutex},
     };
     use tattoy_wezterm_term::color::ColorPalette;
     use tattoy_wezterm_term::{Terminal, TerminalSize};
+
+    #[test]
+    fn official_ai_debug_chunk_accepts_official_hook_markers_and_titles() {
+        assert_eq!(
+            official_ai_debug_chunk("[droid-hook:event=UserPromptSubmit]"),
+            Some("[droid-hook:event=UserPromptSubmit]".to_string())
+        );
+        assert_eq!(
+            official_ai_debug_chunk("\u{1b}]0;[Working...]\u{7}"),
+            Some("\u{1b}]0;[Working...]\u{7}".to_string())
+        );
+        assert_eq!(official_ai_debug_chunk("HOOKS  Stop"), None);
+        assert_eq!(official_ai_debug_chunk("Stop"), None);
+        assert_eq!(official_ai_debug_chunk("[hook] UserPromptSubmit"), None);
+        assert_eq!(official_ai_debug_chunk("factory spinner idle"), None);
+    }
+
+    #[test]
+    fn pending_visible_factory_status_detects_split_stop_across_reads() {
+        let mut pending = PendingVisibleFactoryStatus::default();
+
+        assert_eq!(pending.extract_from_text("HOOKS "), None);
+        assert_eq!(
+            pending.extract_from_text(" Stop\r\n"),
+            Some("HOOKS Stop".to_string())
+        );
+        assert_eq!(
+            pending.extract_from_text(" └─ Script: mergen-ade-droid-status.ps1"),
+            None
+        );
+    }
+
+    #[test]
+    fn pending_visible_factory_status_detects_split_permission_prompt_across_reads() {
+        let mut pending = PendingVisibleFactoryStatus::default();
+
+        assert_eq!(pending.extract_from_text("Droid needs your permi"), None);
+        assert_eq!(
+            pending.extract_from_text("ssion before continuing"),
+            Some("needs your permission".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_factory_status_detects_split_input_prompt_across_reads() {
+        let mut pending = PendingVisibleFactoryStatus::default();
+
+        assert_eq!(
+            pending.extract_from_text("Droid is waiting for your in"),
+            None
+        );
+        assert_eq!(
+            pending.extract_from_text("put before continuing"),
+            Some("waiting for your input".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_factory_status_normalizes_ansi_and_crlf() {
+        let mut pending = PendingVisibleFactoryStatus::default();
+
+        assert_eq!(
+            pending.extract_from_text("\u{1b}[32mHOOKS\u{1b}[0m\r\n  Stop"),
+            Some("HOOKS Stop".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_factory_status_emits_once_when_followed_by_trailing_text() {
+        let mut pending = PendingVisibleFactoryStatus::default();
+
+        assert_eq!(
+            pending.extract_from_text("HOOKS  Stop\n └─ Script: mergen-ade-droid-status.ps1"),
+            Some("HOOKS Stop".to_string())
+        );
+        assert_eq!(pending.extract_from_text("\nResult: Exit code 0"), None);
+    }
+
+    #[test]
+    fn pending_visible_factory_status_keeps_phrase_near_trim_boundary() {
+        let mut pending = PendingVisibleFactoryStatus::default();
+        let filler = "x".repeat(MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS.saturating_sub(12));
+
+        assert_eq!(pending.extract_from_text(&filler), None);
+        assert_eq!(pending.extract_from_text("HOOKS "), None);
+        assert_eq!(
+            pending.extract_from_text("Stop"),
+            Some("HOOKS Stop".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_title_from_bytes_only_reads_osc_sequences() {
+        assert_eq!(
+            extract_complete_title_from_bytes(b"\x1b]0;[Working...]\x07"),
+            Some("[Working...]".to_string())
+        );
+        assert_eq!(
+            extract_complete_title_from_bytes(b"\x1b]2;[Idle]\x1b\\"),
+            Some("[Idle]".to_string())
+        );
+        assert_eq!(extract_complete_title_from_bytes(b"[Working...]"), None);
+    }
+
+    #[test]
+    fn pending_osc_title_reads_bel_terminated_title_across_chunks() {
+        let mut pending = PendingOscTitle::default();
+
+        assert_eq!(pending.extract_from_bytes(b"\x1b]0;[Work"), None);
+        assert_eq!(
+            pending.extract_from_bytes(b"ing...]\x07"),
+            Some("[Working...]".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_osc_title_reads_st_terminated_title_across_chunks() {
+        let mut pending = PendingOscTitle::default();
+
+        assert_eq!(pending.extract_from_bytes(b"\x1b]2;[Id"), None);
+        assert_eq!(
+            pending.extract_from_bytes(b"le]\x1b\\"),
+            Some("[Idle]".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_osc_title_ignores_plain_bracketed_text() {
+        let mut pending = PendingOscTitle::default();
+
+        assert_eq!(pending.extract_from_bytes(b"[Work"), None);
+        assert_eq!(pending.extract_from_bytes(b"ing...]"), None);
+    }
+
+    #[test]
+    fn factory_droid_hook_env_pairs_include_terminal_id_inbox_dir_and_token() {
+        let hooks_dir = Path::new(
+            r"C:\Users\furkan.cakir\AppData\Roaming\Mergen\MergenADE\runtime\factory-droid-hooks",
+        );
+        let pairs = factory_droid_hook_env_pairs(17, hooks_dir, "test-inbox-token");
+
+        assert_eq!(pairs[0].0, FACTORY_DROID_TERMINAL_ID_ENV_VAR);
+        assert_eq!(pairs[0].1, OsString::from("17"));
+        assert_eq!(pairs[1].0, FACTORY_DROID_HOOKS_DIR_ENV_VAR);
+        assert_eq!(pairs[1].1, hooks_dir.as_os_str());
+        assert_eq!(pairs[2].0, FACTORY_DROID_HOOK_INBOX_TOKEN_ENV_VAR);
+        assert_eq!(pairs[2].1, OsString::from("test-inbox-token"));
+    }
 
     fn snapshot_entry(
         pid: u32,
@@ -1801,6 +2370,21 @@ mod tests {
             pid,
             parent_pid,
             creation_time,
+            executable_name: None,
+        }
+    }
+
+    fn named_snapshot_entry(
+        pid: u32,
+        parent_pid: u32,
+        creation_time: Option<u64>,
+        executable_name: &str,
+    ) -> ProcessSnapshotEntry {
+        ProcessSnapshotEntry {
+            pid,
+            parent_pid,
+            creation_time,
+            executable_name: Some(executable_name.to_owned()),
         }
     }
 
@@ -1861,6 +2445,8 @@ mod tests {
                 child_process_handle: Mutex::new(None),
                 #[cfg(target_os = "windows")]
                 job_handle: Mutex::new(None),
+                #[cfg(test)]
+                forced_factory_droid_process_active: None,
             },
             command_rx,
             shared_writer,
@@ -2184,6 +2770,45 @@ mod tests {
                 snapshot_entry(3, 1, Some(300))
             ])
         );
+    }
+
+    #[test]
+    fn has_named_descendant_process_matches_factory_droid_executables() {
+        let entries = vec![
+            named_snapshot_entry(1, 0, Some(100), "powershell.exe"),
+            named_snapshot_entry(2, 1, Some(200), "node.exe"),
+            named_snapshot_entry(3, 2, Some(300), "droid.exe"),
+            named_snapshot_entry(4, 1, Some(400), "factory.exe"),
+        ];
+
+        assert!(has_named_descendant_process(
+            &entries,
+            Some(1),
+            Some(100),
+            &["droid.exe"]
+        ));
+        assert!(has_named_descendant_process(
+            &entries,
+            Some(1),
+            Some(100),
+            &["factory.exe"]
+        ));
+    }
+
+    #[test]
+    fn has_named_descendant_process_ignores_unrelated_node_descendants() {
+        let entries = vec![
+            named_snapshot_entry(1, 0, Some(100), "powershell.exe"),
+            named_snapshot_entry(2, 1, Some(200), "node.exe"),
+            named_snapshot_entry(3, 2, Some(300), "cmd.exe"),
+        ];
+
+        assert!(!has_named_descendant_process(
+            &entries,
+            Some(1),
+            Some(100),
+            &["droid.exe", "factory.exe"]
+        ));
     }
 
     #[test]

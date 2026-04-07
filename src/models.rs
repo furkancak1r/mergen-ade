@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::hooks::{AiHooksConfig, ProjectAiConfig};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShellKind {
@@ -148,6 +150,8 @@ pub struct ProjectRecord {
     pub path: PathBuf,
     #[serde(default)]
     pub saved_messages: Vec<String>,
+    #[serde(default)]
+    pub ai_config: ProjectAiConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +161,7 @@ pub struct AppConfig {
     pub default_shell: ShellKind,
     pub ui: UiConfig,
     pub projects: Vec<ProjectRecord>,
+    pub ai_hooks: AiHooksConfig,
 }
 
 impl Default for AppConfig {
@@ -166,6 +171,7 @@ impl Default for AppConfig {
             default_shell: ShellKind::default(),
             ui: UiConfig::default(),
             projects: Vec::new(),
+            ai_hooks: AiHooksConfig::default(),
         }
     }
 }

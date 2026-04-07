@@ -10,15 +10,25 @@ use crate::models::{AppConfig, ProjectRecord, ShellKind, UiConfig};
 const QUALIFIER: &str = "com";
 const ORGANIZATION: &str = "Mergen";
 const APPLICATION: &str = "MergenADE";
+const FACTORY_DROID_HOOK_RUNTIME_DIR: &str = "runtime/factory-droid-hooks";
+
+fn project_dirs() -> io::Result<ProjectDirs> {
+    ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "App data directory not available"))
+}
 
 pub fn config_path() -> io::Result<PathBuf> {
-    let dirs = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "App data directory not available")
-    })?;
-
-    let config_dir = dirs.config_dir();
-    fs::create_dir_all(config_dir)?;
+    let config_dir = project_dirs()?.config_dir().to_path_buf();
+    fs::create_dir_all(&config_dir)?;
     Ok(config_dir.join("config.toml"))
+}
+
+pub fn factory_droid_hook_runtime_dir() -> io::Result<PathBuf> {
+    let runtime_dir = project_dirs()?
+        .config_dir()
+        .join(FACTORY_DROID_HOOK_RUNTIME_DIR);
+    fs::create_dir_all(&runtime_dir)?;
+    Ok(runtime_dir)
 }
 
 pub fn load_config(path: &Path) -> io::Result<AppConfig> {
@@ -91,6 +101,7 @@ impl From<LegacyAppConfig> for AppConfig {
                     name: project.name,
                     path: project.path,
                     saved_messages: project.saved_messages,
+                    ai_config: crate::hooks::ProjectAiConfig::default(),
                 }
             })
             .collect();
@@ -100,6 +111,7 @@ impl From<LegacyAppConfig> for AppConfig {
             default_shell: value.default_shell,
             ui: value.ui,
             projects,
+            ai_hooks: crate::hooks::AiHooksConfig::default(),
         }
     }
 }

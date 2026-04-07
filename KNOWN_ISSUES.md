@@ -1,5 +1,22 @@
 ### Known Issues & Fix Log
 
+#### Factory Droid badge behavior fixed: detection vs hook events {#factory-droid-badge-behavior-fixed}
+- Date: 2026-04-06T00:00:00Z
+- Context: main/Windows terminal title bar AI status badge
+- Error signature: `Badge turned green when typing 'droid' instead of waiting for UserPromptSubmit`
+- Symptoms/Impact: Badge would glow green immediately when user typed `droid` command, but user wanted badge to only turn green when `UserPromptSubmit` hook event arrived (new prompt submitted).
+- Root cause: `detect_tool()` was setting `status = Running` immediately upon `droid` detection, which was an over-correction from a previous fix that had made the badge invisible.
+- Resolution:
+  - `detect_tool()` now only sets `tool = FactoryDroid`, status stays `Inactive`
+  - Badge only turns green (Running) when `UserPromptSubmit` hook event is received
+  - Badge turns yellow (Attention) when `Stop` hook event is received
+  - `parse_hook_event()` supports Droid CLI formats: `[droid-hook:event=X]`, `[factory-droid-hook:event=X]`, standalone word-boundary names
+  - Added `request_repaint_after(100ms)` to `draw_ai_badge()` for animation continuity
+- Prevent recurrence:
+  - Detection should only identify the tool, not trigger UI state
+  - Hook events should drive all UI state changes
+- Files/Commands touched: `src/hooks.rs`, `src/app.rs`, `cargo test`, `cargo build --release`
+
 #### Multiline paste in opencode CLI submitted blank lines as live Enter keys {#multiline-paste-in-opencode-cli-submitted-blank-lines-as-live-enter-keys}
 - Date: 2026-04-01T00:00:00Z
 - Context: main/Windows local terminal paste path with opencode CLI/readline-style TUIs
@@ -472,3 +489,200 @@
   - Add helper-level tests for pointer-state transitions whenever terminal click handling mixes selection and activation behaviors.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: local workspace follow-up fix on 2026-03-25; commit pending
+
+#### Factory Droid title badge stayed dark because Factory hooks were unregistered and title-only signals were ignored before tool detection {#factory-droid-title-badge-stayed-dark-because-factory-hooks-were-unregistered-and-title-only-signals-were-ignored-before-tool-detection}
+- Date: 2026-04-06T00:00:00Z
+- Context: main/Windows local Factory Droid sessions inside the integrated terminal
+- Error signature: `Factory Droid green/yellow badge did not react even though the user wanted running = green pulse and waiting/completed = yellow pulse until terminal focus acknowledgement.`
+- Symptoms/Impact: The terminal header indicator stayed inactive because Mergen-ADE only reacted after prior tool detection, while the local Factory setup had no registered hook entries and an old unsupported `~/.claude/hooks` experiment was writing only console-title changes.
+- Root cause: `~/.factory/settings.json` had no `hooks` registrations, the legacy `~/.claude/hooks/on-working.ps1` / `on-stop.ps1` files were unsupported for Factory, and `src/hooks.rs` rejected the first title-based `[Working...]` / `[Idle]` transition unless `session.tool` had already been set by an official hook marker.
+- Resolution: Mergen-ADE now seeds `FactoryDroid` status directly from official title patterns, keeps partial hook markers buffered until the closing bracket arrives, adds a repo-owned Factory hook script plus idempotent installer, and installs user-wide Factory `UserPromptSubmit` / `Notification` / `Stop` hooks that emit official `factory-droid-hook:*` markers and `[Working...]` / `[Idle]` title updates.
+- Prevent recurrence:
+  - Keep Factory hook registration in `~/.factory/settings.json`; do not rely on unsupported `~/.claude/hooks/*` files.
+  - Avoid writing `UserPromptSubmit` markers through ordinary hook stdout paths that would pollute Droid prompt context.
+  - Keep title-based detection able to seed tool state when official markers are missing or delayed.
+  - Require a closing `]` before parsing buffered hook markers from chunked PTY output.
+- Files/Commands touched: `src/hooks.rs`, `scripts/factory-droid-status-hook.ps1`, `scripts/install-factory-droid-hooks.ps1`, `scripts/__tests__/factory-droid-hooks.tests.ps1`, `KNOWN_ISSUES.md`, `cargo test`, `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-factory-droid-hooks.ps1`
+- References: Factory docs reviewed on 2026-04-06 (`https://docs.factory.ai/reference/hooks-reference`, `https://docs.factory.ai/cli/configuration/hooks-guide`, `https://docs.factory.ai/guides/hooks/notifications`); local Factory log evidence in `%USERPROFILE%\.factory\logs\droid-log-single.log`
+
+#### AI attention badge cleared on terminal switches instead of only on the selected terminal {#ai-attention-badge-cleared-on-terminal-switches-instead-of-only-on-the-selected-terminal}
+- Date: 2026-04-06T00:00:00Z
+- Context: main/Windows local terminal header and terminal-manager selection flow
+- Error signature: Selecting a different terminal cleared the previous terminal's yellow AI attention state, and same-terminal clicks/focus changes did not reliably acknowledge attention.
+- Symptoms/Impact: The badge could disappear as soon as the user changed focus to another terminal, so attention state no longer meant "this terminal still needs a click/focus acknowledgment."
+- Root cause: `src/app.rs` treated `set_active_terminal()` as a global attention reset and only cleared status for the previously active terminal, instead of acknowledging the terminal that was actually clicked or selected.
+- Resolution: Reworked `src/app.rs` so `set_active_terminal()` acknowledges attention on the target terminal only, preserves other terminals' yellow state when switching away, and keeps copy/paste/typing paths clearing attention through the existing interaction flow. Added regression tests for same-terminal acknowledgement and for leaving another terminal's yellow state intact.
+- Prevent recurrence:
+  - Never clear attention on the terminal being abandoned just because focus moved elsewhere.
+  - Route all click/focus/manager selection acknowledgments through one helper so the UI and tests stay aligned.
+  - Keep interaction-driven clears limited to the active terminal's own user action paths.
+- Files/Commands touched: `src/app.rs`, `src/hooks.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: local workspace fix on 2026-04-06; commit pending
+
+#### Factory Droid Windows hook commands failed because the installer persisted a quoted launcher string {#factory-droid-windows-hook-commands-failed-because-the-installer-persisted-a-quoted-launcher-string}
+- Date: 2026-04-06T16:45:00Z
+- Context: main/Windows local Factory Droid user-wide hook installation under `%USERPROFILE%\.factory\settings.json`
+- Error signature: `HOOKS Stop ... '\"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe\"' is not recognized as an internal or external command`
+- Symptoms/Impact: Factory registered the hook entry but failed before launching the PowerShell script, so Mergen-ADE never received the intended running/attention marker or title updates from `UserPromptSubmit` / `Notification` / `Stop`.
+- Root cause: `scripts/install-factory-droid-hooks.ps1` wrote a launcher command that wrapped `powershell.exe` and the managed hook path in quotes. Factory's Windows hook runner forwarded that command shape literally, so `cmd` treated the quoted executable token as the program name instead of launching PowerShell.
+- Resolution: The installer now emits one canonical Windows launcher command with an unquoted executable token and a quoted absolute script path, migrates any existing `mergen-ade-droid-status.ps1` hook entries to that canonical command instead of duplicating them, and verifies the installed command executes successfully through `cmd /c`.
+- Prevent recurrence:
+  - Keep the managed Factory Droid hook command canonicalized by the installer; do not hand-edit quoted variants into `%USERPROFILE%\.factory\settings.json`.
+  - Re-run the installer when the managed hook path changes so legacy/broken entries are normalized instead of accumulating.
+  - Restart Droid or accept the change from `/hooks` after editing hook settings because Factory snapshots hooks at session start.
+- Files/Commands touched: `scripts/install-factory-droid-hooks.ps1`, `scripts/__tests__/factory-droid-hooks.tests.ps1`, `KNOWN_ISSUES.md`, `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-factory-droid-hooks.ps1`, `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\__tests__\factory-droid-hooks.tests.ps1`
+- References: Factory docs reviewed on 2026-04-06 (`https://docs.factory.ai/reference/hooks-reference`); local failure reproduced from Droid transcript output on Windows
+
+#### Factory Droid Hooks menu crashed because the installer serialized managed hook events as objects instead of arrays {#factory-droid-hooks-menu-crashed-because-the-installer-serialized-managed-hook-events-as-objects-instead-of-arrays}
+- Date: 2026-04-06T17:15:00Z
+- Context: main/Windows local Factory Droid `/hooks` and terminal startup after the first Windows launcher fix
+- Error signature: `ERROR (D.hooks?.[G]||[]).reduce is not a function` in `src/components/hooks/HooksMenu.tsx`
+- Symptoms/Impact: Droid could start and the hook command itself was valid, but opening the Hooks UI crashed because `~/.factory/settings.json` stored `UserPromptSubmit`, `Notification`, and `Stop` as `{ hooks: [...] }` instead of `[ { hooks: [...] } ]`.
+- Root cause: `Normalize-FactoryHookEventEntries()` returned a one-element collection through the PowerShell pipeline, which unwrapped the array to a scalar `PSCustomObject` before `Merge-FactoryHookSettings()` assigned it. `ConvertTo-Json` then persisted an object-shaped event value, and the Hooks UI assumed an array and called `.reduce(...)`.
+- Resolution: The installer now preserves managed event lists as arrays at both the normalization return boundary and the settings assignment point, validates the serialized JSON shape after writing, and adds regression tests that inspect the raw written `settings.json` instead of masking object-vs-array bugs with `@(...)`.
+- Prevent recurrence:
+  - Validate the persisted JSON contract, not just the in-memory PowerShell object graph.
+  - Keep managed hook events serialized as arrays even when there is only one hook entry.
+  - Seed tests with the malformed object-shaped form so future migrations prove the Hooks UI contract stays intact.
+- Files/Commands touched: `scripts/install-factory-droid-hooks.ps1`, `scripts/__tests__/factory-droid-hooks.tests.ps1`, `KNOWN_ISSUES.md`, `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-factory-droid-hooks.ps1`, `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\__tests__\factory-droid-hooks.tests.ps1`
+- References: Droid Hooks UI crash observed locally on 2026-04-06 after the Windows launcher quoting fix; current contract verified against `%USERPROFILE%\.factory\settings.json`
+
+#### Factory Droid badge transport stayed dark because Factory hook output does not reliably flow through the PTY stream {#factory-droid-badge-transport-stayed-dark-because-factory-hook-output-does-not-reliably-flow-through-the-pty-stream}
+- Date: 2026-04-06T18:30:00Z
+- Context: main/Windows local Factory Droid sessions inside Mergen-ADE integrated terminals after hook registration and installer fixes
+- Error signature: Hooks appeared in Droid and the terminal transcript showed `HOOKS Stop`, but the Mergen-ADE green/yellow badge still never changed state.
+- Symptoms/Impact: The hook runner was active, yet `UserPromptSubmit`, `Notification`, and `Stop` signals did not reach the badge pipeline because `src/terminal.rs` only updates AI status from PTY bytes and OSC title bytes observed by the integrated terminal reader.
+- Root cause: Factory hook stdout/stderr semantics do not provide one PTY-visible channel for all needed events. `UserPromptSubmit` output is special-cased by Factory, `Notification` output is not guaranteed to be transcript-visible, and writing to `CONOUT$` or console title APIs bypassed Mergen-ADE's PTY reader entirely.
+- Resolution: Replaced the PTY marker/title transport with a terminal-scoped JSONL inbox under the Mergen-ADE app-data runtime directory. Each spawned terminal now injects `MERGEN_ADE_TERMINAL_ID` and `MERGEN_ADE_FACTORY_DROID_HOOKS_DIR`, the Factory hook script appends one quiet JSONL record per actionable event, and `src/app.rs` polls those inbox files to drive `Running` and `Attention`. A local Enter-submit fallback now also sets `Running` immediately for already-tagged Factory Droid terminals.
+- Prevent recurrence:
+  - Do not rely on Factory hook stdout, stderr, or `CONOUT$` writes as the primary badge transport.
+  - Keep hook delivery scoped by terminal id so concurrent Droid terminals cannot cross-talk.
+  - Treat `UserPromptSubmit` / `Notification` / `Stop` as app-runtime events, not transcript markers.
+- Files/Commands touched: `src/app.rs`, `src/config.rs`, `src/hooks.rs`, `src/terminal.rs`, `scripts/factory-droid-status-hook.ps1`, `scripts/__tests__/factory-droid-hooks.tests.ps1`, `KNOWN_ISSUES.md`, `cargo test`, `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\__tests__\factory-droid-hooks.tests.ps1`
+- References: Factory docs rechecked on 2026-04-06 (`https://docs.factory.ai/reference/hooks-reference`); local Droid transcript showed registered hooks without badge updates
+
+#### Factory Droid badge fixes appeared broken when the user relaunched a stale Desktop binary instead of the rebuilt release {#factory-droid-badge-fixes-appeared-broken-when-the-user-relaunched-a-stale-desktop-binary-instead-of-the-rebuilt-release}
+- Date: 2026-04-06T19:00:00Z
+- Context: main/Windows local manual launch flow using `C:\Users\furkan.cakir\Desktop\mergen-ade-new.exe`
+- Error signature: The integrated terminal still showed no green/yellow Factory Droid indicator even after the inbox-based hook transport shipped and the global Factory hooks were installed correctly.
+- Symptoms/Impact: The repo built successfully and the user-wide hook script was current, but the visible app behavior stayed old because the user continued launching an older side-loaded Desktop executable instead of the freshly built release binary from the repo.
+- Root cause: The running process path pointed at `C:\Users\furkan.cakir\Desktop\mergen-ade-new.exe`, whose hash differed from `target\x86_64-pc-windows-msvc\release\mergen-ade.exe`. That stale launcher binary did not include the latest Factory Droid transport and diagnostics changes.
+- Resolution: Added in-app diagnostics for the current executable path and Factory Droid inbox runtime status, plus a visible top-bar warning when the inbox runtime directory is unavailable. Operationally, the Desktop launcher must be replaced with the current release build before testing Droid badge behavior.
+- Prevent recurrence:
+  - Always update the actual launcher binary the user runs, not just the repo build output.
+  - Surface the current executable path in Settings so stale side-loaded binaries are immediately visible.
+  - Verify the Factory Droid inbox runtime path shown by the app before diagnosing hook behavior.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: local process inspection on 2026-04-06 showed the running app was `C:\Users\furkan.cakir\Desktop\mergen-ade-new.exe` while the current repo release binary lived under `target\x86_64-pc-windows-msvc\release\mergen-ade.exe`
+
+#### Factory Droid inbox transport was not reliable because Droid hooks did not consistently inherit Mergen-specific env vars {#factory-droid-inbox-transport-was-not-reliable-because-droid-hooks-did-not-consistently-inherit-mergen-specific-env-vars}
+- Date: 2026-04-06T19:20:00Z
+- Context: main/Windows local Factory Droid sessions after the inbox-based hook transport and launcher refresh were already in place
+- Error signature: Settings showed `Inbox JSONL (Factory Droid hooks)` as ready and Droid showed `HOOKS Stop`, but `%APPDATA%\Mergen\MergenADE\config\runtime\factory-droid-hooks` stayed empty during real sessions.
+- Symptoms/Impact: The hook script worked in direct PowerShell tests with `MERGEN_ADE_TERMINAL_ID` and `MERGEN_ADE_FACTORY_DROID_HOOKS_DIR`, yet real Droid hook executions still produced no JSONL files, so the badge pipeline never saw `Running` or `Attention`.
+- Root cause: Mergen injected custom `MERGEN_ADE_*` env vars into the integrated shell child, but Factory's hook subprocess did not reliably inherit those env vars in real runs. Factory docs only guarantee hook stdin JSON and documented Droid env like `FACTORY_PROJECT_DIR`, not arbitrary terminal-local env propagation. This made the inbox transport a best-effort path instead of a dependable primary signal.
+- Resolution: Pivoted the primary Factory Droid badge transport to PTY/process detection. Mergen now treats descendant `droid.exe`/`factory.exe` processes as the authoritative session boundary, marks `Running` from prompt submission inside an active Droid session, and marks `Attention` from visible PTY text like `HOOKS Stop`, permission prompts, and idle prompts. Inbox JSONL remains as fallback only.
+- Prevent recurrence:
+  - Do not make badge correctness depend on undocumented hook env inheritance.
+  - Use process-descendant checks to prove a terminal is actually hosting a Droid session before turning prompt submits into green activity.
+  - Treat hook inbox files as optional enrichment, not the sole transport.
+- Files/Commands touched: `src/app.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, direct hook smoke tests, `droid --help`, `droid exec --help`, `droid --debug exec ...`
+- References: Factory docs rechecked on 2026-04-06 (`https://docs.factory.ai/reference/hooks-reference`, `https://docs.factory.ai/cli/configuration/hooks-guide`); local direct script invocation wrote JSONL while real Droid hook execution did not
+
+#### Factory Droid `Stop` PTY events could be dropped when the Droid process exited before the next UI frame {#factory-droid-stop-pty-events-could-be-dropped-when-the-droid-process-exited-before-the-next-ui-frame}
+- Date: 2026-04-07T00:00:00Z
+- Context: main/Windows local Factory Droid sessions after the PTY/process-primary badge pivot
+- Error signature: Green `Running` pulse started correctly after prompt submit, Droid visibly printed `HOOKS Stop`, but the badge never transitioned to yellow `Attention`.
+- Symptoms/Impact: Mergen detected active Droid sessions and prompt submits, yet completion and waiting-state PTY text could be ignored if the descendant Droid process disappeared immediately before the next `update()` cycle. This left the badge stuck in green or cleared it before the user saw the stop state.
+- Root cause: `update()` previously polled descendant Droid processes before draining PTY terminal events. When `droid.exe` exited, `poll_factory_droid_processes()` cleared the Factory Droid session immediately, so the trailing `HOOKS Stop`, permission, or input-wait PTY chunks arriving in the same frame were no longer associated with an active Droid session.
+- Resolution: Reordered the main loop to process PTY terminal events before process polling, added a 750 ms trailing-output grace window for missing Droid processes, and preserved `Attention` until user interaction instead of clearing it as soon as the process tree vanished. Added regressions for update-order stop delivery, post-exit stop chunks, attention persistence, and stale-running cleanup after grace expiry.
+- Prevent recurrence:
+  - Process PTY-delivered Factory Droid status before descendant-process cleanup.
+  - Keep a short trailing-output grace window so process exit and terminal transcript delivery do not race.
+  - Do not auto-clear `Attention` just because the Droid process has already exited.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: local reproduction on 2026-04-07 from a real Droid session where `HOOKS Stop` was visible but the badge stayed green; reviewer confirmation from subagent `Ampere`
+
+#### Factory Droid visible `HOOKS Stop` text could still be missed when PTY output split the phrase across multiple reads {#factory-droid-visible-hooks-stop-text-could-still-be-missed-when-pty-output-split-the-phrase-across-multiple-reads}
+- Date: 2026-04-07T00:30:00Z
+- Context: main/Windows local Factory Droid sessions after the stop-race fix was already in place
+- Error signature: Droid transcript visibly showed `HOOKS  Stop`, but the badge stayed green even though the process-exit race and trailing grace logic were already fixed.
+- Symptoms/Impact: The app-side state machine was ready to turn visible stop/wait text into `Attention`, but the PTY reader only looked for those phrases inside the current `read()` chunk. If `HOOKS  Stop`, `needs your permission`, or `waiting for your input` was split across PTY reads, the transcript rendered the full line while no `AiRawChunk` event was emitted.
+- Root cause: `src/terminal.rs` used stateless visible-text detection via `official_ai_debug_chunk(&text)` on one PTY chunk at a time. Unlike OSC title parsing, there was no rolling buffer for visible Factory Droid status text, no ANSI normalization, and no CRLF normalization for this path.
+- Resolution: Added a bounded rolling visible-status parser in `src/terminal.rs` that normalizes ANSI/CRLF, carries text across PTY reads, detects split `HOOKS Stop` / permission / input-wait phrases once, and emits a single canonical `AiRawChunk` when the full phrase is assembled.
+- Prevent recurrence:
+  - Keep visible Factory Droid status detection stateful across PTY reads.
+  - Normalize ANSI escape sequences and CRLF before matching visible status phrases.
+  - Bound the rolling parser buffer and regression-test split-read, duplicate-emission, and trim-boundary cases.
+- Files/Commands touched: `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: local reproduction on 2026-04-07 from a real Droid session showing `HOOKS  Stop`; reviewer confirmation from subagent `McClintock`
+
+#### Factory Droid Windows hook launcher printed a PowerShell banner and `Yolda geçersiz karakterler var` because the managed `-File` path was quoted {#factory-droid-windows-hook-launcher-printed-a-powershell-banner-and-yolda-gecersiz-karakterler-var-because-the-managed-file-path-was-quoted}
+- Date: 2026-04-07T00:45:00Z
+- Context: main/Windows local Factory Droid sessions after the badge transport fixes were already working
+- Error signature: Droid showed a hook warning block with `Windows PowerShell`, `Install the latest PowerShell...`, and `Processing -File '"C:\Users\furkan.cakir\.factory\hooks\mergen-ade-droid-status.ps1"' failed: Yolda geçersiz karakterler var`.
+- Symptoms/Impact: `Stop` still reached Droid, but each managed hook invocation leaked noisy banner text and an invalid-path warning into the transcript because PowerShell received an extra-quoted `-File` argument.
+- Root cause: The managed hook command in `%USERPROFILE%\.factory\settings.json` was persisted as `powershell.exe ... -File "C:\...\mergen-ade-droid-status.ps1"`. Factory's Windows hook runner re-quoted that token, so PowerShell saw `-File '"C:\...\ps1"'`, rejected it as an invalid path, and printed its normal Windows PowerShell startup banner because `-NoLogo` was not present.
+- Resolution: The installer now normalizes every managed Factory Droid hook command to `powershell.exe -NoLogo -NonInteractive -NoProfile -ExecutionPolicy Bypass -File C:\...\mergen-ade-droid-status.ps1`, migrates existing quoted commands in place, rejects whitespace-containing managed script paths on Windows, and regression-tests the quote-free `cmd /c` execution path.
+- Prevent recurrence:
+  - Keep the managed Windows hook command quote-free after `-File`.
+  - Include `-NoLogo -NonInteractive` in the canonical hook launcher to suppress banner noise.
+  - Fail fast when the managed hook script path contains whitespace instead of persisting a command that Factory will re-quote incorrectly.
+- Files/Commands touched: `scripts/install-factory-droid-hooks.ps1`, `scripts/__tests__/factory-droid-hooks.tests.ps1`, `KNOWN_ISSUES.md`, `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-factory-droid-hooks.ps1`, `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\__tests__\factory-droid-hooks.tests.ps1`
+- References: local Droid transcript captured on 2026-04-07 showing the PowerShell banner and invalid `-File` path error
+
+#### Factory Droid yellow `Attention` badge sometimes required a click because typed input was blocked by UI focus and the routed-input clear check looked at an already-flushed buffer {#factory-droid-yellow-attention-badge-sometimes-required-a-click-because-typed-input-was-blocked-by-ui-focus-and-the-routed-input-clear-check-looked-at-an-already-flushed-buffer}
+- Date: 2026-04-07T01:00:00Z
+- Context: main/Windows local Factory Droid sessions after green/yellow badge signaling was otherwise working
+- Error signature: Yellow `Attention` badge cleared on clicking the active terminal, but sometimes stayed yellow when the user started typing until they clicked first.
+- Symptoms/Impact: When a repo UI text field still owned keyboard focus, the first typed character never reached the active terminal, so the badge did not clear. Even when terminal text did reach `route_active_terminal_input()`, the attention-clear check could still miss it because it looked at `outbound.is_empty()` after `flush_terminal_outbound()` had already drained the buffer.
+- Root cause: Two conditions combined. First, `raw_input_hook()` left keyboard ownership with directory search or saved-message draft inputs unless the user clicked the terminal. Second, `route_active_terminal_input()` used the post-flush `outbound` buffer to decide whether terminal interaction happened, so real typed input could fail to call `manager.user_interacted(...)`.
+- Resolution: Added an attention-specific one-frame keyboard-routing override that surrenders app text-input focus and buffers the first terminal text-entry event for the active terminal, while still preserving popup/context-menu/modal ownership. Separately, `route_active_terminal_input()` now tracks terminal interaction with a dedicated latch instead of checking the already-flushed `outbound` buffer.
+- Prevent recurrence:
+  - Do not infer user interaction from a buffer after it has been drained into the PTY writer.
+  - Keep attention-specific keyboard stealing scoped to active-terminal `Attention` sessions and app text-input focus only.
+  - Preserve popup, context-menu, and settings-modal keyboard ownership even when a terminal is waiting.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: local user reproduction on 2026-04-07 where yellow cleared only after clicking; reviewer confirmation from subagent `Hooke`
+
+#### Factory Droid hook disablement still left the hook runtime active because bootstrap created a fallback manager {#factory-droid-hook-disablement-still-left-the-hook-runtime-active-because-bootstrap-created-a-fallback-manager}
+- Date: 2026-04-07T02:00:00Z
+- Context: main/Windows local Factory Droid integration with `ai_hooks.global_enabled = false`
+- Error signature: Disabling AI hooks in config still left Factory Droid badge state and hook-runtime behavior active.
+- Symptoms/Impact: Users could turn hooks off in config yet Mergen-ADE still created a hook manager, still exposed Factory Droid runtime diagnostics, and could still react to Factory-specific status transitions instead of fully disabling the integration.
+- Root cause: `src/app.rs` previously treated the disabled branch as "use Factory defaults," so bootstrap still constructed an `AiHookManager` and downstream logic still had a live hook runtime to poll and route through.
+- Resolution: Hook bootstrap is now authoritative on `ai_hooks.global_enabled`: disabled config returns `None` for the manager and runtime directory, terminal spawn skips Factory-specific env injection, launch-pending/input-steal/inbox-polling paths are gated on manager presence, and PTY/title Factory Droid status changes now flow through the shared status helper so diagnostics record the real source when hooks are enabled.
+- Prevent recurrence:
+  - Treat disabled hook config as an absent runtime, not as a request to fall back to Factory defaults.
+  - Gate every Factory Droid-specific runtime path on manager presence instead of re-deriving "enabled" from partial state.
+  - Keep status-source diagnostics routed through the shared Factory Droid state helper so transport reporting stays consistent.
+- Files/Commands touched: `src/app.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo test`
+- References: 2026-04-07 code review finding for `src/app.rs`; local regression tests `disabled_ai_hooks_do_not_create_manager`, `ai_status_change_event_updates_badge_without_debug_ui_state`, `ai_status_change_event_from_title_records_terminal_title_source`
+
+#### Factory Droid Windows managed hook launcher could not be installed under profile paths with spaces because the persisted command relied on `-File` quoting {#factory-droid-windows-managed-hook-launcher-could-not-be-installed-under-profile-paths-with-spaces-because-the-persisted-command-relied-on-file-quoting}
+- Date: 2026-04-07T02:15:00Z
+- Context: main/Windows local Factory Droid hook installation under `%USERPROFILE%\.factory\hooks`
+- Error signature: Managed hook installation failed for Windows users whose home/profile path contained spaces.
+- Symptoms/Impact: The hook script lives under `%USERPROFILE%\.factory\hooks`, so the installer could reject otherwise normal Windows profile paths and leave Factory Droid hook registration unusable on affected machines.
+- Root cause: The managed launcher contract still depended on a `powershell.exe ... -File <path>` command shape that Factory/cmd would re-quote inconsistently on Windows. The installer tried to avoid the quoting failure by rejecting whitespace instead of making the launcher path-safe.
+- Resolution: The installer now persists one canonical `powershell.exe ... -EncodedCommand <base64>` launcher that bootstraps the managed script path inside PowerShell, recognizes and migrates both legacy `-File` and encoded managed commands, and keeps spaces and `%` characters working in the installed script path. Regression tests now exercise whitespace-containing and percent-containing home directories.
+- Prevent recurrence:
+  - Keep the persisted managed launcher in encoded-command form instead of depending on shell-level path quoting.
+  - Normalize legacy managed entries in place so reinstalling collapses old `-File` variants and duplicates.
+  - Test installer behavior with realistic Windows profile paths, including spaces and `%`.
+- Files/Commands touched: `scripts/install-factory-droid-hooks.ps1`, `scripts/__tests__/factory-droid-hooks.tests.ps1`, `KNOWN_ISSUES.md`, `powershell -ExecutionPolicy Bypass -File .\scripts\__tests__\factory-droid-hooks.tests.ps1`
+- References: 2026-04-07 code review finding for `scripts/install-factory-droid-hooks.ps1`; local PowerShell regression tests for encoded launcher canonicalization and space-containing home dirs
+
+#### Factory Droid inbox JSONL records could replay into a new terminal after app restart because acceptance keyed only on terminal id {#factory-droid-inbox-jsonl-records-could-replay-into-a-new-terminal-after-app-restart-because-acceptance-keyed-only-on-terminal-id}
+- Date: 2026-04-07T02:30:00Z
+- Context: main/Windows local Factory Droid inbox transport after terminal ids began restarting from `1` on each app launch
+- Error signature: Delayed inbox writes from an older Droid session could mark a new terminal `Running` or `Attention` after restart.
+- Symptoms/Impact: Mergen-ADE reused low terminal ids across launches, so a stale JSONL append targeting `1.jsonl` could be accepted by a freshly spawned terminal with the same id even though the old Droid session was gone.
+- Root cause: `src/app.rs` previously accepted inbox events by filename/terminal id alone. Because terminal ids are app-local counters rather than durable session identities, old hook writes were indistinguishable from current-terminal writes.
+- Resolution: Each spawned terminal now gets a fresh app-generated inbox token, the terminal runtime injects it through `MERGEN_ADE_FACTORY_DROID_INBOX_TOKEN`, the hook script writes that token into each JSONL record, and the app accepts inbox events only when both `terminal_id` and `inbox_token` match the currently running terminal entry. `session_id` remains informational metadata only.
+- Prevent recurrence:
+  - Use a per-terminal-instance token for inbox delivery identity; do not rely on restartable terminal ids alone.
+  - Keep hook env propagation and JSONL schema changes regression-tested together so transport identity stays end-to-end.
+  - Treat Factory `session_id` as metadata rather than the sole acceptance key because one terminal can host multiple Droid sessions over time.
+- Files/Commands touched: `src/app.rs`, `src/hooks.rs`, `src/terminal.rs`, `scripts/factory-droid-status-hook.ps1`, `scripts/__tests__/factory-droid-hooks.tests.ps1`, `KNOWN_ISSUES.md`, `cargo test`, `powershell -ExecutionPolicy Bypass -File .\scripts\__tests__\factory-droid-hooks.tests.ps1`
+- References: 2026-04-07 code review finding for `src/app.rs`; local regression tests `factory_droid_hook_inbox_ignores_stale_token_records` and PowerShell inbox-token preservation coverage
