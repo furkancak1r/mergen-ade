@@ -66,9 +66,9 @@ If `cargo` is not on PATH in PowerShell, use:
 - Keep urgent critical-path edits local only when delegation would block progress; otherwise prefer delegation first.
 - In handoff/final notes, summarize which subagents were used and what each one produced.
 
-## Factory Droid Integration
-- **Supported AI tool:** Only Factory Droid is supported. Claude Code, cc, and other AI CLI integrations are not supported.
-- **Hook format:** Only `droid-hook:*` and `factory-droid-hook:*` format patterns are recognized. The `claude-hook:*` format is not supported.
-- **Detection commands:** Only `droid` and `factory` trigger AI session detection. Do not add `cc`, `claude`, or other AI CLI commands.
-- **UI labels:** Use "Droid" and "Factory Droid" terminology. Do not use "Claude" or "claude" references in user-facing text.
-- **Event triggers:** `UserPromptSubmit` → Running (green pulse), `Stop`/notification → Attention (yellow pulse).
+## AI CLI Integration
+- **Supported AI tools:** `Factory Droid` and `Codex CLI` are supported. Codex support is limited to native Windows sessions. Claude Code, `cc`, and other AI CLI integrations are not supported.
+- **Factory Droid hook format:** Only `droid-hook:*` and `factory-droid-hook:*` format patterns are recognized for Factory Droid. The `claude-hook:*` format is not supported.
+- **Factory Droid detection commands:** Only `droid` and `factory` trigger Factory Droid session detection. Do not add `cc`, `claude`, or other AI CLI commands.
+- **UI labels:** Use "Droid", "Factory Droid", and "Codex CLI" terminology. Do not use "Claude" or "claude" references in user-facing text.
+- **Event triggers:** Factory Droid uses `UserPromptSubmit` → Running (green pulse) and `Stop`/notification → Attention (yellow pulse). Codex CLI uses explicit launch detection plus notify/BEL-backed attention on native Windows.

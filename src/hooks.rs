@@ -10,12 +10,14 @@ pub const FACTORY_DROID_HOOK_INBOX_TOKEN_ENV_VAR: &str = "MERGEN_ADE_FACTORY_DRO
 #[serde(rename_all = "snake_case")]
 pub enum AiCliTool {
     FactoryDroid,
+    CodexCli,
 }
 
 impl AiCliTool {
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::FactoryDroid => "Factory Droid",
+            Self::CodexCli => "Codex CLI",
         }
     }
 }
@@ -132,24 +134,39 @@ impl AiHooksConfig {
     pub fn with_factory_droid_defaults() -> Self {
         Self {
             global_enabled: true,
-            hooks: vec![AiHookConfig {
-                tool: AiCliTool::FactoryDroid,
-                enabled: true,
-                detection_commands: vec!["droid".to_string(), "factory".to_string()],
-                running_hook_events: vec!["UserPromptSubmit".to_string()],
-                inactive_hook_events: vec![
-                    "Stop".to_string(),
-                    "Notification".to_string(),
-                    "idle_prompt".to_string(),
-                    "permission_prompt".to_string(),
-                ],
-                show_indicators: true,
-                status_indicators: AiStatusIndicators::default(),
-                // Factory Droid sets terminal title to "[Working...]" when active
-                working_title_pattern: "[Working".to_string(),
-                // Factory Droid sets terminal title to "[Idle]" when waiting
-                idle_title_pattern: "[Idle]".to_string(),
-            }],
+            hooks: vec![
+                AiHookConfig {
+                    tool: AiCliTool::FactoryDroid,
+                    enabled: true,
+                    detection_commands: vec!["droid".to_string(), "factory".to_string()],
+                    running_hook_events: vec!["UserPromptSubmit".to_string()],
+                    inactive_hook_events: vec![
+                        "Stop".to_string(),
+                        "Notification".to_string(),
+                        "idle_prompt".to_string(),
+                        "permission_prompt".to_string(),
+                    ],
+                    show_indicators: true,
+                    status_indicators: AiStatusIndicators::default(),
+                    // Factory Droid sets terminal title to "[Working...]" when active
+                    working_title_pattern: "[Working".to_string(),
+                    // Factory Droid sets terminal title to "[Idle]" when waiting
+                    idle_title_pattern: "[Idle]".to_string(),
+                },
+                AiHookConfig {
+                    tool: AiCliTool::CodexCli,
+                    enabled: true,
+                    // Codex is tracked through explicit launch and status paths,
+                    // not broad PTY text matching.
+                    detection_commands: Vec::new(),
+                    running_hook_events: Vec::new(),
+                    inactive_hook_events: Vec::new(),
+                    show_indicators: true,
+                    status_indicators: AiStatusIndicators::default(),
+                    working_title_pattern: String::new(),
+                    idle_title_pattern: String::new(),
+                },
+            ],
             project_overrides: BTreeMap::new(),
         }
     }
@@ -222,6 +239,7 @@ fn normalize_hook_name(name: &str) -> String {
 /// Extract complete lines from a buffer, returning (complete_lines, incomplete_tail).
 /// A line is complete if it ends with newline, or if it contains a full bracket pattern
 /// that could be a hook event.
+#[cfg(test)]
 fn extract_complete_lines(buffer: &str) -> (Vec<&str>, &str) {
     let mut complete_lines = Vec::new();
     let mut search_start = 0;
@@ -278,11 +296,11 @@ fn title_status_for_config(
     config: &AiHookConfig,
     title: &str,
 ) -> Option<(AiCliStatus, AiHookEvent)> {
-    if title.contains(&config.working_title_pattern) {
+    if !config.working_title_pattern.is_empty() && title.contains(&config.working_title_pattern) {
         return Some((AiCliStatus::Running, AiHookEvent::Running));
     }
 
-    if title.contains(&config.idle_title_pattern) {
+    if !config.idle_title_pattern.is_empty() && title.contains(&config.idle_title_pattern) {
         return Some((AiCliStatus::Attention, AiHookEvent::Attention));
     }
 
@@ -628,6 +646,35 @@ mod tests {
         );
         assert_eq!(parse_hook_event("Stop", &config), None);
         assert_eq!(parse_hook_event("UserPromptSubmit", &config), None);
+    }
+
+    #[test]
+    fn codex_default_config_does_not_detect_generic_codex_text() {
+        let config = AiHooksConfig::with_factory_droid_defaults();
+        let mut session = AiCliSession::default();
+
+        assert!(!session.detect_tool("codex", &config));
+        assert!(!session.detect_tool("launching codex session", &config));
+        assert_eq!(session.tool, None);
+    }
+
+    #[test]
+    fn codex_default_config_has_no_broad_detection_commands() {
+        let config = AiHooksConfig::with_factory_droid_defaults();
+        let codex = config
+            .config_for(AiCliTool::CodexCli)
+            .expect("codex config should exist");
+
+        assert!(codex.detection_commands.is_empty());
+    }
+
+    #[test]
+    fn factory_droid_detection_still_works_with_codex_hardened() {
+        let config = AiHooksConfig::with_factory_droid_defaults();
+        let mut session = AiCliSession::default();
+
+        assert!(session.detect_tool("[factory-droid-hook:event=UserPromptSubmit]", &config));
+        assert_eq!(session.tool, Some(AiCliTool::FactoryDroid));
     }
 
     #[test]

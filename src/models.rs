@@ -102,6 +102,30 @@ impl TerminalKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum TerminalManagerFilter {
+    #[default]
+    Foreground,
+    Background,
+}
+
+impl TerminalManagerFilter {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Foreground => "Foreground",
+            Self::Background => "Background",
+        }
+    }
+
+    pub const fn terminal_kind(self) -> TerminalKind {
+        match self {
+            Self::Foreground => TerminalKind::Foreground,
+            Self::Background => TerminalKind::Background,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum MainVisibilityMode {
     #[default]
     Global,
@@ -125,6 +149,7 @@ pub struct UiConfig {
     pub show_terminal_manager: bool,
     pub terminal_manager_expanded: bool,
     pub multi_terminal_view_enabled: bool,
+    pub terminal_manager_filter: TerminalManagerFilter,
     pub last_selected_project_id: Option<u64>,
     pub main_visibility_mode: MainVisibilityMode,
     pub left_sidebar_tab: LeftSidebarTab,
@@ -138,6 +163,7 @@ impl Default for UiConfig {
             show_terminal_manager: true,
             terminal_manager_expanded: true,
             multi_terminal_view_enabled: false,
+            terminal_manager_filter: TerminalManagerFilter::Foreground,
             last_selected_project_id: None,
             main_visibility_mode: MainVisibilityMode::Global,
             left_sidebar_tab: LeftSidebarTab::Directory,

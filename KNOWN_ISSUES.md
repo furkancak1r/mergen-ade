@@ -1,5 +1,50 @@
 ### Known Issues & Fix Log
 
+#### Terminal header source control badge and Terminal Manager row chrome were simplified {#terminal-header-source-control-badge-and-terminal-manager-row-chrome-were-simplified}
+- Date: 2026-04-08T00:00:00Z
+- Context: main/Windows local terminal header chrome + Terminal Manager project and terminal rows
+- Error signature: `Terminal headers still showed a source control icon, Terminal Manager repeated +/- diff totals on every terminal row, and terminal rows started with extra terminal icons before the text.`
+- Symptoms/Impact: Source control status was duplicated across surfaces, Terminal Manager rows looked visually noisy, and per-terminal diff totals obscured the project-level git state the user actually wanted to scan.
+- Root cause: The main terminal header still rendered the old source-control badge path, Terminal Manager diff summaries were attached to each terminal title instead of the project group label, and terminal rows still painted a static terminal icon ahead of the text even after the AI badge became the primary status marker.
+- Resolution:
+  - Removed the source control badge from the terminal header and left only the AI badge/status path there.
+  - Moved the Terminal Manager `+/-` diff summary to the project group header so git totals are shown once per project.
+  - Removed the leading terminal icon from Terminal Manager terminal rows so rows now begin directly with AI state and text.
+- Prevent recurrence:
+  - Keep project-level source control summaries attached to project headers instead of duplicating them on every child terminal row.
+  - Avoid parallel status indicators in terminal chrome unless they provide distinct information.
+  - When simplifying row chrome, update both layout code and regression tests together so removed icons do not leave dead spacing.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo test`
+
+#### Terminal Manager filter actions, single-view Ctrl navigation, and Settings diagnostics layout were corrected {#terminal-manager-filter-actions-single-view-ctrl-navigation-and-settings-diagnostics-layout-were-corrected}
+- Date: 2026-04-08T00:00:00Z
+- Context: main/Windows local Terminal Manager project actions, single-terminal keyboard navigation, and Settings modal layout
+- Error signature: `Terminal Manager always showed separate foreground/background buttons, Ctrl+Up/Down did nothing while only one terminal was visible, and diagnostics could expand the Settings modal until Saved Messages became cramped.`
+- Symptoms/Impact: The Terminal Manager action row did not reflect the selected foreground/background filter, single-view users could not cycle terminals with the expected `Ctrl+Up/Down` shortcut, and the diagnostics block consumed most of the Settings window height when expanded.
+- Root cause: The project header action row was hard-wired for two inline spawn buttons instead of being driven by the selected filter, plain `Ctrl+Up/Down` stayed on the grid-navigation path even when only one terminal was visible, and diagnostics were rendered as an unbounded linear block in the same flow as the rest of the Settings content.
+- Resolution:
+  - Terminal Manager project headers now render one inline spawn button that matches the active foreground/background filter.
+  - Plain `Ctrl+Up/Down` now routes through single-view linear terminal navigation when `Show multiple terminals at once` is off, while the existing multi-terminal grid navigation remains intact.
+  - Settings diagnostics now default to collapsed and render inside a dedicated capped scroll area so Saved Messages keeps usable space.
+- Prevent recurrence:
+  - Keep filter-driven actions bound to the same state that determines which terminal rows are visible.
+  - Handle shortcut reinterpretation at the contextual routing layer so raw input buffering, terminal capture, and final navigation stay aligned.
+  - When a settings subsection can grow significantly, give it its own bounded scroll container before adding more controls beneath it.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo test`
+
+#### Source Control refresh no longer replaced preserved branch/diff data with placeholders {#source-control-refresh-no-longer-replaced-preserved-branch-diff-data-with-placeholders}
+- Date: 2026-04-08T00:00:00Z
+- Context: main/Windows local source-control sidebar + Terminal Manager diff summary during refresh/error states
+- Error signature: `Refreshing source control replaced the last visible branch/diff snapshot with '-' or placeholder UI even before new data arrived.`
+- Symptoms/Impact: While `Refresh Status` or `Fetch + Refresh` was running, terminal chrome and related source-control surfaces could temporarily lose the last known branch/diff/file state and show placeholder text instead. Refresh errors could also wipe the previous successful snapshot from the UI.
+- Root cause: Source-control worker results were written back as full snapshot replacements, and tooltip/diff-summary rendering treated `loading` or `last_error` as mutually exclusive with existing snapshot data instead of as status overlays on top of preserved data.
+- Resolution: Source-control refresh now preserves the last successful branch/diff/file snapshot during loading and refresh failures, merges error results onto existing data, and keeps tooltip/sidebar rendering focused on showing loading/error banners above preserved branch/file context instead of dropping to placeholders when totals already exist.
+- Prevent recurrence:
+  - Treat source-control `loading` and `last_error` as freshness metadata layered on top of snapshot data, not as reasons to discard the last successful snapshot.
+  - When a refresh can fail independently from the last known state, merge status fields into cached data instead of replacing the entire model.
+  - Keep regression tests around preserved diff totals and tooltip contents for loading/error states.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo test`
+
 #### Factory Droid badge behavior fixed: detection vs hook events {#factory-droid-badge-behavior-fixed}
 - Date: 2026-04-06T00:00:00Z
 - Context: main/Windows terminal title bar AI status badge

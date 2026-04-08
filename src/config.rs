@@ -11,6 +11,7 @@ const QUALIFIER: &str = "com";
 const ORGANIZATION: &str = "Mergen";
 const APPLICATION: &str = "MergenADE";
 const FACTORY_DROID_HOOK_RUNTIME_DIR: &str = "runtime/factory-droid-hooks";
+const CODEX_CLI_RUNTIME_DIR: &str = "runtime/codex-cli";
 
 fn project_dirs() -> io::Result<ProjectDirs> {
     ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
@@ -27,6 +28,12 @@ pub fn factory_droid_hook_runtime_dir() -> io::Result<PathBuf> {
     let runtime_dir = project_dirs()?
         .config_dir()
         .join(FACTORY_DROID_HOOK_RUNTIME_DIR);
+    fs::create_dir_all(&runtime_dir)?;
+    Ok(runtime_dir)
+}
+
+pub fn codex_cli_runtime_dir() -> io::Result<PathBuf> {
+    let runtime_dir = project_dirs()?.config_dir().join(CODEX_CLI_RUNTIME_DIR);
     fs::create_dir_all(&runtime_dir)?;
     Ok(runtime_dir)
 }
@@ -127,7 +134,7 @@ fn normalize_config_for_current_platform(config: &mut AppConfig) {
 #[cfg(test)]
 mod tests {
     use super::{load_config, save_config};
-    use crate::models::{AppConfig, ShellKind};
+    use crate::models::{AppConfig, ShellKind, TerminalManagerFilter};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -227,6 +234,35 @@ terminal_manager_expanded = true
     }
 
     #[test]
+    fn missing_terminal_manager_filter_defaults_to_foreground() {
+        let path = unique_temp_path("missing-terminal-manager-filter");
+        fs::write(
+            &path,
+            r#"
+version = 1
+default_shell = "powershell"
+
+[ui]
+show_project_explorer = true
+project_explorer_expanded = true
+show_terminal_manager = true
+terminal_manager_expanded = true
+multi_terminal_view_enabled = true
+"#,
+        )
+        .expect("should write config");
+
+        let config = load_config(&path).expect("should load config");
+
+        assert_eq!(
+            config.ui.terminal_manager_filter,
+            TerminalManagerFilter::Foreground
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn save_and_load_preserves_multi_terminal_setting() {
         let path = unique_temp_path("preserve-multi-terminal-setting");
         let mut config = AppConfig::default();
@@ -237,6 +273,24 @@ terminal_manager_expanded = true
         let loaded = load_config(&path).expect("should load config");
 
         assert!(loaded.ui.multi_terminal_view_enabled);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_and_load_preserves_terminal_manager_filter() {
+        let path = unique_temp_path("preserve-terminal-manager-filter");
+        let mut config = AppConfig::default();
+        config.ui.terminal_manager_filter = TerminalManagerFilter::Background;
+
+        save_config(&path, &config).expect("should save config");
+
+        let loaded = load_config(&path).expect("should load config");
+
+        assert_eq!(
+            loaded.ui.terminal_manager_filter,
+            TerminalManagerFilter::Background
+        );
 
         let _ = fs::remove_file(path);
     }

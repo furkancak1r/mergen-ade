@@ -30,17 +30,19 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, SPI_GETKEYBOARDDELAY, SPI_GETKEYBOARDSPEED,
 };
 
+use crate::codex::{self, CodexEnableOutcome, CodexNotifyInboxEvent};
 use crate::config;
 use crate::hooks::{AiCliSession, AiCliStatus, AiCliTool, AiHookManager};
 use crate::layout;
 use crate::models::{
     AppConfig, LeftSidebarTab, MainVisibilityMode, ProjectRecord, ShellKind, TerminalKind,
+    TerminalManagerFilter,
 };
 use crate::terminal::{
     try_terminal_selection_snapshot, try_terminal_snapshots, TerminalColor, TerminalCursor,
     TerminalCursorShape, TerminalDimensions, TerminalRuntime, TerminalSelectionLine,
     TerminalSelectionSnapshot, TerminalSnapshot, TerminalUiEvent, TerminalUiEventKind,
-    TerminalWheelEvent, WheelDirection,
+    TerminalWheelEvent, TrackedProcessIdentity, WheelDirection,
 };
 use crate::title::{terminal_title_candidate, update_terminal_title};
 
@@ -52,6 +54,10 @@ const FACTORY_DROID_HOOK_POLL_MS: u64 = 75;
 const FACTORY_DROID_PROCESS_POLL_MS: u64 = 75;
 const FACTORY_DROID_LAUNCH_GRACE_MS: u64 = 5_000;
 const FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS: u64 = 750;
+const CODEX_NOTIFY_POLL_MS: u64 = 75;
+const CODEX_PROCESS_POLL_MS: u64 = 75;
+const CODEX_LAUNCH_GRACE_MS: u64 = 5_000;
+const CODEX_TRAILING_OUTPUT_GRACE_MS: u64 = 750;
 const CURSOR_BLINK_STEP_SECS: f64 = 0.6;
 const TERMINAL_COPY_TOAST_SECS: f64 = 1.75;
 const TERMINAL_COPY_FEEDBACK_TEXT: &str = "Copied terminal selection";
@@ -117,6 +123,7 @@ const WINDOWS_TERMINAL_FONT_CANDIDATES: [(&str, &str); 2] = [
 ];
 
 static FACTORY_DROID_INBOX_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
+static CODEX_NOTIFY_INBOX_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum AppIcon {
@@ -250,6 +257,11 @@ struct FactoryDroidHookInboxState {
     offset: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CodexNotifyInboxState {
+    offset: u64,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 struct FactoryDroidHookInboxEvent {
     terminal_id: String,
@@ -286,6 +298,23 @@ impl FactoryDroidStatusSource {
             Self::PtyNotification => "pty_notification",
             Self::TerminalTitle => "terminal_title",
             Self::Inbox => "inbox",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexCliStatusSource {
+    PromptSubmit,
+    Notify,
+    Bell,
+}
+
+impl CodexCliStatusSource {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::PromptSubmit => "prompt_submit",
+            Self::Notify => "notify",
+            Self::Bell => "bell",
         }
     }
 }
@@ -354,6 +383,11 @@ pub struct AdeApp {
     factory_droid_hook_inboxes: BTreeMap<u64, FactoryDroidHookInboxState>,
     factory_droid_hook_last_poll_at: Option<Instant>,
     factory_droid_process_last_poll_at: Option<Instant>,
+    codex_cli_runtime_dir: Option<PathBuf>,
+    codex_cli_runtime_dir_error: Option<String>,
+    codex_notify_inboxes: BTreeMap<u64, CodexNotifyInboxState>,
+    codex_notify_last_poll_at: Option<Instant>,
+    codex_process_last_poll_at: Option<Instant>,
     config: AppConfig,
     config_load_error: Option<String>,
     config_save_requires_reload: bool,
@@ -373,6 +407,7 @@ pub struct AdeApp {
     terminal_events_rx: Receiver<TerminalUiEvent>,
     ai_hook_manager: Option<Arc<AiHookManager>>,
     show_settings_popup: bool,
+    settings_diagnostics_expanded: bool,
     saved_message_drafts: BTreeMap<u64, String>,
     directory_search_query: String,
     directory_pending_tree_open_state_by_project: BTreeMap<u64, bool>,
@@ -421,11 +456,19 @@ struct TerminalEntry {
     runtime: TerminalRuntime,
     ai_session: AiCliSession,
     factory_droid_inbox_token: Option<String>,
+    codex_notify_inbox_token: Option<String>,
     factory_droid_launch_pending_since: Option<Instant>,
     factory_droid_session_active: bool,
     factory_droid_last_process_seen_at: Option<Instant>,
     factory_droid_process_missing_since: Option<Instant>,
     factory_droid_last_status_source: Option<FactoryDroidStatusSource>,
+    codex_launch_pending_since: Option<Instant>,
+    codex_launch_process_baseline: Option<Vec<TrackedProcessIdentity>>,
+    codex_session_active: bool,
+    codex_process_identity: Option<TrackedProcessIdentity>,
+    codex_last_process_seen_at: Option<Instant>,
+    codex_process_missing_since: Option<Instant>,
+    codex_last_status_source: Option<CodexCliStatusSource>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -587,17 +630,8 @@ enum SourceControlDispatchPriority {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceControlBadgeState {
-    Unknown,
-    Loading,
-    Dirty,
     Clean,
     Error,
-}
-
-#[derive(Debug, Clone)]
-struct SourceControlBadgeModel {
-    state: SourceControlBadgeState,
-    tooltip_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -714,43 +748,26 @@ fn draw_ai_badge(ui: &mut Ui, badge: &AiBadgeModel) -> egui::Response {
 struct TerminalStatusBadgeLayout {
     #[cfg(test)]
     ai_rect: Option<egui::Rect>,
-    #[cfg(test)]
-    source_control_rect: egui::Rect,
 }
 
 struct TerminalManagerTitleSummaryLayout {
-    response: egui::Response,
     #[cfg(test)]
     title_rect: egui::Rect,
     #[cfg(test)]
     diff_summary_rect: egui::Rect,
 }
 
-fn draw_terminal_status_badges(
-    ui: &mut Ui,
-    ai_badge: &AiBadgeModel,
-    source_control_badge: &SourceControlBadgeModel,
-) -> TerminalStatusBadgeLayout {
+fn draw_terminal_status_badges(ui: &mut Ui, ai_badge: &AiBadgeModel) -> TerminalStatusBadgeLayout {
     let ai_response = ai_badge_visual(ai_badge.status).map(|_| draw_ai_badge(ui, ai_badge));
+    #[cfg(test)]
     let ai_rect = ai_response.as_ref().map(|response| response.rect);
     if ai_response.is_some() {
         ui.add_space(4.0);
     }
 
-    let source_control_response = draw_source_control_badge(ui, source_control_badge);
-    let source_control_rect = source_control_response.rect;
-    ui.add_space(4.0);
-
-    let _response = match ai_response {
-        Some(response) => response.union(source_control_response),
-        None => source_control_response,
-    };
-
     TerminalStatusBadgeLayout {
         #[cfg(test)]
         ai_rect,
-        #[cfg(test)]
-        source_control_rect,
     }
 }
 
@@ -823,6 +840,23 @@ impl AdeApp {
         }
     }
 
+    fn codex_cli_runtime_state(
+        config: &AppConfig,
+    ) -> (Option<Arc<AiHookManager>>, Option<PathBuf>, Option<String>) {
+        let ai_hook_manager = Self::ai_hook_manager_from_config(config);
+        if ai_hook_manager.is_none() {
+            return (None, None, None);
+        }
+
+        match config::codex_cli_runtime_dir() {
+            Ok(dir) => (ai_hook_manager, Some(dir), None),
+            Err(err) => {
+                log::warn!("Codex CLI runtime directory unavailable: {err}");
+                (ai_hook_manager, None, Some(err.to_string()))
+            }
+        }
+    }
+
     fn next_factory_droid_inbox_token(terminal_id: u64) -> String {
         let counter = FACTORY_DROID_INBOX_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
         let timestamp_nanos = SystemTime::now()
@@ -835,6 +869,88 @@ impl AdeApp {
             std::process::id()
         )
     }
+
+    fn next_codex_notify_inbox_token(terminal_id: u64) -> String {
+        let counter = CODEX_NOTIFY_INBOX_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let timestamp_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+
+        format!(
+            "{terminal_id:016x}-{:08x}-{timestamp_nanos:032x}-{counter:016x}",
+            std::process::id()
+        )
+    }
+
+    fn enable_codex_cli_integration(&mut self, ctx: &egui::Context) {
+        match codex::enable_codex_cli_integration(&self.current_executable_path) {
+            Ok(CodexEnableOutcome::MissingInstall) => {
+                self.status_line =
+                    "Codex CLI was not found. Install it with npm, then run `codex login`."
+                        .to_owned();
+                ctx.open_url(egui::OpenUrl::new_tab(codex::codex_setup_url()));
+            }
+            Ok(CodexEnableOutcome::NeedsLogin) => {
+                self.status_line =
+                    "Codex CLI is installed but not signed in. Run `codex login`, then try again."
+                        .to_owned();
+            }
+            Ok(CodexEnableOutcome::CustomNotifyHookPreserved { path }) => {
+                self.status_line = format!(
+                    "Codex CLI kept the existing custom notify hook and only refreshed TUI notification settings; turn-complete tracking may stay limited until notify is routed through Mergen: {}",
+                    path.display()
+                );
+            }
+            Ok(CodexEnableOutcome::ConfigUpdated { path, updated }) => {
+                self.status_line = if updated {
+                    format!(
+                        "Codex CLI integration enabled with Mergen turn-complete notify routing and BEL-backed TUI notifications: {}",
+                        path.display()
+                    )
+                } else {
+                    format!(
+                        "Codex CLI integration already configured with Mergen turn-complete notify routing and BEL-backed TUI notifications: {}",
+                        path.display()
+                    )
+                };
+            }
+            Err(err) => {
+                self.status_line = format!("Failed to enable Codex CLI integration: {err}");
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    #[cfg(not(test))]
+    fn prepare_codex_cli_integration_for_launch(&mut self) {
+        let Ok(path) = codex::user_codex_config_path() else {
+            return;
+        };
+
+        match codex::patch_codex_config_file(&path, &self.current_executable_path) {
+            Ok(codex::CodexConfigPatchOutcome::Updated) => {
+                self.status_line = format!(
+                    "Codex CLI launch prepared Mergen turn-complete notifications in {}",
+                    path.display()
+                );
+            }
+            Ok(codex::CodexConfigPatchOutcome::Unchanged) => {}
+            Ok(codex::CodexConfigPatchOutcome::CustomNotifyHookPreserved) => {
+                self.status_line = format!(
+                    "Codex CLI still uses a custom notify hook in {}; Mergen can track launch/running state, but turn-complete attention may stay limited until notify is routed through Mergen.",
+                    path.display()
+                );
+            }
+            Err(err) => {
+                self.status_line =
+                    format!("Failed to prepare Codex CLI notifications for launch: {err}");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn prepare_codex_cli_integration_for_launch(&mut self) {}
 
     pub fn bootstrap(cc: &eframe::CreationContext<'_>) -> Self {
         let config_path = config::config_path().unwrap_or_else(|_| PathBuf::from("config.toml"));
@@ -865,6 +981,8 @@ impl AdeApp {
             std::env::current_exe().unwrap_or_else(|_| PathBuf::from("unknown"));
         let (ai_hook_manager, factory_droid_hooks_dir, factory_droid_hooks_dir_error) =
             Self::factory_droid_hook_runtime_state(&config);
+        let (_, codex_cli_runtime_dir, codex_cli_runtime_dir_error) =
+            Self::codex_cli_runtime_state(&config);
 
         let (terminal_events_tx, terminal_events_rx) = crossbeam_channel::unbounded();
         let (source_control_commands_tx, source_control_commands_rx) =
@@ -881,6 +999,11 @@ impl AdeApp {
             factory_droid_hook_inboxes: BTreeMap::new(),
             factory_droid_hook_last_poll_at: None,
             factory_droid_process_last_poll_at: None,
+            codex_cli_runtime_dir,
+            codex_cli_runtime_dir_error: codex_cli_runtime_dir_error.clone(),
+            codex_notify_inboxes: BTreeMap::new(),
+            codex_notify_last_poll_at: None,
+            codex_process_last_poll_at: None,
             config,
             config_load_error: config_load_error.clone(),
             config_save_requires_reload: config_load_error.is_some(),
@@ -900,6 +1023,7 @@ impl AdeApp {
             terminal_events_rx,
             ai_hook_manager,
             show_settings_popup: false,
+            settings_diagnostics_expanded: false,
             saved_message_drafts: BTreeMap::new(),
             directory_search_query: String::new(),
             directory_pending_tree_open_state_by_project: BTreeMap::new(),
@@ -909,6 +1033,11 @@ impl AdeApp {
                     factory_droid_hooks_dir_error
                         .as_ref()
                         .map(|err| format!("Factory Droid inbox fallback unavailable: {err}"))
+                })
+                .or_else(|| {
+                    codex_cli_runtime_dir_error
+                        .as_ref()
+                        .map(|err| format!("Codex CLI runtime unavailable: {err}"))
                 })
                 .unwrap_or_else(|| "Ready".to_owned()),
             copy_toast: None,
@@ -1063,12 +1192,19 @@ impl AdeApp {
             .collect::<Vec<_>>();
         let mut close_failures = 0usize;
         for terminal_id in terminal_ids {
-            if let Some(terminal) = self.terminals.remove(&terminal_id) {
-                if terminal.runtime.terminate().is_err() {
+            if self.terminals.contains_key(&terminal_id) {
+                if self
+                    .terminals
+                    .get(&terminal_id)
+                    .is_some_and(|terminal| terminal.runtime.terminate().is_err())
+                {
                     close_failures += 1;
                 }
                 self.clear_factory_droid_state(terminal_id);
                 self.reset_factory_droid_hook_inbox(terminal_id);
+                self.clear_codex_state(terminal_id);
+                self.reset_codex_notify_inbox(terminal_id);
+                self.terminals.remove(&terminal_id);
             }
         }
 
@@ -1125,10 +1261,15 @@ impl AdeApp {
         let terminal_id = self.next_terminal_id;
         self.next_terminal_id += 1;
         self.reset_factory_droid_hook_inbox(terminal_id);
+        self.reset_codex_notify_inbox(terminal_id);
         let factory_droid_inbox_token = self
             .ai_hook_manager
             .as_ref()
             .map(|_| Self::next_factory_droid_inbox_token(terminal_id));
+        let codex_notify_inbox_token = self
+            .ai_hook_manager
+            .as_ref()
+            .map(|_| Self::next_codex_notify_inbox_token(terminal_id));
 
         let dimensions = TerminalDimensions::default();
         let runtime = match TerminalRuntime::spawn(
@@ -1141,6 +1282,8 @@ impl AdeApp {
             self.ai_hook_manager.clone(),
             self.factory_droid_hooks_dir.clone(),
             factory_droid_inbox_token.clone(),
+            self.codex_cli_runtime_dir.clone(),
+            codex_notify_inbox_token.clone(),
         ) {
             Ok(runtime) => runtime,
             Err(err) => {
@@ -1174,11 +1317,19 @@ impl AdeApp {
             runtime,
             ai_session: AiCliSession::default(),
             factory_droid_inbox_token,
+            codex_notify_inbox_token,
             factory_droid_launch_pending_since: None,
             factory_droid_session_active: false,
             factory_droid_last_process_seen_at: None,
             factory_droid_process_missing_since: None,
             factory_droid_last_status_source: None,
+            codex_launch_pending_since: None,
+            codex_launch_process_baseline: None,
+            codex_session_active: false,
+            codex_process_identity: None,
+            codex_last_process_seen_at: None,
+            codex_process_missing_since: None,
+            codex_last_status_source: None,
         };
 
         self.terminals.insert(terminal_id, entry);
@@ -1193,33 +1344,60 @@ impl AdeApp {
         dir.join(format!("{terminal_id}.jsonl"))
     }
 
+    fn codex_notify_inbox_path_for_dir(dir: &Path, terminal_id: u64, inbox_token: &str) -> PathBuf {
+        codex::codex_notify_inbox_path_for_dir(dir, terminal_id, inbox_token)
+    }
+
     fn factory_droid_hook_inbox_path(&self, terminal_id: u64) -> Option<PathBuf> {
         self.factory_droid_hooks_dir
             .as_deref()
             .map(|dir| Self::factory_droid_hook_inbox_path_for_dir(dir, terminal_id))
     }
 
-    fn is_factory_droid_launch_command(line: &str) -> bool {
+    fn codex_notify_inbox_path(&self, terminal_id: u64) -> Option<PathBuf> {
+        let inbox_token = self
+            .terminals
+            .get(&terminal_id)?
+            .codex_notify_inbox_token
+            .as_deref()?;
+        self.codex_cli_runtime_dir
+            .as_deref()
+            .map(|dir| Self::codex_notify_inbox_path_for_dir(dir, terminal_id, inbox_token))
+    }
+
+    fn launch_command_stem(line: &str) -> Option<&str> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            return false;
+            return None;
         }
 
-        let command = trimmed
-            .split_whitespace()
-            .next()
-            .map(|token| token.trim_matches(|ch| ch == '"' || ch == '\''))
-            .unwrap_or_default();
-        if command.is_empty() {
-            return false;
-        }
-
-        let command_path = Path::new(command);
-        let Some(stem) = command_path.file_stem().and_then(|stem| stem.to_str()) else {
-            return false;
+        let command = match trimmed.chars().next() {
+            Some(quote @ ('"' | '\'')) => {
+                let after_quote = &trimmed[quote.len_utf8()..];
+                match after_quote
+                    .char_indices()
+                    .find_map(|(offset, ch)| (ch == quote).then_some(offset))
+                {
+                    Some(offset) => &after_quote[..offset],
+                    None => after_quote,
+                }
+            }
+            Some(_) => trimmed.split_whitespace().next().unwrap_or_default(),
+            None => return None,
         };
+        if command.is_empty() {
+            return None;
+        }
 
-        matches!(stem.to_ascii_lowercase().as_str(), "droid" | "factory")
+        Path::new(command)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+    }
+
+    fn is_factory_droid_launch_command(line: &str) -> bool {
+        Self::launch_command_stem(line).is_some_and(|stem| {
+            stem.eq_ignore_ascii_case("droid") || stem.eq_ignore_ascii_case("factory")
+        })
     }
 
     fn factory_droid_attention_source_from_chunk(chunk: &str) -> Option<FactoryDroidStatusSource> {
@@ -1642,23 +1820,519 @@ impl AdeApp {
         }
     }
 
-    fn terminal_counts_for_project(&self, project_id: u64) -> (usize, usize) {
-        let foreground_count = self
-            .terminals
-            .values()
-            .filter(|terminal| {
-                terminal.project_id == project_id && terminal.kind == TerminalKind::Foreground
-            })
-            .count();
-        let background_count = self
-            .terminals
-            .values()
-            .filter(|terminal| {
-                terminal.project_id == project_id && terminal.kind == TerminalKind::Background
-            })
-            .count();
+    fn is_codex_launch_command(line: &str) -> bool {
+        Self::launch_command_stem(line).is_some_and(|stem| stem.eq_ignore_ascii_case("codex"))
+    }
 
-        (foreground_count, background_count)
+    fn codex_attention_source_from_chunk(chunk: &str) -> Option<CodexCliStatusSource> {
+        chunk
+            .contains("[bell]")
+            .then_some(CodexCliStatusSource::Bell)
+    }
+
+    fn mark_codex_launch_pending(
+        &mut self,
+        terminal_id: u64,
+        baseline: Option<Vec<TrackedProcessIdentity>>,
+    ) -> bool {
+        if self.ai_hook_manager.is_none() {
+            return false;
+        }
+
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        if let Some(manager) = &self.ai_hook_manager {
+            manager.set_tool(terminal_id, AiCliTool::CodexCli);
+        }
+
+        let mut changed = false;
+        if entry.ai_session.tool != Some(AiCliTool::CodexCli) {
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            changed = true;
+        }
+        if entry.ai_session.status != AiCliStatus::Inactive {
+            entry.ai_session.status = AiCliStatus::Inactive;
+            changed = true;
+        }
+        if entry.codex_launch_pending_since.is_none() {
+            changed = true;
+        }
+        entry.codex_launch_pending_since = Some(Instant::now());
+        if entry.codex_launch_process_baseline != baseline {
+            changed = true;
+        }
+        entry.codex_launch_process_baseline = baseline;
+        entry.codex_session_active = false;
+        entry.codex_process_identity = None;
+        entry.codex_last_process_seen_at = None;
+        entry.codex_process_missing_since = None;
+        entry.dirty = true;
+        changed
+    }
+
+    fn clear_codex_state(&mut self, terminal_id: u64) -> bool {
+        if let Some(manager) = &self.ai_hook_manager {
+            manager.reset_session(terminal_id);
+        }
+
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        let changed = entry.ai_session.tool == Some(AiCliTool::CodexCli)
+            || entry.codex_launch_pending_since.is_some()
+            || entry.codex_launch_process_baseline.is_some()
+            || entry.codex_session_active
+            || entry.codex_process_identity.is_some()
+            || entry.codex_process_missing_since.is_some()
+            || entry.codex_last_status_source.is_some();
+
+        if entry.ai_session.tool == Some(AiCliTool::CodexCli) {
+            entry.ai_session = AiCliSession::default();
+        }
+        entry.codex_launch_pending_since = None;
+        entry.codex_launch_process_baseline = None;
+        entry.codex_session_active = false;
+        entry.codex_process_identity = None;
+        entry.codex_last_process_seen_at = None;
+        entry.codex_process_missing_since = None;
+        entry.codex_last_status_source = None;
+        entry.dirty = true;
+        changed
+    }
+
+    fn clear_codex_process_tracking(&mut self, terminal_id: u64) -> bool {
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        let changed = entry.codex_session_active
+            || entry.codex_launch_process_baseline.is_some()
+            || entry.codex_process_identity.is_some()
+            || entry.codex_last_process_seen_at.is_some()
+            || entry.codex_process_missing_since.is_some();
+
+        entry.codex_launch_process_baseline = None;
+        entry.codex_session_active = false;
+        entry.codex_process_identity = None;
+        entry.codex_last_process_seen_at = None;
+        entry.codex_process_missing_since = None;
+        entry.dirty = true;
+        changed
+    }
+
+    fn note_codex_session_active(
+        &mut self,
+        terminal_id: u64,
+        identity: TrackedProcessIdentity,
+    ) -> bool {
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        if let Some(manager) = &self.ai_hook_manager {
+            manager.set_tool(terminal_id, AiCliTool::CodexCli);
+        }
+
+        let mut changed = false;
+        if entry.ai_session.tool != Some(AiCliTool::CodexCli) {
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            changed = true;
+        }
+        if !entry.codex_session_active {
+            entry.codex_session_active = true;
+            changed = true;
+        }
+        if entry.codex_process_identity != Some(identity) {
+            entry.codex_process_identity = Some(identity);
+            changed = true;
+        }
+        if entry.codex_launch_process_baseline.take().is_some() {
+            changed = true;
+        }
+        if entry.codex_process_missing_since.take().is_some() {
+            changed = true;
+        }
+        if entry.codex_launch_pending_since.take().is_some() {
+            changed = true;
+        }
+        entry.codex_last_process_seen_at = Some(Instant::now());
+        entry.dirty = true;
+        changed
+    }
+
+    fn note_codex_process_missing(&mut self, terminal_id: u64) -> bool {
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        let mut changed = false;
+        if entry.codex_session_active {
+            entry.codex_session_active = false;
+            changed = true;
+        }
+        if entry.codex_process_missing_since.is_none() {
+            entry.codex_process_missing_since = Some(Instant::now());
+            changed = true;
+        }
+        entry.dirty = true;
+        changed
+    }
+
+    fn codex_trailing_grace_elapsed(entry: &TerminalEntry) -> bool {
+        entry
+            .codex_process_missing_since
+            .is_some_and(|missing_since| {
+                missing_since.elapsed() >= Duration::from_millis(CODEX_TRAILING_OUTPUT_GRACE_MS)
+            })
+    }
+
+    fn apply_codex_status(
+        &mut self,
+        terminal_id: u64,
+        status: AiCliStatus,
+        source: CodexCliStatusSource,
+    ) -> bool {
+        let Some(manager) = self.ai_hook_manager.as_ref().cloned() else {
+            return false;
+        };
+
+        manager.set_tool(terminal_id, AiCliTool::CodexCli);
+
+        let update = match status {
+            AiCliStatus::Running => manager.ai_activity_started(terminal_id),
+            AiCliStatus::Attention => manager.ai_waiting_for_user(terminal_id),
+            AiCliStatus::Inactive => None,
+        };
+
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        let should_dedupe_attention = status == AiCliStatus::Attention
+            && entry.ai_session.tool == Some(AiCliTool::CodexCli)
+            && entry.ai_session.status == AiCliStatus::Attention
+            && matches!(
+                entry.codex_last_status_source,
+                Some(CodexCliStatusSource::Notify | CodexCliStatusSource::Bell)
+            )
+            && matches!(
+                source,
+                CodexCliStatusSource::Notify | CodexCliStatusSource::Bell
+            );
+        if should_dedupe_attention {
+            return false;
+        }
+
+        let mut changed = false;
+        if entry.ai_session.tool != Some(AiCliTool::CodexCli) {
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            changed = true;
+        }
+        if let Some((tool, next_status)) = update {
+            if entry.ai_session.tool != Some(tool) || entry.ai_session.status != next_status {
+                entry.ai_session.tool = Some(tool);
+                entry.ai_session.status = next_status;
+                changed = true;
+            }
+        } else if entry.ai_session.status != status {
+            entry.ai_session.status = status;
+            changed = true;
+        }
+        if entry.codex_last_status_source != Some(source) {
+            entry.codex_last_status_source = Some(source);
+            changed = true;
+        }
+        if entry.codex_launch_process_baseline.take().is_some() {
+            changed = true;
+        }
+        if !entry.codex_session_active {
+            entry.codex_session_active = true;
+            changed = true;
+        }
+        if entry.codex_process_missing_since.take().is_some() {
+            changed = true;
+        }
+        entry.codex_last_process_seen_at = Some(Instant::now());
+        if entry.codex_launch_pending_since.take().is_some() {
+            changed = true;
+        }
+        entry.dirty = true;
+        changed
+    }
+
+    fn reset_codex_notify_inbox(&mut self, terminal_id: u64) {
+        self.codex_notify_inboxes.remove(&terminal_id);
+
+        if let Some(path) = self.codex_notify_inbox_path(terminal_id) {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    fn poll_codex_processes(&mut self, ctx: &egui::Context) {
+        if self.ai_hook_manager.is_none() || self.terminals.is_empty() {
+            return;
+        }
+
+        if self.codex_process_last_poll_at.is_some_and(|last_poll| {
+            last_poll.elapsed() < Duration::from_millis(CODEX_PROCESS_POLL_MS)
+        }) {
+            return;
+        }
+
+        self.codex_process_last_poll_at = Some(Instant::now());
+
+        let mut changed = false;
+        let terminal_ids = self.terminals.keys().copied().collect::<Vec<_>>();
+        for terminal_id in terminal_ids {
+            let Some((
+                process_identity,
+                recovered_baseline,
+                launch_expired,
+                session_active,
+                is_candidate,
+                tool_is_codex,
+                status,
+                exited,
+            )) = self.terminals.get(&terminal_id).map(|entry| {
+                let mut recovered_baseline = None;
+                let process_identity = if entry.exited {
+                    Some(None)
+                } else if let Some(identity) = entry.codex_process_identity {
+                    entry
+                        .runtime
+                        .tracked_codex_process_present(identity)
+                        .map(|present| present.then_some(identity))
+                } else if entry.codex_launch_pending_since.is_some() {
+                    if let Some(baseline) = entry.codex_launch_process_baseline.as_deref() {
+                        entry.runtime.detect_new_codex_descendant_process(baseline)
+                    } else {
+                        recovered_baseline = entry.runtime.snapshot_codex_descendant_processes();
+                        match recovered_baseline.as_ref() {
+                            Some(baseline) if baseline.is_empty() => Some(None),
+                            _ => None,
+                        }
+                    }
+                } else {
+                    None
+                };
+                let launch_expired = entry.codex_launch_pending_since.is_some_and(|started_at| {
+                    started_at.elapsed() >= Duration::from_millis(CODEX_LAUNCH_GRACE_MS)
+                });
+                (
+                    process_identity,
+                    recovered_baseline,
+                    launch_expired,
+                    entry.codex_session_active,
+                    entry.codex_launch_pending_since.is_some(),
+                    entry.ai_session.tool == Some(AiCliTool::CodexCli),
+                    entry.ai_session.status,
+                    entry.exited,
+                )
+            })
+            else {
+                continue;
+            };
+
+            if let Some(baseline) = recovered_baseline {
+                if let Some(entry) = self.terminals.get_mut(&terminal_id) {
+                    if entry.codex_launch_process_baseline.is_none() {
+                        entry.codex_launch_process_baseline = Some(baseline);
+                        entry.dirty = true;
+                        changed = true;
+                    }
+                }
+            }
+
+            if is_candidate && !launch_expired && process_identity == Some(None) && !exited {
+                continue;
+            }
+
+            if is_candidate && launch_expired && process_identity == Some(None) {
+                changed |= self.clear_codex_state(terminal_id);
+                continue;
+            }
+
+            match process_identity {
+                Some(Some(identity)) => {
+                    changed |= self.note_codex_session_active(terminal_id, identity);
+                    continue;
+                }
+                Some(None) => {
+                    if tool_is_codex {
+                        changed |= self.note_codex_process_missing(terminal_id);
+
+                        match status {
+                            AiCliStatus::Attention => {
+                                if self
+                                    .terminals
+                                    .get(&terminal_id)
+                                    .is_some_and(Self::codex_trailing_grace_elapsed)
+                                {
+                                    changed |= self.clear_codex_process_tracking(terminal_id);
+                                }
+                            }
+                            AiCliStatus::Running => {
+                                if self
+                                    .terminals
+                                    .get(&terminal_id)
+                                    .is_some_and(Self::codex_trailing_grace_elapsed)
+                                {
+                                    changed |= self.clear_codex_state(terminal_id);
+                                }
+                            }
+                            AiCliStatus::Inactive => {
+                                changed |= self.clear_codex_state(terminal_id);
+                            }
+                        }
+                    } else if session_active {
+                        changed |= self.clear_codex_state(terminal_id);
+                    }
+                }
+                None => {
+                    continue;
+                }
+            }
+        }
+
+        if changed {
+            ctx.request_repaint();
+        }
+    }
+
+    fn poll_codex_notify_inboxes(&mut self, ctx: &egui::Context) {
+        if self.ai_hook_manager.is_none()
+            || self.codex_cli_runtime_dir.is_none()
+            || self.terminals.is_empty()
+        {
+            return;
+        }
+
+        if self.codex_notify_last_poll_at.is_some_and(|last_poll| {
+            last_poll.elapsed() < Duration::from_millis(CODEX_NOTIFY_POLL_MS)
+        }) {
+            return;
+        }
+
+        self.codex_notify_last_poll_at = Some(Instant::now());
+
+        let terminal_ids = self.terminals.keys().copied().collect::<Vec<_>>();
+        let mut changed = false;
+        for terminal_id in terminal_ids {
+            changed |= self.process_codex_notify_inbox(terminal_id);
+        }
+
+        if changed {
+            ctx.request_repaint();
+        }
+    }
+
+    fn process_codex_notify_inbox(&mut self, terminal_id: u64) -> bool {
+        let Some(path) = self.codex_notify_inbox_path(terminal_id) else {
+            return false;
+        };
+
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.codex_notify_inboxes
+                    .entry(terminal_id)
+                    .or_default()
+                    .offset = 0;
+                return false;
+            }
+            Err(err) => {
+                log::warn!(
+                    "Failed to read Codex notify inbox for terminal {terminal_id} at {}: {err}",
+                    path.display()
+                );
+                return false;
+            }
+        };
+
+        let previous_offset = self
+            .codex_notify_inboxes
+            .get(&terminal_id)
+            .map(|state| state.offset)
+            .unwrap_or(0);
+        let start = if previous_offset as usize <= bytes.len() {
+            previous_offset as usize
+        } else {
+            0
+        };
+        let unread = &bytes[start..];
+        let Some(last_newline) = unread.iter().rposition(|byte| *byte == b'\n') else {
+            if previous_offset as usize > bytes.len() {
+                self.codex_notify_inboxes
+                    .entry(terminal_id)
+                    .or_default()
+                    .offset = 0;
+            }
+            return false;
+        };
+
+        let processed_end = start + last_newline + 1;
+        let mut changed = false;
+        for line in bytes[start..processed_end].split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+
+            match serde_json::from_slice::<CodexNotifyInboxEvent>(line) {
+                Ok(event) => {
+                    changed |= self.apply_codex_notify_inbox_event(terminal_id, &event);
+                }
+                Err(err) => {
+                    log::warn!(
+                        "Ignoring malformed Codex notify inbox event for terminal {terminal_id} at {}: {err}",
+                        path.display()
+                    );
+                }
+            }
+        }
+
+        self.codex_notify_inboxes
+            .entry(terminal_id)
+            .or_default()
+            .offset = processed_end as u64;
+
+        changed
+    }
+
+    fn apply_codex_notify_inbox_event(
+        &mut self,
+        terminal_id: u64,
+        event: &CodexNotifyInboxEvent,
+    ) -> bool {
+        let expected_inbox_token = self
+            .terminals
+            .get(&terminal_id)
+            .and_then(|entry| entry.codex_notify_inbox_token.as_deref());
+
+        if event.terminal_id != terminal_id.to_string() {
+            return false;
+        }
+        if !event.tool.eq_ignore_ascii_case("codex") {
+            return false;
+        }
+        if event.inbox_token.as_deref() != expected_inbox_token {
+            return false;
+        }
+
+        match event.status.as_str() {
+            "attention" => self.apply_codex_status(
+                terminal_id,
+                AiCliStatus::Attention,
+                CodexCliStatusSource::Notify,
+            ),
+            _ => false,
+        }
+    }
+
+    fn terminal_count_for_project_kind(&self, project_id: u64, kind: TerminalKind) -> usize {
+        terminal_ids_for_project_kind(&self.terminals, project_id, kind).len()
     }
 
     #[cfg(test)]
@@ -1701,6 +2375,12 @@ impl AdeApp {
                         if self.apply_factory_droid_status(terminal_id, status, source) {
                             dirty_ids.insert(terminal_id);
                         }
+                    } else if tool == Some(AiCliTool::CodexCli) {
+                        if let Some(entry) = self.terminals.get_mut(&terminal_id) {
+                            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+                            entry.ai_session.status = status;
+                            dirty_ids.insert(terminal_id);
+                        }
                     } else if let Some(entry) = self.terminals.get_mut(&terminal_id) {
                         if tool.is_some() {
                             entry.ai_session.tool = tool;
@@ -1730,6 +2410,23 @@ impl AdeApp {
                             }
                         }
                     }
+
+                    let should_apply_codex =
+                        self.terminals.get(&terminal_id).is_some_and(|entry| {
+                            !entry.exited
+                                && (entry.codex_session_active
+                                    || entry.codex_launch_pending_since.is_some()
+                                    || entry.ai_session.tool == Some(AiCliTool::CodexCli))
+                        });
+
+                    if should_apply_codex {
+                        if let Some(source) = Self::codex_attention_source_from_chunk(&chunk) {
+                            if self.apply_codex_status(terminal_id, AiCliStatus::Attention, source)
+                            {
+                                dirty_ids.insert(terminal_id);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1755,6 +2452,7 @@ impl AdeApp {
 
         for terminal_id in exited_ids {
             changed |= self.clear_factory_droid_state(terminal_id);
+            changed |= self.clear_codex_state(terminal_id);
         }
 
         if changed {
@@ -1775,8 +2473,12 @@ impl AdeApp {
                 state.last_completed_at = Some(completed_at);
             }
             self.source_control_worker_busy = false;
+            let merged_snapshot = merge_source_control_refresh_result(
+                self.source_control_state.get(&event.project_id),
+                event.snapshot,
+            );
             self.source_control_state
-                .insert(event.project_id, event.snapshot);
+                .insert(event.project_id, merged_snapshot);
             changed = true;
         }
         if changed {
@@ -2378,6 +3080,11 @@ impl AdeApp {
             {
                 None
             }
+            Some(TerminalNavigationShortcut::Grid(
+                direction @ (TerminalNavigationDirection::Up | TerminalNavigationDirection::Down),
+            )) if single_view_shortcuts_enabled => {
+                Some(TerminalNavigationShortcut::SingleViewLinear(direction))
+            }
             shortcut => shortcut,
         }
     }
@@ -2760,7 +3467,10 @@ impl AdeApp {
         let mut copied_selection = None;
         let mut last_key_was_alt_m = false;
         let mut launched_factory_droid = false;
+        let mut launched_codex_cli = false;
+        let mut codex_launch_baseline = None;
         let mut submitted_factory_prompt = false;
+        let mut submitted_codex_prompt = false;
         let mut sent_terminal_input = false;
         {
             let Some(terminal) = self.terminals.get_mut(&active_terminal_id) else {
@@ -2828,13 +3538,29 @@ impl AdeApp {
                             if Self::is_factory_droid_launch_command(&line) {
                                 launched_factory_droid = true;
                             }
+                            if Self::is_codex_launch_command(&line) {
+                                launched_codex_cli = true;
+                                codex_launch_baseline =
+                                    terminal.runtime.snapshot_codex_descendant_processes();
+                            }
                             let sanitized_line = terminal_title_candidate(&line);
                             if terminal.factory_droid_session_active
+                                && !launched_factory_droid
+                                && !launched_codex_cli
                                 && sanitized_line
                                     .as_ref()
                                     .is_some_and(|candidate| !candidate.trim().is_empty())
                             {
                                 submitted_factory_prompt = true;
+                            }
+                            if terminal.codex_session_active
+                                && !launched_factory_droid
+                                && !launched_codex_cli
+                                && sanitized_line
+                                    .as_ref()
+                                    .is_some_and(|candidate| !candidate.trim().is_empty())
+                            {
+                                submitted_codex_prompt = true;
                             }
                             if let Some(sanitized) = sanitized_line {
                                 terminal.full_title = sanitized.clone();
@@ -2877,7 +3603,13 @@ impl AdeApp {
         }
 
         if launched_factory_droid {
+            self.clear_codex_state(active_terminal_id);
             self.mark_factory_droid_launch_pending(active_terminal_id);
+        }
+        if launched_codex_cli {
+            self.clear_factory_droid_state(active_terminal_id);
+            self.prepare_codex_cli_integration_for_launch();
+            self.mark_codex_launch_pending(active_terminal_id, codex_launch_baseline);
         }
 
         if let Some(ref text) = copied_selection {
@@ -2890,7 +3622,20 @@ impl AdeApp {
             let has_copied = copied_selection.is_some();
             if sent_terminal_input || has_copied {
                 if let Some((tool, status)) = manager.user_interacted(active_terminal_id) {
-                    if let Some(entry) = self.terminals.get_mut(&active_terminal_id) {
+                    let should_clear_sticky_codex = self
+                        .terminals
+                        .get(&active_terminal_id)
+                        .is_some_and(|entry| {
+                            tool == AiCliTool::CodexCli
+                                && status == AiCliStatus::Inactive
+                                && entry.ai_session.tool == Some(AiCliTool::CodexCli)
+                                && !entry.codex_session_active
+                                && entry.codex_launch_pending_since.is_none()
+                                && entry.codex_process_identity.is_none()
+                        });
+                    if should_clear_sticky_codex {
+                        self.clear_codex_state(active_terminal_id);
+                    } else if let Some(entry) = self.terminals.get_mut(&active_terminal_id) {
                         entry.ai_session.tool = Some(tool);
                         entry.ai_session.status = status;
                     }
@@ -2904,6 +3649,15 @@ impl AdeApp {
                 active_terminal_id,
                 AiCliStatus::Running,
                 FactoryDroidStatusSource::PromptSubmit,
+            ) {
+                ctx.request_repaint();
+            }
+        }
+        if submitted_codex_prompt {
+            if self.apply_codex_status(
+                active_terminal_id,
+                AiCliStatus::Running,
+                CodexCliStatusSource::PromptSubmit,
             ) {
                 ctx.request_repaint();
             }
@@ -3236,10 +3990,12 @@ impl AdeApp {
             return;
         };
 
-        self.terminals.remove(&terminal_id);
         self.clear_terminal_held_key_repeat_for_terminal(terminal_id);
         self.clear_factory_droid_state(terminal_id);
         self.reset_factory_droid_hook_inbox(terminal_id);
+        self.clear_codex_state(terminal_id);
+        self.reset_codex_notify_inbox(terminal_id);
+        self.terminals.remove(&terminal_id);
         self.status_line = match close_result {
             Ok(()) => format!("Closed {title}"),
             Err(err) => format!("Closed {title} (cleanup failed: {err})"),
@@ -3584,6 +4340,221 @@ impl AdeApp {
         ui.add_space(4.0);
     }
 
+    fn open_settings_popup(&mut self) {
+        self.show_settings_popup = true;
+        self.settings_diagnostics_expanded = false;
+    }
+
+    fn draw_settings_diagnostics_section(&mut self, ctx: &egui::Context, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("{} Diagnostics", icons::EYE))
+                    .strong()
+                    .size(15.0)
+                    .color(TEXT_PRIMARY),
+            );
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let toggle_label = if self.settings_diagnostics_expanded {
+                    "Hide"
+                } else {
+                    "Show"
+                };
+                if ui.button(toggle_label).clicked() {
+                    self.settings_diagnostics_expanded = !self.settings_diagnostics_expanded;
+                }
+            });
+        });
+
+        if !self.settings_diagnostics_expanded {
+            return;
+        }
+
+        let diagnostics = self.factory_droid_transport_diagnostics();
+        egui::Frame::none()
+            .fill(with_alpha(SURFACE_BG, 216))
+            .stroke(Stroke::new(1.0, BORDER_COLOR))
+            .rounding(10.0)
+            .inner_margin(egui::Margin::same(10.0))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("settings-diagnostics-scroll")
+                    .max_height(220.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(
+                                "Factory Droid status uses PTY/process detection first. Inbox JSONL remains a best-effort fallback.",
+                            )
+                            .color(TEXT_MUTED)
+                            .small(),
+                        );
+                        ui.add_space(4.0);
+                        Self::draw_settings_diagnostic_row(
+                            ui,
+                            "Executable Path",
+                            &diagnostics.executable_path.display().to_string(),
+                            TEXT_PRIMARY,
+                        );
+                        Self::draw_settings_diagnostic_row(
+                            ui,
+                            "Factory Droid Primary",
+                            FactoryDroidTransportDiagnostics::PRIMARY_TRANSPORT_LABEL,
+                            TEXT_PRIMARY,
+                        );
+                        Self::draw_settings_diagnostic_row(
+                            ui,
+                            "Factory Droid Fallback",
+                            FactoryDroidTransportDiagnostics::FALLBACK_TRANSPORT_LABEL,
+                            TEXT_PRIMARY,
+                        );
+                        Self::draw_settings_diagnostic_row(
+                            ui,
+                            "Factory Droid Inbox",
+                            &diagnostics.runtime_status_text(),
+                            if diagnostics.hooks_runtime_dir.is_some() {
+                                Color32::from_rgb(114, 209, 152)
+                            } else {
+                                Color32::from_rgb(232, 184, 76)
+                            },
+                        );
+                        Self::draw_settings_diagnostic_row(
+                            ui,
+                            "Droid Session Active",
+                            diagnostics.active_session_text(),
+                            TEXT_PRIMARY,
+                        );
+                        Self::draw_settings_diagnostic_row(
+                            ui,
+                            "Factory Droid Process State",
+                            diagnostics.process_state_text(),
+                            TEXT_PRIMARY,
+                        );
+                        Self::draw_settings_diagnostic_row(
+                            ui,
+                            "Last Status Source",
+                            diagnostics.last_status_source_text(),
+                            TEXT_PRIMARY,
+                        );
+                        if let Some(warning_message) = diagnostics.warning_message() {
+                            ui.label(
+                                RichText::new(warning_message)
+                                    .small()
+                                    .color(Color32::from_rgb(232, 184, 76)),
+                            );
+                        }
+
+                        ui.separator();
+                        let active_terminal = self
+                            .active_terminal
+                            .and_then(|terminal_id| self.terminals.get(&terminal_id));
+                        let codex_runtime_text = if let Some(dir) = &self.codex_cli_runtime_dir {
+                            format!("Ready: {}", dir.display())
+                        } else if let Some(err) = &self.codex_cli_runtime_dir_error {
+                            format!("Unavailable: {err}")
+                        } else {
+                            "Unavailable: unknown error".to_owned()
+                        };
+                        let codex_config_text = match codex::user_codex_config_path() {
+                            Ok(path) => path.display().to_string(),
+                            Err(err) => format!("Unavailable: {err}"),
+                        };
+                        let codex_session_text = match active_terminal {
+                            Some(terminal) if terminal.codex_session_active => "Yes",
+                            Some(_) => "No",
+                            None => "No active terminal",
+                        };
+                        let codex_process_text = match active_terminal {
+                            Some(terminal) if terminal.exited => "terminal exited".to_owned(),
+                            Some(terminal) if terminal.codex_session_active => {
+                                "session active".to_owned()
+                            }
+                            Some(terminal) if terminal.codex_launch_pending_since.is_some() => {
+                                "launch pending".to_owned()
+                            }
+                            Some(terminal) if terminal.codex_process_missing_since.is_some() => {
+                                "awaiting trailing output".to_owned()
+                            }
+                            Some(terminal)
+                                if terminal.ai_session.tool == Some(AiCliTool::CodexCli)
+                                    && terminal.ai_session.status == AiCliStatus::Attention =>
+                            {
+                                "attention needed".to_owned()
+                            }
+                            Some(_) => "idle".to_owned(),
+                            None => "No active terminal".to_owned(),
+                        };
+                        let codex_last_status_source = active_terminal
+                            .and_then(|terminal| terminal.codex_last_status_source)
+                            .map(CodexCliStatusSource::label)
+                            .unwrap_or("none");
+                        ui.label(
+                            RichText::new("Codex CLI")
+                                .strong()
+                                .size(15.0)
+                                .color(TEXT_PRIMARY),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Windows support in Codex CLI is still experimental. For now Mergen only wires native Windows sessions; WSL bridging stays out of scope in this release.",
+                            )
+                            .color(Color32::from_rgb(232, 184, 76))
+                            .small(),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Official Codex hooks are currently disabled on native Windows, so Mergen relies on Codex notify for turn-complete detection and uses BEL-backed TUI notifications only as a supplemental signal.",
+                            )
+                            .color(TEXT_MUTED)
+                            .small(),
+                        );
+                        ui.add_space(4.0);
+                        Self::draw_settings_diagnostic_row(
+                            ui,
+                            "Codex Config",
+                            &codex_config_text,
+                            TEXT_PRIMARY,
+                        );
+                        Self::draw_settings_diagnostic_row(
+                            ui,
+                            "Codex Inbox",
+                            &codex_runtime_text,
+                            if self.codex_cli_runtime_dir.is_some() {
+                                Color32::from_rgb(114, 209, 152)
+                            } else {
+                                Color32::from_rgb(232, 184, 76)
+                            },
+                        );
+                        Self::draw_settings_diagnostic_row(
+                            ui,
+                            "Codex Session Active",
+                            codex_session_text,
+                            TEXT_PRIMARY,
+                        );
+                        Self::draw_settings_diagnostic_row(
+                            ui,
+                            "Codex Process State",
+                            &codex_process_text,
+                            TEXT_PRIMARY,
+                        );
+                        Self::draw_settings_diagnostic_row(
+                            ui,
+                            "Last Codex Source",
+                            codex_last_status_source,
+                            TEXT_PRIMARY,
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.button("Enable Codex CLI integration").clicked() {
+                                self.enable_codex_cli_integration(ctx);
+                            }
+                            if ui.button("Open Codex setup docs").clicked() {
+                                ctx.open_url(egui::OpenUrl::new_tab(codex::codex_setup_url()));
+                            }
+                        });
+                    });
+            });
+    }
+
     fn draw_top_bar(&mut self, ctx: &egui::Context) -> egui::Rect {
         egui::TopBottomPanel::top("top_bar")
             .exact_height(TOP_BAR_HEIGHT)
@@ -3616,7 +4587,7 @@ impl AdeApp {
                                 BTN_ICON_ACTIVE,
                                 "Settings",
                             ) {
-                                self.show_settings_popup = true;
+                                self.open_settings_popup();
                             }
 
                             if let Some(warning_message) = diagnostics.warning_message() {
@@ -4300,15 +5271,9 @@ impl AdeApp {
                                         Color32::LIGHT_RED,
                                         error,
                                     );
-                                } else {
-                                    let mut branch_line =
-                                        format!("{} {}", icons::GIT_BRANCH, snapshot.branch);
-                                    if snapshot.ahead > 0 || snapshot.behind > 0 {
-                                        branch_line.push_str(&format!(
-                                            "  ahead:{} behind:{}",
-                                            snapshot.ahead, snapshot.behind
-                                        ));
-                                    }
+                                }
+                                if let Some(branch_line) = source_control_branch_line(&snapshot) {
+                                    let branch_line = format!("{} {}", icons::GIT_BRANCH, branch_line);
                                     draw_sidebar_text_row(
                                         ui,
                                         RichText::new(&branch_line).color(TEXT_MUTED),
@@ -4318,7 +5283,18 @@ impl AdeApp {
                                 }
 
                                 ui.separator();
-                                if snapshot.files.is_empty()
+                                if !source_control_snapshot_has_display_data(&snapshot)
+                                    && snapshot.last_error.is_none()
+                                    && !snapshot.loading
+                                {
+                                    draw_sidebar_text_row(
+                                        ui,
+                                        RichText::new("Status pending").color(TEXT_MUTED),
+                                        TEXT_MUTED,
+                                        "Status pending",
+                                    );
+                                } else if source_control_snapshot_has_display_data(&snapshot)
+                                    && snapshot.files.is_empty()
                                     && snapshot.last_error.is_none()
                                     && !snapshot.loading
                                 {
@@ -4391,9 +5367,18 @@ impl AdeApp {
     fn draw_terminal_manager_contents(&mut self, ctx: &egui::Context, ui: &mut Ui) {
         let panel_right = ui.max_rect().right();
         ui.set_width(ui.max_rect().width());
+        let mut selected_filter = self.config.ui.terminal_manager_filter;
+
+        if draw_terminal_manager_filter_tabs(ui, &mut selected_filter) {
+            self.config.ui.terminal_manager_filter = selected_filter;
+            self.note_ui_config_changed();
+            self.persist_config();
+        }
+        ui.add_space(8.0);
 
         let mut project_ids = self.projects.keys().copied().collect::<Vec<_>>();
         project_ids.sort_unstable();
+        let visible_kind = self.config.ui.terminal_manager_filter.terminal_kind();
 
         for project_id in project_ids {
             let Some(project_snapshot) = self.projects.get(&project_id).cloned() else {
@@ -4401,6 +5386,8 @@ impl AdeApp {
             };
 
             let project_path = project_snapshot.path.display().to_string();
+            let project_diff_summary =
+                terminal_manager_diff_summary_model(self.source_control_state.get(&project_id));
 
             let header_id = ui.make_persistent_id(format!("project-group-{project_id}"));
             let mut header_state = egui::collapsing_header::CollapsingState::load_with_default_open(
@@ -4409,66 +5396,34 @@ impl AdeApp {
                 false,
             );
             let header_open = header_state.is_open();
-            let (foreground_count, background_count) = self.terminal_counts_for_project(project_id);
-            let has_children = foreground_count > 0 || background_count > 0;
-            let (header_response, foreground_clicked, background_clicked, header_clicked) =
-                draw_project_group_header(ui, &project_snapshot.name, header_open, has_children);
-            let foreground_spawned = foreground_clicked
-                && self.spawn_terminal_for_project(ctx, project_id, TerminalKind::Foreground);
-            let background_spawned = background_clicked
-                && self.spawn_terminal_for_project(ctx, project_id, TerminalKind::Background);
+            let visible_count = self.terminal_count_for_project_kind(project_id, visible_kind);
+            let has_children = visible_count > 0;
+            let (header_response, spawn_clicked, header_clicked) = draw_project_group_header(
+                ui,
+                &project_snapshot.name,
+                header_open,
+                has_children,
+                visible_kind,
+                &project_diff_summary,
+            );
+            let spawn_succeeded =
+                spawn_clicked && self.spawn_terminal_for_project(ctx, project_id, visible_kind);
             if header_clicked && has_children {
                 header_state.toggle(ui);
                 header_state.store(ui.ctx());
             }
-            if foreground_spawned || background_spawned {
+            if spawn_succeeded {
                 header_state.set_open(true);
                 header_state.store(ui.ctx());
             }
-            let _ = header_state.show_body_unindented(ui, |ui| {
-                ui.indent(Id::new(("terminal-manager-body", project_id)), |ui| {
-                    ui.add_space(2.0);
-                    if foreground_count > 0 {
-                        let section_open = draw_terminal_manager_section_header(
-                            ui,
-                            icons::TERMINAL,
-                            project_id,
-                            TerminalKind::Foreground,
-                        );
-                        if section_open {
-                            ui.add_space(2.0);
-                            ui.indent(Id::new(("terminal-rows", project_id, "fg")), |ui| {
-                                self.draw_terminal_rows(
-                                    ctx,
-                                    ui,
-                                    project_id,
-                                    TerminalKind::Foreground,
-                                );
-                            });
-                        }
-                    }
-
-                    if background_count > 0 {
-                        let section_open = draw_terminal_manager_section_header(
-                            ui,
-                            icons::LIST,
-                            project_id,
-                            TerminalKind::Background,
-                        );
-                        if section_open {
-                            ui.add_space(2.0);
-                            ui.indent(Id::new(("terminal-rows", project_id, "bg")), |ui| {
-                                self.draw_terminal_rows(
-                                    ctx,
-                                    ui,
-                                    project_id,
-                                    TerminalKind::Background,
-                                );
-                            });
-                        }
-                    }
+            if has_children {
+                let _ = header_state.show_body_unindented(ui, |ui| {
+                    ui.indent(Id::new(("terminal-manager-body", project_id)), |ui| {
+                        ui.add_space(4.0);
+                        self.draw_terminal_rows(ctx, ui, project_id, visible_kind);
+                    });
                 });
-            });
+            }
 
             header_response.context_menu(|ui| {
                 with_minimal_button_chrome(ui, |ui| {
@@ -4510,12 +5465,7 @@ impl AdeApp {
         project_id: u64,
         kind: TerminalKind,
     ) {
-        let ids = self
-            .terminals
-            .iter()
-            .filter(|(_, terminal)| terminal.project_id == project_id && terminal.kind == kind)
-            .map(|(id, _)| *id)
-            .collect::<Vec<_>>();
+        let ids = terminal_ids_for_project_kind(&self.terminals, project_id, kind);
         let saved_messages = self
             .projects
             .get(&project_id)
@@ -4523,8 +5473,6 @@ impl AdeApp {
             .unwrap_or_default();
         let current_active = self.active_terminal;
         let show_visibility_toggle = self.config.ui.multi_terminal_view_enabled;
-        let project_source_control_diff_summary =
-            terminal_manager_diff_summary_model(self.source_control_state.get(&project_id));
 
         for terminal_id in ids {
             let mut set_active = false;
@@ -4584,42 +5532,29 @@ impl AdeApp {
                                     ui.add_space(4.0);
                                 }
 
-                                let term_icon_color = if terminal.exited {
-                                    Color32::from_rgb(200, 100, 100)
-                                } else {
-                                    row_chrome.icon_color
-                                };
-                                let (icon_rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(16.0, row_height),
-                                    Sense::hover(),
-                                );
-                                ui.painter().text(
-                                    icon_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    icons::TERMINAL.to_string(),
-                                    egui::FontId::proportional(12.0),
-                                    term_icon_color,
-                                );
-
-                                ui.add_space(3.0);
-
                                 let text_color = if terminal.exited {
                                     with_alpha(TEXT_MUTED, 160)
                                 } else {
                                     row_chrome.title_color
                                 };
-                                let title_layout = draw_terminal_manager_title_and_diff_summary(
+                                let title_font = egui::TextStyle::Body.resolve(ui.style());
+                                let title_response = ui.add_sized(
+                                    egui::vec2(ui.available_width().max(0.0), row_height),
+                                    egui::Label::new(RichText::new(&label).color(text_color))
+                                        .truncate()
+                                        .sense(Sense::click()),
+                                );
+                                let title_response = with_truncation_tooltip(
                                     ui,
+                                    title_response,
                                     &label,
+                                    &title_font,
                                     text_color,
-                                    active,
-                                    row_height,
-                                    &project_source_control_diff_summary,
                                 );
 
                                 match ai_response {
-                                    Some(response) => response.union(title_layout.response),
-                                    None => title_layout.response,
+                                    Some(response) => response.union(title_response),
+                                    None => title_response,
                                 }
                             },
                         )
@@ -4837,25 +5772,16 @@ impl AdeApp {
     }
 
     fn draw_terminal_pane(&mut self, ui: &mut Ui, terminal_id: u64, pane_size: Vec2) {
-        let (project_name, source_control_badge) = self
+        let project_name = self
             .terminals
             .get(&terminal_id)
             .map(|terminal| {
-                let project_name = self
-                    .projects
+                self.projects
                     .get(&terminal.project_id)
                     .map(|project| project.name.clone())
-                    .unwrap_or_else(|| "Unknown Project".to_owned());
-                let badge =
-                    source_control_badge_model(self.source_control_state.get(&terminal.project_id));
-                (project_name, badge)
+                    .unwrap_or_else(|| "Unknown Project".to_owned())
             })
-            .unwrap_or_else(|| {
-                (
-                    "Unknown Project".to_owned(),
-                    source_control_badge_model(None),
-                )
-            });
+            .unwrap_or_else(|| "Unknown Project".to_owned());
         let is_active = self.active_terminal == Some(terminal_id);
 
         let (clicked, close_requested, copied_selection, paste_requested, link_to_open) = {
@@ -4888,7 +5814,7 @@ impl AdeApp {
                             ui.set_min_height(TERMINAL_HEADER_HEIGHT - 12.0);
 
                             let ai_badge = AiBadgeModel::from_session(&terminal.ai_session);
-                            draw_terminal_status_badges(ui, &ai_badge, &source_control_badge);
+                            draw_terminal_status_badges(ui, &ai_badge);
 
                             let title = terminal_display_label(&terminal.title, terminal.exited);
                             let title_font = egui::TextStyle::Body.resolve(ui.style());
@@ -5422,74 +6348,7 @@ impl AdeApp {
                 }
 
                 ui.separator();
-                let diagnostics = self.factory_droid_transport_diagnostics();
-                ui.label(
-                    RichText::new(format!("{} Diagnostics", icons::EYE))
-                        .strong()
-                        .size(15.0)
-                        .color(TEXT_PRIMARY),
-                );
-                ui.label(
-                    RichText::new(
-                        "Factory Droid status uses PTY/process detection first. Inbox JSONL remains a best-effort fallback.",
-                    )
-                    .color(TEXT_MUTED)
-                    .small(),
-                );
-                ui.add_space(4.0);
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Executable Path",
-                    &diagnostics.executable_path.display().to_string(),
-                    TEXT_PRIMARY,
-                );
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Factory Droid Primary",
-                    FactoryDroidTransportDiagnostics::PRIMARY_TRANSPORT_LABEL,
-                    TEXT_PRIMARY,
-                );
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Factory Droid Fallback",
-                    FactoryDroidTransportDiagnostics::FALLBACK_TRANSPORT_LABEL,
-                    TEXT_PRIMARY,
-                );
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Factory Droid Inbox",
-                    &diagnostics.runtime_status_text(),
-                    if diagnostics.hooks_runtime_dir.is_some() {
-                        Color32::from_rgb(114, 209, 152)
-                    } else {
-                        Color32::from_rgb(232, 184, 76)
-                    },
-                );
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Droid Session Active",
-                    diagnostics.active_session_text(),
-                    TEXT_PRIMARY,
-                );
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Factory Droid Process State",
-                    diagnostics.process_state_text(),
-                    TEXT_PRIMARY,
-                );
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Last Status Source",
-                    diagnostics.last_status_source_text(),
-                    TEXT_PRIMARY,
-                );
-                if let Some(warning_message) = diagnostics.warning_message() {
-                    ui.label(
-                        RichText::new(warning_message)
-                            .small()
-                            .color(Color32::from_rgb(232, 184, 76)),
-                    );
-                }
+                self.draw_settings_diagnostics_section(ctx, ui);
 
                 ui.separator();
                 ui.label(
@@ -5721,6 +6580,8 @@ impl eframe::App for AdeApp {
         self.process_terminal_events(ctx);
         self.poll_factory_droid_hook_inboxes(ctx);
         self.poll_factory_droid_processes(ctx);
+        self.poll_codex_notify_inboxes(ctx);
+        self.poll_codex_processes(ctx);
         self.process_source_control_events(ctx);
         self.process_directory_index_events(ctx);
         self.schedule_source_control_refresh(ctx);
@@ -5760,6 +6621,7 @@ impl eframe::App for AdeApp {
         let terminal_ids = self.terminals.keys().copied().collect::<Vec<_>>();
         for terminal_id in terminal_ids {
             self.reset_factory_droid_hook_inbox(terminal_id);
+            self.reset_codex_notify_inbox(terminal_id);
         }
 
         self.persist_config();
@@ -5787,6 +6649,7 @@ fn recover_config_state(
         config.ui.project_explorer_expanded = current_config.ui.project_explorer_expanded;
         config.ui.terminal_manager_expanded = current_config.ui.terminal_manager_expanded;
         config.ui.multi_terminal_view_enabled = current_config.ui.multi_terminal_view_enabled;
+        config.ui.terminal_manager_filter = current_config.ui.terminal_manager_filter;
         config.ui.left_sidebar_tab = current_config.ui.left_sidebar_tab;
     }
 
@@ -6998,7 +7861,6 @@ struct TerminalManagerRowChrome {
     fill: Option<Color32>,
     stroke: Stroke,
     title_color: Color32,
-    icon_color: Color32,
 }
 
 fn terminal_header_chrome(is_active: bool) -> TerminalHeaderChrome {
@@ -7025,21 +7887,18 @@ fn terminal_manager_row_chrome(is_active: bool, is_hovered: bool) -> TerminalMan
             fill: Some(Color32::from_rgb(24, 48, 68)),
             stroke: Stroke::new(1.0, with_alpha(ACCENT, 220)),
             title_color: Color32::from_rgb(244, 251, 255),
-            icon_color: Color32::from_rgb(132, 214, 255),
         }
     } else if is_hovered {
         TerminalManagerRowChrome {
             fill: Some(with_alpha(SURFACE_BG_SOFT, 180)),
             stroke: Stroke::new(1.0, with_alpha(BORDER_COLOR, 210)),
             title_color: with_alpha(TEXT_PRIMARY, 230),
-            icon_color: with_alpha(TEXT_MUTED, 220),
         }
     } else {
         TerminalManagerRowChrome {
             fill: None,
             stroke: Stroke::NONE,
             title_color: with_alpha(TEXT_PRIMARY, 210),
-            icon_color: with_alpha(TEXT_MUTED, 200),
         }
     }
 }
@@ -7070,39 +7929,53 @@ fn with_truncation_tooltip(
     }
 }
 
-fn source_control_badge_state(snapshot: Option<&SourceControlSnapshot>) -> SourceControlBadgeState {
-    match snapshot {
-        None => SourceControlBadgeState::Unknown,
-        Some(snapshot) if snapshot.loading => SourceControlBadgeState::Loading,
-        Some(snapshot) if snapshot.last_error.is_some() => SourceControlBadgeState::Error,
-        Some(snapshot) if !snapshot.files.is_empty() => SourceControlBadgeState::Dirty,
-        Some(_) => SourceControlBadgeState::Clean,
-    }
-}
-
 fn source_control_badge_color(state: SourceControlBadgeState) -> Color32 {
     match state {
-        SourceControlBadgeState::Unknown => TEXT_MUTED,
-        SourceControlBadgeState::Loading => ACCENT,
-        SourceControlBadgeState::Dirty => Color32::from_rgb(255, 184, 77),
         SourceControlBadgeState::Clean => Color32::from_rgb(94, 196, 130),
         SourceControlBadgeState::Error => Color32::from_rgb(224, 92, 92),
     }
 }
 
-fn source_control_badge_model(snapshot: Option<&SourceControlSnapshot>) -> SourceControlBadgeModel {
-    match snapshot {
-        Some(snapshot) => SourceControlBadgeModel {
-            state: source_control_badge_state(Some(snapshot)),
-            tooltip_lines: source_control_tooltip_lines(
-                snapshot,
-                SOURCE_CONTROL_TOOLTIP_FILE_LIMIT,
-            ),
-        },
-        None => SourceControlBadgeModel {
-            state: SourceControlBadgeState::Unknown,
-            tooltip_lines: vec!["Status pending".to_owned()],
-        },
+fn source_control_snapshot_has_display_data(snapshot: &SourceControlSnapshot) -> bool {
+    !snapshot.branch.is_empty()
+        || snapshot.ahead > 0
+        || snapshot.behind > 0
+        || !snapshot.files.is_empty()
+        || snapshot.added_lines.is_some()
+        || snapshot.removed_lines.is_some()
+}
+
+fn source_control_branch_line(snapshot: &SourceControlSnapshot) -> Option<String> {
+    if snapshot.branch.is_empty() {
+        return None;
+    }
+
+    let mut branch_line = snapshot.branch.clone();
+    if snapshot.ahead > 0 || snapshot.behind > 0 {
+        branch_line.push_str(&format!(
+            "  ahead:{} behind:{}",
+            snapshot.ahead, snapshot.behind
+        ));
+    }
+    Some(branch_line)
+}
+
+fn merge_source_control_refresh_result(
+    current: Option<&SourceControlSnapshot>,
+    incoming: SourceControlSnapshot,
+) -> SourceControlSnapshot {
+    if incoming.last_error.is_none() {
+        return incoming;
+    }
+
+    match current {
+        Some(current) if source_control_snapshot_has_display_data(current) => {
+            let mut merged = current.clone();
+            merged.loading = incoming.loading;
+            merged.last_error = incoming.last_error;
+            merged
+        }
+        _ => incoming,
     }
 }
 
@@ -7110,29 +7983,29 @@ fn terminal_manager_diff_summary_model(
     snapshot: Option<&SourceControlSnapshot>,
 ) -> TerminalManagerDiffSummaryModel {
     match snapshot {
-        Some(snapshot) if snapshot.loading => TerminalManagerDiffSummaryModel {
-            state: TerminalManagerDiffSummaryState::Loading,
-            added_lines: 0,
-            removed_lines: 0,
-            tooltip_lines: source_control_tooltip_lines(
-                snapshot,
-                SOURCE_CONTROL_TOOLTIP_FILE_LIMIT,
-            ),
-        },
-        Some(snapshot) if snapshot.last_error.is_some() => TerminalManagerDiffSummaryModel {
-            state: TerminalManagerDiffSummaryState::Error,
-            added_lines: 0,
-            removed_lines: 0,
-            tooltip_lines: source_control_tooltip_lines(
-                snapshot,
-                SOURCE_CONTROL_TOOLTIP_FILE_LIMIT,
-            ),
-        },
         Some(snapshot) => match (snapshot.added_lines, snapshot.removed_lines) {
             (Some(added_lines), Some(removed_lines)) => TerminalManagerDiffSummaryModel {
                 state: TerminalManagerDiffSummaryState::Ready,
                 added_lines,
                 removed_lines,
+                tooltip_lines: source_control_tooltip_lines(
+                    snapshot,
+                    SOURCE_CONTROL_TOOLTIP_FILE_LIMIT,
+                ),
+            },
+            _ if snapshot.loading => TerminalManagerDiffSummaryModel {
+                state: TerminalManagerDiffSummaryState::Loading,
+                added_lines: 0,
+                removed_lines: 0,
+                tooltip_lines: source_control_tooltip_lines(
+                    snapshot,
+                    SOURCE_CONTROL_TOOLTIP_FILE_LIMIT,
+                ),
+            },
+            _ if snapshot.last_error.is_some() => TerminalManagerDiffSummaryModel {
+                state: TerminalManagerDiffSummaryState::Error,
+                added_lines: 0,
+                removed_lines: 0,
                 tooltip_lines: source_control_tooltip_lines(
                     snapshot,
                     SOURCE_CONTROL_TOOLTIP_FILE_LIMIT,
@@ -7182,25 +8055,32 @@ fn terminal_manager_diff_summary_visual(
 }
 
 fn source_control_tooltip_lines(snapshot: &SourceControlSnapshot, max_files: usize) -> Vec<String> {
-    if let Some(error) = &snapshot.last_error {
-        return vec![error.clone()];
-    }
+    let has_display_data = source_control_snapshot_has_display_data(snapshot);
+    let mut lines = Vec::with_capacity(max_files.saturating_add(3));
+
     if snapshot.loading {
-        return vec!["Refreshing source control...".to_owned()];
+        lines.push("Refreshing source control...".to_owned());
     }
-    if snapshot.files.is_empty() {
-        return vec!["Working tree is clean".to_owned()];
+    if let Some(error) = &snapshot.last_error {
+        lines.push(error.clone());
+    }
+    if !has_display_data {
+        if lines.is_empty() {
+            lines.push("Status pending".to_owned());
+        }
+        return lines;
     }
 
-    let mut lines = Vec::with_capacity(max_files.saturating_add(2));
-    let mut branch_line = snapshot.branch.clone();
-    if snapshot.ahead > 0 || snapshot.behind > 0 {
-        branch_line.push_str(&format!(
-            "  ahead:{} behind:{}",
-            snapshot.ahead, snapshot.behind
-        ));
+    if let Some(branch_line) = source_control_branch_line(snapshot) {
+        lines.push(branch_line);
     }
-    lines.push(branch_line);
+
+    if snapshot.files.is_empty() {
+        if snapshot.last_error.is_none() && !snapshot.loading {
+            lines.push("Working tree is clean".to_owned());
+        }
+        return lines;
+    }
 
     for file in snapshot.files.iter().take(max_files) {
         let staged = if file.staged { " [staged]" } else { "" };
@@ -7212,24 +8092,6 @@ fn source_control_tooltip_lines(snapshot: &SourceControlSnapshot, max_files: usi
     }
 
     lines
-}
-
-fn draw_source_control_badge(ui: &mut Ui, badge: &SourceControlBadgeModel) -> egui::Response {
-    let icon = format!("{}", icons::GIT_BRANCH);
-    let response = ui.add(
-        egui::Label::new(
-            RichText::new(icon)
-                .color(source_control_badge_color(badge.state))
-                .small(),
-        )
-        .sense(Sense::hover()),
-    );
-
-    response.on_hover_ui(|ui| {
-        for line in &badge.tooltip_lines {
-            ui.label(line);
-        }
-    })
 }
 
 fn terminal_manager_diff_summary_layout_job(
@@ -7326,9 +8188,9 @@ fn draw_terminal_manager_title_and_diff_summary(
             let diff_summary_response = draw_terminal_manager_diff_summary(ui, diff_summary);
             ui.add_space(6.0);
 
-            let title_label = egui::Label::new(RichText::new(title).color(text_color))
+            let title_label = egui::Label::new(RichText::new(title).color(text_color).strong())
                 .truncate()
-                .sense(Sense::click());
+                .sense(Sense::hover());
             let title_response = ui.add_sized(
                 egui::vec2(ui.available_width().max(0.0), row_height),
                 title_label,
@@ -7348,7 +8210,6 @@ fn draw_terminal_manager_title_and_diff_summary(
                 .on_hover_text(title);
 
             TerminalManagerTitleSummaryLayout {
-                response: diff_summary_response.union(title_response.clone()),
                 #[cfg(test)]
                 title_rect: title_response.rect,
                 #[cfg(test)]
@@ -7453,8 +8314,97 @@ fn with_minimal_button_chrome<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)
     .inner
 }
 
-fn project_group_header_actions_width(section_gap: f32) -> f32 {
-    (CONTROL_ROW_HEIGHT * 2.0) + section_gap
+fn project_group_header_actions_width(_section_gap: f32) -> f32 {
+    CONTROL_ROW_HEIGHT
+}
+
+fn project_group_header_action_spec(
+    action_kind: TerminalKind,
+) -> (AppIcon, Color32, Color32, &'static str) {
+    match action_kind {
+        TerminalKind::Foreground => (
+            icons::TERMINAL,
+            BTN_BLUE,
+            BTN_BLUE_HOVER,
+            "New Foreground Terminal",
+        ),
+        TerminalKind::Background => (
+            icons::LIST,
+            BTN_TEAL,
+            BTN_TEAL_HOVER,
+            "New Background Terminal",
+        ),
+    }
+}
+
+fn terminal_manager_filter_color(filter: TerminalManagerFilter) -> Color32 {
+    match filter {
+        TerminalManagerFilter::Foreground => ACCENT,
+        TerminalManagerFilter::Background => Color32::from_rgb(100, 180, 160),
+    }
+}
+
+fn draw_terminal_manager_filter_tabs(
+    ui: &mut Ui,
+    selected_filter: &mut TerminalManagerFilter,
+) -> bool {
+    let mut changed = false;
+
+    ui.horizontal(|ui| {
+        ui.add_space(SIDEBAR_ROW_LEADING_INSET);
+
+        for filter in [
+            TerminalManagerFilter::Foreground,
+            TerminalManagerFilter::Background,
+        ] {
+            let is_selected = *selected_filter == filter;
+            let response = ui
+                .add(
+                    egui::Label::new(RichText::new(filter.label()).strong().color(
+                        if is_selected {
+                            terminal_manager_filter_color(filter)
+                        } else {
+                            with_alpha(TEXT_MUTED, 180)
+                        },
+                    ))
+                    .sense(Sense::click()),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+            if is_selected {
+                let underline_rect = egui::Rect::from_min_max(
+                    egui::pos2(response.rect.left(), response.rect.bottom() + 2.0),
+                    egui::pos2(response.rect.right(), response.rect.bottom() + 4.0),
+                );
+                ui.painter().rect_filled(
+                    underline_rect,
+                    2.0,
+                    terminal_manager_filter_color(filter),
+                );
+            }
+
+            if response.clicked() && !is_selected {
+                *selected_filter = filter;
+                changed = true;
+            }
+
+            ui.add_space(12.0);
+        }
+    });
+
+    changed
+}
+
+fn terminal_ids_for_project_kind(
+    terminals: &BTreeMap<u64, TerminalEntry>,
+    project_id: u64,
+    kind: TerminalKind,
+) -> Vec<u64> {
+    terminals
+        .iter()
+        .filter(|(_, terminal)| terminal.project_id == project_id && terminal.kind == kind)
+        .map(|(id, _)| *id)
+        .collect()
 }
 
 fn project_group_header_row_layout(total_width: f32, section_gap: f32) -> (f32, f32) {
@@ -7470,7 +8420,9 @@ fn draw_project_group_header(
     project_name: &str,
     open: bool,
     can_expand: bool,
-) -> (egui::Response, bool, bool, bool) {
+    action_kind: TerminalKind,
+    diff_summary: &TerminalManagerDiffSummaryModel,
+) -> (egui::Response, bool, bool) {
     let row_width = ui.available_width();
     let section_gap = ui.spacing().item_spacing.x;
     let (label_width, actions_width) = project_group_header_row_layout(row_width, section_gap);
@@ -7494,27 +8446,26 @@ fn draw_project_group_header(
         with_alpha(TEXT_MUTED, 180)
     };
 
-    let mut foreground_clicked = false;
-    let mut background_clicked = false;
+    let mut spawn_clicked = false;
 
     let label_rect = egui::Rect::from_min_size(row_rect.min, egui::vec2(label_width, row_height));
     if label_width > 0.0 && ui.is_rect_visible(label_rect) {
-        let button_padding = ui.spacing().button_padding;
-        let label = format!("{} {}", icons::FOLDER_OPEN, project_name);
-        let label_wrap_width = sidebar_row_wrap_width(label_rect.width(), button_padding);
-        let galley = WidgetText::from(label).strong().into_galley(
-            ui,
-            Some(TextWrapMode::Truncate),
-            label_wrap_width,
-            egui::TextStyle::Body,
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(label_rect)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                let label = format!("{} {}", icons::FOLDER_OPEN, project_name);
+                let _ = draw_terminal_manager_title_and_diff_summary(
+                    ui,
+                    &label,
+                    text_color,
+                    open,
+                    row_height,
+                    diff_summary,
+                );
+            },
         );
-        let text_pos = directory_row_text_position(label_rect, button_padding, galley.size());
-        ui.painter().galley(text_pos, galley, text_color);
-    }
-
-    if label_width > 0.0 {
-        let full_text = format!("Project: {}", project_name);
-        response.clone().on_hover_text(full_text);
     }
 
     let actions_rect = egui::Rect::from_min_size(
@@ -7526,84 +8477,16 @@ fn draw_project_group_header(
             .max_rect(actions_rect)
             .layout(Layout::right_to_left(Align::Center)),
         |ui| {
-            if styled_icon_button(
-                ui,
-                icons::LIST,
-                BTN_TEAL,
-                BTN_TEAL_HOVER,
-                BTN_ICON_ACTIVE,
-                "New Background Terminal",
-            ) {
-                background_clicked = true;
-            }
-            if styled_icon_button(
-                ui,
-                icons::TERMINAL,
-                BTN_BLUE,
-                BTN_BLUE_HOVER,
-                BTN_ICON_ACTIVE,
-                "New Foreground Terminal",
-            ) {
-                foreground_clicked = true;
+            let (icon, bg, hover_bg, tooltip) = project_group_header_action_spec(action_kind);
+            if styled_icon_button(ui, icon, bg, hover_bg, BTN_ICON_ACTIVE, tooltip) {
+                spawn_clicked = true;
             }
         },
     );
 
-    let header_clicked = response.clicked() && !foreground_clicked && !background_clicked;
+    let header_clicked = response.clicked() && !spawn_clicked;
 
-    (
-        response,
-        foreground_clicked,
-        background_clicked,
-        header_clicked,
-    )
-}
-
-fn terminal_manager_section_id(project_id: u64, kind: TerminalKind) -> Id {
-    Id::new(("terminal-manager-section", project_id, kind.label()))
-}
-
-fn draw_terminal_manager_section_header(
-    ui: &mut Ui,
-    icon: AppIcon,
-    project_id: u64,
-    kind: TerminalKind,
-) -> bool {
-    let header_id = terminal_manager_section_id(project_id, kind);
-    let mut header_state =
-        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), header_id, true);
-    let _open = header_state.is_open();
-
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), CONTROL_ROW_HEIGHT),
-        Sense::click(),
-    );
-
-    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
-
-    let kind_color = match kind {
-        TerminalKind::Foreground => ACCENT,
-        TerminalKind::Background => Color32::from_rgb(100, 180, 160),
-    };
-    let label_text = format!("{}  {}", icon, kind.label());
-
-    ui.painter().text(
-        egui::pos2(
-            rect.left() + 4.0 + SIDEBAR_ROW_LEADING_INSET,
-            rect.center().y,
-        ),
-        egui::Align2::LEFT_CENTER,
-        label_text,
-        egui::FontId::proportional(12.5),
-        kind_color,
-    );
-
-    if response.clicked() {
-        header_state.toggle(ui);
-        header_state.store(ui.ctx());
-    }
-
-    header_state.is_open()
+    (response, spawn_clicked, header_clicked)
 }
 
 fn styled_icon_button(
@@ -8522,43 +9405,48 @@ mod tests {
         ai_badge_visual, average_terminal_cell_width, build_terminal_cursor_overlay,
         build_terminal_render, collect_source_control_line_totals, collect_source_control_snapshot,
         configure_terminal_font_family, count_text_line_bytes, cursor_hidden_by_row_filter,
-        default_app_open_command, draw_ai_badge, draw_source_control_badge,
-        draw_terminal_manager_title_and_diff_summary, draw_terminal_status_badges,
-        force_terminal_pane_width, install_terminal_font_family, next_active_terminal_after_close,
+        default_app_open_command, draw_ai_badge, draw_terminal_manager_title_and_diff_summary,
+        draw_terminal_status_badges, force_terminal_pane_width, install_terminal_font_family,
+        merge_source_control_refresh_result, next_active_terminal_after_close,
         next_terminal_in_direction, next_terminal_in_linear_direction,
         normalize_terminal_background, parse_branch_header, parse_git_numstat_totals,
         recover_config_state, resolve_ctrl_c_action, should_resolve_terminal_link,
-        source_control_badge_color, source_control_badge_model, source_control_badge_state,
-        source_control_tooltip_lines, terminal_cell_metric, terminal_cursor_blink_phase_visible,
-        terminal_cursor_overlay_rect, terminal_font_family, terminal_font_id,
-        terminal_grid_dimensions, terminal_line_height, terminal_link_activation_modifiers,
-        terminal_link_at_point, terminal_logical_line, terminal_logical_line_byte_index,
-        terminal_manager_actions_width, terminal_manager_diff_summary_model,
-        terminal_manager_diff_summary_visual, terminal_manager_row_chrome,
-        terminal_manager_row_widths, terminal_output_surface_size, terminal_output_viewport_size,
-        terminal_secondary_click_action, terminal_selection_point_from_pointer,
-        terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
-        AdeApp, AiBadgeModel, AiBadgeVisual, CtrlCAction, DirectoryIndexSnapshot, DirectoryNode,
+        source_control_badge_color, source_control_tooltip_lines, terminal_cell_metric,
+        terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect, terminal_font_family,
+        terminal_font_id, terminal_grid_dimensions, terminal_line_height,
+        terminal_link_activation_modifiers, terminal_link_at_point, terminal_logical_line,
+        terminal_logical_line_byte_index, terminal_manager_actions_width,
+        terminal_manager_diff_summary_model, terminal_manager_diff_summary_visual,
+        terminal_manager_row_chrome, terminal_manager_row_widths, terminal_output_surface_size,
+        terminal_output_viewport_size, terminal_secondary_click_action,
+        terminal_selection_point_from_pointer, terminal_selection_text, to_egui_color,
+        update_stable_cursor_row, visible_terminal_cursor, AdeApp, AiBadgeModel, AiBadgeVisual,
+        CodexCliStatusSource, CtrlCAction, DirectoryIndexSnapshot, DirectoryNode,
         FactoryDroidHookInboxEvent, FactoryDroidStatusSource, FactoryDroidTransportDiagnostics,
         PendingConfigChanges, PendingTerminalLinkClick, SourceControlBadgeState, SourceControlFile,
         SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
         TerminalSecondaryClickAction, TerminalSelection, TerminalSelectionPoint, TransientToast,
+        CODEX_LAUNCH_GRACE_MS, CODEX_PROCESS_POLL_MS, CODEX_TRAILING_OUTPUT_GRACE_MS,
         FACTORY_DROID_HOOK_POLL_MS, FACTORY_DROID_PROCESS_POLL_MS,
-        FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS, TERMINAL_COPY_FEEDBACK_TEXT,
-        TERMINAL_COPY_TOAST_SECS, TERMINAL_OUTPUT_BG,
+        FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT,
+        TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_COPY_TOAST_SECS, TERMINAL_OUTPUT_BG,
     };
+    use crate::codex::CodexNotifyInboxEvent;
     use crate::hooks::{
         AiCliSession, AiCliStatus, AiCliTool, AiHookManager, AiHooksConfig, ProjectAiConfig,
     };
     use crate::layout;
-    use crate::models::{AppConfig, MainVisibilityMode, ProjectRecord, ShellKind, TerminalKind};
+    use crate::models::{
+        AppConfig, MainVisibilityMode, ProjectRecord, ShellKind, TerminalKind,
+        TerminalManagerFilter,
+    };
     use crate::terminal::{
         test_terminal_runtime, test_terminal_runtime_with_capture, TerminalColor, TerminalCursor,
         TerminalCursorLine, TerminalCursorShape, TerminalRuntime, TerminalSelectionHyperlink,
         TerminalSelectionLine, TerminalSelectionSnapshot, TerminalSnapshot, TerminalStyle,
         TerminalStyledCell, TerminalStyledLine, TerminalStyledRun, TerminalUiEvent,
-        TerminalUiEventKind,
+        TerminalUiEventKind, TrackedProcessIdentity,
     };
     use eframe::egui::text::{LayoutJob, TextFormat};
     use eframe::egui::{
@@ -8867,6 +9755,26 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_vertical_arrow_shortcuts_stay_out_of_terminal_stream_in_single_view() {
+        let ctrl_down = Event::Key {
+            key: Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        };
+
+        let (terminal_events, remaining_events) =
+            AdeApp::partition_terminal_input_events(vec![ctrl_down.clone()], true);
+
+        assert!(terminal_events.is_empty());
+        assert_eq!(remaining_events, vec![ctrl_down]);
+    }
+
+    #[test]
     fn ctrl_shift_arrow_remains_terminal_input() {
         let ctrl_shift_right = Event::Key {
             key: Key::ArrowRight,
@@ -9094,6 +10002,17 @@ mod tests {
 
         assert!(captured.is_empty());
         assert_eq!(ctx.input(|input| input.events.len()), 1);
+    }
+
+    #[test]
+    fn opening_settings_popup_resets_diagnostics_to_collapsed() {
+        let mut app = test_app([], None);
+        app.settings_diagnostics_expanded = true;
+
+        app.open_settings_popup();
+
+        assert!(app.show_settings_popup);
+        assert!(!app.settings_diagnostics_expanded);
     }
 
     #[test]
@@ -10143,7 +11062,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_manager_title_layout_keeps_diff_summary_right_aligned() {
+    fn project_group_title_layout_keeps_diff_summary_right_aligned() {
         let ctx = Context::default();
         ctx.set_fonts(FontDefinitions::default());
 
@@ -10162,7 +11081,11 @@ mod tests {
                     |ui| {
                         let layout = draw_terminal_manager_title_and_diff_summary(
                             ui,
-                            "terminal command title that should truncate",
+                            &format!(
+                                "{} {}",
+                                super::icons::FOLDER_OPEN,
+                                "project name that should truncate"
+                            ),
                             super::TEXT_PRIMARY,
                             false,
                             super::CONTROL_ROW_HEIGHT,
@@ -10179,30 +11102,41 @@ mod tests {
     }
 
     #[test]
-    fn project_group_header_row_reserves_space_for_inline_actions() {
+    fn project_group_header_row_reserves_space_for_single_inline_action() {
         let (label_width, actions_width) = super::project_group_header_row_layout(160.0, 8.0);
 
         assert_eq!(
             actions_width,
             super::project_group_header_actions_width(8.0)
         );
-        assert!(((label_width as f32) - 88.0).abs() < f32::EPSILON);
+        assert!((label_width - 124.0).abs() < f32::EPSILON);
     }
 
     #[test]
-    fn project_group_header_row_clamps_actions_when_space_is_tight() {
+    fn project_group_header_row_keeps_label_space_when_one_button_fits() {
         let (label_width, actions_width) = super::project_group_header_row_layout(40.0, 8.0);
 
-        assert_eq!(label_width, 0.0);
-        assert_eq!(actions_width, 40.0);
+        assert_eq!(label_width, 4.0);
+        assert_eq!(actions_width, super::CONTROL_ROW_HEIGHT);
     }
 
     #[test]
-    fn project_group_header_actions_width_matches_two_buttons_and_gap() {
+    fn project_group_header_actions_width_matches_single_button() {
         assert_eq!(
             super::project_group_header_actions_width(8.0),
-            (super::CONTROL_ROW_HEIGHT * 2.0) + 8.0
+            super::CONTROL_ROW_HEIGHT
         );
+    }
+
+    #[test]
+    fn project_group_header_action_spec_matches_selected_kind() {
+        let foreground = super::project_group_header_action_spec(TerminalKind::Foreground);
+        let background = super::project_group_header_action_spec(TerminalKind::Background);
+
+        assert_eq!(foreground.0, super::icons::TERMINAL);
+        assert_eq!(foreground.3, "New Foreground Terminal");
+        assert_eq!(background.0, super::icons::LIST);
+        assert_eq!(background.3, "New Background Terminal");
     }
 
     #[test]
@@ -10223,33 +11157,41 @@ mod tests {
     }
 
     #[test]
-    fn source_control_badge_state_covers_clean_dirty_loading_and_error() {
-        let clean = test_source_control_snapshot("main", &[]);
-        let dirty = test_source_control_snapshot("main", &[("src/app.rs", "Modified", false)]);
-        let mut loading = test_source_control_snapshot("main", &[]);
-        loading.loading = true;
-        let mut error = test_source_control_snapshot("main", &[]);
-        error.last_error = Some("Not a git repository".to_owned());
+    fn terminal_manager_filter_defaults_to_foreground() {
+        assert_eq!(
+            TerminalManagerFilter::default(),
+            TerminalManagerFilter::Foreground
+        );
+    }
+
+    #[test]
+    fn terminal_ids_for_project_kind_only_return_matching_terminals() {
+        let terminals = BTreeMap::from([
+            (
+                1,
+                test_terminal_entry_with_kind(1, 7, TerminalKind::Foreground),
+            ),
+            (
+                2,
+                test_terminal_entry_with_kind(2, 7, TerminalKind::Background),
+            ),
+            (
+                3,
+                test_terminal_entry_with_kind(3, 8, TerminalKind::Foreground),
+            ),
+            (
+                4,
+                test_terminal_entry_with_kind(4, 7, TerminalKind::Foreground),
+            ),
+        ]);
 
         assert_eq!(
-            source_control_badge_state(None),
-            SourceControlBadgeState::Unknown
+            super::terminal_ids_for_project_kind(&terminals, 7, TerminalKind::Foreground),
+            vec![1, 4]
         );
         assert_eq!(
-            source_control_badge_state(Some(&clean)),
-            SourceControlBadgeState::Clean
-        );
-        assert_eq!(
-            source_control_badge_state(Some(&dirty)),
-            SourceControlBadgeState::Dirty
-        );
-        assert_eq!(
-            source_control_badge_state(Some(&loading)),
-            SourceControlBadgeState::Loading
-        );
-        assert_eq!(
-            source_control_badge_state(Some(&error)),
-            SourceControlBadgeState::Error
+            super::terminal_ids_for_project_kind(&terminals, 7, TerminalKind::Background),
+            vec![2]
         );
     }
 
@@ -10290,6 +11232,42 @@ mod tests {
             "expected staged file entry"
         );
         assert_eq!(lines.last().map(String::as_str), Some("+3 more"));
+    }
+
+    #[test]
+    fn source_control_tooltip_lines_keep_existing_data_visible_during_loading() {
+        let mut snapshot =
+            test_source_control_snapshot("main", &[("src/app.rs", "Modified", true)]);
+        snapshot.loading = true;
+
+        let lines = source_control_tooltip_lines(&snapshot, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT);
+
+        assert_eq!(
+            lines,
+            vec![
+                "Refreshing source control...".to_owned(),
+                "main".to_owned(),
+                "Modified [staged]: src/app.rs".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn source_control_tooltip_lines_keep_existing_data_visible_during_error() {
+        let mut snapshot =
+            test_source_control_snapshot("main", &[("src/app.rs", "Modified", false)]);
+        snapshot.last_error = Some("git status failed".to_owned());
+
+        let lines = source_control_tooltip_lines(&snapshot, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT);
+
+        assert_eq!(
+            lines,
+            vec![
+                "git status failed".to_owned(),
+                "main".to_owned(),
+                "Modified: src/app.rs".to_owned(),
+            ]
+        );
     }
 
     #[test]
@@ -10384,14 +11362,25 @@ mod tests {
     fn terminal_manager_diff_summary_visuals_cover_ready_loading_and_error_states() {
         let clean =
             terminal_manager_diff_summary_model(Some(&test_source_control_snapshot("main", &[])));
-        let loading = terminal_manager_diff_summary_model(Some(&SourceControlSnapshot {
-            loading: true,
-            ..test_source_control_snapshot("main", &[])
-        }));
-        let error = terminal_manager_diff_summary_model(Some(&SourceControlSnapshot {
+        let loading_with_totals =
+            terminal_manager_diff_summary_model(Some(&SourceControlSnapshot {
+                loading: true,
+                ..test_source_control_snapshot("main", &[])
+            }));
+        let error_with_totals = terminal_manager_diff_summary_model(Some(&SourceControlSnapshot {
             last_error: Some("git status failed".to_owned()),
             ..test_source_control_snapshot("main", &[])
         }));
+        let loading_without_totals =
+            terminal_manager_diff_summary_model(Some(&SourceControlSnapshot {
+                loading: true,
+                ..SourceControlSnapshot::default()
+            }));
+        let error_without_totals =
+            terminal_manager_diff_summary_model(Some(&SourceControlSnapshot {
+                last_error: Some("git status failed".to_owned()),
+                ..SourceControlSnapshot::default()
+            }));
 
         assert_eq!(
             terminal_manager_diff_summary_visual(&clean),
@@ -10404,19 +11393,110 @@ mod tests {
             }
         );
         assert_eq!(
-            terminal_manager_diff_summary_visual(&loading),
+            terminal_manager_diff_summary_visual(&loading_with_totals),
+            TerminalManagerDiffSummaryVisual::Totals {
+                added_text: "+0".to_owned(),
+                removed_text: "-0".to_owned(),
+                added_color: source_control_badge_color(SourceControlBadgeState::Clean),
+                removed_color: source_control_badge_color(SourceControlBadgeState::Error),
+                separator_color: super::TEXT_MUTED,
+            }
+        );
+        assert_eq!(
+            terminal_manager_diff_summary_visual(&error_with_totals),
+            TerminalManagerDiffSummaryVisual::Totals {
+                added_text: "+0".to_owned(),
+                removed_text: "-0".to_owned(),
+                added_color: source_control_badge_color(SourceControlBadgeState::Clean),
+                removed_color: source_control_badge_color(SourceControlBadgeState::Error),
+                separator_color: super::TEXT_MUTED,
+            }
+        );
+        assert_eq!(
+            terminal_manager_diff_summary_visual(&loading_without_totals),
             TerminalManagerDiffSummaryVisual::Placeholder {
                 text: "...",
                 color: super::TEXT_MUTED,
             }
         );
         assert_eq!(
-            terminal_manager_diff_summary_visual(&error),
+            terminal_manager_diff_summary_visual(&error_without_totals),
             TerminalManagerDiffSummaryVisual::Placeholder {
                 text: "--",
                 color: super::TEXT_MUTED,
             }
         );
+    }
+
+    #[test]
+    fn request_source_control_refresh_marks_loading_without_clearing_snapshot_data() {
+        let mut app = test_app([], None);
+        app.projects = BTreeMap::from([(7, test_project(7, "Repo", "C:/repo", &[]))]);
+        app.source_control_state.insert(
+            7,
+            SourceControlSnapshot {
+                branch: "main".to_owned(),
+                ahead: 2,
+                behind: 1,
+                files: vec![SourceControlFile {
+                    path: "src/app.rs".to_owned(),
+                    status: "Modified",
+                    staged: false,
+                }],
+                added_lines: Some(5),
+                removed_lines: Some(2),
+                loading: false,
+                last_error: Some("old error".to_owned()),
+            },
+        );
+
+        app.request_source_control_refresh(7, false, true);
+
+        let snapshot = app
+            .source_control_state
+            .get(&7)
+            .expect("expected source control snapshot");
+        assert!(snapshot.loading);
+        assert_eq!(snapshot.last_error, None);
+        assert_eq!(snapshot.branch, "main");
+        assert_eq!(snapshot.ahead, 2);
+        assert_eq!(snapshot.behind, 1);
+        assert_eq!(snapshot.files.len(), 1);
+        assert_eq!(snapshot.added_lines, Some(5));
+        assert_eq!(snapshot.removed_lines, Some(2));
+    }
+
+    #[test]
+    fn merge_source_control_refresh_result_preserves_existing_data_on_error() {
+        let current = SourceControlSnapshot {
+            branch: "main".to_owned(),
+            ahead: 1,
+            behind: 0,
+            files: vec![SourceControlFile {
+                path: "src/app.rs".to_owned(),
+                status: "Modified",
+                staged: true,
+            }],
+            added_lines: Some(8),
+            removed_lines: Some(3),
+            loading: true,
+            last_error: None,
+        };
+        let incoming = SourceControlSnapshot {
+            last_error: Some("git status failed".to_owned()),
+            ..SourceControlSnapshot::default()
+        };
+
+        let merged = merge_source_control_refresh_result(Some(&current), incoming);
+
+        assert_eq!(merged.branch, "main");
+        assert_eq!(merged.ahead, 1);
+        assert_eq!(merged.behind, 0);
+        assert_eq!(merged.files.len(), 1);
+        assert_eq!(merged.added_lines, Some(8));
+        assert_eq!(merged.removed_lines, Some(3));
+        assert!(!merged.loading);
+        assert_eq!(merged.last_error.as_deref(), Some("git status failed"));
     }
 
     #[test]
@@ -10812,6 +11892,68 @@ mod tests {
         app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
 
         assert_eq!(app.active_terminal, Some(2));
+    }
+
+    #[test]
+    fn handle_shortcuts_moves_single_view_terminal_with_ctrl_down() {
+        let ctx = Context::default();
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowDown,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+                (3, test_terminal_entry(3, 7)),
+            ],
+            Some(1),
+        );
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(app.active_terminal, Some(2));
+        assert_eq!(app.visible_terminal_ids_for_main(), vec![2]);
+    }
+
+    #[test]
+    fn handle_shortcuts_moves_single_view_terminal_with_ctrl_up() {
+        let ctx = Context::default();
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowUp,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+                (3, test_terminal_entry(3, 7)),
+            ],
+            Some(3),
+        );
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(app.active_terminal, Some(2));
+        assert_eq!(app.visible_terminal_ids_for_main(), vec![2]);
     }
 
     #[test]
@@ -11219,6 +12361,36 @@ mod tests {
             app.buffered_terminal_navigation,
             vec![TerminalNavigationShortcut::Grid(
                 TerminalNavigationDirection::Right,
+            )]
+        );
+    }
+
+    #[test]
+    fn raw_input_hook_buffers_ctrl_vertical_arrow_for_single_view_navigation() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let ctrl_down = Event::Key {
+            key: Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        };
+        let mut raw_input = RawInput {
+            events: vec![ctrl_down],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(raw_input.events.is_empty());
+        assert_eq!(
+            app.buffered_terminal_navigation,
+            vec![TerminalNavigationShortcut::SingleViewLinear(
+                TerminalNavigationDirection::Down,
             )]
         );
     }
@@ -12074,6 +13246,813 @@ mod tests {
     }
 
     #[test]
+    fn codex_launch_detection_matches_expected_commands() {
+        assert!(AdeApp::is_codex_launch_command("codex"));
+        assert!(AdeApp::is_codex_launch_command("codex --help"));
+        assert!(AdeApp::is_codex_launch_command(
+            r#""C:\Program Files\OpenAI\codex.exe" --version"#
+        ));
+        assert!(!AdeApp::is_codex_launch_command("codex-helper"));
+        assert!(!AdeApp::is_codex_launch_command("npm exec codex"));
+        assert!(!AdeApp::is_codex_launch_command("git codex"));
+    }
+
+    #[test]
+    fn factory_droid_launch_detection_matches_expected_commands() {
+        assert!(AdeApp::is_factory_droid_launch_command("droid"));
+        assert!(AdeApp::is_factory_droid_launch_command("factory --help"));
+        assert!(AdeApp::is_factory_droid_launch_command(
+            r#""C:\Program Files\Factory Droid\droid.exe" --version"#
+        ));
+        assert!(!AdeApp::is_factory_droid_launch_command("droid-helper"));
+        assert!(!AdeApp::is_factory_droid_launch_command("npm exec droid"));
+        assert!(!AdeApp::is_factory_droid_launch_command("git factory"));
+    }
+
+    #[test]
+    fn route_active_terminal_input_marks_codex_launch_pending_without_running() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![
+                Event::Text("codex".to_owned()),
+                Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::default(),
+                },
+            ],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(terminal.codex_launch_pending_since.is_some());
+        assert!(!terminal.codex_session_active);
+    }
+
+    #[test]
+    fn route_active_terminal_input_captures_codex_baseline_before_queuing_launch_bytes() {
+        let ctx = Context::default();
+        let (runtime, _capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        let fast_start_identity = TrackedProcessIdentity {
+            pid: 5010,
+            creation_time: Some(6010),
+        };
+
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry
+                .runtime
+                .set_codex_descendant_processes_for_test(Some(vec![]));
+            entry
+                .runtime
+                .queue_codex_descendant_processes_after_next_input_for_test(vec![(
+                    fast_start_identity,
+                    "node.exe",
+                )]);
+        }
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![
+                Event::Text("codex".to_owned()),
+                Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::default(),
+                },
+            ],
+        );
+
+        assert_eq!(
+            app.terminals
+                .get(&1)
+                .expect("terminal 1")
+                .codex_launch_process_baseline,
+            Some(Vec::new())
+        );
+
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(terminal.codex_session_active);
+        assert_eq!(terminal.codex_process_identity, Some(fast_start_identity));
+        assert!(terminal.codex_launch_pending_since.is_none());
+    }
+
+    #[test]
+    fn route_active_terminal_input_switches_from_factory_droid_to_codex_launch() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_ai_attention(&mut app, 1);
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![
+                Event::Text("codex".to_owned()),
+                Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::default(),
+                },
+            ],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(terminal.codex_launch_pending_since.is_some());
+        assert!(!terminal.codex_session_active);
+        assert!(!terminal.factory_droid_session_active);
+        assert!(terminal.factory_droid_launch_pending_since.is_none());
+        assert_eq!(terminal.factory_droid_last_status_source, None);
+    }
+
+    #[test]
+    fn route_active_terminal_input_switches_from_codex_to_factory_droid_launch() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_codex_attention(&mut app, 1);
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![
+                Event::Text("droid".to_owned()),
+                Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::default(),
+                },
+            ],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::FactoryDroid));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(terminal.factory_droid_launch_pending_since.is_some());
+        assert!(!terminal.factory_droid_session_active);
+        assert!(!terminal.codex_session_active);
+        assert!(terminal.codex_launch_pending_since.is_none());
+        assert_eq!(terminal.codex_last_status_source, None);
+    }
+
+    #[test]
+    fn codex_status_lifecycle_transitions_running_attention_idle_running_and_inactive() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let baseline_identity = TrackedProcessIdentity {
+            pid: 5007,
+            creation_time: Some(6007),
+        };
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry
+                .runtime
+                .set_codex_descendant_processes_for_test(Some(vec![(
+                    baseline_identity,
+                    "node.exe",
+                )]));
+        }
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![
+                Event::Text("codex".to_owned()),
+                Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::default(),
+                },
+            ],
+        );
+        app.terminals
+            .get_mut(&1)
+            .expect("terminal 1")
+            .runtime
+            .set_codex_process_active_for_test(Some(true));
+        app.poll_codex_processes(&ctx);
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![
+                Event::Text("summarize this diff".to_owned()),
+                Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::default(),
+                },
+            ],
+        );
+        {
+            let terminal = app.terminals.get(&1).expect("terminal 1");
+            assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+            assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+            assert_eq!(
+                terminal.codex_last_status_source,
+                Some(CodexCliStatusSource::PromptSubmit)
+            );
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "[bell]".to_owned(),
+                },
+            })
+            .expect("send codex bell chunk");
+        app.process_terminal_events(&ctx);
+        {
+            let terminal = app.terminals.get(&1).expect("terminal 1");
+            assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+            assert_eq!(
+                terminal.codex_last_status_source,
+                Some(CodexCliStatusSource::Bell)
+            );
+        }
+
+        app.route_active_terminal_input(&ctx, vec![Event::Text("continue".to_owned())]);
+        {
+            let terminal = app.terminals.get(&1).expect("terminal 1");
+            assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+            assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+            assert_eq!(terminal.pending_line_for_title, "continue");
+        }
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+        {
+            let terminal = app.terminals.get(&1).expect("terminal 1");
+            assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+            assert_eq!(
+                terminal.codex_last_status_source,
+                Some(CodexCliStatusSource::PromptSubmit)
+            );
+        }
+
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal
+                .runtime
+                .set_codex_process_active_for_test(Some(false));
+            terminal.codex_process_missing_since =
+                Some(Instant::now() - Duration::from_millis(CODEX_TRAILING_OUTPUT_GRACE_MS + 25));
+        }
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, None);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(!terminal.codex_session_active);
+        assert!(terminal.codex_launch_pending_since.is_none());
+        assert!(terminal.codex_process_missing_since.is_none());
+    }
+
+    #[test]
+    fn codex_launch_pending_survives_early_false_probe() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Inactive;
+            entry.codex_launch_pending_since = Some(Instant::now());
+            entry.codex_launch_process_baseline = Some(Vec::new());
+            entry.runtime.set_codex_process_active_for_test(Some(false));
+        }
+
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(terminal.codex_launch_pending_since.is_some());
+        assert!(!terminal.codex_session_active);
+        assert!(terminal.codex_process_missing_since.is_none());
+    }
+
+    #[test]
+    fn codex_launch_pending_latches_detected_node_identity() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let baseline_identity = TrackedProcessIdentity {
+            pid: 5001,
+            creation_time: Some(6001),
+        };
+        let node_identity = TrackedProcessIdentity {
+            pid: 5002,
+            creation_time: Some(6002),
+        };
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry
+                .runtime
+                .set_codex_descendant_processes_for_test(Some(vec![(
+                    baseline_identity,
+                    "node.exe",
+                )]));
+        }
+        assert!(app.mark_codex_launch_pending(1, snapshot_codex_launch_baseline(&app, 1)));
+        app.terminals
+            .get_mut(&1)
+            .expect("terminal 1")
+            .runtime
+            .set_codex_descendant_processes_for_test(Some(vec![
+                (baseline_identity, "node.exe"),
+                (node_identity, "node.exe"),
+            ]));
+
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(terminal.codex_session_active);
+        assert_eq!(terminal.codex_process_identity, Some(node_identity));
+        assert!(terminal.codex_launch_pending_since.is_none());
+    }
+
+    #[test]
+    fn codex_launch_pending_ignores_preexisting_node_descendant() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let preexisting_node_identity = TrackedProcessIdentity {
+            pid: 5002,
+            creation_time: Some(6002),
+        };
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry
+                .runtime
+                .set_codex_descendant_processes_for_test(Some(vec![(
+                    preexisting_node_identity,
+                    "node.exe",
+                )]));
+        }
+        assert!(app.mark_codex_launch_pending(1, snapshot_codex_launch_baseline(&app, 1)));
+
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(terminal.codex_launch_pending_since.is_some());
+        assert!(!terminal.codex_session_active);
+        assert_eq!(
+            terminal.codex_launch_process_baseline,
+            Some(vec![preexisting_node_identity])
+        );
+    }
+
+    #[test]
+    fn codex_launch_pending_with_unavailable_baseline_does_not_latch_existing_descendant() {
+        let ctx = Context::default();
+        let preexisting_node_identity = TrackedProcessIdentity {
+            pid: 5005,
+            creation_time: Some(6005),
+        };
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.runtime.set_codex_process_probe_unavailable_for_test();
+        }
+        assert!(app.mark_codex_launch_pending(1, snapshot_codex_launch_baseline(&app, 1)));
+        assert_eq!(
+            app.terminals
+                .get(&1)
+                .expect("terminal 1")
+                .codex_launch_process_baseline,
+            None
+        );
+        app.terminals
+            .get_mut(&1)
+            .expect("terminal 1")
+            .runtime
+            .set_codex_descendant_processes_for_test(Some(vec![(
+                preexisting_node_identity,
+                "node.exe",
+            )]));
+
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(terminal.codex_launch_pending_since.is_some());
+        assert_eq!(
+            terminal.codex_launch_process_baseline,
+            Some(vec![preexisting_node_identity])
+        );
+        assert!(!terminal.codex_session_active);
+        assert_eq!(terminal.codex_process_identity, None);
+    }
+
+    #[test]
+    fn codex_launch_pending_recovers_empty_baseline_after_unavailable_probe() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.runtime.set_codex_process_probe_unavailable_for_test();
+        }
+        assert!(app.mark_codex_launch_pending(1, snapshot_codex_launch_baseline(&app, 1)));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.codex_launch_pending_since =
+                Some(Instant::now() - Duration::from_millis(CODEX_LAUNCH_GRACE_MS + 25));
+            entry
+                .runtime
+                .set_codex_descendant_processes_for_test(Some(vec![]));
+        }
+
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, None);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(terminal.codex_launch_pending_since.is_none());
+        assert!(terminal.codex_launch_process_baseline.is_none());
+        assert!(!terminal.codex_session_active);
+    }
+
+    #[test]
+    fn codex_tracked_identity_ignores_replacement_node_process() {
+        let ctx = Context::default();
+        let tracked_identity = TrackedProcessIdentity {
+            pid: 5003,
+            creation_time: Some(6003),
+        };
+        let replacement_identity = TrackedProcessIdentity {
+            pid: 5004,
+            creation_time: Some(6004),
+        };
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+            entry.codex_process_identity = Some(tracked_identity);
+            entry
+                .runtime
+                .set_codex_process_identity_for_test(Some(replacement_identity));
+        }
+
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(!terminal.codex_session_active);
+        assert_eq!(terminal.codex_process_identity, Some(tracked_identity));
+        assert!(terminal.codex_process_missing_since.is_some());
+    }
+
+    #[test]
+    fn codex_tracked_identity_survives_temporary_probe_unavailability() {
+        let ctx = Context::default();
+        let tracked_identity = TrackedProcessIdentity {
+            pid: 5006,
+            creation_time: Some(6006),
+        };
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+            entry.codex_process_identity = Some(tracked_identity);
+            entry.runtime.set_codex_process_probe_unavailable_for_test();
+        }
+
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+        assert!(terminal.codex_session_active);
+        assert_eq!(terminal.codex_process_identity, Some(tracked_identity));
+        assert!(terminal.codex_process_missing_since.is_none());
+    }
+
+    #[test]
+    fn codex_launch_pending_clears_after_grace_when_process_is_still_missing() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Inactive;
+            entry.codex_launch_pending_since =
+                Some(Instant::now() - Duration::from_millis(CODEX_LAUNCH_GRACE_MS + 25));
+            entry.codex_launch_process_baseline = Some(Vec::new());
+            entry.runtime.set_codex_process_active_for_test(Some(false));
+        }
+
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, None);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(!terminal.codex_session_active);
+        assert!(terminal.codex_launch_pending_since.is_none());
+        assert!(terminal.codex_process_missing_since.is_none());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn codex_process_poll_keeps_expired_launch_when_process_probe_is_unsupported() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Inactive;
+            entry.codex_launch_pending_since =
+                Some(Instant::now() - Duration::from_millis(CODEX_LAUNCH_GRACE_MS + 25));
+        }
+
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(terminal.codex_launch_pending_since.is_some());
+        assert!(!terminal.codex_session_active);
+        assert!(terminal.codex_process_missing_since.is_none());
+    }
+
+    #[test]
+    fn codex_notify_inbox_poll_updates_attention() {
+        let ctx = Context::default();
+        let temp_dir = TestTempDir::new("codex-notify-inbox");
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.codex_cli_runtime_dir = Some(temp_dir.path.clone());
+
+        write_test_codex_notify_events(
+            &temp_dir.path,
+            1,
+            &test_codex_inbox_token(1),
+            &[test_codex_notify_event(
+                1,
+                &test_codex_inbox_token(1),
+                "attention",
+            )],
+        );
+
+        app.poll_codex_notify_inboxes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert!(terminal.codex_session_active);
+        assert_eq!(
+            terminal.codex_last_status_source,
+            Some(CodexCliStatusSource::Notify)
+        );
+    }
+
+    #[test]
+    fn codex_notify_inbox_ignores_events_from_other_token() {
+        let ctx = Context::default();
+        let temp_dir = TestTempDir::new("codex-notify-inbox-other-token");
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.codex_cli_runtime_dir = Some(temp_dir.path.clone());
+
+        write_test_codex_notify_events(
+            &temp_dir.path,
+            1,
+            "other-codex-token",
+            &[test_codex_notify_event(1, "other-codex-token", "attention")],
+        );
+
+        app.poll_codex_notify_inboxes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, None);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(!terminal.codex_session_active);
+    }
+
+    #[test]
+    fn reset_codex_notify_inbox_removes_only_current_tokenized_file() {
+        let temp_dir = TestTempDir::new("codex-notify-reset");
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.codex_cli_runtime_dir = Some(temp_dir.path.clone());
+
+        let current_path =
+            AdeApp::codex_notify_inbox_path_for_dir(&temp_dir.path, 1, &test_codex_inbox_token(1));
+        let other_path = AdeApp::codex_notify_inbox_path_for_dir(&temp_dir.path, 1, "other-token");
+        fs::write(&current_path, "current\n").expect("write current inbox");
+        fs::write(&other_path, "other\n").expect("write other inbox");
+
+        app.reset_codex_notify_inbox(1);
+
+        assert!(!current_path.exists());
+        assert!(other_path.exists());
+    }
+
+    #[test]
+    fn codex_attention_stays_visible_after_process_exit_grace() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_codex_attention(&mut app, 1);
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.runtime.set_codex_process_identity_for_test(None);
+            entry.codex_process_missing_since =
+                Some(Instant::now() - Duration::from_millis(CODEX_TRAILING_OUTPUT_GRACE_MS + 25));
+        }
+
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert!(!terminal.codex_session_active);
+        assert!(terminal.codex_process_missing_since.is_none());
+        assert!(terminal.codex_process_identity.is_none());
+        assert_eq!(
+            terminal.codex_last_status_source,
+            Some(CodexCliStatusSource::Notify)
+        );
+    }
+
+    #[test]
+    fn sticky_codex_attention_is_cleared_by_user_interaction() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_codex_attention(&mut app, 1);
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.runtime.set_codex_process_identity_for_test(None);
+            entry.codex_process_missing_since =
+                Some(Instant::now() - Duration::from_millis(CODEX_TRAILING_OUTPUT_GRACE_MS + 25));
+        }
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(&ctx);
+
+        app.route_active_terminal_input(&ctx, vec![Event::Text("continue".to_owned())]);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, None);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(!terminal.codex_session_active);
+        assert!(terminal.codex_process_identity.is_none());
+        assert!(terminal.codex_process_missing_since.is_none());
+        assert_eq!(terminal.codex_last_status_source, None);
+    }
+
+    #[test]
+    fn sticky_codex_attention_does_not_reprobe_unrelated_node_after_grace() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_codex_attention(&mut app, 1);
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.runtime.set_codex_process_identity_for_test(None);
+            entry.codex_process_missing_since =
+                Some(Instant::now() - Duration::from_millis(CODEX_TRAILING_OUTPUT_GRACE_MS + 25));
+        }
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(&ctx);
+
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry
+                .runtime
+                .set_codex_process_identity_for_test(Some(TrackedProcessIdentity {
+                    pid: 5009,
+                    creation_time: Some(6009),
+                }));
+        }
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert!(!terminal.codex_session_active);
+        assert!(terminal.codex_process_identity.is_none());
+        assert!(terminal.codex_process_missing_since.is_none());
+    }
+
+    #[test]
+    fn codex_bell_is_deduped_after_notify_attention() {
+        let ctx = Context::default();
+        let temp_dir = TestTempDir::new("codex-notify-bell-dedupe");
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.codex_cli_runtime_dir = Some(temp_dir.path.clone());
+
+        write_test_codex_notify_events(
+            &temp_dir.path,
+            1,
+            &test_codex_inbox_token(1),
+            &[test_codex_notify_event(
+                1,
+                &test_codex_inbox_token(1),
+                "attention",
+            )],
+        );
+        app.poll_codex_notify_inboxes(&ctx);
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "[bell]".to_owned(),
+                },
+            })
+            .expect("send codex bell chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.codex_last_status_source,
+            Some(CodexCliStatusSource::Notify)
+        );
+    }
+
+    #[test]
+    fn process_terminal_events_clears_codex_state_on_exit() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_codex_attention(&mut app, 1);
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.codex_launch_pending_since = Some(Instant::now());
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::Exit,
+            })
+            .expect("send exit event");
+
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(terminal.exited);
+        assert_eq!(terminal.ai_session.tool, None);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(!terminal.codex_session_active);
+        assert!(terminal.codex_launch_pending_since.is_none());
+    }
+
+    #[test]
     fn event_terminal_navigation_shortcut_accepts_egui_command_alias_for_ctrl() {
         let shortcut = AdeApp::event_terminal_navigation_shortcut(&Event::Key {
             key: Key::ArrowDown,
@@ -12130,6 +14109,33 @@ mod tests {
             up,
             Some(TerminalNavigationShortcut::SingleViewLinear(
                 TerminalNavigationDirection::Up,
+            ))
+        );
+    }
+
+    #[test]
+    fn active_terminal_navigation_shortcut_maps_ctrl_vertical_arrows_by_view_mode() {
+        let ctrl_down = Event::Key {
+            key: Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        };
+
+        assert_eq!(
+            AdeApp::active_terminal_navigation_shortcut(&ctrl_down, true),
+            Some(TerminalNavigationShortcut::SingleViewLinear(
+                TerminalNavigationDirection::Down,
+            ))
+        );
+        assert_eq!(
+            AdeApp::active_terminal_navigation_shortcut(&ctrl_down, false),
+            Some(TerminalNavigationShortcut::Grid(
+                TerminalNavigationDirection::Down,
             ))
         );
     }
@@ -12212,6 +14218,7 @@ mod tests {
             ui: crate::models::UiConfig {
                 project_explorer_expanded: false,
                 multi_terminal_view_enabled: true,
+                terminal_manager_filter: TerminalManagerFilter::Background,
                 last_selected_project_id: Some(loaded_project.id),
                 ..boot_failed_current_config().ui
             },
@@ -12231,6 +14238,10 @@ mod tests {
         assert!(!recovered.ui.project_explorer_expanded);
         assert!(recovered.ui.multi_terminal_view_enabled);
         assert_eq!(
+            recovered.ui.terminal_manager_filter,
+            TerminalManagerFilter::Background
+        );
+        assert_eq!(
             recovered.ui.last_selected_project_id,
             Some(loaded_project.id)
         );
@@ -12245,12 +14256,14 @@ mod tests {
         let loaded_config = AppConfig {
             ui: crate::models::UiConfig {
                 multi_terminal_view_enabled: true,
+                terminal_manager_filter: TerminalManagerFilter::Background,
                 ..crate::models::UiConfig::default()
             },
             ..AppConfig::default()
         };
         let mut current_config = boot_failed_current_config();
         current_config.ui.multi_terminal_view_enabled = false;
+        current_config.ui.terminal_manager_filter = TerminalManagerFilter::Foreground;
 
         let recovered = recover_config_state(
             &current_config,
@@ -12264,6 +14277,10 @@ mod tests {
         );
 
         assert!(!recovered.ui.multi_terminal_view_enabled);
+        assert_eq!(
+            recovered.ui.terminal_manager_filter,
+            TerminalManagerFilter::Foreground
+        );
     }
 
     #[test]
@@ -12500,6 +14517,16 @@ mod tests {
         test_terminal_entry_with_runtime(id, project_id, test_terminal_runtime())
     }
 
+    fn test_terminal_entry_with_kind(
+        id: u64,
+        project_id: u64,
+        kind: TerminalKind,
+    ) -> TerminalEntry {
+        let mut terminal = test_terminal_entry(id, project_id);
+        terminal.kind = kind;
+        terminal
+    }
+
     fn test_terminal_entry_with_runtime(
         id: u64,
         project_id: u64,
@@ -12529,11 +14556,19 @@ mod tests {
             runtime,
             ai_session: AiCliSession::default(),
             factory_droid_inbox_token: Some(test_factory_droid_inbox_token(id)),
+            codex_notify_inbox_token: Some(test_codex_inbox_token(id)),
             factory_droid_launch_pending_since: None,
             factory_droid_session_active: false,
             factory_droid_last_process_seen_at: None,
             factory_droid_process_missing_since: None,
             factory_droid_last_status_source: None,
+            codex_launch_pending_since: None,
+            codex_launch_process_baseline: None,
+            codex_session_active: false,
+            codex_process_identity: None,
+            codex_last_process_seen_at: None,
+            codex_process_missing_since: None,
+            codex_last_status_source: None,
         }
     }
 
@@ -12569,6 +14604,11 @@ mod tests {
             factory_droid_hook_inboxes: BTreeMap::new(),
             factory_droid_hook_last_poll_at: None,
             factory_droid_process_last_poll_at: None,
+            codex_cli_runtime_dir: None,
+            codex_cli_runtime_dir_error: None,
+            codex_notify_inboxes: BTreeMap::new(),
+            codex_notify_last_poll_at: None,
+            codex_process_last_poll_at: None,
             config: AppConfig::default(),
             config_load_error: None,
             config_save_requires_reload: false,
@@ -12587,6 +14627,7 @@ mod tests {
             terminal_events_tx,
             terminal_events_rx,
             show_settings_popup: false,
+            settings_diagnostics_expanded: false,
             saved_message_drafts: BTreeMap::new(),
             directory_search_query: String::new(),
             directory_pending_tree_open_state_by_project: BTreeMap::new(),
@@ -12624,6 +14665,17 @@ mod tests {
         app
     }
 
+    fn snapshot_codex_launch_baseline(
+        app: &AdeApp,
+        terminal_id: u64,
+    ) -> Option<Vec<TrackedProcessIdentity>> {
+        app.terminals
+            .get(&terminal_id)
+            .expect("terminal")
+            .runtime
+            .snapshot_codex_descendant_processes()
+    }
+
     fn seed_ai_attention(app: &mut AdeApp, terminal_id: u64) {
         let Some(manager) = app.ai_hook_manager.as_ref().cloned() else {
             panic!("expected ai hook manager");
@@ -12641,8 +14693,32 @@ mod tests {
         }
     }
 
+    fn seed_codex_attention(app: &mut AdeApp, terminal_id: u64) {
+        let Some(manager) = app.ai_hook_manager.as_ref().cloned() else {
+            panic!("expected ai hook manager");
+        };
+
+        manager.set_tool(terminal_id, AiCliTool::CodexCli);
+        let _ = manager.ai_waiting_for_user(terminal_id);
+
+        if let Some(entry) = app.terminals.get_mut(&terminal_id) {
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Attention;
+            entry.codex_session_active = true;
+            entry.codex_process_identity = Some(TrackedProcessIdentity {
+                pid: 7001,
+                creation_time: Some(8001),
+            });
+            entry.codex_last_status_source = Some(CodexCliStatusSource::Notify);
+        }
+    }
+
     fn test_factory_droid_inbox_token(terminal_id: u64) -> String {
         format!("test-inbox-token-{terminal_id}")
+    }
+
+    fn test_codex_inbox_token(terminal_id: u64) -> String {
+        format!("test-codex-inbox-token-{terminal_id}")
     }
 
     struct TestTempDir {
@@ -12749,6 +14825,40 @@ mod tests {
             payload.push('\n');
         }
         fs::write(path, payload).expect("write hook inbox");
+    }
+
+    fn test_codex_notify_event(
+        terminal_id: u64,
+        inbox_token: &str,
+        status: &str,
+    ) -> CodexNotifyInboxEvent {
+        CodexNotifyInboxEvent {
+            terminal_id: terminal_id.to_string(),
+            tool: "codex".to_owned(),
+            status: status.to_owned(),
+            inbox_token: Some(inbox_token.to_owned()),
+            event_kind: Some(match status {
+                "attention" => "agent-turn-complete".to_owned(),
+                _ => "unknown".to_owned(),
+            }),
+            raw_json: format!("{{\"event\":\"{status}\"}}"),
+            timestamp_utc: "2026-04-06T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn write_test_codex_notify_events(
+        dir: &std::path::Path,
+        terminal_id: u64,
+        inbox_token: &str,
+        events: &[CodexNotifyInboxEvent],
+    ) {
+        let path = AdeApp::codex_notify_inbox_path_for_dir(dir, terminal_id, inbox_token);
+        let mut payload = String::new();
+        for event in events {
+            payload.push_str(&serde_json::to_string(event).expect("serialize codex notify event"));
+            payload.push('\n');
+        }
+        fs::write(path, payload).expect("write codex notify inbox");
     }
 
     #[test]
@@ -13098,7 +15208,6 @@ mod tests {
             Stroke::new(1.0, super::with_alpha(super::ACCENT, 220))
         );
         assert_eq!(chrome.title_color, Color32::from_rgb(244, 251, 255));
-        assert_eq!(chrome.icon_color, Color32::from_rgb(132, 214, 255));
     }
 
     #[test]
@@ -13111,7 +15220,6 @@ mod tests {
             chrome.title_color,
             super::with_alpha(super::TEXT_PRIMARY, 210)
         );
-        assert_eq!(chrome.icon_color, super::with_alpha(super::TEXT_MUTED, 200));
     }
 
     #[test]
@@ -13536,12 +15644,10 @@ mod tests {
     }
 
     #[test]
-    fn draw_terminal_status_badges_places_ai_before_source_control_when_active() {
+    fn draw_terminal_status_badges_places_ai_before_following_content_when_active() {
         let ctx = Context::default();
         ctx.set_fonts(FontDefinitions::default());
 
-        let source_control_badge =
-            source_control_badge_model(Some(&test_source_control_snapshot("main", &[])));
         let running_badge = AiBadgeModel {
             tool: Some(AiCliTool::FactoryDroid),
             status: AiCliStatus::Running,
@@ -13552,18 +15658,18 @@ mod tests {
         let _ = ctx.run(RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    let layout =
-                        draw_terminal_status_badges(ui, &running_badge, &source_control_badge);
+                    let layout = draw_terminal_status_badges(ui, &running_badge);
+                    let title_rect = ui.label("terminal title").rect;
                     observed = Some((
                         layout.ai_rect.expect("expected visible ai badge"),
-                        layout.source_control_rect,
+                        title_rect,
                     ));
                 });
             });
         });
 
-        let (ai_rect, source_control_rect) = observed.expect("expected badge layout");
-        assert!(ai_rect.center().x < source_control_rect.center().x);
+        let (ai_rect, title_rect) = observed.expect("expected badge layout");
+        assert!(ai_rect.center().x < title_rect.min.x);
     }
 
     #[test]
@@ -13571,8 +15677,6 @@ mod tests {
         let ctx = Context::default();
         ctx.set_fonts(FontDefinitions::default());
 
-        let source_control_badge =
-            source_control_badge_model(Some(&test_source_control_snapshot("main", &[])));
         let inactive_badge = AiBadgeModel {
             tool: Some(AiCliTool::FactoryDroid),
             status: AiCliStatus::Inactive,
@@ -13584,28 +15688,22 @@ mod tests {
         let _ = ctx.run(RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    let layout =
-                        draw_terminal_status_badges(ui, &inactive_badge, &source_control_badge);
-                    observed = Some((layout.ai_rect, layout.source_control_rect.min.x));
+                    let layout = draw_terminal_status_badges(ui, &inactive_badge);
+                    observed = Some((layout.ai_rect, ui.label("terminal title").rect.min.x));
                 });
             });
         });
         let _ = ctx.run(RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    direct_x = Some(
-                        draw_source_control_badge(ui, &source_control_badge)
-                            .rect
-                            .min
-                            .x,
-                    );
+                    direct_x = Some(ui.label("terminal title").rect.min.x);
                 });
             });
         });
 
-        let (ai_rect, source_control_x) = observed.expect("expected badge layout");
+        let (ai_rect, title_x) = observed.expect("expected badge layout");
         assert_eq!(ai_rect, None);
-        assert!((source_control_x - direct_x.expect("expected source control badge")).abs() < 0.5);
+        assert!((title_x - direct_x.expect("expected direct title")).abs() < 0.5);
     }
 
     #[test]

@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::codex::codex_env_pairs;
 use crate::hooks::{AiCliStatus, AiCliTool, AiHookEvent};
 use crate::hooks::{
     AiHookManager, FACTORY_DROID_HOOKS_DIR_ENV_VAR, FACTORY_DROID_HOOK_INBOX_TOKEN_ENV_VAR,
@@ -271,6 +272,10 @@ pub struct TerminalRuntime {
     job_handle: Mutex<Option<WinHandle>>,
     #[cfg(test)]
     forced_factory_droid_process_active: Option<bool>,
+    #[cfg(test)]
+    forced_codex_process_probe: Mutex<Option<TestCodexProcessProbe>>,
+    #[cfg(test)]
+    queued_codex_process_probe_after_next_input: Mutex<Option<TestCodexProcessProbe>>,
 }
 
 enum RuntimeCommand {
@@ -323,6 +328,25 @@ struct ProcessSnapshotEntry {
     parent_pid: u32,
     creation_time: Option<u64>,
     executable_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackedProcessIdentity {
+    pub pid: u32,
+    pub creation_time: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NamedTrackedProcessIdentity {
+    identity: TrackedProcessIdentity,
+    executable_name: String,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TestCodexProcessProbe {
+    Unavailable,
+    Descendants(Vec<NamedTrackedProcessIdentity>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -402,6 +426,8 @@ impl TerminalRuntime {
         ai_hook_manager: Option<Arc<AiHookManager>>,
         factory_droid_hooks_dir: Option<PathBuf>,
         factory_droid_inbox_token: Option<String>,
+        codex_cli_runtime_dir: Option<PathBuf>,
+        codex_notify_inbox_token: Option<String>,
     ) -> io::Result<Self> {
         let pty_system = native_pty_system();
         let pty_pair = pty_system
@@ -424,6 +450,17 @@ impl TerminalRuntime {
             factory_droid_inbox_token.as_deref(),
         ) {
             for (name, value) in factory_droid_hook_env_pairs(terminal_id, hooks_dir, inbox_token) {
+                command.env(name, value);
+            }
+        }
+        if let (Some(_), Some(codex_runtime_dir), Some(codex_notify_inbox_token)) = (
+            &ai_hook_manager,
+            codex_cli_runtime_dir.as_deref(),
+            codex_notify_inbox_token.as_deref(),
+        ) {
+            for (name, value) in
+                codex_env_pairs(terminal_id, codex_runtime_dir, codex_notify_inbox_token)
+            {
                 command.env(name, value);
             }
         }
@@ -518,6 +555,10 @@ impl TerminalRuntime {
             job_handle: Mutex::new(job_handle),
             #[cfg(test)]
             forced_factory_droid_process_active: None,
+            #[cfg(test)]
+            forced_codex_process_probe: Mutex::new(None),
+            #[cfg(test)]
+            queued_codex_process_probe_after_next_input: Mutex::new(None),
         })
     }
 
@@ -525,6 +566,9 @@ impl TerminalRuntime {
         if bytes.is_empty() {
             return;
         }
+
+        #[cfg(test)]
+        self.apply_queued_codex_process_probe_after_next_input_for_test();
 
         let _ = self.command_tx.send(RuntimeCommand::Input(bytes));
     }
@@ -632,6 +676,104 @@ impl TerminalRuntime {
                 self.child_creation_time,
                 &["droid.exe", "factory.exe"],
             ));
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            None
+        }
+    }
+
+    pub fn snapshot_codex_descendant_processes(&self) -> Option<Vec<TrackedProcessIdentity>> {
+        #[cfg(test)]
+        if let Some(forced_probe) = self.forced_codex_process_probe_for_test() {
+            return match forced_probe {
+                TestCodexProcessProbe::Unavailable => None,
+                TestCodexProcessProbe::Descendants(descendants) => {
+                    Some(descendants.iter().map(|entry| entry.identity).collect())
+                }
+            };
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let Ok(snapshot) = snapshot_processes() else {
+                return None;
+            };
+            return codex_named_descendant_processes(
+                &snapshot,
+                self.child_pid,
+                self.child_creation_time,
+            )
+            .map(|descendants| {
+                descendants
+                    .into_iter()
+                    .map(|entry| entry.identity)
+                    .collect()
+            });
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            None
+        }
+    }
+
+    pub fn detect_new_codex_descendant_process(
+        &self,
+        baseline: &[TrackedProcessIdentity],
+    ) -> Option<Option<TrackedProcessIdentity>> {
+        #[cfg(test)]
+        if let Some(forced_probe) = self.forced_codex_process_probe_for_test() {
+            return match forced_probe {
+                TestCodexProcessProbe::Unavailable => None,
+                TestCodexProcessProbe::Descendants(descendants) => {
+                    Some(select_new_codex_descendant_process(&descendants, baseline))
+                }
+            };
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let Ok(snapshot) = snapshot_processes() else {
+                return None;
+            };
+            return codex_named_descendant_processes(
+                &snapshot,
+                self.child_pid,
+                self.child_creation_time,
+            )
+            .map(|descendants| select_new_codex_descendant_process(&descendants, baseline));
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            None
+        }
+    }
+
+    pub fn tracked_codex_process_present(&self, identity: TrackedProcessIdentity) -> Option<bool> {
+        #[cfg(test)]
+        if let Some(forced_probe) = self.forced_codex_process_probe_for_test() {
+            return match forced_probe {
+                TestCodexProcessProbe::Unavailable => None,
+                TestCodexProcessProbe::Descendants(descendants) => {
+                    Some(descendants.iter().any(|entry| entry.identity == identity))
+                }
+            };
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let Ok(snapshot) = snapshot_processes() else {
+                return None;
+            };
+            return descendant_process_identity_present(
+                &snapshot,
+                self.child_pid,
+                self.child_creation_time,
+                identity,
+            );
         }
 
         #[cfg(not(target_os = "windows"))]
@@ -758,6 +900,10 @@ pub(crate) fn test_terminal_runtime() -> TerminalRuntime {
         job_handle: Mutex::new(None),
         #[cfg(test)]
         forced_factory_droid_process_active: None,
+        #[cfg(test)]
+        forced_codex_process_probe: Mutex::new(None),
+        #[cfg(test)]
+        queued_codex_process_probe_after_next_input: Mutex::new(None),
     }
 }
 
@@ -821,6 +967,10 @@ pub(crate) fn test_terminal_runtime_with_capture() -> (TerminalRuntime, TestTerm
             job_handle: Mutex::new(None),
             #[cfg(test)]
             forced_factory_droid_process_active: None,
+            #[cfg(test)]
+            forced_codex_process_probe: Mutex::new(None),
+            #[cfg(test)]
+            queued_codex_process_probe_after_next_input: Mutex::new(None),
         },
         TestTerminalRuntimeCapture {
             command_rx,
@@ -838,8 +988,101 @@ impl TerminalRuntime {
         }
     }
 
+    fn set_forced_codex_process_probe_for_test(&self, probe: Option<TestCodexProcessProbe>) {
+        if let Ok(mut forced_probe) = self.forced_codex_process_probe.lock() {
+            *forced_probe = probe;
+        }
+    }
+
+    fn forced_codex_process_probe_for_test(&self) -> Option<TestCodexProcessProbe> {
+        self.forced_codex_process_probe
+            .lock()
+            .ok()
+            .and_then(|forced_probe| forced_probe.clone())
+    }
+
+    fn apply_queued_codex_process_probe_after_next_input_for_test(&self) {
+        let queued_probe = self
+            .queued_codex_process_probe_after_next_input
+            .lock()
+            .ok()
+            .and_then(|mut queued_probe| queued_probe.take());
+        if let Some(queued_probe) = queued_probe {
+            self.set_forced_codex_process_probe_for_test(Some(queued_probe));
+        }
+    }
+
     pub(crate) fn set_factory_droid_process_active_for_test(&mut self, active: Option<bool>) {
         self.forced_factory_droid_process_active = active;
+    }
+
+    pub(crate) fn set_codex_process_active_for_test(&mut self, active: Option<bool>) {
+        self.set_forced_codex_process_probe_for_test(active.map(|active| {
+            TestCodexProcessProbe::Descendants(
+                active
+                    .then_some(vec![NamedTrackedProcessIdentity {
+                        identity: TrackedProcessIdentity {
+                            pid: 4101,
+                            creation_time: Some(9101),
+                        },
+                        executable_name: "node.exe".to_owned(),
+                    }])
+                    .unwrap_or_default(),
+            )
+        }));
+    }
+
+    pub(crate) fn set_codex_process_identity_for_test(
+        &mut self,
+        identity: Option<TrackedProcessIdentity>,
+    ) {
+        self.set_forced_codex_process_probe_for_test(Some(TestCodexProcessProbe::Descendants(
+            identity
+                .into_iter()
+                .map(|identity| NamedTrackedProcessIdentity {
+                    identity,
+                    executable_name: "node.exe".to_owned(),
+                })
+                .collect(),
+        )));
+    }
+
+    pub(crate) fn set_codex_descendant_processes_for_test(
+        &mut self,
+        descendants: Option<Vec<(TrackedProcessIdentity, &str)>>,
+    ) {
+        self.set_forced_codex_process_probe_for_test(descendants.map(|descendants| {
+            TestCodexProcessProbe::Descendants(
+                descendants
+                    .into_iter()
+                    .map(|(identity, executable_name)| NamedTrackedProcessIdentity {
+                        identity,
+                        executable_name: executable_name.to_owned(),
+                    })
+                    .collect(),
+            )
+        }));
+    }
+
+    pub(crate) fn queue_codex_descendant_processes_after_next_input_for_test(
+        &self,
+        descendants: Vec<(TrackedProcessIdentity, &str)>,
+    ) {
+        if let Ok(mut queued_probe) = self.queued_codex_process_probe_after_next_input.lock() {
+            *queued_probe = Some(TestCodexProcessProbe::Descendants(
+                descendants
+                    .into_iter()
+                    .map(|(identity, executable_name)| NamedTrackedProcessIdentity {
+                        identity,
+                        executable_name: executable_name.to_owned(),
+                    })
+                    .collect(),
+            ));
+        }
+    }
+
+    pub(crate) fn set_codex_process_probe_unavailable_for_test(&mut self) {
+        self.set_forced_codex_process_probe_for_test(Some(TestCodexProcessProbe::Unavailable));
     }
 }
 
@@ -1140,6 +1383,116 @@ fn has_named_descendant_process(
     })
 }
 
+fn named_descendant_processes(
+    entries: &[ProcessSnapshotEntry],
+    root_pid: Option<u32>,
+    expected_root_creation_time: Option<u64>,
+    expected_names: &[&str],
+) -> Option<Vec<NamedTrackedProcessIdentity>> {
+    let root_pid = root_pid?;
+    let descendants =
+        verified_process_tree_descendants(entries, root_pid, expected_root_creation_time)?;
+
+    Some(
+        descendants
+            .into_iter()
+            .filter_map(|entry| {
+                let executable_name = entry.executable_name?;
+                expected_names
+                    .iter()
+                    .any(|candidate| executable_name.eq_ignore_ascii_case(candidate))
+                    .then_some(NamedTrackedProcessIdentity {
+                        identity: TrackedProcessIdentity {
+                            pid: entry.pid,
+                            creation_time: entry.creation_time,
+                        },
+                        executable_name,
+                    })
+            })
+            .collect(),
+    )
+}
+
+fn codex_named_descendant_processes(
+    entries: &[ProcessSnapshotEntry],
+    root_pid: Option<u32>,
+    expected_root_creation_time: Option<u64>,
+) -> Option<Vec<NamedTrackedProcessIdentity>> {
+    named_descendant_processes(
+        entries,
+        root_pid,
+        expected_root_creation_time,
+        &["codex.exe", "node.exe"],
+    )
+}
+
+fn select_new_codex_descendant_process(
+    descendants: &[NamedTrackedProcessIdentity],
+    baseline: &[TrackedProcessIdentity],
+) -> Option<TrackedProcessIdentity> {
+    let is_new_descendant =
+        |entry: &&NamedTrackedProcessIdentity| !baseline.contains(&entry.identity);
+    let candidate_key = |entry: &&NamedTrackedProcessIdentity| {
+        (
+            entry.identity.creation_time.unwrap_or(u64::MAX),
+            entry.identity.pid,
+        )
+    };
+
+    descendants
+        .iter()
+        .filter(is_new_descendant)
+        .filter(|entry| entry.executable_name.eq_ignore_ascii_case("codex.exe"))
+        .min_by_key(candidate_key)
+        .map(|entry| entry.identity)
+        .or_else(|| {
+            descendants
+                .iter()
+                .filter(is_new_descendant)
+                .filter(|entry| entry.executable_name.eq_ignore_ascii_case("node.exe"))
+                .min_by_key(candidate_key)
+                .map(|entry| entry.identity)
+        })
+}
+
+#[cfg(test)]
+fn has_descendant_process_identity(
+    entries: &[ProcessSnapshotEntry],
+    root_pid: Option<u32>,
+    expected_root_creation_time: Option<u64>,
+    identity: TrackedProcessIdentity,
+) -> bool {
+    let Some(root_pid) = root_pid else {
+        return false;
+    };
+
+    let Some(descendants) =
+        verified_process_tree_descendants(entries, root_pid, expected_root_creation_time)
+    else {
+        return false;
+    };
+
+    descendants
+        .iter()
+        .any(|entry| entry.pid == identity.pid && entry.creation_time == identity.creation_time)
+}
+
+fn descendant_process_identity_present(
+    entries: &[ProcessSnapshotEntry],
+    root_pid: Option<u32>,
+    expected_root_creation_time: Option<u64>,
+    identity: TrackedProcessIdentity,
+) -> Option<bool> {
+    let root_pid = root_pid?;
+    let descendants =
+        verified_process_tree_descendants(entries, root_pid, expected_root_creation_time)?;
+    Some(
+        descendants.iter().any(|entry| {
+            entry.pid == identity.pid && entry.creation_time == identity.creation_time
+        }),
+    )
+}
+
 #[cfg(target_os = "windows")]
 fn snapshot_processes() -> io::Result<Vec<ProcessSnapshotEntry>> {
     unsafe {
@@ -1251,6 +1604,7 @@ struct PendingOscTitle {
 }
 
 impl PendingOscTitle {
+    #[cfg(test)]
     fn extract_from_bytes(&mut self, bytes: &[u8]) -> Option<String> {
         self.extract_from_bytes_with_end_offset(bytes)
             .map(|(title, _)| title)
@@ -1306,6 +1660,7 @@ impl PendingOscTitle {
     }
 }
 
+#[cfg(test)]
 fn extract_complete_title_from_bytes(bytes: &[u8]) -> Option<String> {
     extract_complete_title_from_bytes_with_end_offset(bytes).map(|(title, _)| title)
 }
@@ -1362,6 +1717,7 @@ fn find_incomplete_osc_title_start(bytes: &[u8]) -> Option<usize> {
     None
 }
 
+#[cfg(test)]
 fn official_ai_debug_chunk(text: &str) -> Option<String> {
     official_ai_debug_chunk_with_end_offset(text).map(|(chunk, _)| chunk)
 }
@@ -1389,6 +1745,7 @@ struct PendingVisibleFactoryStatus {
 }
 
 impl PendingVisibleFactoryStatus {
+    #[cfg(test)]
     fn extract_from_text(&mut self, text: &str) -> Option<String> {
         self.extract_from_text_with_end_offset(text)
             .map(|(status, _)| status)
@@ -1597,7 +1954,9 @@ fn collect_ai_read_signals(
         })
         .collect::<Vec<_>>();
 
+    let mut title_bell_offset = None;
     if let Some((title, end_offset)) = pending_osc_title.extract_from_bytes_with_end_offset(bytes) {
+        title_bell_offset = end_offset.checked_sub(1);
         if let Some((tool, status, event)) = manager.update_from_title(terminal_id, &title) {
             signals.push(PendingAiReadSignal {
                 text_offset: end_offset.min(text.len()),
@@ -1615,6 +1974,23 @@ fn collect_ai_read_signals(
         signals.push(PendingAiReadSignal {
             text_offset: end_offset.min(text.len()),
             kind: PendingAiReadSignalKind::RawChunk { chunk },
+        });
+    }
+
+    let bell_offsets = bytes
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, byte)| {
+            (*byte == 0x07 && Some(offset) != title_bell_offset).then_some(offset)
+        })
+        .collect::<Vec<_>>();
+
+    for offset in bell_offsets {
+        signals.push(PendingAiReadSignal {
+            text_offset: offset.min(text.len()),
+            kind: PendingAiReadSignalKind::RawChunk {
+                chunk: "[bell]".to_owned(),
+            },
         });
     }
 
@@ -2423,18 +2799,24 @@ fn io_error_from_anyhow(err: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        begin_termination, best_effort_terminate_entries, collect_ai_read_signals, default_style,
-        extract_complete_title_from_bytes, factory_droid_hook_env_pairs,
+        begin_termination, best_effort_terminate_entries, codex_named_descendant_processes,
+        collect_ai_read_signals, default_style, extract_complete_title_from_bytes,
+        factory_droid_hook_env_pairs, has_descendant_process_identity,
         has_named_descendant_process, is_benign_process_exit_error, official_ai_debug_chunk,
         process_tree_kill_order, root_process_termination_plan, sanitize_cell_text,
-        selection_snapshot_from_terminal, snapshot_from_terminal, snapshots_from_terminal,
-        test_terminal_runtime, trim_trailing_default_cells, verified_process_entry,
-        verified_process_tree_descendants, verified_snapshot_root_process, AdeTerminalConfig,
-        PendingAiReadSignalKind, PendingOscTitle, PendingVisibleFactoryStatus,
-        ProcessSnapshotEntry, RootProcessTerminationPlan, RuntimeCommand, SharedWriter,
-        SharedWriterHandle, TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape,
-        TerminalDimensions, TerminalRuntime, TerminalSelectionHyperlink, TerminalStyle,
-        TerminalStyledCell, VerifiedProcessLookup, MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS,
+        select_new_codex_descendant_process, selection_snapshot_from_terminal,
+        snapshot_from_terminal, snapshots_from_terminal, test_terminal_runtime,
+        trim_trailing_default_cells, verified_process_entry, verified_process_tree_descendants,
+        verified_snapshot_root_process, AdeTerminalConfig, PendingAiReadSignalKind,
+        PendingOscTitle, PendingVisibleFactoryStatus, ProcessSnapshotEntry,
+        RootProcessTerminationPlan, RuntimeCommand, SharedWriter, SharedWriterHandle,
+        TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape, TerminalDimensions,
+        TerminalRuntime, TerminalSelectionHyperlink, TerminalStyle, TerminalStyledCell,
+        TrackedProcessIdentity, VerifiedProcessLookup, MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS,
+    };
+    use crate::codex::{
+        codex_env_pairs, MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR, MERGEN_AI_INBOX_DIR_ENV_VAR,
+        MERGEN_AI_TOOL_HINT_CODEX, MERGEN_AI_TOOL_HINT_ENV_VAR, MERGEN_TERMINAL_ID_ENV_VAR,
     };
     use crate::hooks::{
         AiCliStatus, AiHooksConfig, FACTORY_DROID_HOOKS_DIR_ENV_VAR,
@@ -2690,6 +3072,177 @@ mod tests {
         assert_eq!(pairs[2].1, OsString::from("test-inbox-token"));
     }
 
+    #[test]
+    fn codex_env_pairs_include_terminal_id_inbox_dir_tool_hint_and_token() {
+        let inbox_dir =
+            Path::new(r"C:\Users\furkan.cakir\AppData\Roaming\Mergen\MergenADE\runtime\codex-cli");
+        let pairs = codex_env_pairs(29, inbox_dir, "codex-token-29");
+
+        assert_eq!(pairs[0].0, MERGEN_TERMINAL_ID_ENV_VAR);
+        assert_eq!(pairs[0].1, OsString::from("29"));
+        assert_eq!(pairs[1].0, MERGEN_AI_INBOX_DIR_ENV_VAR);
+        assert_eq!(pairs[1].1, inbox_dir.as_os_str());
+        assert_eq!(pairs[2].0, MERGEN_AI_TOOL_HINT_ENV_VAR);
+        assert_eq!(pairs[2].1, OsString::from(MERGEN_AI_TOOL_HINT_CODEX));
+        assert_eq!(pairs[3].0, MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR);
+        assert_eq!(pairs[3].1, OsString::from("codex-token-29"));
+    }
+
+    #[test]
+    fn collect_ai_read_signals_emits_bell_raw_chunk_without_title() {
+        let manager =
+            crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let mut pending_osc_title = PendingOscTitle::default();
+        let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+
+        let signals = collect_ai_read_signals(
+            1,
+            b"\x07",
+            &manager,
+            &mut pending_osc_title,
+            &mut pending_visible_factory_status,
+        );
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(
+            signals[0].kind,
+            PendingAiReadSignalKind::RawChunk {
+                chunk: "[bell]".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn collect_ai_read_signals_emits_bell_for_each_non_title_bell() {
+        let manager =
+            crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let mut pending_osc_title = PendingOscTitle::default();
+        let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+
+        let signals = collect_ai_read_signals(
+            1,
+            b"\x07\x07\x07",
+            &manager,
+            &mut pending_osc_title,
+            &mut pending_visible_factory_status,
+        );
+
+        assert_eq!(
+            signals
+                .iter()
+                .filter(|signal| matches!(
+                    &signal.kind,
+                    PendingAiReadSignalKind::RawChunk { chunk } if chunk == "[bell]"
+                ))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn collect_ai_read_signals_ignores_title_terminator_bell_without_extra_bell() {
+        let manager =
+            crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let mut pending_osc_title = PendingOscTitle::default();
+        let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+
+        let signals = collect_ai_read_signals(
+            1,
+            b"\x1b]0;[Idle]\x07",
+            &manager,
+            &mut pending_osc_title,
+            &mut pending_visible_factory_status,
+        );
+
+        assert!(signals.iter().any(|signal| matches!(
+            signal.kind,
+            PendingAiReadSignalKind::StatusChange {
+                from_title: true,
+                ..
+            }
+        )));
+        assert!(!signals.iter().any(|signal| matches!(
+            &signal.kind,
+            PendingAiReadSignalKind::RawChunk { chunk } if chunk == "[bell]"
+        )));
+    }
+
+    #[test]
+    fn collect_ai_read_signals_emits_bell_after_title_when_extra_bell_is_present() {
+        let manager =
+            crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let mut pending_osc_title = PendingOscTitle::default();
+        let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+
+        let signals = collect_ai_read_signals(
+            1,
+            b"\x1b]0;[Idle]\x07\x07",
+            &manager,
+            &mut pending_osc_title,
+            &mut pending_visible_factory_status,
+        );
+
+        assert!(signals.iter().any(|signal| matches!(
+            signal.kind,
+            PendingAiReadSignalKind::StatusChange {
+                from_title: true,
+                ..
+            }
+        )));
+        let title_index = signals.iter().position(|signal| {
+            matches!(
+                signal.kind,
+                PendingAiReadSignalKind::StatusChange {
+                    from_title: true,
+                    ..
+                }
+            )
+        });
+        let bell_index = signals.iter().position(|signal| {
+            matches!(
+                &signal.kind,
+                PendingAiReadSignalKind::RawChunk { chunk } if chunk == "[bell]"
+            )
+        });
+        assert!(title_index.is_some());
+        assert!(bell_index.is_some());
+        assert!(title_index.unwrap() < bell_index.unwrap());
+    }
+
+    #[test]
+    fn collect_ai_read_signals_ignores_title_terminator_bell_but_keeps_later_bells() {
+        let manager =
+            crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let mut pending_osc_title = PendingOscTitle::default();
+        let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+
+        let signals = collect_ai_read_signals(
+            1,
+            b"\x1b]0;[Idle]\x07\x07\x07",
+            &manager,
+            &mut pending_osc_title,
+            &mut pending_visible_factory_status,
+        );
+
+        assert!(signals.iter().any(|signal| matches!(
+            signal.kind,
+            PendingAiReadSignalKind::StatusChange {
+                from_title: true,
+                ..
+            }
+        )));
+        assert_eq!(
+            signals
+                .iter()
+                .filter(|signal| matches!(
+                    &signal.kind,
+                    PendingAiReadSignalKind::RawChunk { chunk } if chunk == "[bell]"
+                ))
+                .count(),
+            2
+        );
+    }
+
     fn snapshot_entry(
         pid: u32,
         parent_pid: u32,
@@ -2776,6 +3329,10 @@ mod tests {
                 job_handle: Mutex::new(None),
                 #[cfg(test)]
                 forced_factory_droid_process_active: None,
+                #[cfg(test)]
+                forced_codex_process_probe: Mutex::new(None),
+                #[cfg(test)]
+                queued_codex_process_probe_after_next_input: Mutex::new(None),
             },
             command_rx,
             shared_writer,
@@ -3137,6 +3694,85 @@ mod tests {
             Some(1),
             Some(100),
             &["droid.exe", "factory.exe"]
+        ));
+    }
+
+    #[test]
+    fn select_new_codex_descendant_process_prefers_new_codex_descendant() {
+        let entries = vec![
+            named_snapshot_entry(1, 0, Some(100), "powershell.exe"),
+            named_snapshot_entry(2, 1, Some(200), "node.exe"),
+            named_snapshot_entry(3, 1, Some(300), "codex.exe"),
+            named_snapshot_entry(4, 1, Some(400), "node.exe"),
+        ];
+        let baseline = vec![TrackedProcessIdentity {
+            pid: 2,
+            creation_time: Some(200),
+        }];
+
+        assert_eq!(
+            select_new_codex_descendant_process(
+                &codex_named_descendant_processes(&entries, Some(1), Some(100))
+                    .expect("descendants"),
+                &baseline,
+            ),
+            Some(TrackedProcessIdentity {
+                pid: 3,
+                creation_time: Some(300),
+            })
+        );
+    }
+
+    #[test]
+    fn select_new_codex_descendant_process_uses_earliest_new_node_when_no_new_codex_exists() {
+        let entries = vec![
+            named_snapshot_entry(1, 0, Some(100), "powershell.exe"),
+            named_snapshot_entry(2, 1, Some(200), "node.exe"),
+            named_snapshot_entry(3, 1, Some(350), "node.exe"),
+            named_snapshot_entry(4, 1, Some(400), "node.exe"),
+        ];
+        let baseline = vec![TrackedProcessIdentity {
+            pid: 2,
+            creation_time: Some(200),
+        }];
+
+        assert_eq!(
+            select_new_codex_descendant_process(
+                &codex_named_descendant_processes(&entries, Some(1), Some(100))
+                    .expect("descendants"),
+                &baseline,
+            ),
+            Some(TrackedProcessIdentity {
+                pid: 3,
+                creation_time: Some(350),
+            })
+        );
+    }
+
+    #[test]
+    fn has_descendant_process_identity_requires_exact_pid_and_creation_time() {
+        let entries = vec![
+            named_snapshot_entry(1, 0, Some(100), "powershell.exe"),
+            named_snapshot_entry(2, 1, Some(200), "node.exe"),
+        ];
+
+        assert!(has_descendant_process_identity(
+            &entries,
+            Some(1),
+            Some(100),
+            TrackedProcessIdentity {
+                pid: 2,
+                creation_time: Some(200),
+            }
+        ));
+        assert!(!has_descendant_process_identity(
+            &entries,
+            Some(1),
+            Some(100),
+            TrackedProcessIdentity {
+                pid: 2,
+                creation_time: Some(201),
+            }
         ));
     }
 
