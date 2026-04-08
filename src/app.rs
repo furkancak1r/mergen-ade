@@ -3706,23 +3706,23 @@ impl AdeApp {
             }
         }
 
-        if submitted_factory_prompt {
-            if self.apply_factory_droid_status(
+        if submitted_factory_prompt
+            && self.apply_factory_droid_status(
                 active_terminal_id,
                 AiCliStatus::Running,
                 FactoryDroidStatusSource::PromptSubmit,
-            ) {
-                ctx.request_repaint();
-            }
+            )
+        {
+            ctx.request_repaint();
         }
-        if submitted_codex_prompt {
-            if self.apply_codex_status(
+        if submitted_codex_prompt
+            && self.apply_codex_status(
                 active_terminal_id,
                 AiCliStatus::Running,
                 CodexCliStatusSource::PromptSubmit,
-            ) {
-                ctx.request_repaint();
-            }
+            )
+        {
+            ctx.request_repaint();
         }
     }
 

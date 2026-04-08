@@ -79,13 +79,11 @@ fn embed_windows_icon(manifest_dir: &Path, target: &str, icon_ico: &Path) {
             );
             return;
         }
-    } else if target.contains("-windows-msvc") {
-        if !configure_msvc_toolkit(&mut resource) {
-            println!(
-                "cargo:warning=Skipping MSVC exe icon embedding because rc.exe was not found in the current shell or installed Windows SDK locations."
-            );
-            return;
-        }
+    } else if target.contains("-windows-msvc") && !configure_msvc_toolkit(&mut resource) {
+        println!(
+            "cargo:warning=Skipping MSVC exe icon embedding because rc.exe was not found in the current shell or installed Windows SDK locations."
+        );
+        return;
     }
     resource.set_icon(icon_ico.to_string_lossy().as_ref());
     resource
