@@ -1799,14 +1799,29 @@ fn detect_visible_factory_status_with_end(text: &str) -> Option<(&'static str, u
 
     for (display, needle) in [
         ("HOOKS Stop", "hooks stop"),
+        ("hook stop", "hook stop"),
         ("needs your permission", "needs your permission"),
         ("waiting for your input", "waiting for your input"),
+        ("idle", "idle"),
     ] {
         if let Some(start) = collapsed.find(needle) {
             let end = start + needle.len();
             let end_char_index = collapsed[..end].chars().count().saturating_sub(1);
             if let Some(end_offset) = collapsed_offsets.get(end_char_index).copied() {
                 return Some((display, end_offset));
+            }
+        }
+    }
+
+    // Detect "Stop - <hook-type>" style headers from hook editor screens.
+    // These appear when Droid shows a hook/rule configuration UI.
+    if let Some(stop_pos) = collapsed.find("stop") {
+        let after_stop = &collapsed[stop_pos..];
+        if after_stop.starts_with("stop - ") || after_stop.starts_with("stop -") {
+            let end = stop_pos + 4;
+            let end_char_index = collapsed[..end].chars().count().saturating_sub(1);
+            if let Some(end_offset) = collapsed_offsets.get(end_char_index).copied() {
+                return Some(("Stop - Hook", end_offset));
             }
         }
     }
@@ -2918,6 +2933,50 @@ mod tests {
         assert_eq!(
             pending.extract_from_text("Stop"),
             Some("HOOKS Stop".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_factory_status_detects_hook_stop_variant() {
+        let mut pending = PendingVisibleFactoryStatus::default();
+
+        assert_eq!(pending.extract_from_text("hook stop"), Some("hook stop".to_string()));
+        assert_eq!(
+            pending.extract_from_text("\u{1b}[32mhook stop\u{1b}[0m"),
+            Some("hook stop".to_string())
+        );
+        assert_eq!(
+            pending.extract_from_text("  Hook Stop  "),
+            Some("hook stop".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_factory_status_detects_stop_hook_editor_header() {
+        let mut pending = PendingVisibleFactoryStatus::default();
+
+        assert_eq!(
+            pending.extract_from_text("Stop - Matcher"),
+            Some("Stop - Hook".to_string())
+        );
+        assert_eq!(
+            pending.extract_from_text("Stop - Rule"),
+            Some("Stop - Hook".to_string())
+        );
+        assert_eq!(
+            pending.extract_from_text("\u{1b}[1mStop -\u{1b}[0m Matcher"),
+            Some("Stop - Hook".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_factory_status_detects_idle_pattern() {
+        let mut pending = PendingVisibleFactoryStatus::default();
+
+        assert_eq!(pending.extract_from_text("idle"), Some("idle".to_string()));
+        assert_eq!(
+            pending.extract_from_text("[Idle] Droid ready"),
+            Some("idle".to_string())
         );
     }
 
