@@ -1408,7 +1408,14 @@ impl AdeApp {
 
     fn factory_droid_attention_source_from_chunk(chunk: &str) -> Option<FactoryDroidStatusSource> {
         let lower = chunk.to_ascii_lowercase();
-        if lower.contains("hooks  stop") || lower.contains("hooks stop") {
+        // Match "HOOKS  Stop" (visible script output) and also the raw
+        // [droid-hook:event=Stop] / [factory-droid-hook:event=Stop] markers
+        // that may appear in the PTY stream before the visible text.
+        if lower.contains("hooks  stop")
+            || lower.contains("hooks stop")
+            || lower.contains("[droid-hook:event=stop]")
+            || lower.contains("[factory-droid-hook:event=stop]")
+        {
             return Some(FactoryDroidStatusSource::PtyStop);
         }
 
@@ -13080,6 +13087,66 @@ mod tests {
                 },
             })
             .expect("send ai raw stop chunk");
+
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::PtyStop)
+        );
+    }
+
+    #[test]
+    fn factory_droid_stop_chunk_matches_official_hook_marker() {
+        // Test that [droid-hook:event=Stop] raw marker triggers attention.
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            entry.factory_droid_session_active = true;
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "[droid-hook:event=Stop]".to_owned(),
+                },
+            })
+            .expect("send droid-hook stop chunk");
+
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::PtyStop)
+        );
+    }
+
+    #[test]
+    fn factory_droid_stop_chunk_matches_factory_droid_hook_marker() {
+        // Test that [factory-droid-hook:event=Stop] raw marker triggers attention.
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            entry.factory_droid_session_active = true;
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "[factory-droid-hook:event=Stop]".to_owned(),
+                },
+            })
+            .expect("send factory-droid-hook stop chunk");
 
         app.process_terminal_events(&ctx);
 
