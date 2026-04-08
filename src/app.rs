@@ -8908,8 +8908,11 @@ fn draw_terminal_manager_title_and_diff_summary(
 
             ui.add_space(6.0);
 
-            // Always render diff summary (non-test builds only; test builds use rect for measurement)
+            // Always render diff summary; bind response only in test builds for rect measurement
+            #[cfg(test)]
             let diff_summary_response = draw_terminal_manager_diff_summary(ui, diff_summary);
+            #[cfg(not(test))]
+            let _ = draw_terminal_manager_diff_summary(ui, diff_summary);
 
             TerminalManagerTitleSummaryLayout {
                 #[cfg(test)]
