@@ -578,6 +578,7 @@ enum TerminalNavigationDirection {
 enum TerminalNavigationShortcut {
     Grid(TerminalNavigationDirection),
     SingleViewLinear(TerminalNavigationDirection),
+    SingleViewFilter(TerminalNavigationDirection),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -629,6 +630,7 @@ enum SourceControlDispatchPriority {
     BackgroundAuto,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceControlBadgeState {
     Clean,
@@ -643,6 +645,7 @@ enum TerminalManagerDiffSummaryState {
     Error,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct TerminalManagerDiffSummaryModel {
     state: TerminalManagerDiffSummaryState,
@@ -651,6 +654,7 @@ struct TerminalManagerDiffSummaryModel {
     tooltip_lines: Vec<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TerminalManagerDiffSummaryVisual {
     Totals {
@@ -2821,7 +2825,7 @@ impl AdeApp {
         let mut changed = false;
         let shortcuts = self.take_terminal_navigation_shortcuts(ctx);
         for shortcut in shortcuts {
-            let next_terminal = match shortcut {
+            match shortcut {
                 TerminalNavigationShortcut::Grid(direction) => {
                     let visible_ids = self.visible_terminal_ids_for_main();
                     let grid = layout::compute_tile_grid(
@@ -2829,18 +2833,21 @@ impl AdeApp {
                         main_area_size.x,
                         main_area_size.y,
                     );
-                    next_terminal_in_direction(
+                    if let Some(next_terminal) = next_terminal_in_direction(
                         self.active_terminal_accepts_input(),
                         &visible_ids,
                         grid,
                         direction,
-                    )
+                    ) {
+                        self.set_active_terminal(ctx, Some(next_terminal));
+                        changed = true;
+                    }
                 }
                 TerminalNavigationShortcut::SingleViewLinear(direction)
                     if !self.config.ui.multi_terminal_view_enabled =>
                 {
                     let terminal_ids = self.terminal_ids_for_single_view_navigation();
-                    next_terminal_in_linear_direction(
+                    if let Some(next_terminal) = next_terminal_in_linear_direction(
                         self.single_view_navigation_anchor(),
                         &terminal_ids,
                         |terminal_id| {
@@ -2849,19 +2856,44 @@ impl AdeApp {
                                 .is_some_and(|terminal| !terminal.exited)
                         },
                         direction,
-                    )
+                    ) {
+                        self.set_active_terminal(ctx, Some(next_terminal));
+                        changed = true;
+                    }
                 }
-                TerminalNavigationShortcut::SingleViewLinear(_) => None,
-            };
-            if let Some(next_terminal) = next_terminal {
-                self.set_active_terminal(ctx, Some(next_terminal));
-                changed = true;
+                TerminalNavigationShortcut::SingleViewFilter(direction)
+                    if !self.config.ui.multi_terminal_view_enabled =>
+                {
+                    self.cycle_terminal_manager_filter(direction, ctx);
+                    changed = true;
+                }
+                _ => {}
             }
         }
 
         if changed {
             ctx.request_repaint();
         }
+    }
+
+    fn cycle_terminal_manager_filter(
+        &mut self,
+        direction: TerminalNavigationDirection,
+        _ctx: &egui::Context,
+    ) {
+        use crate::models::TerminalManagerFilter;
+        let next_filter = match (self.config.ui.terminal_manager_filter, direction) {
+            (TerminalManagerFilter::Foreground, TerminalNavigationDirection::Right) => {
+                TerminalManagerFilter::Background
+            }
+            (TerminalManagerFilter::Background, TerminalNavigationDirection::Left) => {
+                TerminalManagerFilter::Foreground
+            }
+            _ => return,
+        };
+        self.config.ui.terminal_manager_filter = next_filter;
+        self.note_ui_config_changed();
+        self.persist_config();
     }
 
     fn active_terminal_accepts_input(&self) -> Option<u64> {
@@ -3086,6 +3118,12 @@ impl AdeApp {
                 direction @ (TerminalNavigationDirection::Up | TerminalNavigationDirection::Down),
             )) if single_view_shortcuts_enabled => {
                 Some(TerminalNavigationShortcut::SingleViewLinear(direction))
+            }
+            Some(TerminalNavigationShortcut::Grid(
+                direction
+                @ (TerminalNavigationDirection::Left | TerminalNavigationDirection::Right),
+            )) if single_view_shortcuts_enabled => {
+                Some(TerminalNavigationShortcut::SingleViewFilter(direction))
             }
             shortcut => shortcut,
         }
@@ -3446,7 +3484,22 @@ impl AdeApp {
     }
 
     fn terminal_ids_for_single_view_navigation(&self) -> Vec<u64> {
-        self.terminals.keys().copied().collect()
+        if self.projects.is_empty() {
+            return self.terminals.keys().copied().collect();
+        }
+
+        let kind = self.config.ui.terminal_manager_filter.terminal_kind();
+        let mut result = Vec::new();
+
+        let mut project_ids = self.projects.keys().copied().collect::<Vec<_>>();
+        project_ids.sort_unstable();
+
+        for project_id in project_ids {
+            let ids = terminal_ids_for_project_kind(&self.terminals, project_id, kind);
+            result.extend(ids);
+        }
+
+        result
     }
 
     fn route_active_terminal_input(&mut self, ctx: &egui::Context, events: Vec<Event>) {
@@ -8056,6 +8109,7 @@ fn with_truncation_tooltip(
     }
 }
 
+#[allow(dead_code)]
 fn source_control_badge_color(state: SourceControlBadgeState) -> Color32 {
     match state {
         SourceControlBadgeState::Clean => Color32::from_rgb(94, 196, 130),
@@ -8157,6 +8211,7 @@ fn terminal_manager_diff_summary_model(
     }
 }
 
+#[allow(dead_code)]
 fn terminal_manager_diff_summary_visual(
     summary: &TerminalManagerDiffSummaryModel,
 ) -> TerminalManagerDiffSummaryVisual {
@@ -8221,6 +8276,7 @@ fn source_control_tooltip_lines(snapshot: &SourceControlSnapshot, max_files: usi
     lines
 }
 
+#[allow(dead_code)]
 fn terminal_manager_diff_summary_layout_job(
     ui: &Ui,
     summary: &TerminalManagerDiffSummaryModel,
@@ -8282,6 +8338,7 @@ fn terminal_manager_diff_summary_layout_job(
     layout_job
 }
 
+#[allow(dead_code)]
 fn draw_terminal_manager_diff_summary(
     ui: &mut Ui,
     summary: &TerminalManagerDiffSummaryModel,
@@ -8306,7 +8363,7 @@ fn draw_terminal_manager_title_and_diff_summary(
     text_color: Color32,
     is_active: bool,
     row_height: f32,
-    diff_summary: &TerminalManagerDiffSummaryModel,
+    _diff_summary: &TerminalManagerDiffSummaryModel,
 ) -> TerminalManagerTitleSummaryLayout {
     ui.allocate_ui_with_layout(
         egui::vec2(ui.available_width().max(0.0), row_height),
@@ -8331,13 +8388,12 @@ fn draw_terminal_manager_title_and_diff_summary(
                 .on_hover_text(title);
 
             ui.add_space(6.0);
-            let diff_summary_response = draw_terminal_manager_diff_summary(ui, diff_summary);
 
             TerminalManagerTitleSummaryLayout {
                 #[cfg(test)]
                 title_rect: title_response.rect,
                 #[cfg(test)]
-                diff_summary_rect: diff_summary_response.rect,
+                diff_summary_rect: draw_terminal_manager_diff_summary(ui, _diff_summary).rect,
             }
         },
     )
@@ -12388,6 +12444,120 @@ mod tests {
     }
 
     #[test]
+    fn handle_shortcuts_cycles_filter_with_ctrl_right_in_single_view() {
+        let ctx = Context::default();
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        assert_eq!(
+            app.config.ui.terminal_manager_filter,
+            TerminalManagerFilter::Foreground
+        );
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(
+            app.config.ui.terminal_manager_filter,
+            TerminalManagerFilter::Background
+        );
+    }
+
+    #[test]
+    fn handle_shortcuts_cycles_filter_with_ctrl_left_in_single_view() {
+        let ctx = Context::default();
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowLeft,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.config.ui.terminal_manager_filter = TerminalManagerFilter::Background;
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(
+            app.config.ui.terminal_manager_filter,
+            TerminalManagerFilter::Foreground
+        );
+    }
+
+    #[test]
+    fn handle_shortcuts_ctrl_left_does_not_change_filter_when_already_at_foreground() {
+        let ctx = Context::default();
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowLeft,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        assert_eq!(
+            app.config.ui.terminal_manager_filter,
+            TerminalManagerFilter::Foreground
+        );
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(
+            app.config.ui.terminal_manager_filter,
+            TerminalManagerFilter::Foreground
+        );
+    }
+
+    #[test]
+    fn handle_shortcuts_ctrl_right_does_not_change_filter_when_already_at_background() {
+        let ctx = Context::default();
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.config.ui.terminal_manager_filter = TerminalManagerFilter::Background;
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(
+            app.config.ui.terminal_manager_filter,
+            TerminalManagerFilter::Background
+        );
+    }
+
+    #[test]
     fn raw_input_hook_filters_shift_tab_when_terminal_wont_capture_keyboard() {
         let ctx = Context::default();
         let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
@@ -12459,7 +12629,39 @@ mod tests {
     }
 
     #[test]
-    fn raw_input_hook_buffers_ctrl_arrow_for_active_terminal() {
+    fn raw_input_hook_buffers_ctrl_arrow_for_active_terminal_in_multi_view() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.config.ui.multi_terminal_view_enabled = true;
+        let ctrl_right = Event::Key {
+            key: Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                command: true,
+                ..Modifiers::default()
+            },
+        };
+        let mut raw_input = RawInput {
+            events: vec![ctrl_right],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(raw_input.events.is_empty());
+        assert_eq!(
+            app.buffered_terminal_navigation,
+            vec![TerminalNavigationShortcut::Grid(
+                TerminalNavigationDirection::Right,
+            )]
+        );
+    }
+
+    #[test]
+    fn raw_input_hook_buffers_ctrl_horizontal_arrow_for_filter_in_single_view() {
         let ctx = Context::default();
         let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
         let ctrl_right = Event::Key {
@@ -12483,7 +12685,7 @@ mod tests {
         assert!(raw_input.events.is_empty());
         assert_eq!(
             app.buffered_terminal_navigation,
-            vec![TerminalNavigationShortcut::Grid(
+            vec![TerminalNavigationShortcut::SingleViewFilter(
                 TerminalNavigationDirection::Right,
             )]
         );
@@ -12520,7 +12722,7 @@ mod tests {
     }
 
     #[test]
-    fn surrender_ui_text_focus_allows_ctrl_arrow_buffering_after_terminal_click() {
+    fn surrender_ui_text_focus_allows_ctrl_horizontal_arrow_buffering_for_filter() {
         let ctx = Context::default();
         let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
         ctx.memory_mut(|mem| mem.request_focus(AdeApp::directory_search_input_id()));
@@ -12548,7 +12750,7 @@ mod tests {
         assert!(raw_input.events.is_empty());
         assert_eq!(
             app.buffered_terminal_navigation,
-            vec![TerminalNavigationShortcut::Grid(
+            vec![TerminalNavigationShortcut::SingleViewFilter(
                 TerminalNavigationDirection::Right,
             )]
         );
@@ -14260,6 +14462,56 @@ mod tests {
             AdeApp::active_terminal_navigation_shortcut(&ctrl_down, false),
             Some(TerminalNavigationShortcut::Grid(
                 TerminalNavigationDirection::Down,
+            ))
+        );
+    }
+
+    #[test]
+    fn active_terminal_navigation_shortcut_maps_ctrl_horizontal_arrows_to_filter_in_single_view() {
+        let ctrl_left = Event::Key {
+            key: Key::ArrowLeft,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        };
+        let ctrl_right = Event::Key {
+            key: Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        };
+
+        assert_eq!(
+            AdeApp::active_terminal_navigation_shortcut(&ctrl_left, true),
+            Some(TerminalNavigationShortcut::SingleViewFilter(
+                TerminalNavigationDirection::Left,
+            ))
+        );
+        assert_eq!(
+            AdeApp::active_terminal_navigation_shortcut(&ctrl_right, true),
+            Some(TerminalNavigationShortcut::SingleViewFilter(
+                TerminalNavigationDirection::Right,
+            ))
+        );
+
+        assert_eq!(
+            AdeApp::active_terminal_navigation_shortcut(&ctrl_left, false),
+            Some(TerminalNavigationShortcut::Grid(
+                TerminalNavigationDirection::Left,
+            ))
+        );
+        assert_eq!(
+            AdeApp::active_terminal_navigation_shortcut(&ctrl_right, false),
+            Some(TerminalNavigationShortcut::Grid(
+                TerminalNavigationDirection::Right,
             ))
         );
     }
