@@ -82,19 +82,20 @@ const SOURCE_CONTROL_BACKGROUND_REFRESH_SECS: f64 = 20.0;
 const SOURCE_CONTROL_POLL_TICK_MS: u64 = 250;
 const SOURCE_CONTROL_TOOLTIP_FILE_LIMIT: usize = 12;
 const DIRECTORY_ENTRY_TOOLTIP_MAX_CHARS: usize = 500;
-const TERMINAL_OUTPUT_BG: Color32 = Color32::from_rgb(26, 30, 36);
+// Pure Dark Theme colors
+const TERMINAL_OUTPUT_BG: Color32 = Color32::from_rgb(16, 16, 16);
 const TERMINAL_HEADER_HEIGHT: f32 = 38.0;
 const TERMINAL_HEADER_GAP: f32 = 6.0;
 const TERMINAL_TILE_GAP_X: f32 = 0.0;
 const TERMINAL_TILE_GAP_Y: f32 = 0.0;
 const TERMINAL_PANE_INNER_MARGIN: f32 = 2.0;
-const APP_BG: Color32 = Color32::from_rgb(14, 18, 24);
-const SURFACE_BG: Color32 = Color32::from_rgb(22, 28, 38);
-const SURFACE_BG_SOFT: Color32 = Color32::from_rgb(24, 38, 52);
-const BORDER_COLOR: Color32 = Color32::from_rgb(46, 60, 78);
-const ACCENT: Color32 = Color32::from_rgb(26, 179, 255);
-const TEXT_PRIMARY: Color32 = Color32::from_rgb(225, 233, 245);
-const TEXT_MUTED: Color32 = Color32::from_rgb(148, 167, 191);
+const APP_BG: Color32 = Color32::from_rgb(16, 16, 16);
+const SURFACE_BG: Color32 = Color32::from_rgb(22, 22, 22);
+const SURFACE_BG_SOFT: Color32 = Color32::from_rgb(28, 28, 28);
+const BORDER_COLOR: Color32 = Color32::from_rgb(38, 38, 38);
+const ACCENT: Color32 = Color32::from_rgb(200, 200, 200);
+const TEXT_PRIMARY: Color32 = Color32::from_rgb(255, 255, 255);
+const TEXT_MUTED: Color32 = Color32::from_rgb(140, 140, 140);
 const PROJECT_EXPLORER_WIDTH: f32 = 352.0;
 const ACTIVITY_RAIL_WIDTH: f32 = 48.0;
 const CONTROL_ROW_HEIGHT: f32 = 28.0;
@@ -107,15 +108,15 @@ const DIRECTORY_SEARCH_INPUT_ID: &str = "directory-search-input";
 const SAVED_MESSAGE_DRAFT_INPUT_ID: &str = "saved-message-draft-input";
 // Pill button palette
 const BTN_BLUE: Color32 = Color32::from_rgb(16, 64, 112);
-const BTN_BLUE_HOVER: Color32 = Color32::from_rgb(22, 88, 150);
+const BTN_BLUE_HOVER: Color32 = Color32::from_rgb(48, 48, 48);
 const BTN_TEAL: Color32 = Color32::from_rgb(14, 68, 82);
 const BTN_TEAL_HOVER: Color32 = Color32::from_rgb(20, 92, 110);
 const BTN_SUBTLE: Color32 = Color32::from_rgb(20, 63, 92);
-const BTN_SUBTLE_HOVER: Color32 = Color32::from_rgb(28, 85, 122);
+const BTN_SUBTLE_HOVER: Color32 = Color32::from_rgb(44, 44, 44);
 const BTN_RED: Color32 = Color32::from_rgb(120, 30, 30);
 const BTN_RED_HOVER: Color32 = Color32::from_rgb(160, 40, 40);
 const BTN_ICON: Color32 = Color32::from_rgb(24, 70, 103);
-const BTN_ICON_HOVER: Color32 = Color32::from_rgb(31, 98, 144);
+const BTN_ICON_HOVER: Color32 = Color32::from_rgb(50, 50, 50);
 const BTN_ICON_ACTIVE: Color32 = Color32::from_rgb(24, 118, 172);
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -798,8 +799,8 @@ enum AiBadgeVisual {
 fn ai_badge_visual(status: AiCliStatus) -> Option<AiBadgeVisual> {
     match status {
         AiCliStatus::Inactive => None,
-        AiCliStatus::Running => Some(AiBadgeVisual::Spinner(Color32::from_rgb(76, 209, 114))),
-        AiCliStatus::Attention => Some(AiBadgeVisual::Pulse(Color32::from_rgb(46, 130, 255))),
+        AiCliStatus::Running => Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180))),
+        AiCliStatus::Attention => Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 220, 220))),
     }
 }
 
@@ -4247,32 +4248,32 @@ impl AdeApp {
         visuals.panel_fill = SURFACE_BG;
         visuals.window_fill = SURFACE_BG;
         visuals.faint_bg_color = SURFACE_BG_SOFT;
-        visuals.extreme_bg_color = Color32::from_rgb(18, 30, 44);
-        visuals.code_bg_color = Color32::from_rgb(12, 16, 22);
+        visuals.extreme_bg_color = Color32::from_rgb(16, 16, 16);
+        visuals.code_bg_color = Color32::from_rgb(18, 18, 18);
         visuals.hyperlink_color = ACCENT;
         visuals.window_stroke = Stroke::new(1.0, BORDER_COLOR);
-        visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(24, 45, 66);
-        visuals.widgets.noninteractive.weak_bg_fill = Color32::from_rgb(22, 38, 56);
-        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(55, 95, 128));
+        visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(30, 30, 30);
+        visuals.widgets.noninteractive.weak_bg_fill = Color32::from_rgb(26, 26, 26);
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(45, 45, 45));
         visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_MUTED);
-        visuals.widgets.inactive.bg_fill = Color32::from_rgb(26, 66, 98);
-        visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(23, 55, 83);
-        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(76, 122, 162));
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(32, 32, 32);
+        visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(28, 28, 28);
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(50, 50, 50));
         visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(33, 86, 128);
-        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(30, 76, 113);
-        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT);
-        visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::from_rgb(240, 247, 255));
-        visuals.widgets.active.bg_fill = Color32::from_rgb(20, 112, 166);
-        visuals.widgets.active.weak_bg_fill = Color32::from_rgb(18, 96, 145);
-        visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
-        visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::from_rgb(244, 251, 255));
-        visuals.widgets.open.bg_fill = Color32::from_rgb(28, 78, 118);
-        visuals.widgets.open.weak_bg_fill = Color32::from_rgb(24, 64, 98);
-        visuals.widgets.open.bg_stroke = Stroke::new(1.0, Color32::from_rgb(74, 126, 168));
-        visuals.widgets.open.fg_stroke = Stroke::new(1.0, Color32::from_rgb(235, 245, 255));
-        visuals.selection.bg_fill = Color32::from_rgb(18, 93, 136);
-        visuals.selection.stroke = Stroke::new(1.0, ACCENT);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(50, 50, 50);
+        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(45, 45, 45);
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(80, 80, 80));
+        visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::from_rgb(255, 255, 255));
+        visuals.widgets.active.bg_fill = Color32::from_rgb(60, 60, 60);
+        visuals.widgets.active.weak_bg_fill = Color32::from_rgb(55, 55, 55);
+        visuals.widgets.active.bg_stroke = Stroke::new(1.0, Color32::from_rgb(100, 100, 100));
+        visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::from_rgb(255, 255, 255));
+        visuals.widgets.open.bg_fill = Color32::from_rgb(70, 70, 70);
+        visuals.widgets.open.weak_bg_fill = Color32::from_rgb(60, 60, 60);
+        visuals.widgets.open.bg_stroke = Stroke::new(1.0, Color32::from_rgb(120, 120, 120));
+        visuals.widgets.open.fg_stroke = Stroke::new(1.0, Color32::from_rgb(255, 255, 255));
+        visuals.selection.bg_fill = Color32::from_rgb(50, 50, 50);
+        visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(100, 100, 100));
 
         style.visuals = visuals;
         ctx.set_style(style);
@@ -8524,14 +8525,14 @@ struct TerminalManagerRowChrome {
 fn terminal_header_chrome(is_active: bool) -> TerminalHeaderChrome {
     if is_active {
         TerminalHeaderChrome {
-            fill: Color32::from_rgb(28, 52, 72),
+            fill: Color32::from_rgb(30, 30, 30),
             stroke: Stroke::NONE,
-            title_color: Color32::from_rgb(244, 251, 255),
+            title_color: Color32::from_rgb(255, 255, 255),
             detail_color: with_alpha(TEXT_MUTED, 238),
         }
     } else {
         TerminalHeaderChrome {
-            fill: Color32::from_rgb(22, 32, 46),
+            fill: Color32::from_rgb(22, 22, 22),
             stroke: Stroke::new(1.0, BORDER_COLOR),
             title_color: TEXT_PRIMARY,
             detail_color: with_alpha(TEXT_MUTED, 230),
@@ -8542,9 +8543,9 @@ fn terminal_header_chrome(is_active: bool) -> TerminalHeaderChrome {
 fn terminal_manager_row_chrome(is_active: bool, is_hovered: bool) -> TerminalManagerRowChrome {
     if is_active {
         TerminalManagerRowChrome {
-            fill: Some(Color32::from_rgb(24, 48, 68)),
-            stroke: Stroke::new(1.0, with_alpha(ACCENT, 220)),
-            title_color: Color32::from_rgb(244, 251, 255),
+            fill: Some(Color32::from_rgb(38, 38, 38)),
+            stroke: Stroke::new(1.0, with_alpha(Color32::from_rgb(100, 100, 100), 220)),
+            title_color: Color32::from_rgb(255, 255, 255),
         }
     } else if is_hovered {
         TerminalManagerRowChrome {
@@ -8881,7 +8882,7 @@ fn draw_terminal_manager_title_and_diff_summary(
     text_color: Color32,
     is_active: bool,
     row_height: f32,
-    _diff_summary: &TerminalManagerDiffSummaryModel,
+    #[allow(unused_variables)] diff_summary: &TerminalManagerDiffSummaryModel,
 ) -> TerminalManagerTitleSummaryLayout {
     ui.allocate_ui_with_layout(
         egui::vec2(ui.available_width().max(0.0), row_height),
@@ -8907,11 +8908,14 @@ fn draw_terminal_manager_title_and_diff_summary(
 
             ui.add_space(6.0);
 
+            // Always render diff summary (non-test builds only; test builds use rect for measurement)
+            let diff_summary_response = draw_terminal_manager_diff_summary(ui, diff_summary);
+
             TerminalManagerTitleSummaryLayout {
                 #[cfg(test)]
                 title_rect: title_response.rect,
                 #[cfg(test)]
-                diff_summary_rect: draw_terminal_manager_diff_summary(ui, _diff_summary).rect,
+                diff_summary_rect: diff_summary_response.rect,
             }
         },
     )
@@ -8926,7 +8930,7 @@ fn paint_minimal_disclosure_icon(ui: &mut Ui, openness: f32, response: &egui::Re
     let rect = response.rect;
     let center = rect.center();
     let stroke_color = if response.hovered() {
-        Color32::from_rgb(244, 249, 255)
+        Color32::from_rgb(255, 255, 255)
     } else {
         with_alpha(TEXT_MUTED, 210)
     };
@@ -8995,17 +8999,17 @@ fn with_minimal_button_chrome<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)
         style.visuals.widgets.hovered.weak_bg_fill = hover_fill;
         style.visuals.widgets.hovered.bg_stroke = Stroke::NONE;
         style.visuals.widgets.hovered.fg_stroke =
-            Stroke::new(1.0, Color32::from_rgb(244, 249, 255));
+            Stroke::new(1.0, Color32::from_rgb(255, 255, 255));
 
         style.visuals.widgets.active.bg_fill = Color32::TRANSPARENT;
         style.visuals.widgets.active.weak_bg_fill = Color32::TRANSPARENT;
         style.visuals.widgets.active.bg_stroke = Stroke::NONE;
-        style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::from_rgb(244, 249, 255));
+        style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::from_rgb(255, 255, 255));
 
         style.visuals.widgets.open.bg_fill = Color32::TRANSPARENT;
         style.visuals.widgets.open.weak_bg_fill = Color32::TRANSPARENT;
         style.visuals.widgets.open.bg_stroke = Stroke::NONE;
-        style.visuals.widgets.open.fg_stroke = Stroke::new(1.0, Color32::from_rgb(244, 249, 255));
+        style.visuals.widgets.open.fg_stroke = Stroke::new(1.0, Color32::from_rgb(255, 255, 255));
 
         add_contents(ui)
     })
@@ -9038,7 +9042,7 @@ fn project_group_header_action_spec(
 fn terminal_manager_filter_color(filter: TerminalManagerFilter) -> Color32 {
     match filter {
         TerminalManagerFilter::Foreground => ACCENT,
-        TerminalManagerFilter::Background => Color32::from_rgb(100, 180, 160),
+        TerminalManagerFilter::Background => Color32::from_rgb(140, 140, 140),
     }
 }
 
@@ -9220,7 +9224,7 @@ fn styled_icon_button(
     }
 
     let icon_color = if response.is_pointer_button_down_on() || response.hovered() {
-        Color32::from_rgb(244, 249, 255)
+        Color32::from_rgb(255, 255, 255)
     } else {
         with_alpha(TEXT_PRIMARY, 178)
     };
@@ -9250,7 +9254,7 @@ fn styled_icon_toggle(ui: &mut Ui, selected: bool, icon: AppIcon, tooltip: &str)
     }
 
     let icon_color = if selected || response.hovered() || response.is_pointer_button_down_on() {
-        Color32::from_rgb(244, 249, 255)
+        Color32::from_rgb(255, 255, 255)
     } else {
         with_alpha(TEXT_PRIMARY, 170)
     };
@@ -16293,9 +16297,9 @@ mod tests {
     fn terminal_header_chrome_emphasizes_active_terminal() {
         let chrome = super::terminal_header_chrome(true);
 
-        assert_eq!(chrome.fill, Color32::from_rgb(28, 52, 72));
+        assert_eq!(chrome.fill, Color32::from_rgb(30, 30, 30));
         assert_eq!(chrome.stroke, Stroke::NONE);
-        assert_eq!(chrome.title_color, Color32::from_rgb(244, 251, 255));
+        assert_eq!(chrome.title_color, Color32::from_rgb(255, 255, 255));
         assert_eq!(
             chrome.detail_color,
             super::with_alpha(super::TEXT_MUTED, 238)
@@ -16306,7 +16310,7 @@ mod tests {
     fn terminal_header_chrome_keeps_inactive_terminal_subtle() {
         let chrome = super::terminal_header_chrome(false);
 
-        assert_eq!(chrome.fill, Color32::from_rgb(22, 32, 46));
+        assert_eq!(chrome.fill, Color32::from_rgb(22, 22, 22));
         assert_eq!(chrome.stroke, Stroke::new(1.0, super::BORDER_COLOR));
         assert_eq!(chrome.title_color, super::TEXT_PRIMARY);
         assert_eq!(
@@ -16319,12 +16323,15 @@ mod tests {
     fn terminal_manager_row_chrome_emphasizes_active_terminal() {
         let chrome = terminal_manager_row_chrome(true, false);
 
-        assert_eq!(chrome.fill, Some(Color32::from_rgb(24, 48, 68)));
+        assert_eq!(chrome.fill, Some(Color32::from_rgb(38, 38, 38)));
         assert_eq!(
             chrome.stroke,
-            Stroke::new(1.0, super::with_alpha(super::ACCENT, 220))
+            Stroke::new(
+                1.0,
+                super::with_alpha(Color32::from_rgb(100, 100, 100), 220)
+            )
         );
-        assert_eq!(chrome.title_color, Color32::from_rgb(244, 251, 255));
+        assert_eq!(chrome.title_color, Color32::from_rgb(255, 255, 255));
     }
 
     #[test]
@@ -16714,11 +16721,11 @@ mod tests {
     fn ai_badge_visuals_match_status() {
         assert_eq!(
             ai_badge_visual(AiCliStatus::Running),
-            Some(AiBadgeVisual::Spinner(Color32::from_rgb(76, 209, 114)))
+            Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180)))
         );
         assert_eq!(
             ai_badge_visual(AiCliStatus::Attention),
-            Some(AiBadgeVisual::Pulse(Color32::from_rgb(46, 130, 255)))
+            Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 220, 220)))
         );
         assert_eq!(ai_badge_visual(AiCliStatus::Inactive), None);
     }
