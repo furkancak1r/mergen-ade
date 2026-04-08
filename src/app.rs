@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
@@ -440,6 +440,7 @@ struct TerminalEntry {
     title: String,
     full_title: String,
     pending_line_for_title: String,
+    recent_inputs: VecDeque<String>,
     in_main_view: bool,
     dirty: bool,
     last_seqno: usize,
@@ -699,7 +700,7 @@ fn ai_badge_visual(status: AiCliStatus) -> Option<AiBadgeVisual> {
     match status {
         AiCliStatus::Inactive => None,
         AiCliStatus::Running => Some(AiBadgeVisual::Spinner(Color32::from_rgb(76, 209, 114))),
-        AiCliStatus::Attention => Some(AiBadgeVisual::Pulse(Color32::from_rgb(209, 186, 46))),
+        AiCliStatus::Attention => Some(AiBadgeVisual::Pulse(Color32::from_rgb(46, 130, 255))),
     }
 }
 
@@ -1301,6 +1302,7 @@ impl AdeApp {
             title: fallback_title.clone(),
             full_title: fallback_title,
             pending_line_for_title: String::new(),
+            recent_inputs: VecDeque::new(),
             in_main_view: true,
             dirty: true,
             last_seqno: runtime.latest_seqno(),
@@ -4226,8 +4228,64 @@ impl AdeApp {
             terminal.full_title = sanitized;
             terminal.title = update_terminal_title(&line, terminal.id as usize, TITLE_MAX_LEN);
         }
+
+        Self::push_recent_input(&mut terminal.recent_inputs, message);
+
         terminal.dirty = true;
         self.status_line = format!("Sent saved message to {}", destination_title);
+    }
+
+    const RECENT_INPUTS_MAX: usize = 4;
+
+    fn push_recent_input(recent_inputs: &mut VecDeque<String>, message: &str) {
+        if message.trim().is_empty() {
+            return;
+        }
+        recent_inputs.push_front(message.to_owned());
+        while recent_inputs.len() > Self::RECENT_INPUTS_MAX {
+            recent_inputs.pop_back();
+        }
+    }
+
+    #[allow(dead_code)]
+    fn send_ai_command_to_project_terminal(&mut self, project_id: u64, command: &str) {
+        let target_terminal_id = self
+            .active_terminal
+            .filter(|tid| {
+                self.terminals
+                    .get(tid)
+                    .is_some_and(|t| t.project_id == project_id && !t.exited)
+            })
+            .or_else(|| {
+                self.terminals
+                    .iter()
+                    .filter(|(_, t)| t.project_id == project_id && !t.exited)
+                    .map(|(&id, _)| id)
+                    .next()
+            });
+
+        let Some(target_terminal_id) = target_terminal_id else {
+            self.status_line = "No active terminal for AI command".to_owned();
+            return;
+        };
+
+        let Some(terminal) = self.terminals.get_mut(&target_terminal_id) else {
+            return;
+        };
+
+        let mut outbound = command.as_bytes().to_vec();
+        outbound.push(b'\r');
+        terminal.runtime.send_bytes(outbound);
+        Self::clear_terminal_selection(terminal);
+        Self::append_pending_line(&mut terminal.pending_line_for_title, command);
+        let line = std::mem::take(&mut terminal.pending_line_for_title);
+        if let Some(sanitized) = terminal_title_candidate(&line) {
+            terminal.full_title = sanitized;
+            terminal.title = update_terminal_title(&line, terminal.id as usize, TITLE_MAX_LEN);
+        }
+
+        terminal.dirty = true;
+        self.status_line = format!("Sent '{}' to {}", command, terminal.title);
     }
 
     fn finalize_pointer_selection_copy(&mut self, ctx: &egui::Context) {
@@ -5495,11 +5553,21 @@ impl AdeApp {
                 let row_height = ui.spacing().interact_size.y.max(CONTROL_ROW_HEIGHT);
                 let (row_rect, row_response) =
                     ui.allocate_exact_size(egui::vec2(row_width, row_height), Sense::click());
-                let row_response = row_response.on_hover_text(if terminal.exited {
+                let hover_text = if terminal.exited {
                     format!("{} (Exited)", label)
                 } else {
-                    label.clone()
-                });
+                    let base_text = label.clone();
+                    if terminal.recent_inputs.is_empty() {
+                        base_text
+                    } else {
+                        format!(
+                            "{}\n\n{}",
+                            base_text,
+                            recent_inputs_tooltip_text(&terminal.recent_inputs)
+                        )
+                    }
+                };
+                let row_response = row_response.on_hover_text(hover_text);
                 let row_chrome = terminal_manager_row_chrome(active, row_response.hovered());
 
                 if ui.is_rect_visible(row_rect) {
@@ -5538,8 +5606,7 @@ impl AdeApp {
                                     row_chrome.title_color
                                 };
                                 let title_font = egui::TextStyle::Body.resolve(ui.style());
-                                let title_response = ui.add_sized(
-                                    egui::vec2(ui.available_width().max(0.0), row_height),
+                                let title_response = ui.add(
                                     egui::Label::new(RichText::new(&label).color(text_color))
                                         .truncate()
                                         .sense(Sense::click()),
@@ -5550,7 +5617,14 @@ impl AdeApp {
                                     &label,
                                     &title_font,
                                     text_color,
+                                    row_label_width,
                                 );
+                                // Add recent inputs tooltip
+                                if !terminal.recent_inputs.is_empty() {
+                                    title_response.clone().on_hover_text(
+                                        recent_inputs_tooltip_text(&terminal.recent_inputs),
+                                    );
+                                }
 
                                 match ai_response {
                                     Some(response) => response.union(title_response),
@@ -5833,6 +5907,7 @@ impl AdeApp {
                                 &terminal.full_title,
                                 &title_font,
                                 TEXT_PRIMARY,
+                                ui.available_width(),
                             );
                             if title_response.clicked() {
                                 pane_clicked = true;
@@ -6421,6 +6496,7 @@ impl AdeApp {
                                             message,
                                             &egui::TextStyle::Monospace.resolve(ui.style()),
                                             TEXT_PRIMARY,
+                                            ui.available_width(),
                                         );
 
                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -7726,7 +7802,14 @@ fn draw_directory_file_row(ui: &mut Ui, text: &str) -> egui::Response {
     }
 
     let font_id = egui::TextStyle::Body.resolve(ui.style());
-    with_truncation_tooltip(ui, response, text, &font_id, ui.visuals().text_color())
+    with_truncation_tooltip(
+        ui,
+        response,
+        text,
+        &font_id,
+        ui.visuals().text_color(),
+        wrap_width,
+    )
 }
 
 fn draw_directory_folder_row(ui: &mut Ui, text: &str) -> egui::Response {
@@ -7750,7 +7833,14 @@ fn draw_directory_folder_row(ui: &mut Ui, text: &str) -> egui::Response {
     }
 
     let font_id = egui::TextStyle::Body.resolve(ui.style());
-    with_truncation_tooltip(ui, response, text, &font_id, ui.visuals().text_color())
+    with_truncation_tooltip(
+        ui,
+        response,
+        text,
+        &font_id,
+        ui.visuals().text_color(),
+        wrap_width,
+    )
 }
 
 fn draw_sidebar_text_row<T>(
@@ -7781,7 +7871,7 @@ where
     }
 
     let font_id = egui::TextStyle::Body.resolve(ui.style());
-    with_truncation_tooltip(ui, response, tooltip, &font_id, fallback_color)
+    with_truncation_tooltip(ui, response, tooltip, &font_id, fallback_color, wrap_width)
 }
 
 fn draw_source_control_file_row(ui: &mut Ui, status_icon: AppIcon, text: &str) -> egui::Response {
@@ -7841,7 +7931,14 @@ fn draw_source_control_file_row(ui: &mut Ui, status_icon: AppIcon, text: &str) -
     }
 
     let font_id = egui::TextStyle::Small.resolve(ui.style());
-    with_truncation_tooltip(ui, response, text, &font_id, ui.visuals().text_color())
+    with_truncation_tooltip(
+        ui,
+        response,
+        text,
+        &font_id,
+        ui.visuals().text_color(),
+        wrap_width,
+    )
 }
 
 fn directory_file_row_hover_fill(is_hovered: bool) -> Option<Color32> {
@@ -7915,14 +8012,44 @@ fn capped_hover_text(text: &str, max_chars: usize) -> String {
     result
 }
 
+const RECENT_INPUTS_HOVER_MAX_CHARS: usize = 100;
+
+fn recent_inputs_tooltip_text(recent_inputs: &VecDeque<String>) -> String {
+    if recent_inputs.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = Vec::with_capacity(recent_inputs.len() + 2);
+
+    lines.push("─ Recent Inputs ─".to_owned());
+    for (i, input) in recent_inputs.iter().enumerate() {
+        let truncated = capped_hover_text(input, RECENT_INPUTS_HOVER_MAX_CHARS);
+        lines.push(format!("{}: {}", i + 1, truncated));
+    }
+
+    lines.join("\n")
+}
+
 fn with_truncation_tooltip(
-    _ui: &Ui,
+    ui: &Ui,
     response: egui::Response,
     text: &str,
     _font_id: &FontId,
     _color: Color32,
+    available_width: f32,
 ) -> egui::Response {
-    if !text.trim().is_empty() {
+    if text.trim().is_empty() {
+        return response;
+    }
+
+    let galley = WidgetText::from(text.to_owned()).into_galley(
+        ui,
+        Some(TextWrapMode::Truncate),
+        available_width,
+        egui::TextStyle::Body,
+    );
+
+    if galley.size().x > available_width {
         response.on_hover_text(capped_hover_text(text, DIRECTORY_ENTRY_TOOLTIP_MAX_CHARS))
     } else {
         response
@@ -8183,18 +8310,12 @@ fn draw_terminal_manager_title_and_diff_summary(
 ) -> TerminalManagerTitleSummaryLayout {
     ui.allocate_ui_with_layout(
         egui::vec2(ui.available_width().max(0.0), row_height),
-        Layout::right_to_left(Align::Center),
+        Layout::left_to_right(Align::Center),
         |ui| {
-            let diff_summary_response = draw_terminal_manager_diff_summary(ui, diff_summary);
-            ui.add_space(6.0);
-
             let title_label = egui::Label::new(RichText::new(title).color(text_color).strong())
                 .truncate()
                 .sense(Sense::hover());
-            let title_response = ui.add_sized(
-                egui::vec2(ui.available_width().max(0.0), row_height),
-                title_label,
-            );
+            let title_response = ui.add(title_label);
             {
                 let info = WidgetInfo::selected(
                     WidgetType::SelectableLabel,
@@ -8208,6 +8329,9 @@ fn draw_terminal_manager_title_and_diff_summary(
                 .clone()
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text(title);
+
+            ui.add_space(6.0);
+            let diff_summary_response = draw_terminal_manager_diff_summary(ui, diff_summary);
 
             TerminalManagerTitleSummaryLayout {
                 #[cfg(test)]
@@ -9410,10 +9534,10 @@ mod tests {
         merge_source_control_refresh_result, next_active_terminal_after_close,
         next_terminal_in_direction, next_terminal_in_linear_direction,
         normalize_terminal_background, parse_branch_header, parse_git_numstat_totals,
-        recover_config_state, resolve_ctrl_c_action, should_resolve_terminal_link,
-        source_control_badge_color, source_control_tooltip_lines, terminal_cell_metric,
-        terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect, terminal_font_family,
-        terminal_font_id, terminal_grid_dimensions, terminal_line_height,
+        recent_inputs_tooltip_text, recover_config_state, resolve_ctrl_c_action,
+        should_resolve_terminal_link, source_control_badge_color, source_control_tooltip_lines,
+        terminal_cell_metric, terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect,
+        terminal_font_family, terminal_font_id, terminal_grid_dimensions, terminal_line_height,
         terminal_link_activation_modifiers, terminal_link_at_point, terminal_logical_line,
         terminal_logical_line_byte_index, terminal_manager_actions_width,
         terminal_manager_diff_summary_model, terminal_manager_diff_summary_visual,
@@ -9453,7 +9577,7 @@ mod tests {
         self, pos2, Color32, Context, Event, FontDefinitions, FontFamily, Galley, Id, Key,
         Modifiers, RawInput, Stroke,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -14540,6 +14664,7 @@ mod tests {
             title: format!("Terminal {id}"),
             full_title: format!("Terminal {id}"),
             pending_line_for_title: String::new(),
+            recent_inputs: VecDeque::new(),
             in_main_view: true,
             dirty: false,
             last_seqno: 0,
@@ -14878,6 +15003,63 @@ mod tests {
         AdeApp::append_pending_line(&mut pending, "first\r\n\r\nthird");
 
         assert_eq!(pending, "third");
+    }
+
+    #[test]
+    fn push_recent_input_keeps_last_4() {
+        let mut recent_inputs = VecDeque::new();
+
+        AdeApp::push_recent_input(&mut recent_inputs, "first");
+        assert_eq!(recent_inputs.len(), 1);
+        assert_eq!(recent_inputs[0], "first");
+
+        AdeApp::push_recent_input(&mut recent_inputs, "second");
+        assert_eq!(recent_inputs.len(), 2);
+        assert_eq!(recent_inputs[0], "second");
+        assert_eq!(recent_inputs[1], "first");
+
+        AdeApp::push_recent_input(&mut recent_inputs, "third");
+        AdeApp::push_recent_input(&mut recent_inputs, "fourth");
+        assert_eq!(recent_inputs.len(), 4);
+
+        AdeApp::push_recent_input(&mut recent_inputs, "fifth");
+        assert_eq!(recent_inputs.len(), 4);
+        assert_eq!(recent_inputs[0], "fifth");
+        assert_eq!(recent_inputs[3], "second");
+    }
+
+    #[test]
+    fn push_recent_input_ignores_empty_messages() {
+        let mut recent_inputs = VecDeque::new();
+
+        AdeApp::push_recent_input(&mut recent_inputs, "");
+        assert!(recent_inputs.is_empty());
+
+        AdeApp::push_recent_input(&mut recent_inputs, "   ");
+        assert!(recent_inputs.is_empty());
+    }
+
+    #[test]
+    fn recent_inputs_tooltip_text_shows_all_inputs() {
+        let mut recent_inputs = VecDeque::new();
+        // push_front: newest first
+        recent_inputs.push_front("msg1".to_owned());
+        recent_inputs.push_front("msg2".to_owned());
+
+        let tooltip = recent_inputs_tooltip_text(&recent_inputs);
+
+        // msg2 is newest (index 0, number 1)
+        assert!(tooltip.contains("1: msg2"));
+        // msg1 is second newest (index 1, number 2)
+        assert!(tooltip.contains("2: msg1"));
+        assert!(tooltip.contains("─ Recent Inputs ─"));
+    }
+
+    #[test]
+    fn recent_inputs_tooltip_text_returns_empty_for_no_inputs() {
+        let recent_inputs: VecDeque<String> = VecDeque::new();
+        let tooltip = recent_inputs_tooltip_text(&recent_inputs);
+        assert!(tooltip.is_empty());
     }
 
     #[test]
@@ -15601,7 +15783,7 @@ mod tests {
         );
         assert_eq!(
             ai_badge_visual(AiCliStatus::Attention),
-            Some(AiBadgeVisual::Pulse(Color32::from_rgb(209, 186, 46)))
+            Some(AiBadgeVisual::Pulse(Color32::from_rgb(46, 130, 255)))
         );
         assert_eq!(ai_badge_visual(AiCliStatus::Inactive), None);
     }
