@@ -14,6 +14,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arboard::Clipboard;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{
@@ -54,6 +56,7 @@ const FACTORY_DROID_HOOK_POLL_MS: u64 = 75;
 const FACTORY_DROID_PROCESS_POLL_MS: u64 = 75;
 const FACTORY_DROID_LAUNCH_GRACE_MS: u64 = 5_000;
 const FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS: u64 = 750;
+const FACTORY_DROID_MANAGED_DIAGNOSTICS_REFRESH_MS: u64 = 2_000;
 const CODEX_NOTIFY_POLL_MS: u64 = 75;
 const CODEX_PROCESS_POLL_MS: u64 = 75;
 const CODEX_LAUNCH_GRACE_MS: u64 = 5_000;
@@ -320,11 +323,65 @@ impl CodexCliStatusSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct FactoryDroidManagedInstallComponent {
+    path: PathBuf,
+    status_text: String,
+    healthy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FactoryDroidManagedInstallDiagnostics {
+    settings: FactoryDroidManagedInstallComponent,
+    hook_script: FactoryDroidManagedInstallComponent,
+}
+
+impl FactoryDroidManagedInstallDiagnostics {
+    fn unavailable() -> Self {
+        Self {
+            settings: FactoryDroidManagedInstallComponent {
+                path: PathBuf::from(".factory/settings.json"),
+                status_text: "Home directory unavailable".to_owned(),
+                healthy: false,
+            },
+            hook_script: FactoryDroidManagedInstallComponent {
+                path: PathBuf::from(".factory/hooks/mergen-ade-droid-status.ps1"),
+                status_text: "Home directory unavailable".to_owned(),
+                healthy: false,
+            },
+        }
+    }
+
+    fn needs_repair(&self) -> bool {
+        !self.settings.healthy || !self.hook_script.healthy
+    }
+
+    fn warning_message(&self) -> Option<String> {
+        self.needs_repair().then(|| {
+            let mut issues = Vec::new();
+            if !self.settings.healthy {
+                issues.push(format!("Managed settings: {}", self.settings.status_text));
+            }
+            if !self.hook_script.healthy {
+                issues.push(format!(
+                    "Installed hook script: {}",
+                    self.hook_script.status_text
+                ));
+            }
+            format!(
+                "{}. Rerun `powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\install-factory-droid-hooks.ps1`, then restart Droid.",
+                issues.join(" ")
+            )
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct FactoryDroidTransportDiagnostics {
     hooks_enabled: bool,
     executable_path: PathBuf,
     hooks_runtime_dir: Option<PathBuf>,
     hooks_runtime_error: Option<String>,
+    managed_install: FactoryDroidManagedInstallDiagnostics,
     active_session: Option<bool>,
     process_state: Option<String>,
     last_status_source: Option<FactoryDroidStatusSource>,
@@ -366,13 +423,49 @@ impl FactoryDroidTransportDiagnostics {
             .unwrap_or("none")
     }
 
-    fn warning_message(&self) -> Option<String> {
-        self.hooks_enabled.then_some(()).and(
-            self.hooks_runtime_error
-                .as_ref()
-                .map(|err| format!("Factory Droid inbox fallback unavailable: {err}")),
-        )
+    fn warning_badge_text(&self) -> Option<&'static str> {
+        if !self.hooks_enabled {
+            None
+        } else if self.managed_install.needs_repair() {
+            Some("Factory Droid hook repair needed")
+        } else if self.hooks_runtime_error.is_some() {
+            Some("Factory Droid inbox fallback unavailable")
+        } else {
+            None
+        }
     }
+
+    fn warning_message(&self) -> Option<String> {
+        if !self.hooks_enabled {
+            return None;
+        }
+
+        let mut warnings = Vec::new();
+        if let Some(message) = self.managed_install.warning_message() {
+            warnings.push(message);
+        }
+        if let Some(err) = &self.hooks_runtime_error {
+            warnings.push(format!("Factory Droid inbox fallback unavailable: {err}"));
+        }
+
+        (!warnings.is_empty()).then(|| warnings.join(" "))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FactoryDroidManagedCommandClassification {
+    Healthy,
+    LegacyFileLauncher,
+    Drifted,
+    Unmanaged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FactoryDroidManagedEventStatus {
+    Healthy,
+    LegacyFileLauncher,
+    Drifted,
+    Missing,
 }
 
 pub struct AdeApp {
@@ -383,6 +476,8 @@ pub struct AdeApp {
     factory_droid_hook_inboxes: BTreeMap<u64, FactoryDroidHookInboxState>,
     factory_droid_hook_last_poll_at: Option<Instant>,
     factory_droid_process_last_poll_at: Option<Instant>,
+    factory_droid_managed_install_diagnostics: Option<FactoryDroidManagedInstallDiagnostics>,
+    factory_droid_managed_install_last_refresh_at: Option<Instant>,
     codex_cli_runtime_dir: Option<PathBuf>,
     codex_cli_runtime_dir_error: Option<String>,
     codex_notify_inboxes: BTreeMap<u64, CodexNotifyInboxState>,
@@ -862,6 +957,315 @@ impl AdeApp {
         }
     }
 
+    fn user_home_dir() -> Option<PathBuf> {
+        std::env::var_os("USERPROFILE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+            })
+    }
+
+    fn factory_droid_managed_settings_path_for_home(home_dir: &Path) -> PathBuf {
+        home_dir.join(".factory").join("settings.json")
+    }
+
+    fn factory_droid_managed_hook_script_path_for_home(home_dir: &Path) -> PathBuf {
+        home_dir
+            .join(".factory")
+            .join("hooks")
+            .join("mergen-ade-droid-status.ps1")
+    }
+
+    fn escape_powershell_single_quoted_string(value: &str) -> String {
+        value.replace('\'', "''")
+    }
+
+    fn expected_factory_droid_encoded_script_block(script_path: &Path) -> String {
+        format!(
+            "& '{}'",
+            Self::escape_powershell_single_quoted_string(&script_path.display().to_string())
+        )
+    }
+
+    fn normalize_factory_droid_script_block(script_block: &str) -> String {
+        script_block.trim().replace('/', "\\").to_ascii_lowercase()
+    }
+
+    fn decode_factory_droid_encoded_command(command: &str) -> Option<String> {
+        let marker = "-encodedcommand";
+        let lower = command.to_ascii_lowercase();
+        let marker_index = lower.find(marker)?;
+        let encoded = command[marker_index + marker.len()..]
+            .trim_start()
+            .split_whitespace()
+            .next()?;
+        let bytes = BASE64_STANDARD.decode(encoded).ok()?;
+        if bytes.len() % 2 != 0 {
+            return None;
+        }
+
+        let utf16 = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        String::from_utf16(&utf16).ok()
+    }
+
+    fn classify_factory_droid_managed_command(
+        command: &str,
+        expected_script_path: &Path,
+    ) -> FactoryDroidManagedCommandClassification {
+        let normalized_command = command.trim();
+        let lower = normalized_command.to_ascii_lowercase();
+        let references_managed_script = lower.contains("mergen-ade-droid-status.ps1");
+
+        if lower.contains("-file") && references_managed_script {
+            return FactoryDroidManagedCommandClassification::LegacyFileLauncher;
+        }
+
+        if let Some(decoded) = Self::decode_factory_droid_encoded_command(normalized_command) {
+            if decoded
+                .to_ascii_lowercase()
+                .contains("mergen-ade-droid-status.ps1")
+            {
+                let expected =
+                    Self::expected_factory_droid_encoded_script_block(expected_script_path);
+                if Self::normalize_factory_droid_script_block(&decoded)
+                    == Self::normalize_factory_droid_script_block(&expected)
+                {
+                    return FactoryDroidManagedCommandClassification::Healthy;
+                }
+
+                return FactoryDroidManagedCommandClassification::Drifted;
+            }
+        }
+
+        if references_managed_script {
+            return FactoryDroidManagedCommandClassification::Drifted;
+        }
+
+        FactoryDroidManagedCommandClassification::Unmanaged
+    }
+
+    fn single_or_array_items(value: &serde_json::Value) -> Vec<&serde_json::Value> {
+        match value {
+            serde_json::Value::Array(items) => items.iter().collect(),
+            _ => vec![value],
+        }
+    }
+
+    fn inspect_factory_droid_managed_event_status(
+        event_value: Option<&serde_json::Value>,
+        expected_script_path: &Path,
+    ) -> FactoryDroidManagedEventStatus {
+        let Some(event_value) = event_value else {
+            return FactoryDroidManagedEventStatus::Missing;
+        };
+
+        let mut saw_legacy_file_launcher = false;
+        let mut saw_drifted_command = false;
+        for entry in Self::single_or_array_items(event_value) {
+            let Some(hooks_value) = entry.get("hooks") else {
+                continue;
+            };
+            for hook in Self::single_or_array_items(hooks_value) {
+                if hook.get("type").and_then(serde_json::Value::as_str) != Some("command") {
+                    continue;
+                }
+
+                let Some(command) = hook.get("command").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                match Self::classify_factory_droid_managed_command(command, expected_script_path) {
+                    FactoryDroidManagedCommandClassification::Healthy => {
+                        return FactoryDroidManagedEventStatus::Healthy;
+                    }
+                    FactoryDroidManagedCommandClassification::LegacyFileLauncher => {
+                        saw_legacy_file_launcher = true;
+                    }
+                    FactoryDroidManagedCommandClassification::Drifted => {
+                        saw_drifted_command = true;
+                    }
+                    FactoryDroidManagedCommandClassification::Unmanaged => {}
+                }
+            }
+        }
+
+        if saw_legacy_file_launcher {
+            FactoryDroidManagedEventStatus::LegacyFileLauncher
+        } else if saw_drifted_command {
+            FactoryDroidManagedEventStatus::Drifted
+        } else {
+            FactoryDroidManagedEventStatus::Missing
+        }
+    }
+
+    fn inspect_factory_droid_managed_settings(
+        settings_path: &Path,
+        expected_script_path: &Path,
+    ) -> FactoryDroidManagedInstallComponent {
+        let raw_settings = match fs::read_to_string(settings_path) {
+            Ok(raw_settings) => raw_settings,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return FactoryDroidManagedInstallComponent {
+                    path: settings_path.to_path_buf(),
+                    status_text: "Missing settings.json".to_owned(),
+                    healthy: false,
+                };
+            }
+            Err(err) => {
+                return FactoryDroidManagedInstallComponent {
+                    path: settings_path.to_path_buf(),
+                    status_text: format!("Read failed: {err}"),
+                    healthy: false,
+                };
+            }
+        };
+
+        let parsed_settings = match serde_json::from_str::<serde_json::Value>(&raw_settings) {
+            Ok(parsed_settings) => parsed_settings,
+            Err(err) => {
+                return FactoryDroidManagedInstallComponent {
+                    path: settings_path.to_path_buf(),
+                    status_text: format!("Invalid settings.json: {err}"),
+                    healthy: false,
+                };
+            }
+        };
+
+        let hooks = parsed_settings.get("hooks");
+        let mut legacy_events = Vec::new();
+        let mut drifted_events = Vec::new();
+        let mut missing_events = Vec::new();
+        for event_name in ["UserPromptSubmit", "Notification", "Stop"] {
+            match Self::inspect_factory_droid_managed_event_status(
+                hooks.and_then(|hooks_value| hooks_value.get(event_name)),
+                expected_script_path,
+            ) {
+                FactoryDroidManagedEventStatus::Healthy => {}
+                FactoryDroidManagedEventStatus::LegacyFileLauncher => {
+                    legacy_events.push(event_name);
+                }
+                FactoryDroidManagedEventStatus::Drifted => {
+                    drifted_events.push(event_name);
+                }
+                FactoryDroidManagedEventStatus::Missing => {
+                    missing_events.push(event_name);
+                }
+            }
+        }
+
+        let mut issues = Vec::new();
+        if !legacy_events.is_empty() {
+            issues.push(format!(
+                "Legacy -File launcher for {}",
+                legacy_events.join(", ")
+            ));
+        }
+        if !drifted_events.is_empty() {
+            issues.push(format!(
+                "Stale managed hook command for {}",
+                drifted_events.join(", ")
+            ));
+        }
+        if !missing_events.is_empty() {
+            issues.push(format!(
+                "Missing managed hook for {}",
+                missing_events.join(", ")
+            ));
+        }
+
+        FactoryDroidManagedInstallComponent {
+            path: settings_path.to_path_buf(),
+            status_text: if issues.is_empty() {
+                "Healthy".to_owned()
+            } else {
+                issues.join("; ")
+            },
+            healthy: issues.is_empty(),
+        }
+    }
+
+    fn inspect_factory_droid_managed_hook_script(
+        hook_script_path: &Path,
+    ) -> FactoryDroidManagedInstallComponent {
+        let script_contents = match fs::read_to_string(hook_script_path) {
+            Ok(script_contents) => script_contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return FactoryDroidManagedInstallComponent {
+                    path: hook_script_path.to_path_buf(),
+                    status_text: "Missing installed hook script".to_owned(),
+                    healthy: false,
+                };
+            }
+            Err(err) => {
+                return FactoryDroidManagedInstallComponent {
+                    path: hook_script_path.to_path_buf(),
+                    status_text: format!("Read failed: {err}"),
+                    healthy: false,
+                };
+            }
+        };
+
+        let has_inbox_token_env = script_contents.contains("MERGEN_ADE_FACTORY_DROID_INBOX_TOKEN");
+        let has_inbox_token_field = script_contents.contains("inbox_token");
+        FactoryDroidManagedInstallComponent {
+            path: hook_script_path.to_path_buf(),
+            status_text: if has_inbox_token_env && has_inbox_token_field {
+                "Healthy".to_owned()
+            } else {
+                "Missing inbox_token support".to_owned()
+            },
+            healthy: has_inbox_token_env && has_inbox_token_field,
+        }
+    }
+
+    fn inspect_factory_droid_managed_install_for_home(
+        home_dir: &Path,
+    ) -> FactoryDroidManagedInstallDiagnostics {
+        let settings_path = Self::factory_droid_managed_settings_path_for_home(home_dir);
+        let hook_script_path = Self::factory_droid_managed_hook_script_path_for_home(home_dir);
+        FactoryDroidManagedInstallDiagnostics {
+            settings: Self::inspect_factory_droid_managed_settings(
+                &settings_path,
+                &hook_script_path,
+            ),
+            hook_script: Self::inspect_factory_droid_managed_hook_script(&hook_script_path),
+        }
+    }
+
+    fn inspect_factory_droid_managed_install() -> FactoryDroidManagedInstallDiagnostics {
+        let Some(home_dir) = Self::user_home_dir() else {
+            return FactoryDroidManagedInstallDiagnostics::unavailable();
+        };
+        Self::inspect_factory_droid_managed_install_for_home(&home_dir)
+    }
+
+    fn cached_factory_droid_managed_install_diagnostics(
+        &mut self,
+    ) -> FactoryDroidManagedInstallDiagnostics {
+        let needs_refresh = self
+            .factory_droid_managed_install_last_refresh_at
+            .map(|last_refresh| {
+                last_refresh.elapsed()
+                    >= Duration::from_millis(FACTORY_DROID_MANAGED_DIAGNOSTICS_REFRESH_MS)
+            })
+            .unwrap_or(true);
+
+        if needs_refresh {
+            self.factory_droid_managed_install_diagnostics =
+                Some(Self::inspect_factory_droid_managed_install());
+            self.factory_droid_managed_install_last_refresh_at = Some(Instant::now());
+        }
+
+        self.factory_droid_managed_install_diagnostics
+            .clone()
+            .unwrap_or_else(Self::inspect_factory_droid_managed_install)
+    }
+
     fn next_factory_droid_inbox_token(terminal_id: u64) -> String {
         let counter = FACTORY_DROID_INBOX_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
         let timestamp_nanos = SystemTime::now()
@@ -1004,6 +1408,8 @@ impl AdeApp {
             factory_droid_hook_inboxes: BTreeMap::new(),
             factory_droid_hook_last_poll_at: None,
             factory_droid_process_last_poll_at: None,
+            factory_droid_managed_install_diagnostics: None,
+            factory_droid_managed_install_last_refresh_at: None,
             codex_cli_runtime_dir,
             codex_cli_runtime_dir_error: codex_cli_runtime_dir_error.clone(),
             codex_notify_inboxes: BTreeMap::new(),
@@ -1809,6 +2215,12 @@ impl AdeApp {
         event: &FactoryDroidHookInboxEvent,
     ) -> bool {
         if event.terminal_id != terminal_id.to_string() {
+            log::warn!(
+                "Ignoring Factory Droid hook inbox event for terminal {terminal_id}: reason=mismatched_terminal_id, event_terminal_id={}, status={}, hook_event_name={}, stale_install_drift=unlikely",
+                event.terminal_id,
+                event.status,
+                event.hook_event_name
+            );
             return false;
         }
 
@@ -1817,10 +2229,32 @@ impl AdeApp {
             .get(&terminal_id)
             .and_then(|terminal| terminal.factory_droid_inbox_token.as_deref())
         else {
+            log::warn!(
+                "Ignoring Factory Droid hook inbox event for terminal {terminal_id}: reason=missing_current_inbox_token, event_terminal_id={}, status={}, hook_event_name={}, stale_install_drift=unknown",
+                event.terminal_id,
+                event.status,
+                event.hook_event_name
+            );
             return false;
         };
 
-        if event.inbox_token.as_deref() != Some(expected_inbox_token) {
+        let Some(event_inbox_token) = event.inbox_token.as_deref() else {
+            log::warn!(
+                "Ignoring Factory Droid hook inbox event for terminal {terminal_id}: reason=missing_inbox_token, event_terminal_id={}, status={}, hook_event_name={}, stale_install_drift=likely, reinstall_hint=.\\scripts\\install-factory-droid-hooks.ps1",
+                event.terminal_id,
+                event.status,
+                event.hook_event_name
+            );
+            return false;
+        };
+
+        if event_inbox_token != expected_inbox_token {
+            log::warn!(
+                "Ignoring Factory Droid hook inbox event for terminal {terminal_id}: reason=mismatched_inbox_token, event_terminal_id={}, status={}, hook_event_name={}, stale_install_drift=possible",
+                event.terminal_id,
+                event.status,
+                event.hook_event_name
+            );
             return false;
         }
 
@@ -2352,6 +2786,13 @@ impl AdeApp {
 
     fn terminal_count_for_project_kind(&self, project_id: u64, kind: TerminalKind) -> usize {
         terminal_ids_for_project_kind(&self.terminals, project_id, kind).len()
+    }
+
+    fn terminal_count_live_for_project_kind(&self, project_id: u64, kind: TerminalKind) -> usize {
+        self.terminals
+            .values()
+            .filter(|t| t.project_id == project_id && t.kind == kind && !t.exited)
+            .count()
     }
 
     #[cfg(test)]
@@ -4436,7 +4877,8 @@ impl AdeApp {
             })
     }
 
-    fn factory_droid_transport_diagnostics(&self) -> FactoryDroidTransportDiagnostics {
+    fn factory_droid_transport_diagnostics(&mut self) -> FactoryDroidTransportDiagnostics {
+        let managed_install = self.cached_factory_droid_managed_install_diagnostics();
         let active_terminal = self
             .active_terminal
             .and_then(|terminal_id| self.terminals.get(&terminal_id));
@@ -4445,6 +4887,7 @@ impl AdeApp {
             executable_path: self.current_executable_path.clone(),
             hooks_runtime_dir: self.factory_droid_hooks_dir.clone(),
             hooks_runtime_error: self.factory_droid_hooks_dir_error.clone(),
+            managed_install,
             active_session: active_terminal.map(|terminal| terminal.factory_droid_session_active),
             process_state: active_terminal
                 .map(Self::factory_droid_process_state_text)
@@ -4495,6 +4938,18 @@ impl AdeApp {
         }
 
         let diagnostics = self.factory_droid_transport_diagnostics();
+        let managed_settings_path = diagnostics
+            .managed_install
+            .settings
+            .path
+            .display()
+            .to_string();
+        let managed_hook_script_path = diagnostics
+            .managed_install
+            .hook_script
+            .path
+            .display()
+            .to_string();
         egui::Frame::none()
             .fill(with_alpha(SURFACE_BG, 216))
             .stroke(Stroke::new(1.0, BORDER_COLOR))
@@ -4537,6 +4992,38 @@ impl AdeApp {
                             "Factory Droid Inbox",
                             &diagnostics.runtime_status_text(),
                             if diagnostics.hooks_runtime_dir.is_some() {
+                                Color32::from_rgb(114, 209, 152)
+                            } else {
+                                Color32::from_rgb(232, 184, 76)
+                            },
+                        );
+                        Self::draw_settings_diagnostic_row(
+                            ui,
+                            "Managed Settings Path",
+                            &managed_settings_path,
+                            TEXT_PRIMARY,
+                        );
+                        Self::draw_settings_diagnostic_row(
+                            ui,
+                            "Managed Hook Commands",
+                            &diagnostics.managed_install.settings.status_text,
+                            if diagnostics.managed_install.settings.healthy {
+                                Color32::from_rgb(114, 209, 152)
+                            } else {
+                                Color32::from_rgb(232, 184, 76)
+                            },
+                        );
+                        Self::draw_settings_diagnostic_row(
+                            ui,
+                            "Managed Hook Script",
+                            &managed_hook_script_path,
+                            TEXT_PRIMARY,
+                        );
+                        Self::draw_settings_diagnostic_row(
+                            ui,
+                            "Managed Hook Script Health",
+                            &diagnostics.managed_install.hook_script.status_text,
+                            if diagnostics.managed_install.hook_script.healthy {
                                 Color32::from_rgb(114, 209, 152)
                             } else {
                                 Color32::from_rgb(232, 184, 76)
@@ -4716,8 +5203,11 @@ impl AdeApp {
 
                             if let Some(warning_message) = diagnostics.warning_message() {
                                 ui.add_space(8.0);
+                                let warning_label = diagnostics
+                                    .warning_badge_text()
+                                    .unwrap_or("Factory Droid diagnostics warning");
                                 ui.label(
-                                    RichText::new("Factory Droid inbox fallback unavailable")
+                                    RichText::new(warning_label)
                                         .small()
                                         .strong()
                                         .color(Color32::from_rgb(232, 184, 76)),
@@ -5521,6 +6011,8 @@ impl AdeApp {
             );
             let header_open = header_state.is_open();
             let visible_count = self.terminal_count_for_project_kind(project_id, visible_kind);
+            let has_live_terminal =
+                self.terminal_count_live_for_project_kind(project_id, visible_kind) > 0;
             let has_children = visible_count > 0;
             let (header_response, spawn_clicked, header_clicked) = draw_project_group_header(
                 ui,
@@ -5529,6 +6021,7 @@ impl AdeApp {
                 has_children,
                 visible_kind,
                 &project_diff_summary,
+                has_live_terminal,
             );
             let spawn_succeeded =
                 spawn_clicked && self.spawn_terminal_for_project(ctx, project_id, visible_kind);
@@ -5684,7 +6177,8 @@ impl AdeApp {
                                     &title_font,
                                     text_color,
                                     row_label_width,
-                                );
+                                )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
                                 // Add recent inputs tooltip
                                 if !terminal.recent_inputs.is_empty() {
                                     title_response.clone().on_hover_text(
@@ -5974,7 +6468,8 @@ impl AdeApp {
                                 &title_font,
                                 TEXT_PRIMARY,
                                 ui.available_width(),
-                            );
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
                             if title_response.clicked() {
                                 pane_clicked = true;
                             }
@@ -8229,13 +8724,23 @@ fn terminal_manager_diff_summary_visual(
     summary: &TerminalManagerDiffSummaryModel,
 ) -> TerminalManagerDiffSummaryVisual {
     match summary.state {
-        TerminalManagerDiffSummaryState::Ready => TerminalManagerDiffSummaryVisual::Totals {
-            added_text: format!("+{}", summary.added_lines),
-            removed_text: format!("-{}", summary.removed_lines),
-            added_color: source_control_badge_color(SourceControlBadgeState::Clean),
-            removed_color: source_control_badge_color(SourceControlBadgeState::Error),
-            separator_color: TEXT_MUTED,
-        },
+        TerminalManagerDiffSummaryState::Ready => {
+            // When there are no changes at all, show nothing instead of "+0 -0"
+            if summary.added_lines == 0 && summary.removed_lines == 0 {
+                TerminalManagerDiffSummaryVisual::Placeholder {
+                    text: "",
+                    color: Color32::TRANSPARENT,
+                }
+            } else {
+                TerminalManagerDiffSummaryVisual::Totals {
+                    added_text: format!("+{}", summary.added_lines),
+                    removed_text: format!("-{}", summary.removed_lines),
+                    added_color: source_control_badge_color(SourceControlBadgeState::Clean),
+                    removed_color: source_control_badge_color(SourceControlBadgeState::Error),
+                    separator_color: TEXT_MUTED,
+                }
+            }
+        }
         TerminalManagerDiffSummaryState::Loading => TerminalManagerDiffSummaryVisual::Placeholder {
             text: "...",
             color: TEXT_MUTED,
@@ -8543,47 +9048,55 @@ fn draw_terminal_manager_filter_tabs(
 ) -> bool {
     let mut changed = false;
 
-    ui.horizontal(|ui| {
-        ui.add_space(SIDEBAR_ROW_LEADING_INSET);
+    let available = ui.available_width();
+    let available_height = ui.spacing().interact_size.y;
 
-        for filter in [
-            TerminalManagerFilter::Foreground,
-            TerminalManagerFilter::Background,
-        ] {
-            let is_selected = *selected_filter == filter;
-            let response = ui
-                .add(
-                    egui::Label::new(RichText::new(filter.label()).strong().color(
-                        if is_selected {
-                            terminal_manager_filter_color(filter)
-                        } else {
-                            with_alpha(TEXT_MUTED, 180)
-                        },
-                    ))
-                    .sense(Sense::click()),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
+    ui.allocate_ui_with_layout(
+        egui::vec2(available, available_height),
+        Layout::top_down(Align::Center),
+        |ui| {
+            ui.set_height(available_height);
+            ui.horizontal_centered(|ui| {
+                for filter in [
+                    TerminalManagerFilter::Foreground,
+                    TerminalManagerFilter::Background,
+                ] {
+                    let is_selected = *selected_filter == filter;
+                    let response = ui
+                        .add(
+                            egui::Label::new(RichText::new(filter.label()).strong().color(
+                                if is_selected {
+                                    terminal_manager_filter_color(filter)
+                                } else {
+                                    with_alpha(TEXT_MUTED, 180)
+                                },
+                            ))
+                            .sense(Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
 
-            if is_selected {
-                let underline_rect = egui::Rect::from_min_max(
-                    egui::pos2(response.rect.left(), response.rect.bottom() + 2.0),
-                    egui::pos2(response.rect.right(), response.rect.bottom() + 4.0),
-                );
-                ui.painter().rect_filled(
-                    underline_rect,
-                    2.0,
-                    terminal_manager_filter_color(filter),
-                );
-            }
+                    if is_selected {
+                        let underline_rect = egui::Rect::from_min_max(
+                            egui::pos2(response.rect.left(), response.rect.bottom() + 2.0),
+                            egui::pos2(response.rect.right(), response.rect.bottom() + 4.0),
+                        );
+                        ui.painter().rect_filled(
+                            underline_rect,
+                            2.0,
+                            terminal_manager_filter_color(filter),
+                        );
+                    }
 
-            if response.clicked() && !is_selected {
-                *selected_filter = filter;
-                changed = true;
-            }
+                    if response.clicked() && !is_selected {
+                        *selected_filter = filter;
+                        changed = true;
+                    }
 
-            ui.add_space(12.0);
-        }
-    });
+                    ui.add_space(12.0);
+                }
+            });
+        },
+    );
 
     changed
 }
@@ -8615,6 +9128,7 @@ fn draw_project_group_header(
     can_expand: bool,
     action_kind: TerminalKind,
     diff_summary: &TerminalManagerDiffSummaryModel,
+    has_live_terminal: bool,
 ) -> (egui::Response, bool, bool) {
     let row_width = ui.available_width();
     let section_gap = ui.spacing().item_spacing.x;
@@ -8629,9 +9143,11 @@ fn draw_project_group_header(
         response
     };
 
-    let text_color = if open {
+    // Project header is bright only when it has at least one live (non-exited) terminal.
+    // When all terminals are closed/exited, the project header dims back to muted color.
+    let text_color = if has_live_terminal && open {
         TEXT_PRIMARY
-    } else if response.hovered() && can_expand {
+    } else if has_live_terminal && response.hovered() && can_expand {
         with_alpha(TEXT_PRIMARY, 180)
     } else if response.hovered() {
         with_alpha(TEXT_MUTED, 180)
@@ -9615,9 +10131,11 @@ mod tests {
         terminal_selection_point_from_pointer, terminal_selection_text, to_egui_color,
         update_stable_cursor_row, visible_terminal_cursor, AdeApp, AiBadgeModel, AiBadgeVisual,
         CodexCliStatusSource, CtrlCAction, DirectoryIndexSnapshot, DirectoryNode,
-        FactoryDroidHookInboxEvent, FactoryDroidStatusSource, FactoryDroidTransportDiagnostics,
-        PendingConfigChanges, PendingTerminalLinkClick, SourceControlBadgeState, SourceControlFile,
-        SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
+        FactoryDroidHookInboxEvent, FactoryDroidManagedInstallComponent,
+        FactoryDroidManagedInstallDiagnostics, FactoryDroidStatusSource,
+        FactoryDroidTransportDiagnostics, PendingConfigChanges, PendingTerminalLinkClick,
+        SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
+        SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
         TerminalSecondaryClickAction, TerminalSelection, TerminalSelectionPoint, TransientToast,
         CODEX_LAUNCH_GRACE_MS, CODEX_PROCESS_POLL_MS, CODEX_TRAILING_OUTPUT_GRACE_MS,
@@ -11553,58 +12071,45 @@ mod tests {
 
     #[test]
     fn terminal_manager_diff_summary_visuals_cover_ready_loading_and_error_states() {
+        // Clean working tree (0 added, 0 removed) shows nothing instead of "+0 -0"
         let clean =
             terminal_manager_diff_summary_model(Some(&test_source_control_snapshot("main", &[])));
-        let loading_with_totals =
-            terminal_manager_diff_summary_model(Some(&SourceControlSnapshot {
-                loading: true,
-                ..test_source_control_snapshot("main", &[])
-            }));
-        let error_with_totals = terminal_manager_diff_summary_model(Some(&SourceControlSnapshot {
-            last_error: Some("git status failed".to_owned()),
-            ..test_source_control_snapshot("main", &[])
+        assert_eq!(
+            terminal_manager_diff_summary_visual(&clean),
+            TerminalManagerDiffSummaryVisual::Placeholder {
+                text: "",
+                color: Color32::TRANSPARENT,
+            }
+        );
+
+        // Ready state with actual changes shows Totals
+        let with_changes = terminal_manager_diff_summary_model(Some(&SourceControlSnapshot {
+            added_lines: Some(3),
+            removed_lines: Some(1),
+            files: vec![SourceControlFile {
+                path: "foo.rs".to_owned(),
+                status: "M",
+                staged: false,
+            }],
+            ..Default::default()
         }));
+        assert_eq!(
+            terminal_manager_diff_summary_visual(&with_changes),
+            TerminalManagerDiffSummaryVisual::Totals {
+                added_text: "+3".to_owned(),
+                removed_text: "-1".to_owned(),
+                added_color: source_control_badge_color(SourceControlBadgeState::Clean),
+                removed_color: source_control_badge_color(SourceControlBadgeState::Error),
+                separator_color: super::TEXT_MUTED,
+            }
+        );
+
+        // Loading with 0,0 shows "..." placeholder (Ready state shows nothing for 0,0)
         let loading_without_totals =
             terminal_manager_diff_summary_model(Some(&SourceControlSnapshot {
                 loading: true,
                 ..SourceControlSnapshot::default()
             }));
-        let error_without_totals =
-            terminal_manager_diff_summary_model(Some(&SourceControlSnapshot {
-                last_error: Some("git status failed".to_owned()),
-                ..SourceControlSnapshot::default()
-            }));
-
-        assert_eq!(
-            terminal_manager_diff_summary_visual(&clean),
-            TerminalManagerDiffSummaryVisual::Totals {
-                added_text: "+0".to_owned(),
-                removed_text: "-0".to_owned(),
-                added_color: source_control_badge_color(SourceControlBadgeState::Clean),
-                removed_color: source_control_badge_color(SourceControlBadgeState::Error),
-                separator_color: super::TEXT_MUTED,
-            }
-        );
-        assert_eq!(
-            terminal_manager_diff_summary_visual(&loading_with_totals),
-            TerminalManagerDiffSummaryVisual::Totals {
-                added_text: "+0".to_owned(),
-                removed_text: "-0".to_owned(),
-                added_color: source_control_badge_color(SourceControlBadgeState::Clean),
-                removed_color: source_control_badge_color(SourceControlBadgeState::Error),
-                separator_color: super::TEXT_MUTED,
-            }
-        );
-        assert_eq!(
-            terminal_manager_diff_summary_visual(&error_with_totals),
-            TerminalManagerDiffSummaryVisual::Totals {
-                added_text: "+0".to_owned(),
-                removed_text: "-0".to_owned(),
-                added_color: source_control_badge_color(SourceControlBadgeState::Clean),
-                removed_color: source_control_badge_color(SourceControlBadgeState::Error),
-                separator_color: super::TEXT_MUTED,
-            }
-        );
         assert_eq!(
             terminal_manager_diff_summary_visual(&loading_without_totals),
             TerminalManagerDiffSummaryVisual::Placeholder {
@@ -11612,6 +12117,13 @@ mod tests {
                 color: super::TEXT_MUTED,
             }
         );
+
+        // Error with 0,0 shows "--" placeholder
+        let error_without_totals =
+            terminal_manager_diff_summary_model(Some(&SourceControlSnapshot {
+                last_error: Some("git status failed".to_owned()),
+                ..SourceControlSnapshot::default()
+            }));
         assert_eq!(
             terminal_manager_diff_summary_visual(&error_without_totals),
             TerminalManagerDiffSummaryVisual::Placeholder {
@@ -13324,6 +13836,25 @@ mod tests {
                 "attention",
             )],
         );
+
+        app.poll_factory_droid_hook_inboxes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert_eq!(terminal.factory_droid_last_status_source, None);
+    }
+
+    #[test]
+    fn factory_droid_hook_inbox_ignores_missing_token_records() {
+        let ctx = Context::default();
+        let hook_dir = TestFactoryDroidHookDir::new();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.factory_droid_hooks_dir = Some(hook_dir.path.clone());
+
+        let mut event =
+            test_factory_droid_hook_event(1, &test_factory_droid_inbox_token(1), "attention");
+        event.inbox_token = None;
+        write_test_factory_droid_hook_events(&hook_dir.path, 1, &[event]);
 
         app.poll_factory_droid_hook_inboxes(&ctx);
 
@@ -15114,6 +15645,8 @@ mod tests {
             factory_droid_hook_inboxes: BTreeMap::new(),
             factory_droid_hook_last_poll_at: None,
             factory_droid_process_last_poll_at: None,
+            factory_droid_managed_install_diagnostics: None,
+            factory_droid_managed_install_last_refresh_at: None,
             codex_cli_runtime_dir: None,
             codex_cli_runtime_dir_error: None,
             codex_notify_inboxes: BTreeMap::new(),
@@ -15225,6 +15758,23 @@ mod tests {
 
     fn test_factory_droid_inbox_token(terminal_id: u64) -> String {
         format!("test-inbox-token-{terminal_id}")
+    }
+
+    fn test_factory_droid_managed_install_diagnostics() -> FactoryDroidManagedInstallDiagnostics {
+        FactoryDroidManagedInstallDiagnostics {
+            settings: FactoryDroidManagedInstallComponent {
+                path: PathBuf::from(r"C:\Users\furkan.cakir\.factory\settings.json"),
+                status_text: "Healthy".to_owned(),
+                healthy: true,
+            },
+            hook_script: FactoryDroidManagedInstallComponent {
+                path: PathBuf::from(
+                    r"C:\Users\furkan.cakir\.factory\hooks\mergen-ade-droid-status.ps1",
+                ),
+                status_text: "Healthy".to_owned(),
+                healthy: true,
+            },
+        }
     }
 
     fn test_codex_inbox_token(terminal_id: u64) -> String {
@@ -16282,6 +16832,7 @@ mod tests {
                 r"C:\Users\furkan.cakir\AppData\Roaming\Mergen\MergenADE\config\runtime\factory-droid-hooks",
             )),
             hooks_runtime_error: None,
+            managed_install: test_factory_droid_managed_install_diagnostics(),
             active_session: Some(true),
             process_state: Some("active".to_owned()),
             last_status_source: Some(FactoryDroidStatusSource::PromptSubmit),
@@ -16294,6 +16845,7 @@ mod tests {
         assert_eq!(diagnostics.active_session_text(), "Yes");
         assert_eq!(diagnostics.process_state_text(), "active");
         assert_eq!(diagnostics.last_status_source_text(), "prompt_submit");
+        assert_eq!(diagnostics.warning_badge_text(), None);
         assert_eq!(diagnostics.warning_message(), None);
     }
 
@@ -16304,6 +16856,7 @@ mod tests {
             executable_path: PathBuf::from(r"C:\Users\furkan.cakir\Desktop\mergen-ade-new.exe"),
             hooks_runtime_dir: None,
             hooks_runtime_error: Some("Access denied".to_owned()),
+            managed_install: test_factory_droid_managed_install_diagnostics(),
             active_session: Some(false),
             process_state: Some("missing (grace)".to_owned()),
             last_status_source: None,
@@ -16317,6 +16870,10 @@ mod tests {
         assert_eq!(diagnostics.process_state_text(), "missing (grace)");
         assert_eq!(diagnostics.last_status_source_text(), "none");
         assert_eq!(
+            diagnostics.warning_badge_text(),
+            Some("Factory Droid inbox fallback unavailable")
+        );
+        assert_eq!(
             diagnostics.warning_message(),
             Some("Factory Droid inbox fallback unavailable: Access denied".to_owned())
         );
@@ -16329,13 +16886,117 @@ mod tests {
             executable_path: PathBuf::from(r"C:\Users\furkan.cakir\Desktop\mergen-ade-new.exe"),
             hooks_runtime_dir: None,
             hooks_runtime_error: Some("Access denied".to_owned()),
+            managed_install: test_factory_droid_managed_install_diagnostics(),
             active_session: None,
             process_state: None,
             last_status_source: None,
         };
 
         assert_eq!(diagnostics.runtime_status_text(), "Disabled");
+        assert_eq!(diagnostics.warning_badge_text(), None);
         assert_eq!(diagnostics.warning_message(), None);
+    }
+
+    #[test]
+    fn inspect_factory_droid_managed_install_reports_stale_global_install() {
+        let temp_dir = TestTempDir::new("factory-droid-managed-install");
+        let home_dir = temp_dir.path.join("home");
+        let hook_script_path = AdeApp::factory_droid_managed_hook_script_path_for_home(&home_dir);
+        fs::create_dir_all(hook_script_path.parent().expect("hook script parent"))
+            .expect("create hook script dir");
+
+        let settings_path = AdeApp::factory_droid_managed_settings_path_for_home(&home_dir);
+        let legacy_command = format!(
+            "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+            hook_script_path.display()
+        );
+        let settings_payload = serde_json::to_string_pretty(&serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": legacy_command,
+                        "timeout": 5
+                    }]
+                }],
+                "Notification": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": legacy_command,
+                        "timeout": 5
+                    }]
+                }],
+                "Stop": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": legacy_command,
+                        "timeout": 5
+                    }]
+                }]
+            }
+        }))
+        .expect("serialize settings");
+        fs::write(&settings_path, settings_payload).expect("write settings");
+        fs::write(
+            &hook_script_path,
+            "$env:MERGEN_ADE_TERMINAL_ID | Out-Null\n",
+        )
+        .expect("write stale installed hook script");
+
+        let diagnostics = AdeApp::inspect_factory_droid_managed_install_for_home(&home_dir);
+
+        assert_eq!(
+            diagnostics.settings.path,
+            home_dir.join(".factory").join("settings.json")
+        );
+        assert_eq!(
+            diagnostics.settings.status_text,
+            "Legacy -File launcher for UserPromptSubmit, Notification, Stop"
+        );
+        assert!(!diagnostics.settings.healthy);
+        assert_eq!(
+            diagnostics.hook_script.path,
+            home_dir
+                .join(".factory")
+                .join("hooks")
+                .join("mergen-ade-droid-status.ps1")
+        );
+        assert_eq!(
+            diagnostics.hook_script.status_text,
+            "Missing inbox_token support"
+        );
+        assert!(!diagnostics.hook_script.healthy);
+    }
+
+    #[test]
+    fn factory_droid_transport_diagnostics_warn_when_managed_install_is_stale() {
+        let mut managed_install = test_factory_droid_managed_install_diagnostics();
+        managed_install.settings.status_text = "Legacy -File launcher for Stop".to_owned();
+        managed_install.settings.healthy = false;
+
+        let diagnostics = FactoryDroidTransportDiagnostics {
+            hooks_enabled: true,
+            executable_path: PathBuf::from(r"C:\Users\furkan.cakir\Desktop\mergen-ade-new.exe"),
+            hooks_runtime_dir: Some(PathBuf::from(
+                r"C:\Users\furkan.cakir\AppData\Roaming\Mergen\MergenADE\config\runtime\factory-droid-hooks",
+            )),
+            hooks_runtime_error: None,
+            managed_install,
+            active_session: Some(true),
+            process_state: Some("active".to_owned()),
+            last_status_source: Some(FactoryDroidStatusSource::Inbox),
+        };
+
+        assert_eq!(
+            diagnostics.warning_badge_text(),
+            Some("Factory Droid hook repair needed")
+        );
+        assert_eq!(
+            diagnostics.warning_message(),
+            Some(
+                "Managed settings: Legacy -File launcher for Stop. Rerun `powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\install-factory-droid-hooks.ps1`, then restart Droid.".to_owned()
+            )
+        );
     }
 
     #[test]

@@ -457,8 +457,11 @@ function Test-InstallFactoryDroidHooksWritesSettingsBackupAndWorkingCommand {
         $env:MERGEN_ADE_FACTORY_DROID_INBOX_TOKEN = "token-77"
         $commandOutput = '{"hook_event_name":"Stop","message":"Droid is waiting for your input"}' | cmd /c $result.Command 2>&1 | Out-String
         $record = Read-TestHookInboxRecord -InboxDir $hookInboxDir -TerminalId "77"
+        $expectedHookScript = Get-Content -Path (Join-Path $repoRoot "scripts\factory-droid-status-hook.ps1") -Raw
+        $installedHookScript = Get-Content -Path $result.InstalledHookPath -Raw
 
         Assert-True -Condition (Test-Path $result.InstalledHookPath) -Message "Expected Install-FactoryDroidHooks to copy the hook script into the user Factory hooks directory."
+        Assert-Equal -Actual $installedHookScript -Expected $expectedHookScript -Message "Expected Install-FactoryDroidHooks to refresh the installed hook script copy from the repo source."
         Assert-True -Condition (Test-Path $result.BackupPath) -Message "Expected Install-FactoryDroidHooks to back up an existing settings.json before rewriting it."
         Assert-Equal -Actual $installedSettings.personality -Expected "pragmatic" -Message "Expected Install-FactoryDroidHooks to preserve unrelated top-level settings."
         Assert-FactoryHookEventsAreArrays -Settings $rawInstalledSettings -MessagePrefix "Expected Install-FactoryDroidHooks to write array-shaped hook events to settings.json."

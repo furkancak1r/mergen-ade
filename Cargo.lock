@@ -2109,6 +2109,7 @@ name = "mergen-ade"
 version = "0.1.9"
 dependencies = [
  "arboard",
+ "base64",
  "crossbeam-channel",
  "directories",
  "eframe",

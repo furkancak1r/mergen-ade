@@ -829,3 +829,17 @@
   - When a broad "save pending changes" commit includes unusually large file counts, inspect the path list before pushing.
 - Files/Commands touched: `.gitignore`, `KNOWN_ISSUES.md`, `git cherry-pick --no-commit`, `git restore --source=HEAD --staged --worktree .claude .firecrawl target_test`
 - References: local push recovery on 2026-04-07 after `git diff --name-only origin/main..HEAD` exposed `target_test/`, `.firecrawl/`, and `.claude/settings.local.json` in the unpushed history
+
+#### Factory Droid `Stop` could stay green when the global managed hook install drifted behind Mergen's inbox-token contract {#factory-droid-stop-could-stay-green-when-the-global-managed-hook-install-drifted-behind-mergens-inbox-token-contract}
+- Date: 2026-04-08T00:00:00Z
+- Context: main/Windows local Factory Droid sessions after the per-terminal inbox-token guard had already shipped
+- Error signature: `Droid finished, global Stop hook ran, but the badge stayed green instead of switching to yellow Attention.`
+- Symptoms/Impact: `UserPromptSubmit` still turned the badge green, yet `Stop` could be silently dropped. The app consumed the JSONL inbox line, advanced the file offset, and gave no visible reason why the end-of-response signal was ignored.
+- Root cause: `%USERPROFILE%\.factory\hooks\mergen-ade-droid-status.ps1` had drifted behind the repo copy and no longer wrote `inbox_token`, while `%USERPROFILE%\.factory\settings.json` still contained a legacy managed `-File` launcher. Mergen correctly required both `terminal_id` and `inbox_token`, so stale global hook output was rejected as unsafe cross-session input.
+- Resolution: Added managed-hook diagnostics in `src/app.rs` that inspect the user-global Factory settings and installed hook copy, warn when a legacy `-File` launcher or missing `inbox_token` support is detected, and log explicit reasons when inbox events are ignored for terminal-id or token mismatches. The installer-backed repair path remains the supported fix, and regression coverage now verifies the installer refreshes the copied hook script from the repo source.
+- Prevent recurrence:
+  - Keep `%USERPROFILE%\.factory\hooks\mergen-ade-droid-status.ps1` installer-managed; do not rely on an older manual copy.
+  - Keep managed Factory hook commands on the canonical installer shape; do not hand-edit them back to `-File`.
+  - When Diagnostics shows `Factory Droid hook repair needed`, rerun `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-factory-droid-hooks.ps1` from the repo root and restart Droid.
+- Files/Commands touched: `src/app.rs`, `scripts/__tests__/factory-droid-hooks.tests.ps1`, `README.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `powershell -ExecutionPolicy Bypass -File .\scripts\__tests__\factory-droid-hooks.tests.ps1`
+- References: local 2026-04-08 investigation of `%USERPROFILE%\.factory\settings.json`, `%USERPROFILE%\.factory\hooks\mergen-ade-droid-status.ps1`, and `%APPDATA%\mergen\MergenADE\config\runtime\factory-droid-hooks\*.jsonl`; Factory docs reviewed at `https://docs.factory.ai/reference/hooks-reference` and `https://docs.factory.ai/cli/configuration/settings`

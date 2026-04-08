@@ -2940,7 +2940,10 @@ mod tests {
     fn pending_visible_factory_status_detects_hook_stop_variant() {
         let mut pending = PendingVisibleFactoryStatus::default();
 
-        assert_eq!(pending.extract_from_text("hook stop"), Some("hook stop".to_string()));
+        assert_eq!(
+            pending.extract_from_text("hook stop"),
+            Some("hook stop".to_string())
+        );
         assert_eq!(
             pending.extract_from_text("\u{1b}[32mhook stop\u{1b}[0m"),
             Some("hook stop".to_string())

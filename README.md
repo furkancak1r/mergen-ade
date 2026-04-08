@@ -117,11 +117,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-factory-dr
    It registers exactly one managed command for `UserPromptSubmit`, `Notification`, and `Stop`.
    It preserves unrelated Factory hooks that are already present in your settings.
    It writes the canonical quote-safe launcher command, so do not hand-edit the managed entry back to a `-File` variant.
+   If Diagnostics shows `Factory Droid hook repair needed`, your global `%USERPROFILE%\.factory\hooks\mergen-ade-droid-status.ps1` copy is likely stale or `%USERPROFILE%\.factory\settings.json` still has a legacy launcher; rerun the installer instead of hand-editing either file.
 4. Restart or refresh Factory Droid after installation.
    Restart the `droid` or `factory` session, or revisit `/hooks`, because Factory snapshots hook settings when the session starts.
 5. Verify the hook registration.
    Open `/hooks` in Factory Droid or inspect `%USERPROFILE%\.factory\settings.json`.
    Confirm that `UserPromptSubmit`, `Notification`, and `Stop` each contain one managed command entry for the Mergen ADE hook.
+   Confirm `%USERPROFILE%\.factory\hooks\mergen-ade-droid-status.ps1` is the freshly copied installer-managed script, not an older manual copy.
 6. Verify the badge behavior inside Mergen ADE.
    Open Mergen ADE, start a terminal, and launch `droid` or `factory` inside that terminal.
    Submit a prompt and confirm the badge switches to green `Running`.
