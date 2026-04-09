@@ -109,13 +109,6 @@ pub enum TerminalManagerFilter {
 }
 
 impl TerminalManagerFilter {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Foreground => "Foreground",
-            Self::Background => "Background",
-        }
-    }
-
     pub const fn terminal_kind(self) -> TerminalKind {
         match self {
             Self::Foreground => TerminalKind::Foreground,

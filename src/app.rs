@@ -99,6 +99,12 @@ const TEXT_MUTED: Color32 = Color32::from_rgb(140, 140, 140);
 const PROJECT_EXPLORER_WIDTH: f32 = 352.0;
 const ACTIVITY_RAIL_WIDTH: f32 = 48.0;
 const CONTROL_ROW_HEIGHT: f32 = 28.0;
+const TERMINAL_MANAGER_FILTER_ROW_HEIGHT_EXTRA: f32 = 12.0;
+const TERMINAL_MANAGER_FILTER_SIDE_PADDING: f32 = 8.0;
+const TERMINAL_MANAGER_FILTER_CENTER_GAP: f32 = 28.0;
+const TERMINAL_MANAGER_FILTER_TOP_PADDING: f32 = 4.0;
+const TERMINAL_MANAGER_FILTER_UNDERLINE_GAP: f32 = 2.0;
+const TERMINAL_MANAGER_FILTER_UNDERLINE_HEIGHT: f32 = 2.0;
 const SIDEBAR_ROW_LEADING_INSET: f32 = 6.0;
 const TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH: f32 = 32.0;
 const SOURCE_CONTROL_FILE_ICON_WIDTH: f32 = 16.0;
@@ -9042,11 +9048,105 @@ fn project_group_header_action_spec(
     }
 }
 
+fn terminal_manager_filter_label(filter: TerminalManagerFilter) -> &'static str {
+    match filter {
+        TerminalManagerFilter::Foreground => "Foreground",
+        TerminalManagerFilter::Background => "Background",
+    }
+}
+
 fn terminal_manager_filter_color(filter: TerminalManagerFilter) -> Color32 {
     match filter {
         TerminalManagerFilter::Foreground => ACCENT,
-        TerminalManagerFilter::Background => Color32::from_rgb(140, 140, 140),
+        TerminalManagerFilter::Background => TEXT_MUTED,
     }
+}
+
+fn terminal_manager_filter_row_height(base_height: f32) -> f32 {
+    base_height + TERMINAL_MANAGER_FILTER_ROW_HEIGHT_EXTRA
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TerminalManagerFilterLayout {
+    foreground_label_rect: egui::Rect,
+    background_label_rect: egui::Rect,
+}
+
+fn terminal_manager_filter_label_size(ui: &Ui, filter: TerminalManagerFilter) -> Vec2 {
+    WidgetText::from(RichText::new(terminal_manager_filter_label(filter)).strong())
+        .into_galley(
+            ui,
+            Some(TextWrapMode::Truncate),
+            f32::INFINITY,
+            egui::TextStyle::Body,
+        )
+        .size()
+}
+
+fn terminal_manager_filter_label_rect(slot_rect: egui::Rect, label_size: Vec2) -> egui::Rect {
+    let label_width = label_size.x.min(slot_rect.width().max(0.0));
+    let label_x = slot_rect.center().x - (label_width * 0.5);
+
+    egui::Rect::from_min_size(
+        egui::pos2(
+            label_x,
+            slot_rect.top() + TERMINAL_MANAGER_FILTER_TOP_PADDING,
+        ),
+        egui::vec2(label_width, label_size.y),
+    )
+}
+
+fn terminal_manager_filter_slot_rects(row_rect: egui::Rect) -> (egui::Rect, egui::Rect) {
+    let inner_left = row_rect.left() + TERMINAL_MANAGER_FILTER_SIDE_PADDING;
+    let inner_right = (row_rect.right() - TERMINAL_MANAGER_FILTER_SIDE_PADDING).max(inner_left);
+    let inner_width = (inner_right - inner_left).max(0.0);
+    let center_gap = TERMINAL_MANAGER_FILTER_CENTER_GAP.min(inner_width);
+    let slot_width = ((inner_width - center_gap).max(0.0)) * 0.5;
+
+    let foreground_slot_rect = egui::Rect::from_min_max(
+        egui::pos2(inner_left, row_rect.top()),
+        egui::pos2(inner_left + slot_width, row_rect.bottom()),
+    );
+    let background_slot_rect = egui::Rect::from_min_max(
+        egui::pos2(foreground_slot_rect.right() + center_gap, row_rect.top()),
+        egui::pos2(inner_right, row_rect.bottom()),
+    );
+
+    (foreground_slot_rect, background_slot_rect)
+}
+
+fn terminal_manager_filter_layout(
+    row_rect: egui::Rect,
+    foreground_label_size: Vec2,
+    background_label_size: Vec2,
+) -> TerminalManagerFilterLayout {
+    let (foreground_slot_rect, background_slot_rect) = terminal_manager_filter_slot_rects(row_rect);
+
+    TerminalManagerFilterLayout {
+        foreground_label_rect: terminal_manager_filter_label_rect(
+            foreground_slot_rect,
+            foreground_label_size,
+        ),
+        background_label_rect: terminal_manager_filter_label_rect(
+            background_slot_rect,
+            background_label_size,
+        ),
+    }
+}
+
+fn terminal_manager_filter_underline_rect(label_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(
+            label_rect.left(),
+            label_rect.bottom() + TERMINAL_MANAGER_FILTER_UNDERLINE_GAP,
+        ),
+        egui::pos2(
+            label_rect.right(),
+            label_rect.bottom()
+                + TERMINAL_MANAGER_FILTER_UNDERLINE_GAP
+                + TERMINAL_MANAGER_FILTER_UNDERLINE_HEIGHT,
+        ),
+    )
 }
 
 fn draw_terminal_manager_filter_tabs(
@@ -9055,55 +9155,58 @@ fn draw_terminal_manager_filter_tabs(
 ) -> bool {
     let mut changed = false;
 
-    let available = ui.available_width();
-    let available_height = ui.spacing().interact_size.y;
-
-    ui.allocate_ui_with_layout(
-        egui::vec2(available, available_height),
-        Layout::top_down(Align::Center),
-        |ui| {
-            ui.set_height(available_height);
-            ui.horizontal_centered(|ui| {
-                for filter in [
-                    TerminalManagerFilter::Foreground,
-                    TerminalManagerFilter::Background,
-                ] {
-                    let is_selected = *selected_filter == filter;
-                    let response = ui
-                        .add(
-                            egui::Label::new(RichText::new(filter.label()).strong().color(
-                                if is_selected {
-                                    terminal_manager_filter_color(filter)
-                                } else {
-                                    with_alpha(TEXT_MUTED, 180)
-                                },
-                            ))
-                            .sense(Sense::click()),
-                        )
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
-
-                    if is_selected {
-                        let underline_rect = egui::Rect::from_min_max(
-                            egui::pos2(response.rect.left(), response.rect.bottom() + 2.0),
-                            egui::pos2(response.rect.right(), response.rect.bottom() + 4.0),
-                        );
-                        ui.painter().rect_filled(
-                            underline_rect,
-                            2.0,
-                            terminal_manager_filter_color(filter),
-                        );
-                    }
-
-                    if response.clicked() && !is_selected {
-                        *selected_filter = filter;
-                        changed = true;
-                    }
-
-                    ui.add_space(12.0);
-                }
-            });
-        },
+    let row_size = egui::vec2(
+        ui.available_width(),
+        terminal_manager_filter_row_height(ui.spacing().interact_size.y),
     );
+    let (row_rect, _) = ui.allocate_exact_size(row_size, Sense::hover());
+    let layout = terminal_manager_filter_layout(
+        row_rect,
+        terminal_manager_filter_label_size(ui, TerminalManagerFilter::Foreground),
+        terminal_manager_filter_label_size(ui, TerminalManagerFilter::Background),
+    );
+
+    for (filter, label_rect) in [
+        (
+            TerminalManagerFilter::Foreground,
+            layout.foreground_label_rect,
+        ),
+        (
+            TerminalManagerFilter::Background,
+            layout.background_label_rect,
+        ),
+    ] {
+        let is_selected = *selected_filter == filter;
+        let response = ui
+            .put(
+                label_rect,
+                egui::Label::new(
+                    RichText::new(terminal_manager_filter_label(filter))
+                        .strong()
+                        .color(if is_selected {
+                            terminal_manager_filter_color(filter)
+                        } else {
+                            with_alpha(TEXT_MUTED, 180)
+                        }),
+                )
+                .truncate()
+                .sense(Sense::click()),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+        if is_selected {
+            ui.painter().rect_filled(
+                terminal_manager_filter_underline_rect(label_rect),
+                2.0,
+                terminal_manager_filter_color(filter),
+            );
+        }
+
+        if response.clicked() && !is_selected {
+            *selected_filter = filter;
+            changed = true;
+        }
+    }
 
     changed
 }
@@ -11776,6 +11879,74 @@ mod tests {
         assert_eq!(
             actions_width,
             super::CONTROL_ROW_HEIGHT + super::TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH + 8.0
+        );
+    }
+
+    #[test]
+    fn terminal_manager_filter_row_height_adds_extra_breathing_room() {
+        assert_eq!(
+            super::terminal_manager_filter_row_height(super::CONTROL_ROW_HEIGHT),
+            super::CONTROL_ROW_HEIGHT + super::TERMINAL_MANAGER_FILTER_ROW_HEIGHT_EXTRA
+        );
+    }
+
+    #[test]
+    fn terminal_manager_filter_layout_splits_inner_row_evenly_with_center_gap() {
+        let row_rect = egui::Rect::from_min_size(pos2(12.0, 8.0), egui::vec2(320.0, 40.0));
+        let (foreground_slot_rect, background_slot_rect) =
+            super::terminal_manager_filter_slot_rects(row_rect);
+
+        assert_eq!(
+            foreground_slot_rect.left(),
+            row_rect.left() + super::TERMINAL_MANAGER_FILTER_SIDE_PADDING
+        );
+        assert_eq!(
+            background_slot_rect.right(),
+            row_rect.right() - super::TERMINAL_MANAGER_FILTER_SIDE_PADDING
+        );
+        assert_eq!(
+            background_slot_rect.left() - foreground_slot_rect.right(),
+            super::TERMINAL_MANAGER_FILTER_CENTER_GAP
+        );
+        assert_eq!(foreground_slot_rect.width(), background_slot_rect.width());
+    }
+
+    #[test]
+    fn terminal_manager_filter_layout_centers_each_label_inside_its_slot() {
+        let row_rect = egui::Rect::from_min_size(pos2(12.0, 8.0), egui::vec2(320.0, 40.0));
+        let (foreground_slot_rect, background_slot_rect) =
+            super::terminal_manager_filter_slot_rects(row_rect);
+        let layout = super::terminal_manager_filter_layout(
+            row_rect,
+            egui::vec2(78.0, 14.0),
+            egui::vec2(82.0, 14.0),
+        );
+
+        assert_eq!(
+            layout.foreground_label_rect.center().x,
+            foreground_slot_rect.center().x
+        );
+        assert_eq!(
+            layout.background_label_rect.center().x,
+            background_slot_rect.center().x
+        );
+        assert!(layout.background_label_rect.left() > layout.foreground_label_rect.right());
+    }
+
+    #[test]
+    fn terminal_manager_filter_underline_tracks_selected_label_bounds() {
+        let label_rect = egui::Rect::from_min_max(pos2(48.0, 14.0), pos2(124.0, 28.0));
+        let underline_rect = super::terminal_manager_filter_underline_rect(label_rect);
+
+        assert_eq!(underline_rect.left(), label_rect.left());
+        assert_eq!(underline_rect.right(), label_rect.right());
+        assert_eq!(
+            underline_rect.top(),
+            label_rect.bottom() + super::TERMINAL_MANAGER_FILTER_UNDERLINE_GAP
+        );
+        assert_eq!(
+            underline_rect.height(),
+            super::TERMINAL_MANAGER_FILTER_UNDERLINE_HEIGHT
         );
     }
 
