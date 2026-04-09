@@ -1,5 +1,33 @@
 ### Known Issues & Fix Log
 
+#### Settings Technical Details accordion no longer sits flush against the diagnostics scroll boundary when collapsed {#settings-technical-details-accordion-no-longer-sits-flush-against-the-diagnostics-scroll-boundary-when-collapsed}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Settings modal diagnostics section
+- Error signature: `When Technical Details was collapsed, the accordion card ended immediately at the diagnostics section boundary, so the row could read as if the card was visually cut off.`
+- Symptoms/Impact: The collapsed card looked unfinished at the bottom of the scroll area, especially when it was the last visible element in the Diagnostics section.
+- Root cause: The diagnostics section ended directly after rendering the Technical Details surface frame, with no trailing spacer to give the collapsed accordion any breathing room against the scroll viewport edge.
+- Resolution:
+  - Added a dedicated bottom gap after the Technical Details accordion card.
+  - Kept the accordion/header behavior unchanged and fixed only the section spacing.
+- Prevent recurrence:
+  - When a framed accordion is the last element inside a settings scroll section, leave explicit trailing space so the card chrome does not read as clipped by the viewport.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+
+#### Settings Technical Details section now expands from a triangle header instead of a separate button row {#settings-technical-details-section-now-expands-from-a-triangle-header-instead-of-a-separate-button-row}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Settings modal diagnostics section
+- Error signature: `The Technical Details block used a separate Expanded/Collapsed label and Show details/Hide details buttons, so it did not behave like the rest of the accordion-style settings UI.`
+- Symptoms/Impact: Diagnostics looked inconsistent with Saved Messages, the card spent vertical space on toggle chrome instead of content, and the open/close affordance felt more like a form control than a section accordion.
+- Root cause: Technical Details reused the generic settings card shell and layered button-driven expanded state inside the body, rather than treating the card header itself as the collapsible control.
+- Resolution:
+  - Replaced the button row with a header-level accordion for the Technical Details card.
+  - Reused the shared settings disclosure painter so Diagnostics and Saved Messages use the same triangle behavior.
+  - Moved the old description/help text into the accordion body so the collapsed card is just the clickable header.
+- Prevent recurrence:
+  - When a Settings section is primarily about revealing more detail, prefer a header-driven accordion over embedding extra Show/Hide buttons in the body.
+  - Keep disclosure triangle behavior shared across Settings accordions even when the row layouts differ.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+
 #### Settings saved message draft input now reads as an actual field again without leaving the theme palette {#settings-saved-message-draft-input-now-reads-as-an-actual-field-again-without-leaving-the-theme-palette}
 - Date: 2026-04-09T00:00:00Z
 - Context: main/Windows local Settings modal saved messages section

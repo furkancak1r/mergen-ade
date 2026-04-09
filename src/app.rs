@@ -124,8 +124,9 @@ const SETTINGS_SAVED_MESSAGE_ACTIONS_GAP: f32 = 8.0;
 const SETTINGS_SAVED_MESSAGE_CARD_MARGIN: f32 = 10.0;
 const SETTINGS_SAVED_MESSAGE_TEXT_SIZE: f32 = 14.0;
 const SETTINGS_SAVED_MESSAGES_SECTION_TOP_GAP: f32 = 16.0;
-const SETTINGS_SAVED_MESSAGES_DISCLOSURE_Y_OFFSET: f32 = 2.5;
-const SETTINGS_SAVED_MESSAGES_PROJECT_ICON_GAP: f32 = 6.0;
+const SETTINGS_DIAGNOSTICS_SECTION_BOTTOM_GAP: f32 = 12.0;
+const SETTINGS_ACCORDION_DISCLOSURE_Y_OFFSET: f32 = 2.5;
+const SETTINGS_ACCORDION_HEADER_ICON_GAP: f32 = 6.0;
 const SETTINGS_NAV_ROW_HEIGHT: f32 = 34.0;
 // Pill button palette
 const BTN_BLUE: Color32 = Color32::from_rgb(16, 64, 112);
@@ -898,6 +899,13 @@ struct SettingsSavedMessagesProjectHeaderLayout {
     folder_icon_rect: egui::Rect,
     title_rect: egui::Rect,
     count_rect: egui::Rect,
+}
+
+#[derive(Clone, Copy)]
+struct SettingsDiagnosticsAccordionHeaderLayout {
+    disclosure_rect: egui::Rect,
+    icon_rect: egui::Rect,
+    title_rect: egui::Rect,
 }
 
 fn draw_terminal_status_badges(ui: &mut Ui, ai_badge: &AiBadgeModel) -> TerminalStatusBadgeLayout {
@@ -5683,224 +5691,177 @@ impl AdeApp {
         );
         ui.add_space(12.0);
 
-        show_settings_card(
-            ui,
-            AppIcon::List,
-            "Technical Details",
-            "Inspect exact paths, sources, and health checks when something needs debugging.",
-            |ui| {
-                let use_single_column =
-                    settings_diagnostics_uses_single_column(ui.available_width());
-                if use_single_column {
-                    ui.label(
-                        RichText::new(if self.settings_diagnostics_expanded {
-                            "Expanded"
-                        } else {
-                            "Collapsed"
-                        })
-                        .small()
-                        .color(TEXT_MUTED),
-                    );
-                    let toggle_label = if self.settings_diagnostics_expanded {
-                        "Hide details"
-                    } else {
-                        "Show details"
-                    };
-                    if ui
-                        .add_sized(
-                            [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
-                            egui::Button::new(toggle_label),
-                        )
-                        .clicked()
-                    {
-                        self.settings_diagnostics_expanded = !self.settings_diagnostics_expanded;
-                    }
+        settings_surface_frame(with_alpha(SURFACE_BG_SOFT, 228), 12.0).show(ui, |ui| {
+            let header_response = draw_settings_diagnostics_accordion_header(
+                ui,
+                AppIcon::List,
+                "Technical Details",
+                if self.settings_diagnostics_expanded {
+                    1.0
                 } else {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(if self.settings_diagnostics_expanded {
-                                "Expanded"
-                            } else {
-                                "Collapsed"
-                            })
-                            .small()
-                            .color(TEXT_MUTED),
-                        );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let toggle_label = if self.settings_diagnostics_expanded {
-                                "Hide details"
-                            } else {
-                                "Show details"
-                            };
-                            if ui.button(toggle_label).clicked() {
-                                self.settings_diagnostics_expanded =
-                                    !self.settings_diagnostics_expanded;
-                            }
-                        });
-                    });
-                }
+                    0.0
+                },
+            );
+            if header_response.clicked() {
+                self.settings_diagnostics_expanded = !self.settings_diagnostics_expanded;
+            }
 
-                if !self.settings_diagnostics_expanded {
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new(
-                            "Open this when you need the managed install paths, runtime inbox location, or last observed status sources.",
-                        )
-                        .small()
-                        .color(TEXT_MUTED),
-                    );
-                    return;
-                }
+            if !self.settings_diagnostics_expanded {
+                return;
+            }
 
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new(
-                        "Factory Droid status uses PTY/process detection first. Inbox JSONL remains a best-effort fallback.",
-                    )
-                    .small()
-                    .color(TEXT_MUTED),
-                );
-                ui.add_space(4.0);
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Executable Path",
-                    &diagnostics.executable_path.display().to_string(),
-                    TEXT_PRIMARY,
-                );
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Factory Droid Primary",
-                    FactoryDroidTransportDiagnostics::PRIMARY_TRANSPORT_LABEL,
-                    TEXT_PRIMARY,
-                );
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Factory Droid Fallback",
-                    FactoryDroidTransportDiagnostics::FALLBACK_TRANSPORT_LABEL,
-                    TEXT_PRIMARY,
-                );
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Factory Droid Inbox",
-                    &diagnostics.runtime_status_text(),
-                    if diagnostics.hooks_runtime_dir.is_some() {
-                        healthy_color
-                    } else {
-                        warning_color
-                    },
-                );
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Managed Settings Path",
-                    &managed_settings_path,
-                    TEXT_PRIMARY,
-                );
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Managed Hook Commands",
-                    &diagnostics.managed_install.settings.status_text,
-                    if diagnostics.managed_install.settings.healthy {
-                        healthy_color
-                    } else {
-                        warning_color
-                    },
-                );
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Managed Hook Script",
-                    &managed_hook_script_path,
-                    TEXT_PRIMARY,
-                );
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Managed Hook Script Health",
-                    &diagnostics.managed_install.hook_script.status_text,
-                    if diagnostics.managed_install.hook_script.healthy {
-                        healthy_color
-                    } else {
-                        warning_color
-                    },
-                );
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Droid Session Active",
-                    diagnostics.active_session_text(),
-                    TEXT_PRIMARY,
-                );
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Factory Droid Process State",
-                    diagnostics.process_state_text(),
-                    TEXT_PRIMARY,
-                );
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Last Status Source",
-                    diagnostics.last_status_source_text(),
-                    TEXT_PRIMARY,
-                );
-                if let Some(warning_message) = diagnostics.warning_message() {
-                    ui.label(RichText::new(warning_message).small().color(warning_color));
-                }
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(
+                    "Inspect exact paths, sources, and health checks when something needs debugging.",
+                )
+                .small()
+                .color(TEXT_MUTED),
+            );
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(
+                    "Factory Droid status uses PTY/process detection first. Inbox JSONL remains a best-effort fallback.",
+                )
+                .small()
+                .color(TEXT_MUTED),
+            );
+            ui.add_space(4.0);
+            Self::draw_settings_diagnostic_row(
+                ui,
+                "Executable Path",
+                &diagnostics.executable_path.display().to_string(),
+                TEXT_PRIMARY,
+            );
+            Self::draw_settings_diagnostic_row(
+                ui,
+                "Factory Droid Primary",
+                FactoryDroidTransportDiagnostics::PRIMARY_TRANSPORT_LABEL,
+                TEXT_PRIMARY,
+            );
+            Self::draw_settings_diagnostic_row(
+                ui,
+                "Factory Droid Fallback",
+                FactoryDroidTransportDiagnostics::FALLBACK_TRANSPORT_LABEL,
+                TEXT_PRIMARY,
+            );
+            Self::draw_settings_diagnostic_row(
+                ui,
+                "Factory Droid Inbox",
+                &diagnostics.runtime_status_text(),
+                if diagnostics.hooks_runtime_dir.is_some() {
+                    healthy_color
+                } else {
+                    warning_color
+                },
+            );
+            Self::draw_settings_diagnostic_row(
+                ui,
+                "Managed Settings Path",
+                &managed_settings_path,
+                TEXT_PRIMARY,
+            );
+            Self::draw_settings_diagnostic_row(
+                ui,
+                "Managed Hook Commands",
+                &diagnostics.managed_install.settings.status_text,
+                if diagnostics.managed_install.settings.healthy {
+                    healthy_color
+                } else {
+                    warning_color
+                },
+            );
+            Self::draw_settings_diagnostic_row(
+                ui,
+                "Managed Hook Script",
+                &managed_hook_script_path,
+                TEXT_PRIMARY,
+            );
+            Self::draw_settings_diagnostic_row(
+                ui,
+                "Managed Hook Script Health",
+                &diagnostics.managed_install.hook_script.status_text,
+                if diagnostics.managed_install.hook_script.healthy {
+                    healthy_color
+                } else {
+                    warning_color
+                },
+            );
+            Self::draw_settings_diagnostic_row(
+                ui,
+                "Droid Session Active",
+                diagnostics.active_session_text(),
+                TEXT_PRIMARY,
+            );
+            Self::draw_settings_diagnostic_row(
+                ui,
+                "Factory Droid Process State",
+                diagnostics.process_state_text(),
+                TEXT_PRIMARY,
+            );
+            Self::draw_settings_diagnostic_row(
+                ui,
+                "Last Status Source",
+                diagnostics.last_status_source_text(),
+                TEXT_PRIMARY,
+            );
+            if let Some(warning_message) = diagnostics.warning_message() {
+                ui.label(RichText::new(warning_message).small().color(warning_color));
+            }
 
-                ui.separator();
-                ui.label(
-                    RichText::new("Codex CLI")
-                        .strong()
-                        .size(15.0)
-                        .color(TEXT_PRIMARY),
-                );
-                ui.label(
-                    RichText::new(
-                        "Windows support in Codex CLI is still experimental. For now Mergen only wires native Windows sessions; WSL bridging stays out of scope in this release.",
-                    )
-                    .small()
-                    .color(warning_color),
-                );
-                ui.label(
-                    RichText::new(
-                        "Official Codex hooks are currently disabled on native Windows, so Mergen relies on Codex notify for turn-complete detection and uses BEL-backed TUI notifications only as a supplemental signal.",
-                    )
-                    .small()
-                    .color(TEXT_MUTED),
-                );
-                ui.add_space(4.0);
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Codex Config",
-                    &codex_config_text,
-                    TEXT_PRIMARY,
-                );
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Codex Inbox",
-                    &codex_runtime_text,
-                    if self.codex_cli_runtime_dir.is_some() {
-                        healthy_color
-                    } else {
-                        warning_color
-                    },
-                );
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Codex Session Active",
-                    codex_session_text,
-                    TEXT_PRIMARY,
-                );
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Codex Process State",
-                    &codex_process_text,
-                    TEXT_PRIMARY,
-                );
-                Self::draw_settings_diagnostic_row(
-                    ui,
-                    "Last Codex Source",
-                    codex_last_status_source,
-                    TEXT_PRIMARY,
-                );
-            },
-        );
+            ui.separator();
+            ui.label(
+                RichText::new("Codex CLI")
+                    .strong()
+                    .size(15.0)
+                    .color(TEXT_PRIMARY),
+            );
+            ui.label(
+                RichText::new(
+                    "Windows support in Codex CLI is still experimental. For now Mergen only wires native Windows sessions; WSL bridging stays out of scope in this release.",
+                )
+                .small()
+                .color(warning_color),
+            );
+            ui.label(
+                RichText::new(
+                    "Official Codex hooks are currently disabled on native Windows, so Mergen relies on Codex notify for turn-complete detection and uses BEL-backed TUI notifications only as a supplemental signal.",
+                )
+                .small()
+                .color(TEXT_MUTED),
+            );
+            ui.add_space(4.0);
+            Self::draw_settings_diagnostic_row(ui, "Codex Config", &codex_config_text, TEXT_PRIMARY);
+            Self::draw_settings_diagnostic_row(
+                ui,
+                "Codex Inbox",
+                &codex_runtime_text,
+                if self.codex_cli_runtime_dir.is_some() {
+                    healthy_color
+                } else {
+                    warning_color
+                },
+            );
+            Self::draw_settings_diagnostic_row(
+                ui,
+                "Codex Session Active",
+                codex_session_text,
+                TEXT_PRIMARY,
+            );
+            Self::draw_settings_diagnostic_row(
+                ui,
+                "Codex Process State",
+                &codex_process_text,
+                TEXT_PRIMARY,
+            );
+            Self::draw_settings_diagnostic_row(
+                ui,
+                "Last Codex Source",
+                codex_last_status_source,
+                TEXT_PRIMARY,
+            );
+        });
+        ui.add_space(SETTINGS_DIAGNOSTICS_SECTION_BOTTOM_GAP);
     }
 
     fn main_area_size_from_chrome(
@@ -10110,8 +10071,7 @@ fn settings_saved_messages_project_header_layout(
         egui::vec2(safe_disclosure_width, row_rect.height()),
     );
     let icon_width = CONTROL_ROW_HEIGHT.min(content_width);
-    let icon_gap =
-        SETTINGS_SAVED_MESSAGES_PROJECT_ICON_GAP.min((content_width - icon_width).max(0.0));
+    let icon_gap = SETTINGS_ACCORDION_HEADER_ICON_GAP.min((content_width - icon_width).max(0.0));
     let title_width = (content_width - icon_width - icon_gap).max(0.0);
     let content_rect = egui::Rect::from_min_size(
         egui::pos2(disclosure_rect.right(), row_rect.top()),
@@ -10138,7 +10098,7 @@ fn settings_saved_messages_project_header_layout(
     }
 }
 
-fn settings_saved_messages_disclosure_icon_rect(disclosure_rect: egui::Rect) -> egui::Rect {
+fn settings_accordion_disclosure_icon_rect(disclosure_rect: egui::Rect) -> egui::Rect {
     let icon_size = disclosure_rect
         .width()
         .min(disclosure_rect.height())
@@ -10146,20 +10106,20 @@ fn settings_saved_messages_disclosure_icon_rect(disclosure_rect: egui::Rect) -> 
     egui::Rect::from_center_size(
         egui::pos2(
             disclosure_rect.center().x,
-            disclosure_rect.center().y + SETTINGS_SAVED_MESSAGES_DISCLOSURE_Y_OFFSET,
+            disclosure_rect.center().y + SETTINGS_ACCORDION_DISCLOSURE_Y_OFFSET,
         ),
         egui::vec2(icon_size, icon_size),
     )
 }
 
-fn paint_settings_saved_messages_disclosure_icon(
+fn paint_settings_accordion_disclosure_icon(
     ui: &mut Ui,
     disclosure_rect: egui::Rect,
     openness: f32,
     response: &egui::Response,
 ) {
     let visuals = ui.style().interact(response);
-    let rect = settings_saved_messages_disclosure_icon_rect(disclosure_rect);
+    let rect = settings_accordion_disclosure_icon_rect(disclosure_rect);
     let rect = egui::Rect::from_center_size(rect.center(), rect.size() * 0.75);
     let rect = rect.expand(visuals.expansion);
     let mut points = vec![rect.left_top(), rect.right_top(), rect.center_bottom()];
@@ -10177,6 +10137,95 @@ fn paint_settings_saved_messages_disclosure_icon(
         visuals.fg_stroke.color,
         Stroke::NONE,
     ));
+}
+
+fn settings_diagnostics_accordion_header_layout(
+    row_rect: egui::Rect,
+    disclosure_width: f32,
+) -> SettingsDiagnosticsAccordionHeaderLayout {
+    let safe_disclosure_width = disclosure_width.clamp(0.0, row_rect.width());
+    let remaining_width = (row_rect.width() - safe_disclosure_width).max(0.0);
+    let disclosure_rect = egui::Rect::from_min_size(
+        row_rect.min,
+        egui::vec2(safe_disclosure_width, row_rect.height()),
+    );
+    let icon_width = CONTROL_ROW_HEIGHT.min(remaining_width);
+    let icon_gap = SETTINGS_ACCORDION_HEADER_ICON_GAP.min((remaining_width - icon_width).max(0.0));
+    let title_width = (remaining_width - icon_width - icon_gap).max(0.0);
+    let content_rect = egui::Rect::from_min_size(
+        egui::pos2(disclosure_rect.right(), row_rect.top()),
+        egui::vec2(remaining_width, row_rect.height()),
+    );
+    let icon_rect = egui::Rect::from_min_size(
+        content_rect.min,
+        egui::vec2(icon_width, content_rect.height()),
+    );
+    let title_rect = egui::Rect::from_min_size(
+        egui::pos2(icon_rect.right() + icon_gap, content_rect.top()),
+        egui::vec2(title_width, content_rect.height()),
+    );
+
+    SettingsDiagnosticsAccordionHeaderLayout {
+        disclosure_rect,
+        icon_rect,
+        title_rect,
+    }
+}
+
+fn draw_settings_diagnostics_accordion_header(
+    ui: &mut Ui,
+    icon: AppIcon,
+    title: &str,
+    openness: f32,
+) -> egui::Response {
+    let row_width = ui.available_width().max(0.0);
+    let (row_rect, response) =
+        ui.allocate_exact_size(egui::vec2(row_width, CONTROL_ROW_HEIGHT), Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let layout = settings_diagnostics_accordion_header_layout(row_rect, ui.spacing().indent);
+
+    if !ui.is_rect_visible(row_rect) {
+        return response;
+    }
+
+    if layout.disclosure_rect.width() > 0.0 {
+        paint_settings_accordion_disclosure_icon(ui, layout.disclosure_rect, openness, &response);
+    }
+
+    if layout.icon_rect.width() > 0.0 {
+        ui.painter().text(
+            layout.icon_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{icon}"),
+            egui::FontId::proportional(15.0),
+            TEXT_PRIMARY,
+        );
+    }
+
+    if layout.title_rect.width() > 0.0 {
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(layout.title_rect)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                let title_response = ui.add(
+                    egui::Label::new(RichText::new(title).strong().size(15.0).color(TEXT_PRIMARY))
+                        .truncate(),
+                );
+                let title_font = egui::TextStyle::Body.resolve(ui.style());
+                let _ = with_truncation_tooltip(
+                    ui,
+                    title_response,
+                    title,
+                    &title_font,
+                    TEXT_PRIMARY,
+                    layout.title_rect.width(),
+                );
+            },
+        );
+    }
+
+    response
 }
 
 fn draw_settings_saved_messages_project_header(
@@ -10208,12 +10257,7 @@ fn draw_settings_saved_messages_project_header(
     }
 
     if layout.disclosure_rect.width() > 0.0 {
-        paint_settings_saved_messages_disclosure_icon(
-            ui,
-            layout.disclosure_rect,
-            openness,
-            &response,
-        );
+        paint_settings_accordion_disclosure_icon(ui, layout.disclosure_rect, openness, &response);
     }
 
     if layout.folder_icon_rect.width() > 0.0 {
@@ -11226,27 +11270,28 @@ mod tests {
         next_terminal_in_direction, next_terminal_in_linear_direction,
         normalize_terminal_background, parse_branch_header, parse_git_numstat_totals,
         recent_inputs_tooltip_text, recover_config_state, resolve_ctrl_c_action,
+        settings_accordion_disclosure_icon_rect, settings_diagnostics_accordion_header_layout,
         settings_diagnostics_uses_single_column, settings_general_uses_stacked_layout,
         settings_popup_uses_stacked_layout, settings_saved_message_card_width,
-        settings_saved_message_text_width, settings_saved_messages_disclosure_icon_rect,
-        settings_saved_messages_project_header_layout, settings_saved_messages_project_state_id,
-        settings_saved_messages_stacks_draft_row, settings_text_edit_chrome,
-        settings_window_size_for_screen, should_resolve_terminal_link, source_control_badge_color,
-        source_control_tooltip_lines, terminal_cell_metric, terminal_cursor_blink_phase_visible,
-        terminal_cursor_overlay_rect, terminal_font_family, terminal_font_id,
-        terminal_grid_dimensions, terminal_line_height, terminal_link_activation_modifiers,
-        terminal_link_at_point, terminal_logical_line, terminal_logical_line_byte_index,
-        terminal_manager_actions_width, terminal_manager_diff_summary_model,
-        terminal_manager_diff_summary_visual, terminal_manager_row_chrome,
-        terminal_manager_row_widths, terminal_output_surface_size, terminal_output_viewport_size,
-        terminal_secondary_click_action, terminal_selection_point_from_pointer,
-        terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
-        with_settings_text_edit_chrome, AdeApp, AiBadgeModel, AiBadgeVisual, CodexCliStatusSource,
-        CtrlCAction, DirectoryIndexSnapshot, DirectoryNode, FactoryDroidHookInboxEvent,
-        FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
-        FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, PendingConfigChanges,
-        PendingTerminalLinkClick, SettingsSection, SourceControlBadgeState, SourceControlFile,
-        SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
+        settings_saved_message_text_width, settings_saved_messages_project_header_layout,
+        settings_saved_messages_project_state_id, settings_saved_messages_stacks_draft_row,
+        settings_text_edit_chrome, settings_window_size_for_screen, should_resolve_terminal_link,
+        source_control_badge_color, source_control_tooltip_lines, terminal_cell_metric,
+        terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect, terminal_font_family,
+        terminal_font_id, terminal_grid_dimensions, terminal_line_height,
+        terminal_link_activation_modifiers, terminal_link_at_point, terminal_logical_line,
+        terminal_logical_line_byte_index, terminal_manager_actions_width,
+        terminal_manager_diff_summary_model, terminal_manager_diff_summary_visual,
+        terminal_manager_row_chrome, terminal_manager_row_widths, terminal_output_surface_size,
+        terminal_output_viewport_size, terminal_secondary_click_action,
+        terminal_selection_point_from_pointer, terminal_selection_text, to_egui_color,
+        update_stable_cursor_row, visible_terminal_cursor, with_settings_text_edit_chrome, AdeApp,
+        AiBadgeModel, AiBadgeVisual, CodexCliStatusSource, CtrlCAction, DirectoryIndexSnapshot,
+        DirectoryNode, FactoryDroidHookInboxEvent, FactoryDroidManagedInstallComponent,
+        FactoryDroidManagedInstallDiagnostics, FactoryDroidStatusSource,
+        FactoryDroidTransportDiagnostics, PendingConfigChanges, PendingTerminalLinkClick,
+        SettingsSection, SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
+        SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
         TerminalSecondaryClickAction, TerminalSelection, TerminalSelectionPoint, TransientToast,
         CODEX_LAUNCH_GRACE_MS, CODEX_PROCESS_POLL_MS, CODEX_TRAILING_OUTPUT_GRACE_MS,
@@ -11890,6 +11935,11 @@ mod tests {
     }
 
     #[test]
+    fn settings_diagnostics_section_bottom_gap_adds_trailing_breathing_room() {
+        assert_eq!(super::SETTINGS_DIAGNOSTICS_SECTION_BOTTOM_GAP, 12.0);
+    }
+
+    #[test]
     fn settings_saved_message_text_width_reserves_space_for_right_actions() {
         assert_eq!(settings_saved_message_text_width(0.0), 0.0);
         assert_eq!(
@@ -11916,7 +11966,7 @@ mod tests {
         assert_eq!(layout.folder_icon_rect.min.x, layout.disclosure_rect.max.x);
         assert_eq!(
             layout.title_rect.min.x,
-            layout.folder_icon_rect.max.x + super::SETTINGS_SAVED_MESSAGES_PROJECT_ICON_GAP
+            layout.folder_icon_rect.max.x + super::SETTINGS_ACCORDION_HEADER_ICON_GAP
         );
         assert!(layout.title_rect.max.x <= layout.count_rect.min.x);
     }
@@ -11933,15 +11983,34 @@ mod tests {
     }
 
     #[test]
-    fn settings_saved_messages_disclosure_icon_rect_sits_below_slot_center() {
+    fn settings_diagnostics_accordion_header_layout_keeps_icon_and_title_centered() {
+        let row_rect = egui::Rect::from_min_size(
+            pos2(20.0, 32.0),
+            egui::vec2(220.0, super::CONTROL_ROW_HEIGHT),
+        );
+        let layout = settings_diagnostics_accordion_header_layout(row_rect, 18.0);
+
+        assert_eq!(layout.disclosure_rect.center().y, row_rect.center().y);
+        assert_eq!(layout.icon_rect.center().y, row_rect.center().y);
+        assert_eq!(layout.title_rect.center().y, row_rect.center().y);
+        assert_eq!(layout.icon_rect.min.x, layout.disclosure_rect.max.x);
+        assert_eq!(
+            layout.title_rect.min.x,
+            layout.icon_rect.max.x + super::SETTINGS_ACCORDION_HEADER_ICON_GAP
+        );
+        assert!(layout.title_rect.max.x <= row_rect.max.x);
+    }
+
+    #[test]
+    fn settings_accordion_disclosure_icon_rect_sits_below_slot_center() {
         let disclosure_rect =
             egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(18.0, super::CONTROL_ROW_HEIGHT));
-        let icon_rect = settings_saved_messages_disclosure_icon_rect(disclosure_rect);
+        let icon_rect = settings_accordion_disclosure_icon_rect(disclosure_rect);
 
         assert_eq!(icon_rect.center().x, disclosure_rect.center().x);
         assert_eq!(
             icon_rect.center().y,
-            disclosure_rect.center().y + super::SETTINGS_SAVED_MESSAGES_DISCLOSURE_Y_OFFSET
+            disclosure_rect.center().y + super::SETTINGS_ACCORDION_DISCLOSURE_Y_OFFSET
         );
     }
 
