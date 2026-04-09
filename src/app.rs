@@ -32,7 +32,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, SPI_GETKEYBOARDDELAY, SPI_GETKEYBOARDSPEED,
 };
 
-use crate::codex::{self, CodexEnableOutcome, CodexNotifyInboxEvent};
+use crate::codex::{self, CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
 use crate::config;
 use crate::hooks::{AiCliSession, AiCliStatus, AiCliTool, AiHookManager};
 use crate::layout;
@@ -62,7 +62,7 @@ const CODEX_PROCESS_POLL_MS: u64 = 75;
 const CODEX_LAUNCH_GRACE_MS: u64 = 5_000;
 const CODEX_TRAILING_OUTPUT_GRACE_MS: u64 = 750;
 const CURSOR_BLINK_STEP_SECS: f64 = 0.6;
-const TERMINAL_COPY_TOAST_SECS: f64 = 1.75;
+const TRANSIENT_TOAST_SECS: f64 = 1.75;
 const TERMINAL_COPY_FEEDBACK_TEXT: &str = "Copied terminal selection";
 const POWERSHELL_CURSOR_ROW_STABLE_SECS: f64 = 0.06;
 const TERMINAL_CHAR_WIDTH_SAMPLE_CELLS: usize = 64;
@@ -543,7 +543,7 @@ pub struct AdeApp {
     directory_search_query: String,
     directory_pending_tree_open_state_by_project: BTreeMap<u64, bool>,
     status_line: String,
-    copy_toast: Option<TransientToast>,
+    transient_toast: Option<TransientToast>,
     layout_epoch: u64,
     theme_initialized: bool,
     #[cfg(target_os = "windows")]
@@ -1424,27 +1424,34 @@ impl AdeApp {
         )
     }
 
-    fn enable_codex_cli_integration(&mut self, ctx: &egui::Context) {
-        match codex::enable_codex_cli_integration(&self.current_executable_path) {
-            Ok(CodexEnableOutcome::MissingInstall) => {
-                self.status_line =
-                    "Codex CLI was not found. Install it with npm, then run `codex login`."
-                        .to_owned();
-                ctx.open_url(egui::OpenUrl::new_tab(codex::codex_setup_url()));
+    fn show_status_feedback(&mut self, ctx: &egui::Context, message: impl Into<String>) {
+        let message = message.into();
+        let now = ctx.input(|input| input.time);
+        self.status_line = message.clone();
+        self.transient_toast = Some(TransientToast {
+            message,
+            expires_at: now + TRANSIENT_TOAST_SECS,
+        });
+        ctx.request_repaint();
+        ctx.request_repaint_after(Duration::from_secs_f64(TRANSIENT_TOAST_SECS));
+    }
+
+    fn codex_enable_outcome_message(outcome: &CodexEnableOutcome) -> String {
+        match outcome {
+            CodexEnableOutcome::MissingInstall => {
+                "Codex CLI was not found. Install it with npm, then run `codex login`."
+                    .to_owned()
             }
-            Ok(CodexEnableOutcome::NeedsLogin) => {
-                self.status_line =
-                    "Codex CLI is installed but not signed in. Run `codex login`, then try again."
-                        .to_owned();
+            CodexEnableOutcome::NeedsLogin => {
+                "Codex CLI is installed but not signed in. Run `codex login`, then try again."
+                    .to_owned()
             }
-            Ok(CodexEnableOutcome::CustomNotifyHookPreserved { path }) => {
-                self.status_line = format!(
-                    "Codex CLI kept the existing custom notify hook and only refreshed TUI notification settings; turn-complete tracking may stay limited until notify is routed through Mergen: {}",
-                    path.display()
-                );
-            }
-            Ok(CodexEnableOutcome::ConfigUpdated { path, updated }) => {
-                self.status_line = if updated {
+            CodexEnableOutcome::CustomNotifyHookPreserved { path } => format!(
+                "Codex CLI kept the existing custom notify hook and only refreshed TUI notification settings; turn-complete tracking may stay limited until notify is routed through Mergen: {}",
+                path.display()
+            ),
+            CodexEnableOutcome::ConfigUpdated { path, updated } => {
+                if *updated {
                     format!(
                         "Codex CLI integration enabled with Mergen turn-complete notify routing and BEL-backed TUI notifications: {}",
                         path.display()
@@ -1454,13 +1461,72 @@ impl AdeApp {
                         "Codex CLI integration already configured with Mergen turn-complete notify routing and BEL-backed TUI notifications: {}",
                         path.display()
                     )
-                };
-            }
-            Err(err) => {
-                self.status_line = format!("Failed to enable Codex CLI integration: {err}");
+                }
             }
         }
-        ctx.request_repaint();
+    }
+
+    fn should_show_codex_enable_button(status: &CodexIntegrationStatus) -> bool {
+        !matches!(status, CodexIntegrationStatus::EnabledHealthy { .. })
+    }
+
+    fn codex_integration_status_text(status: &CodexIntegrationStatus) -> &'static str {
+        match status {
+            CodexIntegrationStatus::EnabledHealthy { .. } => "Enabled",
+            CodexIntegrationStatus::NeedsSetup { .. } => "Not enabled",
+            CodexIntegrationStatus::CustomNotifyHook { .. } => "Custom notify hook",
+            CodexIntegrationStatus::ConfigReadError { .. } => "Config unreadable",
+        }
+    }
+
+    fn codex_integration_status_color(
+        status: &CodexIntegrationStatus,
+        healthy_color: Color32,
+        warning_color: Color32,
+    ) -> Color32 {
+        match status {
+            CodexIntegrationStatus::EnabledHealthy { .. } => healthy_color,
+            CodexIntegrationStatus::NeedsSetup { .. } => TEXT_MUTED,
+            CodexIntegrationStatus::CustomNotifyHook { .. }
+            | CodexIntegrationStatus::ConfigReadError { .. } => warning_color,
+        }
+    }
+
+    fn codex_runtime_overview_message(status: &CodexIntegrationStatus) -> String {
+        match status {
+            CodexIntegrationStatus::EnabledHealthy { .. } => {
+                "Factory Droid hooks are available. Codex CLI integration is already enabled and Mergen can receive notify-backed turn completion signals."
+                    .to_owned()
+            }
+            CodexIntegrationStatus::NeedsSetup { .. } => {
+                "Factory Droid hooks are available. Codex CLI integration can be enabled here when you want notify-backed turn completion signals."
+                    .to_owned()
+            }
+            CodexIntegrationStatus::CustomNotifyHook { .. } => {
+                "Factory Droid hooks are available. Codex CLI still uses a custom notify hook, so turn-complete attention may stay limited until notify is routed through Mergen."
+                    .to_owned()
+            }
+            CodexIntegrationStatus::ConfigReadError { error, .. } => format!(
+                "Factory Droid hooks are available. Codex CLI config could not be inspected, so Settings could not verify whether notify routing is already enabled: {error}"
+            ),
+        }
+    }
+
+    fn enable_codex_cli_integration(&mut self, ctx: &egui::Context) {
+        let mut open_setup_docs = false;
+        let message = match codex::enable_codex_cli_integration(&self.current_executable_path) {
+            Ok(outcome) => {
+                if matches!(outcome, CodexEnableOutcome::MissingInstall) {
+                    open_setup_docs = true;
+                }
+                Self::codex_enable_outcome_message(&outcome)
+            }
+            Err(err) => format!("Failed to enable Codex CLI integration: {err}"),
+        };
+        if open_setup_docs {
+            ctx.open_url(egui::OpenUrl::new_tab(codex::codex_setup_url()));
+        }
+        self.show_status_feedback(ctx, message);
     }
 
     #[cfg(not(test))]
@@ -1492,6 +1558,55 @@ impl AdeApp {
 
     #[cfg(test)]
     fn prepare_codex_cli_integration_for_launch(&mut self) {}
+
+    fn show_terminal_copy_feedback(&mut self, ctx: &egui::Context) {
+        self.show_status_feedback(ctx, TERMINAL_COPY_FEEDBACK_TEXT);
+    }
+
+    fn active_transient_toast_message(
+        transient_toast: Option<&TransientToast>,
+        now: f64,
+    ) -> Option<&str> {
+        transient_toast
+            .and_then(|toast| (now <= toast.expires_at).then_some(toast.message.as_str()))
+    }
+
+    fn draw_transient_toast(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|input| input.time);
+        let Some(message) =
+            Self::active_transient_toast_message(self.transient_toast.as_ref(), now)
+                .map(str::to_owned)
+        else {
+            self.transient_toast = None;
+            return;
+        };
+        let remaining = self
+            .transient_toast
+            .as_ref()
+            .map(|toast| (toast.expires_at - now).max(0.0))
+            .unwrap_or_default();
+        ctx.request_repaint_after(Duration::from_secs_f64(remaining));
+
+        egui::Area::new(Id::new("transient_status_toast"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-18.0, -18.0))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(SURFACE_BG_SOFT)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .rounding(10.0)
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(message)
+                                .color(TEXT_PRIMARY)
+                                .strong()
+                                .size(13.0),
+                        );
+                    });
+            });
+    }
 
     pub fn bootstrap(cc: &eframe::CreationContext<'_>) -> Self {
         let config_path = config::config_path().unwrap_or_else(|_| PathBuf::from("config.toml"));
@@ -1584,7 +1699,7 @@ impl AdeApp {
                         .map(|err| format!("Codex CLI runtime unavailable: {err}"))
                 })
                 .unwrap_or_else(|| "Ready".to_owned()),
-            copy_toast: None,
+            transient_toast: None,
             layout_epoch: 0,
             theme_initialized: false,
             #[cfg(target_os = "windows")]
@@ -4932,57 +5047,6 @@ impl AdeApp {
         self.show_terminal_copy_feedback(ctx);
     }
 
-    fn show_terminal_copy_feedback(&mut self, ctx: &egui::Context) {
-        let now = ctx.input(|input| input.time);
-        self.status_line = TERMINAL_COPY_FEEDBACK_TEXT.to_owned();
-        self.copy_toast = Some(TransientToast {
-            message: TERMINAL_COPY_FEEDBACK_TEXT.to_owned(),
-            expires_at: now + TERMINAL_COPY_TOAST_SECS,
-        });
-        ctx.request_repaint();
-        ctx.request_repaint_after(Duration::from_secs_f64(TERMINAL_COPY_TOAST_SECS));
-    }
-
-    fn active_copy_toast_message(copy_toast: Option<&TransientToast>, now: f64) -> Option<&str> {
-        copy_toast.and_then(|toast| (now <= toast.expires_at).then_some(toast.message.as_str()))
-    }
-
-    fn draw_copy_toast(&mut self, ctx: &egui::Context) {
-        let now = ctx.input(|input| input.time);
-        let Some(message) =
-            Self::active_copy_toast_message(self.copy_toast.as_ref(), now).map(str::to_owned)
-        else {
-            self.copy_toast = None;
-            return;
-        };
-        let remaining = self
-            .copy_toast
-            .as_ref()
-            .map(|toast| (toast.expires_at - now).max(0.0))
-            .unwrap_or_default();
-        ctx.request_repaint_after(Duration::from_secs_f64(remaining));
-
-        egui::Area::new(Id::new("terminal_copy_toast"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-18.0, -18.0))
-            .order(egui::Order::Foreground)
-            .interactable(false)
-            .show(ctx, |ui| {
-                egui::Frame::none()
-                    .fill(SURFACE_BG_SOFT)
-                    .stroke(Stroke::new(1.0, BORDER_COLOR))
-                    .rounding(10.0)
-                    .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(message)
-                                .color(TEXT_PRIMARY)
-                                .strong()
-                                .size(13.0),
-                        );
-                    });
-            });
-    }
-
     fn preferred_terminal_for_project(&self, project_id: u64) -> Option<u64> {
         if let Some(active_terminal_id) = self.active_terminal {
             if self
@@ -5514,6 +5578,16 @@ impl AdeApp {
             .and_then(|terminal| terminal.codex_last_status_source)
             .map(CodexCliStatusSource::label)
             .unwrap_or("none");
+        let codex_integration_status =
+            codex::inspect_codex_cli_integration(&self.current_executable_path);
+        let codex_integration_text = Self::codex_integration_status_text(&codex_integration_status);
+        let codex_integration_color = Self::codex_integration_status_color(
+            &codex_integration_status,
+            healthy_color,
+            warning_color,
+        );
+        let should_show_codex_enable_button =
+            Self::should_show_codex_enable_button(&codex_integration_status);
         let managed_settings_path = diagnostics
             .managed_install
             .settings
@@ -5529,9 +5603,19 @@ impl AdeApp {
         let summary_title = diagnostics
             .warning_badge_text()
             .unwrap_or("Factory Droid transport looks healthy");
-        let summary_message = diagnostics.warning_message().unwrap_or_else(|| {
-            "Factory Droid hooks are available. Codex CLI integration can be enabled here when you want notify-backed turn completion signals.".to_owned()
-        });
+        let summary_message = diagnostics
+            .warning_message()
+            .unwrap_or_else(|| Self::codex_runtime_overview_message(&codex_integration_status));
+        let summary_message_color = if diagnostics.shows_settings_warning_badge()
+            || matches!(
+                codex_integration_status,
+                CodexIntegrationStatus::CustomNotifyHook { .. }
+                    | CodexIntegrationStatus::ConfigReadError { .. }
+            ) {
+            warning_color
+        } else {
+            TEXT_MUTED
+        };
 
         show_settings_card(
             ui,
@@ -5546,13 +5630,11 @@ impl AdeApp {
                         healthy_color
                     },
                 ));
-                ui.label(RichText::new(&summary_message).small().color(
-                    if diagnostics.shows_settings_warning_badge() {
-                        warning_color
-                    } else {
-                        TEXT_MUTED
-                    },
-                ));
+                ui.label(
+                    RichText::new(&summary_message)
+                        .small()
+                        .color(summary_message_color),
+                );
                 ui.add_space(10.0);
                 let use_single_column =
                     settings_diagnostics_uses_single_column(ui.available_width());
@@ -5604,6 +5686,12 @@ impl AdeApp {
                         &codex_process_text,
                         TEXT_PRIMARY,
                     );
+                    Self::draw_settings_diagnostic_row(
+                        ui,
+                        "Integration",
+                        codex_integration_text,
+                        codex_integration_color,
+                    );
                 } else {
                     ui.columns(2, |columns| {
                         columns[0]
@@ -5654,19 +5742,27 @@ impl AdeApp {
                             &codex_process_text,
                             TEXT_PRIMARY,
                         );
+                        Self::draw_settings_diagnostic_row(
+                            &mut columns[1],
+                            "Integration",
+                            codex_integration_text,
+                            codex_integration_color,
+                        );
                     });
                 }
                 ui.add_space(8.0);
                 if use_single_column {
                     let button_width = ui.available_width().max(0.0);
-                    if ui
-                        .add_sized(
-                            [button_width, CONTROL_ROW_HEIGHT],
-                            egui::Button::new("Enable Codex CLI integration"),
-                        )
-                        .clicked()
-                    {
-                        self.enable_codex_cli_integration(ctx);
+                    if should_show_codex_enable_button {
+                        if ui
+                            .add_sized(
+                                [button_width, CONTROL_ROW_HEIGHT],
+                                egui::Button::new("Enable Codex CLI integration"),
+                            )
+                            .clicked()
+                        {
+                            self.enable_codex_cli_integration(ctx);
+                        }
                     }
                     if ui
                         .add_sized(
@@ -5679,7 +5775,9 @@ impl AdeApp {
                     }
                 } else {
                     ui.horizontal(|ui| {
-                        if ui.button("Enable Codex CLI integration").clicked() {
+                        if should_show_codex_enable_button
+                            && ui.button("Enable Codex CLI integration").clicked()
+                        {
                             self.enable_codex_cli_integration(ctx);
                         }
                         if ui.button("Open Codex setup docs").clicked() {
@@ -7784,7 +7882,7 @@ impl eframe::App for AdeApp {
 
         self.route_active_terminal_input(ctx, terminal_events);
         self.flush_pending_terminal_pastes(ctx);
-        self.draw_copy_toast(ctx);
+        self.draw_transient_toast(ctx);
     }
 
     fn persist_egui_memory(&self) -> bool {
@@ -11297,9 +11395,9 @@ mod tests {
         CODEX_LAUNCH_GRACE_MS, CODEX_PROCESS_POLL_MS, CODEX_TRAILING_OUTPUT_GRACE_MS,
         FACTORY_DROID_HOOK_POLL_MS, FACTORY_DROID_PROCESS_POLL_MS,
         FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG,
-        TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_COPY_TOAST_SECS, TERMINAL_OUTPUT_BG,
+        TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_OUTPUT_BG, TRANSIENT_TOAST_SECS,
     };
-    use crate::codex::CodexNotifyInboxEvent;
+    use crate::codex::{CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
     use crate::hooks::{
         AiCliSession, AiCliStatus, AiCliTool, AiHookManager, AiHooksConfig, ProjectAiConfig,
     };
@@ -12070,6 +12168,36 @@ mod tests {
     }
 
     #[test]
+    fn settings_codex_enable_button_is_hidden_only_when_integration_is_healthy() {
+        assert!(!AdeApp::should_show_codex_enable_button(
+            &CodexIntegrationStatus::EnabledHealthy {
+                path: PathBuf::from(r"C:\Users\furkan.cakir\.codex\config.toml"),
+            }
+        ));
+        assert!(AdeApp::should_show_codex_enable_button(
+            &CodexIntegrationStatus::NeedsSetup {
+                path: PathBuf::from(r"C:\Users\furkan.cakir\.codex\config.toml"),
+            }
+        ));
+        assert!(AdeApp::should_show_codex_enable_button(
+            &CodexIntegrationStatus::CustomNotifyHook {
+                path: PathBuf::from(r"C:\Users\furkan.cakir\.codex\config.toml"),
+            }
+        ));
+    }
+
+    #[test]
+    fn settings_codex_runtime_overview_message_reflects_enabled_integration() {
+        let message =
+            AdeApp::codex_runtime_overview_message(&CodexIntegrationStatus::EnabledHealthy {
+                path: PathBuf::from(r"C:\Users\furkan.cakir\.codex\config.toml"),
+            });
+
+        assert!(message.contains("already enabled"));
+        assert!(!message.contains("can be enabled here"));
+    }
+
+    #[test]
     fn settings_general_layout_switches_to_stacked_only_when_space_is_narrow() {
         assert!(settings_general_uses_stacked_layout(479.0));
         assert!(!settings_general_uses_stacked_layout(480.0));
@@ -12513,7 +12641,7 @@ mod tests {
     }
 
     #[test]
-    fn show_terminal_copy_feedback_sets_status_line_and_toast() {
+    fn show_terminal_copy_feedback_sets_status_line_and_transient_toast() {
         let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
         let ctx = Context::default();
         ctx.input_mut(|input| input.time = 2.5);
@@ -12521,24 +12649,50 @@ mod tests {
         app.show_terminal_copy_feedback(&ctx);
 
         assert_eq!(app.status_line, TERMINAL_COPY_FEEDBACK_TEXT);
-        let toast = app.copy_toast.as_ref().expect("expected toast");
+        let toast = app
+            .transient_toast
+            .as_ref()
+            .expect("expected transient toast");
         assert_eq!(toast.message, TERMINAL_COPY_FEEDBACK_TEXT);
-        assert!((toast.expires_at - (2.5 + TERMINAL_COPY_TOAST_SECS)).abs() < f64::EPSILON);
+        assert!((toast.expires_at - (2.5 + TRANSIENT_TOAST_SECS)).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn active_copy_toast_message_hides_expired_toast() {
+    fn show_status_feedback_sets_transient_toast_for_non_copy_messages() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let ctx = Context::default();
+        ctx.input_mut(|input| input.time = 1.0);
+        let message = AdeApp::codex_enable_outcome_message(&CodexEnableOutcome::ConfigUpdated {
+            path: PathBuf::from(r"C:\Users\furkan.cakir\.codex\config.toml"),
+            updated: false,
+        });
+
+        app.show_status_feedback(&ctx, message.clone());
+
+        assert_eq!(app.status_line, message);
+        let toast = app
+            .transient_toast
+            .as_ref()
+            .expect("expected transient toast");
+        assert_eq!(toast.message, app.status_line);
+    }
+
+    #[test]
+    fn active_transient_toast_message_hides_expired_toast() {
         let toast = TransientToast {
             message: TERMINAL_COPY_FEEDBACK_TEXT.to_owned(),
             expires_at: 4.0,
         };
 
         assert_eq!(
-            AdeApp::active_copy_toast_message(Some(&toast), 3.5),
+            AdeApp::active_transient_toast_message(Some(&toast), 3.5),
             Some(TERMINAL_COPY_FEEDBACK_TEXT)
         );
-        assert_eq!(AdeApp::active_copy_toast_message(Some(&toast), 4.1), None);
-        assert_eq!(AdeApp::active_copy_toast_message(None, 0.0), None);
+        assert_eq!(
+            AdeApp::active_transient_toast_message(Some(&toast), 4.1),
+            None
+        );
+        assert_eq!(AdeApp::active_transient_toast_message(None, 0.0), None);
     }
 
     #[test]
@@ -17855,7 +18009,7 @@ mod tests {
             directory_search_query: String::new(),
             directory_pending_tree_open_state_by_project: BTreeMap::new(),
             status_line: "Ready".to_owned(),
-            copy_toast: None,
+            transient_toast: None,
             layout_epoch: 0,
             theme_initialized: false,
             #[cfg(target_os = "windows")]

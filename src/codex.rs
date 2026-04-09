@@ -40,6 +40,23 @@ pub enum CodexConfigPatchOutcome {
     CustomNotifyHookPreserved,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexIntegrationStatus {
+    EnabledHealthy {
+        path: PathBuf,
+    },
+    NeedsSetup {
+        path: PathBuf,
+    },
+    CustomNotifyHook {
+        path: PathBuf,
+    },
+    ConfigReadError {
+        path: Option<PathBuf>,
+        error: String,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CodexNotifyInboxEvent {
     pub terminal_id: String,
@@ -123,6 +140,16 @@ pub fn enable_codex_cli_integration(executable_path: &Path) -> io::Result<CodexE
         CodexConfigPatchOutcome::CustomNotifyHookPreserved => {
             Ok(CodexEnableOutcome::CustomNotifyHookPreserved { path })
         }
+    }
+}
+
+pub fn inspect_codex_cli_integration(executable_path: &Path) -> CodexIntegrationStatus {
+    match user_codex_config_path() {
+        Ok(path) => inspect_codex_cli_integration_at_path(path, executable_path),
+        Err(err) => CodexIntegrationStatus::ConfigReadError {
+            path: None,
+            error: err.to_string(),
+        },
     }
 }
 
@@ -341,6 +368,88 @@ fn toml_value_string_array_matches(value: &TomlValue, expected: &[String]) -> bo
             .all(|(item, expected_item)| item.as_str() == Some(expected_item.as_str()))
 }
 
+fn toml_value_string_array_contains_all(value: &TomlValue, required: &[&str]) -> bool {
+    let Some(items) = value.as_array() else {
+        return false;
+    };
+
+    required.iter().all(|required_item| {
+        items
+            .iter()
+            .any(|item| item.as_str() == Some(*required_item))
+    })
+}
+
+fn inspect_codex_cli_integration_at_path(
+    path: PathBuf,
+    executable_path: &Path,
+) -> CodexIntegrationStatus {
+    let existing = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return CodexIntegrationStatus::NeedsSetup { path };
+        }
+        Err(err) => {
+            return CodexIntegrationStatus::ConfigReadError {
+                path: Some(path),
+                error: err.to_string(),
+            };
+        }
+    };
+
+    let value = if existing.trim().is_empty() {
+        TomlValue::Table(Default::default())
+    } else {
+        match toml::from_str::<TomlValue>(&existing) {
+            Ok(value) => value,
+            Err(err) => {
+                return CodexIntegrationStatus::ConfigReadError {
+                    path: Some(path),
+                    error: format!("Invalid config.toml: {err}"),
+                };
+            }
+        }
+    };
+
+    let Some(root) = value.as_table() else {
+        return CodexIntegrationStatus::ConfigReadError {
+            path: Some(path),
+            error: "Codex config root must be a TOML table".to_owned(),
+        };
+    };
+
+    let notify_command = codex_notify_command(executable_path);
+    let notify_matches = match root.get("notify") {
+        Some(existing_notify)
+            if toml_value_string_array_matches(existing_notify, notify_command.as_slice()) =>
+        {
+            true
+        }
+        Some(_) => {
+            return CodexIntegrationStatus::CustomNotifyHook { path };
+        }
+        None => false,
+    };
+
+    let Some(tui) = root.get("tui").and_then(TomlValue::as_table) else {
+        return CodexIntegrationStatus::NeedsSetup { path };
+    };
+    let notification_method_matches = tui.get("notification_method").and_then(TomlValue::as_str)
+        == Some(CODEX_NOTIFICATION_METHOD);
+    let notifications_match = tui.get("notifications").is_some_and(|notifications| {
+        toml_value_string_array_contains_all(
+            notifications,
+            &[CODEX_TURN_COMPLETE_EVENT, CODEX_APPROVAL_REQUESTED_EVENT],
+        )
+    });
+
+    if notify_matches && notification_method_matches && notifications_match {
+        CodexIntegrationStatus::EnabledHealthy { path }
+    } else {
+        CodexIntegrationStatus::NeedsSetup { path }
+    }
+}
+
 fn run_codex_command(args: &[&str]) -> io::Result<Output> {
     #[cfg(target_os = "windows")]
     {
@@ -361,11 +470,11 @@ fn run_codex_command(args: &[&str]) -> io::Result<Output> {
 mod tests {
     use super::{
         codex_env_pairs, codex_notify_inbox_path_for_dir, handle_codex_notify,
-        patch_codex_config_file, write_codex_notify_event, CodexConfigPatchOutcome,
-        CodexNotifyInboxEvent, CODEX_APPROVAL_REQUESTED_EVENT, CODEX_NOTIFICATION_METHOD,
-        CODEX_TURN_COMPLETE_EVENT, MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR,
-        MERGEN_AI_INBOX_DIR_ENV_VAR, MERGEN_AI_TOOL_HINT_CODEX, MERGEN_AI_TOOL_HINT_ENV_VAR,
-        MERGEN_TERMINAL_ID_ENV_VAR,
+        inspect_codex_cli_integration_at_path, patch_codex_config_file, write_codex_notify_event,
+        CodexConfigPatchOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent,
+        CODEX_APPROVAL_REQUESTED_EVENT, CODEX_NOTIFICATION_METHOD, CODEX_TURN_COMPLETE_EVENT,
+        MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR, MERGEN_AI_INBOX_DIR_ENV_VAR,
+        MERGEN_AI_TOOL_HINT_CODEX, MERGEN_AI_TOOL_HINT_ENV_VAR, MERGEN_TERMINAL_ID_ENV_VAR,
     };
     use std::ffi::OsString;
     use std::fs;
@@ -670,6 +779,114 @@ notification_method = "desktop"
             value["tui"]["notification_method"].as_str(),
             Some(CODEX_NOTIFICATION_METHOD)
         );
+    }
+
+    #[test]
+    fn inspect_codex_cli_integration_reports_enabled_healthy_when_notify_and_tui_match() {
+        let temp = TestTempDir::new("codex-config-health");
+        let path = temp.path.join("config.toml");
+        fs::write(
+            &path,
+            r#"
+notify = ['C:\Users\furkan.cakir\Desktop\mergen-ade.exe', "--codex-notify"]
+
+[tui]
+notification_method = "bel"
+notifications = ["agent-turn-complete", "approval-requested", "extra-event"]
+"#,
+        )
+        .expect("write config");
+
+        let executable = Path::new(r"C:\Users\furkan.cakir\Desktop\mergen-ade.exe");
+        assert_eq!(
+            inspect_codex_cli_integration_at_path(path.clone(), executable),
+            CodexIntegrationStatus::EnabledHealthy { path }
+        );
+    }
+
+    #[test]
+    fn inspect_codex_cli_integration_reports_needs_setup_when_notify_is_missing() {
+        let temp = TestTempDir::new("codex-config-missing-notify");
+        let path = temp.path.join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[tui]
+notification_method = "bel"
+notifications = ["agent-turn-complete", "approval-requested"]
+"#,
+        )
+        .expect("write config");
+
+        let executable = Path::new(r"C:\Users\furkan.cakir\Desktop\mergen-ade.exe");
+        assert_eq!(
+            inspect_codex_cli_integration_at_path(path.clone(), executable),
+            CodexIntegrationStatus::NeedsSetup { path }
+        );
+    }
+
+    #[test]
+    fn inspect_codex_cli_integration_reports_custom_notify_hook_when_notify_differs() {
+        let temp = TestTempDir::new("codex-config-custom-inspect");
+        let path = temp.path.join("config.toml");
+        fs::write(
+            &path,
+            r#"
+notify = ["powershell.exe", "-File", "custom-notify.ps1"]
+
+[tui]
+notification_method = "bel"
+notifications = ["agent-turn-complete", "approval-requested"]
+"#,
+        )
+        .expect("write config");
+
+        let executable = Path::new(r"C:\Users\furkan.cakir\Desktop\mergen-ade.exe");
+        assert_eq!(
+            inspect_codex_cli_integration_at_path(path.clone(), executable),
+            CodexIntegrationStatus::CustomNotifyHook { path }
+        );
+    }
+
+    #[test]
+    fn inspect_codex_cli_integration_reports_needs_setup_when_required_notifications_are_missing() {
+        let temp = TestTempDir::new("codex-config-missing-events");
+        let path = temp.path.join("config.toml");
+        fs::write(
+            &path,
+            r#"
+notify = ['C:\Users\furkan.cakir\Desktop\mergen-ade.exe', "--codex-notify"]
+
+[tui]
+notification_method = "bel"
+notifications = ["agent-turn-complete"]
+"#,
+        )
+        .expect("write config");
+
+        let executable = Path::new(r"C:\Users\furkan.cakir\Desktop\mergen-ade.exe");
+        assert_eq!(
+            inspect_codex_cli_integration_at_path(path.clone(), executable),
+            CodexIntegrationStatus::NeedsSetup { path }
+        );
+    }
+
+    #[test]
+    fn inspect_codex_cli_integration_reports_config_read_error_for_invalid_toml() {
+        let temp = TestTempDir::new("codex-config-invalid");
+        let path = temp.path.join("config.toml");
+        fs::write(&path, "notify = [").expect("write invalid config");
+
+        let executable = Path::new(r"C:\Users\furkan.cakir\Desktop\mergen-ade.exe");
+        let status = inspect_codex_cli_integration_at_path(path.clone(), executable);
+
+        assert!(matches!(
+            status,
+            CodexIntegrationStatus::ConfigReadError {
+                path: Some(observed_path),
+                ..
+            } if observed_path == path
+        ));
     }
 
     struct TestTempDir {

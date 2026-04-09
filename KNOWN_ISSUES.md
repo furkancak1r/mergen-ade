@@ -1,5 +1,20 @@
 ### Known Issues & Fix Log
 
+#### Settings Codex CLI enable action now stays hidden when Mergen notify wiring is already healthy and shows visible feedback when used {#settings-codex-cli-enable-action-now-stays-hidden-when-mergen-notify-wiring-is-already-healthy-and-shows-visible-feedback-when-used}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Settings modal diagnostics section
+- Error signature: `Enable Codex CLI integration was clickable even when ~/.codex/config.toml already matched Mergen notify routing, and clicking it only updated an internal status_line that was not visible in the current UI.`
+- Symptoms/Impact: Users could click the button and perceive that nothing happened, even though the config patch path was running or already idempotent. The Runtime Overview copy also kept implying that Codex could be enabled from here even when the integration was already healthy.
+- Root cause: The Settings diagnostics UI had no explicit Codex integration health inspection. It rendered the enable button unconditionally and routed the result only through a non-rendered status line instead of a visible feedback surface.
+- Resolution:
+  - Added a Codex config inspection helper that distinguishes healthy Mergen notify wiring, missing setup, preserved custom notify hooks, and unreadable config states.
+  - Hid the enable button when the current Codex config is already healthy for the active Mergen executable.
+  - Reused the transient toast surface for Codex integration feedback and added inline Runtime Overview status text that reflects the actual Codex state.
+- Prevent recurrence:
+  - Any settings action that mutates external tool configuration should expose a visible success/failure surface instead of relying only on background status text.
+  - Optional setup buttons in Settings should be gated by an explicit health inspection so already-satisfied actions do not remain visible.
+- Files/Commands touched: `src/app.rs`, `src/codex.rs`, `KNOWN_ISSUES.md`
+
 #### Settings Technical Details accordion no longer sits flush against the diagnostics scroll boundary when collapsed {#settings-technical-details-accordion-no-longer-sits-flush-against-the-diagnostics-scroll-boundary-when-collapsed}
 - Date: 2026-04-09T00:00:00Z
 - Context: main/Windows local Settings modal diagnostics section
