@@ -83,7 +83,6 @@ const SOURCE_CONTROL_POLL_TICK_MS: u64 = 250;
 const SOURCE_CONTROL_TOOLTIP_FILE_LIMIT: usize = 12;
 const DIRECTORY_ENTRY_TOOLTIP_MAX_CHARS: usize = 500;
 // Pure Dark Theme colors
-const TERMINAL_OUTPUT_BG: Color32 = Color32::from_rgb(16, 16, 16);
 const TERMINAL_HEADER_HEIGHT: f32 = 38.0;
 const TERMINAL_HEADER_GAP: f32 = 6.0;
 const TERMINAL_TILE_GAP_X: f32 = 0.0;
@@ -92,6 +91,7 @@ const TERMINAL_PANE_INNER_MARGIN: f32 = 2.0;
 const APP_BG: Color32 = Color32::from_rgb(16, 16, 16);
 const SURFACE_BG: Color32 = Color32::from_rgb(22, 22, 22);
 const SURFACE_BG_SOFT: Color32 = Color32::from_rgb(28, 28, 28);
+const TERMINAL_OUTPUT_BG: Color32 = SURFACE_BG;
 const BORDER_COLOR: Color32 = Color32::from_rgb(38, 38, 38);
 const ACCENT: Color32 = Color32::from_rgb(200, 200, 200);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(255, 255, 255);
@@ -10223,7 +10223,7 @@ mod tests {
         TerminalSecondaryClickAction, TerminalSelection, TerminalSelectionPoint, TransientToast,
         CODEX_LAUNCH_GRACE_MS, CODEX_PROCESS_POLL_MS, CODEX_TRAILING_OUTPUT_GRACE_MS,
         FACTORY_DROID_HOOK_POLL_MS, FACTORY_DROID_PROCESS_POLL_MS,
-        FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT,
+        FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG,
         TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_COPY_TOAST_SECS, TERMINAL_OUTPUT_BG,
     };
     use crate::codex::CodexNotifyInboxEvent;
@@ -16598,6 +16598,7 @@ mod tests {
     #[test]
     fn normalizes_near_black_terminal_background() {
         let normalized = normalize_terminal_background(TerminalColor { r: 0, g: 0, b: 0 });
+        assert_eq!(normalized, SURFACE_BG);
         assert_eq!(normalized, TERMINAL_OUTPUT_BG);
     }
 

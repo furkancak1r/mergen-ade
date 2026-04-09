@@ -1,5 +1,20 @@
 ### Known Issues & Fix Log
 
+#### Terminal default background now follows the app surface theme {#terminal-default-background-now-follows-the-app-surface-theme}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local terminal output surface and default cell background rendering
+- Error signature: `New terminal panes kept a flatter pure-black background that did not match the rest of the theme surface.`
+- Symptoms/Impact: Empty prompt space, resize fill, and default-background terminal cells looked visually detached from the surrounding pane chrome even though the app already used a slightly lighter dark surface tone elsewhere.
+- Root cause: The terminal viewport fill and near-black background normalization path were both pinned to a standalone pure-black constant instead of the shared theme surface color, so default terminal background rendering diverged from the app theme.
+- Resolution:
+  - Rebound the terminal output background constant to the shared `SURFACE_BG` theme color.
+  - Kept ANSI or explicitly colored terminal cell backgrounds unchanged by preserving the existing passthrough behavior for non-default backgrounds.
+  - Updated the regression test to assert that normalized default terminal backgrounds resolve to the same themed surface color as the viewport.
+- Prevent recurrence:
+  - Keep terminal default-background mapping tied to shared theme surface constants instead of duplicating raw RGB values.
+  - When adjusting terminal render colors, verify both the viewport fill and per-cell default-background normalization path together.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+
 #### Terminal header source control badge and Terminal Manager row chrome were simplified {#terminal-header-source-control-badge-and-terminal-manager-row-chrome-were-simplified}
 - Date: 2026-04-08T00:00:00Z
 - Context: main/Windows local terminal header chrome + Terminal Manager project and terminal rows
