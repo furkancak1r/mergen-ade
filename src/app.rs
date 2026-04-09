@@ -109,7 +109,6 @@ const SIDEBAR_ROW_LEADING_INSET: f32 = 6.0;
 const TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH: f32 = 32.0;
 const SOURCE_CONTROL_FILE_ICON_WIDTH: f32 = 16.0;
 const SOURCE_CONTROL_FILE_ICON_GAP: f32 = 6.0;
-const TOP_BAR_HEIGHT: f32 = 54.0;
 const DIRECTORY_SEARCH_INPUT_ID: &str = "directory-search-input";
 const SAVED_MESSAGE_DRAFT_INPUT_ID: &str = "saved-message-draft-input";
 // Pill button palette
@@ -456,6 +455,18 @@ impl FactoryDroidTransportDiagnostics {
         }
 
         (!warnings.is_empty()).then(|| warnings.join(" "))
+    }
+
+    fn settings_tooltip_text(&self) -> String {
+        if let Some(warning_message) = self.warning_message() {
+            format!("Settings\n\n{warning_message}")
+        } else {
+            "Settings".to_owned()
+        }
+    }
+
+    fn shows_settings_warning_badge(&self) -> bool {
+        self.warning_badge_text().is_some()
     }
 }
 
@@ -5173,71 +5184,14 @@ impl AdeApp {
             });
     }
 
-    fn draw_top_bar(&mut self, ctx: &egui::Context) -> egui::Rect {
-        egui::TopBottomPanel::top("top_bar")
-            .exact_height(TOP_BAR_HEIGHT)
-            .frame(
-                egui::Frame::none()
-                    .fill(SURFACE_BG)
-                    .stroke(Stroke::new(1.0, BORDER_COLOR))
-                    .inner_margin(egui::Margin::symmetric(10.0, 8.0)),
-            )
-            .show(ctx, |ui| {
-                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(format!("{}  Mergen ADE", icons::TERMINAL_WINDOW))
-                            .strong()
-                            .size(15.0)
-                            .color(ACCENT),
-                    );
-                    ui.add_space(6.0);
-                    let remaining_width = ui.available_size_before_wrap().x.max(0.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(remaining_width, 28.0),
-                        Layout::right_to_left(Align::Center),
-                        |ui| {
-                            let diagnostics = self.factory_droid_transport_diagnostics();
-                            if styled_icon_button(
-                                ui,
-                                icons::GEAR,
-                                BTN_SUBTLE,
-                                BTN_SUBTLE_HOVER,
-                                BTN_ICON_ACTIVE,
-                                "Settings",
-                            ) {
-                                self.open_settings_popup();
-                            }
-
-                            if let Some(warning_message) = diagnostics.warning_message() {
-                                ui.add_space(8.0);
-                                let warning_label = diagnostics
-                                    .warning_badge_text()
-                                    .unwrap_or("Factory Droid diagnostics warning");
-                                ui.label(
-                                    RichText::new(warning_label)
-                                        .small()
-                                        .strong()
-                                        .color(Color32::from_rgb(232, 184, 76)),
-                                )
-                                .on_hover_text(warning_message);
-                            }
-                        },
-                    );
-                });
-            })
-            .response
-            .rect
-    }
-
     fn main_area_size_from_chrome(
         &self,
         content_rect: egui::Rect,
-        top_bar_rect: egui::Rect,
         activity_rect: Option<egui::Rect>,
         explorer_rect: Option<egui::Rect>,
     ) -> Vec2 {
         let mut width = content_rect.width();
-        let height = content_rect.height() - top_bar_rect.height();
+        let height = content_rect.height();
 
         if let Some(activity_rect) = activity_rect {
             width -= activity_rect.width();
@@ -5250,10 +5204,6 @@ impl AdeApp {
     }
 
     fn draw_activity_rail(&mut self, ctx: &egui::Context) -> Option<egui::Rect> {
-        if !self.config.ui.show_project_explorer {
-            return None;
-        }
-
         let response = egui::SidePanel::left("activity_rail")
             .resizable(false)
             .exact_width(ACTIVITY_RAIL_WIDTH)
@@ -5276,17 +5226,14 @@ impl AdeApp {
                 let terminal_manager_active = self.config.ui.show_project_explorer
                     && self.config.ui.project_explorer_expanded
                     && self.config.ui.left_sidebar_tab == LeftSidebarTab::TerminalManager;
+                let diagnostics = self.factory_droid_transport_diagnostics();
+                let settings_tooltip = diagnostics.settings_tooltip_text();
+                let shows_settings_warning_badge = diagnostics.shows_settings_warning_badge();
 
-                ui.vertical_centered(|ui| {
+                ui.with_layout(Layout::top_down(Align::Center), |ui| {
                     ui.add_space(4.0);
 
-                    if self.config.ui.show_project_explorer
-                        && styled_icon_toggle(
-                            ui,
-                            directory_active,
-                            icons::TREE_VIEW,
-                            "Open Directory",
-                        )
+                    if styled_icon_toggle(ui, directory_active, icons::TREE_VIEW, "Open Directory")
                     {
                         self.config.ui.show_project_explorer = true;
                         if directory_active {
@@ -5298,23 +5245,21 @@ impl AdeApp {
                         should_persist = true;
                     }
 
-                    if self.config.ui.show_project_explorer {
-                        ui.add_space(6.0);
-                        if styled_icon_toggle(
-                            ui,
-                            source_control_active,
-                            icons::GIT_BRANCH,
-                            "Open Source Control",
-                        ) {
-                            self.config.ui.show_project_explorer = true;
-                            if source_control_active {
-                                self.config.ui.project_explorer_expanded = false;
-                            } else {
-                                self.config.ui.project_explorer_expanded = true;
-                                self.config.ui.left_sidebar_tab = LeftSidebarTab::SourceControl;
-                            }
-                            should_persist = true;
+                    ui.add_space(6.0);
+                    if styled_icon_toggle(
+                        ui,
+                        source_control_active,
+                        icons::GIT_BRANCH,
+                        "Open Source Control",
+                    ) {
+                        self.config.ui.show_project_explorer = true;
+                        if source_control_active {
+                            self.config.ui.project_explorer_expanded = false;
+                        } else {
+                            self.config.ui.project_explorer_expanded = true;
+                            self.config.ui.left_sidebar_tab = LeftSidebarTab::SourceControl;
                         }
+                        should_persist = true;
                     }
 
                     ui.add_space(6.0);
@@ -5332,6 +5277,22 @@ impl AdeApp {
                             self.config.ui.left_sidebar_tab = LeftSidebarTab::TerminalManager;
                         }
                         should_persist = true;
+                    }
+
+                    let footer_space = (ui.available_height() - CONTROL_ROW_HEIGHT).max(0.0);
+                    ui.add_space(footer_space);
+
+                    let settings_response = activity_rail_icon_button(
+                        ui,
+                        self.show_settings_popup,
+                        icons::GEAR,
+                        &settings_tooltip,
+                    );
+                    if shows_settings_warning_badge {
+                        paint_activity_rail_warning_badge(ui, settings_response.rect);
+                    }
+                    if settings_response.clicked() {
+                        self.open_settings_popup();
                     }
                 });
 
@@ -7233,15 +7194,10 @@ impl eframe::App for AdeApp {
         let mut terminal_events = self.take_buffered_terminal_input();
         terminal_events.extend(self.capture_active_terminal_input(ctx));
         terminal_events = self.preprocess_terminal_input_with_held_repeat(ctx, terminal_events);
-        let top_bar_rect = self.draw_top_bar(ctx);
         let activity_rect = self.draw_activity_rail(ctx);
         let explorer_rect = self.draw_project_explorer(ctx);
-        let main_area_size = self.main_area_size_from_chrome(
-            ctx.screen_rect(),
-            top_bar_rect,
-            activity_rect,
-            explorer_rect,
-        );
+        let main_area_size =
+            self.main_area_size_from_chrome(ctx.screen_rect(), activity_rect, explorer_rect);
         self.handle_shortcuts(ctx, main_area_size);
         self.draw_main_area(ctx);
         if let (Some(activity_rect), Some(explorer_rect)) = (activity_rect, explorer_rect) {
@@ -9345,7 +9301,12 @@ fn styled_icon_button(
     response.clicked()
 }
 
-fn styled_icon_toggle(ui: &mut Ui, selected: bool, icon: AppIcon, tooltip: &str) -> bool {
+fn activity_rail_icon_button(
+    ui: &mut Ui,
+    selected: bool,
+    icon: AppIcon,
+    tooltip: &str,
+) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT),
         Sense::click(),
@@ -9372,7 +9333,19 @@ fn styled_icon_toggle(ui: &mut Ui, selected: bool, icon: AppIcon, tooltip: &str)
         icon_color,
     );
 
-    response.clicked()
+    response
+}
+
+fn paint_activity_rail_warning_badge(ui: &Ui, button_rect: egui::Rect) {
+    let center = egui::pos2(button_rect.right() - 6.0, button_rect.top() + 6.0);
+    ui.painter()
+        .circle_filled(center, 4.0, Color32::from_rgb(232, 184, 76));
+    ui.painter()
+        .circle_stroke(center, 4.0, Stroke::new(1.0, SURFACE_BG));
+}
+
+fn styled_icon_toggle(ui: &mut Ui, selected: bool, icon: AppIcon, tooltip: &str) -> bool {
+    activity_rail_icon_button(ui, selected, icon, tooltip).clicked()
 }
 
 fn resolve_ctrl_c_action(can_copy_selection: bool) -> CtrlCAction {
@@ -15886,6 +15859,23 @@ mod tests {
         app
     }
 
+    fn shape_contains_filled_circle(shape: &egui::epaint::Shape, fill: Color32) -> bool {
+        match shape {
+            egui::epaint::Shape::Circle(circle) => circle.fill == fill,
+            egui::epaint::Shape::Vec(shapes) => shapes
+                .iter()
+                .any(|shape| shape_contains_filled_circle(shape, fill)),
+            _ => false,
+        }
+    }
+
+    fn frame_contains_filled_circle(output: &egui::FullOutput, fill: Color32) -> bool {
+        output
+            .shapes
+            .iter()
+            .any(|shape| shape_contains_filled_circle(&shape.shape, fill))
+    }
+
     fn snapshot_codex_launch_baseline(
         app: &AdeApp,
         terminal_id: u64,
@@ -16971,6 +16961,65 @@ mod tests {
     }
 
     #[test]
+    fn activity_rail_stays_available_when_project_explorer_is_hidden() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let mut app = test_app([], None);
+        app.config.ui.show_project_explorer = false;
+
+        let mut activity_rect = None;
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            activity_rect = app.draw_activity_rail(ctx);
+        });
+
+        assert_eq!(
+            activity_rect.map(|rect| rect.width()),
+            Some(super::ACTIVITY_RAIL_WIDTH)
+        );
+    }
+
+    #[test]
+    fn activity_rail_paints_settings_warning_badge_when_diagnostics_warn() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let mut app = test_app_with_ai_hooks([], None);
+        app.factory_droid_hooks_dir_error = Some("Access denied".to_owned());
+        app.factory_droid_managed_install_diagnostics =
+            Some(test_factory_droid_managed_install_diagnostics());
+        app.factory_droid_managed_install_last_refresh_at = Some(Instant::now());
+
+        let output = ctx.run(RawInput::default(), |ctx| {
+            app.draw_activity_rail(ctx);
+        });
+
+        assert!(frame_contains_filled_circle(
+            &output,
+            Color32::from_rgb(232, 184, 76)
+        ));
+    }
+
+    #[test]
+    fn main_area_size_from_chrome_uses_full_height_without_top_bar() {
+        let app = test_app([], None);
+
+        let main_area_size = app.main_area_size_from_chrome(
+            egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(1600.0, 900.0)),
+            Some(egui::Rect::from_min_size(
+                pos2(0.0, 0.0),
+                egui::vec2(super::ACTIVITY_RAIL_WIDTH, 900.0),
+            )),
+            Some(egui::Rect::from_min_size(
+                pos2(super::ACTIVITY_RAIL_WIDTH, 0.0),
+                egui::vec2(super::PROJECT_EXPLORER_WIDTH, 900.0),
+            )),
+        );
+
+        assert_eq!(main_area_size, egui::vec2(1200.0, 900.0));
+    }
+
+    #[test]
     fn draw_terminal_status_badges_does_not_leave_leading_gap_when_ai_is_inactive() {
         let ctx = Context::default();
         ctx.set_fonts(FontDefinitions::default());
@@ -17028,6 +17077,8 @@ mod tests {
         assert_eq!(diagnostics.last_status_source_text(), "prompt_submit");
         assert_eq!(diagnostics.warning_badge_text(), None);
         assert_eq!(diagnostics.warning_message(), None);
+        assert_eq!(diagnostics.settings_tooltip_text(), "Settings");
+        assert!(!diagnostics.shows_settings_warning_badge());
     }
 
     #[test]
@@ -17058,6 +17109,11 @@ mod tests {
             diagnostics.warning_message(),
             Some("Factory Droid inbox fallback unavailable: Access denied".to_owned())
         );
+        assert_eq!(
+            diagnostics.settings_tooltip_text(),
+            "Settings\n\nFactory Droid inbox fallback unavailable: Access denied"
+        );
+        assert!(diagnostics.shows_settings_warning_badge());
     }
 
     #[test]
@@ -17076,6 +17132,8 @@ mod tests {
         assert_eq!(diagnostics.runtime_status_text(), "Disabled");
         assert_eq!(diagnostics.warning_badge_text(), None);
         assert_eq!(diagnostics.warning_message(), None);
+        assert_eq!(diagnostics.settings_tooltip_text(), "Settings");
+        assert!(!diagnostics.shows_settings_warning_badge());
     }
 
     #[test]
@@ -17178,6 +17236,7 @@ mod tests {
                 "Managed settings: Legacy -File launcher for Stop. Rerun `powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\install-factory-droid-hooks.ps1`, then restart Droid.".to_owned()
             )
         );
+        assert!(diagnostics.shows_settings_warning_badge());
     }
 
     #[test]
