@@ -120,10 +120,13 @@ const SETTINGS_WINDOW_STACK_BREAKPOINT: f32 = 680.0;
 const SETTINGS_DIAGNOSTICS_SINGLE_COLUMN_BREAKPOINT: f32 = 560.0;
 const SETTINGS_GENERAL_STACK_BREAKPOINT: f32 = 480.0;
 const SETTINGS_SAVED_MESSAGES_COMPACT_BREAKPOINT: f32 = 520.0;
-const SETTINGS_SAVED_MESSAGE_CHIP_MAX_WIDTH: f32 = 320.0;
+const SETTINGS_SAVED_MESSAGE_ACTIONS_GAP: f32 = 8.0;
+const SETTINGS_SAVED_MESSAGE_CARD_MARGIN: f32 = 10.0;
 const SETTINGS_SAVED_MESSAGE_TEXT_SIZE: f32 = 14.0;
+const SETTINGS_SAVED_MESSAGES_SECTION_TOP_GAP: f32 = 16.0;
+const SETTINGS_SAVED_MESSAGES_DISCLOSURE_Y_OFFSET: f32 = 2.5;
+const SETTINGS_SAVED_MESSAGES_PROJECT_ICON_GAP: f32 = 6.0;
 const SETTINGS_NAV_ROW_HEIGHT: f32 = 34.0;
-const SETTINGS_NAV_ICON_GAP: f32 = 8.0;
 // Pill button palette
 const BTN_BLUE: Color32 = Color32::from_rgb(16, 64, 112);
 const BTN_BLUE_HOVER: Color32 = Color32::from_rgb(48, 48, 48);
@@ -889,6 +892,14 @@ struct TerminalManagerTitleSummaryLayout {
     diff_summary_rect: egui::Rect,
 }
 
+#[derive(Clone, Copy)]
+struct SettingsSavedMessagesProjectHeaderLayout {
+    disclosure_rect: egui::Rect,
+    folder_icon_rect: egui::Rect,
+    title_rect: egui::Rect,
+    count_rect: egui::Rect,
+}
+
 fn draw_terminal_status_badges(ui: &mut Ui, ai_badge: &AiBadgeModel) -> TerminalStatusBadgeLayout {
     let ai_response = ai_badge_visual(ai_badge.status).map(|_| draw_ai_badge(ui, ai_badge));
     #[cfg(test)]
@@ -969,7 +980,7 @@ impl SettingsSection {
     const fn navigation_title(self) -> &'static str {
         match self {
             Self::General => "General",
-            Self::SavedMessages => "Prompts",
+            Self::SavedMessages => "Saved Messages",
             Self::Diagnostics => "Diagnostics",
         }
     }
@@ -978,7 +989,7 @@ impl SettingsSection {
         match self {
             Self::General => "Adjust terminal defaults and layout behavior for the workspace.",
             Self::SavedMessages => {
-                "Manage reusable prompts per project and send them to active terminals."
+                "Manage saved messages per project and send them to active terminals."
             }
             Self::Diagnostics => {
                 "Inspect Factory Droid and Codex CLI wiring, health, and runtime signals."
@@ -5037,52 +5048,13 @@ impl AdeApp {
             let response = response.on_hover_text(section.description());
             let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
             let is_interacting = response.hovered() || response.is_pointer_button_down_on();
-            let fill = if is_selected {
-                Some(with_alpha(BTN_ICON_ACTIVE, 40))
-            } else if is_interacting {
-                Some(with_alpha(BTN_ICON_HOVER, 96))
-            } else {
-                None
-            };
-            let stroke = if is_selected {
-                Stroke::new(1.0, with_alpha(BTN_ICON_ACTIVE, 168))
-            } else if is_interacting {
-                Stroke::new(1.0, with_alpha(BORDER_COLOR, 188))
-            } else {
-                Stroke::NONE
-            };
-            let paint_rect = rect.shrink2(egui::vec2(1.0, 1.0));
-            if let Some(fill) = fill {
-                ui.painter().rect_filled(paint_rect, 8.0, fill);
-            }
-            if stroke != Stroke::NONE {
-                ui.painter().rect_stroke(paint_rect, 8.0, stroke);
-            }
-            let icon_color = if is_selected || is_interacting {
-                Color32::from_rgb(255, 255, 255)
-            } else {
-                with_alpha(TEXT_PRIMARY, 176)
-            };
-            let text_color = if is_selected || is_interacting {
-                TEXT_PRIMARY
-            } else {
-                with_alpha(TEXT_PRIMARY, 188)
-            };
-            let icon_center = egui::pos2(rect.left() + 14.0, rect.center().y);
+            let text_style = settings_navigation_label_style(is_selected, is_interacting);
             ui.painter().text(
-                icon_center,
-                egui::Align2::CENTER_CENTER,
-                format!("{}", section.icon()),
-                egui::FontId::proportional(14.0),
-                icon_color,
-            );
-            let text_pos = egui::pos2(icon_center.x + SETTINGS_NAV_ICON_GAP, rect.center().y);
-            ui.painter().text(
-                text_pos,
+                egui::pos2(rect.left() + SIDEBAR_ROW_LEADING_INSET, rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 section.navigation_title(),
-                egui::FontId::proportional(13.0),
-                text_color,
+                text_style.font_id,
+                text_style.color,
             );
             if section == SettingsSection::Diagnostics && shows_diagnostics_warning_badge {
                 paint_activity_rail_warning_badge(ui, rect);
@@ -5090,7 +5062,7 @@ impl AdeApp {
             if response.clicked() {
                 self.active_settings_section = section;
             }
-            ui.add_space(6.0);
+            ui.add_space(2.0);
         }
     }
 
@@ -5100,7 +5072,7 @@ impl AdeApp {
         shows_diagnostics_warning_badge: bool,
         fill_height: Option<f32>,
     ) {
-        settings_surface_frame(with_alpha(SURFACE_BG_SOFT, 200), 10.0).show(ui, |ui| {
+        ui.scope(|ui| {
             if let Some(fill_height) = fill_height {
                 ui.allocate_ui_with_layout(
                     egui::vec2(ui.available_width().max(0.0), fill_height.max(0.0)),
@@ -5315,12 +5287,12 @@ impl AdeApp {
 
         ui.label(
             RichText::new(
-                "Saved prompts stay grouped by project and can be sent to any live terminal in that workspace.",
+                "Saved messages stay grouped by project and can be sent to any live terminal in that workspace.",
             )
                 .small()
                 .color(TEXT_MUTED),
         );
-        ui.add_space(10.0);
+        ui.add_space(SETTINGS_SAVED_MESSAGES_SECTION_TOP_GAP);
 
         for project_id in project_ids {
             let Some(project_snapshot) = self.projects.get(&project_id).cloned() else {
@@ -5333,48 +5305,34 @@ impl AdeApp {
             let send_target_terminal = self.preferred_terminal_for_project(project_id);
             let message_count = project_snapshot.saved_messages.len();
             let message_count_text = format!(
-                "{} saved prompt{}",
+                "{} saved message{}",
                 message_count,
                 if message_count == 1 { "" } else { "s" }
             );
 
             settings_surface_frame(with_alpha(SURFACE_BG_SOFT, 228), 12.0).show(ui, |ui| {
-                let project_state =
+                let mut project_state =
                     egui::collapsing_header::CollapsingState::load_with_default_open(
                         ui.ctx(),
                         settings_saved_messages_project_state_id(project_id),
                         self.selected_project == Some(project_id),
                     );
-                let _ = project_state
-                    .show_header(ui, |ui| {
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width().max(0.0), CONTROL_ROW_HEIGHT),
-                            Layout::left_to_right(Align::Center),
-                            |ui| {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{} {}",
-                                        icons::FOLDER_OPEN,
-                                        project_snapshot.name
-                                    ))
-                                    .strong()
-                                    .size(15.0)
-                                    .color(TEXT_PRIMARY),
-                                );
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    ui.label(
-                                        RichText::new(&message_count_text).small().color(TEXT_MUTED),
-                                    );
-                                });
-                            },
-                        );
-                    })
-                    .body(|ui| {
+                let header_response = draw_settings_saved_messages_project_header(
+                    ui,
+                    &project_snapshot.name,
+                    &message_count_text,
+                    project_state.openness(ui.ctx()),
+                );
+                if header_response.clicked() {
+                    project_state.toggle(ui);
+                    project_state.store(ui.ctx());
+                }
+                let _ = project_state.show_body_indented(&header_response, ui, |ui| {
                         ui.add_space(8.0);
 
                         if project_snapshot.saved_messages.is_empty() {
                             ui.label(
-                                RichText::new("No saved prompts for this project.")
+                                RichText::new("No saved messages for this project.")
                                     .small()
                                     .color(TEXT_MUTED),
                             );
@@ -5382,7 +5340,7 @@ impl AdeApp {
                             if send_target_terminal.is_none() {
                                 ui.label(
                                     RichText::new(
-                                        "Open a live terminal in this project to send prompts one by one.",
+                                        "Open a live terminal in this project to send saved messages one by one.",
                                     )
                                     .small()
                                     .color(TEXT_MUTED),
@@ -5390,18 +5348,18 @@ impl AdeApp {
                                 ui.add_space(8.0);
                             }
 
-                            let chip_max_width =
-                                settings_saved_message_chip_max_width(ui.available_width());
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                            let card_width =
+                                settings_saved_message_card_width(ui.available_width());
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(0.0, 8.0);
                                 for (index, message) in
                                     project_snapshot.saved_messages.iter().enumerate()
                                 {
                                     let (send_clicked, remove_clicked) =
-                                        draw_settings_saved_message_chip(
+                                        draw_settings_saved_message_card(
                                             ui,
                                             message,
-                                            chip_max_width,
+                                            card_width,
                                             send_target_terminal.is_some(),
                                         );
                                     if send_clicked {
@@ -5420,13 +5378,15 @@ impl AdeApp {
                         let draft = self.saved_message_drafts.entry(project_id).or_default();
                         if stack_draft_row {
                             let input_width = ui.available_width().max(0.0);
-                            ui.add_sized(
-                                [input_width, CONTROL_ROW_HEIGHT],
-                                egui::TextEdit::singleline(draft)
-                                    .hint_text("Save a reusable prompt for this project")
-                                    .id(Self::saved_message_draft_input_id(project_id))
-                                    .desired_width(input_width),
-                            );
+                            with_settings_text_edit_chrome(ui, |ui| {
+                                ui.add_sized(
+                                    [input_width, CONTROL_ROW_HEIGHT],
+                                    egui::TextEdit::singleline(draft)
+                                        .hint_text("Add a saved message for this project")
+                                        .id(Self::saved_message_draft_input_id(project_id))
+                                        .desired_width(input_width),
+                                );
+                            });
                             ui.add_space(8.0);
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if styled_icon_button(
@@ -5448,13 +5408,15 @@ impl AdeApp {
                             ui.horizontal(|ui| {
                                 let button_space = CONTROL_ROW_HEIGHT + ui.spacing().item_spacing.x;
                                 let input_width = (ui.available_width() - button_space).max(0.0);
-                                ui.add_sized(
-                                    [input_width, CONTROL_ROW_HEIGHT],
-                                    egui::TextEdit::singleline(draft)
-                                        .hint_text("Save a reusable prompt for this project")
-                                        .id(Self::saved_message_draft_input_id(project_id))
-                                        .desired_width(input_width),
-                                );
+                                with_settings_text_edit_chrome(ui, |ui| {
+                                    ui.add_sized(
+                                        [input_width, CONTROL_ROW_HEIGHT],
+                                        egui::TextEdit::singleline(draft)
+                                            .hint_text("Add a saved message for this project")
+                                            .id(Self::saved_message_draft_input_id(project_id))
+                                            .desired_width(input_width),
+                                    );
+                                });
                                 if styled_icon_button(
                                     ui,
                                     icons::PLUS,
@@ -7687,7 +7649,7 @@ impl AdeApp {
                         .color(TEXT_PRIMARY),
                 );
                 ui.label(
-                    RichText::new("Workspace defaults, saved prompts, and diagnostics.")
+                    RichText::new("Workspace defaults, saved messages, and diagnostics.")
                         .small()
                         .color(TEXT_MUTED),
                 );
@@ -9143,6 +9105,19 @@ struct TerminalManagerRowChrome {
     title_color: Color32,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct SettingsNavigationLabelStyle {
+    color: Color32,
+    font_id: egui::FontId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SettingsTextEditChrome {
+    fill: Color32,
+    stroke: Stroke,
+    focus_stroke: Stroke,
+}
+
 fn terminal_header_chrome(is_active: bool) -> TerminalHeaderChrome {
     if is_active {
         TerminalHeaderChrome {
@@ -9181,6 +9156,59 @@ fn terminal_manager_row_chrome(is_active: bool, is_hovered: bool) -> TerminalMan
             title_color: with_alpha(TEXT_PRIMARY, 210),
         }
     }
+}
+
+fn settings_navigation_label_style(
+    is_selected: bool,
+    is_interacting: bool,
+) -> SettingsNavigationLabelStyle {
+    if is_selected {
+        SettingsNavigationLabelStyle {
+            color: TEXT_PRIMARY,
+            font_id: egui::FontId::proportional(13.5),
+        }
+    } else if is_interacting {
+        SettingsNavigationLabelStyle {
+            color: with_alpha(TEXT_PRIMARY, 220),
+            font_id: egui::FontId::proportional(13.0),
+        }
+    } else {
+        SettingsNavigationLabelStyle {
+            color: TEXT_MUTED,
+            font_id: egui::FontId::proportional(13.0),
+        }
+    }
+}
+
+fn settings_text_edit_chrome() -> SettingsTextEditChrome {
+    SettingsTextEditChrome {
+        fill: with_alpha(SURFACE_BG, 236),
+        stroke: Stroke::new(1.0, with_alpha(Color32::from_rgb(92, 92, 92), 230)),
+        focus_stroke: Stroke::new(1.0, with_alpha(Color32::from_rgb(110, 110, 110), 230)),
+    }
+}
+
+fn with_settings_text_edit_chrome<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    let chrome = settings_text_edit_chrome();
+    ui.scope(|ui| {
+        let style = ui.style_mut();
+        style.visuals.extreme_bg_color = chrome.fill;
+        style.visuals.selection.stroke = chrome.focus_stroke;
+        style.visuals.widgets.inactive.bg_fill = chrome.fill;
+        style.visuals.widgets.inactive.weak_bg_fill = chrome.fill;
+        style.visuals.widgets.inactive.bg_stroke = chrome.stroke;
+        style.visuals.widgets.hovered.bg_fill = chrome.fill;
+        style.visuals.widgets.hovered.weak_bg_fill = chrome.fill;
+        style.visuals.widgets.hovered.bg_stroke = chrome.focus_stroke;
+        style.visuals.widgets.active.bg_fill = chrome.fill;
+        style.visuals.widgets.active.weak_bg_fill = chrome.fill;
+        style.visuals.widgets.active.bg_stroke = chrome.focus_stroke;
+        style.visuals.widgets.open.bg_fill = chrome.fill;
+        style.visuals.widgets.open.weak_bg_fill = chrome.fill;
+        style.visuals.widgets.open.bg_stroke = chrome.focus_stroke;
+        add_contents(ui)
+    })
+    .inner
 }
 
 fn capped_hover_text(text: &str, max_chars: usize) -> String {
@@ -10062,9 +10090,196 @@ fn settings_saved_messages_stacks_draft_row(available_width: f32) -> bool {
     available_width < SETTINGS_SAVED_MESSAGES_COMPACT_BREAKPOINT
 }
 
-fn settings_saved_message_chip_max_width(available_width: f32) -> f32 {
-    available_width
-        .min(SETTINGS_SAVED_MESSAGE_CHIP_MAX_WIDTH)
+fn settings_saved_messages_project_header_layout(
+    row_rect: egui::Rect,
+    disclosure_width: f32,
+    count_width: f32,
+    section_gap: f32,
+) -> SettingsSavedMessagesProjectHeaderLayout {
+    let safe_disclosure_width = disclosure_width.clamp(0.0, row_rect.width());
+    let remaining_width = (row_rect.width() - safe_disclosure_width).max(0.0);
+    let safe_count_width = count_width.clamp(0.0, remaining_width);
+    let count_gap = if safe_count_width > 0.0 {
+        section_gap.min((remaining_width - safe_count_width).max(0.0))
+    } else {
+        0.0
+    };
+    let content_width = (remaining_width - safe_count_width - count_gap).max(0.0);
+    let disclosure_rect = egui::Rect::from_min_size(
+        row_rect.min,
+        egui::vec2(safe_disclosure_width, row_rect.height()),
+    );
+    let icon_width = CONTROL_ROW_HEIGHT.min(content_width);
+    let icon_gap =
+        SETTINGS_SAVED_MESSAGES_PROJECT_ICON_GAP.min((content_width - icon_width).max(0.0));
+    let title_width = (content_width - icon_width - icon_gap).max(0.0);
+    let content_rect = egui::Rect::from_min_size(
+        egui::pos2(disclosure_rect.right(), row_rect.top()),
+        egui::vec2(content_width, row_rect.height()),
+    );
+    let folder_icon_rect = egui::Rect::from_min_size(
+        content_rect.min,
+        egui::vec2(icon_width, content_rect.height()),
+    );
+    let title_rect = egui::Rect::from_min_size(
+        egui::pos2(folder_icon_rect.right() + icon_gap, content_rect.top()),
+        egui::vec2(title_width, content_rect.height()),
+    );
+    let count_rect = egui::Rect::from_min_size(
+        egui::pos2(content_rect.right() + count_gap, row_rect.top()),
+        egui::vec2(safe_count_width, row_rect.height()),
+    );
+
+    SettingsSavedMessagesProjectHeaderLayout {
+        disclosure_rect,
+        folder_icon_rect,
+        title_rect,
+        count_rect,
+    }
+}
+
+fn settings_saved_messages_disclosure_icon_rect(disclosure_rect: egui::Rect) -> egui::Rect {
+    let icon_size = disclosure_rect
+        .width()
+        .min(disclosure_rect.height())
+        .min(10.0);
+    egui::Rect::from_center_size(
+        egui::pos2(
+            disclosure_rect.center().x,
+            disclosure_rect.center().y + SETTINGS_SAVED_MESSAGES_DISCLOSURE_Y_OFFSET,
+        ),
+        egui::vec2(icon_size, icon_size),
+    )
+}
+
+fn paint_settings_saved_messages_disclosure_icon(
+    ui: &mut Ui,
+    disclosure_rect: egui::Rect,
+    openness: f32,
+    response: &egui::Response,
+) {
+    let visuals = ui.style().interact(response);
+    let rect = settings_saved_messages_disclosure_icon_rect(disclosure_rect);
+    let rect = egui::Rect::from_center_size(rect.center(), rect.size() * 0.75);
+    let rect = rect.expand(visuals.expansion);
+    let mut points = vec![rect.left_top(), rect.right_top(), rect.center_bottom()];
+    let rotation = egui::emath::Rot2::from_angle(egui::remap(
+        openness,
+        0.0..=1.0,
+        -std::f32::consts::FRAC_PI_2..=0.0,
+    ));
+    for point in &mut points {
+        *point = rect.center() + rotation * (*point - rect.center());
+    }
+
+    ui.painter().add(egui::Shape::convex_polygon(
+        points,
+        visuals.fg_stroke.color,
+        Stroke::NONE,
+    ));
+}
+
+fn draw_settings_saved_messages_project_header(
+    ui: &mut Ui,
+    project_name: &str,
+    message_count_text: &str,
+    openness: f32,
+) -> egui::Response {
+    let row_width = ui.available_width().max(0.0);
+    let (row_rect, response) =
+        ui.allocate_exact_size(egui::vec2(row_width, CONTROL_ROW_HEIGHT), Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let count_galley =
+        WidgetText::from(RichText::new(message_count_text).small().color(TEXT_MUTED)).into_galley(
+            ui,
+            Some(TextWrapMode::Truncate),
+            row_width,
+            egui::TextStyle::Small,
+        );
+    let layout = settings_saved_messages_project_header_layout(
+        row_rect,
+        ui.spacing().indent,
+        count_galley.size().x.ceil(),
+        ui.spacing().item_spacing.x,
+    );
+
+    if !ui.is_rect_visible(row_rect) {
+        return response;
+    }
+
+    if layout.disclosure_rect.width() > 0.0 {
+        paint_settings_saved_messages_disclosure_icon(
+            ui,
+            layout.disclosure_rect,
+            openness,
+            &response,
+        );
+    }
+
+    if layout.folder_icon_rect.width() > 0.0 {
+        ui.painter().text(
+            layout.folder_icon_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{}", icons::FOLDER_OPEN),
+            egui::FontId::proportional(15.0),
+            TEXT_PRIMARY,
+        );
+    }
+
+    if layout.title_rect.width() > 0.0 {
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(layout.title_rect)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                let title_response = ui.add(
+                    egui::Label::new(
+                        RichText::new(project_name)
+                            .strong()
+                            .size(15.0)
+                            .color(TEXT_PRIMARY),
+                    )
+                    .truncate(),
+                );
+                let title_font = egui::TextStyle::Body.resolve(ui.style());
+                let _ = with_truncation_tooltip(
+                    ui,
+                    title_response,
+                    project_name,
+                    &title_font,
+                    TEXT_PRIMARY,
+                    layout.title_rect.width(),
+                );
+            },
+        );
+    }
+
+    if layout.count_rect.width() > 0.0 {
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(layout.count_rect)
+                .layout(Layout::right_to_left(Align::Center)),
+            |ui| {
+                ui.add(
+                    egui::Label::new(RichText::new(message_count_text).small().color(TEXT_MUTED))
+                        .truncate(),
+                );
+            },
+        );
+    }
+
+    response
+}
+
+fn settings_saved_message_card_width(available_width: f32) -> f32 {
+    available_width.max(0.0)
+}
+
+fn settings_saved_message_text_width(card_width: f32) -> f32 {
+    (card_width
+        - CONTROL_ROW_HEIGHT
+        - SETTINGS_SAVED_MESSAGE_ACTIONS_GAP
+        - (SETTINGS_SAVED_MESSAGE_CARD_MARGIN * 2.0))
         .max(0.0)
 }
 
@@ -10072,27 +10287,35 @@ fn settings_saved_messages_project_state_id(project_id: u64) -> Id {
     Id::new(("settings-saved-messages-project", project_id))
 }
 
-fn draw_settings_saved_message_chip(
+fn draw_settings_saved_message_card(
     ui: &mut Ui,
     message: &str,
-    chip_max_width: f32,
+    card_width: f32,
     show_send_action: bool,
 ) -> (bool, bool) {
     let mut send_clicked = false;
     let mut remove_clicked = false;
-    settings_surface_frame(with_alpha(SURFACE_BG, 188), 10.0).show(ui, |ui| {
-        ui.set_min_width(0.0);
-        ui.set_max_width(chip_max_width);
-        ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
-        ui.add(
-            egui::Label::new(
-                RichText::new(message)
-                    .size(SETTINGS_SAVED_MESSAGE_TEXT_SIZE)
-                    .color(TEXT_PRIMARY),
-            )
-            .wrap(),
-        );
-        ui.horizontal(|ui| {
+    let text_width = settings_saved_message_text_width(card_width);
+    ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
+        ui.spacing_mut().item_spacing.x = SETTINGS_SAVED_MESSAGE_ACTIONS_GAP;
+        settings_surface_frame(
+            with_alpha(SURFACE_BG, 188),
+            SETTINGS_SAVED_MESSAGE_CARD_MARGIN,
+        )
+        .show(ui, |ui| {
+            ui.set_min_width(text_width);
+            ui.set_max_width(text_width);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(message)
+                        .size(SETTINGS_SAVED_MESSAGE_TEXT_SIZE)
+                        .color(TEXT_PRIMARY),
+                )
+                .wrap(),
+            );
+        });
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 6.0);
             if show_send_action
                 && styled_icon_button(
                     ui,
@@ -10100,7 +10323,7 @@ fn draw_settings_saved_message_chip(
                     BTN_BLUE,
                     BTN_BLUE_HOVER,
                     BTN_ICON_ACTIVE,
-                    "Send prompt",
+                    "Send saved message",
                 )
             {
                 send_clicked = true;
@@ -10111,7 +10334,7 @@ fn draw_settings_saved_message_chip(
                 BTN_RED,
                 BTN_RED_HOVER,
                 Color32::from_rgb(186, 58, 58),
-                "Remove prompt",
+                "Remove saved message",
             ) {
                 remove_clicked = true;
             }
@@ -11004,8 +11227,10 @@ mod tests {
         normalize_terminal_background, parse_branch_header, parse_git_numstat_totals,
         recent_inputs_tooltip_text, recover_config_state, resolve_ctrl_c_action,
         settings_diagnostics_uses_single_column, settings_general_uses_stacked_layout,
-        settings_popup_uses_stacked_layout, settings_saved_message_chip_max_width,
-        settings_saved_messages_project_state_id, settings_saved_messages_stacks_draft_row,
+        settings_popup_uses_stacked_layout, settings_saved_message_card_width,
+        settings_saved_message_text_width, settings_saved_messages_disclosure_icon_rect,
+        settings_saved_messages_project_header_layout, settings_saved_messages_project_state_id,
+        settings_saved_messages_stacks_draft_row, settings_text_edit_chrome,
         settings_window_size_for_screen, should_resolve_terminal_link, source_control_badge_color,
         source_control_tooltip_lines, terminal_cell_metric, terminal_cursor_blink_phase_visible,
         terminal_cursor_overlay_rect, terminal_font_family, terminal_font_id,
@@ -11016,8 +11241,8 @@ mod tests {
         terminal_manager_row_widths, terminal_output_surface_size, terminal_output_viewport_size,
         terminal_secondary_click_action, terminal_selection_point_from_pointer,
         terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
-        AdeApp, AiBadgeModel, AiBadgeVisual, CodexCliStatusSource, CtrlCAction,
-        DirectoryIndexSnapshot, DirectoryNode, FactoryDroidHookInboxEvent,
+        with_settings_text_edit_chrome, AdeApp, AiBadgeModel, AiBadgeVisual, CodexCliStatusSource,
+        CtrlCAction, DirectoryIndexSnapshot, DirectoryNode, FactoryDroidHookInboxEvent,
         FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
         FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, PendingConfigChanges,
         PendingTerminalLinkClick, SettingsSection, SourceControlBadgeState, SourceControlFile,
@@ -11653,21 +11878,122 @@ mod tests {
     }
 
     #[test]
-    fn settings_saved_messages_layout_switches_to_compact_rows_when_space_is_narrow() {
-        assert!(settings_saved_messages_stacks_draft_row(519.0));
-        assert!(!settings_saved_messages_stacks_draft_row(520.0));
+    fn settings_saved_message_cards_use_full_available_width() {
+        assert_eq!(settings_saved_message_card_width(-12.0), 0.0);
+        assert_eq!(settings_saved_message_card_width(280.0), 280.0);
+        assert_eq!(settings_saved_message_card_width(480.0), 480.0);
     }
 
     #[test]
-    fn settings_saved_message_chip_width_clamps_to_available_space() {
-        assert_eq!(settings_saved_message_chip_max_width(280.0), 280.0);
-        assert_eq!(settings_saved_message_chip_max_width(480.0), 320.0);
+    fn settings_saved_messages_section_top_gap_adds_extra_breathing_room() {
+        assert_eq!(super::SETTINGS_SAVED_MESSAGES_SECTION_TOP_GAP, 16.0);
     }
 
     #[test]
-    fn settings_navigation_uses_compact_saved_messages_label() {
+    fn settings_saved_message_text_width_reserves_space_for_right_actions() {
+        assert_eq!(settings_saved_message_text_width(0.0), 0.0);
+        assert_eq!(
+            settings_saved_message_text_width(280.0),
+            280.0
+                - super::CONTROL_ROW_HEIGHT
+                - super::SETTINGS_SAVED_MESSAGE_ACTIONS_GAP
+                - (super::SETTINGS_SAVED_MESSAGE_CARD_MARGIN * 2.0)
+        );
+    }
+
+    #[test]
+    fn settings_saved_messages_header_layout_keeps_icon_title_and_count_centered() {
+        let row_rect = egui::Rect::from_min_size(
+            pos2(16.0, 24.0),
+            egui::vec2(240.0, super::CONTROL_ROW_HEIGHT),
+        );
+        let layout = settings_saved_messages_project_header_layout(row_rect, 18.0, 72.0, 8.0);
+
+        assert_eq!(layout.disclosure_rect.center().y, row_rect.center().y);
+        assert_eq!(layout.folder_icon_rect.center().y, row_rect.center().y);
+        assert_eq!(layout.title_rect.center().y, row_rect.center().y);
+        assert_eq!(layout.count_rect.center().y, row_rect.center().y);
+        assert_eq!(layout.folder_icon_rect.min.x, layout.disclosure_rect.max.x);
+        assert_eq!(
+            layout.title_rect.min.x,
+            layout.folder_icon_rect.max.x + super::SETTINGS_SAVED_MESSAGES_PROJECT_ICON_GAP
+        );
+        assert!(layout.title_rect.max.x <= layout.count_rect.min.x);
+    }
+
+    #[test]
+    fn settings_saved_messages_header_layout_clamps_without_overlap_when_narrow() {
+        let row_rect =
+            egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(84.0, super::CONTROL_ROW_HEIGHT));
+        let layout = settings_saved_messages_project_header_layout(row_rect, 18.0, 80.0, 8.0);
+
+        assert!(layout.title_rect.width() == 0.0);
+        assert!(layout.folder_icon_rect.max.x <= layout.count_rect.min.x);
+        assert!(layout.count_rect.max.x <= row_rect.max.x);
+    }
+
+    #[test]
+    fn settings_saved_messages_disclosure_icon_rect_sits_below_slot_center() {
+        let disclosure_rect =
+            egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(18.0, super::CONTROL_ROW_HEIGHT));
+        let icon_rect = settings_saved_messages_disclosure_icon_rect(disclosure_rect);
+
+        assert_eq!(icon_rect.center().x, disclosure_rect.center().x);
+        assert_eq!(
+            icon_rect.center().y,
+            disclosure_rect.center().y + super::SETTINGS_SAVED_MESSAGES_DISCLOSURE_Y_OFFSET
+        );
+    }
+
+    #[test]
+    fn settings_text_edit_chrome_matches_surface_theme() {
+        let chrome = settings_text_edit_chrome();
+
+        assert_eq!(chrome.fill, super::with_alpha(super::SURFACE_BG, 236));
+        assert_eq!(
+            chrome.stroke,
+            Stroke::new(1.0, super::with_alpha(Color32::from_rgb(92, 92, 92), 230))
+        );
+        assert_eq!(
+            chrome.focus_stroke,
+            Stroke::new(
+                1.0,
+                super::with_alpha(Color32::from_rgb(110, 110, 110), 230)
+            )
+        );
+    }
+
+    #[test]
+    fn with_settings_text_edit_chrome_overrides_actual_text_edit_visuals() {
+        let ctx = Context::default();
+        let mut observed = None;
+
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                with_settings_text_edit_chrome(ui, |ui| {
+                    observed = Some((ui.visuals().extreme_bg_color, ui.visuals().selection.stroke));
+                });
+            });
+        });
+
+        let (fill, focus_stroke) = observed.expect("expected settings text edit visuals");
+        assert_eq!(fill, super::with_alpha(super::SURFACE_BG, 236));
+        assert_eq!(
+            focus_stroke,
+            Stroke::new(
+                1.0,
+                super::with_alpha(Color32::from_rgb(110, 110, 110), 230)
+            )
+        );
+    }
+
+    #[test]
+    fn settings_navigation_uses_saved_messages_label() {
         assert_eq!(SettingsSection::General.navigation_title(), "General");
-        assert_eq!(SettingsSection::SavedMessages.navigation_title(), "Prompts");
+        assert_eq!(
+            SettingsSection::SavedMessages.navigation_title(),
+            "Saved Messages"
+        );
         assert_eq!(
             SettingsSection::Diagnostics.navigation_title(),
             "Diagnostics"
@@ -18142,6 +18468,25 @@ mod tests {
             chrome.title_color,
             super::with_alpha(super::TEXT_PRIMARY, 210)
         );
+    }
+
+    #[test]
+    fn settings_navigation_row_chrome_uses_neutral_active_state() {
+        let style = super::settings_navigation_label_style(true, false);
+
+        assert_eq!(style.color, super::TEXT_PRIMARY);
+        assert_eq!(style.font_id, egui::FontId::proportional(13.5));
+    }
+
+    #[test]
+    fn settings_navigation_row_chrome_keeps_hover_state_theme_neutral() {
+        let hovered = super::settings_navigation_label_style(false, true);
+        let idle = super::settings_navigation_label_style(false, false);
+
+        assert_eq!(hovered.color, super::with_alpha(super::TEXT_PRIMARY, 220));
+        assert_eq!(hovered.font_id, egui::FontId::proportional(13.0));
+        assert_eq!(idle.color, super::TEXT_MUTED);
+        assert_eq!(idle.font_id, egui::FontId::proportional(13.0));
     }
 
     #[test]

@@ -1,5 +1,198 @@
 ### Known Issues & Fix Log
 
+#### Settings saved message draft input now reads as an actual field again without leaving the theme palette {#settings-saved-message-draft-input-now-reads-as-an-actual-field-again-without-leaving-the-theme-palette}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Settings modal saved messages section
+- Error signature: `After the Saved Messages draft input was recolored to match the theme black, it blended too far into the surrounding card and no longer read clearly as an editable field.`
+- Symptoms/Impact: The add-message row looked flat, users could miss that the left area was an input, and the section lost a basic affordance cue even though the color family was technically correct.
+- Root cause: The local text-edit fill and border were too close to the surrounding Saved Messages section surface, so the field no longer had enough separation to read as a control.
+- Resolution:
+  - Shifted the draft input fill to the darker shared theme black (`SURFACE_BG`) instead of the softer section surface.
+  - Strengthened the idle and focused border tones with neutral greys so the field stays obvious without introducing a blue accent.
+  - Updated the local text-edit chrome tests to assert the new field contrast values.
+- Prevent recurrence:
+  - When aligning a text field to the theme, preserve a small but explicit fill/stroke separation from the containing card.
+  - Treat "theme-consistent" and "discoverable as input" as two separate constraints and test both at the helper level.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+
+#### Settings saved message draft input now overrides egui's actual text-edit background and focus stroke {#settings-saved-message-draft-input-now-overrides-eguis-actual-text-edit-background-and-focus-stroke}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Settings modal saved messages section
+- Error signature: `The Saved Messages add-message input still rendered with a near-pure black background even after the local widget fill override was updated.`
+- Symptoms/Impact: The draft field continued to look darker than the surrounding Settings theme surface, and its focused outline could still appear harsher than intended.
+- Root cause: egui's `TextEdit` frame uses `visuals.extreme_bg_color` for the background and `visuals.selection.stroke` for the focused border, so overriding only `widgets.*.bg_fill` and `bg_stroke` did not affect the actual focused text-edit chrome.
+- Resolution:
+  - Extended the local Saved Messages text-edit scope to override `visuals.extreme_bg_color` with the section-matched surface fill.
+  - Bound the local focused outline to the same muted theme stroke via `visuals.selection.stroke`.
+  - Kept the existing widget-state overrides so hover/open states stay visually consistent.
+- Prevent recurrence:
+  - When skinning egui text inputs, verify whether the widget reads from `widgets.*` or `visuals.extreme_bg_color` before assuming the frame fill changed.
+  - Treat focused text-edit borders separately from generic widget borders because egui routes them through `selection.stroke`.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+
+#### Settings saved message draft input no longer falls back to the bright focused text-edit chrome {#settings-saved-message-draft-input-no-longer-falls-back-to-the-bright-focused-text-edit-chrome}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Settings modal saved messages section
+- Error signature: `The Saved Messages add-message input still switched to a harsh focused background/border once it received focus, despite the section-specific theme override.`
+- Symptoms/Impact: The draft input looked visually detached from the surrounding Saved Messages surface, especially while focused, because it picked up a darker default fill and a brighter border than the rest of the section.
+- Root cause: The local Settings text-edit chrome helper only overrode the inactive, hovered, and active widget visuals; the focused/open text-edit state still used egui's default `widgets.open` styling.
+- Resolution:
+  - Extended the local Settings text-edit chrome model with a dedicated focus stroke.
+  - Applied the Saved Messages surface fill and muted border to the `widgets.open` state as well, so focus no longer changes the input background family.
+  - Updated the regression test to assert the focused chrome stays on the same theme.
+- Prevent recurrence:
+  - When locally skinning an egui `TextEdit`, override `inactive`, `hovered`, `active`, and `open` together.
+  - Keep focus-state styling in the same helper struct so the focused border cannot drift separately from the base field chrome.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+
+#### Settings saved message disclosure triangle now sits lower inside the accordion row {#settings-saved-message-disclosure-triangle-now-sits-lower-inside-the-accordion-row}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Settings modal saved messages section
+- Error signature: `The Saved Messages accordion triangle still looked too high even after the folder icon and title were centered, so the disclosure glyph felt visually detached from the row.`
+- Symptoms/Impact: The header text and folder icon read correctly, but the triangle remained slightly high relative to the visual center of the card, which made the accordion look off-balance.
+- Root cause: egui's built-in `show_header(...)` disclosure button uses its own compact icon slot and does not expose a vertical offset for the triangle inside the taller custom header row.
+- Resolution:
+  - Replaced the built-in Saved Messages `show_header(...)` toggle with a custom disclosure row that still uses the same persistent `CollapsingState`.
+  - Drew the triangle manually with a dedicated downward offset while preserving the existing open/close animation and body indentation.
+  - Added regression coverage for the header layout and disclosure icon vertical offset.
+- Prevent recurrence:
+  - When a Settings accordion needs icon-level alignment control, avoid the default `show_header(...)` button and render the disclosure slot explicitly.
+  - Keep the disclosure offset in a named constant so future header tweaks do not reintroduce the high triangle.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+
+#### Settings saved messages accordions now sit slightly lower under the section intro {#settings-saved-messages-accordions-now-sit-slightly-lower-under-the-section-intro}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Settings modal saved messages section
+- Error signature: `The Saved Messages accordion list sat too close to the section intro copy, so the first project card started higher than the intended breathing room.`
+- Symptoms/Impact: The section opened feeling a bit cramped at the top, and the first accordion card visually collided with the introductory sentence.
+- Root cause: The vertical gap between the intro text and the first Saved Messages accordion used a smaller fixed spacer than the rest of the section now needs.
+- Resolution:
+  - Increased the top spacer between the intro copy and the accordion list.
+  - Promoted that spacing to a named Settings constant and added a regression test.
+- Prevent recurrence:
+  - Keep section-level vertical rhythm in named spacing constants instead of scattered literals.
+  - Add a small test when a Settings spacing tweak is meant to be kept stable.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+
+#### Settings saved message project headers now keep the accordion caret, folder icon, and title aligned {#settings-saved-message-project-headers-now-keep-the-accordion-caret-folder-icon-and-title-aligned}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Settings modal saved messages section
+- Error signature: `Saved Messages project accordions showed a visually off-center folder icon/title row, so the caret, folder glyph, and header copy did not read as one aligned control.`
+- Symptoms/Impact: The accordion header looked slightly crooked, especially next to the built-in disclosure triangle, and longer project names risked making the row feel uneven.
+- Root cause: The project header rendered the folder icon and project title as one combined text label, which let the icon glyph inherit text baseline behavior instead of sitting in its own centered slot.
+- Resolution:
+  - Split the header into dedicated icon, title, and right-count lanes inside the existing collapsing header row.
+  - Centered the folder icon in its own control-height slot and added truncate handling for long project names.
+  - Added layout regression tests for normal and narrow header widths.
+- Prevent recurrence:
+  - Keep accordion header icons in explicit slots instead of embedding them into a shared text string.
+  - Back Saved Messages header geometry with tests whenever row composition changes.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+
+#### Settings saved message draft input now uses the section theme surface {#settings-saved-message-draft-input-now-uses-the-section-theme-surface}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Settings modal saved messages draft input
+- Error signature: `The add-new-message input field used the generic app text-edit fill instead of the Saved Messages section surface tone.`
+- Symptoms/Impact: The draft input looked slightly off-theme compared with the surrounding Saved Messages card and section backgrounds, so the add-message row felt visually detached.
+- Root cause: The saved-message draft field used the global `TextEdit` visuals, whose inactive fill is brighter than the Saved Messages section surface, and there was no local style override for that input.
+- Resolution:
+  - Added a local Settings text-edit chrome helper for the saved-message draft field.
+  - Rebound the input background to the shared `SURFACE_BG_SOFT` surface color and kept a subtle border for field definition.
+  - Added a regression test for the local chrome helper.
+- Prevent recurrence:
+  - When a Settings input is meant to visually merge with its section card, prefer a local text-edit chrome override instead of changing the global text-edit palette.
+  - Keep theme-surface styling in a helper so future Settings inputs can reuse the same treatment.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+
+#### Settings saved message actions no longer sit inside the text box {#settings-saved-message-actions-no-longer-sit-inside-the-text-box}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Settings modal saved messages section
+- Error signature: `Saved message action icons were rendered inside the message box and could end up below the text instead of clearly separated on the right.`
+- Symptoms/Impact: The trash action felt visually attached to the text body, long messages pushed the action row downward, and the control target was harder to scan because it did not stay in a stable right-hand action lane.
+- Root cause: Each saved message card rendered both the text and action icons inside the same framed surface, so the action layout participated in the text card's internal flow.
+- Resolution:
+  - Split each saved message row into a left text frame and a separate right action column.
+  - Kept the message box dedicated to text only and reserved explicit width for the external action lane.
+  - Replaced the old narrow-card action-stack test with a text-width reservation test.
+- Prevent recurrence:
+  - Keep per-row actions in a dedicated action lane when the row body contains multi-line text.
+  - Back row geometry with helper tests so text width always reserves space for right-side controls.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+
+#### Settings saved messages now render as a single-column list without overflow-prone wrapping {#settings-saved-messages-now-render-as-a-single-column-list-without-overflow-prone-wrapping}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Settings modal saved messages section
+- Error signature: `Saved messages were laid out side by side, which made the section harder to scan and increased the chance of cramped cards or horizontal overflow pressure.`
+- Symptoms/Impact: Multiple saved messages could appear next to each other in wrapped rows instead of a clean top-to-bottom list, and long messages had less predictable room because each card width was clamped separately.
+- Root cause: The Settings section rendered saved messages with `horizontal_wrapped()` and a per-card max-width clamp, so cards flowed into multiple columns whenever there was enough width.
+- Resolution:
+  - Replaced the wrapped horizontal layout with a vertical single-column list.
+  - Switched saved-message cards to use the full available content width so long entries wrap inside one card instead of competing for row space.
+  - Updated the width regression test to cover the full-width card behavior.
+- Prevent recurrence:
+  - Keep saved-message entries in a single-column reading layout unless there is a dedicated design change for dense grid presentation.
+  - Tie saved-message card width directly to the available content width when overflow safety matters.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+
+#### Settings saved-messages copy no longer mixed in prompt terminology {#settings-saved-messages-copy-no-longer-mixed-in-prompt-terminology}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Settings modal saved messages section
+- Error signature: `The Settings section still mixed "Prompts" and "prompt" wording even though the feature is presented as Saved Messages elsewhere.`
+- Symptoms/Impact: The navigation label, section description, helper copy, input hint text, and chip tooltips used inconsistent terminology, which made the Saved Messages feature feel split across two names.
+- Root cause: Several user-facing strings in the Settings saved messages section were left on older prompt-based copy even after the feature model and section title standardized on saved messages.
+- Resolution:
+  - Renamed the Settings navigation label from `Prompts` to `Saved Messages`.
+  - Updated Settings helper text, counters, empty states, hints, and chip action tooltips to use saved-messages wording consistently.
+  - Updated the related navigation label regression test.
+- Prevent recurrence:
+  - Keep all user-facing copy for the saved messages feature aligned to one canonical name.
+  - When renaming a feature surface, audit navigation labels, helper text, empty states, and action tooltips together.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+
+#### Settings navigation chrome was simplified to a text-only list {#settings-navigation-chrome-was-simplified-to-a-text-only-list}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Settings modal left navigation
+- Error signature: `The left Settings menu still looked like a boxed control list instead of a minimal stacked set of section labels.`
+- Symptoms/Impact: Even after color cleanup, the Settings navigation still felt heavier than the rest of the modal because it kept a framed panel, row chrome, and icon-driven emphasis.
+- Root cause: The left navigation continued to render each section with custom chrome helpers and the panel itself still used the shared settings surface frame, so the menu read as a separate bordered widget instead of lightweight navigation text.
+- Resolution:
+  - Removed the left navigation panel frame and row chrome.
+  - Dropped the section icons from the left menu and rendered the navigation as stacked text labels only.
+  - Kept selection and hover feedback text-only via subtle color and type-size emphasis.
+- Prevent recurrence:
+  - Keep auxiliary navigation surfaces visually lighter than the main content cards unless there is a strong interaction reason not to.
+  - Prefer text-only state cues before reintroducing panel chrome or per-row containers in Settings navigation.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+
+#### Settings navigation icon and label alignment was tightened {#settings-navigation-icon-and-label-alignment-was-tightened}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Settings modal left navigation
+- Error signature: `Settings navigation labels sat too close to their icons and the rows relied on ad-hoc coordinates instead of a shared alignment layout.`
+- Symptoms/Impact: The left Settings menu looked cramped, the gap between icon and text was inconsistent to the eye, and future spacing tweaks would have required changing magic numbers in the paint path.
+- Root cause: `draw_settings_navigation()` painted the icon from a hard-coded center point and then started the label from an offset of that center, so the visible gap depended on icon glyph width rather than a fixed aligned slot.
+- Resolution:
+  - Replaced the ad-hoc positioning with a dedicated Settings navigation row layout helper.
+  - Introduced explicit leading inset, icon slot width, and icon-to-label gap constants so rows share one alignment system.
+  - Added a regression test covering the computed icon and text positions.
+- Prevent recurrence:
+  - Keep Settings navigation spacing driven by named layout constants instead of inline offsets.
+  - Add or update pure layout tests whenever Settings row geometry changes.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+
+#### Settings navigation selected state no longer used a blue accent {#settings-navigation-selected-state-no-longer-used-a-blue-accent}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Settings modal section navigation
+- Error signature: `The selected Settings section painted a blue highlight that clashed with the rest of the dark terminal-first theme.`
+- Symptoms/Impact: Switching between General, Prompts, and Diagnostics made the active row stand out with a saturated blue tint that looked inconsistent beside the neutral terminal and panel chrome.
+- Root cause: `draw_settings_navigation()` used the shared `BTN_ICON_ACTIVE` action color for the selected row fill and stroke even though the rest of the Settings modal and terminal surfaces used neutral grays for active state emphasis.
+- Resolution:
+  - Replaced the selected Settings navigation chrome with a neutral active treatment that matches the existing terminal manager row styling.
+  - Added regression coverage for both selected and hover Settings navigation chrome states.
+- Prevent recurrence:
+  - Keep Settings navigation selection styles aligned with neutral theme surface constants instead of reusing action/accent colors meant for buttons.
+  - When adjusting Settings chrome, cover active and hover states with focused unit tests so theme regressions are caught early.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+
 #### Terminal default background now follows the app surface theme {#terminal-default-background-now-follows-the-app-surface-theme}
 - Date: 2026-04-09T00:00:00Z
 - Context: main/Windows local terminal output surface and default cell background rendering
