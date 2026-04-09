@@ -32,7 +32,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, SPI_GETKEYBOARDDELAY, SPI_GETKEYBOARDSPEED,
 };
 
-use crate::codex::{self, CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
+use crate::codex::{
+    self, CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent,
+    CODEX_UNKNOWN_NOTIFY_EVENT,
+};
 use crate::config;
 use crate::hooks::{AiCliSession, AiCliStatus, AiCliTool, AiHookManager};
 use crate::layout;
@@ -333,6 +336,7 @@ impl FactoryDroidStatusSource {
 enum CodexCliStatusSource {
     PromptSubmit,
     Notify,
+    VisibleUi,
     Bell,
 }
 
@@ -341,7 +345,59 @@ impl CodexCliStatusSource {
         match self {
             Self::PromptSubmit => "prompt_submit",
             Self::Notify => "notify",
+            Self::VisibleUi => "visible_ui",
             Self::Bell => "bell",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexAttentionReason {
+    ApprovalRequested,
+    UserInputRequested,
+    PlanModePrompt,
+    TurnComplete,
+    UnknownNotify,
+}
+
+impl CodexAttentionReason {
+    fn from_event_kind(event_kind: Option<&str>) -> Self {
+        let normalized = event_kind
+            .unwrap_or(CODEX_UNKNOWN_NOTIFY_EVENT)
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .map(|ch| ch.to_ascii_lowercase())
+            .collect::<String>();
+
+        match normalized.as_str() {
+            "approvalrequested" => Self::ApprovalRequested,
+            "userinputrequested" | "requestuserinput" | "toolrequestuserinput" => {
+                Self::UserInputRequested
+            }
+            "planmodeprompt" => Self::PlanModePrompt,
+            "agentturncomplete" | "turncompleted" | "turncomplete" => Self::TurnComplete,
+            _ => Self::UnknownNotify,
+        }
+    }
+
+    const fn allows_empty_submit(self) -> bool {
+        matches!(
+            self,
+            Self::ApprovalRequested | Self::UserInputRequested | Self::PlanModePrompt
+        )
+    }
+
+    const fn persists_after_session_exit(self) -> bool {
+        matches!(self, Self::TurnComplete)
+    }
+
+    const fn tooltip(self) -> &'static str {
+        match self {
+            Self::ApprovalRequested => "Codex CLI - Waiting for approval...",
+            Self::UserInputRequested => "Codex CLI - Waiting for your reply...",
+            Self::PlanModePrompt => "Codex CLI - Waiting for plan approval...",
+            Self::TurnComplete => "Codex CLI - Turn complete; waiting for your next prompt...",
+            Self::UnknownNotify => "Codex CLI - Waiting for you...",
         }
     }
 }
@@ -602,6 +658,7 @@ struct TerminalEntry {
     codex_last_process_seen_at: Option<Instant>,
     codex_process_missing_since: Option<Instant>,
     codex_last_status_source: Option<CodexCliStatusSource>,
+    codex_attention_reason: Option<CodexAttentionReason>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -810,19 +867,32 @@ struct AiBadgeModel {
 }
 
 impl AiBadgeModel {
-    fn from_session(session: &AiCliSession) -> Self {
-        let tool = session.tool;
-        let status = session.status;
-        let tooltip_lines = if let Some(t) = tool {
-            vec![status.tooltip(t)]
-        } else {
-            vec!["AI: Not detected".to_string()]
-        };
+    fn from_terminal(terminal: &TerminalEntry) -> Self {
+        let tool = terminal.ai_session.tool;
+        let status = terminal.ai_session.status;
+        let tooltip_lines = ai_badge_tooltip_lines(tool, status, terminal.codex_attention_reason);
         Self {
             tool,
             status,
             tooltip_lines,
         }
+    }
+}
+
+fn ai_badge_tooltip_lines(
+    tool: Option<AiCliTool>,
+    status: AiCliStatus,
+    codex_attention_reason: Option<CodexAttentionReason>,
+) -> Vec<String> {
+    match tool {
+        Some(AiCliTool::CodexCli) if status == AiCliStatus::Attention => {
+            vec![codex_attention_reason
+                .unwrap_or(CodexAttentionReason::UnknownNotify)
+                .tooltip()
+                .to_owned()]
+        }
+        Some(tool) => vec![status.tooltip(tool)],
+        None => vec!["AI: Not detected".to_owned()],
     }
 }
 
@@ -851,6 +921,7 @@ fn draw_ai_badge(ui: &mut Ui, badge: &AiBadgeModel) -> egui::Response {
         match visual {
             AiBadgeVisual::Spinner(color) => {
                 egui::Spinner::new().color(color).paint_at(ui, rect);
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
             }
             AiBadgeVisual::Pulse(color) => {
                 let time_seconds = ui.ctx().input(|i| i.time);
@@ -1991,6 +2062,7 @@ impl AdeApp {
             codex_last_process_seen_at: None,
             codex_process_missing_since: None,
             codex_last_status_source: None,
+            codex_attention_reason: None,
         };
 
         self.terminals.insert(terminal_id, entry);
@@ -2526,10 +2598,27 @@ impl AdeApp {
         Self::launch_command_stem(line).is_some_and(|stem| stem.eq_ignore_ascii_case("codex"))
     }
 
-    fn codex_attention_source_from_chunk(chunk: &str) -> Option<CodexCliStatusSource> {
-        chunk
-            .contains("[bell]")
-            .then_some(CodexCliStatusSource::Bell)
+    fn codex_status_from_chunk(
+        chunk: &str,
+    ) -> Option<(
+        AiCliStatus,
+        CodexCliStatusSource,
+        Option<CodexAttentionReason>,
+    )> {
+        if chunk.contains("[bell]") {
+            return Some((AiCliStatus::Attention, CodexCliStatusSource::Bell, None));
+        }
+        if chunk == "codex-question-prompt" {
+            return Some((
+                AiCliStatus::Attention,
+                CodexCliStatusSource::VisibleUi,
+                Some(CodexAttentionReason::UserInputRequested),
+            ));
+        }
+        if chunk == "codex-interrupted-banner" {
+            return Some((AiCliStatus::Inactive, CodexCliStatusSource::VisibleUi, None));
+        }
+        None
     }
 
     fn mark_codex_launch_pending(
@@ -2570,6 +2659,7 @@ impl AdeApp {
         entry.codex_process_identity = None;
         entry.codex_last_process_seen_at = None;
         entry.codex_process_missing_since = None;
+        entry.codex_attention_reason = None;
         entry.dirty = true;
         changed
     }
@@ -2589,7 +2679,8 @@ impl AdeApp {
             || entry.codex_session_active
             || entry.codex_process_identity.is_some()
             || entry.codex_process_missing_since.is_some()
-            || entry.codex_last_status_source.is_some();
+            || entry.codex_last_status_source.is_some()
+            || entry.codex_attention_reason.is_some();
 
         if entry.ai_session.tool == Some(AiCliTool::CodexCli) {
             entry.ai_session = AiCliSession::default();
@@ -2601,6 +2692,7 @@ impl AdeApp {
         entry.codex_last_process_seen_at = None;
         entry.codex_process_missing_since = None;
         entry.codex_last_status_source = None;
+        entry.codex_attention_reason = None;
         entry.dirty = true;
         changed
     }
@@ -2696,6 +2788,7 @@ impl AdeApp {
         terminal_id: u64,
         status: AiCliStatus,
         source: CodexCliStatusSource,
+        attention_reason: Option<CodexAttentionReason>,
     ) -> bool {
         let Some(manager) = self.ai_hook_manager.as_ref().cloned() else {
             return false;
@@ -2716,14 +2809,38 @@ impl AdeApp {
         let should_dedupe_attention = status == AiCliStatus::Attention
             && entry.ai_session.tool == Some(AiCliTool::CodexCli)
             && entry.ai_session.status == AiCliStatus::Attention
-            && matches!(
-                entry.codex_last_status_source,
-                Some(CodexCliStatusSource::Notify | CodexCliStatusSource::Bell)
-            )
-            && matches!(
-                source,
-                CodexCliStatusSource::Notify | CodexCliStatusSource::Bell
-            );
+            && match source {
+                CodexCliStatusSource::Bell => matches!(
+                    entry.codex_last_status_source,
+                    Some(
+                        CodexCliStatusSource::Notify
+                            | CodexCliStatusSource::VisibleUi
+                            | CodexCliStatusSource::Bell
+                    )
+                ),
+                CodexCliStatusSource::VisibleUi => {
+                    (entry.codex_last_status_source == Some(CodexCliStatusSource::Notify)
+                        && entry.codex_attention_reason == attention_reason)
+                        || (entry.codex_last_status_source == Some(CodexCliStatusSource::VisibleUi)
+                            && entry.codex_attention_reason == attention_reason)
+                }
+                CodexCliStatusSource::Notify => {
+                    (entry.codex_last_status_source == Some(CodexCliStatusSource::Notify)
+                        && entry.codex_attention_reason == attention_reason)
+                        || (entry.codex_last_status_source == Some(CodexCliStatusSource::VisibleUi)
+                            && matches!(
+                                (entry.codex_attention_reason, attention_reason),
+                                (
+                                    Some(CodexAttentionReason::UserInputRequested),
+                                    Some(
+                                        CodexAttentionReason::TurnComplete
+                                            | CodexAttentionReason::UnknownNotify
+                                    )
+                                )
+                            ))
+                }
+                _ => false,
+            };
         if should_dedupe_attention {
             return false;
         }
@@ -2742,6 +2859,21 @@ impl AdeApp {
         } else if entry.ai_session.status != status {
             entry.ai_session.status = status;
             changed = true;
+        }
+        match status {
+            AiCliStatus::Attention => {
+                if let Some(reason) = attention_reason {
+                    if entry.codex_attention_reason != Some(reason) {
+                        entry.codex_attention_reason = Some(reason);
+                        changed = true;
+                    }
+                }
+            }
+            AiCliStatus::Running | AiCliStatus::Inactive => {
+                if entry.codex_attention_reason.take().is_some() {
+                    changed = true;
+                }
+            }
         }
         if entry.codex_last_status_source != Some(source) {
             entry.codex_last_status_source = Some(source);
@@ -2873,7 +3005,18 @@ impl AdeApp {
                                     .get(&terminal_id)
                                     .is_some_and(Self::codex_trailing_grace_elapsed)
                                 {
-                                    changed |= self.clear_codex_process_tracking(terminal_id);
+                                    let persists_after_session_exit = self
+                                        .terminals
+                                        .get(&terminal_id)
+                                        .and_then(|entry| entry.codex_attention_reason)
+                                        .is_some_and(
+                                            CodexAttentionReason::persists_after_session_exit,
+                                        );
+                                    if persists_after_session_exit {
+                                        changed |= self.clear_codex_process_tracking(terminal_id);
+                                    } else {
+                                        changed |= self.clear_codex_state(terminal_id);
+                                    }
                                 }
                             }
                             AiCliStatus::Running => {
@@ -3028,6 +3171,15 @@ impl AdeApp {
                 terminal_id,
                 AiCliStatus::Attention,
                 CodexCliStatusSource::Notify,
+                Some(CodexAttentionReason::from_event_kind(
+                    event.event_kind.as_deref(),
+                )),
+            ),
+            "unknown" => self.apply_codex_status(
+                terminal_id,
+                AiCliStatus::Attention,
+                CodexCliStatusSource::Notify,
+                Some(CodexAttentionReason::UnknownNotify),
             ),
             _ => false,
         }
@@ -3129,9 +3281,10 @@ impl AdeApp {
                         });
 
                     if should_apply_codex {
-                        if let Some(source) = Self::codex_attention_source_from_chunk(&chunk) {
-                            if self.apply_codex_status(terminal_id, AiCliStatus::Attention, source)
-                            {
+                        if let Some((status, source, reason)) =
+                            Self::codex_status_from_chunk(&chunk)
+                        {
+                            if self.apply_codex_status(terminal_id, status, source, reason) {
                                 dirty_ids.insert(terminal_id);
                             }
                         }
@@ -4229,6 +4382,7 @@ impl AdeApp {
         let mut codex_launch_baseline = None;
         let mut submitted_factory_prompt = false;
         let mut submitted_codex_prompt = false;
+        let mut committed_codex_reply = false;
         let mut sent_terminal_input = false;
         {
             let Some(terminal) = self.terminals.get_mut(&active_terminal_id) else {
@@ -4302,21 +4456,35 @@ impl AdeApp {
                                     terminal.runtime.snapshot_codex_descendant_processes();
                             }
                             let sanitized_line = terminal_title_candidate(&line);
+                            let has_non_empty_line = sanitized_line
+                                .as_ref()
+                                .is_some_and(|candidate| !candidate.trim().is_empty());
+                            let allows_empty_codex_submit = terminal
+                                .codex_attention_reason
+                                .is_some_and(CodexAttentionReason::allows_empty_submit)
+                                && terminal.ai_session.tool == Some(AiCliTool::CodexCli)
+                                && terminal.ai_session.status == AiCliStatus::Attention;
+                            let submitted_codex_interaction =
+                                has_non_empty_line || allows_empty_codex_submit;
                             if terminal.factory_droid_session_active
                                 && !launched_factory_droid
                                 && !launched_codex_cli
-                                && sanitized_line
-                                    .as_ref()
-                                    .is_some_and(|candidate| !candidate.trim().is_empty())
+                                && has_non_empty_line
                             {
                                 submitted_factory_prompt = true;
+                            }
+                            if terminal.ai_session.tool == Some(AiCliTool::CodexCli)
+                                && terminal.ai_session.status == AiCliStatus::Attention
+                                && !launched_factory_droid
+                                && !launched_codex_cli
+                                && submitted_codex_interaction
+                            {
+                                committed_codex_reply = true;
                             }
                             if terminal.codex_session_active
                                 && !launched_factory_droid
                                 && !launched_codex_cli
-                                && sanitized_line
-                                    .as_ref()
-                                    .is_some_and(|candidate| !candidate.trim().is_empty())
+                                && submitted_codex_interaction
                             {
                                 submitted_codex_prompt = true;
                             }
@@ -4378,28 +4546,29 @@ impl AdeApp {
         // Clear AI attention status when user types input
         if let Some(manager) = &self.ai_hook_manager {
             let has_copied = copied_selection.is_some();
-            if sent_terminal_input || has_copied {
+            let should_clear_attention =
+                self.terminals
+                    .get(&active_terminal_id)
+                    .is_some_and(|entry| {
+                        entry.ai_session.tool != Some(AiCliTool::CodexCli)
+                            && (sent_terminal_input || has_copied)
+                    });
+            if should_clear_attention {
                 if let Some((tool, status)) = manager.user_interacted(active_terminal_id) {
-                    let should_clear_sticky_codex = self
-                        .terminals
-                        .get(&active_terminal_id)
-                        .is_some_and(|entry| {
-                            tool == AiCliTool::CodexCli
-                                && status == AiCliStatus::Inactive
-                                && entry.ai_session.tool == Some(AiCliTool::CodexCli)
-                                && !entry.codex_session_active
-                                && entry.codex_launch_pending_since.is_none()
-                                && entry.codex_process_identity.is_none()
-                        });
-                    if should_clear_sticky_codex {
-                        self.clear_codex_state(active_terminal_id);
-                    } else if let Some(entry) = self.terminals.get_mut(&active_terminal_id) {
+                    if let Some(entry) = self.terminals.get_mut(&active_terminal_id) {
                         entry.ai_session.tool = Some(tool);
                         entry.ai_session.status = status;
                     }
                     ctx.request_repaint();
                 }
             }
+        }
+
+        if committed_codex_reply
+            && !submitted_codex_prompt
+            && self.clear_codex_attention_on_commit(active_terminal_id)
+        {
+            ctx.request_repaint();
         }
 
         if submitted_factory_prompt
@@ -4416,6 +4585,7 @@ impl AdeApp {
                 active_terminal_id,
                 AiCliStatus::Running,
                 CodexCliStatusSource::PromptSubmit,
+                None,
             )
         {
             ctx.request_repaint();
@@ -4793,7 +4963,56 @@ impl AdeApp {
         ctx.request_repaint();
     }
 
+    fn clear_codex_attention_on_commit(&mut self, terminal_id: u64) -> bool {
+        let Some(manager) = &self.ai_hook_manager else {
+            return false;
+        };
+
+        let Some((tool, status)) = manager.user_interacted(terminal_id) else {
+            return false;
+        };
+        if tool != AiCliTool::CodexCli || status != AiCliStatus::Inactive {
+            return false;
+        }
+
+        let should_clear_sticky_codex = self.terminals.get(&terminal_id).is_some_and(|entry| {
+            entry.ai_session.tool == Some(AiCliTool::CodexCli)
+                && !entry.codex_session_active
+                && entry.codex_launch_pending_since.is_none()
+                && entry.codex_process_identity.is_none()
+        });
+        if should_clear_sticky_codex {
+            return self.clear_codex_state(terminal_id);
+        }
+
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        let mut changed = false;
+        if entry.ai_session.tool != Some(tool) {
+            entry.ai_session.tool = Some(tool);
+            changed = true;
+        }
+        if entry.ai_session.status != status {
+            entry.ai_session.status = status;
+            changed = true;
+        }
+        if entry.codex_attention_reason.take().is_some() {
+            changed = true;
+        }
+        entry.dirty = true;
+        changed
+    }
+
     fn acknowledge_terminal_attention(&mut self, terminal_id: u64) {
+        if self.terminals.get(&terminal_id).is_some_and(|entry| {
+            entry.ai_session.tool == Some(AiCliTool::CodexCli)
+                && entry.ai_session.status == AiCliStatus::Attention
+        }) {
+            return;
+        }
+
         let Some(manager) = &self.ai_hook_manager else {
             return;
         };
@@ -4963,6 +5182,9 @@ impl AdeApp {
     }
 
     fn send_saved_message_to_terminal(&mut self, terminal_id: u64, message: &str) {
+        let mut submitted_factory_prompt = false;
+        let mut submitted_codex_prompt = false;
+        let mut committed_codex_reply = false;
         let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
             self.status_line = "Target terminal not found".to_owned();
             return;
@@ -4984,11 +5206,43 @@ impl AdeApp {
             terminal.full_title = sanitized;
             terminal.title = update_terminal_title(&line, terminal.id as usize, TITLE_MAX_LEN);
         }
+        let has_non_empty_line = !message.trim().is_empty();
+        if terminal.factory_droid_session_active && has_non_empty_line {
+            submitted_factory_prompt = true;
+        }
+        if terminal.ai_session.tool == Some(AiCliTool::CodexCli)
+            && terminal.ai_session.status == AiCliStatus::Attention
+            && has_non_empty_line
+        {
+            committed_codex_reply = true;
+        }
+        if terminal.codex_session_active && has_non_empty_line {
+            submitted_codex_prompt = true;
+        }
 
         Self::push_recent_input(&mut terminal.recent_inputs, message);
 
         terminal.dirty = true;
         self.status_line = format!("Sent saved message to {}", destination_title);
+
+        if committed_codex_reply && !submitted_codex_prompt {
+            let _ = self.clear_codex_attention_on_commit(terminal_id);
+        }
+        if submitted_factory_prompt {
+            let _ = self.apply_factory_droid_status(
+                terminal_id,
+                AiCliStatus::Running,
+                FactoryDroidStatusSource::PromptSubmit,
+            );
+        }
+        if submitted_codex_prompt {
+            let _ = self.apply_codex_status(
+                terminal_id,
+                AiCliStatus::Running,
+                CodexCliStatusSource::PromptSubmit,
+                None,
+            );
+        }
     }
 
     const RECENT_INPUTS_MAX: usize = 4;
@@ -6019,6 +6273,31 @@ impl AdeApp {
         egui::vec2(width.max(1.0), height.max(1.0))
     }
 
+    fn activity_rail_ai_badge_model(&self) -> Option<AiBadgeModel> {
+        let selected_terminal = self
+            .terminals
+            .values()
+            .filter(|terminal| terminal.ai_session.status != AiCliStatus::Inactive)
+            .min_by_key(|terminal| {
+                (
+                    match terminal.ai_session.status {
+                        AiCliStatus::Attention => 0u8,
+                        AiCliStatus::Running => 1,
+                        AiCliStatus::Inactive => 2,
+                    },
+                    (self.active_terminal != Some(terminal.id)) as u8,
+                    terminal.id,
+                )
+            })?;
+
+        let mut badge = AiBadgeModel::from_terminal(selected_terminal);
+        badge.tooltip_lines.push(format!(
+            "Terminal: {}",
+            terminal_display_label(&selected_terminal.full_title, selected_terminal.exited)
+        ));
+        Some(badge)
+    }
+
     fn draw_activity_rail(&mut self, ctx: &egui::Context) -> Option<egui::Rect> {
         let response = egui::SidePanel::left("activity_rail")
             .resizable(false)
@@ -6045,6 +6324,7 @@ impl AdeApp {
                 let diagnostics = self.factory_droid_transport_diagnostics();
                 let settings_tooltip = diagnostics.settings_tooltip_text();
                 let shows_settings_warning_badge = diagnostics.shows_settings_warning_badge();
+                let activity_ai_badge = self.activity_rail_ai_badge_model();
 
                 ui.with_layout(Layout::top_down(Align::Center), |ui| {
                     ui.add_space(4.0);
@@ -6095,8 +6375,21 @@ impl AdeApp {
                         should_persist = true;
                     }
 
-                    let footer_space = (ui.available_height() - CONTROL_ROW_HEIGHT).max(0.0);
+                    let badge_slot_height = if activity_ai_badge.is_some() {
+                        22.0
+                    } else {
+                        0.0
+                    };
+                    let footer_space =
+                        (ui.available_height() - CONTROL_ROW_HEIGHT - badge_slot_height).max(0.0);
                     ui.add_space(footer_space);
+
+                    if let Some(ai_badge) = activity_ai_badge.as_ref() {
+                        ui.vertical_centered(|ui| {
+                            let _ = draw_ai_badge(ui, ai_badge);
+                        });
+                        ui.add_space(6.0);
+                    }
 
                     let settings_response = activity_rail_icon_button(
                         ui,
@@ -6955,7 +7248,7 @@ impl AdeApp {
                             |ui| {
                                 ui.add_space(SIDEBAR_ROW_LEADING_INSET);
 
-                                let ai_badge = AiBadgeModel::from_session(&terminal.ai_session);
+                                let ai_badge = AiBadgeModel::from_terminal(terminal);
                                 let ai_response = ai_badge_visual(ai_badge.status)
                                     .map(|_| draw_ai_badge(ui, &ai_badge));
                                 if ai_response.is_some() {
@@ -7247,7 +7540,7 @@ impl AdeApp {
                         .show(ui, |ui| {
                             ui.set_min_height(TERMINAL_HEADER_HEIGHT - 12.0);
 
-                            let ai_badge = AiBadgeModel::from_session(&terminal.ai_session);
+                            let ai_badge = AiBadgeModel::from_terminal(terminal);
                             draw_terminal_status_badges(ui, &ai_badge);
 
                             let title = terminal_display_label(&terminal.title, terminal.exited);
@@ -11428,12 +11721,13 @@ mod tests {
         terminal_manager_row_widths, terminal_output_surface_size, terminal_output_viewport_size,
         terminal_secondary_click_action, terminal_selection_point_from_pointer,
         terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
-        with_settings_text_edit_chrome, AdeApp, AiBadgeModel, AiBadgeVisual, CodexCliStatusSource,
-        CtrlCAction, DirectoryIndexSnapshot, DirectoryNode, FactoryDroidHookInboxEvent,
-        FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
-        FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, PendingConfigChanges,
-        PendingTerminalLinkClick, SettingsSection, SourceControlBadgeState, SourceControlFile,
-        SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
+        with_settings_text_edit_chrome, AdeApp, AiBadgeModel, AiBadgeVisual, CodexAttentionReason,
+        CodexCliStatusSource, CtrlCAction, DirectoryIndexSnapshot, DirectoryNode,
+        FactoryDroidHookInboxEvent, FactoryDroidManagedInstallComponent,
+        FactoryDroidManagedInstallDiagnostics, FactoryDroidStatusSource,
+        FactoryDroidTransportDiagnostics, PendingConfigChanges, PendingTerminalLinkClick,
+        SettingsSection, SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
+        SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
         TerminalSecondaryClickAction, TerminalSelection, TerminalSelectionPoint, TransientToast,
         CODEX_LAUNCH_GRACE_MS, CODEX_PROCESS_POLL_MS, CODEX_TRAILING_OUTPUT_GRACE_MS,
@@ -11441,7 +11735,10 @@ mod tests {
         FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG,
         TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_OUTPUT_BG, TRANSIENT_TOAST_SECS,
     };
-    use crate::codex::{CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
+    use crate::codex::{
+        CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent,
+        CODEX_UNKNOWN_NOTIFY_EVENT,
+    };
     use crate::hooks::{
         AiCliSession, AiCliStatus, AiCliTool, AiHookManager, AiHooksConfig, ProjectAiConfig,
     };
@@ -16874,7 +17171,7 @@ mod tests {
         {
             let terminal = app.terminals.get(&1).expect("terminal 1");
             assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
-            assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+            assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
             assert_eq!(terminal.pending_line_for_title, "continue");
         }
 
@@ -17233,6 +17530,117 @@ mod tests {
             terminal.codex_last_status_source,
             Some(CodexCliStatusSource::Notify)
         );
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::TurnComplete)
+        );
+    }
+
+    #[test]
+    fn codex_notify_inbox_unknown_event_still_sets_attention() {
+        let ctx = Context::default();
+        let temp_dir = TestTempDir::new("codex-notify-inbox-unknown");
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.codex_cli_runtime_dir = Some(temp_dir.path.clone());
+
+        write_test_codex_notify_events(
+            &temp_dir.path,
+            1,
+            &test_codex_inbox_token(1),
+            &[CodexNotifyInboxEvent {
+                terminal_id: "1".to_owned(),
+                tool: "codex".to_owned(),
+                status: "attention".to_owned(),
+                inbox_token: Some(test_codex_inbox_token(1)),
+                event_kind: Some(CODEX_UNKNOWN_NOTIFY_EVENT.to_owned()),
+                raw_json: r#"{"event":"mystery"}"#.to_owned(),
+                timestamp_utc: "2026-04-06T00:00:00Z".to_owned(),
+            }],
+        );
+
+        app.poll_codex_notify_inboxes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::UnknownNotify)
+        );
+    }
+
+    #[test]
+    fn codex_notify_inbox_updates_attention_reason_when_new_notify_arrives() {
+        let ctx = Context::default();
+        let temp_dir = TestTempDir::new("codex-notify-inbox-reason-update");
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.codex_cli_runtime_dir = Some(temp_dir.path.clone());
+
+        write_test_codex_notify_events(
+            &temp_dir.path,
+            1,
+            &test_codex_inbox_token(1),
+            &[
+                test_codex_notify_event(1, &test_codex_inbox_token(1), "attention"),
+                CodexNotifyInboxEvent {
+                    terminal_id: "1".to_owned(),
+                    tool: "codex".to_owned(),
+                    status: "attention".to_owned(),
+                    inbox_token: Some(test_codex_inbox_token(1)),
+                    event_kind: Some("approval-requested".to_owned()),
+                    raw_json: r#"{"event":"approval-requested"}"#.to_owned(),
+                    timestamp_utc: "2026-04-06T00:00:01Z".to_owned(),
+                },
+            ],
+        );
+
+        app.poll_codex_notify_inboxes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::ApprovalRequested)
+        );
+        assert_eq!(
+            terminal.codex_last_status_source,
+            Some(CodexCliStatusSource::Notify)
+        );
+    }
+
+    #[test]
+    fn codex_notify_inbox_maps_plan_mode_prompt_to_attention() {
+        let ctx = Context::default();
+        let temp_dir = TestTempDir::new("codex-notify-inbox-plan-mode");
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.codex_cli_runtime_dir = Some(temp_dir.path.clone());
+
+        write_test_codex_notify_events(
+            &temp_dir.path,
+            1,
+            &test_codex_inbox_token(1),
+            &[CodexNotifyInboxEvent {
+                terminal_id: "1".to_owned(),
+                tool: "codex".to_owned(),
+                status: "attention".to_owned(),
+                inbox_token: Some(test_codex_inbox_token(1)),
+                event_kind: Some("plan-mode-prompt".to_owned()),
+                raw_json: r#"{"event":"plan-mode-prompt"}"#.to_owned(),
+                timestamp_utc: "2026-04-06T00:00:00Z".to_owned(),
+            }],
+        );
+
+        app.poll_codex_notify_inboxes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::PlanModePrompt)
+        );
+        assert_eq!(
+            terminal.codex_last_status_source,
+            Some(CodexCliStatusSource::Notify)
+        );
     }
 
     #[test]
@@ -17280,16 +17688,7 @@ mod tests {
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
         seed_codex_attention(&mut app, 1);
-        {
-            let entry = app.terminals.get_mut(&1).expect("terminal 1");
-            entry.runtime.set_codex_process_identity_for_test(None);
-            entry.codex_process_missing_since =
-                Some(Instant::now() - Duration::from_millis(CODEX_TRAILING_OUTPUT_GRACE_MS + 25));
-        }
-
-        app.codex_process_last_poll_at =
-            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
-        app.poll_codex_processes(&ctx);
+        poll_codex_process_exit_after_grace(&mut app, &ctx, 1);
 
         let terminal = app.terminals.get(&1).expect("terminal 1");
         assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
@@ -17298,13 +17697,250 @@ mod tests {
         assert!(terminal.codex_process_missing_since.is_none());
         assert!(terminal.codex_process_identity.is_none());
         assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::TurnComplete)
+        );
+        assert_eq!(
             terminal.codex_last_status_source,
             Some(CodexCliStatusSource::Notify)
         );
     }
 
     #[test]
-    fn sticky_codex_attention_is_cleared_by_user_interaction() {
+    fn notify_user_input_codex_attention_clears_after_process_exit_grace() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_codex_attention(&mut app, 1);
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.codex_attention_reason = Some(CodexAttentionReason::UserInputRequested);
+        }
+
+        poll_codex_process_exit_after_grace(&mut app, &ctx, 1);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, None);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(!terminal.codex_session_active);
+        assert!(terminal.codex_process_identity.is_none());
+        assert!(terminal.codex_process_missing_since.is_none());
+        assert_eq!(terminal.codex_last_status_source, None);
+        assert_eq!(terminal.codex_attention_reason, None);
+    }
+
+    #[test]
+    fn approval_requested_codex_attention_clears_after_process_exit_grace() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_codex_attention(&mut app, 1);
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.codex_attention_reason = Some(CodexAttentionReason::ApprovalRequested);
+        }
+
+        poll_codex_process_exit_after_grace(&mut app, &ctx, 1);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, None);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert_eq!(terminal.codex_last_status_source, None);
+        assert_eq!(terminal.codex_attention_reason, None);
+    }
+
+    #[test]
+    fn plan_mode_codex_attention_clears_after_process_exit_grace() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_codex_attention(&mut app, 1);
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.codex_attention_reason = Some(CodexAttentionReason::PlanModePrompt);
+        }
+
+        poll_codex_process_exit_after_grace(&mut app, &ctx, 1);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, None);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert_eq!(terminal.codex_last_status_source, None);
+        assert_eq!(terminal.codex_attention_reason, None);
+    }
+
+    #[test]
+    fn unknown_codex_attention_clears_after_process_exit_grace() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_codex_attention(&mut app, 1);
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.codex_attention_reason = Some(CodexAttentionReason::UnknownNotify);
+        }
+
+        poll_codex_process_exit_after_grace(&mut app, &ctx, 1);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, None);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert_eq!(terminal.codex_last_status_source, None);
+        assert_eq!(terminal.codex_attention_reason, None);
+    }
+
+    #[test]
+    fn visible_codex_question_prompt_clears_after_process_exit_grace() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_codex_attention(&mut app, 1);
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "codex-question-prompt".to_owned(),
+                },
+            })
+            .expect("send codex question prompt chunk");
+        app.process_terminal_events(&ctx);
+
+        poll_codex_process_exit_after_grace(&mut app, &ctx, 1);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, None);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert_eq!(terminal.codex_last_status_source, None);
+        assert_eq!(terminal.codex_attention_reason, None);
+    }
+
+    #[test]
+    fn running_codex_interrupt_banner_sets_inactive_without_clearing_session() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let identity = TrackedProcessIdentity {
+            pid: 7010,
+            creation_time: Some(8010),
+        };
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+            entry.codex_process_identity = Some(identity);
+            entry.codex_last_status_source = Some(CodexCliStatusSource::PromptSubmit);
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "codex-interrupted-banner".to_owned(),
+                },
+            })
+            .expect("send codex interrupted banner chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(terminal.codex_session_active);
+        assert_eq!(terminal.codex_process_identity, Some(identity));
+        assert_eq!(
+            terminal.codex_last_status_source,
+            Some(CodexCliStatusSource::VisibleUi)
+        );
+        assert_eq!(terminal.codex_attention_reason, None);
+    }
+
+    #[test]
+    fn attention_codex_interrupt_banner_sets_inactive_without_clearing_session() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let identity = TrackedProcessIdentity {
+            pid: 7011,
+            creation_time: Some(8011),
+        };
+        seed_codex_attention(&mut app, 1);
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.codex_session_active = true;
+            entry.codex_process_identity = Some(identity);
+            entry.codex_attention_reason = Some(CodexAttentionReason::UserInputRequested);
+            entry.codex_last_status_source = Some(CodexCliStatusSource::VisibleUi);
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "codex-interrupted-banner".to_owned(),
+                },
+            })
+            .expect("send codex interrupted banner chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(terminal.codex_session_active);
+        assert_eq!(terminal.codex_process_identity, Some(identity));
+        assert_eq!(
+            terminal.codex_last_status_source,
+            Some(CodexCliStatusSource::VisibleUi)
+        );
+        assert_eq!(terminal.codex_attention_reason, None);
+    }
+
+    #[test]
+    fn codex_question_prompt_can_return_after_interrupt_banner_without_relaunch() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let identity = TrackedProcessIdentity {
+            pid: 7012,
+            creation_time: Some(8012),
+        };
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+            entry.codex_process_identity = Some(identity);
+            entry.codex_last_status_source = Some(CodexCliStatusSource::PromptSubmit);
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "codex-interrupted-banner".to_owned(),
+                },
+            })
+            .expect("send codex interrupted banner chunk");
+        app.process_terminal_events(&ctx);
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "codex-question-prompt".to_owned(),
+                },
+            })
+            .expect("send codex question prompt chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert!(terminal.codex_session_active);
+        assert_eq!(terminal.codex_process_identity, Some(identity));
+        assert_eq!(
+            terminal.codex_last_status_source,
+            Some(CodexCliStatusSource::VisibleUi)
+        );
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::UserInputRequested)
+        );
+    }
+
+    #[test]
+    fn sticky_codex_attention_text_without_enter_stays_visible() {
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
         seed_codex_attention(&mut app, 1);
@@ -17321,12 +17957,278 @@ mod tests {
         app.route_active_terminal_input(&ctx, vec![Event::Text("continue".to_owned())]);
 
         let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert!(!terminal.codex_session_active);
+        assert!(terminal.codex_process_identity.is_none());
+        assert!(terminal.codex_process_missing_since.is_none());
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::TurnComplete)
+        );
+    }
+
+    #[test]
+    fn visible_codex_question_prompt_sets_attention_reason() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "codex-question-prompt".to_owned(),
+                },
+            })
+            .expect("send codex question prompt chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::UserInputRequested)
+        );
+        assert_eq!(
+            terminal.codex_last_status_source,
+            Some(CodexCliStatusSource::VisibleUi)
+        );
+    }
+
+    #[test]
+    fn visible_codex_question_prompt_preserves_matching_notify_attention() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_codex_attention(&mut app, 1);
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.codex_attention_reason = Some(CodexAttentionReason::UserInputRequested);
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "codex-question-prompt".to_owned(),
+                },
+            })
+            .expect("send codex question prompt chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.codex_last_status_source,
+            Some(CodexCliStatusSource::Notify)
+        );
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::UserInputRequested)
+        );
+    }
+
+    #[test]
+    fn visible_codex_question_prompt_upgrades_generic_notify_attention() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_codex_attention(&mut app, 1);
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.codex_attention_reason = Some(CodexAttentionReason::UnknownNotify);
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "codex-question-prompt".to_owned(),
+                },
+            })
+            .expect("send codex question prompt chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.codex_last_status_source,
+            Some(CodexCliStatusSource::VisibleUi)
+        );
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::UserInputRequested)
+        );
+    }
+
+    #[test]
+    fn generic_notify_does_not_downgrade_visible_codex_question_prompt() {
+        let ctx = Context::default();
+        let temp_dir = TestTempDir::new("codex-notify-after-visible-ui");
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.codex_cli_runtime_dir = Some(temp_dir.path.clone());
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "codex-question-prompt".to_owned(),
+                },
+            })
+            .expect("send codex question prompt chunk");
+        app.process_terminal_events(&ctx);
+
+        write_test_codex_notify_events(
+            &temp_dir.path,
+            1,
+            &test_codex_inbox_token(1),
+            &[CodexNotifyInboxEvent {
+                terminal_id: "1".to_owned(),
+                tool: "codex".to_owned(),
+                status: "attention".to_owned(),
+                inbox_token: Some(test_codex_inbox_token(1)),
+                event_kind: Some(CODEX_UNKNOWN_NOTIFY_EVENT.to_owned()),
+                raw_json: r#"{"event":"mystery"}"#.to_owned(),
+                timestamp_utc: "2026-04-06T00:00:00Z".to_owned(),
+            }],
+        );
+        app.poll_codex_notify_inboxes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.codex_last_status_source,
+            Some(CodexCliStatusSource::VisibleUi)
+        );
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::UserInputRequested)
+        );
+    }
+
+    #[test]
+    fn sticky_codex_attention_is_cleared_by_committed_reply() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_codex_attention(&mut app, 1);
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.runtime.set_codex_process_identity_for_test(None);
+            entry.codex_process_missing_since =
+                Some(Instant::now() - Duration::from_millis(CODEX_TRAILING_OUTPUT_GRACE_MS + 25));
+        }
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(&ctx);
+
+        app.route_active_terminal_input(&ctx, vec![Event::Text("continue".to_owned())]);
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
         assert_eq!(terminal.ai_session.tool, None);
         assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
         assert!(!terminal.codex_session_active);
         assert!(terminal.codex_process_identity.is_none());
         assert!(terminal.codex_process_missing_since.is_none());
         assert_eq!(terminal.codex_last_status_source, None);
+    }
+
+    #[test]
+    fn interactive_codex_attention_empty_enter_restores_running() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_codex_attention(&mut app, 1);
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.codex_attention_reason = Some(CodexAttentionReason::UserInputRequested);
+        }
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+        assert_eq!(
+            terminal.codex_last_status_source,
+            Some(CodexCliStatusSource::PromptSubmit)
+        );
+        assert_eq!(terminal.codex_attention_reason, None);
+    }
+
+    #[test]
+    fn sticky_interactive_codex_attention_is_cleared_by_empty_enter() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_codex_attention(&mut app, 1);
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.runtime.set_codex_process_identity_for_test(None);
+            entry.codex_process_missing_since =
+                Some(Instant::now() - Duration::from_millis(CODEX_TRAILING_OUTPUT_GRACE_MS + 25));
+            entry.codex_attention_reason = Some(CodexAttentionReason::UserInputRequested);
+        }
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(&ctx);
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, None);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert_eq!(terminal.codex_last_status_source, None);
+        assert_eq!(terminal.codex_attention_reason, None);
+    }
+
+    #[test]
+    fn codex_attention_same_terminal_focus_does_not_acknowledge() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_codex_attention(&mut app, 1);
+
+        app.set_active_terminal(&ctx, Some(1));
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::TurnComplete)
+        );
     }
 
     #[test]
@@ -17997,6 +18899,7 @@ mod tests {
             codex_last_process_seen_at: None,
             codex_process_missing_since: None,
             codex_last_status_source: None,
+            codex_attention_reason: None,
         }
     }
 
@@ -18158,7 +19061,21 @@ mod tests {
                 creation_time: Some(8001),
             });
             entry.codex_last_status_source = Some(CodexCliStatusSource::Notify);
+            entry.codex_attention_reason = Some(CodexAttentionReason::TurnComplete);
         }
+    }
+
+    fn poll_codex_process_exit_after_grace(app: &mut AdeApp, ctx: &Context, terminal_id: u64) {
+        {
+            let entry = app.terminals.get_mut(&terminal_id).expect("terminal");
+            entry.runtime.set_codex_process_identity_for_test(None);
+            entry.codex_process_missing_since =
+                Some(Instant::now() - Duration::from_millis(CODEX_TRAILING_OUTPUT_GRACE_MS + 25));
+        }
+
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(ctx);
     }
 
     fn test_factory_droid_inbox_token(terminal_id: u64) -> String {
@@ -19255,6 +20172,79 @@ mod tests {
             &output,
             Color32::from_rgb(232, 184, 76)
         ));
+    }
+
+    #[test]
+    fn activity_rail_ai_badge_prefers_attention_and_includes_terminal_label() {
+        let mut app = test_app_with_ai_hooks(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(1),
+        );
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            entry.ai_session.status = AiCliStatus::Running;
+        }
+        if let Some(entry) = app.terminals.get_mut(&2) {
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Attention;
+            entry.title = "Codex Wait".to_owned();
+            entry.full_title = "Codex Wait".to_owned();
+            entry.codex_attention_reason = Some(CodexAttentionReason::UserInputRequested);
+        }
+
+        let badge = app
+            .activity_rail_ai_badge_model()
+            .expect("expected global ai badge");
+
+        assert_eq!(badge.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(badge.status, AiCliStatus::Attention);
+        assert_eq!(
+            badge.tooltip_lines,
+            vec![
+                "Codex CLI - Waiting for your reply...".to_owned(),
+                "Terminal: Codex Wait".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn activity_rail_ai_badge_prefers_active_terminal_for_status_ties() {
+        let mut app = test_app_with_ai_hooks(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(2),
+        );
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.title = "First".to_owned();
+            entry.full_title = "First".to_owned();
+        }
+        if let Some(entry) = app.terminals.get_mut(&2) {
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.title = "Second".to_owned();
+            entry.full_title = "Second".to_owned();
+        }
+
+        let badge = app
+            .activity_rail_ai_badge_model()
+            .expect("expected global ai badge");
+
+        assert_eq!(badge.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(badge.status, AiCliStatus::Running);
+        assert_eq!(
+            badge.tooltip_lines,
+            vec![
+                "Codex CLI - Working...".to_owned(),
+                "Terminal: Second".to_owned(),
+            ]
+        );
     }
 
     #[test]

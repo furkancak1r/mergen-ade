@@ -1205,3 +1205,60 @@
   - Add viewport-bounds coverage for long prompt text whenever Settings layout changes touch wrapped content.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: 2026-04-09 user-reported `Settings > Prompts` follow-up; regression tests `settings_saved_message_chip_width_clamps_to_available_space`, `settings_saved_messages_selected_project_starts_open`, and `settings_saved_messages_long_prompt_keeps_popup_within_viewport`
+
+#### Codex running badge disappeared off-surface and Codex wait states looked like active work {#codex-running-badge-disappeared-off-surface-and-codex-wait-states-looked-like-active-work}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Codex CLI integration, especially when leaving the chat surface or returning to it mid-run
+- Error signature: `The Codex spinner vanished when the chat surface changed, and plan/question wait states still looked like ongoing work.`
+- Symptoms/Impact: Users could lose the only visible running indicator by switching away from the local terminal surface, then return later with no persistent signal that Codex was still working. When Codex stopped to ask a question or request plan approval, the UI still showed a spinner, so the interaction looked active instead of blocked on user input.
+- Root cause: `src/app.rs` only rendered AI badges on terminal-local surfaces and the spinner path did not request periodic repaints, so the running indicator depended on those widgets staying mounted. Codex attention also reused the generic interaction-clears-attention path, so focus/click/chat navigation could acknowledge it without an actual reply. `src/codex.rs` only classified a narrow subset of notify payloads, which made attention-worthy Codex callbacks too easy to drop into an unhelpful fallback state.
+- Resolution: The app now renders a persistent global AI badge in the activity rail while keeping the existing local badges, forces spinner repaints the same way pulse badges already did, and promotes Codex wait states to `Attention` with reason-aware pulse tooltips. Codex attention is no longer cleared by focus, click, or plain typing; it clears only after a real non-empty reply is committed with `Enter` or an equivalent saved-message send. Notify parsing now extracts `event`/`type`/`kind` names, maps approval and user-input requests explicitly, and treats any remaining routed Codex notify callback as attention via an `unknown-notify` fallback.
+- Prevent recurrence:
+  - Keep at least one always-mounted AI status surface for long-running integrations instead of relying only on terminal-local widgets.
+  - Separate `Running` and `Waiting for user` states in the model and visuals; do not overload the spinner for blocked interactions.
+  - For Codex attention, clear on actual submitted input, not generic focus or click events.
+  - Preserve an attention fallback for notify payloads that reach Mergen even when the upstream event schema evolves.
+- Files/Commands touched: `src/app.rs`, `src/codex.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 user-reported Codex badge persistence and wait-state confusion; official Codex docs for `notify` payload routing and TUI notifications (`https://developers.openai.com/codex/config-reference#configtoml`, `https://developers.openai.com/codex/app-server#toolrequestuserinput`)
+
+#### Codex question prompts could stay on spinner when notify was missing, and plan prompts were missing from the notify allow-list {#codex-question-prompts-could-stay-on-spinner-when-notify-was-missing-and-plan-prompts-were-missing-from-the-notify-allow-list}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Codex CLI integration with native TUI question prompts and plan mode approvals
+- Error signature: `Codex showed Question 1/1 or waited on a plan decision, but Mergen kept the running spinner instead of switching to pulse.`
+- Symptoms/Impact: Users could miss that Codex had already stopped for input. Question prompts triggered via the TUI footer (`tab to add notes | enter to submit answer | esc to interrupt`) looked like ongoing work when the upstream notify callback was absent, and plan-mode waits were easier to miss because `plan-mode-prompt` was not part of Mergen’s required Codex notification set.
+- Root cause: `src/codex.rs` only required `agent-turn-complete`, `approval-requested`, and `user-input-requested` in `tui.notifications`, so plan-mode prompt events were not explicitly requested from Codex. Separately, `src/app.rs` only upgraded Codex raw PTY chunks to attention on `[bell]`, even though `src/terminal.rs` already had the right bounded-buffer, ANSI-normalized parsing pattern for visible wait-state chrome. That left native Codex question screens invisible to Mergen whenever notify did not arrive.
+- Resolution: Mergen now adds `plan-mode-prompt` to the required Codex notification list and maps it to a dedicated Codex attention reason. The terminal reader also gained a Codex-specific visible prompt parser that detects the question UI chrome through a bounded ANSI-normalized buffer and emits a `codex-question-prompt` raw chunk only while a Codex session is active. `src/app.rs` promotes that fallback to `Attention` with a `VisibleUi` source, keeps `Notify` higher priority than the fallback, and treats interactive Codex attention reasons as satisfiable by an empty `Enter` submit so selection-based approvals/questions return to `Running` instead of sticking on pulse.
+- Prevent recurrence:
+  - Keep Codex `tui.notifications` in sync with all known user-blocking wait states, not just turn-complete and direct approvals.
+  - Reuse the terminal-layer visible-status parser pattern for AI CLIs that render blocked UI directly in the PTY.
+  - For selection-based CLI prompts, test both non-empty text replies and empty `Enter` submits.
+- Files/Commands touched: `src/app.rs`, `src/codex.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 screenshot-backed Codex question prompt report; regression tests `codex_notify_inbox_maps_plan_mode_prompt_to_attention`, `visible_codex_question_prompt_sets_attention_reason`, `interactive_codex_attention_empty_enter_restores_running`, `sticky_interactive_codex_attention_is_cleared_by_empty_enter`, and `collect_ai_read_signals_emits_visible_codex_question_prompt_for_codex_sessions`
+
+#### Codex interactive pulse could remain after the Codex child process had already exited {#codex-interactive-pulse-could-remain-after-the-codex-child-process-had-already-exited}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Codex CLI integration after `request_user_input`, approval waits, plan-mode waits, or other attention states that outlive the child-process check
+- Error signature: `Mergen still showed a Codex pulse after the Codex session had already returned to the shell prompt or been interrupted with Ctrl+C.`
+- Symptoms/Impact: Users could see a pulse that looked like Codex was still blocked on them even though the actual Codex child process was already gone. This was especially misleading after interactive question-tool flows because the answer screen could finish, the shell prompt could return, and Mergen still kept the pulse alive until the user sent more input.
+- Root cause: `src/app.rs` treated every Codex `Attention` status the same when the tracked Codex child process disappeared after trailing grace. That branch only called `clear_codex_process_tracking()`, which intentionally preserved the sticky attention state regardless of whether the reason was a durable `TurnComplete` reminder or a process-bound interactive wait such as `UserInputRequested`, `ApprovalRequested`, or `PlanModePrompt`.
+- Resolution: Codex attention cleanup on process disappearance is now reason-aware. After trailing grace, `TurnComplete` remains sticky, but interactive and generic attention reasons are fully cleared with the rest of the Codex session state. This covers notify-driven waits, visible-ui question prompts, and generic fallback attention that no longer has a live Codex child behind it.
+- Prevent recurrence:
+  - Distinguish sticky “you may continue later” reminders from process-bound “I am blocked right now” waits before preserving attention across process loss.
+  - Add explicit process-exit regressions for each Codex attention reason instead of relying on one generic sticky-attention test.
+  - Keep visible-ui and notify-backed Codex waits aligned so session exit clears both consistently.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 user-reported Codex question-tool pulse persisting after shell prompt return; regression tests `codex_attention_stays_visible_after_process_exit_grace`, `notify_user_input_codex_attention_clears_after_process_exit_grace`, `approval_requested_codex_attention_clears_after_process_exit_grace`, `plan_mode_codex_attention_clears_after_process_exit_grace`, `unknown_codex_attention_clears_after_process_exit_grace`, and `visible_codex_question_prompt_clears_after_process_exit_grace`
+
+#### Codex spinner could keep running after an `Esc` interrupt even though the active turn had already stopped {#codex-spinner-could-keep-running-after-an-esc-interrupt-even-though-the-active-turn-had-already-stopped}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Codex CLI integration during an in-flight turn that gets interrupted from the Codex TUI with `Esc`
+- Error signature: `Codex showed the "Conversation interrupted ... /feedback" banner, but Mergen kept the running spinner visible.`
+- Symptoms/Impact: Users could stop the current Codex turn, see the shell/TUI remain alive and ready for follow-up input, but still get a spinner that implied active work was continuing. This was especially confusing because the interrupt banner is a terminal-local UI state, not a process exit.
+- Root cause: Mergen had no Codex-specific visible-ui detector for the interrupt banner, so the only post-submit running signal (`PromptSubmit`) remained in place until some later notify, question prompt, or process lifecycle change overwrote it. The existing visible parser only recognized the question prompt footer and intentionally ignored generic text.
+- Resolution: The terminal-layer Codex visible-ui parser now recognizes the interrupt banner through a conservative multi-marker match (`conversation interrupted` plus the banner-specific follow-up/help text) and emits a dedicated raw chunk. `src/app.rs` maps that chunk to `AiCliStatus::Inactive` with `VisibleUi` as the source, which hides the spinner immediately without clearing the live Codex session or process tracking. Follow-up prompts and later question screens still work in the same session.
+- Prevent recurrence:
+  - Treat “turn stopped but session still alive” as a first-class Codex UI state distinct from both process exit and user-blocking attention.
+  - Keep the interrupt parser stricter than the question parser; never key off the word `interrupt` alone because question prompts already include `esc to interrupt`.
+  - Cover both `Running -> Inactive` and `Attention -> Inactive` interruption paths in regressions.
+- Files/Commands touched: `src/app.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 user-reported `Esc` interrupt spinner persistence; regression tests `pending_visible_codex_status_detects_split_interrupted_banner_across_reads`, `running_codex_interrupt_banner_sets_inactive_without_clearing_session`, `attention_codex_interrupt_banner_sets_inactive_without_clearing_session`, and `codex_question_prompt_can_return_after_interrupt_banner_without_relaunch`

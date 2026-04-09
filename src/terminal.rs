@@ -1792,6 +1792,59 @@ impl PendingVisibleFactoryStatus {
     }
 }
 
+#[derive(Debug, Default)]
+struct PendingVisibleCodexStatus {
+    buffer: String,
+}
+
+impl PendingVisibleCodexStatus {
+    #[cfg(test)]
+    fn extract_from_text(&mut self, text: &str) -> Option<String> {
+        self.extract_from_text_with_end_offset(text)
+            .map(|(status, _)| status)
+    }
+
+    fn extract_from_text_with_end_offset(&mut self, text: &str) -> Option<(String, usize)> {
+        if text.is_empty() {
+            return None;
+        }
+
+        let previous_buffer_len = self.buffer.len();
+        self.buffer.push_str(text);
+
+        if let Some((detected, end_offset)) = detect_visible_codex_status_with_end(&self.buffer) {
+            self.buffer.clear();
+            return Some((
+                detected.to_string(),
+                end_offset
+                    .saturating_sub(previous_buffer_len)
+                    .min(text.len()),
+            ));
+        }
+
+        self.truncate_to_limit();
+        None
+    }
+
+    fn truncate_to_limit(&mut self) {
+        let overflow = self
+            .buffer
+            .chars()
+            .count()
+            .saturating_sub(MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS);
+        if overflow == 0 {
+            return;
+        }
+
+        let mut char_indices = self.buffer.char_indices();
+        let split_at = char_indices
+            .nth(overflow - 1)
+            .map(|(index, ch)| index + ch.len_utf8())
+            .unwrap_or(0);
+        self.buffer.drain(..split_at);
+    }
+}
+
 fn detect_visible_factory_status_with_end(text: &str) -> Option<(&'static str, usize)> {
     let (projection, projection_offsets) = build_visible_status_projection(text);
     let (collapsed, collapsed_offsets) =
@@ -1827,6 +1880,74 @@ fn detect_visible_factory_status_with_end(text: &str) -> Option<(&'static str, u
     }
 
     None
+}
+
+fn detect_visible_codex_status_with_end(text: &str) -> Option<(&'static str, usize)> {
+    let (projection, projection_offsets) = build_visible_status_projection(text);
+    let (collapsed, collapsed_offsets) =
+        collapse_projection_whitespace(&projection, &projection_offsets);
+
+    if let Some(end_offset) =
+        detect_visible_codex_interrupted_banner_with_end(&collapsed, &collapsed_offsets)
+    {
+        return Some(("codex-interrupted-banner", end_offset));
+    }
+
+    if let Some(end_offset) =
+        detect_visible_codex_question_prompt_with_end(&collapsed, &collapsed_offsets)
+    {
+        return Some(("codex-question-prompt", end_offset));
+    }
+
+    None
+}
+
+fn detect_visible_codex_question_prompt_with_end(
+    collapsed: &str,
+    collapsed_offsets: &[usize],
+) -> Option<usize> {
+    let question_start = collapsed.find("question ")?;
+    let counter_start = question_start + "question ".len();
+    let unanswered_start = collapsed[counter_start..]
+        .find("unanswered")
+        .map(|offset| counter_start + offset)?;
+    if !collapsed[counter_start..unanswered_start].contains('/') {
+        return None;
+    }
+
+    let enter_start = collapsed[unanswered_start..]
+        .find("enter to submit answer")
+        .map(|offset| unanswered_start + offset)?;
+    let esc_start = collapsed[enter_start..]
+        .find("esc to interrupt")
+        .map(|offset| enter_start + offset)?;
+    let latest_end = esc_start + "esc to interrupt".len();
+    let end_char_index = collapsed[..latest_end].chars().count().saturating_sub(1);
+    collapsed_offsets.get(end_char_index).copied()
+}
+
+fn detect_visible_codex_interrupted_banner_with_end(
+    collapsed: &str,
+    collapsed_offsets: &[usize],
+) -> Option<usize> {
+    let interrupted_start = collapsed.find("conversation interrupted")?;
+    let interrupted_end = interrupted_start + "conversation interrupted".len();
+
+    let detail_end = [
+        "tell the model what to do differently",
+        "something went wrong",
+        "/feedback",
+    ]
+    .into_iter()
+    .filter_map(|needle| {
+        collapsed[interrupted_end..]
+            .find(needle)
+            .map(|offset| interrupted_end + offset + needle.len())
+    })
+    .max()?;
+
+    let end_char_index = collapsed[..detail_end].chars().count().saturating_sub(1);
+    collapsed_offsets.get(end_char_index).copied()
 }
 
 fn build_visible_status_projection(text: &str) -> (String, Vec<usize>) {
@@ -1953,6 +2074,7 @@ fn collect_ai_read_signals(
     manager: &AiHookManager,
     pending_osc_title: &mut PendingOscTitle,
     pending_visible_factory_status: &mut PendingVisibleFactoryStatus,
+    pending_visible_codex_status: &mut PendingVisibleCodexStatus,
 ) -> Vec<PendingAiReadSignal> {
     let text = String::from_utf8_lossy(bytes);
     let mut signals = manager
@@ -2018,6 +2140,21 @@ fn collect_ai_read_signals(
         });
     }
 
+    if manager
+        .session(terminal_id)
+        .and_then(|session| session.tool)
+        == Some(AiCliTool::CodexCli)
+    {
+        if let Some((chunk, end_offset)) =
+            pending_visible_codex_status.extract_from_text_with_end_offset(&text)
+        {
+            signals.push(PendingAiReadSignal {
+                text_offset: end_offset.min(text.len()),
+                kind: PendingAiReadSignalKind::RawChunk { chunk },
+            });
+        }
+    }
+
     signals.sort_by_key(|signal| signal.text_offset);
     signals
 }
@@ -2035,6 +2172,7 @@ fn spawn_reader_thread(
         let mut buffer = vec![0u8; IO_BUFFER_SIZE];
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
 
         loop {
             match reader.read(&mut buffer) {
@@ -2054,6 +2192,7 @@ fn spawn_reader_thread(
                             manager,
                             &mut pending_osc_title,
                             &mut pending_visible_factory_status,
+                            &mut pending_visible_codex_status,
                         ) {
                             match signal.kind {
                                 PendingAiReadSignalKind::StatusChange {
@@ -2823,18 +2962,19 @@ mod tests {
         snapshot_from_terminal, snapshots_from_terminal, test_terminal_runtime,
         trim_trailing_default_cells, verified_process_entry, verified_process_tree_descendants,
         verified_snapshot_root_process, AdeTerminalConfig, PendingAiReadSignalKind,
-        PendingOscTitle, PendingVisibleFactoryStatus, ProcessSnapshotEntry,
-        RootProcessTerminationPlan, RuntimeCommand, SharedWriter, SharedWriterHandle,
-        TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape, TerminalDimensions,
-        TerminalRuntime, TerminalSelectionHyperlink, TerminalStyle, TerminalStyledCell,
-        TrackedProcessIdentity, VerifiedProcessLookup, MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS,
+        PendingOscTitle, PendingVisibleCodexStatus, PendingVisibleFactoryStatus,
+        ProcessSnapshotEntry, RootProcessTerminationPlan, RuntimeCommand, SharedWriter,
+        SharedWriterHandle, TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape,
+        TerminalDimensions, TerminalRuntime, TerminalSelectionHyperlink, TerminalStyle,
+        TerminalStyledCell, TrackedProcessIdentity, VerifiedProcessLookup,
+        MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS,
     };
     use crate::codex::{
         codex_env_pairs, MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR, MERGEN_AI_INBOX_DIR_ENV_VAR,
         MERGEN_AI_TOOL_HINT_CODEX, MERGEN_AI_TOOL_HINT_ENV_VAR, MERGEN_TERMINAL_ID_ENV_VAR,
     };
     use crate::hooks::{
-        AiCliStatus, AiHooksConfig, FACTORY_DROID_HOOKS_DIR_ENV_VAR,
+        AiCliStatus, AiCliTool, AiHooksConfig, FACTORY_DROID_HOOKS_DIR_ENV_VAR,
         FACTORY_DROID_HOOK_INBOX_TOKEN_ENV_VAR, FACTORY_DROID_TERMINAL_ID_ENV_VAR,
     };
     use std::{
@@ -2984,6 +3124,104 @@ mod tests {
     }
 
     #[test]
+    fn pending_visible_codex_status_detects_split_question_prompt_across_reads() {
+        let mut pending = PendingVisibleCodexStatus::default();
+
+        assert_eq!(pending.extract_from_text("Question 1/1 (1 una"), None);
+        assert_eq!(
+            pending.extract_from_text(
+                "nswered)\n tab to add notes | enter to submit answer | esc to interrupt"
+            ),
+            Some("codex-question-prompt".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_codex_status_normalizes_ansi_and_crlf() {
+        let mut pending = PendingVisibleCodexStatus::default();
+
+        assert_eq!(
+            pending.extract_from_text(
+                "\u{1b}[1mQuestion 1/1\u{1b}[0m\r\n(1 unanswered)\r\ntab to add notes | enter to submit answer | esc to interrupt"
+            ),
+            Some("codex-question-prompt".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_codex_status_requires_full_prompt_chrome() {
+        assert_eq!(
+            PendingVisibleCodexStatus::default().extract_from_text("question"),
+            None
+        );
+        assert_eq!(
+            PendingVisibleCodexStatus::default()
+                .extract_from_text("Question about unanswered work items"),
+            None
+        );
+        assert_eq!(
+            PendingVisibleCodexStatus::default()
+                .extract_from_text("enter to submit answer without question footer"),
+            None
+        );
+        assert_eq!(
+            PendingVisibleCodexStatus::default().extract_from_text(
+                "Question about unanswered work items | enter to submit answer | esc to interrupt"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn pending_visible_codex_status_detects_split_interrupted_banner_across_reads() {
+        let mut pending = PendingVisibleCodexStatus::default();
+
+        assert_eq!(
+            pending.extract_from_text("Conversation interrupted - tell "),
+            None
+        );
+        assert_eq!(
+            pending.extract_from_text(
+                "the model what to do differently. Something went wrong? Hit `/feedback` to report the issue."
+            ),
+            Some("codex-interrupted-banner".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_codex_status_normalizes_interrupted_banner_ansi_and_crlf() {
+        let mut pending = PendingVisibleCodexStatus::default();
+
+        assert_eq!(
+            pending.extract_from_text(
+                "\u{1b}[1mConversation interrupted\u{1b}[0m\r\nSomething went wrong? Hit `/feedback` to report the issue."
+            ),
+            Some("codex-interrupted-banner".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_codex_status_does_not_treat_question_footer_as_interrupted_banner() {
+        let mut pending = PendingVisibleCodexStatus::default();
+
+        assert_eq!(
+            pending.extract_from_text(
+                "Question 1/1 (1 unanswered)\n tab to add notes | enter to submit answer | esc to interrupt"
+            ),
+            Some("codex-question-prompt".to_string())
+        );
+        assert_eq!(
+            PendingVisibleCodexStatus::default().extract_from_text("Conversation interrupted"),
+            None
+        );
+        assert_eq!(
+            PendingVisibleCodexStatus::default()
+                .extract_from_text("Something went wrong? Hit `/feedback`"),
+            None
+        );
+    }
+
+    #[test]
     fn extract_title_from_bytes_only_reads_osc_sequences() {
         assert_eq!(
             extract_complete_title_from_bytes(b"\x1b]0;[Working...]\x07"),
@@ -3032,6 +3270,7 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let bytes = b"[droid-hook:event=UserPromptSubmit]\x1b]0;[Idle]\x07";
 
         let signals = collect_ai_read_signals(
@@ -3040,6 +3279,7 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
         );
 
         let status_changes = signals
@@ -3067,6 +3307,7 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let bytes = b"[droid-hook:event=UserPromptSubmit]HOOKS  Stop";
 
         let signals = collect_ai_read_signals(
@@ -3075,6 +3316,7 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
         );
 
         let ordered_kinds = signals
@@ -3103,6 +3345,7 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let hook = "[droid-hook:event=UserPromptSubmit]";
         let bytes = b"[droid-hook:event=UserPromptSubmit]\xF0\x9F\x94\x94";
 
@@ -3112,6 +3355,7 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
         );
 
         assert_eq!(signals.len(), 2);
@@ -3156,6 +3400,7 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
 
         let signals = collect_ai_read_signals(
             1,
@@ -3163,6 +3408,7 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
         );
 
         assert_eq!(signals.len(), 1);
@@ -3180,6 +3426,7 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
 
         let signals = collect_ai_read_signals(
             1,
@@ -3187,6 +3434,7 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
         );
 
         assert_eq!(
@@ -3207,6 +3455,7 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
 
         let signals = collect_ai_read_signals(
             1,
@@ -3214,6 +3463,7 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
         );
 
         assert!(signals.iter().any(|signal| matches!(
@@ -3235,6 +3485,7 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
 
         let signals = collect_ai_read_signals(
             1,
@@ -3242,6 +3493,7 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
         );
 
         assert!(signals.iter().any(|signal| matches!(
@@ -3277,6 +3529,7 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
 
         let signals = collect_ai_read_signals(
             1,
@@ -3284,6 +3537,7 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
         );
 
         assert!(signals.iter().any(|signal| matches!(
@@ -3303,6 +3557,100 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn collect_ai_read_signals_emits_visible_codex_question_prompt_for_codex_sessions() {
+        let manager =
+            crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        manager.set_tool(1, AiCliTool::CodexCli);
+        let mut pending_osc_title = PendingOscTitle::default();
+        let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+
+        let signals = collect_ai_read_signals(
+            1,
+            b"Question 1/1 (1 unanswered)\n tab to add notes | enter to submit answer | esc to interrupt",
+            &manager,
+            &mut pending_osc_title,
+            &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
+        );
+
+        assert!(signals.iter().any(|signal| matches!(
+            &signal.kind,
+            PendingAiReadSignalKind::RawChunk { chunk } if chunk == "codex-question-prompt"
+        )));
+    }
+
+    #[test]
+    fn collect_ai_read_signals_ignores_visible_codex_question_prompt_for_non_codex_sessions() {
+        let manager =
+            crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let mut pending_osc_title = PendingOscTitle::default();
+        let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+
+        let signals = collect_ai_read_signals(
+            1,
+            b"Question 1/1 (1 unanswered)\n tab to add notes | enter to submit answer | esc to interrupt",
+            &manager,
+            &mut pending_osc_title,
+            &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
+        );
+
+        assert!(!signals.iter().any(|signal| matches!(
+            &signal.kind,
+            PendingAiReadSignalKind::RawChunk { chunk } if chunk == "codex-question-prompt"
+        )));
+    }
+
+    #[test]
+    fn collect_ai_read_signals_emits_visible_codex_interrupted_banner_for_codex_sessions() {
+        let manager =
+            crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        manager.set_tool(1, AiCliTool::CodexCli);
+        let mut pending_osc_title = PendingOscTitle::default();
+        let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+
+        let signals = collect_ai_read_signals(
+            1,
+            b"Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.",
+            &manager,
+            &mut pending_osc_title,
+            &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
+        );
+
+        assert!(signals.iter().any(|signal| matches!(
+            &signal.kind,
+            PendingAiReadSignalKind::RawChunk { chunk } if chunk == "codex-interrupted-banner"
+        )));
+    }
+
+    #[test]
+    fn collect_ai_read_signals_ignores_visible_codex_interrupted_banner_for_non_codex_sessions() {
+        let manager =
+            crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let mut pending_osc_title = PendingOscTitle::default();
+        let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+
+        let signals = collect_ai_read_signals(
+            1,
+            b"Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.",
+            &manager,
+            &mut pending_osc_title,
+            &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
+        );
+
+        assert!(!signals.iter().any(|signal| matches!(
+            &signal.kind,
+            PendingAiReadSignalKind::RawChunk { chunk } if chunk == "codex-interrupted-banner"
+        )));
     }
 
     fn snapshot_entry(

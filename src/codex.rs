@@ -22,6 +22,9 @@ pub const MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR: &str = "MERGEN_ADE_CODEX_INBOX_T
 pub const CODEX_NOTIFICATION_METHOD: &str = "bel";
 pub const CODEX_TURN_COMPLETE_EVENT: &str = "agent-turn-complete";
 pub const CODEX_APPROVAL_REQUESTED_EVENT: &str = "approval-requested";
+pub const CODEX_USER_INPUT_REQUESTED_EVENT: &str = "user-input-requested";
+pub const CODEX_PLAN_MODE_PROMPT_EVENT: &str = "plan-mode-prompt";
+pub const CODEX_UNKNOWN_NOTIFY_EVENT: &str = "unknown-notify";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -287,12 +290,9 @@ pub fn write_codex_notify_event(
         }
     }
 
-    let event_kind = classify_codex_notify_payload(payload);
-    let status = if event_kind.is_some() {
-        "attention"
-    } else {
-        "unknown"
-    };
+    let event_kind = classify_codex_notify_payload(payload)
+        .unwrap_or_else(|| CODEX_UNKNOWN_NOTIFY_EVENT.to_owned());
+    let status = "attention";
     let timestamp_utc = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs().to_string())
@@ -302,7 +302,7 @@ pub fn write_codex_notify_event(
         tool: MERGEN_AI_TOOL_HINT_CODEX.to_owned(),
         status: status.to_owned(),
         inbox_token: Some(inbox_token.to_owned()),
-        event_kind: event_kind.map(str::to_owned),
+        event_kind: Some(event_kind),
         raw_json: payload.trim().to_owned(),
         timestamp_utc,
     };
@@ -322,13 +322,35 @@ pub fn write_codex_notify_event(
     Ok(())
 }
 
-fn classify_codex_notify_payload(payload: &str) -> Option<&'static str> {
+fn classify_codex_notify_payload(payload: &str) -> Option<String> {
+    if let Some(event_name) = extract_codex_notify_event_name(payload) {
+        return Some(classify_codex_notify_event_name(&event_name).unwrap_or(event_name));
+    }
+
     let lower = payload.to_ascii_lowercase();
     if lower.contains(CODEX_APPROVAL_REQUESTED_EVENT)
         || lower.contains("approval_requested")
         || lower.contains("approval requested")
     {
-        return Some(CODEX_APPROVAL_REQUESTED_EVENT);
+        return Some(CODEX_APPROVAL_REQUESTED_EVENT.to_owned());
+    }
+
+    if lower.contains(CODEX_USER_INPUT_REQUESTED_EVENT)
+        || lower.contains("user_input_requested")
+        || lower.contains("user input requested")
+        || lower.contains("request_user_input")
+        || lower.contains("request-user-input")
+        || lower.contains("requestuserinput")
+        || lower.contains("tool/requestuserinput")
+    {
+        return Some(CODEX_USER_INPUT_REQUESTED_EVENT.to_owned());
+    }
+
+    if lower.contains(CODEX_PLAN_MODE_PROMPT_EVENT)
+        || lower.contains("plan_mode_prompt")
+        || lower.contains("plan mode prompt")
+    {
+        return Some(CODEX_PLAN_MODE_PROMPT_EVENT.to_owned());
     }
 
     if lower.contains(CODEX_TURN_COMPLETE_EVENT)
@@ -336,10 +358,59 @@ fn classify_codex_notify_payload(payload: &str) -> Option<&'static str> {
         || lower.contains("agent turn complete")
         || lower.contains("turn/completed")
     {
-        return Some(CODEX_TURN_COMPLETE_EVENT);
+        return Some(CODEX_TURN_COMPLETE_EVENT.to_owned());
     }
 
     None
+}
+
+fn extract_codex_notify_event_name(payload: &str) -> Option<String> {
+    fn search(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::Object(map) => {
+                for key in ["event", "type", "kind", "name"] {
+                    if let Some(name) = map.get(key).and_then(serde_json::Value::as_str) {
+                        let normalized = name.trim().to_ascii_lowercase();
+                        if !normalized.is_empty() {
+                            return Some(normalized);
+                        }
+                    }
+                }
+                for child in map.values() {
+                    if let Some(name) = search(child) {
+                        return Some(name);
+                    }
+                }
+                None
+            }
+            serde_json::Value::Array(items) => items.iter().find_map(search),
+            _ => None,
+        }
+    }
+
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|value| search(&value))
+}
+
+fn classify_codex_notify_event_name(event_name: &str) -> Option<String> {
+    let normalized = event_name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect::<String>();
+
+    match normalized.as_str() {
+        "approvalrequested" => Some(CODEX_APPROVAL_REQUESTED_EVENT.to_owned()),
+        "userinputrequested" | "requestuserinput" | "toolrequestuserinput" => {
+            Some(CODEX_USER_INPUT_REQUESTED_EVENT.to_owned())
+        }
+        "planmodeprompt" => Some(CODEX_PLAN_MODE_PROMPT_EVENT.to_owned()),
+        "agentturncomplete" | "turncompleted" | "turncomplete" => {
+            Some(CODEX_TURN_COMPLETE_EVENT.to_owned())
+        }
+        _ => None,
+    }
 }
 
 fn codex_notify_command(executable_path: &Path) -> Vec<String> {
@@ -353,6 +424,8 @@ fn codex_notification_events() -> Vec<TomlValue> {
     vec![
         TomlValue::String(CODEX_TURN_COMPLETE_EVENT.to_owned()),
         TomlValue::String(CODEX_APPROVAL_REQUESTED_EVENT.to_owned()),
+        TomlValue::String(CODEX_USER_INPUT_REQUESTED_EVENT.to_owned()),
+        TomlValue::String(CODEX_PLAN_MODE_PROMPT_EVENT.to_owned()),
     ]
 }
 
@@ -439,7 +512,12 @@ fn inspect_codex_cli_integration_at_path(
     let notifications_match = tui.get("notifications").is_some_and(|notifications| {
         toml_value_string_array_contains_all(
             notifications,
-            &[CODEX_TURN_COMPLETE_EVENT, CODEX_APPROVAL_REQUESTED_EVENT],
+            &[
+                CODEX_TURN_COMPLETE_EVENT,
+                CODEX_APPROVAL_REQUESTED_EVENT,
+                CODEX_USER_INPUT_REQUESTED_EVENT,
+                CODEX_PLAN_MODE_PROMPT_EVENT,
+            ],
         )
     });
 
@@ -472,7 +550,8 @@ mod tests {
         codex_env_pairs, codex_notify_inbox_path_for_dir, handle_codex_notify,
         inspect_codex_cli_integration_at_path, patch_codex_config_file, write_codex_notify_event,
         CodexConfigPatchOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent,
-        CODEX_APPROVAL_REQUESTED_EVENT, CODEX_NOTIFICATION_METHOD, CODEX_TURN_COMPLETE_EVENT,
+        CODEX_APPROVAL_REQUESTED_EVENT, CODEX_NOTIFICATION_METHOD, CODEX_PLAN_MODE_PROMPT_EVENT,
+        CODEX_TURN_COMPLETE_EVENT, CODEX_UNKNOWN_NOTIFY_EVENT, CODEX_USER_INPUT_REQUESTED_EVENT,
         MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR, MERGEN_AI_INBOX_DIR_ENV_VAR,
         MERGEN_AI_TOOL_HINT_CODEX, MERGEN_AI_TOOL_HINT_ENV_VAR, MERGEN_TERMINAL_ID_ENV_VAR,
     };
@@ -523,10 +602,10 @@ mod tests {
     }
 
     #[test]
-    fn codex_notify_writer_keeps_unknown_payloads_for_bell_fallback() {
-        let temp = TestTempDir::new("codex-notify-unknown");
+    fn codex_notify_writer_maps_user_input_requests_to_attention() {
+        let temp = TestTempDir::new("codex-notify-user-input");
         write_codex_notify_event(
-            r#"{"message":"something else"}"#,
+            r#"{"type":"tool/requestUserInput"}"#,
             "8",
             &temp.path,
             "codex-token-8",
@@ -539,9 +618,62 @@ mod tests {
         let event: CodexNotifyInboxEvent =
             serde_json::from_str(payload.trim()).expect("should parse inbox event");
 
-        assert_eq!(event.status, "unknown");
+        assert_eq!(event.status, "attention");
         assert_eq!(event.inbox_token.as_deref(), Some("codex-token-8"));
-        assert_eq!(event.event_kind, None);
+        assert_eq!(
+            event.event_kind.as_deref(),
+            Some(CODEX_USER_INPUT_REQUESTED_EVENT)
+        );
+    }
+
+    #[test]
+    fn codex_notify_writer_maps_plan_mode_prompts_to_attention() {
+        let temp = TestTempDir::new("codex-notify-plan-mode");
+        write_codex_notify_event(
+            r#"{"event":"plan-mode-prompt"}"#,
+            "10",
+            &temp.path,
+            "codex-token-10",
+            Some(MERGEN_AI_TOOL_HINT_CODEX),
+        )
+        .expect("should write codex notify event");
+
+        let path = codex_notify_inbox_path_for_dir(&temp.path, 10, "codex-token-10");
+        let payload = fs::read_to_string(path).expect("should read inbox");
+        let event: CodexNotifyInboxEvent =
+            serde_json::from_str(payload.trim()).expect("should parse inbox event");
+
+        assert_eq!(event.status, "attention");
+        assert_eq!(event.inbox_token.as_deref(), Some("codex-token-10"));
+        assert_eq!(
+            event.event_kind.as_deref(),
+            Some(CODEX_PLAN_MODE_PROMPT_EVENT)
+        );
+    }
+
+    #[test]
+    fn codex_notify_writer_keeps_unknown_payloads_as_attention_fallback() {
+        let temp = TestTempDir::new("codex-notify-unknown");
+        write_codex_notify_event(
+            r#"{"message":"something else"}"#,
+            "9",
+            &temp.path,
+            "codex-token-9",
+            Some(MERGEN_AI_TOOL_HINT_CODEX),
+        )
+        .expect("should write codex notify event");
+
+        let path = codex_notify_inbox_path_for_dir(&temp.path, 9, "codex-token-9");
+        let payload = fs::read_to_string(path).expect("should read inbox");
+        let event: CodexNotifyInboxEvent =
+            serde_json::from_str(payload.trim()).expect("should parse inbox event");
+
+        assert_eq!(event.status, "attention");
+        assert_eq!(event.inbox_token.as_deref(), Some("codex-token-9"));
+        assert_eq!(
+            event.event_kind.as_deref(),
+            Some(CODEX_UNKNOWN_NOTIFY_EVENT)
+        );
     }
 
     #[test]
@@ -618,7 +750,12 @@ alternate_screen = "never"
                 .iter()
                 .map(|item| item.as_str().unwrap_or_default())
                 .collect::<Vec<_>>(),
-            vec![CODEX_TURN_COMPLETE_EVENT, CODEX_APPROVAL_REQUESTED_EVENT]
+            vec![
+                CODEX_TURN_COMPLETE_EVENT,
+                CODEX_APPROVAL_REQUESTED_EVENT,
+                CODEX_USER_INPUT_REQUESTED_EVENT,
+                CODEX_PLAN_MODE_PROMPT_EVENT,
+            ]
         );
         assert_eq!(
             value["notify"]
@@ -681,7 +818,12 @@ alternate_screen = "never"
                 .iter()
                 .map(|item| item.as_str().unwrap_or_default())
                 .collect::<Vec<_>>(),
-            vec![CODEX_TURN_COMPLETE_EVENT, CODEX_APPROVAL_REQUESTED_EVENT]
+            vec![
+                CODEX_TURN_COMPLETE_EVENT,
+                CODEX_APPROVAL_REQUESTED_EVENT,
+                CODEX_USER_INPUT_REQUESTED_EVENT,
+                CODEX_PLAN_MODE_PROMPT_EVENT,
+            ]
         );
         assert_eq!(
             value["notify"]
@@ -734,7 +876,12 @@ alternate_screen = "never"
                 .iter()
                 .map(|item| item.as_str().unwrap_or_default())
                 .collect::<Vec<_>>(),
-            vec![CODEX_TURN_COMPLETE_EVENT, CODEX_APPROVAL_REQUESTED_EVENT]
+            vec![
+                CODEX_TURN_COMPLETE_EVENT,
+                CODEX_APPROVAL_REQUESTED_EVENT,
+                CODEX_USER_INPUT_REQUESTED_EVENT,
+                CODEX_PLAN_MODE_PROMPT_EVENT,
+            ]
         );
         assert_eq!(
             value["tui"]["notification_method"].as_str(),
@@ -773,7 +920,12 @@ notification_method = "desktop"
                 .iter()
                 .map(|item| item.as_str().unwrap_or_default())
                 .collect::<Vec<_>>(),
-            vec![CODEX_TURN_COMPLETE_EVENT, CODEX_APPROVAL_REQUESTED_EVENT]
+            vec![
+                CODEX_TURN_COMPLETE_EVENT,
+                CODEX_APPROVAL_REQUESTED_EVENT,
+                CODEX_USER_INPUT_REQUESTED_EVENT,
+                CODEX_PLAN_MODE_PROMPT_EVENT,
+            ]
         );
         assert_eq!(
             value["tui"]["notification_method"].as_str(),
@@ -792,7 +944,7 @@ notify = ['C:\Users\furkan.cakir\Desktop\mergen-ade.exe', "--codex-notify"]
 
 [tui]
 notification_method = "bel"
-notifications = ["agent-turn-complete", "approval-requested", "extra-event"]
+notifications = ["agent-turn-complete", "approval-requested", "user-input-requested", "plan-mode-prompt", "extra-event"]
 "#,
         )
         .expect("write config");
@@ -813,7 +965,7 @@ notifications = ["agent-turn-complete", "approval-requested", "extra-event"]
             r#"
 [tui]
 notification_method = "bel"
-notifications = ["agent-turn-complete", "approval-requested"]
+notifications = ["agent-turn-complete", "approval-requested", "user-input-requested", "plan-mode-prompt"]
 "#,
         )
         .expect("write config");
@@ -836,7 +988,7 @@ notify = ["powershell.exe", "-File", "custom-notify.ps1"]
 
 [tui]
 notification_method = "bel"
-notifications = ["agent-turn-complete", "approval-requested"]
+notifications = ["agent-turn-complete", "approval-requested", "user-input-requested"]
 "#,
         )
         .expect("write config");
