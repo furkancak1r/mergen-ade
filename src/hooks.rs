@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 pub const FACTORY_DROID_TERMINAL_ID_ENV_VAR: &str = "MERGEN_ADE_TERMINAL_ID";
 pub const FACTORY_DROID_HOOKS_DIR_ENV_VAR: &str = "MERGEN_ADE_FACTORY_DROID_HOOKS_DIR";
 pub const FACTORY_DROID_HOOK_INBOX_TOKEN_ENV_VAR: &str = "MERGEN_ADE_FACTORY_DROID_INBOX_TOKEN";
+const MAX_PENDING_HOOK_LINE_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -405,8 +406,12 @@ impl AiHookManager {
         }
     }
 
+    fn lock_sessions(&self) -> Option<std::sync::MutexGuard<'_, BTreeMap<u64, AiCliSession>>> {
+        self.sessions.lock().ok()
+    }
+
     pub fn ai_activity_started(&self, terminal_id: u64) -> Option<(AiCliTool, AiCliStatus)> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.lock_sessions()?;
         let session = sessions.entry(terminal_id).or_default();
 
         if session.tool.is_none() {
@@ -428,7 +433,7 @@ impl AiHookManager {
     }
 
     pub fn ai_waiting_for_user(&self, terminal_id: u64) -> Option<(AiCliTool, AiCliStatus)> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.lock_sessions()?;
         let session = sessions.entry(terminal_id).or_default();
 
         let tool = session.tool?;
@@ -442,7 +447,7 @@ impl AiHookManager {
     }
 
     pub fn user_interacted(&self, terminal_id: u64) -> Option<(AiCliTool, AiCliStatus)> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.lock_sessions()?;
         let session = sessions.entry(terminal_id).or_default();
 
         if session.status == AiCliStatus::Attention {
@@ -455,7 +460,9 @@ impl AiHookManager {
     }
 
     pub fn set_tool(&self, terminal_id: u64, tool: AiCliTool) {
-        let mut sessions = self.sessions.lock().unwrap();
+        let Some(mut sessions) = self.lock_sessions() else {
+            return;
+        };
         let session = sessions.entry(terminal_id).or_default();
         session.tool = Some(tool);
         if session.status == AiCliStatus::default() {
@@ -478,7 +485,9 @@ impl AiHookManager {
         terminal_id: u64,
         text: &str,
     ) -> Vec<AiHookTransition> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let Some(mut sessions) = self.lock_sessions() else {
+            return Vec::new();
+        };
         let session = sessions.entry(terminal_id).or_default();
 
         // Step 1: Detect tool if not already detected
@@ -545,6 +554,7 @@ impl AiHookManager {
         }
 
         session.pending_line = incomplete_tail.to_string();
+        Self::trim_pending_line_to_limit(&mut session.pending_line);
         transitions
     }
 
@@ -555,7 +565,7 @@ impl AiHookManager {
         terminal_id: u64,
         title: &str,
     ) -> Option<(AiCliTool, AiCliStatus, Option<AiHookEvent>)> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.lock_sessions()?;
         let session = sessions.entry(terminal_id).or_default();
         let matched = if let Some(tool) = session.tool {
             let config = self.config.config_for(tool)?;
@@ -584,15 +594,38 @@ impl AiHookManager {
     }
 
     pub fn session(&self, terminal_id: u64) -> Option<AiCliSession> {
-        self.sessions.lock().unwrap().get(&terminal_id).cloned()
+        self.lock_sessions()?.get(&terminal_id).cloned()
     }
 
     pub fn reset_session(&self, terminal_id: u64) {
-        self.sessions.lock().unwrap().remove(&terminal_id);
+        if let Some(mut sessions) = self.lock_sessions() {
+            sessions.remove(&terminal_id);
+        }
     }
 
     pub fn is_enabled(&self) -> bool {
         self.config.global_enabled
+    }
+
+    fn trim_pending_line_to_limit(pending_line: &mut String) {
+        if pending_line.len() <= MAX_PENDING_HOOK_LINE_BYTES {
+            return;
+        }
+
+        let trim_target = pending_line.len() - MAX_PENDING_HOOK_LINE_BYTES;
+        let cut = if pending_line.is_char_boundary(trim_target) {
+            trim_target
+        } else {
+            pending_line
+                .char_indices()
+                .find(|(index, _)| *index > trim_target)
+                .map(|(index, _)| index)
+                .unwrap_or(pending_line.len())
+        };
+
+        if cut > 0 {
+            pending_line.drain(..cut);
+        }
     }
 }
 
@@ -609,6 +642,56 @@ mod tests {
         );
         assert_eq!(normalize_hook_name("permission_prompt"), "permissionprompt");
         assert_eq!(normalize_hook_name("Stop"), "stop");
+    }
+
+    #[test]
+    fn poisoned_session_lock_returns_graceful_degradation() {
+        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        manager.set_tool(1, AiCliTool::FactoryDroid);
+
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = manager.sessions.lock().unwrap();
+            panic!("poison test");
+        }));
+        assert!(poison_result.is_err());
+
+        assert!(manager.session(1).is_none());
+        assert_eq!(manager.ai_activity_started(1), None);
+        assert_eq!(manager.ai_waiting_for_user(1), None);
+        assert_eq!(manager.user_interacted(1), None);
+        assert_eq!(
+            manager.update(1, "[droid-hook:event=UserPromptSubmit]"),
+            None
+        );
+        manager.reset_session(1);
+    }
+
+    #[test]
+    fn pending_line_is_trimmed_to_tail_limit_after_long_unmatched_input() {
+        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let long_prefix = "x".repeat(MAX_PENDING_HOOK_LINE_BYTES + 4096);
+
+        assert_eq!(manager.update(1, &long_prefix), None);
+
+        let session = manager.session(1).expect("session should exist");
+        assert!(session.pending_line.len() <= MAX_PENDING_HOOK_LINE_BYTES);
+        assert!(session.pending_line.chars().all(|ch| ch == 'x'));
+    }
+
+    #[test]
+    fn pending_line_trimming_preserves_recent_hook_detection() {
+        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let prefix = "x".repeat(MAX_PENDING_HOOK_LINE_BYTES + 128);
+
+        assert_eq!(manager.update(1, &prefix), None);
+        assert_eq!(
+            manager.update(1, "[droid-hook:event=UserPromptSubmit]"),
+            Some((
+                AiCliTool::FactoryDroid,
+                AiCliStatus::Running,
+                Some(AiHookEvent::Running)
+            ))
+        );
     }
 
     #[test]

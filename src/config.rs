@@ -1,6 +1,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use directories::ProjectDirs;
 use serde::Deserialize;
@@ -60,18 +61,68 @@ pub fn save_config(path: &Path, config: &AppConfig) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    let tmp_path = path.with_extension("toml.tmp");
+    let tmp_path = temp_save_path(path);
     let data = toml::to_string_pretty(config)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
 
     fs::write(&tmp_path, data)?;
 
-    if path.exists() {
-        fs::remove_file(path)?;
+    atomic_replace_file(&tmp_path, path)?;
+    Ok(())
+}
+
+fn temp_save_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("config.toml");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let tmp_name = format!("{stem}.tmp-{}-{unique}", std::process::id());
+    path.with_file_name(tmp_name)
+}
+
+fn atomic_replace_file(src: &Path, dst: &Path) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+
+        let mut src_wide: Vec<u16> = src.as_os_str().encode_wide().collect();
+        src_wide.push(0);
+        let mut dst_wide: Vec<u16> = dst.as_os_str().encode_wide().collect();
+        dst_wide.push(0);
+
+        unsafe {
+            if MoveFileExW(
+                src_wide.as_ptr(),
+                dst_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            ) != 0
+            {
+                return Ok(());
+            }
+        }
+
+        let err = io::Error::last_os_error();
+        let _ = fs::remove_file(src);
+        return Err(err);
     }
 
-    fs::rename(tmp_path, path)?;
-    Ok(())
+    #[cfg(not(target_os = "windows"))]
+    {
+        match fs::rename(src, dst) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let _ = fs::remove_file(src);
+                Err(err)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

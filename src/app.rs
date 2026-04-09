@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::ops::Range;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -53,8 +53,10 @@ use crate::title::{terminal_title_candidate, update_terminal_title};
 
 const TITLE_MAX_LEN: usize = 40;
 const TERMINAL_EVENT_BUDGET: usize = 4096;
+const TERMINAL_EVENT_QUEUE_CAPACITY: usize = 512;
 const TERMINAL_RETRY_MS: u64 = 8;
 const TERMINAL_FALLBACK_REFRESH_MS: u64 = 16;
+const TERMINAL_PENDING_LINE_MAX_CHARS: usize = 512;
 const FACTORY_DROID_HOOK_POLL_MS: u64 = 75;
 const FACTORY_DROID_PROCESS_POLL_MS: u64 = 75;
 const FACTORY_DROID_LAUNCH_GRACE_MS: u64 = 5_000;
@@ -80,8 +82,14 @@ const TERMINAL_HELD_KEY_REPEAT_MAX_SYNTHETIC_EVENTS_PER_FRAME: usize = 16;
 const NERD_FONT_DATA: &[u8] = include_bytes!("../assets/fonts/CaskaydiaCoveNerdFont-Regular.ttf");
 const NERD_FONT_NAME: &str = "caskaydia-cove-nerd";
 const DIRECTORY_INDEX_LOADING_ANIMATION_STEP_SECS: f64 = 0.25;
+const DIRECTORY_INDEX_CHANNEL_CAPACITY: usize = 1;
+const DIRECTORY_INDEX_MAX_CHILDREN_PER_DIR: usize = 1_000;
+const DIRECTORY_INDEX_MAX_DEPTH: usize = 10;
+const DIRECTORY_INDEX_MAX_NODES: usize = 20_000;
 const SOURCE_CONTROL_PRIORITY_REFRESH_SECS: f64 = 5.0;
 const SOURCE_CONTROL_BACKGROUND_REFRESH_SECS: f64 = 20.0;
+const SOURCE_CONTROL_CHANNEL_CAPACITY: usize = 1;
+const SOURCE_CONTROL_MAX_FILES: usize = 2_000;
 const SOURCE_CONTROL_POLL_TICK_MS: u64 = 250;
 const SOURCE_CONTROL_TOOLTIP_FILE_LIMIT: usize = 12;
 const DIRECTORY_ENTRY_TOOLTIP_MAX_CHARS: usize = 500;
@@ -333,6 +341,29 @@ impl FactoryDroidStatusSource {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FactoryDroidAttentionReason {
+    AskUser,
+    SpecificationApproval,
+}
+
+impl FactoryDroidAttentionReason {
+    const fn allows_empty_submit(self) -> bool {
+        matches!(self, Self::AskUser | Self::SpecificationApproval)
+    }
+
+    const fn persists_on_focus(self) -> bool {
+        matches!(self, Self::AskUser | Self::SpecificationApproval)
+    }
+
+    const fn tooltip(self) -> &'static str {
+        match self {
+            Self::AskUser => "Factory Droid - Waiting for your reply...",
+            Self::SpecificationApproval => "Factory Droid - Waiting for specification approval...",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexCliStatusSource {
     PromptSubmit,
     Notify,
@@ -388,6 +419,10 @@ impl CodexAttentionReason {
     }
 
     const fn persists_after_session_exit(self) -> bool {
+        matches!(self, Self::TurnComplete)
+    }
+
+    const fn clears_on_terminal_acknowledge(self) -> bool {
         matches!(self, Self::TurnComplete)
     }
 
@@ -613,7 +648,7 @@ pub struct AdeApp {
     source_control_refresh_state: BTreeMap<u64, SourceControlRefreshState>,
     source_control_worker_busy: bool,
     source_control_last_auto_refresh_project: Option<u64>,
-    directory_index_events_tx: Sender<DirectoryIndexEvent>,
+    directory_index_commands_tx: Sender<DirectoryIndexCommand>,
     directory_index_events_rx: Receiver<DirectoryIndexEvent>,
     directory_index_state: BTreeMap<u64, DirectoryIndexSnapshot>,
     directory_tree_has_collapsed_cache_by_project: BTreeMap<u64, bool>,
@@ -651,6 +686,7 @@ struct TerminalEntry {
     factory_droid_last_process_seen_at: Option<Instant>,
     factory_droid_process_missing_since: Option<Instant>,
     factory_droid_last_status_source: Option<FactoryDroidStatusSource>,
+    factory_droid_attention_reason: Option<FactoryDroidAttentionReason>,
     codex_launch_pending_since: Option<Instant>,
     codex_launch_process_baseline: Option<Vec<TrackedProcessIdentity>>,
     codex_session_active: bool,
@@ -776,10 +812,12 @@ struct SourceControlSnapshot {
     ahead: usize,
     behind: usize,
     files: Vec<SourceControlFile>,
+    omitted_files: usize,
     added_lines: Option<usize>,
     removed_lines: Option<usize>,
     loading: bool,
     last_error: Option<String>,
+    partial_warning: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -800,6 +838,13 @@ struct SourceControlCommand {
     project_id: u64,
     project_path: PathBuf,
     run_fetch: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DirectoryIndexCommand {
+    project_id: u64,
+    generation: u64,
+    project_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -870,7 +915,12 @@ impl AiBadgeModel {
     fn from_terminal(terminal: &TerminalEntry) -> Self {
         let tool = terminal.ai_session.tool;
         let status = terminal.ai_session.status;
-        let tooltip_lines = ai_badge_tooltip_lines(tool, status, terminal.codex_attention_reason);
+        let tooltip_lines = ai_badge_tooltip_lines(
+            tool,
+            status,
+            terminal.factory_droid_attention_reason,
+            terminal.codex_attention_reason,
+        );
         Self {
             tool,
             status,
@@ -882,9 +932,15 @@ impl AiBadgeModel {
 fn ai_badge_tooltip_lines(
     tool: Option<AiCliTool>,
     status: AiCliStatus,
+    factory_droid_attention_reason: Option<FactoryDroidAttentionReason>,
     codex_attention_reason: Option<CodexAttentionReason>,
 ) -> Vec<String> {
     match tool {
+        Some(AiCliTool::FactoryDroid) if status == AiCliStatus::Attention => {
+            vec![factory_droid_attention_reason
+                .map(|reason| reason.tooltip().to_owned())
+                .unwrap_or_else(|| status.tooltip(AiCliTool::FactoryDroid))]
+        }
         Some(AiCliTool::CodexCli) if status == AiCliStatus::Attention => {
             vec![codex_attention_reason
                 .unwrap_or(CodexAttentionReason::UnknownNotify)
@@ -1013,6 +1069,7 @@ struct DirectoryNode {
     name: String,
     path: PathBuf,
     is_dir: bool,
+    is_placeholder: bool,
     children: Vec<DirectoryNode>,
 }
 
@@ -1021,6 +1078,7 @@ struct DirectoryIndexSnapshot {
     root: DirectoryNode,
     loading: bool,
     last_error: Option<String>,
+    partial_warning: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1712,12 +1770,21 @@ impl AdeApp {
         let (_, codex_cli_runtime_dir, codex_cli_runtime_dir_error) =
             Self::codex_cli_runtime_state(&config);
 
-        let (terminal_events_tx, terminal_events_rx) = crossbeam_channel::unbounded();
+        let (terminal_events_tx, terminal_events_rx) =
+            crossbeam_channel::bounded(TERMINAL_EVENT_QUEUE_CAPACITY);
         let (source_control_commands_tx, source_control_commands_rx) =
-            crossbeam_channel::unbounded();
-        let (source_control_events_tx, source_control_events_rx) = crossbeam_channel::unbounded();
-        let (directory_index_events_tx, directory_index_events_rx) = crossbeam_channel::unbounded();
+            crossbeam_channel::bounded(SOURCE_CONTROL_CHANNEL_CAPACITY);
+        let (source_control_events_tx, source_control_events_rx) =
+            crossbeam_channel::bounded(SOURCE_CONTROL_CHANNEL_CAPACITY);
+        let (directory_index_commands_tx, directory_index_commands_rx) =
+            crossbeam_channel::bounded(DIRECTORY_INDEX_CHANNEL_CAPACITY);
+        let (directory_index_events_tx, directory_index_events_rx) =
+            crossbeam_channel::bounded(DIRECTORY_INDEX_CHANNEL_CAPACITY);
         spawn_source_control_worker(source_control_commands_rx, source_control_events_tx.clone());
+        spawn_directory_index_worker(
+            directory_index_commands_rx,
+            directory_index_events_tx.clone(),
+        );
 
         let app = Self {
             config_path,
@@ -1784,7 +1851,7 @@ impl AdeApp {
             source_control_refresh_state: BTreeMap::new(),
             source_control_worker_busy: false,
             source_control_last_auto_refresh_project: None,
-            directory_index_events_tx,
+            directory_index_commands_tx,
             directory_index_events_rx,
             directory_index_state: BTreeMap::new(),
             directory_tree_has_collapsed_cache_by_project: BTreeMap::new(),
@@ -1820,9 +1887,8 @@ impl AdeApp {
         };
 
         if !self.config_save_requires_reload {
-            self.config.projects = self.projects.values().cloned().collect();
-            self.config.ui.last_selected_project_id = self.selected_project;
-            config_to_save = self.config.clone();
+            config_to_save.projects = self.projects.values().cloned().collect();
+            config_to_save.ui.last_selected_project_id = self.selected_project;
         }
 
         if let Err(err) = config::save_config(&self.config_path, &config_to_save) {
@@ -1830,6 +1896,7 @@ impl AdeApp {
             return;
         }
 
+        self.config.ui.last_selected_project_id = self.selected_project;
         self.pending_config_changes = PendingConfigChanges::default();
         if recovered_from_disk {
             self.status_line = "Config recovered and changes saved.".to_owned();
@@ -2055,6 +2122,7 @@ impl AdeApp {
             factory_droid_last_process_seen_at: None,
             factory_droid_process_missing_since: None,
             factory_droid_last_status_source: None,
+            factory_droid_attention_reason: None,
             codex_launch_pending_since: None,
             codex_launch_process_baseline: None,
             codex_session_active: false,
@@ -2133,6 +2201,32 @@ impl AdeApp {
         })
     }
 
+    fn factory_droid_status_from_chunk(
+        chunk: &str,
+    ) -> Option<(
+        AiCliStatus,
+        FactoryDroidStatusSource,
+        Option<FactoryDroidAttentionReason>,
+    )> {
+        if chunk == "droid-ask-user-prompt" {
+            return Some((
+                AiCliStatus::Attention,
+                FactoryDroidStatusSource::PtyNotification,
+                Some(FactoryDroidAttentionReason::AskUser),
+            ));
+        }
+        if chunk == "droid-spec-approval-prompt" {
+            return Some((
+                AiCliStatus::Attention,
+                FactoryDroidStatusSource::PtyNotification,
+                Some(FactoryDroidAttentionReason::SpecificationApproval),
+            ));
+        }
+
+        let source = Self::factory_droid_attention_source_from_chunk(chunk)?;
+        Some((AiCliStatus::Attention, source, None))
+    }
+
     fn factory_droid_attention_source_from_chunk(chunk: &str) -> Option<FactoryDroidStatusSource> {
         let lower = chunk.to_ascii_lowercase();
         // Match "HOOKS  Stop" (visible script output), "hook stop" variants,
@@ -2198,6 +2292,7 @@ impl AdeApp {
         entry.factory_droid_session_active = false;
         entry.factory_droid_last_process_seen_at = None;
         entry.factory_droid_process_missing_since = None;
+        entry.factory_droid_attention_reason = None;
         entry.dirty = true;
         changed
     }
@@ -2222,6 +2317,7 @@ impl AdeApp {
         entry.factory_droid_last_process_seen_at = None;
         entry.factory_droid_process_missing_since = None;
         entry.factory_droid_last_status_source = None;
+        entry.factory_droid_attention_reason = None;
         entry.dirty = true;
         changed
     }
@@ -2230,6 +2326,8 @@ impl AdeApp {
         let Some(entry) = self.terminals.get_mut(&terminal_id) else {
             return false;
         };
+        let preserve_interactive_attention =
+            Self::terminal_has_factory_droid_interactive_attention(entry);
 
         if let Some(manager) = &self.ai_hook_manager {
             manager.set_tool(terminal_id, AiCliTool::FactoryDroid);
@@ -2248,6 +2346,10 @@ impl AdeApp {
             changed = true;
         }
         if entry.factory_droid_launch_pending_since.take().is_some() {
+            changed = true;
+        }
+        if !preserve_interactive_attention && entry.factory_droid_attention_reason.take().is_some()
+        {
             changed = true;
         }
         entry.factory_droid_last_process_seen_at = Some(Instant::now());
@@ -2287,6 +2389,7 @@ impl AdeApp {
         terminal_id: u64,
         status: AiCliStatus,
         source: FactoryDroidStatusSource,
+        reason: Option<FactoryDroidAttentionReason>,
     ) -> bool {
         let Some(manager) = self.ai_hook_manager.as_ref().cloned() else {
             return false;
@@ -2294,15 +2397,31 @@ impl AdeApp {
 
         manager.set_tool(terminal_id, AiCliTool::FactoryDroid);
 
+        let Some(current_entry) = self.terminals.get(&terminal_id) else {
+            return false;
+        };
+
+        let should_preserve_interactive_attention = status == AiCliStatus::Running
+            && matches!(
+                source,
+                FactoryDroidStatusSource::PtyHookEvent
+                    | FactoryDroidStatusSource::TerminalTitle
+                    | FactoryDroidStatusSource::Inbox
+            )
+            && Self::terminal_has_factory_droid_interactive_attention(current_entry);
+        if should_preserve_interactive_attention {
+            return false;
+        }
+
         let update = match status {
             AiCliStatus::Running => manager.ai_activity_started(terminal_id),
             AiCliStatus::Attention => manager.ai_waiting_for_user(terminal_id),
             AiCliStatus::Inactive => None,
         };
-
-        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
-            return false;
-        };
+        let entry = self
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal must still exist after immutable lookup");
 
         let mut changed = false;
         if entry.ai_session.tool != Some(AiCliTool::FactoryDroid) {
@@ -2323,6 +2442,23 @@ impl AdeApp {
             entry.factory_droid_last_status_source = Some(source);
             changed = true;
         }
+        let next_reason = if status == AiCliStatus::Attention {
+            match (
+                reason,
+                entry.ai_session.status,
+                entry.factory_droid_attention_reason,
+            ) {
+                (Some(reason), _, _) => Some(reason),
+                (None, AiCliStatus::Attention, current_reason) => current_reason,
+                (None, _, _) => None,
+            }
+        } else {
+            None
+        };
+        if entry.factory_droid_attention_reason != next_reason {
+            entry.factory_droid_attention_reason = next_reason;
+            changed = true;
+        }
         if !entry.factory_droid_session_active {
             entry.factory_droid_session_active = true;
             changed = true;
@@ -2332,6 +2468,38 @@ impl AdeApp {
         }
         entry.factory_droid_last_process_seen_at = Some(Instant::now());
         if entry.factory_droid_launch_pending_since.take().is_some() {
+            changed = true;
+        }
+        entry.dirty = true;
+        changed
+    }
+
+    fn clear_factory_droid_attention_on_interaction(&mut self, terminal_id: u64) -> bool {
+        let Some(manager) = &self.ai_hook_manager else {
+            return false;
+        };
+
+        let Some((tool, status)) = manager.user_interacted(terminal_id) else {
+            return false;
+        };
+        if tool != AiCliTool::FactoryDroid || status != AiCliStatus::Inactive {
+            return false;
+        }
+
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        let mut changed = false;
+        if entry.ai_session.tool != Some(tool) {
+            entry.ai_session.tool = Some(tool);
+            changed = true;
+        }
+        if entry.ai_session.status != status {
+            entry.ai_session.status = status;
+            changed = true;
+        }
+        if entry.factory_droid_attention_reason.take().is_some() {
             changed = true;
         }
         entry.dirty = true;
@@ -2383,6 +2551,7 @@ impl AdeApp {
             let is_candidate = entry.factory_droid_launch_pending_since.is_some();
             let tool_is_factory = entry.ai_session.tool == Some(AiCliTool::FactoryDroid);
             let status = entry.ai_session.status;
+            let attention_reason = entry.factory_droid_attention_reason;
 
             if is_candidate && launch_expired && process_state != Some(true) {
                 changed |= self.clear_factory_droid_state(terminal_id);
@@ -2399,7 +2568,13 @@ impl AdeApp {
                         changed |= self.note_factory_droid_process_missing(terminal_id);
 
                         match status {
-                            AiCliStatus::Attention => {}
+                            AiCliStatus::Attention => {
+                                if attention_reason
+                                    .is_some_and(FactoryDroidAttentionReason::persists_on_focus)
+                                {
+                                    changed |= self.clear_factory_droid_state(terminal_id);
+                                }
+                            }
                             AiCliStatus::Running => {
                                 if self
                                     .terminals
@@ -2584,11 +2759,13 @@ impl AdeApp {
                 terminal_id,
                 AiCliStatus::Running,
                 FactoryDroidStatusSource::Inbox,
+                None,
             ),
             "attention" => self.apply_factory_droid_status(
                 terminal_id,
                 AiCliStatus::Attention,
                 FactoryDroidStatusSource::Inbox,
+                None,
             ),
             _ => false,
         }
@@ -2613,6 +2790,13 @@ impl AdeApp {
                 AiCliStatus::Attention,
                 CodexCliStatusSource::VisibleUi,
                 Some(CodexAttentionReason::UserInputRequested),
+            ));
+        }
+        if chunk == "codex-plan-mode-prompt" {
+            return Some((
+                AiCliStatus::Attention,
+                CodexCliStatusSource::VisibleUi,
+                Some(CodexAttentionReason::PlanModePrompt),
             ));
         }
         if chunk == "codex-interrupted-banner" {
@@ -2831,7 +3015,10 @@ impl AdeApp {
                             && matches!(
                                 (entry.codex_attention_reason, attention_reason),
                                 (
-                                    Some(CodexAttentionReason::UserInputRequested),
+                                    Some(
+                                        CodexAttentionReason::UserInputRequested
+                                            | CodexAttentionReason::PlanModePrompt
+                                    ),
                                     Some(
                                         CodexAttentionReason::TurnComplete
                                             | CodexAttentionReason::UnknownNotify
@@ -3233,7 +3420,7 @@ impl AdeApp {
                         } else {
                             FactoryDroidStatusSource::PtyHookEvent
                         };
-                        if self.apply_factory_droid_status(terminal_id, status, source) {
+                        if self.apply_factory_droid_status(terminal_id, status, source, None) {
                             dirty_ids.insert(terminal_id);
                         }
                     } else if tool == Some(AiCliTool::CodexCli) {
@@ -3259,14 +3446,11 @@ impl AdeApp {
                     });
 
                     if should_apply {
-                        if let Some(source) =
-                            Self::factory_droid_attention_source_from_chunk(&chunk)
+                        if let Some((status, source, reason)) =
+                            Self::factory_droid_status_from_chunk(&chunk)
                         {
-                            if self.apply_factory_droid_status(
-                                terminal_id,
-                                AiCliStatus::Attention,
-                                source,
-                            ) {
+                            if self.apply_factory_droid_status(terminal_id, status, source, reason)
+                            {
                                 dirty_ids.insert(terminal_id);
                             }
                         }
@@ -3358,6 +3542,7 @@ impl AdeApp {
             .and_modify(|snapshot| {
                 snapshot.loading = true;
                 snapshot.last_error = None;
+                snapshot.partial_warning = None;
             })
             .or_insert_with(|| SourceControlSnapshot {
                 loading: true,
@@ -3504,22 +3689,38 @@ impl AdeApp {
         let Some(project) = self.projects.get(&project_id).cloned() else {
             return;
         };
-        let Some(state) = self.source_control_refresh_state.get_mut(&project_id) else {
-            return;
+        let run_fetch = {
+            let Some(state) = self.source_control_refresh_state.get_mut(&project_id) else {
+                return;
+            };
+            let run_fetch = state.queued_fetch;
+            state.queued = false;
+            state.queued_manual = false;
+            state.queued_fetch = false;
+            state.in_flight = true;
+            run_fetch
         };
-
-        let run_fetch = state.queued_fetch;
-        state.queued = false;
-        state.queued_manual = false;
-        state.queued_fetch = false;
-        state.in_flight = true;
         self.source_control_worker_busy = true;
-
-        let _ = self.source_control_commands_tx.send(SourceControlCommand {
-            project_id,
-            project_path: project.path,
-            run_fetch,
-        });
+        let send_failed = self
+            .source_control_commands_tx
+            .send(SourceControlCommand {
+                project_id,
+                project_path: project.path,
+                run_fetch,
+            })
+            .is_err();
+        if send_failed {
+            let Some(state) = self.source_control_refresh_state.get_mut(&project_id) else {
+                return;
+            };
+            state.in_flight = false;
+            self.source_control_worker_busy = false;
+            self.source_control_state
+                .entry(project_id)
+                .or_default()
+                .last_error = Some("Source control worker unavailable".to_owned());
+            self.status_line = "Source control worker unavailable".to_owned();
+        }
     }
 
     fn schedule_source_control_refresh(&mut self, ctx: &egui::Context) {
@@ -3620,22 +3821,27 @@ impl AdeApp {
             .and_modify(|snapshot| {
                 snapshot.loading = true;
                 snapshot.last_error = None;
+                snapshot.partial_warning = None;
             })
             .or_insert_with(|| DirectoryIndexSnapshot {
                 root: build_directory_root_node(&project.path),
                 loading: true,
                 last_error: None,
+                partial_warning: None,
             });
 
-        let tx = self.directory_index_events_tx.clone();
-        std::thread::spawn(move || {
-            let snapshot = collect_directory_index_snapshot(&project.path);
-            let _ = tx.send(DirectoryIndexEvent {
-                project_id,
-                generation: current_generation,
-                snapshot,
-            });
-        });
+        let command = DirectoryIndexCommand {
+            project_id,
+            generation: current_generation,
+            project_path: project.path,
+        };
+        if self.directory_index_commands_tx.send(command).is_err() {
+            if let Some(snapshot) = self.directory_index_state.get_mut(&project_id) {
+                snapshot.loading = false;
+                snapshot.last_error = Some("Directory index worker unavailable".to_owned());
+            }
+            self.status_line = "Directory index worker unavailable".to_owned();
+        }
     }
 
     fn cached_directory_tree_has_collapsed_folders(
@@ -3891,6 +4097,49 @@ impl AdeApp {
         }
     }
 
+    fn event_is_factory_droid_interactive_entry(event: &Event) -> bool {
+        match event {
+            Event::Text(text) => !text.is_empty(),
+            Event::Paste(text) => !text.is_empty(),
+            Event::Key {
+                key:
+                    Key::Enter
+                    | Key::Escape
+                    | Key::Tab
+                    | Key::Backspace
+                    | Key::ArrowUp
+                    | Key::ArrowDown
+                    | Key::ArrowLeft
+                    | Key::ArrowRight,
+                pressed: true,
+                ..
+            } => true,
+            Event::Key {
+                key: Key::G,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.ctrl && !modifiers.alt => true,
+            _ => false,
+        }
+    }
+
+    fn terminal_has_factory_droid_interactive_attention(terminal: &TerminalEntry) -> bool {
+        terminal.ai_session.tool == Some(AiCliTool::FactoryDroid)
+            && terminal.ai_session.status == AiCliStatus::Attention
+            && terminal
+                .factory_droid_attention_reason
+                .is_some_and(FactoryDroidAttentionReason::persists_on_focus)
+    }
+
+    fn terminal_has_acknowledgeable_codex_attention(terminal: &TerminalEntry) -> bool {
+        terminal.ai_session.tool == Some(AiCliTool::CodexCli)
+            && terminal.ai_session.status == AiCliStatus::Attention
+            && terminal
+                .codex_attention_reason
+                .is_some_and(CodexAttentionReason::clears_on_terminal_acknowledge)
+    }
+
     fn should_steal_attention_terminal_input(&self, ctx: &egui::Context, events: &[Event]) -> bool {
         if self.ai_hook_manager.is_none() {
             return false;
@@ -3917,7 +4166,13 @@ impl AdeApp {
         };
 
         terminal.ai_session.status == AiCliStatus::Attention
-            && events.iter().any(Self::event_is_terminal_text_entry)
+            && if Self::terminal_has_factory_droid_interactive_attention(terminal) {
+                events
+                    .iter()
+                    .any(Self::event_is_factory_droid_interactive_entry)
+            } else {
+                events.iter().any(Self::event_is_terminal_text_entry)
+            }
     }
 
     fn event_terminal_navigation_shortcut(event: &Event) -> Option<TerminalNavigationShortcut> {
@@ -4383,6 +4638,7 @@ impl AdeApp {
         let mut submitted_factory_prompt = false;
         let mut submitted_codex_prompt = false;
         let mut committed_codex_reply = false;
+        let mut cancelled_factory_interactive_prompt = false;
         let mut sent_terminal_input = false;
         {
             let Some(terminal) = self.terminals.get_mut(&active_terminal_id) else {
@@ -4459,6 +4715,13 @@ impl AdeApp {
                             let has_non_empty_line = sanitized_line
                                 .as_ref()
                                 .is_some_and(|candidate| !candidate.trim().is_empty());
+                            let allows_empty_factory_submit = terminal
+                                .factory_droid_attention_reason
+                                .is_some_and(FactoryDroidAttentionReason::allows_empty_submit)
+                                && terminal.ai_session.tool == Some(AiCliTool::FactoryDroid)
+                                && terminal.ai_session.status == AiCliStatus::Attention;
+                            let submitted_factory_interaction =
+                                has_non_empty_line || allows_empty_factory_submit;
                             let allows_empty_codex_submit = terminal
                                 .codex_attention_reason
                                 .is_some_and(CodexAttentionReason::allows_empty_submit)
@@ -4469,7 +4732,7 @@ impl AdeApp {
                             if terminal.factory_droid_session_active
                                 && !launched_factory_droid
                                 && !launched_codex_cli
-                                && has_non_empty_line
+                                && submitted_factory_interaction
                             {
                                 submitted_factory_prompt = true;
                             }
@@ -4503,6 +4766,12 @@ impl AdeApp {
                         if key == Key::Backspace {
                             Self::clear_terminal_selection(terminal);
                             terminal.pending_line_for_title.pop();
+                        }
+
+                        if key == Key::Escape
+                            && Self::terminal_has_factory_droid_interactive_attention(terminal)
+                        {
+                            cancelled_factory_interactive_prompt = true;
                         }
 
                         // Encode Alt+M as ESC+m for terminal
@@ -4543,25 +4812,46 @@ impl AdeApp {
             self.show_terminal_copy_feedback(ctx);
         }
 
+        if sent_terminal_input && self.clear_codex_attention_on_interaction(active_terminal_id) {
+            ctx.request_repaint();
+        }
+
         // Clear AI attention status when user types input
-        if let Some(manager) = &self.ai_hook_manager {
+        if let Some(manager) = self.ai_hook_manager.as_ref().cloned() {
             let has_copied = copied_selection.is_some();
             let should_clear_attention =
                 self.terminals
                     .get(&active_terminal_id)
                     .is_some_and(|entry| {
                         entry.ai_session.tool != Some(AiCliTool::CodexCli)
+                            && !Self::terminal_has_factory_droid_interactive_attention(entry)
                             && (sent_terminal_input || has_copied)
                     });
             if should_clear_attention {
+                let mut interaction_changed =
+                    self.clear_factory_droid_attention_on_interaction(active_terminal_id);
                 if let Some((tool, status)) = manager.user_interacted(active_terminal_id) {
                     if let Some(entry) = self.terminals.get_mut(&active_terminal_id) {
-                        entry.ai_session.tool = Some(tool);
-                        entry.ai_session.status = status;
+                        if entry.ai_session.tool != Some(tool) {
+                            entry.ai_session.tool = Some(tool);
+                            interaction_changed = true;
+                        }
+                        if entry.ai_session.status != status {
+                            entry.ai_session.status = status;
+                            interaction_changed = true;
+                        }
                     }
+                }
+                if interaction_changed {
                     ctx.request_repaint();
                 }
             }
+        }
+
+        if cancelled_factory_interactive_prompt
+            && self.clear_factory_droid_attention_on_interaction(active_terminal_id)
+        {
+            ctx.request_repaint();
         }
 
         if committed_codex_reply
@@ -4576,6 +4866,7 @@ impl AdeApp {
                 active_terminal_id,
                 AiCliStatus::Running,
                 FactoryDroidStatusSource::PromptSubmit,
+                None,
             )
         {
             ctx.request_repaint();
@@ -4756,6 +5047,7 @@ impl AdeApp {
             }
             pending.push(ch);
         }
+        trim_pending_line_suffix(pending, TERMINAL_PENDING_LINE_MAX_CHARS);
     }
 
     fn flush_terminal_outbound(
@@ -5005,14 +5297,72 @@ impl AdeApp {
         changed
     }
 
+    fn clear_codex_attention_on_interaction(&mut self, terminal_id: u64) -> bool {
+        let Some((should_clear_sticky_codex, tool, status)) =
+            self.terminals.get(&terminal_id).map(|entry| {
+                (
+                    Self::terminal_has_acknowledgeable_codex_attention(entry)
+                        && !entry.codex_session_active
+                        && entry.codex_launch_pending_since.is_none()
+                        && entry.codex_process_identity.is_none(),
+                    entry.ai_session.tool,
+                    entry.ai_session.status,
+                )
+            })
+        else {
+            return false;
+        };
+        if tool != Some(AiCliTool::CodexCli)
+            || status != AiCliStatus::Attention
+            || !self
+                .terminals
+                .get(&terminal_id)
+                .is_some_and(Self::terminal_has_acknowledgeable_codex_attention)
+        {
+            return false;
+        }
+        if should_clear_sticky_codex {
+            return self.clear_codex_state(terminal_id);
+        }
+
+        if let Some(manager) = &self.ai_hook_manager {
+            let _ = manager.user_interacted(terminal_id);
+        }
+
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        let mut changed = false;
+        if entry.ai_session.tool != Some(AiCliTool::CodexCli) {
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            changed = true;
+        }
+        if entry.ai_session.status != AiCliStatus::Inactive {
+            entry.ai_session.status = AiCliStatus::Inactive;
+            changed = true;
+        }
+        if entry.codex_attention_reason.take().is_some() {
+            changed = true;
+        }
+        entry.dirty = true;
+        changed
+    }
+
     fn acknowledge_terminal_attention(&mut self, terminal_id: u64) {
         if self.terminals.get(&terminal_id).is_some_and(|entry| {
-            entry.ai_session.tool == Some(AiCliTool::CodexCli)
+            (entry.ai_session.tool == Some(AiCliTool::CodexCli)
                 && entry.ai_session.status == AiCliStatus::Attention
+                && !Self::terminal_has_acknowledgeable_codex_attention(entry))
+                || entry
+                    .factory_droid_attention_reason
+                    .is_some_and(FactoryDroidAttentionReason::persists_on_focus)
         }) {
             return;
         }
 
+        let _ = self.clear_codex_attention_on_interaction(terminal_id);
+        let _ = self.clear_factory_droid_attention_on_interaction(terminal_id);
         let Some(manager) = &self.ai_hook_manager else {
             return;
         };
@@ -5233,6 +5583,7 @@ impl AdeApp {
                 terminal_id,
                 AiCliStatus::Running,
                 FactoryDroidStatusSource::PromptSubmit,
+                None,
             );
         }
         if submitted_codex_prompt {
@@ -6728,6 +7079,8 @@ impl AdeApp {
                                                         .to_owned(),
                                                 );
                                             }
+                                        } else if let Some(warning) = &snapshot.partial_warning {
+                                            ui.colored_label(TEXT_MUTED, warning);
                                         } else if !snapshot.loading {
                                             if let Some(open_all) = pending_open_all {
                                                 apply_directory_tree_open_state(
@@ -6961,6 +7314,14 @@ impl AdeApp {
                                         RichText::new(error).color(Color32::LIGHT_RED),
                                         Color32::LIGHT_RED,
                                         error,
+                                    );
+                                }
+                                if let Some(warning) = &snapshot.partial_warning {
+                                    draw_sidebar_text_row(
+                                        ui,
+                                        RichText::new(warning).color(TEXT_MUTED),
+                                        TEXT_MUTED,
+                                        warning,
                                     );
                                 }
                                 if let Some(branch_line) = source_control_branch_line(&snapshot) {
@@ -8345,7 +8706,7 @@ fn merge_saved_messages(loaded_messages: &[String], current_messages: &[String])
     let mut seen_messages = HashSet::with_capacity(loaded_messages.len() + current_messages.len());
 
     for message in loaded_messages.iter().chain(current_messages.iter()) {
-        if seen_messages.insert(message.clone()) {
+        if seen_messages.insert(message.as_str()) {
             merged_messages.push(message.clone());
         }
     }
@@ -8368,6 +8729,27 @@ fn spawn_source_control_worker(rx: Receiver<SourceControlCommand>, tx: Sender<So
             if tx
                 .send(SourceControlEvent {
                     project_id: command.project_id,
+                    snapshot,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+}
+
+fn spawn_directory_index_worker(
+    rx: Receiver<DirectoryIndexCommand>,
+    tx: Sender<DirectoryIndexEvent>,
+) {
+    std::thread::spawn(move || {
+        while let Ok(command) = rx.recv() {
+            let snapshot = collect_directory_index_snapshot(&command.project_path);
+            if tx
+                .send(DirectoryIndexEvent {
+                    project_id: command.project_id,
+                    generation: command.generation,
                     snapshot,
                 })
                 .is_err()
@@ -8403,16 +8785,39 @@ fn collect_source_control_snapshot(project_path: &Path, run_fetch: bool) -> Sour
         }
     }
 
-    let output = match run_git_command(project_path, &["status", "--porcelain", "--branch"]) {
-        Ok(output) => output,
+    let mut command = git_command(project_path, &["status", "--porcelain", "--branch"]);
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
         Err(err) => {
             snapshot.last_error = Some(format!("Status failed: {err}"));
             return snapshot;
         }
     };
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let Some(stdout) = child.stdout.take() else {
+        snapshot.last_error = Some("Status failed: missing git stdout".to_owned());
+        return snapshot;
+    };
+    let status_reader = BufReader::new(stdout);
+    for line in status_reader.lines() {
+        let Ok(line) = line else {
+            snapshot.last_error = Some("Status failed while reading git output".to_owned());
+            return snapshot;
+        };
+        apply_source_control_status_line(&mut snapshot, &line);
+    }
+    snapshot
+        .files
+        .sort_by(|left, right| left.path.cmp(&right.path));
+
+    let stderr = read_process_stderr(&mut child).unwrap_or_default();
+    let Ok(status) = child.wait() else {
+        snapshot.last_error = Some("Status failed while waiting for git".to_owned());
+        return snapshot;
+    };
+    if !status.success() {
         snapshot.last_error = Some(if stderr.is_empty() {
             "Not a git repository".to_owned()
         } else {
@@ -8421,63 +8826,15 @@ fn collect_source_control_snapshot(project_path: &Path, run_fetch: bool) -> Sour
         return snapshot;
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        if let Some(header) = line.strip_prefix("## ") {
-            let (branch, ahead, behind) = parse_branch_header(header);
-            snapshot.branch = branch;
-            snapshot.ahead = ahead;
-            snapshot.behind = behind;
-            continue;
-        }
-
-        if line.len() < 3 {
-            continue;
-        }
-
-        let code = &line[..2];
-        let Some(path_part) = line.get(3..) else {
-            continue;
-        };
-        let mut path = path_part.trim().to_owned();
-        if let Some((_, new_path)) = path.split_once(" -> ") {
-            path = new_path.trim().to_owned();
-        }
-
-        let bytes = code.as_bytes();
-        if bytes.len() < 2 {
-            continue;
-        }
-        let x = bytes[0] as char;
-        let y = bytes[1] as char;
-        let status_char = if x != ' ' && x != '?' { x } else { y };
-
-        let status = match status_char {
-            'M' => "Modified",
-            'A' => "Added",
-            'D' => "Deleted",
-            'R' => "Renamed",
-            'C' => "Copied",
-            'U' => "Conflicted",
-            '?' => "Untracked",
-            '!' => "Ignored",
-            _ => "Changed",
-        };
-
-        snapshot.files.push(SourceControlFile {
-            path,
-            status,
-            staged: x != ' ' && x != '?',
-        });
-    }
-
     if snapshot.branch.is_empty() {
         snapshot.branch = "detached".to_owned();
     }
-
-    snapshot
-        .files
-        .sort_by(|left, right| left.path.cmp(&right.path));
+    if snapshot.omitted_files > 0 {
+        snapshot.partial_warning = Some(format!(
+            "Source control list was truncated to {SOURCE_CONTROL_MAX_FILES} files to protect memory; {} more entries were omitted.",
+            snapshot.omitted_files
+        ));
+    }
 
     if let Some((added_lines, removed_lines)) = collect_source_control_line_totals(project_path) {
         snapshot.added_lines = Some(added_lines);
@@ -8485,6 +8842,68 @@ fn collect_source_control_snapshot(project_path: &Path, run_fetch: bool) -> Sour
     }
 
     snapshot
+}
+
+fn apply_source_control_status_line(snapshot: &mut SourceControlSnapshot, line: &str) {
+    if let Some(header) = line.strip_prefix("## ") {
+        let (branch, ahead, behind) = parse_branch_header(header);
+        snapshot.branch = branch;
+        snapshot.ahead = ahead;
+        snapshot.behind = behind;
+        return;
+    }
+
+    if line.len() < 3 {
+        return;
+    }
+
+    let code = &line[..2];
+    let Some(path_part) = line.get(3..) else {
+        return;
+    };
+    let mut path = path_part.trim().to_owned();
+    if let Some((_, new_path)) = path.split_once(" -> ") {
+        path = new_path.trim().to_owned();
+    }
+
+    let bytes = code.as_bytes();
+    if bytes.len() < 2 {
+        return;
+    }
+    let x = bytes[0] as char;
+    let y = bytes[1] as char;
+    let status_char = if x != ' ' && x != '?' { x } else { y };
+
+    let status = match status_char {
+        'M' => "Modified",
+        'A' => "Added",
+        'D' => "Deleted",
+        'R' => "Renamed",
+        'C' => "Copied",
+        'U' => "Conflicted",
+        '?' => "Untracked",
+        '!' => "Ignored",
+        _ => "Changed",
+    };
+
+    if snapshot.files.len() >= SOURCE_CONTROL_MAX_FILES {
+        snapshot.omitted_files = snapshot.omitted_files.saturating_add(1);
+        return;
+    }
+
+    snapshot.files.push(SourceControlFile {
+        path,
+        status,
+        staged: x != ' ' && x != '?',
+    });
+}
+
+fn read_process_stderr(child: &mut std::process::Child) -> std::io::Result<String> {
+    let mut stderr = String::new();
+    if let Some(mut stderr_reader) = child.stderr.take() {
+        stderr_reader.read_to_string(&mut stderr)?;
+    }
+    Ok(stderr.trim().to_owned())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8534,41 +8953,72 @@ fn git_empty_tree_oid(project_path: &Path) -> std::io::Result<String> {
 }
 
 fn run_git_numstat_totals(project_path: &Path, args: &[&str]) -> std::io::Result<(usize, usize)> {
-    let output = run_git_command(project_path, args)?;
-    if !output.status.success() {
-        return Err(git_command_status_error(args, &output.stderr));
+    let mut command = git_command(project_path, args);
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let Some(stdout) = child.stdout.take() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "git diff missing stdout",
+        ));
+    };
+
+    let mut added_lines = 0usize;
+    let mut removed_lines = 0usize;
+    for line in BufReader::new(stdout).lines() {
+        let line = line?;
+        let (added, removed) = parse_git_numstat_line(&line);
+        added_lines = added_lines.saturating_add(added);
+        removed_lines = removed_lines.saturating_add(removed);
+    }
+    let stderr = read_process_stderr(&mut child)?;
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            if stderr.is_empty() {
+                format!("git {} failed", args.join(" "))
+            } else {
+                stderr
+            },
+        ));
     }
 
-    Ok(parse_git_numstat_totals(&String::from_utf8_lossy(
-        &output.stdout,
-    )))
+    Ok((added_lines, removed_lines))
 }
 
+#[cfg(test)]
 fn parse_git_numstat_totals(stdout: &str) -> (usize, usize) {
     let mut added_lines = 0usize;
     let mut removed_lines = 0usize;
 
     for line in stdout.lines() {
-        let mut columns = line.splitn(3, '\t');
-        let Some(added_text) = columns.next() else {
-            continue;
-        };
-        let Some(removed_text) = columns.next() else {
-            continue;
-        };
-
-        let Ok(added) = added_text.parse::<usize>() else {
-            continue;
-        };
-        let Ok(removed) = removed_text.parse::<usize>() else {
-            continue;
-        };
-
+        let (added, removed) = parse_git_numstat_line(line);
         added_lines = added_lines.saturating_add(added);
         removed_lines = removed_lines.saturating_add(removed);
     }
 
     (added_lines, removed_lines)
+}
+
+fn parse_git_numstat_line(line: &str) -> (usize, usize) {
+    let mut columns = line.splitn(3, '\t');
+    let Some(added_text) = columns.next() else {
+        return (0, 0);
+    };
+    let Some(removed_text) = columns.next() else {
+        return (0, 0);
+    };
+
+    let Ok(added) = added_text.parse::<usize>() else {
+        return (0, 0);
+    };
+    let Ok(removed) = removed_text.parse::<usize>() else {
+        return (0, 0);
+    };
+
+    (added, removed)
 }
 
 fn count_untracked_text_file_lines(project_path: &Path) -> std::io::Result<usize> {
@@ -8706,6 +9156,16 @@ fn git_command_status_error(args: &[&str], stderr: &[u8]) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, message)
 }
 
+fn git_command(project_path: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(project_path).args(args);
+    #[cfg(target_os = "windows")]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 fn run_git_command(project_path: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
     run_git_command_with_input(project_path, args, None)
 }
@@ -8715,12 +9175,7 @@ fn run_git_command_with_input(
     args: &[&str],
     stdin_bytes: Option<&[u8]>,
 ) -> std::io::Result<std::process::Output> {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(project_path).args(args);
-    #[cfg(target_os = "windows")]
-    {
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
+    let mut command = git_command(project_path, args);
 
     if let Some(stdin_bytes) = stdin_bytes {
         command.stdin(Stdio::piped());
@@ -8768,6 +9223,12 @@ fn parse_branch_header(header: &str) -> (String, usize, usize) {
     (branch_part, ahead, behind)
 }
 
+#[derive(Debug, Default)]
+struct DirectoryIndexBuildState {
+    visited_nodes: usize,
+    truncated: bool,
+}
+
 fn build_directory_root_node(path: &Path) -> DirectoryNode {
     let name = path
         .file_name()
@@ -8779,14 +9240,19 @@ fn build_directory_root_node(path: &Path) -> DirectoryNode {
         name,
         path: path.to_path_buf(),
         is_dir: true,
+        is_placeholder: false,
         children: Vec::new(),
     }
 }
 
 fn collect_directory_index_snapshot(project_path: &Path) -> DirectoryIndexSnapshot {
     let mut root = build_directory_root_node(project_path);
+    let mut build_state = DirectoryIndexBuildState {
+        visited_nodes: 1,
+        ..Default::default()
+    };
 
-    let snapshot_error = match read_directory_children(project_path) {
+    let snapshot_error = match read_directory_children(project_path, 0, &mut build_state) {
         Ok(children) => {
             root.children = children;
             None
@@ -8798,27 +9264,79 @@ fn collect_directory_index_snapshot(project_path: &Path) -> DirectoryIndexSnapsh
         root,
         loading: false,
         last_error: snapshot_error,
+        partial_warning: build_state
+            .truncated
+            .then_some(directory_index_partial_warning()),
     }
 }
 
-fn read_directory_children(path: &Path) -> Result<Vec<DirectoryNode>, String> {
+fn directory_index_partial_warning() -> String {
+    format!(
+        "Directory index was truncated to protect memory. Limits: {DIRECTORY_INDEX_MAX_NODES} nodes, depth {DIRECTORY_INDEX_MAX_DEPTH}, {DIRECTORY_INDEX_MAX_CHILDREN_PER_DIR} items per folder."
+    )
+}
+
+fn directory_placeholder_node(parent: &Path, label: String) -> DirectoryNode {
+    DirectoryNode {
+        name: label,
+        path: parent.to_path_buf(),
+        is_dir: false,
+        is_placeholder: true,
+        children: Vec::new(),
+    }
+}
+
+fn read_directory_children(
+    path: &Path,
+    depth: usize,
+    build_state: &mut DirectoryIndexBuildState,
+) -> Result<Vec<DirectoryNode>, String> {
     let entries = fs::read_dir(path).map_err(|err| err.to_string())?;
-    let mut children_paths = entries
-        .filter_map(|entry| entry.ok().map(|dir_entry| dir_entry.path()))
-        .collect::<Vec<PathBuf>>();
+    let mut children_paths = Vec::new();
+    let mut truncated_children = false;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if children_paths.len() >= DIRECTORY_INDEX_MAX_CHILDREN_PER_DIR {
+            truncated_children = true;
+            build_state.truncated = true;
+            break;
+        }
+        children_paths.push(entry.path());
+    }
     children_paths.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
 
     let mut children = Vec::new();
     for child_path in children_paths {
-        if let Some(node) = build_directory_node(&child_path) {
+        if build_state.visited_nodes >= DIRECTORY_INDEX_MAX_NODES {
+            build_state.truncated = true;
+            break;
+        }
+        if let Some(node) = build_directory_node(&child_path, depth + 1, build_state) {
             children.push(node);
         }
+    }
+    if build_state.visited_nodes >= DIRECTORY_INDEX_MAX_NODES {
+        children.push(directory_placeholder_node(
+            path,
+            "... more items omitted".to_owned(),
+        ));
+    } else if truncated_children {
+        children.push(directory_placeholder_node(
+            path,
+            format!("... more items omitted (>{DIRECTORY_INDEX_MAX_CHILDREN_PER_DIR})"),
+        ));
     }
 
     Ok(children)
 }
 
-fn build_directory_node(path: &Path) -> Option<DirectoryNode> {
+fn build_directory_node(
+    path: &Path,
+    depth: usize,
+    build_state: &mut DirectoryIndexBuildState,
+) -> Option<DirectoryNode> {
     let name = path
         .file_name()
         .map(|segment| segment.to_string_lossy().to_string())
@@ -8831,16 +9349,33 @@ fn build_directory_node(path: &Path) -> Option<DirectoryNode> {
         name,
         path: path.to_path_buf(),
         is_dir,
+        is_placeholder: false,
         children: Vec::new(),
     };
+    build_state.visited_nodes = build_state.visited_nodes.saturating_add(1);
 
     if should_descend_into_directory(is_dir, is_symlink) {
-        if let Ok(children) = read_directory_children(path) {
+        if depth >= DIRECTORY_INDEX_MAX_DEPTH {
+            if directory_contains_entries(path) {
+                build_state.truncated = true;
+                node.children.push(directory_placeholder_node(
+                    path,
+                    format!("... more items omitted (depth>{DIRECTORY_INDEX_MAX_DEPTH})"),
+                ));
+            }
+        } else if let Ok(children) = read_directory_children(path, depth, build_state) {
             node.children = children;
         }
     }
 
     Some(node)
+}
+
+fn directory_contains_entries(path: &Path) -> bool {
+    fs::read_dir(path)
+        .ok()
+        .and_then(|mut entries| entries.next())
+        .is_some()
 }
 
 fn should_descend_into_directory(is_dir: bool, is_symlink: bool) -> bool {
@@ -8931,6 +9466,25 @@ fn open_path_with_default_app(path: &Path) -> Result<(), String> {
         Ok(_) => Ok(()),
         Err(err) => Err(err.to_string()),
     }
+}
+
+fn trim_pending_line_suffix(text: &mut String, max_chars: usize) {
+    if max_chars == 0 {
+        text.clear();
+        return;
+    }
+
+    let overflow = text.chars().count().saturating_sub(max_chars);
+    if overflow == 0 {
+        return;
+    }
+
+    let split_at = text
+        .char_indices()
+        .nth(overflow - 1)
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+    text.drain(..split_at);
 }
 
 fn draw_folder_tree(
@@ -9032,13 +9586,23 @@ fn draw_folder_tree(
             });
         } else {
             let should_show_file = match search_query {
-                Some(_) => force_show_all_descendants || item_matches,
+                Some(_) => item.is_placeholder || force_show_all_descendants || item_matches,
                 None => true,
             };
             if !should_show_file {
                 continue;
             }
             rendered_any = true;
+
+            if item.is_placeholder {
+                draw_sidebar_text_row(
+                    ui,
+                    RichText::new(&item.name).color(TEXT_MUTED),
+                    TEXT_MUTED,
+                    &item.name,
+                );
+                continue;
+            }
 
             let response = draw_directory_file_row(ui, &item.name);
             let double_clicked = response.double_clicked();
@@ -9702,6 +10266,7 @@ fn merge_source_control_refresh_result(
             let mut merged = current.clone();
             merged.loading = incoming.loading;
             merged.last_error = incoming.last_error;
+            merged.partial_warning = incoming.partial_warning;
             merged
         }
         _ => incoming,
@@ -9796,13 +10361,16 @@ fn terminal_manager_diff_summary_visual(
 
 fn source_control_tooltip_lines(snapshot: &SourceControlSnapshot, max_files: usize) -> Vec<String> {
     let has_display_data = source_control_snapshot_has_display_data(snapshot);
-    let mut lines = Vec::with_capacity(max_files.saturating_add(3));
+    let mut lines = Vec::with_capacity(max_files.saturating_add(4));
 
     if snapshot.loading {
         lines.push("Refreshing source control...".to_owned());
     }
     if let Some(error) = &snapshot.last_error {
         lines.push(error.clone());
+    }
+    if let Some(warning) = &snapshot.partial_warning {
+        lines.push(warning.clone());
     }
     if !has_display_data {
         if lines.is_empty() {
@@ -9827,8 +10395,13 @@ fn source_control_tooltip_lines(snapshot: &SourceControlSnapshot, max_files: usi
         lines.push(format!("{}{}: {}", file.status, staged, file.path));
     }
 
-    if snapshot.files.len() > max_files {
-        lines.push(format!("+{} more", snapshot.files.len() - max_files));
+    let remaining_files = snapshot
+        .files
+        .len()
+        .saturating_sub(max_files)
+        .saturating_add(snapshot.omitted_files);
+    if remaining_files > 0 {
+        lines.push(format!("+{} more", remaining_files));
     }
 
     lines
@@ -11696,11 +12269,12 @@ fn normalize_terminal_background(color: TerminalColor) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ai_badge_visual, average_terminal_cell_width, build_terminal_cursor_overlay,
-        build_terminal_render, collect_source_control_line_totals, collect_source_control_snapshot,
-        configure_terminal_font_family, count_text_line_bytes, cursor_hidden_by_row_filter,
-        default_app_open_command, draw_ai_badge, draw_terminal_manager_title_and_diff_summary,
-        draw_terminal_status_badges, force_terminal_pane_width, install_terminal_font_family,
+        ai_badge_tooltip_lines, ai_badge_visual, average_terminal_cell_width,
+        build_terminal_cursor_overlay, build_terminal_render, collect_source_control_line_totals,
+        collect_source_control_snapshot, configure_terminal_font_family, count_text_line_bytes,
+        cursor_hidden_by_row_filter, default_app_open_command, draw_ai_badge,
+        draw_terminal_manager_title_and_diff_summary, draw_terminal_status_badges,
+        force_terminal_pane_width, install_terminal_font_family,
         merge_source_control_refresh_result, next_active_terminal_after_close,
         next_terminal_in_direction, next_terminal_in_linear_direction,
         normalize_terminal_background, parse_branch_header, parse_git_numstat_totals,
@@ -11723,17 +12297,19 @@ mod tests {
         terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
         with_settings_text_edit_chrome, AdeApp, AiBadgeModel, AiBadgeVisual, CodexAttentionReason,
         CodexCliStatusSource, CtrlCAction, DirectoryIndexSnapshot, DirectoryNode,
-        FactoryDroidHookInboxEvent, FactoryDroidManagedInstallComponent,
-        FactoryDroidManagedInstallDiagnostics, FactoryDroidStatusSource,
-        FactoryDroidTransportDiagnostics, PendingConfigChanges, PendingTerminalLinkClick,
-        SettingsSection, SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
-        SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
+        FactoryDroidAttentionReason, FactoryDroidHookInboxEvent,
+        FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
+        FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, PendingConfigChanges,
+        PendingTerminalLinkClick, SettingsSection, SourceControlBadgeState, SourceControlFile,
+        SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
         TerminalSecondaryClickAction, TerminalSelection, TerminalSelectionPoint, TransientToast,
         CODEX_LAUNCH_GRACE_MS, CODEX_PROCESS_POLL_MS, CODEX_TRAILING_OUTPUT_GRACE_MS,
-        FACTORY_DROID_HOOK_POLL_MS, FACTORY_DROID_PROCESS_POLL_MS,
-        FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG,
-        TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_OUTPUT_BG, TRANSIENT_TOAST_SECS,
+        DIRECTORY_INDEX_CHANNEL_CAPACITY, FACTORY_DROID_HOOK_POLL_MS,
+        FACTORY_DROID_PROCESS_POLL_MS, FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS,
+        SOURCE_CONTROL_CHANNEL_CAPACITY, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG,
+        TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_OUTPUT_BG,
+        TRANSIENT_TOAST_SECS,
     };
     use crate::codex::{
         CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent,
@@ -14607,10 +15183,12 @@ mod tests {
                     staged: *staged,
                 })
                 .collect(),
+            omitted_files: 0,
             added_lines: Some(0),
             removed_lines: Some(0),
             loading: false,
             last_error: None,
+            partial_warning: None,
         };
 
         let lines = source_control_tooltip_lines(&snapshot, 12);
@@ -14832,10 +15410,12 @@ mod tests {
                     status: "Modified",
                     staged: false,
                 }],
+                omitted_files: 0,
                 added_lines: Some(5),
                 removed_lines: Some(2),
                 loading: false,
                 last_error: Some("old error".to_owned()),
+                partial_warning: None,
             },
         );
 
@@ -14866,10 +15446,12 @@ mod tests {
                 status: "Modified",
                 staged: true,
             }],
+            omitted_files: 0,
             added_lines: Some(8),
             removed_lines: Some(3),
             loading: true,
             last_error: None,
+            partial_warning: None,
         };
         let incoming = SourceControlSnapshot {
             last_error: Some("git status failed".to_owned()),
@@ -14996,10 +15578,12 @@ mod tests {
                     name: "remove".to_owned(),
                     path: PathBuf::from("C:/remove"),
                     is_dir: true,
+                    is_placeholder: false,
                     children: Vec::new(),
                 },
                 loading: false,
                 last_error: None,
+                partial_warning: None,
             },
         );
         app.directory_index_generation.insert(7, 2);
@@ -16026,6 +16610,82 @@ mod tests {
     }
 
     #[test]
+    fn raw_input_hook_steals_tab_for_factory_droid_ask_user_terminal() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_factory_droid_ask_user_attention(&mut app, 1);
+        ctx.memory_mut(|mem| mem.request_focus(AdeApp::directory_search_input_id()));
+        let plain_tab = Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::default(),
+        };
+
+        let mut raw_input = RawInput {
+            events: vec![plain_tab.clone()],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(raw_input.events.is_empty());
+        assert_eq!(app.buffered_terminal_input, vec![plain_tab.clone()]);
+        assert!(!ctx.memory(|mem| mem.has_focus(AdeApp::directory_search_input_id())));
+
+        let buffered_events = app.take_buffered_terminal_input();
+        app.route_active_terminal_input(&ctx, buffered_events);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.factory_droid_attention_reason,
+            Some(FactoryDroidAttentionReason::AskUser)
+        );
+    }
+
+    #[test]
+    fn raw_input_hook_steals_ctrl_g_for_factory_droid_spec_approval_terminal() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_factory_droid_spec_approval_attention(&mut app, 1);
+        ctx.memory_mut(|mem| mem.request_focus(AdeApp::directory_search_input_id()));
+        let ctrl_g = Event::Key {
+            key: Key::G,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                command: true,
+                ..Modifiers::default()
+            },
+        };
+
+        let mut raw_input = RawInput {
+            events: vec![ctrl_g.clone()],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(raw_input.events.is_empty());
+        assert_eq!(app.buffered_terminal_input, vec![ctrl_g.clone()]);
+        assert!(!ctx.memory(|mem| mem.has_focus(AdeApp::directory_search_input_id())));
+
+        let buffered_events = app.take_buffered_terminal_input();
+        app.route_active_terminal_input(&ctx, buffered_events);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.factory_droid_attention_reason,
+            Some(FactoryDroidAttentionReason::SpecificationApproval)
+        );
+    }
+
+    #[test]
     fn raw_input_hook_steals_saved_message_text_for_attention_terminal() {
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
@@ -16102,6 +16762,40 @@ mod tests {
     }
 
     #[test]
+    fn same_terminal_focus_keeps_factory_droid_ask_user_attention() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_factory_droid_ask_user_attention(&mut app, 1);
+
+        app.set_active_terminal(&ctx, Some(1));
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::FactoryDroid));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.factory_droid_attention_reason,
+            Some(FactoryDroidAttentionReason::AskUser)
+        );
+    }
+
+    #[test]
+    fn same_terminal_focus_keeps_factory_droid_spec_approval_attention() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_factory_droid_spec_approval_attention(&mut app, 1);
+
+        app.set_active_terminal(&ctx, Some(1));
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::FactoryDroid));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.factory_droid_attention_reason,
+            Some(FactoryDroidAttentionReason::SpecificationApproval)
+        );
+    }
+
+    #[test]
     fn switching_terminals_preserves_previous_attention() {
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks(
@@ -16121,6 +16815,28 @@ mod tests {
         assert_eq!(terminal_one.ai_session.status, AiCliStatus::Attention);
         assert_eq!(terminal_two.ai_session.status, AiCliStatus::Inactive);
         assert_eq!(app.active_terminal, Some(2));
+    }
+
+    #[test]
+    fn switching_back_to_factory_droid_ask_user_terminal_keeps_attention() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(2),
+        );
+        seed_factory_droid_ask_user_attention(&mut app, 1);
+
+        app.set_active_terminal(&ctx, Some(1));
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.factory_droid_attention_reason,
+            Some(FactoryDroidAttentionReason::AskUser)
+        );
     }
 
     #[test]
@@ -16298,6 +17014,222 @@ mod tests {
             terminal.factory_droid_last_status_source,
             Some(FactoryDroidStatusSource::PtyStop)
         );
+    }
+
+    #[test]
+    fn visible_droid_ask_user_chunk_sets_attention_reason() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            entry.factory_droid_session_active = true;
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "droid-ask-user-prompt".to_owned(),
+                },
+            })
+            .expect("send droid ask user chunk");
+
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::PtyNotification)
+        );
+        assert_eq!(
+            terminal.factory_droid_attention_reason,
+            Some(FactoryDroidAttentionReason::AskUser)
+        );
+    }
+
+    #[test]
+    fn visible_droid_spec_approval_chunk_sets_attention_reason() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            entry.factory_droid_session_active = true;
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "droid-spec-approval-prompt".to_owned(),
+                },
+            })
+            .expect("send droid spec approval chunk");
+
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::PtyNotification)
+        );
+        assert_eq!(
+            terminal.factory_droid_attention_reason,
+            Some(FactoryDroidAttentionReason::SpecificationApproval)
+        );
+    }
+
+    #[test]
+    fn terminal_title_running_does_not_downgrade_factory_droid_ask_user_attention() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_factory_droid_ask_user_attention(&mut app, 1);
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiStatusChange {
+                    terminal_id: 1,
+                    tool: Some(AiCliTool::FactoryDroid),
+                    status: AiCliStatus::Running,
+                    event: None,
+                    from_title: true,
+                },
+            })
+            .expect("send title running status");
+
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::PtyNotification)
+        );
+        assert_eq!(
+            terminal.factory_droid_attention_reason,
+            Some(FactoryDroidAttentionReason::AskUser)
+        );
+    }
+
+    #[test]
+    fn terminal_title_running_does_not_downgrade_factory_droid_spec_approval_attention() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_factory_droid_spec_approval_attention(&mut app, 1);
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiStatusChange {
+                    terminal_id: 1,
+                    tool: Some(AiCliTool::FactoryDroid),
+                    status: AiCliStatus::Running,
+                    event: None,
+                    from_title: true,
+                },
+            })
+            .expect("send title running status");
+
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::PtyNotification)
+        );
+        assert_eq!(
+            terminal.factory_droid_attention_reason,
+            Some(FactoryDroidAttentionReason::SpecificationApproval)
+        );
+    }
+
+    #[test]
+    fn pty_hook_running_does_not_downgrade_factory_droid_spec_approval_attention() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_factory_droid_spec_approval_attention(&mut app, 1);
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiStatusChange {
+                    terminal_id: 1,
+                    tool: Some(AiCliTool::FactoryDroid),
+                    status: AiCliStatus::Running,
+                    event: None,
+                    from_title: false,
+                },
+            })
+            .expect("send hook running status");
+
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::PtyNotification)
+        );
+        assert_eq!(
+            terminal.factory_droid_attention_reason,
+            Some(FactoryDroidAttentionReason::SpecificationApproval)
+        );
+    }
+
+    #[test]
+    fn inbox_running_does_not_downgrade_factory_droid_spec_approval_attention() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_factory_droid_spec_approval_attention(&mut app, 1);
+
+        let event = test_factory_droid_hook_event(1, &test_factory_droid_inbox_token(1), "running");
+
+        assert!(!app.apply_factory_droid_hook_inbox_event(1, &event));
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::PtyNotification)
+        );
+        assert_eq!(
+            terminal.factory_droid_attention_reason,
+            Some(FactoryDroidAttentionReason::SpecificationApproval)
+        );
+    }
+
+    #[test]
+    fn terminal_title_running_can_downgrade_generic_factory_attention() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_ai_attention(&mut app, 1);
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiStatusChange {
+                    terminal_id: 1,
+                    tool: Some(AiCliTool::FactoryDroid),
+                    status: AiCliStatus::Running,
+                    event: None,
+                    from_title: true,
+                },
+            })
+            .expect("send title running status");
+
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::TerminalTitle)
+        );
+        assert_eq!(terminal.factory_droid_attention_reason, None);
     }
 
     #[test]
@@ -16581,6 +17513,104 @@ mod tests {
     }
 
     #[test]
+    fn factory_droid_ask_user_empty_enter_restores_running() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_factory_droid_ask_user_attention(&mut app, 1);
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::PromptSubmit)
+        );
+        assert_eq!(terminal.factory_droid_attention_reason, None);
+    }
+
+    #[test]
+    fn factory_droid_spec_approval_empty_enter_restores_running() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_factory_droid_spec_approval_attention(&mut app, 1);
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::PromptSubmit)
+        );
+        assert_eq!(terminal.factory_droid_attention_reason, None);
+    }
+
+    #[test]
+    fn factory_droid_ask_user_escape_clears_attention_without_running() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_factory_droid_ask_user_attention(&mut app, 1);
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::FactoryDroid));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert_eq!(terminal.factory_droid_attention_reason, None);
+    }
+
+    #[test]
+    fn factory_droid_spec_approval_escape_clears_attention_without_running() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_factory_droid_spec_approval_attention(&mut app, 1);
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::FactoryDroid));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert_eq!(terminal.factory_droid_attention_reason, None);
+    }
+
+    #[test]
     fn route_active_terminal_input_marks_factory_droid_launch_pending_without_running() {
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
@@ -16810,6 +17840,111 @@ mod tests {
         assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
         assert!(!terminal.factory_droid_session_active);
         assert!(terminal.factory_droid_process_missing_since.is_some());
+    }
+
+    #[test]
+    fn factory_droid_process_poll_preserves_spec_approval_attention_before_running_title_update() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_factory_droid_spec_approval_attention(&mut app, 1);
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry
+                .runtime
+                .set_factory_droid_process_active_for_test(Some(true));
+        }
+
+        app.factory_droid_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(FACTORY_DROID_PROCESS_POLL_MS + 1));
+        app.poll_factory_droid_processes(&ctx);
+
+        {
+            let terminal = app.terminals.get(&1).expect("terminal 1");
+            assert_eq!(terminal.ai_session.tool, Some(AiCliTool::FactoryDroid));
+            assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+            assert!(terminal.factory_droid_session_active);
+            assert_eq!(
+                terminal.factory_droid_last_status_source,
+                Some(FactoryDroidStatusSource::PtyNotification)
+            );
+            assert_eq!(
+                terminal.factory_droid_attention_reason,
+                Some(FactoryDroidAttentionReason::SpecificationApproval)
+            );
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiStatusChange {
+                    terminal_id: 1,
+                    tool: Some(AiCliTool::FactoryDroid),
+                    status: AiCliStatus::Running,
+                    event: None,
+                    from_title: true,
+                },
+            })
+            .expect("send title running status");
+
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::FactoryDroid));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert!(terminal.factory_droid_session_active);
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::PtyNotification)
+        );
+        assert_eq!(
+            terminal.factory_droid_attention_reason,
+            Some(FactoryDroidAttentionReason::SpecificationApproval)
+        );
+    }
+
+    #[test]
+    fn factory_droid_ask_user_process_exit_clears_attention() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_factory_droid_ask_user_attention(&mut app, 1);
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry
+                .runtime
+                .set_factory_droid_process_active_for_test(Some(false));
+        }
+
+        app.factory_droid_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(FACTORY_DROID_PROCESS_POLL_MS + 1));
+        app.poll_factory_droid_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, None);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(!terminal.factory_droid_session_active);
+        assert_eq!(terminal.factory_droid_last_status_source, None);
+        assert_eq!(terminal.factory_droid_attention_reason, None);
+    }
+
+    #[test]
+    fn factory_droid_spec_approval_process_exit_clears_attention() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_factory_droid_spec_approval_attention(&mut app, 1);
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry
+                .runtime
+                .set_factory_droid_process_active_for_test(Some(false));
+        }
+
+        app.factory_droid_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(FACTORY_DROID_PROCESS_POLL_MS + 1));
+        app.poll_factory_droid_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, None);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(!terminal.factory_droid_session_active);
+        assert_eq!(terminal.factory_droid_last_status_source, None);
+        assert_eq!(terminal.factory_droid_attention_reason, None);
     }
 
     #[test]
@@ -17940,7 +19075,7 @@ mod tests {
     }
 
     #[test]
-    fn sticky_codex_attention_text_without_enter_stays_visible() {
+    fn sticky_turn_complete_codex_attention_text_without_enter_clears_state() {
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
         seed_codex_attention(&mut app, 1);
@@ -17957,15 +19092,13 @@ mod tests {
         app.route_active_terminal_input(&ctx, vec![Event::Text("continue".to_owned())]);
 
         let terminal = app.terminals.get(&1).expect("terminal 1");
-        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
-        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(terminal.ai_session.tool, None);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
         assert!(!terminal.codex_session_active);
         assert!(terminal.codex_process_identity.is_none());
         assert!(terminal.codex_process_missing_since.is_none());
-        assert_eq!(
-            terminal.codex_attention_reason,
-            Some(CodexAttentionReason::TurnComplete)
-        );
+        assert_eq!(terminal.codex_attention_reason, None);
+        assert_eq!(terminal.codex_last_status_source, None);
     }
 
     #[test]
@@ -17995,6 +19128,40 @@ mod tests {
         assert_eq!(
             terminal.codex_attention_reason,
             Some(CodexAttentionReason::UserInputRequested)
+        );
+        assert_eq!(
+            terminal.codex_last_status_source,
+            Some(CodexCliStatusSource::VisibleUi)
+        );
+    }
+
+    #[test]
+    fn visible_codex_plan_mode_prompt_sets_attention_reason() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "codex-plan-mode-prompt".to_owned(),
+                },
+            })
+            .expect("send codex plan mode prompt chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::PlanModePrompt)
         );
         assert_eq!(
             terminal.codex_last_status_source,
@@ -18116,6 +19283,108 @@ mod tests {
     }
 
     #[test]
+    fn generic_notify_does_not_downgrade_visible_codex_plan_mode_prompt() {
+        let ctx = Context::default();
+        let temp_dir = TestTempDir::new("codex-plan-notify-after-visible-ui");
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.codex_cli_runtime_dir = Some(temp_dir.path.clone());
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "codex-plan-mode-prompt".to_owned(),
+                },
+            })
+            .expect("send codex plan mode prompt chunk");
+        app.process_terminal_events(&ctx);
+
+        write_test_codex_notify_events(
+            &temp_dir.path,
+            1,
+            &test_codex_inbox_token(1),
+            &[CodexNotifyInboxEvent {
+                terminal_id: "1".to_owned(),
+                tool: "codex".to_owned(),
+                status: "attention".to_owned(),
+                inbox_token: Some(test_codex_inbox_token(1)),
+                event_kind: Some(CODEX_UNKNOWN_NOTIFY_EVENT.to_owned()),
+                raw_json: r#"{"event":"mystery"}"#.to_owned(),
+                timestamp_utc: "2026-04-06T00:00:00Z".to_owned(),
+            }],
+        );
+        app.poll_codex_notify_inboxes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.codex_last_status_source,
+            Some(CodexCliStatusSource::VisibleUi)
+        );
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::PlanModePrompt)
+        );
+    }
+
+    #[test]
+    fn turn_complete_notify_does_not_downgrade_visible_codex_plan_mode_prompt() {
+        let ctx = Context::default();
+        let temp_dir = TestTempDir::new("codex-plan-turn-complete-after-visible-ui");
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.codex_cli_runtime_dir = Some(temp_dir.path.clone());
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "codex-plan-mode-prompt".to_owned(),
+                },
+            })
+            .expect("send codex plan mode prompt chunk");
+        app.process_terminal_events(&ctx);
+
+        write_test_codex_notify_events(
+            &temp_dir.path,
+            1,
+            &test_codex_inbox_token(1),
+            &[CodexNotifyInboxEvent {
+                terminal_id: "1".to_owned(),
+                tool: "codex".to_owned(),
+                status: "attention".to_owned(),
+                inbox_token: Some(test_codex_inbox_token(1)),
+                event_kind: Some("agent-turn-complete".to_owned()),
+                raw_json: r#"{"event":"agent-turn-complete"}"#.to_owned(),
+                timestamp_utc: "2026-04-06T00:00:00Z".to_owned(),
+            }],
+        );
+        app.poll_codex_notify_inboxes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.codex_last_status_source,
+            Some(CodexCliStatusSource::VisibleUi)
+        );
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::PlanModePrompt)
+        );
+    }
+
+    #[test]
     fn sticky_codex_attention_is_cleared_by_committed_reply() {
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
@@ -18149,6 +19418,48 @@ mod tests {
         assert!(terminal.codex_process_identity.is_none());
         assert!(terminal.codex_process_missing_since.is_none());
         assert_eq!(terminal.codex_last_status_source, None);
+    }
+
+    #[test]
+    fn interactive_codex_attention_text_without_enter_stays_visible() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_codex_attention(&mut app, 1);
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.codex_attention_reason = Some(CodexAttentionReason::PlanModePrompt);
+        }
+
+        app.route_active_terminal_input(&ctx, vec![Event::Text("continue".to_owned())]);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::PlanModePrompt)
+        );
+    }
+
+    #[test]
+    fn turn_complete_codex_text_without_enter_keeps_live_session_but_clears_attention() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_codex_attention(&mut app, 1);
+
+        let expected_identity = app
+            .terminals
+            .get(&1)
+            .expect("terminal 1")
+            .codex_process_identity;
+
+        app.route_active_terminal_input(&ctx, vec![Event::Text("continue".to_owned())]);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(terminal.codex_session_active);
+        assert_eq!(terminal.codex_process_identity, expected_identity);
+        assert_eq!(terminal.codex_attention_reason, None);
     }
 
     #[test]
@@ -18215,10 +19526,35 @@ mod tests {
     }
 
     #[test]
-    fn codex_attention_same_terminal_focus_does_not_acknowledge() {
+    fn turn_complete_codex_attention_same_terminal_focus_acknowledges() {
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
         seed_codex_attention(&mut app, 1);
+
+        let expected_identity = app
+            .terminals
+            .get(&1)
+            .expect("terminal 1")
+            .codex_process_identity;
+
+        app.set_active_terminal(&ctx, Some(1));
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(terminal.codex_session_active);
+        assert_eq!(terminal.codex_process_identity, expected_identity);
+        assert_eq!(terminal.codex_attention_reason, None);
+    }
+
+    #[test]
+    fn plan_mode_codex_attention_same_terminal_focus_does_not_acknowledge() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_codex_attention(&mut app, 1);
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.codex_attention_reason = Some(CodexAttentionReason::PlanModePrompt);
+        }
 
         app.set_active_terminal(&ctx, Some(1));
 
@@ -18227,8 +19563,33 @@ mod tests {
         assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
         assert_eq!(
             terminal.codex_attention_reason,
-            Some(CodexAttentionReason::TurnComplete)
+            Some(CodexAttentionReason::PlanModePrompt)
         );
+    }
+
+    #[test]
+    fn turn_complete_codex_attention_same_terminal_focus_acknowledges_without_hook_manager() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Attention;
+            entry.codex_session_active = true;
+            entry.codex_process_identity = Some(TrackedProcessIdentity {
+                pid: 7021,
+                creation_time: Some(8021),
+            });
+            entry.codex_attention_reason = Some(CodexAttentionReason::TurnComplete);
+            entry.codex_last_status_source = Some(CodexCliStatusSource::Notify);
+        }
+
+        app.set_active_terminal(&ctx, Some(1));
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(terminal.codex_session_active);
+        assert_eq!(terminal.codex_attention_reason, None);
     }
 
     #[test]
@@ -18835,10 +20196,12 @@ mod tests {
                     staged: *staged,
                 })
                 .collect(),
+            omitted_files: 0,
             added_lines: Some(0),
             removed_lines: Some(0),
             loading: false,
             last_error: None,
+            partial_warning: None,
         }
     }
 
@@ -18892,6 +20255,7 @@ mod tests {
             factory_droid_last_process_seen_at: None,
             factory_droid_process_missing_since: None,
             factory_droid_last_status_source: None,
+            factory_droid_attention_reason: None,
             codex_launch_pending_since: None,
             codex_launch_process_baseline: None,
             codex_session_active: false,
@@ -18921,11 +20285,16 @@ mod tests {
         terminals: impl IntoIterator<Item = (u64, TerminalEntry)>,
         active_terminal: Option<u64>,
     ) -> AdeApp {
-        let (terminal_events_tx, terminal_events_rx) = crossbeam_channel::unbounded();
+        let (terminal_events_tx, terminal_events_rx) =
+            crossbeam_channel::bounded(TERMINAL_EVENT_QUEUE_CAPACITY);
         let (source_control_commands_tx, _source_control_commands_rx) =
-            crossbeam_channel::unbounded();
-        let (_source_control_events_tx, source_control_events_rx) = crossbeam_channel::unbounded();
-        let (directory_index_events_tx, directory_index_events_rx) = crossbeam_channel::unbounded();
+            crossbeam_channel::bounded(SOURCE_CONTROL_CHANNEL_CAPACITY);
+        let (_source_control_events_tx, source_control_events_rx) =
+            crossbeam_channel::bounded(SOURCE_CONTROL_CHANNEL_CAPACITY);
+        let (directory_index_commands_tx, _directory_index_commands_rx) =
+            crossbeam_channel::bounded(DIRECTORY_INDEX_CHANNEL_CAPACITY);
+        let (_directory_index_events_tx, directory_index_events_rx) =
+            crossbeam_channel::bounded(DIRECTORY_INDEX_CHANNEL_CAPACITY);
 
         AdeApp {
             config_path: PathBuf::new(),
@@ -18979,7 +20348,7 @@ mod tests {
             source_control_refresh_state: BTreeMap::new(),
             source_control_worker_busy: false,
             source_control_last_auto_refresh_project: None,
-            directory_index_events_tx,
+            directory_index_commands_tx,
             directory_index_events_rx,
             directory_index_state: BTreeMap::new(),
             directory_tree_has_collapsed_cache_by_project: BTreeMap::new(),
@@ -19042,6 +20411,33 @@ mod tests {
             entry.factory_droid_last_status_source =
                 Some(FactoryDroidStatusSource::PtyNotification);
         }
+    }
+
+    fn seed_factory_droid_interactive_attention(
+        app: &mut AdeApp,
+        terminal_id: u64,
+        reason: FactoryDroidAttentionReason,
+    ) {
+        seed_ai_attention(app, terminal_id);
+        if let Some(entry) = app.terminals.get_mut(&terminal_id) {
+            entry.factory_droid_attention_reason = Some(reason);
+        }
+    }
+
+    fn seed_factory_droid_ask_user_attention(app: &mut AdeApp, terminal_id: u64) {
+        seed_factory_droid_interactive_attention(
+            app,
+            terminal_id,
+            FactoryDroidAttentionReason::AskUser,
+        );
+    }
+
+    fn seed_factory_droid_spec_approval_attention(app: &mut AdeApp, terminal_id: u64) {
+        seed_factory_droid_interactive_attention(
+            app,
+            terminal_id,
+            FactoryDroidAttentionReason::SpecificationApproval,
+        );
     }
 
     fn seed_codex_attention(app: &mut AdeApp, terminal_id: u64) {
@@ -20066,6 +21462,32 @@ mod tests {
             Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 220, 220)))
         );
         assert_eq!(ai_badge_visual(AiCliStatus::Inactive), None);
+    }
+
+    #[test]
+    fn ai_badge_tooltip_uses_factory_droid_ask_user_reason() {
+        assert_eq!(
+            ai_badge_tooltip_lines(
+                Some(AiCliTool::FactoryDroid),
+                AiCliStatus::Attention,
+                Some(FactoryDroidAttentionReason::AskUser),
+                None,
+            ),
+            vec!["Factory Droid - Waiting for your reply...".to_owned()]
+        );
+    }
+
+    #[test]
+    fn ai_badge_tooltip_uses_factory_droid_spec_approval_reason() {
+        assert_eq!(
+            ai_badge_tooltip_lines(
+                Some(AiCliTool::FactoryDroid),
+                AiCliStatus::Attention,
+                Some(FactoryDroidAttentionReason::SpecificationApproval),
+                None,
+            ),
+            vec!["Factory Droid - Waiting for specification approval...".to_owned()]
+        );
     }
 
     #[test]

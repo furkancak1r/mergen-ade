@@ -15,12 +15,14 @@ mod title;
 
 use eframe::egui;
 use eframe::icon_data;
+use std::any::Any;
 use std::ffi::OsString;
 use std::io;
+use std::panic::{self, AssertUnwindSafe};
+use std::time::Duration;
 
 fn setup_panic_hook() {
     use std::io::Write as _;
-    use std::panic;
 
     let log_path = std::path::Path::new("mergen_ade_panic.log");
 
@@ -58,6 +60,150 @@ fn setup_panic_hook() {
 
         eprintln!("[PANIC] {log_line}");
     }));
+}
+
+fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "Unknown panic payload".to_owned()
+    }
+}
+
+fn decode_app_icon_from_bytes(bytes: &[u8]) -> Option<egui::IconData> {
+    match icon_data::from_png_bytes(bytes) {
+        Ok(icon) => Some(icon),
+        Err(err) => {
+            log::warn!("Skipping app icon because the generated PNG could not be decoded: {err}");
+            None
+        }
+    }
+}
+
+fn load_app_icon() -> Option<egui::IconData> {
+    decode_app_icon_from_bytes(include_bytes!(concat!(env!("OUT_DIR"), "/app-icon.png")))
+}
+
+struct CrashShieldApp {
+    inner: Option<app::AdeApp>,
+    startup_error: Option<String>,
+    crash_error: Option<String>,
+}
+
+impl CrashShieldApp {
+    fn new(inner: app::AdeApp) -> Self {
+        Self {
+            inner: Some(inner),
+            startup_error: None,
+            crash_error: None,
+        }
+    }
+
+    fn from_startup_error(error: String) -> Self {
+        Self {
+            inner: None,
+            startup_error: Some(error),
+            crash_error: None,
+        }
+    }
+
+    fn note_crash(&mut self, stage: &'static str, payload: Box<dyn Any + Send>) {
+        let error = format!("{stage} panicked: {}", panic_payload_to_string(&*payload));
+        log::error!("{error}");
+        self.crash_error = Some(error);
+        self.inner = None;
+    }
+
+    fn render_fallback(&self, ctx: &egui::Context) {
+        let message = self
+            .crash_error
+            .as_deref()
+            .or(self.startup_error.as_deref())
+            .unwrap_or("Mergen ADE stopped because an internal error occurred.");
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.with_layout(
+                egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.heading("Mergen ADE recovered from an internal error");
+                        ui.add_space(8.0);
+                        ui.label(message);
+                        ui.add_space(8.0);
+                        ui.label("Restart the app to restore normal operation.");
+                    });
+                },
+            );
+        });
+        ctx.request_repaint_after(Duration::from_secs(1));
+    }
+}
+
+impl eframe::App for CrashShieldApp {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if self.inner.is_none() {
+            self.render_fallback(ctx);
+            return;
+        }
+
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            if let Some(inner) = self.inner.as_mut() {
+                inner.update(ctx, frame);
+            }
+        }));
+
+        if let Err(payload) = result {
+            self.note_crash("update", payload);
+            self.render_fallback(ctx);
+        }
+    }
+
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+
+        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| {
+            inner.raw_input_hook(ctx, raw_input);
+        })) {
+            self.note_crash("raw_input_hook", payload);
+        }
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+
+        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| {
+            inner.save(storage);
+        })) {
+            self.note_crash("save", payload);
+        }
+    }
+
+    fn auto_save_interval(&self) -> Duration {
+        self.inner
+            .as_ref()
+            .map(|inner| inner.auto_save_interval())
+            .unwrap_or_else(|| Duration::from_secs(30))
+    }
+
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        self.inner
+            .as_ref()
+            .map(|inner| inner.clear_color(visuals))
+            .unwrap_or_else(|| egui::Color32::from_rgb(12, 12, 12).to_normalized_gamma_f32())
+    }
+
+    fn persist_egui_memory(&self) -> bool {
+        self.inner
+            .as_ref()
+            .map(|inner| inner.persist_egui_memory())
+            .unwrap_or(false)
+    }
 }
 
 fn maybe_handle_codex_notify_mode_with<I, F>(mut args: I, mut handler: F) -> Result<bool, String>
@@ -104,17 +250,17 @@ fn main() -> Result<(), eframe::Error> {
     setup_panic_hook();
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let app_icon =
-        icon_data::from_png_bytes(include_bytes!(concat!(env!("OUT_DIR"), "/app-icon.png")))
-            .expect("generated app icon should decode");
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1600.0, 980.0])
+        .with_min_inner_size([980.0, 620.0])
+        .with_clamp_size_to_monitor_size(true)
+        .with_title("Mergen ADE");
+    if let Some(app_icon) = load_app_icon() {
+        viewport = viewport.with_icon(app_icon);
+    }
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1600.0, 980.0])
-            .with_min_inner_size([980.0, 620.0])
-            .with_clamp_size_to_monitor_size(true)
-            .with_icon(app_icon)
-            .with_title("Mergen ADE"),
+        viewport,
         centered: true,
         persist_window: false,
         ..Default::default()
@@ -123,7 +269,17 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "Mergen ADE",
         options,
-        Box::new(|cc| Ok(Box::new(app::AdeApp::bootstrap(cc)))),
+        Box::new(|cc| {
+            let shield = match panic::catch_unwind(AssertUnwindSafe(|| app::AdeApp::bootstrap(cc)))
+            {
+                Ok(app) => CrashShieldApp::new(app),
+                Err(payload) => CrashShieldApp::from_startup_error(format!(
+                    "startup panicked: {}",
+                    panic_payload_to_string(&*payload)
+                )),
+            };
+            Ok(Box::new(shield))
+        }),
     )
 }
 
@@ -209,6 +365,11 @@ mod tests {
         .expect_err("missing payload should fail");
 
         assert_eq!(err, "Missing Codex notify payload argument.");
+    }
+
+    #[test]
+    fn invalid_app_icon_bytes_are_non_fatal() {
+        assert!(super::decode_app_icon_from_bytes(&[]).is_none());
     }
 
     fn write_test_notify_event(

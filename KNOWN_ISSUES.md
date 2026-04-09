@@ -1,5 +1,20 @@
 ### Known Issues & Fix Log
 
+#### Crash-resistance hardening now keeps startup and config persistence alive under unwind-safe panic handling {#crash-resistance-hardening-now-keeps-startup-and-config-persistence-alive-under-unwind-safe-panic-handling}
+- Date: 2026-04-09T00:00:00Z
+- Context: main startup path and config persistence on Windows and non-Windows targets
+- Error signature: `A startup icon decode failure or config write failure could become a hard process exit, and release panic handling was configured to abort instead of allowing a crash shield to recover.`
+- Symptoms/Impact: A corrupt generated icon, a panic inside the UI lifecycle, or a partially failed config replace could terminate Mergen ADE instead of degrading safely.
+- Root cause: Release builds used `panic = "abort"`, startup treated the embedded icon as mandatory, and config persistence relied on non-atomic replace behavior that could delete the last good file before the new one landed.
+- Resolution:
+  - Switched release panic handling to unwind so a crash shield can catch and degrade instead of aborting immediately.
+  - Made app icon decode optional and logged the failure instead of treating it as fatal.
+  - Reworked config persistence to write to a unique temp file and replace the target atomically, preserving the old config if replace fails.
+- Prevent recurrence:
+  - Any startup-only asset or persistence path should fail soft and log, not panic.
+  - When changing config save logic, keep the previous file intact until the replacement has succeeded.
+- Files/Commands touched: `Cargo.toml`, `src/main.rs`, `src/config.rs`, `KNOWN_ISSUES.md`
+
 #### Settings Layout control now uses the same inline width treatment as the setting above it {#settings-layout-control-now-uses-the-same-inline-width-treatment-as-the-setting-above-it}
 - Date: 2026-04-09T00:00:00Z
 - Context: main/Windows local Settings modal general section
@@ -1262,3 +1277,101 @@
   - Cover both `Running -> Inactive` and `Attention -> Inactive` interruption paths in regressions.
 - Files/Commands touched: `src/app.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: 2026-04-09 user-reported `Esc` interrupt spinner persistence; regression tests `pending_visible_codex_status_detects_split_interrupted_banner_across_reads`, `running_codex_interrupt_banner_sets_inactive_without_clearing_session`, `attention_codex_interrupt_banner_sets_inactive_without_clearing_session`, and `codex_question_prompt_can_return_after_interrupt_banner_without_relaunch`
+
+#### Factory Droid `Ask User` screens could keep the running spinner instead of switching to pulse {#factory-droid-ask-user-screens-could-keep-the-running-spinner-instead-of-switching-to-pulse}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows native Factory Droid integration when Droid renders the interactive `Ask User` TUI with `Q1`, selectable options, and `Enter Select / ESC cancel`
+- Error signature: `Factory Droid showed an Ask User prompt, but Mergen kept the running spinner instead of a pulse and could clear that wait state too early on focus/input changes.`
+- Symptoms/Impact: Users could mistake a blocked Droid question for ongoing work. Even after the `Ask User` screen appeared, changing focus back to the terminal or sending navigation keys like `Tab` could make the attention indicator disappear before a real answer or cancel action happened.
+- Root cause: `src/terminal.rs` only recognized older visible Droid wait markers such as `HOOKS Stop`, `needs your permission`, and `waiting for your input`; the newer `Ask User / Q1 / Enter Select / ESC cancel` chrome was invisible to Mergen. Separately, `src/app.rs` treated every Factory Droid attention as generic, so focus acknowledgement and any terminal interaction could clear the state immediately.
+- Resolution: Mergen now detects the visible `Ask User` UI through a conservative multi-marker parser in `src/terminal.rs` and emits a dedicated `droid-ask-user-prompt` raw chunk. `src/app.rs` maps that chunk to a dedicated Factory Droid attention reason, keeps that reason sticky across terminal focus changes, routes `Tab` and other prompt controls back into the terminal when UI text inputs own keyboard focus, restores `Running` only on real submit, clears to `Inactive` on `ESC` cancel, and drops the sticky pulse when the Droid session/process exits.
+- Prevent recurrence:
+  - Treat interactive visible Droid question screens as a first-class attention reason, not as a generic `Waiting for you` state.
+  - Keep `Ask User` detection conservative by requiring multiple stable TUI markers instead of matching the title alone.
+  - Test focus acknowledgement, empty-enter submit, `ESC` cancel, and process-exit cleanup independently for sticky interactive Droid waits.
+- Files/Commands touched: `src/app.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo test`
+- References: 2026-04-09 user-reported Factory Droid `Ask User` screenshot; regression tests `pending_visible_factory_status_detects_split_ask_user_prompt_across_reads`, `visible_droid_ask_user_chunk_sets_attention_reason`, `same_terminal_focus_keeps_factory_droid_ask_user_attention`, `factory_droid_ask_user_empty_enter_restores_running`, `factory_droid_ask_user_escape_clears_attention_without_running`, and `factory_droid_ask_user_process_exit_clears_attention`
+
+#### Codex plan-mode prompts could stay on the running spinner, and completed-turn pulse reminders could remain sticky after acknowledgement {#codex-plan-mode-prompts-could-stay-on-the-running-spinner-and-completed-turn-pulse-reminders-could-remain-sticky-after-acknowledgement}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Codex CLI integration when Codex enters the visible `Implement this plan?` confirmation UI or when a finished turn leaves a `TurnComplete` pulse reminder behind
+- Error signature: `Codex showed the plan approval prompt but Mergen sometimes kept the running spinner, and after work was done the pulse could keep blinking even after focusing/clicking/typing in the terminal.`
+- Symptoms/Impact: Users could miss that Codex had paused on a plan approval screen because the badge still looked like active work. Separately, once a turn was already complete, the reminder pulse could stay visible longer than intended and keep demanding attention even after the user had clearly acknowledged the terminal with focus or keyboard input.
+- Root cause: `src/terminal.rs` had no visible-ui detector for the native Codex plan approval chrome, so if the notify path was absent or late the prior `Running` state remained untouched. In `src/app.rs`, focus/input acknowledgement treated every Codex attention reason as sticky, so the durable `TurnComplete` reminder was preserved by the same policy used for genuinely interactive waits such as plan approval or question prompts.
+- Resolution: Mergen now recognizes the visible `Implement this plan? / Yes, implement this plan / No, stay in Plan mode / Press enter to confirm or esc to go back` UI and maps it to `Attention + PlanModePrompt`, which forces the spinner to switch to pulse even without a matching notify event. Codex acknowledgement is also reason-aware: `TurnComplete` clears on terminal focus/click or real keyboard input, while interactive waits like `PlanModePrompt`, `ApprovalRequested`, and `UserInputRequested` remain sticky until a true reply/submit path happens.
+- Prevent recurrence:
+  - Keep visible-ui fallbacks for Codex waits whenever the CLI surfaces stable terminal chrome that may race with or outlive notify delivery.
+  - Separate completion reminders from active user-blocking waits before deciding whether focus/input acknowledgement should clear a pulse.
+  - Cover both live-session and already-exited-session `TurnComplete` acknowledgement paths in regressions.
+- Files/Commands touched: `src/app.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 user-reported Codex `Implement this plan?` spinner persistence and sticky completion pulse; regression tests `pending_visible_codex_status_detects_split_plan_mode_prompt_across_reads`, `visible_codex_plan_mode_prompt_sets_attention_reason`, `generic_notify_does_not_downgrade_visible_codex_plan_mode_prompt`, `turn_complete_codex_text_without_enter_keeps_live_session_but_clears_attention`, `sticky_turn_complete_codex_attention_text_without_enter_clears_state`, `turn_complete_codex_attention_same_terminal_focus_acknowledges`, and `plan_mode_codex_attention_same_terminal_focus_does_not_acknowledge`
+
+#### Factory Droid spec-approval screens could keep the running spinner instead of switching to pulse {#factory-droid-spec-approval-screens-could-keep-the-running-spinner-instead-of-switching-to-pulse}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows native Factory Droid integration when Droid renders the visible `Propose Specification / Specification for approval` screen with numbered choices like `Proceed with the proposal`, `Proceed with comment`, and `No and explain why`
+- Error signature: `Factory Droid showed the specification approval UI, but Mergen kept the running spinner instead of a pulse.`
+- Symptoms/Impact: Users could miss that Droid had stopped for approval because the badge still implied ongoing work. If they interacted from a focused search/input field with prompt controls like `Ctrl+G`, that input could also risk clearing the wait state too early unless the screen was modeled as a real interactive attention reason.
+- Root cause: `src/terminal.rs` only recognized the older visible `Ask User` question chrome and legacy stop/permission markers; it had no detector for the newer `Propose Specification / Specification for approval / Will save to: / Proceed with the proposal ... / ESC Cancel` screen. `src/app.rs` also only had one explicit interactive Droid attention reason (`AskUser`), so the approval UI had no dedicated sticky pulse behavior or tooltip even if its chrome had been detected.
+- Resolution: Mergen now detects the visible Factory Droid specification approval chrome through a conservative multi-marker parser and emits a dedicated `droid-spec-approval-prompt` raw chunk. `src/app.rs` maps that chunk to a new `FactoryDroidAttentionReason::SpecificationApproval`, keeps it sticky across terminal focus changes, routes prompt-control input like `Ctrl+G` back into the terminal when UI text fields own focus, treats empty `Enter` as a real selection submit, clears on `ESC` cancel, and drops the pulse when the Droid session/process exits.
+- Prevent recurrence:
+  - Model visually distinct interactive Droid wait states as explicit reasons instead of collapsing everything into `AskUser` or generic attention.
+  - Keep the spec-approval parser conservative by requiring multiple stable approval-screen markers rather than matching the title alone.
+  - Cover split-read parsing, focus persistence, prompt-control input routing, and process-exit cleanup in regressions for each interactive Droid reason.
+- Files/Commands touched: `src/app.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 user-reported Factory Droid `Propose Specification` spinner persistence; regression tests `pending_visible_factory_status_detects_split_spec_approval_prompt_across_reads`, `visible_droid_spec_approval_chunk_sets_attention_reason`, `raw_input_hook_steals_ctrl_g_for_factory_droid_spec_approval_terminal`, `same_terminal_focus_keeps_factory_droid_spec_approval_attention`, `factory_droid_spec_approval_empty_enter_restores_running`, `factory_droid_spec_approval_escape_clears_attention_without_running`, and `factory_droid_spec_approval_process_exit_clears_attention`
+
+#### Factory Droid spec-approval pulse could still miss live approval screens when the footer used arrow glyphs, and raw status chunks could drop under queue pressure {#factory-droid-spec-approval-pulse-could-still-miss-live-approval-screens-when-the-footer-used-arrow-glyphs-and-raw-status-chunks-could-drop-under-queue-pressure}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows native Factory Droid integration while Droid shows `Propose Specification / Specification for approval` with the live footer variant `↑/↓ Navigate • Enter Select • 1-4 Quick select • ctrl-g to edit plan • ESC Cancel`
+- Error signature: `The Droid approval screen was visible, but Mergen sometimes kept the running spinner instead of switching to pulse.`
+- Symptoms/Impact: Even after the earlier spec-approval fix, the live Droid approval screen could still stay on the spinner because the parser failed to recognize the footer variant actually rendered by Droid. Users also saw intermittent behavior because, under UI event queue pressure, the detected raw status chunk could be dropped before app state consumed it.
+- Root cause: `src/terminal.rs` matched the footer too narrowly by requiring the literal substring `/ Navigate`, while the real UI used arrow glyphs and bullet separators. Separately, `send_ui_event()` treated every `AiRawChunk` as best-effort and silently dropped it on a full bounded queue, including stateful chunks like `droid-spec-approval-prompt`.
+- Resolution: The spec-approval detector now matches semantic footer tokens instead of the exact ASCII `/ Navigate` chrome, so both the old and the live `↑/↓ Navigate` footer variants are accepted. `send_ui_event()` also now keeps `[bell]` best-effort but delivers stateful `AiRawChunk` events reliably, preventing prompt-state transitions from being lost under queue pressure.
+- Prevent recurrence:
+  - Prefer semantic marker matching for visible AI prompt chrome when the surrounding UI may use Unicode glyphs or alternate separators.
+  - Keep noisy telemetry chunks like `[bell]` lossy, but never drop raw chunks that are required to transition visible wait-state UI.
+  - Regress both live-footer parsing and queue-pressure delivery for any new visible prompt detector.
+- Files/Commands touched: `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 user-provided Factory Droid screenshot showing `↑/↓ Navigate • Enter Select • 1-4 Quick select • ctrl-g to edit plan • ESC Cancel`; regression tests `pending_visible_factory_status_detects_split_spec_approval_prompt_across_reads`, `pending_visible_factory_status_detects_spec_approval_prompt_with_ansi_and_crlf`, `collect_ai_read_signals_emits_visible_droid_spec_approval_prompt`, `send_ui_event_drops_bell_raw_chunk_when_queue_is_full`, and `send_ui_event_blocks_stateful_ai_raw_chunk_until_queue_has_capacity`
+
+#### Factory Droid interactive prompt pulse could still be overwritten by later `Running` title or hook updates {#factory-droid-interactive-prompt-pulse-could-still-be-overwritten-by-later-running-title-or-hook-updates}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows native Factory Droid integration after an interactive visible wait state such as `Ask User` or `Propose Specification / Specification for approval` has already been recognized
+- Error signature: `The interactive Droid prompt was visible, but a later running update switched the badge back to the spinner.`
+- Symptoms/Impact: Even when Mergen successfully detected the visible Droid question or approval UI and entered pulse/attention state, the badge could flip back to the running spinner if Droid later emitted a `[Working...]` terminal title, a hook-derived running status, or an inbox-delivered running update. Users then still saw an active-work indicator instead of a blocked-on-user pulse.
+- Root cause: `src/app.rs` had no Codex-style precedence guard for Factory Droid interactive attention. `apply_factory_droid_status()` accepted later `Running` updates from `TerminalTitle`, `PtyHookEvent`, and `Inbox` even while `FactoryDroidAttentionReason::AskUser` or `FactoryDroidAttentionReason::SpecificationApproval` was active, so the existing interactive wait state could be overwritten.
+- Resolution: Mergen now preserves interactive Factory Droid attention against later `Running` updates from terminal-title, PTY-hook, and inbox sources. Real user submit/cancel paths still clear the pulse as before, but background `Running` telemetry no longer downgrades a visible `Ask User` or specification approval prompt.
+- Prevent recurrence:
+  - Treat interactive visible Droid wait states as higher-precedence than title/hook running telemetry until a real submit, cancel, or process exit occurs.
+  - Keep regressions for both `Ask User` and specification approval flows whenever Factory Droid status precedence changes.
+  - Include a control test showing that generic non-interactive Droid attention can still return to `Running`.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 user-reported “still spinner” regression after live Droid spec-approval detection; regression tests `terminal_title_running_does_not_downgrade_factory_droid_ask_user_attention`, `terminal_title_running_does_not_downgrade_factory_droid_spec_approval_attention`, `pty_hook_running_does_not_downgrade_factory_droid_spec_approval_attention`, `inbox_running_does_not_downgrade_factory_droid_spec_approval_attention`, and `terminal_title_running_can_downgrade_generic_factory_attention`
+
+#### Factory Droid spec-approval pulse could still be missed on long approval screens, and active-process polling could clear sticky approval state {#factory-droid-spec-approval-pulse-could-still-be-missed-on-long-approval-screens-and-active-process-polling-could-clear-sticky-approval-state}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows native Factory Droid integration while Droid shows `Propose Specification / Specification for approval` and keeps the Droid process alive during the approval step
+- Error signature: `The approval screen was visible, but Mergen still showed the running spinner instead of the approval pulse.`
+- Symptoms/Impact: Users could land on a real Droid specification approval screen and still see a spinner if the approval chrome arrived across a long PTY split or if a later `[Working...]` title update arrived after process polling had already stripped the sticky approval reason. The badge then implied ongoing work instead of a blocked approval state.
+- Root cause: `src/terminal.rs` kept only 512 characters of pending visible Droid status, so long `Propose Specification` screens could lose the header before the footer arrived in a later PTY read. The approval matcher also required intermediate footer chrome more strictly than necessary. Separately, `src/app.rs` cleared `factory_droid_attention_reason` whenever process polling confirmed the Droid process was still alive, which removed the sticky `SpecificationApproval` guard and let later running title updates downgrade the badge back to the spinner.
+- Resolution: Mergen now keeps a larger visible-status window for Droid prompt parsing, recognizes approval screens from the stable header plus ordered choices and `Enter Select`/`ESC Cancel` footer markers, and preserves interactive Droid attention reasons when process polling only confirms that the process is still active.
+- Prevent recurrence:
+  - Size visible AI prompt buffers to cover at least a full terminal-screen worth of chrome, not just short hook lines.
+  - Keep interactive approval reasons sticky across liveness polls so later running telemetry cannot erase them.
+  - Regress both long split-read approval parsing and process-poll-plus-running-title sequences for Droid approval flows.
+- Files/Commands touched: `src/app.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 user-reported Factory Droid approval spinner persistence after `Propose Specification`; regression tests `pending_visible_factory_status_detects_spec_approval_prompt_with_minimal_footer`, `pending_visible_factory_status_detects_split_spec_approval_prompt_with_long_save_path`, and `factory_droid_process_poll_preserves_spec_approval_attention_before_running_title_update`
+
+#### Factory Droid spec-approval pulse could still miss long specs after the header scrolled out of the PTY tail buffer {#factory-droid-spec-approval-pulse-could-still-miss-long-specs-after-the-header-scrolled-out-of-the-pty-tail-buffer}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows native Factory Droid integration while Droid renders a long specification body before the bottom approval choices stay visible
+- Error signature: `The spec approval footer was on screen, but Mergen still kept the running spinner.`
+- Symptoms/Impact: Even after the earlier spec-approval fixes, very long specs could still leave the badge on spinner because the top `Propose Specification / Specification for approval` header had already fallen out of the rolling PTY tail by the time the bottom choice block was rendered. Users saw the visible approval menu but not the pulse state.
+- Root cause: `src/terminal.rs` still required the top approval markers for the only positive `droid-spec-approval-prompt` match. The rolling visible-status buffer held only the latest tail of PTY text, so long approval bodies could evict the header before the numbered choice/footer block arrived. With no emitted raw chunk, `src/app.rs` never entered `SpecificationApproval`.
+- Resolution: Mergen now keeps the full-header matcher, but adds a footer-signature fallback that recognizes the stable numbered approval choices plus `Enter Select` and `ESC Cancel` even when the top header/body has already scrolled out of the tail buffer. Existing sticky-attention behavior continues to prevent passive running telemetry from switching the pulse back to spinner afterward.
+- Prevent recurrence:
+  - Treat long approval bodies as normal and avoid requiring top-of-screen markers when the bottom interactive menu is the only stable visible chrome left.
+  - Regress footer-only approval detection and oversized-body PTY tail eviction separately.
+  - Keep spinner-to-pulse regressions tied to emitted `droid-spec-approval-prompt` signals, not just app-side state updates.
+- Files/Commands touched: `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 user-provided Factory Droid approval screen showing the bottom numbered choice menu; regression tests `pending_visible_factory_status_detects_spec_approval_prompt_from_footer_only` and `pending_visible_factory_status_detects_spec_approval_prompt_after_oversized_body`

@@ -17,7 +17,7 @@ use crate::hooks::{
     AiHookManager, FACTORY_DROID_HOOKS_DIR_ENV_VAR, FACTORY_DROID_HOOK_INBOX_TOKEN_ENV_VAR,
     FACTORY_DROID_TERMINAL_ID_ENV_VAR,
 };
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, TrySendError};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tattoy_wezterm_surface::{CursorShape, CursorVisibility};
 use tattoy_wezterm_term::color::{ColorPalette, SrgbaTuple};
@@ -1596,7 +1596,9 @@ fn terminate_snapshot_process(entry: ProcessSnapshotEntry) -> io::Result<()> {
 /// Factory Droid hooks set terminal title to "[Working...]" or "[Idle]".
 /// The escape sequence format is: ESC ] 0 ; title BEL (or ESC \)
 const MAX_PENDING_OSC_TITLE_BYTES: usize = 512;
-const MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS: usize = 512;
+// Keep roughly one full terminal screen of visible AI chrome so long approval
+// prompts can still be recognized when PTY reads split header and footer.
+const MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS: usize = 2048;
 
 #[derive(Debug, Default)]
 struct PendingOscTitle {
@@ -1850,6 +1852,23 @@ fn detect_visible_factory_status_with_end(text: &str) -> Option<(&'static str, u
     let (collapsed, collapsed_offsets) =
         collapse_projection_whitespace(&projection, &projection_offsets);
 
+    if let Some(end_offset) =
+        detect_visible_factory_ask_user_prompt_with_end(&collapsed, &collapsed_offsets)
+    {
+        return Some(("droid-ask-user-prompt", end_offset));
+    }
+
+    if let Some(end_offset) =
+        detect_visible_factory_spec_approval_prompt_with_end(&collapsed, &collapsed_offsets)
+    {
+        return Some(("droid-spec-approval-prompt", end_offset));
+    }
+    if let Some(end_offset) =
+        detect_visible_factory_spec_approval_footer_with_end(&collapsed, &collapsed_offsets)
+    {
+        return Some(("droid-spec-approval-prompt", end_offset));
+    }
+
     for (display, needle) in [
         ("HOOKS Stop", "hooks stop"),
         ("hook stop", "hook stop"),
@@ -1882,6 +1901,138 @@ fn detect_visible_factory_status_with_end(text: &str) -> Option<(&'static str, u
     None
 }
 
+fn detect_visible_factory_ask_user_prompt_with_end(
+    collapsed: &str,
+    collapsed_offsets: &[usize],
+) -> Option<usize> {
+    let ask_user_start = collapsed.find("ask user")?;
+    let ask_user_end = ask_user_start + "ask user".len();
+    let question_end = find_prefixed_numeric_token_end(&collapsed[ask_user_end..], 'q')
+        .map(|offset| ask_user_end + offset)?;
+    let enter_start = collapsed[question_end..]
+        .find("enter select")
+        .map(|offset| question_end + offset)?;
+    let esc_start = collapsed[enter_start..]
+        .find("esc cancel")
+        .map(|offset| enter_start + offset)?;
+    let optional_end = ["tab next", "or type your own answer"]
+        .into_iter()
+        .filter_map(|needle| {
+            collapsed[ask_user_end..]
+                .find(needle)
+                .map(|offset| ask_user_end + offset + needle.len())
+        })
+        .max()?;
+    let latest_end = optional_end.max(esc_start + "esc cancel".len());
+    let end_char_index = collapsed[..latest_end].chars().count().saturating_sub(1);
+    collapsed_offsets.get(end_char_index).copied()
+}
+
+fn detect_visible_factory_spec_approval_prompt_with_end(
+    collapsed: &str,
+    collapsed_offsets: &[usize],
+) -> Option<usize> {
+    let propose_start = collapsed.find("propose specification")?;
+    let propose_end = propose_start + "propose specification".len();
+    let approval_end = collapsed[propose_end..]
+        .find("specification for approval")
+        .map(|offset| propose_end + offset + "specification for approval".len())?;
+    let options_start = collapsed[approval_end..]
+        .find("will save to:")
+        .map(|offset| approval_end + offset + "will save to:".len())
+        .unwrap_or(approval_end);
+    detect_visible_factory_spec_approval_footer_with_end_from(
+        collapsed,
+        collapsed_offsets,
+        options_start,
+    )
+}
+
+fn detect_visible_factory_spec_approval_footer_with_end(
+    collapsed: &str,
+    collapsed_offsets: &[usize],
+) -> Option<usize> {
+    detect_visible_factory_spec_approval_footer_with_end_from(collapsed, collapsed_offsets, 0)
+}
+
+fn detect_visible_factory_spec_approval_footer_with_end_from(
+    collapsed: &str,
+    collapsed_offsets: &[usize],
+    search_start: usize,
+) -> Option<usize> {
+    let option_one_end = detect_visible_factory_spec_approval_option_end(
+        collapsed,
+        search_start,
+        "[1]",
+        "proceed with the proposal",
+    )?;
+    let option_two_end = detect_visible_factory_spec_approval_option_end(
+        collapsed,
+        option_one_end,
+        "[2]",
+        "proceed with comment",
+    )?;
+    let option_three_end = detect_visible_factory_spec_approval_option_end(
+        collapsed,
+        option_two_end,
+        "[3]",
+        "manually edit spec",
+    )?;
+    let option_four_end = detect_visible_factory_spec_approval_option_end(
+        collapsed,
+        option_three_end,
+        "[4]",
+        "no and explain why",
+    )?;
+    let enter_end = collapsed[option_four_end..]
+        .find("enter select")
+        .map(|offset| option_four_end + offset + "enter select".len())?;
+    let esc_end = collapsed[enter_end..]
+        .find("esc cancel")
+        .map(|offset| enter_end + offset + "esc cancel".len())?;
+
+    let end_char_index = collapsed[..esc_end].chars().count().saturating_sub(1);
+    collapsed_offsets.get(end_char_index).copied()
+}
+
+fn detect_visible_factory_spec_approval_option_end(
+    collapsed: &str,
+    search_start: usize,
+    label: &str,
+    text: &str,
+) -> Option<usize> {
+    let label_end = collapsed[search_start..]
+        .find(label)
+        .map(|offset| search_start + offset + label.len())?;
+    collapsed[label_end..]
+        .find(text)
+        .map(|offset| label_end + offset + text.len())
+}
+
+fn find_prefixed_numeric_token_end(text: &str, prefix: char) -> Option<usize> {
+    for (start, ch) in text.char_indices() {
+        if ch != prefix {
+            continue;
+        }
+
+        let after_prefix = &text[start + ch.len_utf8()..];
+        let mut digits_end = 0usize;
+        for (offset, next) in after_prefix.char_indices() {
+            if next.is_ascii_digit() {
+                digits_end = offset + next.len_utf8();
+            } else {
+                break;
+            }
+        }
+
+        if digits_end > 0 {
+            return Some(start + ch.len_utf8() + digits_end);
+        }
+    }
+
+    None
+}
+
 fn detect_visible_codex_status_with_end(text: &str) -> Option<(&'static str, usize)> {
     let (projection, projection_offsets) = build_visible_status_projection(text);
     let (collapsed, collapsed_offsets) =
@@ -1897,6 +2048,12 @@ fn detect_visible_codex_status_with_end(text: &str) -> Option<(&'static str, usi
         detect_visible_codex_question_prompt_with_end(&collapsed, &collapsed_offsets)
     {
         return Some(("codex-question-prompt", end_offset));
+    }
+
+    if let Some(end_offset) =
+        detect_visible_codex_plan_mode_prompt_with_end(&collapsed, &collapsed_offsets)
+    {
+        return Some(("codex-plan-mode-prompt", end_offset));
     }
 
     None
@@ -1923,6 +2080,30 @@ fn detect_visible_codex_question_prompt_with_end(
         .map(|offset| enter_start + offset)?;
     let latest_end = esc_start + "esc to interrupt".len();
     let end_char_index = collapsed[..latest_end].chars().count().saturating_sub(1);
+    collapsed_offsets.get(end_char_index).copied()
+}
+
+fn detect_visible_codex_plan_mode_prompt_with_end(
+    collapsed: &str,
+    collapsed_offsets: &[usize],
+) -> Option<usize> {
+    let prompt_start = collapsed.find("implement this plan?")?;
+    let prompt_end = prompt_start + "implement this plan?".len();
+
+    let yes_end = collapsed[prompt_end..]
+        .find("yes, implement this plan")
+        .map(|offset| prompt_end + offset + "yes, implement this plan".len())?;
+    let no_end = collapsed[yes_end..]
+        .find("no, stay in plan mode")
+        .map(|offset| yes_end + offset + "no, stay in plan mode".len())?;
+    let confirm_end = collapsed[no_end..]
+        .find("press enter to confirm")
+        .map(|offset| no_end + offset + "press enter to confirm".len())?;
+    let escape_end = collapsed[confirm_end..]
+        .find("esc to go back")
+        .map(|offset| confirm_end + offset + "esc to go back".len())?;
+
+    let end_char_index = collapsed[..escape_end].chars().count().saturating_sub(1);
     collapsed_offsets.get(end_char_index).copied()
 }
 
@@ -1989,7 +2170,9 @@ fn build_visible_status_projection(text: &str) -> (String, Vec<usize>) {
             }
         }
 
-        let next = text[cursor..].chars().next().expect("cursor within string");
+        let Some(next) = text[cursor..].chars().next() else {
+            break;
+        };
         let mut next_cursor = cursor + next.len_utf8();
         if next == '\r' {
             if bytes.get(next_cursor).copied() == Some(b'\n') {
@@ -2321,8 +2504,40 @@ fn send_ui_event(
     tx: &Sender<TerminalUiEvent>,
     repaint_ctx: &eframe::egui::Context,
 ) {
-    let _ = tx.send(TerminalUiEvent { terminal_id, kind });
+    let event = TerminalUiEvent { terminal_id, kind };
+    match &event.kind {
+        TerminalUiEventKind::Wakeup => match tx.try_send(event) {
+            Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+        },
+        TerminalUiEventKind::AiRawChunk { chunk, .. }
+            if !ai_raw_chunk_requires_reliable_delivery(chunk) =>
+        {
+            match tx.try_send(event) {
+                Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+            }
+        }
+        _ => {
+            let _ = tx.send(event);
+        }
+    }
     repaint_ctx.request_repaint();
+}
+
+fn ai_raw_chunk_requires_reliable_delivery(chunk: &str) -> bool {
+    matches!(
+        chunk,
+        "HOOKS Stop"
+            | "hook stop"
+            | "Stop - Hook"
+            | "needs your permission"
+            | "waiting for your input"
+            | "idle"
+            | "droid-ask-user-prompt"
+            | "droid-spec-approval-prompt"
+            | "codex-question-prompt"
+            | "codex-plan-mode-prompt"
+            | "codex-interrupted-banner"
+    )
 }
 
 pub fn try_terminal_snapshots(
@@ -2958,7 +3173,7 @@ mod tests {
         factory_droid_hook_env_pairs, has_descendant_process_identity,
         has_named_descendant_process, is_benign_process_exit_error, official_ai_debug_chunk,
         process_tree_kill_order, root_process_termination_plan, sanitize_cell_text,
-        select_new_codex_descendant_process, selection_snapshot_from_terminal,
+        select_new_codex_descendant_process, selection_snapshot_from_terminal, send_ui_event,
         snapshot_from_terminal, snapshots_from_terminal, test_terminal_runtime,
         trim_trailing_default_cells, verified_process_entry, verified_process_tree_descendants,
         verified_snapshot_root_process, AdeTerminalConfig, PendingAiReadSignalKind,
@@ -2966,7 +3181,7 @@ mod tests {
         ProcessSnapshotEntry, RootProcessTerminationPlan, RuntimeCommand, SharedWriter,
         SharedWriterHandle, TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape,
         TerminalDimensions, TerminalRuntime, TerminalSelectionHyperlink, TerminalStyle,
-        TerminalStyledCell, TrackedProcessIdentity, VerifiedProcessLookup,
+        TerminalStyledCell, TerminalUiEventKind, TrackedProcessIdentity, VerifiedProcessLookup,
         MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS,
     };
     use crate::codex::{
@@ -2982,6 +3197,8 @@ mod tests {
         io::{self, Write},
         path::Path,
         sync::{Arc, Mutex},
+        thread,
+        time::Duration,
     };
     use tattoy_wezterm_term::color::ColorPalette;
     use tattoy_wezterm_term::{Terminal, TerminalSize};
@@ -3000,6 +3217,16 @@ mod tests {
         assert_eq!(official_ai_debug_chunk("Stop"), None);
         assert_eq!(official_ai_debug_chunk("[hook] UserPromptSubmit"), None);
         assert_eq!(official_ai_debug_chunk("factory spinner idle"), None);
+    }
+
+    #[test]
+    fn build_visible_status_projection_ignores_partial_escape_sequence_without_panicking() {
+        let (projection, offsets) =
+            super::build_visible_status_projection("A\u{1b}[31m世界\u{1b}[0m\u{1b}]");
+
+        assert_eq!(projection, "A世界");
+        assert_eq!(projection.chars().count(), offsets.len());
+        assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
     }
 
     #[test]
@@ -3124,6 +3351,176 @@ mod tests {
     }
 
     #[test]
+    fn pending_visible_factory_status_detects_split_ask_user_prompt_across_reads() {
+        let mut pending = PendingVisibleFactoryStatus::default();
+
+        assert_eq!(pending.extract_from_text("Ask User\nQ"), None);
+        assert_eq!(
+            pending.extract_from_text("1\nOr type your own answer"),
+            None
+        );
+        assert_eq!(
+            pending.extract_from_text("\nTab next / Navigate / Enter Select / ESC cancel"),
+            Some("droid-ask-user-prompt".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_factory_status_detects_ask_user_prompt_with_ansi_and_crlf() {
+        let mut pending = PendingVisibleFactoryStatus::default();
+
+        assert_eq!(
+            pending.extract_from_text(
+                "\u{1b}[1mAsk User\u{1b}[0m\r\nQ1\r\n\u{1b}[2mOr type your own answer...\u{1b}[0m\r\nTab next / Navigate / Enter Select / ESC cancel"
+            ),
+            Some("droid-ask-user-prompt".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_factory_status_detects_split_spec_approval_prompt_across_reads() {
+        let mut pending = PendingVisibleFactoryStatus::default();
+
+        assert_eq!(
+            pending.extract_from_text(
+                "Propose Specification\nSpecification for approval\nWill save to:"
+            ),
+            None
+        );
+        assert_eq!(
+            pending.extract_from_text(
+                "\n[1] Proceed with the proposal\n[2] Proceed with comment\n[3] Manually edit spec\n[4] No and explain why"
+            ),
+            None
+        );
+        assert_eq!(
+            pending.extract_from_text(
+                "\n↑/↓ Navigate • Enter Select • 1-4 Quick select • ctrl-g to edit plan • ESC Cancel"
+            ),
+            Some("droid-spec-approval-prompt".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_factory_status_detects_spec_approval_prompt_with_ansi_and_crlf() {
+        let mut pending = PendingVisibleFactoryStatus::default();
+
+        assert_eq!(
+            pending.extract_from_text(
+                "\u{1b}[1mPropose Specification\u{1b}[0m\r\nSpecification for approval\r\nWill save to: C:\\spec.md\r\n[1] Proceed with the proposal\r\n[2] Proceed with comment\r\n[3] Manually edit spec\r\n[4] No and explain why\r\n↑/↓ Navigate • Enter Select • 1-4 Quick select • ctrl-g to edit plan • ESC Cancel"
+            ),
+            Some("droid-spec-approval-prompt".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_factory_status_detects_spec_approval_prompt_with_minimal_footer() {
+        let mut pending = PendingVisibleFactoryStatus::default();
+
+        assert_eq!(
+            pending.extract_from_text(
+                "Propose Specification\nSpecification for approval\n[1] Proceed with the proposal\n[2] Proceed with comment\n[3] Manually edit spec\n[4] No and explain why\nEnter Select • ESC Cancel"
+            ),
+            Some("droid-spec-approval-prompt".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_factory_status_detects_spec_approval_prompt_from_footer_only() {
+        let mut pending = PendingVisibleFactoryStatus::default();
+
+        assert_eq!(
+            pending.extract_from_text(
+                "[1] Proceed with the proposal\n[2] Proceed with comment\n[3] Manually edit spec\n[4] No and explain why\nEnter Select • ESC Cancel"
+            ),
+            Some("droid-spec-approval-prompt".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_factory_status_detects_split_spec_approval_prompt_with_long_save_path() {
+        let mut pending = PendingVisibleFactoryStatus::default();
+        let long_save_path = format!("C:\\specs\\{}", "nested\\".repeat(180));
+
+        assert_eq!(
+            pending.extract_from_text(&format!(
+                "Propose Specification\nSpecification for approval\nWill save to: {long_save_path}"
+            )),
+            None
+        );
+        assert_eq!(
+            pending.extract_from_text(
+                "\n[1] Proceed with the proposal\n[2] Proceed with comment\n[3] Manually edit spec\n[4] No and explain why\nEnter Select • ESC Cancel"
+            ),
+            Some("droid-spec-approval-prompt".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_factory_status_detects_spec_approval_prompt_after_oversized_body() {
+        let mut pending = PendingVisibleFactoryStatus::default();
+        let oversized_body = "Detailed spec body line.\n"
+            .repeat((MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS / 24) + 64);
+
+        assert_eq!(
+            pending.extract_from_text(
+                "Propose Specification\nSpecification for approval\nWill save to: C:\\spec.md\n"
+            ),
+            None
+        );
+        assert_eq!(pending.extract_from_text(&oversized_body), None);
+        assert_eq!(
+            pending.extract_from_text(
+                "[1] Proceed with the proposal\n[2] Proceed with comment\n[3] Manually edit spec\n[4] No and explain why\nEnter Select • ESC Cancel"
+            ),
+            Some("droid-spec-approval-prompt".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_factory_status_requires_multiple_spec_approval_markers() {
+        assert_eq!(
+            PendingVisibleFactoryStatus::default().extract_from_text("Propose Specification"),
+            None
+        );
+        assert_eq!(
+            PendingVisibleFactoryStatus::default()
+                .extract_from_text("Specification for approval\n[1] Proceed with the proposal"),
+            None
+        );
+        assert_eq!(
+            PendingVisibleFactoryStatus::default().extract_from_text(
+                "Propose Specification\nSpecification for approval\nWill save to:\n[1] Proceed with the proposal\n[2] Proceed with comment\n[3] Manually edit spec\n[4] No and explain why"
+            ),
+            None
+        );
+        assert_eq!(
+            PendingVisibleFactoryStatus::default().extract_from_text(
+                "[1] Proceed with the proposal\n[2] Proceed with comment\n[3] Manually edit spec\nEnter Select • ESC Cancel"
+            ),
+            None
+        );
+        assert_eq!(
+            PendingVisibleFactoryStatus::default().extract_from_text(
+                "Proceed with the proposal\nProceed with comment\nManually edit spec\nNo and explain why\nEnter Select • ESC Cancel"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn pending_visible_factory_status_requires_multiple_ask_user_markers() {
+        let mut pending = PendingVisibleFactoryStatus::default();
+
+        assert_eq!(pending.extract_from_text("Ask User"), None);
+        assert_eq!(
+            pending.extract_from_text("Ask User\nEnter Select / ESC cancel"),
+            None
+        );
+        assert_eq!(pending.extract_from_text("ESC cancel"), None);
+    }
+
+    #[test]
     fn pending_visible_codex_status_detects_split_question_prompt_across_reads() {
         let mut pending = PendingVisibleCodexStatus::default();
 
@@ -3145,6 +3542,53 @@ mod tests {
                 "\u{1b}[1mQuestion 1/1\u{1b}[0m\r\n(1 unanswered)\r\ntab to add notes | enter to submit answer | esc to interrupt"
             ),
             Some("codex-question-prompt".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_codex_status_detects_split_plan_mode_prompt_across_reads() {
+        let mut pending = PendingVisibleCodexStatus::default();
+
+        assert_eq!(
+            pending.extract_from_text("Implement this plan?\n 1. Yes, imple"),
+            None
+        );
+        assert_eq!(
+            pending.extract_from_text(
+                "ment this plan\n 2. No, stay in Plan mode\n Press enter to confirm or esc to go back"
+            ),
+            Some("codex-plan-mode-prompt".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_codex_status_normalizes_plan_mode_prompt_ansi_and_crlf() {
+        let mut pending = PendingVisibleCodexStatus::default();
+
+        assert_eq!(
+            pending.extract_from_text(
+                "\u{1b}[1mImplement this plan?\u{1b}[0m\r\nYes, implement this plan\r\nNo, stay in Plan mode\r\nPress enter to confirm or esc to go back"
+            ),
+            Some("codex-plan-mode-prompt".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_codex_status_requires_full_plan_mode_prompt_chrome() {
+        assert_eq!(
+            PendingVisibleCodexStatus::default().extract_from_text("Implement this plan?"),
+            None
+        );
+        assert_eq!(
+            PendingVisibleCodexStatus::default()
+                .extract_from_text("Yes, implement this plan\nPress enter to confirm"),
+            None
+        );
+        assert_eq!(
+            PendingVisibleCodexStatus::default().extract_from_text(
+                "Implement this plan?\nNo, stay in Plan mode\nPress enter to confirm or esc to go back"
+            ),
+            None
         );
     }
 
@@ -3581,6 +4025,161 @@ mod tests {
             &signal.kind,
             PendingAiReadSignalKind::RawChunk { chunk } if chunk == "codex-question-prompt"
         )));
+    }
+
+    #[test]
+    fn collect_ai_read_signals_emits_visible_droid_ask_user_prompt() {
+        let manager =
+            crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let mut pending_osc_title = PendingOscTitle::default();
+        let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+
+        let signals = collect_ai_read_signals(
+            1,
+            b"Ask User\nQ1\nOr type your own answer...\nTab next / Navigate / Enter Select / ESC cancel",
+            &manager,
+            &mut pending_osc_title,
+            &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
+        );
+
+        assert!(signals.iter().any(|signal| matches!(
+            &signal.kind,
+            PendingAiReadSignalKind::RawChunk { chunk } if chunk == "droid-ask-user-prompt"
+        )));
+    }
+
+    #[test]
+    fn collect_ai_read_signals_emits_visible_droid_spec_approval_prompt() {
+        let manager =
+            crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let mut pending_osc_title = PendingOscTitle::default();
+        let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+
+        let signals = collect_ai_read_signals(
+            1,
+            "Propose Specification\nSpecification for approval\nWill save to: C:\\spec.md\n[1] Proceed with the proposal\n[2] Proceed with comment\n[3] Manually edit spec\n[4] No and explain why\n↑/↓ Navigate • Enter Select • 1-4 Quick select • ctrl-g to edit plan • ESC Cancel".as_bytes(),
+            &manager,
+            &mut pending_osc_title,
+            &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
+        );
+
+        assert!(signals.iter().any(|signal| matches!(
+            &signal.kind,
+            PendingAiReadSignalKind::RawChunk { chunk } if chunk == "droid-spec-approval-prompt"
+        )));
+    }
+
+    #[test]
+    fn send_ui_event_drops_bell_raw_chunk_when_queue_is_full() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let repaint_ctx = eframe::egui::Context::default();
+
+        send_ui_event(1, TerminalUiEventKind::Wakeup, &tx, &repaint_ctx);
+        send_ui_event(
+            1,
+            TerminalUiEventKind::AiRawChunk {
+                terminal_id: 1,
+                chunk: "[bell]".to_owned(),
+            },
+            &tx,
+            &repaint_ctx,
+        );
+
+        assert!(matches!(
+            rx.recv().unwrap().kind,
+            TerminalUiEventKind::Wakeup
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn send_ui_event_blocks_stateful_ai_raw_chunk_until_queue_has_capacity() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let repaint_ctx = eframe::egui::Context::default();
+
+        send_ui_event(1, TerminalUiEventKind::Wakeup, &tx, &repaint_ctx);
+
+        let tx_clone = tx.clone();
+        let repaint_ctx_clone = repaint_ctx.clone();
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded(0);
+        let handle = thread::spawn(move || {
+            let _ = ready_tx.send(());
+            send_ui_event(
+                1,
+                TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "droid-spec-approval-prompt".to_owned(),
+                },
+                &tx_clone,
+                &repaint_ctx_clone,
+            );
+        });
+
+        ready_rx.recv().unwrap();
+        thread::sleep(Duration::from_millis(25));
+        assert!(!handle.is_finished());
+
+        assert!(matches!(
+            rx.recv().unwrap().kind,
+            TerminalUiEventKind::Wakeup
+        ));
+        handle.join().unwrap();
+        assert!(matches!(
+            rx.recv().unwrap().kind,
+            TerminalUiEventKind::AiRawChunk { chunk, .. } if chunk == "droid-spec-approval-prompt"
+        ));
+    }
+
+    #[test]
+    fn send_ui_event_drops_debug_raw_chunk_before_blocking_on_stateful_raw_chunk() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let repaint_ctx = eframe::egui::Context::default();
+
+        send_ui_event(1, TerminalUiEventKind::Wakeup, &tx, &repaint_ctx);
+
+        let tx_clone = tx.clone();
+        let repaint_ctx_clone = repaint_ctx.clone();
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded(0);
+        let handle = thread::spawn(move || {
+            send_ui_event(
+                1,
+                TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "[droid-hook:event=Stop]".to_owned(),
+                },
+                &tx_clone,
+                &repaint_ctx_clone,
+            );
+            let _ = ready_tx.send(());
+            send_ui_event(
+                1,
+                TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "droid-spec-approval-prompt".to_owned(),
+                },
+                &tx_clone,
+                &repaint_ctx_clone,
+            );
+        });
+
+        ready_rx.recv().unwrap();
+        thread::sleep(Duration::from_millis(25));
+        assert!(!handle.is_finished());
+
+        assert!(matches!(
+            rx.recv().unwrap().kind,
+            TerminalUiEventKind::Wakeup
+        ));
+        handle.join().unwrap();
+        assert!(matches!(
+            rx.recv().unwrap().kind,
+            TerminalUiEventKind::AiRawChunk { chunk, .. } if chunk == "droid-spec-approval-prompt"
+        ));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
