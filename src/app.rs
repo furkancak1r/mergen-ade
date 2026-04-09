@@ -20,9 +20,11 @@ use crossbeam_channel::{Receiver, Sender};
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{
     self, Align, Color32, Event, FontData, FontFamily, FontId, Galley, Id, Key, Layout, RichText,
-    Sense, Stroke, TextWrapMode, Ui, Vec2, WidgetInfo, WidgetText, WidgetType,
+    Sense, Stroke, TextWrapMode, TextureHandle, TextureOptions, Ui, Vec2, WidgetInfo, WidgetText,
+    WidgetType,
 };
 use iconflow::{fonts as icon_fonts, try_icon, Pack, Size, Style};
+use image::ImageError;
 use serde::{Deserialize, Serialize};
 use tattoy_wezterm_surface::hyperlink::{
     Rule, CLOSING_PARENTHESIS_HYPERLINK_PATTERN, GENERIC_HYPERLINK_PATTERN,
@@ -40,8 +42,8 @@ use crate::config;
 use crate::hooks::{AiCliSession, AiCliStatus, AiCliTool, AiHookManager};
 use crate::layout;
 use crate::models::{
-    AppConfig, LeftSidebarTab, MainVisibilityMode, ProjectRecord, ShellKind, TerminalKind,
-    TerminalManagerFilter,
+    AppConfig, BuiltinLauncherKind, LauncherEntry, LauncherIconKey, LeftSidebarTab,
+    MainVisibilityMode, ProjectRecord, ShellKind, TerminalKind, TerminalManagerFilter,
 };
 use crate::terminal::{
     try_terminal_selection_snapshot, try_terminal_snapshots, TerminalColor, TerminalCursor,
@@ -81,6 +83,14 @@ const TERMINAL_HELD_KEY_REPEAT_MAX_SYNTHETIC_EVENTS_PER_FRAME: usize = 16;
 // Embedded Nerd Font for terminal icon support
 const NERD_FONT_DATA: &[u8] = include_bytes!("../assets/fonts/CaskaydiaCoveNerdFont-Regular.ttf");
 const NERD_FONT_NAME: &str = "caskaydia-cove-nerd";
+const CODEX_LAUNCHER_ICON_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/launcher-codex.png"));
+const CLAUDE_LAUNCHER_ICON_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/launcher-claude.png"));
+const DROID_LAUNCHER_ICON_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/launcher-droid.png"));
+const OPENCODE_LAUNCHER_ICON_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/launcher-opencode.png"));
 const DIRECTORY_INDEX_LOADING_ANIMATION_STEP_SECS: f64 = 0.25;
 const DIRECTORY_INDEX_CHANNEL_CAPACITY: usize = 1;
 const DIRECTORY_INDEX_MAX_CHILDREN_PER_DIR: usize = 1_000;
@@ -288,6 +298,157 @@ mod icons {
     pub const TRASH: AppIcon = AppIcon::Trash;
     pub const TREE_VIEW: AppIcon = AppIcon::TreeView;
     pub const X: AppIcon = AppIcon::X;
+}
+
+struct LauncherIconBadgeStyle {
+    background: Color32,
+    accent: Color32,
+    foreground: Color32,
+    monogram: &'static str,
+}
+
+fn launcher_icon_badge_style(icon_key: LauncherIconKey) -> LauncherIconBadgeStyle {
+    match icon_key {
+        LauncherIconKey::Codex => LauncherIconBadgeStyle {
+            background: Color32::from_rgb(48, 31, 82),
+            accent: Color32::from_rgb(155, 116, 255),
+            foreground: Color32::from_rgb(247, 241, 255),
+            monogram: "C",
+        },
+        LauncherIconKey::Claude => LauncherIconBadgeStyle {
+            background: Color32::from_rgb(127, 90, 64),
+            accent: Color32::from_rgb(232, 197, 164),
+            foreground: Color32::from_rgb(255, 247, 239),
+            monogram: "Cl",
+        },
+        LauncherIconKey::Droid => LauncherIconBadgeStyle {
+            background: Color32::from_rgb(34, 34, 36),
+            accent: Color32::from_rgb(232, 232, 236),
+            foreground: Color32::from_rgb(255, 255, 255),
+            monogram: "D",
+        },
+        LauncherIconKey::OpenCode => LauncherIconBadgeStyle {
+            background: Color32::from_rgb(33, 30, 30),
+            accent: Color32::from_rgb(183, 177, 177),
+            foreground: Color32::from_rgb(241, 236, 236),
+            monogram: "OC",
+        },
+        LauncherIconKey::Terminal => LauncherIconBadgeStyle {
+            background: Color32::from_rgb(31, 39, 51),
+            accent: Color32::from_rgb(101, 163, 255),
+            foreground: Color32::from_rgb(240, 247, 255),
+            monogram: ">_",
+        },
+        LauncherIconKey::Spark => LauncherIconBadgeStyle {
+            background: Color32::from_rgb(65, 45, 90),
+            accent: Color32::from_rgb(208, 162, 255),
+            foreground: Color32::from_rgb(250, 240, 255),
+            monogram: "*",
+        },
+        LauncherIconKey::Message => LauncherIconBadgeStyle {
+            background: Color32::from_rgb(42, 62, 76),
+            accent: Color32::from_rgb(124, 194, 255),
+            foreground: Color32::from_rgb(241, 249, 255),
+            monogram: "M",
+        },
+        LauncherIconKey::Bot => LauncherIconBadgeStyle {
+            background: Color32::from_rgb(38, 77, 65),
+            accent: Color32::from_rgb(120, 219, 176),
+            foreground: Color32::from_rgb(239, 255, 248),
+            monogram: "B",
+        },
+        LauncherIconKey::Code => LauncherIconBadgeStyle {
+            background: Color32::from_rgb(62, 45, 38),
+            accent: Color32::from_rgb(255, 176, 120),
+            foreground: Color32::from_rgb(255, 247, 239),
+            monogram: "</>",
+        },
+        LauncherIconKey::Wrench => LauncherIconBadgeStyle {
+            background: Color32::from_rgb(69, 54, 32),
+            accent: Color32::from_rgb(236, 186, 92),
+            foreground: Color32::from_rgb(255, 249, 235),
+            monogram: "W",
+        },
+        LauncherIconKey::Rocket => LauncherIconBadgeStyle {
+            background: Color32::from_rgb(57, 34, 58),
+            accent: Color32::from_rgb(255, 128, 196),
+            foreground: Color32::from_rgb(255, 242, 250),
+            monogram: "R",
+        },
+    }
+}
+
+fn paint_launcher_icon_badge(ui: &Ui, rect: egui::Rect, icon_key: LauncherIconKey, hovered: bool) {
+    let style = launcher_icon_badge_style(icon_key);
+    let fill = if hovered {
+        with_alpha(style.background, 230)
+    } else {
+        style.background
+    };
+
+    ui.painter().rect_filled(rect, 8.0, fill);
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.bottom() - 4.0),
+            egui::pos2(rect.right(), rect.bottom()),
+        ),
+        8.0,
+        style.accent,
+    );
+    ui.painter().text(
+        rect.center_top() + egui::vec2(0.0, rect.height() * 0.34),
+        egui::Align2::CENTER_CENTER,
+        style.monogram,
+        egui::FontId::proportional(if style.monogram.len() > 2 { 8.5 } else { 10.5 }),
+        style.foreground,
+    );
+}
+
+fn draw_launcher_icon_badge(ui: &mut Ui, icon_key: LauncherIconKey, size: f32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
+    paint_launcher_icon_badge(ui, rect, icon_key, response.hovered());
+    response
+}
+
+fn builtin_launcher_icon_bytes(icon_key: LauncherIconKey) -> Option<&'static [u8]> {
+    match icon_key {
+        LauncherIconKey::Codex => Some(CODEX_LAUNCHER_ICON_BYTES),
+        LauncherIconKey::Claude => Some(CLAUDE_LAUNCHER_ICON_BYTES),
+        LauncherIconKey::Droid => Some(DROID_LAUNCHER_ICON_BYTES),
+        LauncherIconKey::OpenCode => Some(OPENCODE_LAUNCHER_ICON_BYTES),
+        LauncherIconKey::Terminal
+        | LauncherIconKey::Spark
+        | LauncherIconKey::Message
+        | LauncherIconKey::Bot
+        | LauncherIconKey::Code
+        | LauncherIconKey::Wrench
+        | LauncherIconKey::Rocket => None,
+    }
+}
+
+fn decode_launcher_icon_image(bytes: &[u8]) -> Result<egui::ColorImage, ImageError> {
+    let image = image::load_from_memory(bytes)?.into_rgba8();
+    let [width, height] = [image.width() as usize, image.height() as usize];
+    let pixels = image.into_raw();
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        [width, height],
+        &pixels,
+    ))
+}
+
+fn paint_builtin_launcher_icon(ui: &Ui, rect: egui::Rect, texture: &TextureHandle, hovered: bool) {
+    let fill = if hovered {
+        with_alpha(Color32::from_rgb(54, 54, 54), 220)
+    } else {
+        Color32::from_rgb(38, 38, 38)
+    };
+    ui.painter().rect_filled(rect, 8.0, fill);
+    ui.painter().image(
+        texture.id(),
+        rect.shrink(3.0),
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        Color32::WHITE,
+    );
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -632,6 +793,9 @@ pub struct AdeApp {
     active_settings_section: SettingsSection,
     settings_diagnostics_expanded: bool,
     saved_message_drafts: BTreeMap<u64, String>,
+    launcher_draft: LauncherDraftState,
+    launcher_icon_textures: BTreeMap<LauncherIconKey, TextureHandle>,
+    launcher_icon_failures: BTreeSet<LauncherIconKey>,
     directory_search_query: String,
     directory_pending_tree_open_state_by_project: BTreeMap<u64, bool>,
     status_line: String,
@@ -1091,6 +1255,7 @@ struct DirectoryIndexEvent {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PendingConfigChanges {
     default_shell: bool,
+    launchers: bool,
     ui: bool,
     projects: bool,
     selection: bool,
@@ -1100,16 +1265,23 @@ struct PendingConfigChanges {
 enum SettingsSection {
     #[default]
     General,
+    Launchers,
     SavedMessages,
     Diagnostics,
 }
 
 impl SettingsSection {
-    const ALL: [Self; 3] = [Self::General, Self::SavedMessages, Self::Diagnostics];
+    const ALL: [Self; 4] = [
+        Self::General,
+        Self::Launchers,
+        Self::SavedMessages,
+        Self::Diagnostics,
+    ];
 
     const fn title(self) -> &'static str {
         match self {
             Self::General => "General",
+            Self::Launchers => "Launchers",
             Self::SavedMessages => "Saved Messages",
             Self::Diagnostics => "Diagnostics",
         }
@@ -1118,6 +1290,7 @@ impl SettingsSection {
     const fn navigation_title(self) -> &'static str {
         match self {
             Self::General => "General",
+            Self::Launchers => "Launchers",
             Self::SavedMessages => "Saved Messages",
             Self::Diagnostics => "Diagnostics",
         }
@@ -1126,6 +1299,9 @@ impl SettingsSection {
     const fn description(self) -> &'static str {
         match self {
             Self::General => "Adjust terminal defaults and layout behavior for the workspace.",
+            Self::Launchers => {
+                "Choose which foreground launchers appear and how each command is submitted."
+            }
             Self::SavedMessages => {
                 "Manage saved messages per project and send them to active terminals."
             }
@@ -1138,6 +1314,7 @@ impl SettingsSection {
     const fn icon(self) -> AppIcon {
         match self {
             Self::General => AppIcon::Gear,
+            Self::Launchers => AppIcon::TerminalWindow,
             Self::SavedMessages => AppIcon::ChatText,
             Self::Diagnostics => AppIcon::Eye,
         }
@@ -1146,8 +1323,26 @@ impl SettingsSection {
     const fn scroll_id(self) -> &'static str {
         match self {
             Self::General => "settings-general-scroll",
+            Self::Launchers => "settings-launchers-scroll",
             Self::SavedMessages => "settings-saved-messages-scroll",
             Self::Diagnostics => "settings-diagnostics-scroll",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LauncherDraftState {
+    display_name: String,
+    launch_command: String,
+    icon_key: LauncherIconKey,
+}
+
+impl Default for LauncherDraftState {
+    fn default() -> Self {
+        Self {
+            display_name: String::new(),
+            launch_command: String::new(),
+            icon_key: LauncherIconKey::Terminal,
         }
     }
 }
@@ -1157,6 +1352,7 @@ struct SettingsEditOutcome {
     should_persist: bool,
     ui_config_changed: bool,
     default_shell_changed: bool,
+    launchers_changed: bool,
     projects_changed: bool,
 }
 
@@ -1169,6 +1365,11 @@ impl SettingsEditOutcome {
     fn note_default_shell_change(&mut self) {
         self.should_persist = true;
         self.default_shell_changed = true;
+    }
+
+    fn note_launchers_change(&mut self) {
+        self.should_persist = true;
+        self.launchers_changed = true;
     }
 
     fn note_projects_change(&mut self) {
@@ -1566,6 +1767,58 @@ impl AdeApp {
         ctx.request_repaint_after(Duration::from_secs_f64(TRANSIENT_TOAST_SECS));
     }
 
+    fn builtin_launcher_icon_texture(
+        &mut self,
+        ctx: &egui::Context,
+        icon_key: LauncherIconKey,
+    ) -> Option<&TextureHandle> {
+        let Some(bytes) = builtin_launcher_icon_bytes(icon_key) else {
+            return None;
+        };
+
+        if self.launcher_icon_failures.contains(&icon_key) {
+            return None;
+        }
+
+        if !self.launcher_icon_textures.contains_key(&icon_key) {
+            match decode_launcher_icon_image(bytes) {
+                Ok(image) => {
+                    let texture = ctx.load_texture(
+                        format!("launcher-icon-{}", icon_key.label().to_lowercase()),
+                        image,
+                        TextureOptions::LINEAR,
+                    );
+                    self.launcher_icon_textures.insert(icon_key, texture);
+                }
+                Err(err) => {
+                    log::warn!(
+                        "Failed to decode launcher icon for {}: {err}",
+                        icon_key.label()
+                    );
+                    self.launcher_icon_failures.insert(icon_key);
+                    return None;
+                }
+            }
+        }
+
+        self.launcher_icon_textures.get(&icon_key)
+    }
+
+    fn draw_launcher_icon(
+        &mut self,
+        ui: &mut Ui,
+        icon_key: LauncherIconKey,
+        size: f32,
+    ) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
+        if let Some(texture) = self.builtin_launcher_icon_texture(ui.ctx(), icon_key) {
+            paint_builtin_launcher_icon(ui, rect, texture, response.hovered());
+        } else {
+            paint_launcher_icon_badge(ui, rect, icon_key, response.hovered());
+        }
+        response
+    }
+
     fn codex_enable_outcome_message(outcome: &CodexEnableOutcome) -> String {
         match outcome {
             CodexEnableOutcome::MissingInstall => {
@@ -1823,6 +2076,9 @@ impl AdeApp {
             active_settings_section: SettingsSection::General,
             settings_diagnostics_expanded: false,
             saved_message_drafts: BTreeMap::new(),
+            launcher_draft: LauncherDraftState::default(),
+            launcher_icon_textures: BTreeMap::new(),
+            launcher_icon_failures: std::collections::BTreeSet::new(),
             directory_search_query: String::new(),
             directory_pending_tree_open_state_by_project: BTreeMap::new(),
             status_line: config_load_error
@@ -1909,6 +2165,10 @@ impl AdeApp {
 
     fn note_default_shell_changed(&mut self) {
         self.pending_config_changes.default_shell = true;
+    }
+
+    fn note_launchers_changed(&mut self) {
+        self.pending_config_changes.launchers = true;
     }
 
     fn note_projects_changed(&mut self) {
@@ -2049,9 +2309,34 @@ impl AdeApp {
         ctx: &egui::Context,
         project_id: u64,
         kind: TerminalKind,
+        launcher_id: Option<&str>,
     ) -> bool {
         let Some(project) = self.projects.get(&project_id).cloned() else {
             return false;
+        };
+        let selected_launcher = match kind {
+            TerminalKind::Foreground => {
+                let Some(launcher_id) = launcher_id else {
+                    self.status_line =
+                        "Foreground terminals must be opened from a launcher profile.".to_owned();
+                    return false;
+                };
+                let Some(launcher) = self.launcher_by_id(launcher_id).cloned() else {
+                    self.status_line = "Selected launcher no longer exists.".to_owned();
+                    return false;
+                };
+                if !launcher.enabled
+                    || launcher.display_name.trim().is_empty()
+                    || launcher.launch_command.trim().is_empty()
+                {
+                    self.status_line =
+                        "Selected launcher is disabled or incomplete. Update it in Settings > Launchers."
+                            .to_owned();
+                    return false;
+                }
+                Some(launcher)
+            }
+            TerminalKind::Background => None,
         };
 
         let shell = self.config.default_shell;
@@ -2137,7 +2422,43 @@ impl AdeApp {
         self.set_active_terminal(ctx, Some(terminal_id));
         self.bump_layout_epoch();
 
-        self.status_line = "Terminal created".to_owned();
+        if let Some(launcher) = selected_launcher {
+            match launcher.builtin {
+                Some(BuiltinLauncherKind::Droid) => {
+                    let _ = self.mark_factory_droid_launch_pending(terminal_id);
+                }
+                Some(BuiltinLauncherKind::Codex) => {
+                    let baseline = self
+                        .terminals
+                        .get(&terminal_id)
+                        .map(|terminal| terminal.runtime.snapshot_codex_descendant_processes())
+                        .unwrap_or(None);
+                    let _ = self.mark_codex_launch_pending(terminal_id, baseline);
+                }
+                _ => {}
+            }
+
+            let sent = self
+                .terminals
+                .get_mut(&terminal_id)
+                .is_some_and(|terminal| {
+                    Self::send_command_to_terminal(terminal, &launcher.launch_command, ctx)
+                });
+
+            if sent {
+                self.status_line = format!(
+                    "Opened {} launcher in {}",
+                    launcher.display_name, project.name
+                );
+            } else {
+                self.status_line = format!(
+                    "Created terminal, but failed to submit {}",
+                    launcher.display_name
+                );
+            }
+        } else {
+            self.status_line = "Terminal created".to_owned();
+        }
         true
     }
 
@@ -2195,6 +2516,27 @@ impl AdeApp {
             .and_then(|stem| stem.to_str())
     }
 
+    fn launcher_by_id(&self, launcher_id: &str) -> Option<&LauncherEntry> {
+        self.config
+            .launchers
+            .iter()
+            .find(|launcher| launcher.id == launcher_id)
+    }
+
+    fn foreground_launchers(&self) -> Vec<LauncherEntry> {
+        self.config
+            .launchers
+            .iter()
+            .filter(|launcher| {
+                launcher.enabled
+                    && !launcher.display_name.trim().is_empty()
+                    && !launcher.launch_command.trim().is_empty()
+            })
+            .cloned()
+            .collect()
+    }
+
+    #[cfg(test)]
     fn is_factory_droid_launch_command(line: &str) -> bool {
         Self::launch_command_stem(line).is_some_and(|stem| {
             stem.eq_ignore_ascii_case("droid") || stem.eq_ignore_ascii_case("factory")
@@ -2771,6 +3113,7 @@ impl AdeApp {
         }
     }
 
+    #[cfg(test)]
     fn is_codex_launch_command(line: &str) -> bool {
         Self::launch_command_stem(line).is_some_and(|stem| stem.eq_ignore_ascii_case("codex"))
     }
@@ -4629,6 +4972,23 @@ impl AdeApp {
             return;
         }
 
+        let codex_launcher_stems = self
+            .config
+            .launchers
+            .iter()
+            .filter(|launcher| launcher.builtin == Some(BuiltinLauncherKind::Codex))
+            .filter_map(|launcher| Self::launch_command_stem(&launcher.launch_command))
+            .map(|stem| stem.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        let factory_droid_launcher_stems = self
+            .config
+            .launchers
+            .iter()
+            .filter(|launcher| launcher.builtin == Some(BuiltinLauncherKind::Droid))
+            .filter_map(|launcher| Self::launch_command_stem(&launcher.launch_command))
+            .map(|stem| stem.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+
         let mut outbound = Vec::new();
         let mut copied_selection = None;
         let mut last_key_was_alt_m = false;
@@ -4703,10 +5063,18 @@ impl AdeApp {
                             outbound.push(b'\r');
                             sent_terminal_input = true;
                             let line = std::mem::take(&mut terminal.pending_line_for_title);
-                            if Self::is_factory_droid_launch_command(&line) {
+                            let line_stem = Self::launch_command_stem(&line)
+                                .map(|stem| stem.to_ascii_lowercase());
+                            if line_stem.as_ref().is_some_and(|stem| {
+                                factory_droid_launcher_stems.contains(stem)
+                                    || stem == "droid"
+                                    || stem == "factory"
+                            }) {
                                 launched_factory_droid = true;
                             }
-                            if Self::is_codex_launch_command(&line) {
+                            if line_stem.as_ref().is_some_and(|stem| {
+                                codex_launcher_stems.contains(stem) || stem == "codex"
+                            }) {
                                 launched_codex_cli = true;
                                 codex_launch_baseline =
                                     terminal.runtime.snapshot_codex_descendant_processes();
@@ -5649,6 +6017,71 @@ impl AdeApp {
         self.status_line = format!("Sent '{}' to {}", command, terminal.title);
     }
 
+    fn send_command_to_terminal(
+        terminal: &mut TerminalEntry,
+        command: &str,
+        ctx: &egui::Context,
+    ) -> bool {
+        let trimmed = command.trim();
+        if trimmed.is_empty() || terminal.exited {
+            return false;
+        }
+
+        let mut outbound = trimmed.as_bytes().to_vec();
+        outbound.push(b'\r');
+        terminal.runtime.send_bytes(outbound);
+        Self::clear_terminal_selection(terminal);
+        terminal.pending_line_for_title.clear();
+        Self::append_pending_line(&mut terminal.pending_line_for_title, trimmed);
+        let line = std::mem::take(&mut terminal.pending_line_for_title);
+        if let Some(sanitized) = terminal_title_candidate(&line) {
+            terminal.full_title = sanitized.clone();
+            terminal.title = update_terminal_title(&sanitized, terminal.id as usize, TITLE_MAX_LEN);
+        }
+        Self::push_recent_input(&mut terminal.recent_inputs, trimmed);
+        terminal.dirty = true;
+        ctx.request_repaint();
+        true
+    }
+
+    fn next_custom_launcher_id(&self) -> String {
+        let mut suffix = self.config.launchers.len() + 1;
+        loop {
+            let candidate = format!("custom-{suffix}");
+            if !self
+                .config
+                .launchers
+                .iter()
+                .any(|launcher| launcher.id == candidate)
+            {
+                return candidate;
+            }
+            suffix += 1;
+        }
+    }
+
+    fn duplicate_builtin_launcher_stems(&self) -> HashSet<String> {
+        let mut seen = HashSet::new();
+        let mut duplicates = HashSet::new();
+
+        for launcher in self
+            .config
+            .launchers
+            .iter()
+            .filter(|launcher| launcher.builtin.is_some())
+        {
+            let Some(stem) = Self::launch_command_stem(&launcher.launch_command) else {
+                continue;
+            };
+            let lowered = stem.to_ascii_lowercase();
+            if !seen.insert(lowered.clone()) {
+                duplicates.insert(lowered);
+            }
+        }
+
+        duplicates
+    }
+
     fn finalize_pointer_selection_copy(&mut self, ctx: &egui::Context) {
         self.show_terminal_copy_feedback(ctx);
     }
@@ -5823,6 +6256,9 @@ impl AdeApp {
                             SettingsSection::General => {
                                 self.draw_settings_general_section(ctx, ui, changes);
                             }
+                            SettingsSection::Launchers => {
+                                self.draw_settings_launchers_section(ui, changes);
+                            }
                             SettingsSection::SavedMessages => {
                                 self.draw_settings_saved_messages_section(ui, changes);
                             }
@@ -5976,6 +6412,273 @@ impl AdeApp {
                     } else {
                         ctx.request_repaint();
                     }
+                }
+            },
+        );
+    }
+
+    fn draw_settings_launchers_section(&mut self, ui: &mut Ui, changes: &mut SettingsEditOutcome) {
+        ui.label(
+            RichText::new(
+                "Foreground terminal creation now launches through this catalog instead of opening an empty shell.",
+            )
+            .small()
+            .color(TEXT_MUTED),
+        );
+        ui.add_space(12.0);
+
+        let duplicate_builtin_stems = self.duplicate_builtin_launcher_stems();
+        let mut remove_custom_launcher_index = None;
+
+        show_settings_card(
+            ui,
+            AppIcon::TerminalWindow,
+            "Foreground Launchers",
+            "Built-ins stay available by default. You can rename them, change the submitted command, disable them, or add custom entries.",
+            |ui| {
+                for index in 0..self.config.launchers.len() {
+                    let mut row_changed = false;
+                    let mut remove_requested = false;
+
+                    settings_surface_frame(with_alpha(SURFACE_BG_SOFT, 228), 12.0).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let icon_key = self.config.launchers[index].icon_key;
+                            let is_builtin = self.config.launchers[index].builtin.is_some();
+                            let _ = self.draw_launcher_icon(ui, icon_key, CONTROL_ROW_HEIGHT);
+                            ui.add_space(8.0);
+                            let launcher = &mut self.config.launchers[index];
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(&launcher.display_name)
+                                            .strong()
+                                            .color(TEXT_PRIMARY),
+                                    );
+                                    let kind_label = if is_builtin { "Built-in" } else { "Custom" };
+                                    ui.label(
+                                        RichText::new(kind_label).small().color(TEXT_MUTED),
+                                    );
+                                });
+
+                                ui.add_space(6.0);
+                                ui.label(RichText::new("Menu label").small().color(TEXT_MUTED));
+                                row_changed |= with_settings_text_edit_chrome(ui, |ui| {
+                                    ui.add_sized(
+                                        [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
+                                        egui::TextEdit::singleline(&mut launcher.display_name)
+                                            .hint_text("Launcher name")
+                                            .desired_width(ui.available_width().max(0.0)),
+                                    )
+                                })
+                                .changed();
+
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new("Command to type and submit")
+                                        .small()
+                                        .color(TEXT_MUTED),
+                                );
+                                row_changed |= with_settings_text_edit_chrome(ui, |ui| {
+                                    ui.add_sized(
+                                        [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
+                                        egui::TextEdit::singleline(&mut launcher.launch_command)
+                                            .hint_text("Example: codex, cc, droid, opencode")
+                                            .desired_width(ui.available_width().max(0.0)),
+                                    )
+                                })
+                                .changed();
+
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    let enabled_response = ui.checkbox(
+                                        &mut launcher.enabled,
+                                        "Show in foreground launcher menu",
+                                    );
+                                    row_changed |= enabled_response.changed();
+
+                                    if !is_builtin {
+                                        ui.add_space(12.0);
+                                        egui::ComboBox::from_id_salt(("launcher-icon-key", &launcher.id))
+                                            .selected_text(launcher.icon_key.label())
+                                            .show_ui(ui, |ui| {
+                                                for icon_key in LauncherIconKey::CUSTOM_PRESETS {
+                                                    row_changed |= ui
+                                                        .selectable_value(
+                                                            &mut launcher.icon_key,
+                                                            icon_key,
+                                                            icon_key.label(),
+                                                        )
+                                                        .changed();
+                                                }
+                                            });
+
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            if styled_icon_button(
+                                                ui,
+                                                icons::X,
+                                                BTN_RED,
+                                                BTN_RED_HOVER,
+                                                BTN_ICON_ACTIVE,
+                                                "Remove launcher",
+                                            ) {
+                                                remove_requested = true;
+                                            }
+                                        });
+                                    }
+                                });
+                            });
+                        });
+                    });
+
+                    let launcher = &mut self.config.launchers[index];
+                    if let Some(builtin) = launcher.builtin {
+                        if launcher.display_name.trim().is_empty() {
+                            launcher.display_name = builtin.default_display_name().to_owned();
+                            row_changed = true;
+                        }
+                        if launcher.launch_command.trim().is_empty() {
+                            launcher.launch_command = builtin.default_launch_command().to_owned();
+                            row_changed = true;
+                        }
+                        launcher.icon_key = builtin.icon_key();
+                    }
+
+                    let launch_command_missing = launcher.launch_command.trim().is_empty();
+                    let display_name_missing = launcher.display_name.trim().is_empty();
+                    let duplicate_builtin_command = launcher.builtin.is_some()
+                        && Self::launch_command_stem(&launcher.launch_command)
+                            .is_some_and(|stem| {
+                                duplicate_builtin_stems.contains(&stem.to_ascii_lowercase())
+                            });
+
+                    if launch_command_missing || display_name_missing || duplicate_builtin_command {
+                        ui.add_space(6.0);
+                        let warning = if duplicate_builtin_command {
+                            "Built-in commands must stay unique so Codex and Droid detection remains unambiguous."
+                        } else if launch_command_missing {
+                            "Command cannot be empty."
+                        } else {
+                            "Menu label cannot be empty."
+                        };
+                        ui.label(
+                            RichText::new(warning)
+                                .small()
+                                .color(Color32::from_rgb(232, 184, 76)),
+                        );
+                    }
+
+                    if row_changed {
+                        changes.note_launchers_change();
+                    }
+                    if remove_requested {
+                        remove_custom_launcher_index = Some(index);
+                    }
+
+                    ui.add_space(10.0);
+                }
+            },
+        );
+
+        if let Some(index) = remove_custom_launcher_index {
+            if self
+                .config
+                .launchers
+                .get(index)
+                .is_some_and(|launcher| launcher.builtin.is_none())
+            {
+                self.config.launchers.remove(index);
+                changes.note_launchers_change();
+            }
+        }
+
+        show_settings_card(
+            ui,
+            AppIcon::Plus,
+            "Add Custom Launcher",
+            "Create extra foreground launchers with a preset icon and a custom command.",
+            |ui| {
+                ui.label(RichText::new("Menu label").small().color(TEXT_MUTED));
+                let mut draft_changed = false;
+                draft_changed |= with_settings_text_edit_chrome(ui, |ui| {
+                    ui.add_sized(
+                        [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
+                        egui::TextEdit::singleline(&mut self.launcher_draft.display_name)
+                            .hint_text("Example: Gemini")
+                            .desired_width(ui.available_width().max(0.0)),
+                    )
+                })
+                .changed();
+                ui.add_space(8.0);
+
+                ui.label(
+                    RichText::new("Command to type and submit")
+                        .small()
+                        .color(TEXT_MUTED),
+                );
+                draft_changed |= with_settings_text_edit_chrome(ui, |ui| {
+                    ui.add_sized(
+                        [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
+                        egui::TextEdit::singleline(&mut self.launcher_draft.launch_command)
+                            .hint_text("Example: gemini")
+                            .desired_width(ui.available_width().max(0.0)),
+                    )
+                })
+                .changed();
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    let _ = draw_launcher_icon_badge(
+                        ui,
+                        self.launcher_draft.icon_key,
+                        CONTROL_ROW_HEIGHT,
+                    );
+                    ui.add_space(8.0);
+                    egui::ComboBox::from_id_salt("launcher-draft-icon-key")
+                        .selected_text(self.launcher_draft.icon_key.label())
+                        .show_ui(ui, |ui| {
+                            for icon_key in LauncherIconKey::CUSTOM_PRESETS {
+                                draft_changed |= ui
+                                    .selectable_value(
+                                        &mut self.launcher_draft.icon_key,
+                                        icon_key,
+                                        icon_key.label(),
+                                    )
+                                    .changed();
+                            }
+                        });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if styled_icon_button(
+                            ui,
+                            icons::PLUS,
+                            BTN_BLUE,
+                            BTN_BLUE_HOVER,
+                            BTN_ICON_ACTIVE,
+                            "Add launcher",
+                        ) {
+                            let display_name = self.launcher_draft.display_name.trim();
+                            let launch_command = self.launcher_draft.launch_command.trim();
+                            if !display_name.is_empty() && !launch_command.is_empty() {
+                                self.config.launchers.push(LauncherEntry {
+                                    id: self.next_custom_launcher_id(),
+                                    builtin: None,
+                                    display_name: display_name.to_owned(),
+                                    launch_command: launch_command.to_owned(),
+                                    enabled: true,
+                                    icon_key: self.launcher_draft.icon_key,
+                                });
+                                self.launcher_draft = LauncherDraftState::default();
+                                changes.note_launchers_change();
+                            } else {
+                                self.status_line =
+                                    "Custom launcher needs both a menu label and a command."
+                                        .to_owned();
+                            }
+                        }
+                    });
+                });
+
+                if draft_changed {
+                    ui.ctx().request_repaint();
                 }
             },
         );
@@ -7431,6 +8134,7 @@ impl AdeApp {
         let mut project_ids = self.projects.keys().copied().collect::<Vec<_>>();
         project_ids.sort_unstable();
         let visible_kind = self.config.ui.terminal_manager_filter.terminal_kind();
+        let foreground_launchers = self.foreground_launchers();
 
         for project_id in project_ids {
             let Some(project_snapshot) = self.projects.get(&project_id).cloned() else {
@@ -7452,17 +8156,34 @@ impl AdeApp {
             let has_live_terminal =
                 self.terminal_count_live_for_project_kind(project_id, visible_kind) > 0;
             let has_children = visible_count > 0;
-            let (header_response, spawn_clicked, header_clicked) = draw_project_group_header(
-                ui,
-                &project_snapshot.name,
-                header_open,
-                has_children,
-                visible_kind,
-                &project_diff_summary,
-                has_live_terminal,
-            );
-            let spawn_succeeded =
-                spawn_clicked && self.spawn_terminal_for_project(ctx, project_id, visible_kind);
+            let (header_response, spawn_clicked, selected_launcher_id, header_clicked) =
+                draw_project_group_header(
+                    self,
+                    ui,
+                    &project_snapshot.name,
+                    header_open,
+                    has_children,
+                    visible_kind,
+                    &foreground_launchers,
+                    &project_diff_summary,
+                    has_live_terminal,
+                );
+            let spawn_succeeded = match visible_kind {
+                TerminalKind::Foreground => {
+                    selected_launcher_id.as_deref().is_some_and(|launcher_id| {
+                        self.spawn_terminal_for_project(
+                            ctx,
+                            project_id,
+                            visible_kind,
+                            Some(launcher_id),
+                        )
+                    })
+                }
+                TerminalKind::Background => {
+                    spawn_clicked
+                        && self.spawn_terminal_for_project(ctx, project_id, visible_kind, None)
+                }
+            };
             if header_clicked && has_children {
                 header_state.toggle(ui);
                 header_state.store(ui.ctx());
@@ -8400,9 +9121,11 @@ impl AdeApp {
                         .color(TEXT_PRIMARY),
                 );
                 ui.label(
-                    RichText::new("Workspace defaults, saved messages, and diagnostics.")
-                        .small()
-                        .color(TEXT_MUTED),
+                    RichText::new(
+                        "Workspace defaults, launchers, saved messages, and diagnostics.",
+                    )
+                    .small()
+                    .color(TEXT_MUTED),
                 );
                 ui.add_space(12.0);
 
@@ -8479,6 +9202,9 @@ impl AdeApp {
             }
             if changes.default_shell_changed {
                 self.note_default_shell_changed();
+            }
+            if changes.launchers_changed {
+                self.note_launchers_changed();
             }
             if changes.projects_changed {
                 self.note_projects_changed();
@@ -8606,6 +9332,10 @@ fn recover_config_state(
 
     if pending_config_changes.default_shell {
         config.default_shell = current_config.default_shell;
+    }
+
+    if pending_config_changes.launchers {
+        config.launchers = current_config.launchers.clone();
     }
 
     config.ui.show_project_explorer = current_config.ui.show_project_explorer;
@@ -10648,7 +11378,7 @@ fn project_group_header_action_spec(
             icons::TERMINAL,
             BTN_BLUE,
             BTN_BLUE_HOVER,
-            "New Foreground Terminal",
+            "Open Foreground Launcher",
         ),
         TerminalKind::Background => (
             icons::LIST,
@@ -10861,14 +11591,16 @@ fn project_group_header_row_layout(total_width: f32, section_gap: f32) -> (f32, 
 }
 
 fn draw_project_group_header(
+    app: &mut AdeApp,
     ui: &mut Ui,
     project_name: &str,
     open: bool,
     can_expand: bool,
     action_kind: TerminalKind,
+    foreground_launchers: &[LauncherEntry],
     diff_summary: &TerminalManagerDiffSummaryModel,
     has_live_terminal: bool,
-) -> (egui::Response, bool, bool) {
+) -> (egui::Response, bool, Option<String>, bool) {
     let row_width = ui.available_width();
     let section_gap = ui.spacing().item_spacing.x;
     let (label_width, actions_width) = project_group_header_row_layout(row_width, section_gap);
@@ -10895,6 +11627,7 @@ fn draw_project_group_header(
     };
 
     let mut spawn_clicked = false;
+    let mut selected_launcher_id = None;
 
     let label_rect = egui::Rect::from_min_size(row_rect.min, egui::vec2(label_width, row_height));
     if label_width > 0.0 && ui.is_rect_visible(label_rect) {
@@ -10927,15 +11660,31 @@ fn draw_project_group_header(
             .layout(Layout::right_to_left(Align::Center)),
         |ui| {
             let (icon, bg, hover_bg, tooltip) = project_group_header_action_spec(action_kind);
-            if styled_icon_button(ui, icon, bg, hover_bg, BTN_ICON_ACTIVE, tooltip) {
+            if action_kind == TerminalKind::Foreground {
+                selected_launcher_id = styled_launcher_menu_button(
+                    app,
+                    ui,
+                    icon,
+                    bg,
+                    hover_bg,
+                    BTN_ICON_ACTIVE,
+                    tooltip,
+                    foreground_launchers,
+                );
+            } else if styled_icon_button(ui, icon, bg, hover_bg, BTN_ICON_ACTIVE, tooltip) {
                 spawn_clicked = true;
             }
         },
     );
 
-    let header_clicked = response.clicked() && !spawn_clicked;
+    let header_clicked = response.clicked() && !spawn_clicked && selected_launcher_id.is_none();
 
-    (response, spawn_clicked, header_clicked)
+    (
+        response,
+        spawn_clicked,
+        selected_launcher_id,
+        header_clicked,
+    )
 }
 
 fn styled_icon_button(
@@ -10973,6 +11722,78 @@ fn styled_icon_button(
     );
 
     response.clicked()
+}
+
+fn styled_launcher_menu_button(
+    app: &mut AdeApp,
+    ui: &mut Ui,
+    icon: AppIcon,
+    _bg: Color32,
+    _hover_bg: Color32,
+    _active_bg: Color32,
+    tooltip: &str,
+    launchers: &[LauncherEntry],
+) -> Option<String> {
+    let mut selected_launcher = None;
+    let menu = with_minimal_button_chrome(ui, |ui| {
+        ui.menu_button(format!("{icon}"), |ui| {
+            with_minimal_button_chrome(ui, |ui| {
+                if launchers.is_empty() {
+                    ui.label(
+                        RichText::new("Enable a launcher in Settings > Launchers")
+                            .small()
+                            .color(TEXT_MUTED),
+                    );
+                    return;
+                }
+
+                for launcher in launchers {
+                    let response = ui.horizontal(|ui| {
+                        let _ = app.draw_launcher_icon(ui, launcher.icon_key, 20.0);
+                        ui.add_space(6.0);
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new(&launcher.display_name)
+                                    .strong()
+                                    .color(TEXT_PRIMARY),
+                            );
+                            ui.label(
+                                RichText::new(&launcher.launch_command)
+                                    .small()
+                                    .color(TEXT_MUTED),
+                            );
+                        });
+                    });
+                    let row_id = ui.make_persistent_id(("foreground-launcher", &launcher.id));
+                    let row_response = ui
+                        .interact(response.response.rect, row_id, Sense::click())
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if row_response.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if row_response.clicked() {
+                        selected_launcher = Some(launcher.id.clone());
+                        ui.close_menu();
+                    }
+                }
+            });
+        })
+    });
+
+    let response = menu
+        .response
+        .on_hover_text(if launchers.is_empty() {
+            "No foreground launchers enabled"
+        } else {
+            tooltip
+        })
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    selected_launcher
 }
 
 fn activity_rail_icon_button(
@@ -12320,8 +13141,8 @@ mod tests {
     };
     use crate::layout;
     use crate::models::{
-        AppConfig, MainVisibilityMode, ProjectRecord, ShellKind, TerminalKind,
-        TerminalManagerFilter,
+        AppConfig, BuiltinLauncherKind, LauncherEntry, LauncherIconKey, MainVisibilityMode,
+        ProjectRecord, ShellKind, TerminalKind, TerminalManagerFilter,
     };
     use crate::terminal::{
         test_terminal_runtime, test_terminal_runtime_with_capture, TerminalColor, TerminalCursor,
@@ -13074,6 +13895,7 @@ mod tests {
     #[test]
     fn settings_navigation_uses_saved_messages_label() {
         assert_eq!(SettingsSection::General.navigation_title(), "General");
+        assert_eq!(SettingsSection::Launchers.navigation_title(), "Launchers");
         assert_eq!(
             SettingsSection::SavedMessages.navigation_title(),
             "Saved Messages"
@@ -14940,6 +15762,7 @@ mod tests {
         row_width: f32,
         diff_summary: &super::TerminalManagerDiffSummaryModel,
     ) -> (egui::Pos2, egui::Pos2) {
+        let mut app = test_app(std::iter::empty(), None);
         let mut observed = None;
         let _ = ctx.run(RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -14947,12 +15770,14 @@ mod tests {
                     egui::vec2(row_width, super::CONTROL_ROW_HEIGHT),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
-                        let (response, _, _) = super::draw_project_group_header(
+                        let (response, _, _, _) = super::draw_project_group_header(
+                            &mut app,
                             ui,
                             "Demo Project",
                             false,
                             false,
                             TerminalKind::Foreground,
+                            &[],
                             diff_summary,
                             false,
                         );
@@ -14980,6 +15805,7 @@ mod tests {
         diff_summary: &super::TerminalManagerDiffSummaryModel,
         has_live_terminal: bool,
     ) -> egui::CursorIcon {
+        let mut app = test_app(std::iter::empty(), None);
         let output = ctx.run(
             RawInput {
                 events: vec![Event::PointerMoved(hover_pos)],
@@ -14992,11 +15818,13 @@ mod tests {
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             let _ = super::draw_project_group_header(
+                                &mut app,
                                 ui,
                                 "Demo Project",
                                 false,
                                 can_expand,
                                 TerminalKind::Foreground,
+                                &[],
                                 diff_summary,
                                 has_live_terminal,
                             );
@@ -15105,7 +15933,7 @@ mod tests {
         let background = super::project_group_header_action_spec(TerminalKind::Background);
 
         assert_eq!(foreground.0, super::icons::TERMINAL);
-        assert_eq!(foreground.3, "New Foreground Terminal");
+        assert_eq!(foreground.3, "Open Foreground Launcher");
         assert_eq!(background.0, super::icons::LIST);
         assert_eq!(background.3, "New Background Terminal");
     }
@@ -18079,6 +18907,99 @@ mod tests {
     }
 
     #[test]
+    fn built_in_launcher_icons_have_embedded_assets() {
+        for icon_key in [
+            LauncherIconKey::Codex,
+            LauncherIconKey::Claude,
+            LauncherIconKey::Droid,
+            LauncherIconKey::OpenCode,
+        ] {
+            let bytes = super::builtin_launcher_icon_bytes(icon_key)
+                .unwrap_or_else(|| panic!("missing embedded asset for {}", icon_key.label()));
+            let image = super::decode_launcher_icon_image(bytes)
+                .unwrap_or_else(|err| panic!("failed to decode {} asset: {err}", icon_key.label()));
+            assert!(image.size[0] > 0);
+            assert!(image.size[1] > 0);
+        }
+    }
+
+    #[test]
+    fn invalid_launcher_icon_bytes_fail_to_decode() {
+        assert!(super::decode_launcher_icon_image(b"not-an-image").is_err());
+    }
+
+    #[test]
+    fn route_active_terminal_input_uses_codex_launcher_alias_from_settings() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.config
+            .launchers
+            .iter_mut()
+            .find(|launcher| launcher.builtin == Some(BuiltinLauncherKind::Codex))
+            .expect("codex launcher")
+            .launch_command = "cx".to_owned();
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![
+                Event::Text("cx".to_owned()),
+                Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::default(),
+                },
+            ],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert!(terminal.codex_launch_pending_since.is_some());
+    }
+
+    #[test]
+    fn recover_config_state_preserves_pending_launcher_changes() {
+        let mut current_config = AppConfig::default();
+        current_config
+            .launchers
+            .iter_mut()
+            .find(|launcher| launcher.builtin == Some(BuiltinLauncherKind::Claude))
+            .expect("claude launcher")
+            .launch_command = "cc".to_owned();
+        current_config.launchers.push(LauncherEntry {
+            id: "custom-gemini".to_owned(),
+            builtin: None,
+            display_name: "Gemini".to_owned(),
+            launch_command: "gemini".to_owned(),
+            enabled: true,
+            icon_key: LauncherIconKey::Spark,
+        });
+
+        let recovered = super::recover_config_state(
+            &current_config,
+            &BTreeMap::new(),
+            None,
+            AppConfig::default(),
+            PendingConfigChanges {
+                launchers: true,
+                ..PendingConfigChanges::default()
+            },
+        );
+
+        let claude = recovered
+            .launchers
+            .iter()
+            .find(|launcher| launcher.builtin == Some(BuiltinLauncherKind::Claude))
+            .expect("claude launcher");
+        assert_eq!(claude.launch_command, "cc");
+        assert!(recovered
+            .launchers
+            .iter()
+            .any(|launcher| launcher.id == "custom-gemini"));
+    }
+
+    #[test]
     fn route_active_terminal_input_marks_codex_launch_pending_without_running() {
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
@@ -20332,6 +21253,9 @@ mod tests {
             active_settings_section: SettingsSection::General,
             settings_diagnostics_expanded: false,
             saved_message_drafts: BTreeMap::new(),
+            launcher_draft: super::LauncherDraftState::default(),
+            launcher_icon_textures: BTreeMap::new(),
+            launcher_icon_failures: std::collections::BTreeSet::new(),
             directory_search_query: String::new(),
             directory_pending_tree_open_state_by_project: BTreeMap::new(),
             status_line: "Ready".to_owned(),

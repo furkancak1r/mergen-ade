@@ -83,6 +83,191 @@ impl Default for ShellKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltinLauncherKind {
+    Codex,
+    Claude,
+    Droid,
+    OpenCode,
+}
+
+impl BuiltinLauncherKind {
+    pub const ALL: [Self; 4] = [Self::Codex, Self::Claude, Self::Droid, Self::OpenCode];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Droid => "droid",
+            Self::OpenCode => "opencode",
+        }
+    }
+
+    pub const fn default_display_name(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude",
+            Self::Droid => "Droid",
+            Self::OpenCode => "OpenCode",
+        }
+    }
+
+    pub const fn default_launch_command(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Droid => "droid",
+            Self::OpenCode => "opencode",
+        }
+    }
+
+    pub const fn icon_key(self) -> LauncherIconKey {
+        match self {
+            Self::Codex => LauncherIconKey::Codex,
+            Self::Claude => LauncherIconKey::Claude,
+            Self::Droid => LauncherIconKey::Droid,
+            Self::OpenCode => LauncherIconKey::OpenCode,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LauncherIconKey {
+    Codex,
+    Claude,
+    Droid,
+    OpenCode,
+    Terminal,
+    Spark,
+    Message,
+    Bot,
+    Code,
+    Wrench,
+    Rocket,
+}
+
+impl LauncherIconKey {
+    pub const CUSTOM_PRESETS: [Self; 7] = [
+        Self::Terminal,
+        Self::Spark,
+        Self::Message,
+        Self::Bot,
+        Self::Code,
+        Self::Wrench,
+        Self::Rocket,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude",
+            Self::Droid => "Droid",
+            Self::OpenCode => "OpenCode",
+            Self::Terminal => "Terminal",
+            Self::Spark => "Spark",
+            Self::Message => "Message",
+            Self::Bot => "Bot",
+            Self::Code => "Code",
+            Self::Wrench => "Wrench",
+            Self::Rocket => "Rocket",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LauncherEntry {
+    pub id: String,
+    #[serde(default)]
+    pub builtin: Option<BuiltinLauncherKind>,
+    pub display_name: String,
+    pub launch_command: String,
+    #[serde(default = "default_launcher_enabled")]
+    pub enabled: bool,
+    pub icon_key: LauncherIconKey,
+}
+
+impl LauncherEntry {
+    pub fn builtin(kind: BuiltinLauncherKind) -> Self {
+        Self {
+            id: kind.id().to_owned(),
+            builtin: Some(kind),
+            display_name: kind.default_display_name().to_owned(),
+            launch_command: kind.default_launch_command().to_owned(),
+            enabled: true,
+            icon_key: kind.icon_key(),
+        }
+    }
+}
+
+const fn default_launcher_enabled() -> bool {
+    true
+}
+
+pub fn default_launchers() -> Vec<LauncherEntry> {
+    BuiltinLauncherKind::ALL
+        .into_iter()
+        .map(LauncherEntry::builtin)
+        .collect()
+}
+
+pub fn normalize_launcher_entries(entries: &mut Vec<LauncherEntry>) {
+    let mut normalized = Vec::new();
+
+    for builtin in BuiltinLauncherKind::ALL {
+        if let Some(existing) = entries
+            .iter()
+            .find(|entry| entry.builtin == Some(builtin) || entry.id == builtin.id())
+        {
+            normalized.push(LauncherEntry {
+                id: builtin.id().to_owned(),
+                builtin: Some(builtin),
+                display_name: if existing.display_name.trim().is_empty() {
+                    builtin.default_display_name().to_owned()
+                } else {
+                    existing.display_name.clone()
+                },
+                launch_command: if existing.launch_command.trim().is_empty() {
+                    builtin.default_launch_command().to_owned()
+                } else {
+                    existing.launch_command.clone()
+                },
+                enabled: existing.enabled,
+                icon_key: builtin.icon_key(),
+            });
+        } else {
+            normalized.push(LauncherEntry::builtin(builtin));
+        }
+    }
+
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.builtin.is_some() {
+            continue;
+        }
+        if entry.display_name.trim().is_empty() || entry.launch_command.trim().is_empty() {
+            continue;
+        }
+
+        let id = if entry.id.trim().is_empty() {
+            format!("custom-{}", index + 1)
+        } else {
+            entry.id.clone()
+        };
+
+        normalized.push(LauncherEntry {
+            id,
+            builtin: None,
+            display_name: entry.display_name.clone(),
+            launch_command: entry.launch_command.clone(),
+            enabled: entry.enabled,
+            icon_key: entry.icon_key,
+        });
+    }
+
+    *entries = normalized;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalKind {
@@ -181,6 +366,8 @@ pub struct AppConfig {
     pub version: u32,
     pub default_shell: ShellKind,
     pub ui: UiConfig,
+    #[serde(default = "default_launchers")]
+    pub launchers: Vec<LauncherEntry>,
     pub projects: Vec<ProjectRecord>,
     pub ai_hooks: AiHooksConfig,
 }
@@ -191,6 +378,7 @@ impl Default for AppConfig {
             version: 1,
             default_shell: ShellKind::default(),
             ui: UiConfig::default(),
+            launchers: default_launchers(),
             projects: Vec::new(),
             ai_hooks: AiHooksConfig::default(),
         }
@@ -199,7 +387,10 @@ impl Default for AppConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::ShellKind;
+    use super::{
+        default_launchers, normalize_launcher_entries, BuiltinLauncherKind, LauncherEntry,
+        LauncherIconKey, ShellKind,
+    };
 
     #[test]
     fn shell_kind_default_matches_platform() {
@@ -223,5 +414,47 @@ mod tests {
             ShellKind::available_for_current_platform(),
             &[ShellKind::Zsh]
         );
+    }
+
+    #[test]
+    fn default_launchers_include_expected_builtins() {
+        let launchers = default_launchers();
+
+        assert_eq!(launchers.len(), 4);
+        assert_eq!(
+            launchers[0],
+            LauncherEntry::builtin(BuiltinLauncherKind::Codex)
+        );
+        assert_eq!(
+            launchers[1],
+            LauncherEntry::builtin(BuiltinLauncherKind::Claude)
+        );
+        assert_eq!(
+            launchers[2],
+            LauncherEntry::builtin(BuiltinLauncherKind::Droid)
+        );
+        assert_eq!(
+            launchers[3],
+            LauncherEntry::builtin(BuiltinLauncherKind::OpenCode)
+        );
+    }
+
+    #[test]
+    fn normalize_launcher_entries_restores_missing_builtins_and_keeps_custom_entries() {
+        let mut launchers = vec![LauncherEntry {
+            id: "custom-launcher".to_owned(),
+            builtin: None,
+            display_name: "Custom".to_owned(),
+            launch_command: "my-cli".to_owned(),
+            enabled: true,
+            icon_key: LauncherIconKey::Rocket,
+        }];
+
+        normalize_launcher_entries(&mut launchers);
+
+        assert_eq!(launchers.len(), 5);
+        assert_eq!(launchers[0].builtin, Some(BuiltinLauncherKind::Codex));
+        assert_eq!(launchers[4].builtin, None);
+        assert_eq!(launchers[4].display_name, "Custom");
     }
 }

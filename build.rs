@@ -5,15 +5,19 @@ use std::path::{Path, PathBuf};
 use ico::{IconDir, IconDirEntry, IconImage, ResourceType};
 use image::imageops::{self, FilterType};
 use image::RgbaImage;
+use resvg::{tiny_skia, usvg};
 
 const SOURCE_LOGO: &str = "logo.png";
 const OUTPUT_PNG: &str = "app-icon.png";
 const OUTPUT_ICO: &str = "app-icon.ico";
 const MASTER_ICON_SIZE: u32 = 1024;
 const ICO_SIZES: [u32; 7] = [16, 24, 32, 48, 64, 128, 256];
+const LAUNCHER_ICON_DIR: &str = "assets/launcher-icons";
+const LAUNCHER_ICON_OUTPUT_PREFIX: &str = "launcher-";
 
 fn main() {
     println!("cargo:rerun-if-changed={SOURCE_LOGO}");
+    println!("cargo:rerun-if-changed={LAUNCHER_ICON_DIR}");
     println!("cargo:rerun-if-changed=.toolchain/llvm-mingw-20260224-ucrt-x86_64/bin/windres.exe");
     println!("cargo:rerun-if-changed=.toolchain/llvm-mingw-20260224-ucrt-x86_64/bin/ar.exe");
     println!("cargo:rerun-if-env-changed=WindowsSdkDir");
@@ -32,6 +36,7 @@ fn main() {
     icon.save(&icon_png)
         .unwrap_or_else(|err| panic!("failed to write {}: {err}", icon_png.display()));
     write_ico(&icon, &icon_ico);
+    prepare_launcher_icons(&manifest_dir, &out_dir);
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target = env::var("TARGET").unwrap_or_default();
@@ -51,6 +56,63 @@ fn prepare_icon(source_logo: &Path) -> RgbaImage {
         MASTER_ICON_SIZE,
         FilterType::CatmullRom,
     )
+}
+
+fn prepare_launcher_icons(manifest_dir: &Path, out_dir: &Path) {
+    let launcher_icon_dir = manifest_dir.join(LAUNCHER_ICON_DIR);
+    copy_launcher_icon(
+        &launcher_icon_dir.join("claude.png"),
+        &out_dir.join(format!("{LAUNCHER_ICON_OUTPUT_PREFIX}claude.png")),
+    );
+    copy_launcher_icon(
+        &launcher_icon_dir.join("codex.png"),
+        &out_dir.join(format!("{LAUNCHER_ICON_OUTPUT_PREFIX}codex.png")),
+    );
+    copy_launcher_icon(
+        &launcher_icon_dir.join("opencode.png"),
+        &out_dir.join(format!("{LAUNCHER_ICON_OUTPUT_PREFIX}opencode.png")),
+    );
+    render_launcher_svg_icon(
+        &launcher_icon_dir.join("droid.svg"),
+        &out_dir.join(format!("{LAUNCHER_ICON_OUTPUT_PREFIX}droid.png")),
+        256,
+    );
+}
+
+fn copy_launcher_icon(source_path: &Path, output_path: &Path) {
+    std::fs::copy(source_path, output_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to copy launcher icon {} to {}: {err}",
+            source_path.display(),
+            output_path.display()
+        )
+    });
+}
+
+fn render_launcher_svg_icon(source_path: &Path, output_path: &Path, size: u32) {
+    let svg_bytes = std::fs::read(source_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", source_path.display()));
+    let options = usvg::Options::default();
+    let tree = usvg::Tree::from_data(&svg_bytes, &options)
+        .unwrap_or_else(|err| panic!("failed to parse {}: {err}", source_path.display()));
+    let svg_size = tree.size();
+    let scale = (size as f32 / svg_size.width()).min(size as f32 / svg_size.height());
+    let translate_x = (size as f32 - svg_size.width() * scale) * 0.5;
+    let translate_y = (size as f32 - svg_size.height() * scale) * 0.5;
+    let transform =
+        tiny_skia::Transform::from_scale(scale, scale).post_translate(translate_x, translate_y);
+    let mut pixmap = tiny_skia::Pixmap::new(size, size).unwrap_or_else(|| {
+        panic!(
+            "failed to allocate {}x{} pixmap for {}",
+            size,
+            size,
+            source_path.display()
+        )
+    });
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    pixmap
+        .save_png(output_path)
+        .unwrap_or_else(|err| panic!("failed to write {}: {err}", output_path.display()));
 }
 
 fn write_ico(icon: &RgbaImage, output_path: &Path) {

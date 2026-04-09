@@ -1375,3 +1375,58 @@
   - Keep spinner-to-pulse regressions tied to emitted `droid-spec-approval-prompt` signals, not just app-side state updates.
 - Files/Commands touched: `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: 2026-04-09 user-provided Factory Droid approval screen showing the bottom numbered choice menu; regression tests `pending_visible_factory_status_detects_spec_approval_prompt_from_footer_only` and `pending_visible_factory_status_detects_spec_approval_prompt_after_oversized_body`
+
+#### Foreground terminal creation could still open an empty shell instead of a chosen launcher {#foreground-terminal-creation-could-still-open-an-empty-shell-instead-of-a-chosen-launcher}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows terminal manager foreground creation flow after Codex/Droid support had been added but before launcher profiles existed
+- Error signature: `Clicking the foreground new-terminal control opened a blank shell with no launcher selection.`
+- Symptoms/Impact: Users had to open a foreground terminal first and then manually type `codex`, `claude`, `droid`, `opencode`, or a custom alias. That added friction, made alias customization impossible, and prevented the foreground create action from matching the intended launcher-first workflow.
+- Root cause: `src/app.rs` only had a single direct foreground spawn path through `draw_project_group_header()` and `spawn_terminal_for_project()`. There was no persisted launcher catalog in config, no settings editor for launcher aliases, and no launcher-aware spawn path that could inject a configured command on terminal creation.
+- Resolution: Mergen now stores a launcher catalog in config, exposes a dedicated Settings > Launchers editor, opens a launcher menu for foreground creation, auto-submits the selected command, and keeps Codex/Droid launch-pending detection working when users replace the default command with an alias such as `cc`.
+- Prevent recurrence:
+  - Keep foreground creation launcher-driven unless a deliberate raw-shell option is added later.
+  - Regress config recovery for pending launcher edits and alias-based Codex/Droid detection.
+  - Keep background creation behavior covered separately so launcher-only rules do not accidentally change raw background shells.
+- Files/Commands touched: `src/app.rs`, `src/config.rs`, `src/models.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 user request for Codex/Claude/Droid/OpenCode foreground launcher profiles with editable aliases; regression tests `route_active_terminal_input_uses_codex_launcher_alias_from_settings`, `recover_config_state_preserves_pending_launcher_changes`, `missing_launchers_field_restores_default_builtins`, and `save_and_load_preserves_launcher_command_edits`
+
+#### Codex and Droid launcher icons could still show the wrong brand variants after the first branded-icon rollout {#codex-and-droid-launcher-icons-could-still-show-the-wrong-brand-variants-after-the-first-branded-icon-rollout}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows launcher menu and Settings > Launchers after built-in branded assets were introduced for Codex, Claude, Droid, and OpenCode
+- Error signature: `Claude and OpenCode looked correct, but Codex was not purple and Droid did not use the expected Factory symbol.`
+- Symptoms/Impact: The built-in launcher menu looked inconsistent with the actual products. Codex appeared as the wrong brand treatment, and Droid used a weaker/non-canonical mark, which made the built-in choices feel unfinished even though launcher behavior itself worked.
+- Root cause: The first asset pass used the wrong source variants for Codex and Droid. Codex was not backed by the official purple Codex product icon, and Droid was not using the Factory `mobile-nav-logo` symbol from the official site.
+- Resolution: Mergen now sources Codex from the official transparent Codex product app icon asset and renders Droid from the official Factory `mobile-nav-logo` SVG. The monogram fallback palette was also updated so decode failures still resemble the intended brands more closely.
+- Prevent recurrence:
+  - Validate product-specific icon variants with the user when a company brand page exposes both parent-brand and product-brand assets.
+  - Prefer official vector/site symbols over favicons when a built-in launcher is meant to represent a specific product.
+  - Keep launcher icon review separate from launcher behavior review so branding regressions are caught early.
+- Files/Commands touched: `assets/launcher-icons`, `build.rs`, `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 user-reported Codex purple-icon mismatch and Droid symbol mismatch after the branded launcher rollout
+
+#### Droid launcher icon could still use the wrong color variant after switching to the correct Factory symbol {#droid-launcher-icon-could-still-use-the-wrong-color-variant-after-switching-to-the-correct-factory-symbol}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows launcher menu and Settings > Launchers after Droid switched from a non-canonical asset to the Factory `mobile-nav-logo` symbol
+- Error signature: `The Droid symbol shape was correct, but the icon still appeared orange instead of white.`
+- Symptoms/Impact: The built-in Droid launcher still looked off against the rest of the dark launcher UI because the chosen symbol color did not match the expected monochrome treatment. Users could read it as a partially fixed icon rollout rather than a finished branded surface.
+- Root cause: The adopted `mobile-nav-logo` SVG was pinned to an orange fill instead of the intended white-on-dark treatment for this surface, and the Droid fallback badge palette still reinforced the orange variant.
+- Resolution: Mergen now renders the Droid symbol as white on transparent background and updates the Droid fallback badge palette to a neutral dark slot with white foreground treatment.
+- Prevent recurrence:
+  - Confirm both shape and color variant when locking a product icon for a dark themed launcher surface.
+  - Keep fallback badge colors aligned with the chosen asset treatment so decode failures do not reintroduce a rejected variant.
+  - Re-review launcher icons in both the menu and settings rows after brand-asset swaps.
+- Files/Commands touched: `assets/launcher-icons/droid.svg`, `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 user-reported Droid white-icon mismatch after the Factory symbol fix
+
+#### Foreground launcher menu rows could still show the default cursor even though the whole row was clickable {#foreground-launcher-menu-rows-could-still-show-the-default-cursor-even-though-the-whole-row-was-clickable}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows foreground launcher creation menu after launcher profiles replaced empty-shell foreground creation
+- Error signature: `Hovering a launcher row did not show a pointer cursor, even though clicking anywhere on the row selected the launcher.`
+- Symptoms/Impact: The launcher menu felt less obviously interactive because the row behaved like a button but the cursor still looked passive. Users had weaker hover affordance on the most common foreground-terminal creation path.
+- Root cause: `src/app.rs` made each launcher row clickable with `ui.interact(..., Sense::click())`, but did not attach hover cursor behavior to that row response.
+- Resolution: Mergen now applies `PointingHand` to each clickable launcher row in the foreground launcher menu, matching the rest of the app's clickable list surfaces.
+- Prevent recurrence:
+  - Whenever a whole list row is clickable through `ui.interact`, pair it with explicit hover cursor behavior.
+  - Re-check cursor affordance after converting button-based flows into full-row click targets.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 user-reported launcher menu hover cursor mismatch

@@ -6,7 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use directories::ProjectDirs;
 use serde::Deserialize;
 
-use crate::models::{AppConfig, ProjectRecord, ShellKind, UiConfig};
+use crate::models::{
+    default_launchers, normalize_launcher_entries, AppConfig, ProjectRecord, ShellKind, UiConfig,
+};
 
 const QUALIFIER: &str = "com";
 const ORGANIZATION: &str = "Mergen";
@@ -168,6 +170,7 @@ impl From<LegacyAppConfig> for AppConfig {
             version: value.version,
             default_shell: value.default_shell,
             ui: value.ui,
+            launchers: default_launchers(),
             projects,
             ai_hooks: crate::hooks::AiHooksConfig::default(),
         }
@@ -180,12 +183,13 @@ const fn default_config_version() -> u32 {
 
 fn normalize_config_for_current_platform(config: &mut AppConfig) {
     config.default_shell = config.default_shell.normalize_for_current_platform();
+    normalize_launcher_entries(&mut config.launchers);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{load_config, save_config};
-    use crate::models::{AppConfig, ShellKind, TerminalManagerFilter};
+    use crate::models::{AppConfig, BuiltinLauncherKind, ShellKind, TerminalManagerFilter};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -342,6 +346,66 @@ multi_terminal_view_enabled = true
             loaded.ui.terminal_manager_filter,
             TerminalManagerFilter::Background
         );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn missing_launchers_field_restores_default_builtins() {
+        let path = unique_temp_path("missing-launchers-field");
+        fs::write(
+            &path,
+            r#"
+version = 1
+default_shell = "powershell"
+"#,
+        )
+        .expect("should write config");
+
+        let config = load_config(&path).expect("should load config");
+
+        assert_eq!(config.launchers.len(), 4);
+        assert_eq!(
+            config.launchers[0].builtin,
+            Some(BuiltinLauncherKind::Codex)
+        );
+        assert_eq!(
+            config.launchers[1].builtin,
+            Some(BuiltinLauncherKind::Claude)
+        );
+        assert_eq!(
+            config.launchers[2].builtin,
+            Some(BuiltinLauncherKind::Droid)
+        );
+        assert_eq!(
+            config.launchers[3].builtin,
+            Some(BuiltinLauncherKind::OpenCode)
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_and_load_preserves_launcher_command_edits() {
+        let path = unique_temp_path("preserve-launcher-command");
+        let mut config = AppConfig::default();
+        config
+            .launchers
+            .iter_mut()
+            .find(|launcher| launcher.builtin == Some(BuiltinLauncherKind::Claude))
+            .expect("claude launcher")
+            .launch_command = "cc".to_owned();
+
+        save_config(&path, &config).expect("should save config");
+
+        let loaded = load_config(&path).expect("should load config");
+        let claude = loaded
+            .launchers
+            .iter()
+            .find(|launcher| launcher.builtin == Some(BuiltinLauncherKind::Claude))
+            .expect("claude launcher");
+
+        assert_eq!(claude.launch_command, "cc");
 
         let _ = fs::remove_file(path);
     }
