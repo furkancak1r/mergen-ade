@@ -858,3 +858,31 @@
   - When Diagnostics shows `Factory Droid hook repair needed`, rerun `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-factory-droid-hooks.ps1` from the repo root and restart Droid.
 - Files/Commands touched: `src/app.rs`, `scripts/__tests__/factory-droid-hooks.tests.ps1`, `README.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `powershell -ExecutionPolicy Bypass -File .\scripts\__tests__\factory-droid-hooks.tests.ps1`
 - References: local 2026-04-08 investigation of `%USERPROFILE%\.factory\settings.json`, `%USERPROFILE%\.factory\hooks\mergen-ade-droid-status.ps1`, and `%APPDATA%\mergen\MergenADE\config\runtime\factory-droid-hooks\*.jsonl`; Factory docs reviewed at `https://docs.factory.ai/reference/hooks-reference` and `https://docs.factory.ai/cli/configuration/settings`
+
+#### Terminal Manager filter tabs only switched on label text clicks instead of the full slot area {#terminal-manager-filter-tabs-only-switched-on-label-text-clicks-instead-of-the-full-slot-area}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Terminal Manager foreground/background filter tabs
+- Error signature: `Clicking empty space inside the Foreground or Background filter box did nothing unless the pointer was directly on the text label.`
+- Symptoms/Impact: Terminal Manager filter switching felt inconsistent because the visible per-filter box implied a larger hit area than the code actually accepted. Users had to aim precisely at the label text instead of being able to click anywhere inside the owning slot.
+- Root cause: `src/app.rs` attached `Sense::click()` only to the centered `Label` widget's `label_rect`, while the surrounding slot rectangle was layout-only and never registered pointer interaction.
+- Resolution: The filter layout now retains both slot rects and label rects, the full slot rect handles hover/click interaction, the label remains centered and visual-only, and regression tests now cover blank-space clicks inside both filter slots plus the selected-slot no-op case.
+- Prevent recurrence:
+  - Bind Terminal Manager tab hit-testing to the same slot geometry used for layout, not just the text bounds.
+  - Keep underline rendering tied to label bounds so click-area expansions do not accidentally change the visual design.
+  - Add pointer-event regression tests whenever a control's visible affordance is larger than its text or icon content.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 user-reported Terminal Manager filter hit-area bug; regression tests `terminal_manager_filter_clicking_blank_space_in_background_slot_switches_selection`, `terminal_manager_filter_clicking_blank_space_in_foreground_slot_switches_selection`, and `terminal_manager_filter_clicking_selected_slot_blank_space_is_no_op`
+
+#### Terminal Manager filter follow-up fix restored blank-space clicks but broke direct label clicks {#terminal-manager-filter-follow-up-fix-restored-blank-space-clicks-but-broke-direct-label-clicks}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Terminal Manager foreground/background filter tabs after the initial slot hit-area expansion
+- Error signature: `After blank-space clicks were fixed, clicking directly on the Foreground or Background text stopped switching the filter.`
+- Symptoms/Impact: The visible tab text itself no longer acted like part of the tab control, so the filter only switched when the user clicked around the text instead of on it.
+- Root cause: `src/app.rs` split interaction and painting into two overlapping widgets: the slot used `ui.interact(..., Sense::click())`, but the centered label was added afterward as a separate non-clickable widget on top of the text area, so text hits no longer flowed through the slot click response.
+- Resolution: The filter tabs now keep the full-slot click response, make the label explicitly clickable and non-selectable, and merge the slot and label responses so both blank space and text activate the same filter behavior. Regression coverage now includes background/foreground label clicks and selected-label no-op behavior.
+- Prevent recurrence:
+  - When a control is visually composed from multiple overlapping widgets, merge their interaction responses instead of assuming the background response will catch topmost text hits.
+  - Mark tab-like labels as non-selectable unless text selection is the intended UX.
+  - Keep both blank-space and direct-text click regression tests for tab controls that mix layout rects with overlaid labels.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 follow-up user report after the slot-hit-area fix; regression tests `terminal_manager_filter_clicking_background_label_text_switches_selection`, `terminal_manager_filter_clicking_foreground_label_text_switches_selection`, and `terminal_manager_filter_clicking_selected_label_text_is_no_op`

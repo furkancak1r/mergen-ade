@@ -9024,6 +9024,8 @@ fn terminal_manager_filter_row_height(base_height: f32) -> f32 {
 
 #[derive(Clone, Copy, Debug)]
 struct TerminalManagerFilterLayout {
+    foreground_slot_rect: egui::Rect,
+    background_slot_rect: egui::Rect,
     foreground_label_rect: egui::Rect,
     background_label_rect: egui::Rect,
 }
@@ -9079,6 +9081,8 @@ fn terminal_manager_filter_layout(
     let (foreground_slot_rect, background_slot_rect) = terminal_manager_filter_slot_rects(row_rect);
 
     TerminalManagerFilterLayout {
+        foreground_slot_rect,
+        background_slot_rect,
         foreground_label_rect: terminal_manager_filter_label_rect(
             foreground_slot_rect,
             foreground_label_size,
@@ -9122,32 +9126,46 @@ fn draw_terminal_manager_filter_tabs(
         terminal_manager_filter_label_size(ui, TerminalManagerFilter::Background),
     );
 
-    for (filter, label_rect) in [
+    for (filter, slot_rect, label_rect) in [
         (
             TerminalManagerFilter::Foreground,
+            layout.foreground_slot_rect,
             layout.foreground_label_rect,
         ),
         (
             TerminalManagerFilter::Background,
+            layout.background_slot_rect,
             layout.background_label_rect,
         ),
     ] {
         let is_selected = *selected_filter == filter;
-        let response = ui
-            .put(
-                label_rect,
-                egui::Label::new(
-                    RichText::new(terminal_manager_filter_label(filter))
-                        .strong()
-                        .color(if is_selected {
-                            terminal_manager_filter_color(filter)
-                        } else {
-                            with_alpha(TEXT_MUTED, 180)
-                        }),
-                )
-                .truncate()
-                .sense(Sense::click()),
+        let slot_response = ui.interact(
+            slot_rect,
+            ui.make_persistent_id((
+                "terminal-manager-filter-slot",
+                terminal_manager_filter_label(filter),
+            )),
+            Sense::click(),
+        );
+
+        let label_response = ui.put(
+            label_rect,
+            egui::Label::new(
+                RichText::new(terminal_manager_filter_label(filter))
+                    .strong()
+                    .color(if is_selected {
+                        terminal_manager_filter_color(filter)
+                    } else {
+                        with_alpha(TEXT_MUTED, 180)
+                    }),
             )
+            .truncate()
+            .selectable(false)
+            .sense(Sense::click()),
+        );
+
+        let response = slot_response
+            .union(label_response)
             .on_hover_cursor(egui::CursorIcon::PointingHand);
 
         if is_selected {
@@ -11921,6 +11939,257 @@ mod tests {
             underline_rect.height(),
             super::TERMINAL_MANAGER_FILTER_UNDERLINE_HEIGHT
         );
+    }
+
+    fn terminal_manager_filter_test_layout(ctx: &Context) -> super::TerminalManagerFilterLayout {
+        let mut observed = None;
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let test_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(320.0, 72.0));
+                let child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(test_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                let row_rect = egui::Rect::from_min_size(
+                    test_rect.min,
+                    egui::vec2(
+                        child.available_width(),
+                        super::terminal_manager_filter_row_height(child.spacing().interact_size.y),
+                    ),
+                );
+                observed = Some(super::terminal_manager_filter_layout(
+                    row_rect,
+                    super::terminal_manager_filter_label_size(
+                        &child,
+                        TerminalManagerFilter::Foreground,
+                    ),
+                    super::terminal_manager_filter_label_size(
+                        &child,
+                        TerminalManagerFilter::Background,
+                    ),
+                ));
+            });
+        });
+
+        observed.expect("expected terminal manager filter layout")
+    }
+
+    fn terminal_manager_filter_blank_click_point(
+        slot_rect: egui::Rect,
+        label_rect: egui::Rect,
+    ) -> egui::Pos2 {
+        let click_y = slot_rect.bottom() - 6.0;
+        let left_x = slot_rect.left() + 6.0;
+        if left_x < label_rect.left() {
+            return pos2(left_x, click_y);
+        }
+
+        let right_x = slot_rect.right() - 6.0;
+        assert!(
+            right_x > label_rect.right(),
+            "expected slot blank space outside label"
+        );
+        pos2(right_x, click_y)
+    }
+
+    fn terminal_manager_filter_label_click_point(label_rect: egui::Rect) -> egui::Pos2 {
+        label_rect.center()
+    }
+
+    fn terminal_manager_filter_click_input(pos: egui::Pos2) -> RawInput {
+        RawInput {
+            events: vec![
+                Event::PointerMoved(pos),
+                Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::default(),
+                },
+                Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::default(),
+                },
+            ],
+            ..RawInput::default()
+        }
+    }
+
+    fn draw_terminal_manager_filter_tabs_in_test_ui(
+        ctx: &Context,
+        raw_input: RawInput,
+        selected_filter: &mut TerminalManagerFilter,
+    ) -> bool {
+        let mut changed = false;
+        let _ = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let test_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(320.0, 72.0));
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(test_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                changed = super::draw_terminal_manager_filter_tabs(&mut child, selected_filter);
+            });
+        });
+
+        changed
+    }
+
+    #[test]
+    fn terminal_manager_filter_clicking_blank_space_in_background_slot_switches_selection() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let layout = terminal_manager_filter_test_layout(&ctx);
+        let click_pos = terminal_manager_filter_blank_click_point(
+            layout.background_slot_rect,
+            layout.background_label_rect,
+        );
+        let mut selected_filter = TerminalManagerFilter::Foreground;
+        let _ = draw_terminal_manager_filter_tabs_in_test_ui(
+            &ctx,
+            RawInput::default(),
+            &mut selected_filter,
+        );
+
+        let changed = draw_terminal_manager_filter_tabs_in_test_ui(
+            &ctx,
+            terminal_manager_filter_click_input(click_pos),
+            &mut selected_filter,
+        );
+
+        assert!(changed);
+        assert_eq!(selected_filter, TerminalManagerFilter::Background);
+    }
+
+    #[test]
+    fn terminal_manager_filter_clicking_blank_space_in_foreground_slot_switches_selection() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let layout = terminal_manager_filter_test_layout(&ctx);
+        let click_pos = terminal_manager_filter_blank_click_point(
+            layout.foreground_slot_rect,
+            layout.foreground_label_rect,
+        );
+        let mut selected_filter = TerminalManagerFilter::Background;
+        let _ = draw_terminal_manager_filter_tabs_in_test_ui(
+            &ctx,
+            RawInput::default(),
+            &mut selected_filter,
+        );
+
+        let changed = draw_terminal_manager_filter_tabs_in_test_ui(
+            &ctx,
+            terminal_manager_filter_click_input(click_pos),
+            &mut selected_filter,
+        );
+
+        assert!(changed);
+        assert_eq!(selected_filter, TerminalManagerFilter::Foreground);
+    }
+
+    #[test]
+    fn terminal_manager_filter_clicking_selected_slot_blank_space_is_no_op() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let layout = terminal_manager_filter_test_layout(&ctx);
+        let click_pos = terminal_manager_filter_blank_click_point(
+            layout.background_slot_rect,
+            layout.background_label_rect,
+        );
+        let mut selected_filter = TerminalManagerFilter::Background;
+        let _ = draw_terminal_manager_filter_tabs_in_test_ui(
+            &ctx,
+            RawInput::default(),
+            &mut selected_filter,
+        );
+
+        let changed = draw_terminal_manager_filter_tabs_in_test_ui(
+            &ctx,
+            terminal_manager_filter_click_input(click_pos),
+            &mut selected_filter,
+        );
+
+        assert!(!changed);
+        assert_eq!(selected_filter, TerminalManagerFilter::Background);
+    }
+
+    #[test]
+    fn terminal_manager_filter_clicking_background_label_text_switches_selection() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let layout = terminal_manager_filter_test_layout(&ctx);
+        let click_pos = terminal_manager_filter_label_click_point(layout.background_label_rect);
+        let mut selected_filter = TerminalManagerFilter::Foreground;
+        let _ = draw_terminal_manager_filter_tabs_in_test_ui(
+            &ctx,
+            RawInput::default(),
+            &mut selected_filter,
+        );
+
+        let changed = draw_terminal_manager_filter_tabs_in_test_ui(
+            &ctx,
+            terminal_manager_filter_click_input(click_pos),
+            &mut selected_filter,
+        );
+
+        assert!(changed);
+        assert_eq!(selected_filter, TerminalManagerFilter::Background);
+    }
+
+    #[test]
+    fn terminal_manager_filter_clicking_foreground_label_text_switches_selection() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let layout = terminal_manager_filter_test_layout(&ctx);
+        let click_pos = terminal_manager_filter_label_click_point(layout.foreground_label_rect);
+        let mut selected_filter = TerminalManagerFilter::Background;
+        let _ = draw_terminal_manager_filter_tabs_in_test_ui(
+            &ctx,
+            RawInput::default(),
+            &mut selected_filter,
+        );
+
+        let changed = draw_terminal_manager_filter_tabs_in_test_ui(
+            &ctx,
+            terminal_manager_filter_click_input(click_pos),
+            &mut selected_filter,
+        );
+
+        assert!(changed);
+        assert_eq!(selected_filter, TerminalManagerFilter::Foreground);
+    }
+
+    #[test]
+    fn terminal_manager_filter_clicking_selected_label_text_is_no_op() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let layout = terminal_manager_filter_test_layout(&ctx);
+        let click_pos = terminal_manager_filter_label_click_point(layout.background_label_rect);
+        let mut selected_filter = TerminalManagerFilter::Background;
+        let _ = draw_terminal_manager_filter_tabs_in_test_ui(
+            &ctx,
+            RawInput::default(),
+            &mut selected_filter,
+        );
+
+        let changed = draw_terminal_manager_filter_tabs_in_test_ui(
+            &ctx,
+            terminal_manager_filter_click_input(click_pos),
+            &mut selected_filter,
+        );
+
+        assert!(!changed);
+        assert_eq!(selected_filter, TerminalManagerFilter::Background);
     }
 
     #[test]
