@@ -1,5 +1,18 @@
 ### Known Issues & Fix Log
 
+#### Settings Layout control now uses the same inline width treatment as the setting above it {#settings-layout-control-now-uses-the-same-inline-width-treatment-as-the-setting-above-it}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Settings modal general section
+- Error signature: `The Layout section control rendered as a narrow left-aligned checkbox, so it looked visually smaller than the Default shell control above it even though both lived in full-width cards.`
+- Symptoms/Impact: The Layout area read as cramped and inconsistent with the rest of Settings, especially next to the wider Default shell row directly above it.
+- Root cause: The card shell was already full width, but the Layout setting content used a bare checkbox without the same inline control-width and right-aligned row treatment used by the upper setting.
+- Resolution:
+  - Reworked the Layout control row so it uses the same inline-width control treatment as Default shell.
+  - Added a shared inline control width helper for General settings controls.
+- Prevent recurrence:
+  - When multiple controls share a card family inside Settings General, keep their inline control widths and row alignment consistent rather than mixing bare widgets with framed rows.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+
 #### Settings Codex CLI enable action now stays hidden when Mergen notify wiring is already healthy and shows visible feedback when used {#settings-codex-cli-enable-action-now-stays-hidden-when-mergen-notify-wiring-is-already-healthy-and-shows-visible-feedback-when-used}
 - Date: 2026-04-09T00:00:00Z
 - Context: main/Windows local Settings modal diagnostics section

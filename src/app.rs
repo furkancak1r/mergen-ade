@@ -119,6 +119,7 @@ const SETTINGS_WINDOW_ID: &str = "settings-window";
 const SETTINGS_WINDOW_STACK_BREAKPOINT: f32 = 680.0;
 const SETTINGS_DIAGNOSTICS_SINGLE_COLUMN_BREAKPOINT: f32 = 560.0;
 const SETTINGS_GENERAL_STACK_BREAKPOINT: f32 = 480.0;
+const SETTINGS_GENERAL_INLINE_CONTROL_WIDTH: f32 = 180.0;
 const SETTINGS_SAVED_MESSAGES_COMPACT_BREAKPOINT: f32 = 520.0;
 const SETTINGS_SAVED_MESSAGE_ACTIONS_GAP: f32 = 8.0;
 const SETTINGS_SAVED_MESSAGE_CARD_MARGIN: f32 = 10.0;
@@ -5279,7 +5280,9 @@ impl AdeApp {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             egui::ComboBox::from_id_salt("settings-default-shell")
                                 .selected_text(self.config.default_shell.label())
-                                .width(180.0)
+                                .width(settings_general_inline_control_width(
+                                    ui.available_width().max(0.0),
+                                ))
                                 .show_ui(ui, |ui| {
                                     for shell in ShellKind::available_for_current_platform() {
                                         ui.selectable_value(
@@ -5308,20 +5311,55 @@ impl AdeApp {
             |ui| {
                 let previous_multi_terminal_view_enabled =
                     self.config.ui.multi_terminal_view_enabled;
-                let multi_terminal_toggle = ui.checkbox(
-                    &mut self.config.ui.multi_terminal_view_enabled,
-                    "Show multiple terminals at once",
-                );
-                multi_terminal_toggle.on_hover_text(
-                    "When disabled, only the active terminal stays visible in the main area.",
-                );
-                ui.label(
-                    RichText::new(
-                        "Turn this off when you want the main view to stay focused on a single terminal.",
-                    )
-                    .small()
-                    .color(TEXT_MUTED),
-                );
+                let stack_controls = settings_general_uses_stacked_layout(ui.available_width());
+                let helper_text =
+                    "Turn this off when you want the main view to stay focused on a single terminal.";
+
+                if stack_controls {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Workspace visibility").strong().color(TEXT_PRIMARY));
+                        ui.label(RichText::new(helper_text).small().color(TEXT_MUTED));
+                        ui.add_space(8.0);
+                        let multi_terminal_toggle = ui.add_sized(
+                            [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
+                            egui::Checkbox::new(
+                                &mut self.config.ui.multi_terminal_view_enabled,
+                                "Show multiple terminals at once",
+                            ),
+                        );
+                        multi_terminal_toggle.on_hover_text(
+                            "When disabled, only the active terminal stays visible in the main area.",
+                        );
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new("Workspace visibility")
+                                    .strong()
+                                    .color(TEXT_PRIMARY),
+                            );
+                            ui.label(RichText::new(helper_text).small().color(TEXT_MUTED));
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let multi_terminal_toggle = ui.add_sized(
+                                [
+                                    settings_general_inline_control_width(
+                                        ui.available_width().max(0.0),
+                                    ),
+                                    CONTROL_ROW_HEIGHT,
+                                ],
+                                egui::Checkbox::new(
+                                    &mut self.config.ui.multi_terminal_view_enabled,
+                                    "Show multiple terminals at once",
+                                ),
+                            );
+                            multi_terminal_toggle.on_hover_text(
+                                "When disabled, only the active terminal stays visible in the main area.",
+                            );
+                        });
+                    });
+                }
 
                 if self.config.ui.multi_terminal_view_enabled
                     != previous_multi_terminal_view_enabled
@@ -10489,6 +10527,12 @@ fn settings_general_uses_stacked_layout(available_width: f32) -> bool {
     available_width < SETTINGS_GENERAL_STACK_BREAKPOINT
 }
 
+fn settings_general_inline_control_width(available_width: f32) -> f32 {
+    available_width
+        .max(0.0)
+        .min(SETTINGS_GENERAL_INLINE_CONTROL_WIDTH)
+}
+
 fn show_settings_card<R>(
     ui: &mut Ui,
     icon: AppIcon,
@@ -11369,27 +11413,27 @@ mod tests {
         normalize_terminal_background, parse_branch_header, parse_git_numstat_totals,
         recent_inputs_tooltip_text, recover_config_state, resolve_ctrl_c_action,
         settings_accordion_disclosure_icon_rect, settings_diagnostics_accordion_header_layout,
-        settings_diagnostics_uses_single_column, settings_general_uses_stacked_layout,
-        settings_popup_uses_stacked_layout, settings_saved_message_card_width,
-        settings_saved_message_text_width, settings_saved_messages_project_header_layout,
-        settings_saved_messages_project_state_id, settings_saved_messages_stacks_draft_row,
-        settings_text_edit_chrome, settings_window_size_for_screen, should_resolve_terminal_link,
-        source_control_badge_color, source_control_tooltip_lines, terminal_cell_metric,
-        terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect, terminal_font_family,
-        terminal_font_id, terminal_grid_dimensions, terminal_line_height,
-        terminal_link_activation_modifiers, terminal_link_at_point, terminal_logical_line,
-        terminal_logical_line_byte_index, terminal_manager_actions_width,
-        terminal_manager_diff_summary_model, terminal_manager_diff_summary_visual,
-        terminal_manager_row_chrome, terminal_manager_row_widths, terminal_output_surface_size,
-        terminal_output_viewport_size, terminal_secondary_click_action,
-        terminal_selection_point_from_pointer, terminal_selection_text, to_egui_color,
-        update_stable_cursor_row, visible_terminal_cursor, with_settings_text_edit_chrome, AdeApp,
-        AiBadgeModel, AiBadgeVisual, CodexCliStatusSource, CtrlCAction, DirectoryIndexSnapshot,
-        DirectoryNode, FactoryDroidHookInboxEvent, FactoryDroidManagedInstallComponent,
-        FactoryDroidManagedInstallDiagnostics, FactoryDroidStatusSource,
-        FactoryDroidTransportDiagnostics, PendingConfigChanges, PendingTerminalLinkClick,
-        SettingsSection, SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
-        SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
+        settings_diagnostics_uses_single_column, settings_general_inline_control_width,
+        settings_general_uses_stacked_layout, settings_popup_uses_stacked_layout,
+        settings_saved_message_card_width, settings_saved_message_text_width,
+        settings_saved_messages_project_header_layout, settings_saved_messages_project_state_id,
+        settings_saved_messages_stacks_draft_row, settings_text_edit_chrome,
+        settings_window_size_for_screen, should_resolve_terminal_link, source_control_badge_color,
+        source_control_tooltip_lines, terminal_cell_metric, terminal_cursor_blink_phase_visible,
+        terminal_cursor_overlay_rect, terminal_font_family, terminal_font_id,
+        terminal_grid_dimensions, terminal_line_height, terminal_link_activation_modifiers,
+        terminal_link_at_point, terminal_logical_line, terminal_logical_line_byte_index,
+        terminal_manager_actions_width, terminal_manager_diff_summary_model,
+        terminal_manager_diff_summary_visual, terminal_manager_row_chrome,
+        terminal_manager_row_widths, terminal_output_surface_size, terminal_output_viewport_size,
+        terminal_secondary_click_action, terminal_selection_point_from_pointer,
+        terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
+        with_settings_text_edit_chrome, AdeApp, AiBadgeModel, AiBadgeVisual, CodexCliStatusSource,
+        CtrlCAction, DirectoryIndexSnapshot, DirectoryNode, FactoryDroidHookInboxEvent,
+        FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
+        FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, PendingConfigChanges,
+        PendingTerminalLinkClick, SettingsSection, SourceControlBadgeState, SourceControlFile,
+        SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
         TerminalSecondaryClickAction, TerminalSelection, TerminalSelectionPoint, TransientToast,
         CODEX_LAUNCH_GRACE_MS, CODEX_PROCESS_POLL_MS, CODEX_TRAILING_OUTPUT_GRACE_MS,
@@ -12201,6 +12245,16 @@ mod tests {
     fn settings_general_layout_switches_to_stacked_only_when_space_is_narrow() {
         assert!(settings_general_uses_stacked_layout(479.0));
         assert!(!settings_general_uses_stacked_layout(480.0));
+    }
+
+    #[test]
+    fn settings_general_inline_control_width_matches_available_space_until_cap() {
+        assert_eq!(settings_general_inline_control_width(-8.0), 0.0);
+        assert_eq!(settings_general_inline_control_width(132.0), 132.0);
+        assert_eq!(
+            settings_general_inline_control_width(320.0),
+            super::SETTINGS_GENERAL_INLINE_CONTROL_WIDTH
+        );
     }
 
     fn draw_settings_popup_in_test_ui(
