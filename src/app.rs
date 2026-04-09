@@ -111,6 +111,19 @@ const SOURCE_CONTROL_FILE_ICON_WIDTH: f32 = 16.0;
 const SOURCE_CONTROL_FILE_ICON_GAP: f32 = 6.0;
 const DIRECTORY_SEARCH_INPUT_ID: &str = "directory-search-input";
 const SAVED_MESSAGE_DRAFT_INPUT_ID: &str = "saved-message-draft-input";
+const SETTINGS_NAV_WIDTH: f32 = 144.0;
+const SETTINGS_WINDOW_DEFAULT_WIDTH: f32 = 760.0;
+const SETTINGS_WINDOW_DEFAULT_HEIGHT: f32 = 520.0;
+const SETTINGS_WINDOW_SCREEN_MARGIN: f32 = 48.0;
+const SETTINGS_WINDOW_ID: &str = "settings-window";
+const SETTINGS_WINDOW_STACK_BREAKPOINT: f32 = 680.0;
+const SETTINGS_DIAGNOSTICS_SINGLE_COLUMN_BREAKPOINT: f32 = 560.0;
+const SETTINGS_GENERAL_STACK_BREAKPOINT: f32 = 480.0;
+const SETTINGS_SAVED_MESSAGES_COMPACT_BREAKPOINT: f32 = 520.0;
+const SETTINGS_SAVED_MESSAGE_CHIP_MAX_WIDTH: f32 = 320.0;
+const SETTINGS_SAVED_MESSAGE_TEXT_SIZE: f32 = 14.0;
+const SETTINGS_NAV_ROW_HEIGHT: f32 = 34.0;
+const SETTINGS_NAV_ICON_GAP: f32 = 8.0;
 // Pill button palette
 const BTN_BLUE: Color32 = Color32::from_rgb(16, 64, 112);
 const BTN_BLUE_HOVER: Color32 = Color32::from_rgb(48, 48, 48);
@@ -520,6 +533,7 @@ pub struct AdeApp {
     terminal_events_rx: Receiver<TerminalUiEvent>,
     ai_hook_manager: Option<Arc<AiHookManager>>,
     show_settings_popup: bool,
+    active_settings_section: SettingsSection,
     settings_diagnostics_expanded: bool,
     saved_message_drafts: BTreeMap<u64, String>,
     directory_search_query: String,
@@ -931,6 +945,87 @@ struct PendingConfigChanges {
     ui: bool,
     projects: bool,
     selection: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SettingsSection {
+    #[default]
+    General,
+    SavedMessages,
+    Diagnostics,
+}
+
+impl SettingsSection {
+    const ALL: [Self; 3] = [Self::General, Self::SavedMessages, Self::Diagnostics];
+
+    const fn title(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::SavedMessages => "Saved Messages",
+            Self::Diagnostics => "Diagnostics",
+        }
+    }
+
+    const fn navigation_title(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::SavedMessages => "Prompts",
+            Self::Diagnostics => "Diagnostics",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::General => "Adjust terminal defaults and layout behavior for the workspace.",
+            Self::SavedMessages => {
+                "Manage reusable prompts per project and send them to active terminals."
+            }
+            Self::Diagnostics => {
+                "Inspect Factory Droid and Codex CLI wiring, health, and runtime signals."
+            }
+        }
+    }
+
+    const fn icon(self) -> AppIcon {
+        match self {
+            Self::General => AppIcon::Gear,
+            Self::SavedMessages => AppIcon::ChatText,
+            Self::Diagnostics => AppIcon::Eye,
+        }
+    }
+
+    const fn scroll_id(self) -> &'static str {
+        match self {
+            Self::General => "settings-general-scroll",
+            Self::SavedMessages => "settings-saved-messages-scroll",
+            Self::Diagnostics => "settings-diagnostics-scroll",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SettingsEditOutcome {
+    should_persist: bool,
+    ui_config_changed: bool,
+    default_shell_changed: bool,
+    projects_changed: bool,
+}
+
+impl SettingsEditOutcome {
+    fn note_ui_change(&mut self) {
+        self.should_persist = true;
+        self.ui_config_changed = true;
+    }
+
+    fn note_default_shell_change(&mut self) {
+        self.should_persist = true;
+        self.default_shell_changed = true;
+    }
+
+    fn note_projects_change(&mut self) {
+        self.should_persist = true;
+        self.projects_changed = true;
+    }
 }
 
 impl AdeApp {
@@ -1452,6 +1547,7 @@ impl AdeApp {
             terminal_events_rx,
             ai_hook_manager,
             show_settings_popup: false,
+            active_settings_section: SettingsSection::General,
             settings_diagnostics_expanded: false,
             saved_message_drafts: BTreeMap::new(),
             directory_search_query: String::new(),
@@ -4927,35 +5023,527 @@ impl AdeApp {
 
     fn open_settings_popup(&mut self) {
         self.show_settings_popup = true;
+        self.active_settings_section = SettingsSection::General;
         self.settings_diagnostics_expanded = false;
     }
 
-    fn draw_settings_diagnostics_section(&mut self, ctx: &egui::Context, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("{} Diagnostics", icons::EYE))
-                    .strong()
-                    .size(15.0)
-                    .color(TEXT_PRIMARY),
+    fn draw_settings_navigation(&mut self, ui: &mut Ui, shows_diagnostics_warning_badge: bool) {
+        for section in SettingsSection::ALL {
+            let is_selected = self.active_settings_section == section;
+            let (rect, response) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width().max(0.0), SETTINGS_NAV_ROW_HEIGHT),
+                Sense::click(),
             );
+            let response = response.on_hover_text(section.description());
+            let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+            let is_interacting = response.hovered() || response.is_pointer_button_down_on();
+            let fill = if is_selected {
+                Some(with_alpha(BTN_ICON_ACTIVE, 40))
+            } else if is_interacting {
+                Some(with_alpha(BTN_ICON_HOVER, 96))
+            } else {
+                None
+            };
+            let stroke = if is_selected {
+                Stroke::new(1.0, with_alpha(BTN_ICON_ACTIVE, 168))
+            } else if is_interacting {
+                Stroke::new(1.0, with_alpha(BORDER_COLOR, 188))
+            } else {
+                Stroke::NONE
+            };
+            let paint_rect = rect.shrink2(egui::vec2(1.0, 1.0));
+            if let Some(fill) = fill {
+                ui.painter().rect_filled(paint_rect, 8.0, fill);
+            }
+            if stroke != Stroke::NONE {
+                ui.painter().rect_stroke(paint_rect, 8.0, stroke);
+            }
+            let icon_color = if is_selected || is_interacting {
+                Color32::from_rgb(255, 255, 255)
+            } else {
+                with_alpha(TEXT_PRIMARY, 176)
+            };
+            let text_color = if is_selected || is_interacting {
+                TEXT_PRIMARY
+            } else {
+                with_alpha(TEXT_PRIMARY, 188)
+            };
+            let icon_center = egui::pos2(rect.left() + 14.0, rect.center().y);
+            ui.painter().text(
+                icon_center,
+                egui::Align2::CENTER_CENTER,
+                format!("{}", section.icon()),
+                egui::FontId::proportional(14.0),
+                icon_color,
+            );
+            let text_pos = egui::pos2(icon_center.x + SETTINGS_NAV_ICON_GAP, rect.center().y);
+            ui.painter().text(
+                text_pos,
+                egui::Align2::LEFT_CENTER,
+                section.navigation_title(),
+                egui::FontId::proportional(13.0),
+                text_color,
+            );
+            if section == SettingsSection::Diagnostics && shows_diagnostics_warning_badge {
+                paint_activity_rail_warning_badge(ui, rect);
+            }
+            if response.clicked() {
+                self.active_settings_section = section;
+            }
+            ui.add_space(6.0);
+        }
+    }
 
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let toggle_label = if self.settings_diagnostics_expanded {
-                    "Hide"
-                } else {
-                    "Show"
-                };
-                if ui.button(toggle_label).clicked() {
-                    self.settings_diagnostics_expanded = !self.settings_diagnostics_expanded;
-                }
-            });
+    fn draw_settings_navigation_panel(
+        &mut self,
+        ui: &mut Ui,
+        shows_diagnostics_warning_badge: bool,
+        fill_height: Option<f32>,
+    ) {
+        settings_surface_frame(with_alpha(SURFACE_BG_SOFT, 200), 10.0).show(ui, |ui| {
+            if let Some(fill_height) = fill_height {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width().max(0.0), fill_height.max(0.0)),
+                    Layout::top_down(Align::Min),
+                    |ui| self.draw_settings_navigation(ui, shows_diagnostics_warning_badge),
+                );
+            } else {
+                ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                    self.draw_settings_navigation(ui, shows_diagnostics_warning_badge);
+                });
+            }
         });
+    }
 
-        if !self.settings_diagnostics_expanded {
+    fn draw_settings_content_panel(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut Ui,
+        fill_height: f32,
+        diagnostics: &FactoryDroidTransportDiagnostics,
+        changes: &mut SettingsEditOutcome,
+    ) {
+        settings_surface_frame(with_alpha(SURFACE_BG, 220), 14.0).show(ui, |ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width().max(0.0), fill_height.max(0.0)),
+                Layout::top_down(Align::Min),
+                |ui| self.draw_settings_section_panel(ctx, ui, diagnostics, changes),
+            );
+        });
+    }
+
+    fn draw_settings_section_panel(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut Ui,
+        diagnostics: &FactoryDroidTransportDiagnostics,
+        changes: &mut SettingsEditOutcome,
+    ) {
+        ui.set_width(ui.available_width().max(0.0));
+        ui.label(
+            RichText::new(format!(
+                "{} {}",
+                self.active_settings_section.icon(),
+                self.active_settings_section.title()
+            ))
+            .strong()
+            .size(17.0)
+            .color(TEXT_PRIMARY),
+        );
+        ui.label(
+            RichText::new(self.active_settings_section.description())
+                .small()
+                .color(TEXT_MUTED),
+        );
+        ui.add_space(12.0);
+
+        let scroll_height = ui.available_height().max(0.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width().max(0.0), scroll_height),
+            Layout::top_down(Align::Min),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt(self.active_settings_section.scroll_id())
+                    .auto_shrink([false, false])
+                    .max_height(scroll_height)
+                    .show(ui, |ui| {
+                        let section_width = ui.available_width().max(0.0);
+                        ui.set_width(section_width);
+                        match self.active_settings_section {
+                            SettingsSection::General => {
+                                self.draw_settings_general_section(ctx, ui, changes);
+                            }
+                            SettingsSection::SavedMessages => {
+                                self.draw_settings_saved_messages_section(ui, changes);
+                            }
+                            SettingsSection::Diagnostics => {
+                                self.draw_settings_diagnostics_section(ctx, ui, diagnostics);
+                            }
+                        }
+                    });
+            },
+        );
+    }
+
+    fn draw_settings_general_section(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut Ui,
+        changes: &mut SettingsEditOutcome,
+    ) {
+        show_settings_card(
+            ui,
+            AppIcon::Terminal,
+            "Terminal Defaults",
+            "Choose the shell and launch defaults used for new terminals.",
+            |ui| {
+                let previous_shell = self.config.default_shell;
+                let stack_controls = settings_general_uses_stacked_layout(ui.available_width());
+
+                if stack_controls {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Default shell").strong().color(TEXT_PRIMARY));
+                        ui.label(
+                            RichText::new("Used when you open a new terminal from Mergen ADE.")
+                                .small()
+                                .color(TEXT_MUTED),
+                        );
+                        ui.add_space(8.0);
+                        egui::ComboBox::from_id_salt("settings-default-shell")
+                            .selected_text(self.config.default_shell.label())
+                            .width(ui.available_width().max(0.0))
+                            .show_ui(ui, |ui| {
+                                for shell in ShellKind::available_for_current_platform() {
+                                    ui.selectable_value(
+                                        &mut self.config.default_shell,
+                                        *shell,
+                                        shell.label(),
+                                    );
+                                }
+                            });
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new("Default shell").strong().color(TEXT_PRIMARY));
+                            ui.label(
+                                RichText::new("Used when you open a new terminal from Mergen ADE.")
+                                    .small()
+                                    .color(TEXT_MUTED),
+                            );
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            egui::ComboBox::from_id_salt("settings-default-shell")
+                                .selected_text(self.config.default_shell.label())
+                                .width(180.0)
+                                .show_ui(ui, |ui| {
+                                    for shell in ShellKind::available_for_current_platform() {
+                                        ui.selectable_value(
+                                            &mut self.config.default_shell,
+                                            *shell,
+                                            shell.label(),
+                                        );
+                                    }
+                                });
+                        });
+                    });
+                }
+
+                if self.config.default_shell != previous_shell {
+                    changes.note_default_shell_change();
+                }
+            },
+        );
+        ui.add_space(12.0);
+
+        show_settings_card(
+            ui,
+            AppIcon::List,
+            "Layout",
+            "Tune how much of the terminal workspace stays visible at once.",
+            |ui| {
+                let previous_multi_terminal_view_enabled =
+                    self.config.ui.multi_terminal_view_enabled;
+                let multi_terminal_toggle = ui.checkbox(
+                    &mut self.config.ui.multi_terminal_view_enabled,
+                    "Show multiple terminals at once",
+                );
+                multi_terminal_toggle.on_hover_text(
+                    "When disabled, only the active terminal stays visible in the main area.",
+                );
+                ui.label(
+                    RichText::new(
+                        "Turn this off when you want the main view to stay focused on a single terminal.",
+                    )
+                    .small()
+                    .color(TEXT_MUTED),
+                );
+
+                if self.config.ui.multi_terminal_view_enabled
+                    != previous_multi_terminal_view_enabled
+                {
+                    changes.note_ui_change();
+                    self.bump_layout_epoch();
+                    if !self.config.ui.multi_terminal_view_enabled {
+                        self.set_active_terminal(ctx, self.single_terminal_id_for_main());
+                    } else {
+                        ctx.request_repaint();
+                    }
+                }
+            },
+        );
+    }
+
+    fn draw_settings_saved_messages_section(
+        &mut self,
+        ui: &mut Ui,
+        changes: &mut SettingsEditOutcome,
+    ) {
+        let mut project_ids = self.projects.keys().copied().collect::<Vec<_>>();
+        project_ids.sort_unstable();
+
+        if project_ids.is_empty() {
+            show_settings_card(
+                ui,
+                AppIcon::Folder,
+                "No Projects Yet",
+                "Add a project from the Directory panel to manage saved messages here.",
+                |_ui| {},
+            );
             return;
         }
 
-        let diagnostics = self.factory_droid_transport_diagnostics();
+        ui.label(
+            RichText::new(
+                "Saved prompts stay grouped by project and can be sent to any live terminal in that workspace.",
+            )
+                .small()
+                .color(TEXT_MUTED),
+        );
+        ui.add_space(10.0);
+
+        for project_id in project_ids {
+            let Some(project_snapshot) = self.projects.get(&project_id).cloned() else {
+                continue;
+            };
+
+            let mut add_message: Option<String> = None;
+            let mut remove_message_index: Option<usize> = None;
+            let mut send_message_request: Option<String> = None;
+            let send_target_terminal = self.preferred_terminal_for_project(project_id);
+            let message_count = project_snapshot.saved_messages.len();
+            let message_count_text = format!(
+                "{} saved prompt{}",
+                message_count,
+                if message_count == 1 { "" } else { "s" }
+            );
+
+            settings_surface_frame(with_alpha(SURFACE_BG_SOFT, 228), 12.0).show(ui, |ui| {
+                let project_state =
+                    egui::collapsing_header::CollapsingState::load_with_default_open(
+                        ui.ctx(),
+                        settings_saved_messages_project_state_id(project_id),
+                        self.selected_project == Some(project_id),
+                    );
+                let _ = project_state
+                    .show_header(ui, |ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width().max(0.0), CONTROL_ROW_HEIGHT),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} {}",
+                                        icons::FOLDER_OPEN,
+                                        project_snapshot.name
+                                    ))
+                                    .strong()
+                                    .size(15.0)
+                                    .color(TEXT_PRIMARY),
+                                );
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.label(
+                                        RichText::new(&message_count_text).small().color(TEXT_MUTED),
+                                    );
+                                });
+                            },
+                        );
+                    })
+                    .body(|ui| {
+                        ui.add_space(8.0);
+
+                        if project_snapshot.saved_messages.is_empty() {
+                            ui.label(
+                                RichText::new("No saved prompts for this project.")
+                                    .small()
+                                    .color(TEXT_MUTED),
+                            );
+                        } else {
+                            if send_target_terminal.is_none() {
+                                ui.label(
+                                    RichText::new(
+                                        "Open a live terminal in this project to send prompts one by one.",
+                                    )
+                                    .small()
+                                    .color(TEXT_MUTED),
+                                );
+                                ui.add_space(8.0);
+                            }
+
+                            let chip_max_width =
+                                settings_saved_message_chip_max_width(ui.available_width());
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                                for (index, message) in
+                                    project_snapshot.saved_messages.iter().enumerate()
+                                {
+                                    let (send_clicked, remove_clicked) =
+                                        draw_settings_saved_message_chip(
+                                            ui,
+                                            message,
+                                            chip_max_width,
+                                            send_target_terminal.is_some(),
+                                        );
+                                    if send_clicked {
+                                        send_message_request = Some(message.clone());
+                                    }
+                                    if remove_clicked {
+                                        remove_message_index = Some(index);
+                                    }
+                                }
+                            });
+                        }
+
+                        ui.add_space(10.0);
+                        let stack_draft_row =
+                            settings_saved_messages_stacks_draft_row(ui.available_width());
+                        let draft = self.saved_message_drafts.entry(project_id).or_default();
+                        if stack_draft_row {
+                            let input_width = ui.available_width().max(0.0);
+                            ui.add_sized(
+                                [input_width, CONTROL_ROW_HEIGHT],
+                                egui::TextEdit::singleline(draft)
+                                    .hint_text("Save a reusable prompt for this project")
+                                    .id(Self::saved_message_draft_input_id(project_id))
+                                    .desired_width(input_width),
+                            );
+                            ui.add_space(8.0);
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if styled_icon_button(
+                                    ui,
+                                    icons::PLUS,
+                                    BTN_BLUE,
+                                    BTN_BLUE_HOVER,
+                                    BTN_ICON_ACTIVE,
+                                    "Add message",
+                                ) {
+                                    let text = draft.trim();
+                                    if !text.is_empty() {
+                                        add_message = Some(text.to_owned());
+                                        draft.clear();
+                                    }
+                                }
+                            });
+                        } else {
+                            ui.horizontal(|ui| {
+                                let button_space = CONTROL_ROW_HEIGHT + ui.spacing().item_spacing.x;
+                                let input_width = (ui.available_width() - button_space).max(0.0);
+                                ui.add_sized(
+                                    [input_width, CONTROL_ROW_HEIGHT],
+                                    egui::TextEdit::singleline(draft)
+                                        .hint_text("Save a reusable prompt for this project")
+                                        .id(Self::saved_message_draft_input_id(project_id))
+                                        .desired_width(input_width),
+                                );
+                                if styled_icon_button(
+                                    ui,
+                                    icons::PLUS,
+                                    BTN_BLUE,
+                                    BTN_BLUE_HOVER,
+                                    BTN_ICON_ACTIVE,
+                                    "Add message",
+                                ) {
+                                    let text = draft.trim();
+                                    if !text.is_empty() {
+                                        add_message = Some(text.to_owned());
+                                        draft.clear();
+                                    }
+                                }
+                            });
+                        }
+                    });
+            });
+            ui.add_space(12.0);
+
+            if let Some(project) = self.projects.get_mut(&project_id) {
+                if let Some(message) = add_message {
+                    project.saved_messages.push(message);
+                    changes.note_projects_change();
+                }
+                if let Some(index) = remove_message_index {
+                    if index < project.saved_messages.len() {
+                        project.saved_messages.remove(index);
+                        changes.note_projects_change();
+                    }
+                }
+            }
+
+            if let (Some(terminal_id), Some(message)) = (send_target_terminal, send_message_request)
+            {
+                self.send_saved_message_to_terminal(terminal_id, &message);
+            }
+        }
+    }
+
+    fn draw_settings_diagnostics_section(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut Ui,
+        diagnostics: &FactoryDroidTransportDiagnostics,
+    ) {
+        let healthy_color = Color32::from_rgb(114, 209, 152);
+        let warning_color = Color32::from_rgb(232, 184, 76);
+        let active_terminal = self
+            .active_terminal
+            .and_then(|terminal_id| self.terminals.get(&terminal_id));
+        let codex_runtime_text = if let Some(dir) = &self.codex_cli_runtime_dir {
+            format!("Ready: {}", dir.display())
+        } else if let Some(err) = &self.codex_cli_runtime_dir_error {
+            format!("Unavailable: {err}")
+        } else {
+            "Unavailable: unknown error".to_owned()
+        };
+        let codex_config_text = match codex::user_codex_config_path() {
+            Ok(path) => path.display().to_string(),
+            Err(err) => format!("Unavailable: {err}"),
+        };
+        let codex_session_text = match active_terminal {
+            Some(terminal) if terminal.codex_session_active => "Yes",
+            Some(_) => "No",
+            None => "No active terminal",
+        };
+        let codex_process_text = match active_terminal {
+            Some(terminal) if terminal.exited => "terminal exited".to_owned(),
+            Some(terminal) if terminal.codex_session_active => "session active".to_owned(),
+            Some(terminal) if terminal.codex_launch_pending_since.is_some() => {
+                "launch pending".to_owned()
+            }
+            Some(terminal) if terminal.codex_process_missing_since.is_some() => {
+                "awaiting trailing output".to_owned()
+            }
+            Some(terminal)
+                if terminal.ai_session.tool == Some(AiCliTool::CodexCli)
+                    && terminal.ai_session.status == AiCliStatus::Attention =>
+            {
+                "attention needed".to_owned()
+            }
+            Some(_) => "idle".to_owned(),
+            None => "No active terminal".to_owned(),
+        };
+        let codex_last_status_source = active_terminal
+            .and_then(|terminal| terminal.codex_last_status_source)
+            .map(CodexCliStatusSource::label)
+            .unwrap_or("none");
         let managed_settings_path = diagnostics
             .managed_install
             .settings
@@ -4968,220 +5556,389 @@ impl AdeApp {
             .path
             .display()
             .to_string();
-        egui::Frame::none()
-            .fill(with_alpha(SURFACE_BG, 216))
-            .stroke(Stroke::new(1.0, BORDER_COLOR))
-            .rounding(10.0)
-            .inner_margin(egui::Margin::same(10.0))
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("settings-diagnostics-scroll")
-                    .max_height(220.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(
-                                "Factory Droid status uses PTY/process detection first. Inbox JSONL remains a best-effort fallback.",
-                            )
-                            .color(TEXT_MUTED)
-                            .small(),
-                        );
-                        ui.add_space(4.0);
+        let summary_title = diagnostics
+            .warning_badge_text()
+            .unwrap_or("Factory Droid transport looks healthy");
+        let summary_message = diagnostics.warning_message().unwrap_or_else(|| {
+            "Factory Droid hooks are available. Codex CLI integration can be enabled here when you want notify-backed turn completion signals.".to_owned()
+        });
+
+        show_settings_card(
+            ui,
+            AppIcon::Eye,
+            "Runtime Overview",
+            "Get a quick read on integration health before opening the verbose diagnostics.",
+            |ui| {
+                ui.label(RichText::new(summary_title).strong().color(
+                    if diagnostics.shows_settings_warning_badge() {
+                        warning_color
+                    } else {
+                        healthy_color
+                    },
+                ));
+                ui.label(RichText::new(&summary_message).small().color(
+                    if diagnostics.shows_settings_warning_badge() {
+                        warning_color
+                    } else {
+                        TEXT_MUTED
+                    },
+                ));
+                ui.add_space(10.0);
+                let use_single_column =
+                    settings_diagnostics_uses_single_column(ui.available_width());
+                if use_single_column {
+                    ui.label(RichText::new("Factory Droid").strong().color(TEXT_PRIMARY));
+                    Self::draw_settings_diagnostic_row(
+                        ui,
+                        "Primary",
+                        FactoryDroidTransportDiagnostics::PRIMARY_TRANSPORT_LABEL,
+                        TEXT_PRIMARY,
+                    );
+                    Self::draw_settings_diagnostic_row(
+                        ui,
+                        "Inbox",
+                        &diagnostics.runtime_status_text(),
+                        if diagnostics.hooks_runtime_dir.is_some() {
+                            healthy_color
+                        } else {
+                            warning_color
+                        },
+                    );
+                    Self::draw_settings_diagnostic_row(
+                        ui,
+                        "Process State",
+                        diagnostics.process_state_text(),
+                        TEXT_PRIMARY,
+                    );
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Codex CLI").strong().color(TEXT_PRIMARY));
+                    Self::draw_settings_diagnostic_row(
+                        ui,
+                        "Inbox",
+                        &codex_runtime_text,
+                        if self.codex_cli_runtime_dir.is_some() {
+                            healthy_color
+                        } else {
+                            warning_color
+                        },
+                    );
+                    Self::draw_settings_diagnostic_row(
+                        ui,
+                        "Session Active",
+                        codex_session_text,
+                        TEXT_PRIMARY,
+                    );
+                    Self::draw_settings_diagnostic_row(
+                        ui,
+                        "Process State",
+                        &codex_process_text,
+                        TEXT_PRIMARY,
+                    );
+                } else {
+                    ui.columns(2, |columns| {
+                        columns[0]
+                            .label(RichText::new("Factory Droid").strong().color(TEXT_PRIMARY));
                         Self::draw_settings_diagnostic_row(
-                            ui,
-                            "Executable Path",
-                            &diagnostics.executable_path.display().to_string(),
-                            TEXT_PRIMARY,
-                        );
-                        Self::draw_settings_diagnostic_row(
-                            ui,
-                            "Factory Droid Primary",
+                            &mut columns[0],
+                            "Primary",
                             FactoryDroidTransportDiagnostics::PRIMARY_TRANSPORT_LABEL,
                             TEXT_PRIMARY,
                         );
                         Self::draw_settings_diagnostic_row(
-                            ui,
-                            "Factory Droid Fallback",
-                            FactoryDroidTransportDiagnostics::FALLBACK_TRANSPORT_LABEL,
-                            TEXT_PRIMARY,
-                        );
-                        Self::draw_settings_diagnostic_row(
-                            ui,
-                            "Factory Droid Inbox",
+                            &mut columns[0],
+                            "Inbox",
                             &diagnostics.runtime_status_text(),
                             if diagnostics.hooks_runtime_dir.is_some() {
-                                Color32::from_rgb(114, 209, 152)
+                                healthy_color
                             } else {
-                                Color32::from_rgb(232, 184, 76)
+                                warning_color
                             },
                         );
                         Self::draw_settings_diagnostic_row(
-                            ui,
-                            "Managed Settings Path",
-                            &managed_settings_path,
-                            TEXT_PRIMARY,
-                        );
-                        Self::draw_settings_diagnostic_row(
-                            ui,
-                            "Managed Hook Commands",
-                            &diagnostics.managed_install.settings.status_text,
-                            if diagnostics.managed_install.settings.healthy {
-                                Color32::from_rgb(114, 209, 152)
-                            } else {
-                                Color32::from_rgb(232, 184, 76)
-                            },
-                        );
-                        Self::draw_settings_diagnostic_row(
-                            ui,
-                            "Managed Hook Script",
-                            &managed_hook_script_path,
-                            TEXT_PRIMARY,
-                        );
-                        Self::draw_settings_diagnostic_row(
-                            ui,
-                            "Managed Hook Script Health",
-                            &diagnostics.managed_install.hook_script.status_text,
-                            if diagnostics.managed_install.hook_script.healthy {
-                                Color32::from_rgb(114, 209, 152)
-                            } else {
-                                Color32::from_rgb(232, 184, 76)
-                            },
-                        );
-                        Self::draw_settings_diagnostic_row(
-                            ui,
-                            "Droid Session Active",
-                            diagnostics.active_session_text(),
-                            TEXT_PRIMARY,
-                        );
-                        Self::draw_settings_diagnostic_row(
-                            ui,
-                            "Factory Droid Process State",
+                            &mut columns[0],
+                            "Process State",
                             diagnostics.process_state_text(),
                             TEXT_PRIMARY,
                         );
-                        Self::draw_settings_diagnostic_row(
-                            ui,
-                            "Last Status Source",
-                            diagnostics.last_status_source_text(),
-                            TEXT_PRIMARY,
-                        );
-                        if let Some(warning_message) = diagnostics.warning_message() {
-                            ui.label(
-                                RichText::new(warning_message)
-                                    .small()
-                                    .color(Color32::from_rgb(232, 184, 76)),
-                            );
-                        }
 
-                        ui.separator();
-                        let active_terminal = self
-                            .active_terminal
-                            .and_then(|terminal_id| self.terminals.get(&terminal_id));
-                        let codex_runtime_text = if let Some(dir) = &self.codex_cli_runtime_dir {
-                            format!("Ready: {}", dir.display())
-                        } else if let Some(err) = &self.codex_cli_runtime_dir_error {
-                            format!("Unavailable: {err}")
-                        } else {
-                            "Unavailable: unknown error".to_owned()
-                        };
-                        let codex_config_text = match codex::user_codex_config_path() {
-                            Ok(path) => path.display().to_string(),
-                            Err(err) => format!("Unavailable: {err}"),
-                        };
-                        let codex_session_text = match active_terminal {
-                            Some(terminal) if terminal.codex_session_active => "Yes",
-                            Some(_) => "No",
-                            None => "No active terminal",
-                        };
-                        let codex_process_text = match active_terminal {
-                            Some(terminal) if terminal.exited => "terminal exited".to_owned(),
-                            Some(terminal) if terminal.codex_session_active => {
-                                "session active".to_owned()
-                            }
-                            Some(terminal) if terminal.codex_launch_pending_since.is_some() => {
-                                "launch pending".to_owned()
-                            }
-                            Some(terminal) if terminal.codex_process_missing_since.is_some() => {
-                                "awaiting trailing output".to_owned()
-                            }
-                            Some(terminal)
-                                if terminal.ai_session.tool == Some(AiCliTool::CodexCli)
-                                    && terminal.ai_session.status == AiCliStatus::Attention =>
-                            {
-                                "attention needed".to_owned()
-                            }
-                            Some(_) => "idle".to_owned(),
-                            None => "No active terminal".to_owned(),
-                        };
-                        let codex_last_status_source = active_terminal
-                            .and_then(|terminal| terminal.codex_last_status_source)
-                            .map(CodexCliStatusSource::label)
-                            .unwrap_or("none");
-                        ui.label(
-                            RichText::new("Codex CLI")
-                                .strong()
-                                .size(15.0)
-                                .color(TEXT_PRIMARY),
-                        );
-                        ui.label(
-                            RichText::new(
-                                "Windows support in Codex CLI is still experimental. For now Mergen only wires native Windows sessions; WSL bridging stays out of scope in this release.",
-                            )
-                            .color(Color32::from_rgb(232, 184, 76))
-                            .small(),
-                        );
-                        ui.label(
-                            RichText::new(
-                                "Official Codex hooks are currently disabled on native Windows, so Mergen relies on Codex notify for turn-complete detection and uses BEL-backed TUI notifications only as a supplemental signal.",
-                            )
-                            .color(TEXT_MUTED)
-                            .small(),
-                        );
-                        ui.add_space(4.0);
+                        columns[1].label(RichText::new("Codex CLI").strong().color(TEXT_PRIMARY));
                         Self::draw_settings_diagnostic_row(
-                            ui,
-                            "Codex Config",
-                            &codex_config_text,
-                            TEXT_PRIMARY,
-                        );
-                        Self::draw_settings_diagnostic_row(
-                            ui,
-                            "Codex Inbox",
+                            &mut columns[1],
+                            "Inbox",
                             &codex_runtime_text,
                             if self.codex_cli_runtime_dir.is_some() {
-                                Color32::from_rgb(114, 209, 152)
+                                healthy_color
                             } else {
-                                Color32::from_rgb(232, 184, 76)
+                                warning_color
                             },
                         );
                         Self::draw_settings_diagnostic_row(
-                            ui,
-                            "Codex Session Active",
+                            &mut columns[1],
+                            "Session Active",
                             codex_session_text,
                             TEXT_PRIMARY,
                         );
                         Self::draw_settings_diagnostic_row(
-                            ui,
-                            "Codex Process State",
+                            &mut columns[1],
+                            "Process State",
                             &codex_process_text,
                             TEXT_PRIMARY,
                         );
-                        Self::draw_settings_diagnostic_row(
-                            ui,
-                            "Last Codex Source",
-                            codex_last_status_source,
-                            TEXT_PRIMARY,
+                    });
+                }
+                ui.add_space(8.0);
+                if use_single_column {
+                    let button_width = ui.available_width().max(0.0);
+                    if ui
+                        .add_sized(
+                            [button_width, CONTROL_ROW_HEIGHT],
+                            egui::Button::new("Enable Codex CLI integration"),
+                        )
+                        .clicked()
+                    {
+                        self.enable_codex_cli_integration(ctx);
+                    }
+                    if ui
+                        .add_sized(
+                            [button_width, CONTROL_ROW_HEIGHT],
+                            egui::Button::new("Open Codex setup docs"),
+                        )
+                        .clicked()
+                    {
+                        ctx.open_url(egui::OpenUrl::new_tab(codex::codex_setup_url()));
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        if ui.button("Enable Codex CLI integration").clicked() {
+                            self.enable_codex_cli_integration(ctx);
+                        }
+                        if ui.button("Open Codex setup docs").clicked() {
+                            ctx.open_url(egui::OpenUrl::new_tab(codex::codex_setup_url()));
+                        }
+                    });
+                }
+            },
+        );
+        ui.add_space(12.0);
+
+        show_settings_card(
+            ui,
+            AppIcon::List,
+            "Technical Details",
+            "Inspect exact paths, sources, and health checks when something needs debugging.",
+            |ui| {
+                let use_single_column =
+                    settings_diagnostics_uses_single_column(ui.available_width());
+                if use_single_column {
+                    ui.label(
+                        RichText::new(if self.settings_diagnostics_expanded {
+                            "Expanded"
+                        } else {
+                            "Collapsed"
+                        })
+                        .small()
+                        .color(TEXT_MUTED),
+                    );
+                    let toggle_label = if self.settings_diagnostics_expanded {
+                        "Hide details"
+                    } else {
+                        "Show details"
+                    };
+                    if ui
+                        .add_sized(
+                            [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
+                            egui::Button::new(toggle_label),
+                        )
+                        .clicked()
+                    {
+                        self.settings_diagnostics_expanded = !self.settings_diagnostics_expanded;
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(if self.settings_diagnostics_expanded {
+                                "Expanded"
+                            } else {
+                                "Collapsed"
+                            })
+                            .small()
+                            .color(TEXT_MUTED),
                         );
-                        ui.horizontal(|ui| {
-                            if ui.button("Enable Codex CLI integration").clicked() {
-                                self.enable_codex_cli_integration(ctx);
-                            }
-                            if ui.button("Open Codex setup docs").clicked() {
-                                ctx.open_url(egui::OpenUrl::new_tab(codex::codex_setup_url()));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let toggle_label = if self.settings_diagnostics_expanded {
+                                "Hide details"
+                            } else {
+                                "Show details"
+                            };
+                            if ui.button(toggle_label).clicked() {
+                                self.settings_diagnostics_expanded =
+                                    !self.settings_diagnostics_expanded;
                             }
                         });
                     });
-            });
+                }
+
+                if !self.settings_diagnostics_expanded {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "Open this when you need the managed install paths, runtime inbox location, or last observed status sources.",
+                        )
+                        .small()
+                        .color(TEXT_MUTED),
+                    );
+                    return;
+                }
+
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(
+                        "Factory Droid status uses PTY/process detection first. Inbox JSONL remains a best-effort fallback.",
+                    )
+                    .small()
+                    .color(TEXT_MUTED),
+                );
+                ui.add_space(4.0);
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Executable Path",
+                    &diagnostics.executable_path.display().to_string(),
+                    TEXT_PRIMARY,
+                );
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Factory Droid Primary",
+                    FactoryDroidTransportDiagnostics::PRIMARY_TRANSPORT_LABEL,
+                    TEXT_PRIMARY,
+                );
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Factory Droid Fallback",
+                    FactoryDroidTransportDiagnostics::FALLBACK_TRANSPORT_LABEL,
+                    TEXT_PRIMARY,
+                );
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Factory Droid Inbox",
+                    &diagnostics.runtime_status_text(),
+                    if diagnostics.hooks_runtime_dir.is_some() {
+                        healthy_color
+                    } else {
+                        warning_color
+                    },
+                );
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Managed Settings Path",
+                    &managed_settings_path,
+                    TEXT_PRIMARY,
+                );
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Managed Hook Commands",
+                    &diagnostics.managed_install.settings.status_text,
+                    if diagnostics.managed_install.settings.healthy {
+                        healthy_color
+                    } else {
+                        warning_color
+                    },
+                );
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Managed Hook Script",
+                    &managed_hook_script_path,
+                    TEXT_PRIMARY,
+                );
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Managed Hook Script Health",
+                    &diagnostics.managed_install.hook_script.status_text,
+                    if diagnostics.managed_install.hook_script.healthy {
+                        healthy_color
+                    } else {
+                        warning_color
+                    },
+                );
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Droid Session Active",
+                    diagnostics.active_session_text(),
+                    TEXT_PRIMARY,
+                );
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Factory Droid Process State",
+                    diagnostics.process_state_text(),
+                    TEXT_PRIMARY,
+                );
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Last Status Source",
+                    diagnostics.last_status_source_text(),
+                    TEXT_PRIMARY,
+                );
+                if let Some(warning_message) = diagnostics.warning_message() {
+                    ui.label(RichText::new(warning_message).small().color(warning_color));
+                }
+
+                ui.separator();
+                ui.label(
+                    RichText::new("Codex CLI")
+                        .strong()
+                        .size(15.0)
+                        .color(TEXT_PRIMARY),
+                );
+                ui.label(
+                    RichText::new(
+                        "Windows support in Codex CLI is still experimental. For now Mergen only wires native Windows sessions; WSL bridging stays out of scope in this release.",
+                    )
+                    .small()
+                    .color(warning_color),
+                );
+                ui.label(
+                    RichText::new(
+                        "Official Codex hooks are currently disabled on native Windows, so Mergen relies on Codex notify for turn-complete detection and uses BEL-backed TUI notifications only as a supplemental signal.",
+                    )
+                    .small()
+                    .color(TEXT_MUTED),
+                );
+                ui.add_space(4.0);
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Codex Config",
+                    &codex_config_text,
+                    TEXT_PRIMARY,
+                );
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Codex Inbox",
+                    &codex_runtime_text,
+                    if self.codex_cli_runtime_dir.is_some() {
+                        healthy_color
+                    } else {
+                        warning_color
+                    },
+                );
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Codex Session Active",
+                    codex_session_text,
+                    TEXT_PRIMARY,
+                );
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Codex Process State",
+                    &codex_process_text,
+                    TEXT_PRIMARY,
+                );
+                Self::draw_settings_diagnostic_row(
+                    ui,
+                    "Last Codex Source",
+                    codex_last_status_source,
+                    TEXT_PRIMARY,
+                );
+            },
+        );
     }
 
     fn main_area_size_from_chrome(
@@ -6096,6 +6853,24 @@ impl AdeApp {
                 };
                 let row_response = row_response.on_hover_text(hover_text);
                 let row_chrome = terminal_manager_row_chrome(active, row_response.hovered());
+                let selection_rect =
+                    terminal_manager_row_selection_rect(row_rect, row_actions_width);
+                let selection_response = (selection_rect.width() > 0.0).then(|| {
+                    ui.interact(
+                        selection_rect,
+                        ui.id()
+                            .with(("terminal_manager_row_select", terminal_entry_id)),
+                        Sense::click(),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                });
+                if ui
+                    .ctx()
+                    .input(|input| input.pointer.hover_pos())
+                    .is_some_and(|pos| selection_rect.contains(pos))
+                {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
 
                 if ui.is_rect_visible(row_rect) {
                     let paint_rect = row_rect.shrink2(egui::vec2(1.0, 1.0));
@@ -6107,6 +6882,7 @@ impl AdeApp {
                     }
                 }
 
+                let mut activation_response = selection_response;
                 if row_label_width > 0.0 {
                     let label_rect = egui::Rect::from_min_size(
                         row_rect.min,
@@ -6161,15 +6937,17 @@ impl AdeApp {
                             },
                         )
                         .inner;
-                    if label_response.clicked() {
-                        set_active = true;
-                    }
+                    activation_response = Some(match activation_response {
+                        Some(response) => response.union(label_response),
+                        None => label_response,
+                    });
                 }
 
                 let actions_rect = egui::Rect::from_min_size(
                     egui::pos2(row_rect.right() - row_actions_width, row_rect.top()),
                     egui::vec2(row_actions_width, row_rect.height()),
                 );
+                let mut action_clicked = false;
                 ui.scope_builder(
                     egui::UiBuilder::new()
                         .max_rect(actions_rect)
@@ -6184,6 +6962,7 @@ impl AdeApp {
                             "Close",
                         ) {
                             close_terminal = true;
+                            action_clicked = true;
                         }
 
                         if show_visibility_toggle {
@@ -6205,31 +6984,25 @@ impl AdeApp {
                             ) {
                                 terminal.in_main_view = !terminal.in_main_view;
                                 visibility_changed = true;
+                                action_clicked = true;
                             }
                         }
 
-                        let message_menu = with_minimal_button_chrome(ui, |ui| {
-                            ui.menu_button(format!("{}", icons::CHAT_TEXT), |ui| {
-                                with_minimal_button_chrome(ui, |ui| {
-                                    if saved_messages.is_empty() {
-                                        ui.label(
-                                            RichText::new("No saved messages").color(TEXT_MUTED),
-                                        );
-                                        return;
-                                    }
-
-                                    for message in &saved_messages {
-                                        if ui.button(message).clicked() {
-                                            send_message = Some(message.clone());
-                                            ui.close_menu();
-                                        }
-                                    }
-                                });
-                            })
-                        });
-                        message_menu.response.on_hover_text("Send saved message");
+                        let message_response = draw_terminal_saved_message_menu_button(
+                            ui,
+                            &saved_messages,
+                            &mut send_message,
+                        );
+                        action_clicked |= message_response.clicked();
                     },
                 );
+                if activation_response
+                    .as_ref()
+                    .is_some_and(|response| response.clicked())
+                    && !action_clicked
+                {
+                    set_active = true;
+                }
 
                 terminal_entry_id
             };
@@ -6867,10 +7640,7 @@ impl AdeApp {
             return;
         }
 
-        let mut should_persist = false;
-        let mut ui_config_changed = false;
-        let mut default_shell_changed = false;
-        let mut projects_changed = false;
+        let mut changes = SettingsEditOutcome::default();
 
         // Dark overlay backdrop
         egui::Area::new("settings_overlay".into())
@@ -6895,14 +7665,20 @@ impl AdeApp {
             return;
         }
 
+        let screen = ctx.screen_rect();
+        let window_size =
+            settings_window_size_for_screen(screen.size(), ctx.style().spacing.window_margin);
+        let diagnostics = self.factory_droid_transport_diagnostics();
+        let shows_diagnostics_warning_badge = diagnostics.shows_settings_warning_badge();
+
         egui::Window::new(format!("{} Settings", icons::GEAR))
+            .id(egui::Id::new(SETTINGS_WINDOW_ID))
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
             .movable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .min_width(380.0)
-            .max_height((ctx.screen_rect().height() - 80.0).max(360.0))
+            .fixed_size(window_size)
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new("Application Settings")
@@ -6910,210 +7686,88 @@ impl AdeApp {
                         .size(16.0)
                         .color(TEXT_PRIMARY),
                 );
-                ui.separator();
-
-                let previous_shell = self.config.default_shell;
-                egui::ComboBox::from_label("Default Shell")
-                    .selected_text(self.config.default_shell.label())
-                    .width(200.0)
-                    .show_ui(ui, |ui| {
-                        for shell in ShellKind::available_for_current_platform() {
-                            ui.selectable_value(
-                                &mut self.config.default_shell,
-                                *shell,
-                                shell.label(),
-                            );
-                        }
-                    });
-                if self.config.default_shell != previous_shell {
-                    should_persist = true;
-                    default_shell_changed = true;
-                }
-
-                let previous_multi_terminal_view_enabled =
-                    self.config.ui.multi_terminal_view_enabled;
-                let multi_terminal_toggle = ui.checkbox(
-                    &mut self.config.ui.multi_terminal_view_enabled,
-                    "Show multiple terminals at once",
-                );
-                multi_terminal_toggle.on_hover_text(
-                    "When disabled, only the active terminal stays visible in the main area.",
-                );
-                if self.config.ui.multi_terminal_view_enabled != previous_multi_terminal_view_enabled
-                {
-                    should_persist = true;
-                    ui_config_changed = true;
-                    self.bump_layout_epoch();
-                    if !self.config.ui.multi_terminal_view_enabled {
-                        self.set_active_terminal(ctx, self.single_terminal_id_for_main());
-                    } else {
-                        ctx.request_repaint();
-                    }
-                }
-
-                ui.separator();
-                self.draw_settings_diagnostics_section(ctx, ui);
-
-                ui.separator();
                 ui.label(
-                    RichText::new(format!("{} Saved Messages", icons::CHAT_TEXT))
-                        .strong()
-                        .size(15.0)
-                        .color(TEXT_PRIMARY),
+                    RichText::new("Workspace defaults, saved prompts, and diagnostics.")
+                        .small()
+                        .color(TEXT_MUTED),
                 );
+                ui.add_space(12.0);
 
-                let mut project_ids = self.projects.keys().copied().collect::<Vec<_>>();
-                project_ids.sort_unstable();
+                let body_size = egui::vec2(
+                    ui.available_width().max(0.0),
+                    (window_size.y - ui.min_rect().height()).max(0.0),
+                );
+                let (body_rect, _) = ui.allocate_exact_size(body_size, Sense::hover());
+                let mut body_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(body_rect)
+                        .layout(Layout::top_down(Align::Min)),
+                );
+                let use_stacked_layout =
+                    settings_popup_uses_stacked_layout(body_ui.available_width());
+                if use_stacked_layout {
+                    self.draw_settings_navigation_panel(
+                        &mut body_ui,
+                        shows_diagnostics_warning_badge,
+                        None,
+                    );
+                    body_ui.add_space(12.0);
+                    let content_height = body_ui.available_height().max(0.0);
 
-                egui::ScrollArea::vertical()
-                    .id_salt("settings-saved-messages-scroll")
-                    .max_height(ui.available_height().max(180.0))
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if project_ids.is_empty() {
-                            ui.label(
-                                RichText::new("Add a project to manage saved messages.")
-                                    .color(TEXT_MUTED),
+                    self.draw_settings_content_panel(
+                        ctx,
+                        &mut body_ui,
+                        content_height,
+                        &diagnostics,
+                        &mut changes,
+                    );
+                } else {
+                    let body_height = body_ui.available_height().max(0.0);
+                    let row_rect = body_ui.available_rect_before_wrap();
+                    let mut row_ui = body_ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(row_rect)
+                            .layout(Layout::left_to_right(Align::Min)),
+                    );
+                    let nav_width = SETTINGS_NAV_WIDTH.min(row_ui.available_width().max(0.0));
+                    row_ui.allocate_ui_with_layout(
+                        egui::vec2(nav_width, body_height),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            self.draw_settings_navigation_panel(
+                                ui,
+                                shows_diagnostics_warning_badge,
+                                Some(body_height),
                             );
-                        }
-
-                        for project_id in project_ids {
-                            let Some(project_snapshot) = self.projects.get(&project_id).cloned() else {
-                                continue;
-                            };
-
-                            let mut add_message: Option<String> = None;
-                            let mut remove_message_index: Option<usize> = None;
-                            let mut send_message_request: Option<String> = None;
-                            let send_target_terminal = self.preferred_terminal_for_project(project_id);
-
-                            egui::CollapsingHeader::new(format!(
-                                "{} {}",
-                                icons::FOLDER_OPEN,
-                                project_snapshot.name
-                            ))
-                            .id_salt(format!("settings-saved-messages-{project_id}"))
-                            .default_open(self.selected_project == Some(project_id))
-                            .icon(paint_minimal_disclosure_icon)
-                            .show(ui, |ui| {
-                                if project_snapshot.saved_messages.is_empty() {
-                                    ui.label(
-                                        RichText::new("No saved messages for this project.")
-                                            .color(TEXT_MUTED),
-                                    );
-                                } else if send_target_terminal.is_none() {
-                                    ui.label(
-                                        RichText::new(
-                                            "Open a live terminal in this project to send messages one by one.",
-                                        )
-                                        .color(TEXT_MUTED),
-                                    );
-                                }
-
-                                for (index, message) in project_snapshot.saved_messages.iter().enumerate()
-                                {
-                                    ui.horizontal(|ui| {
-                                        let message_label = ui.add(
-                                            egui::Label::new(
-                                                RichText::new(message).monospace().small(),
-                                            )
-                                            .truncate(),
-                                        );
-                                        let _ = with_truncation_tooltip(
-                                            ui,
-                                            message_label,
-                                            message,
-                                            &egui::TextStyle::Monospace.resolve(ui.style()),
-                                            TEXT_PRIMARY,
-                                            ui.available_width(),
-                                        );
-
-                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                            if styled_icon_button(
-                                                ui,
-                                                icons::TRASH,
-                                                BTN_RED,
-                                                BTN_RED_HOVER,
-                                                Color32::from_rgb(186, 58, 58),
-                                                "Remove message",
-                                            ) {
-                                                remove_message_index = Some(index);
-                                            }
-
-                                            if let Some(_terminal_id) = send_target_terminal {
-                                                if styled_icon_button(
-                                                    ui,
-                                                    icons::TERMINAL,
-                                                    BTN_BLUE,
-                                                    BTN_BLUE_HOVER,
-                                                    BTN_ICON_ACTIVE,
-                                                    "Send message",
-                                                ) {
-                                                    send_message_request = Some(message.clone());
-                                                }
-                                            }
-                                        });
-                                    });
-                                }
-
-                                ui.horizontal(|ui| {
-                                    let draft = self.saved_message_drafts.entry(project_id).or_default();
-                                    ui.add(
-                                        egui::TextEdit::singleline(draft)
-                                            .id(Self::saved_message_draft_input_id(project_id)),
-                                    );
-                                    if styled_icon_button(
-                                        ui,
-                                        icons::PLUS,
-                                        BTN_BLUE,
-                                        BTN_BLUE_HOVER,
-                                        BTN_ICON_ACTIVE,
-                                        "Add message",
-                                    ) {
-                                        let text = draft.trim();
-                                        if !text.is_empty() {
-                                            add_message = Some(text.to_owned());
-                                            draft.clear();
-                                        }
-                                    }
-                                });
-                            });
-
-                            if let Some(project) = self.projects.get_mut(&project_id) {
-                                if let Some(message) = add_message {
-                                    project.saved_messages.push(message);
-                                    should_persist = true;
-                                    projects_changed = true;
-                                }
-                                if let Some(index) = remove_message_index {
-                                    if index < project.saved_messages.len() {
-                                        project.saved_messages.remove(index);
-                                        should_persist = true;
-                                        projects_changed = true;
-                                    }
-                                }
-                            }
-
-                            if let (Some(terminal_id), Some(message)) =
-                                (send_target_terminal, send_message_request)
-                            {
-                                self.send_saved_message_to_terminal(terminal_id, &message);
-                            }
-                        }
-                    });
-
+                        },
+                    );
+                    row_ui.add_space(12.0);
+                    row_ui.allocate_ui_with_layout(
+                        egui::vec2(row_ui.available_width().max(0.0), body_height),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            self.draw_settings_content_panel(
+                                ctx,
+                                ui,
+                                body_height,
+                                &diagnostics,
+                                &mut changes,
+                            );
+                        },
+                    );
+                }
             });
 
         self.show_settings_popup = open;
 
-        if should_persist {
-            if ui_config_changed {
+        if changes.should_persist {
+            if changes.ui_config_changed {
                 self.note_ui_config_changed();
             }
-            if default_shell_changed {
+            if changes.default_shell_changed {
                 self.note_default_shell_changed();
             }
-            if projects_changed {
+            if changes.projects_changed {
                 self.note_projects_changed();
             }
             self.persist_config();
@@ -8269,6 +8923,11 @@ fn terminal_manager_row_widths(
     (label_width, actions_width)
 }
 
+fn terminal_manager_row_selection_rect(row_rect: egui::Rect, actions_width: f32) -> egui::Rect {
+    let selection_right = (row_rect.right() - actions_width.max(0.0)).max(row_rect.left());
+    egui::Rect::from_min_max(row_rect.min, egui::pos2(selection_right, row_rect.bottom()))
+}
+
 fn sidebar_row_content_rect(rect: egui::Rect, button_padding: Vec2) -> egui::Rect {
     let mut content_rect = rect.shrink2(button_padding);
     content_rect.min.x = (content_rect.min.x + SIDEBAR_ROW_LEADING_INSET).min(content_rect.max.x);
@@ -8845,6 +9504,7 @@ fn draw_terminal_manager_title_and_diff_summary(
     is_active: bool,
     row_height: f32,
     #[allow(unused_variables)] diff_summary: &TerminalManagerDiffSummaryModel,
+    show_pointing_cursor: bool,
 ) -> TerminalManagerTitleSummaryLayout {
     ui.allocate_ui_with_layout(
         egui::vec2(ui.available_width().max(0.0), row_height),
@@ -8852,6 +9512,7 @@ fn draw_terminal_manager_title_and_diff_summary(
         |ui| {
             let title_label = egui::Label::new(RichText::new(title).color(text_color).strong())
                 .truncate()
+                .selectable(false)
                 .sense(Sense::hover());
             let title_response = ui.add(title_label);
             {
@@ -8863,10 +9524,14 @@ fn draw_terminal_manager_title_and_diff_summary(
                 );
                 title_response.widget_info(|| info.clone());
             }
-            title_response
-                .clone()
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(title);
+            if show_pointing_cursor {
+                title_response
+                    .clone()
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(title);
+            } else {
+                title_response.clone().on_hover_text(title);
+            }
 
             ui.add_space(6.0);
 
@@ -8885,39 +9550,6 @@ fn draw_terminal_manager_title_and_diff_summary(
         },
     )
     .inner
-}
-
-fn lerp_pos(a: egui::Pos2, b: egui::Pos2, t: f32) -> egui::Pos2 {
-    egui::pos2(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
-}
-
-fn paint_minimal_disclosure_icon(ui: &mut Ui, openness: f32, response: &egui::Response) {
-    let rect = response.rect;
-    let center = rect.center();
-    let stroke_color = if response.hovered() {
-        Color32::from_rgb(255, 255, 255)
-    } else {
-        with_alpha(TEXT_MUTED, 210)
-    };
-    let stroke = Stroke::new(1.6, stroke_color);
-
-    let closed = [
-        egui::pos2(center.x - 2.0, center.y - 5.0),
-        egui::pos2(center.x + 2.5, center.y),
-        egui::pos2(center.x - 2.0, center.y + 5.0),
-    ];
-    let open = [
-        egui::pos2(center.x - 5.0, center.y - 2.0),
-        egui::pos2(center.x, center.y + 2.5),
-        egui::pos2(center.x + 5.0, center.y - 2.0),
-    ];
-
-    let p0 = lerp_pos(closed[0], open[0], openness);
-    let p1 = lerp_pos(closed[1], open[1], openness);
-    let p2 = lerp_pos(closed[2], open[2], openness);
-
-    ui.painter().line_segment([p0, p1], stroke);
-    ui.painter().line_segment([p1, p2], stroke);
 }
 
 fn paint_minimal_combo_icon(
@@ -8979,6 +9611,38 @@ fn with_minimal_button_chrome<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)
         add_contents(ui)
     })
     .inner
+}
+
+fn draw_terminal_saved_message_menu_button(
+    ui: &mut Ui,
+    saved_messages: &[String],
+    send_message: &mut Option<String>,
+) -> egui::Response {
+    let message_menu = with_minimal_button_chrome(ui, |ui| {
+        ui.menu_button(format!("{}", icons::CHAT_TEXT), |ui| {
+            with_minimal_button_chrome(ui, |ui| {
+                if saved_messages.is_empty() {
+                    ui.label(RichText::new("No saved messages").color(TEXT_MUTED));
+                    return;
+                }
+
+                for message in saved_messages {
+                    if ui.button(message).clicked() {
+                        *send_message = Some(message.clone());
+                        ui.close_menu();
+                    }
+                }
+            });
+        })
+    });
+    let response = message_menu
+        .response
+        .on_hover_text("Send saved message")
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
 }
 
 fn project_group_header_actions_width(_section_gap: f32) -> f32 {
@@ -9256,6 +9920,7 @@ fn draw_project_group_header(
                     open,
                     row_height,
                     diff_summary,
+                    can_expand,
                 );
             },
         );
@@ -9364,6 +10029,123 @@ fn paint_activity_rail_warning_badge(ui: &Ui, button_rect: egui::Rect) {
 
 fn styled_icon_toggle(ui: &mut Ui, selected: bool, icon: AppIcon, tooltip: &str) -> bool {
     activity_rail_icon_button(ui, selected, icon, tooltip).clicked()
+}
+
+fn settings_surface_frame(fill: Color32, margin: f32) -> egui::Frame {
+    egui::Frame::none()
+        .fill(fill)
+        .stroke(Stroke::new(1.0, BORDER_COLOR))
+        .rounding(12.0)
+        .inner_margin(egui::Margin::same(margin))
+}
+
+fn settings_window_size_for_screen(screen_size: Vec2, window_margin: egui::Margin) -> Vec2 {
+    let safe_screen_size = (screen_size
+        - egui::vec2(SETTINGS_WINDOW_SCREEN_MARGIN, SETTINGS_WINDOW_SCREEN_MARGIN)
+        - window_margin.sum())
+    .max(egui::Vec2::ZERO);
+    egui::vec2(
+        SETTINGS_WINDOW_DEFAULT_WIDTH.min(safe_screen_size.x),
+        SETTINGS_WINDOW_DEFAULT_HEIGHT.min(safe_screen_size.y),
+    )
+}
+
+fn settings_popup_uses_stacked_layout(available_width: f32) -> bool {
+    available_width < SETTINGS_WINDOW_STACK_BREAKPOINT
+}
+
+fn settings_diagnostics_uses_single_column(available_width: f32) -> bool {
+    available_width < SETTINGS_DIAGNOSTICS_SINGLE_COLUMN_BREAKPOINT
+}
+
+fn settings_saved_messages_stacks_draft_row(available_width: f32) -> bool {
+    available_width < SETTINGS_SAVED_MESSAGES_COMPACT_BREAKPOINT
+}
+
+fn settings_saved_message_chip_max_width(available_width: f32) -> f32 {
+    available_width
+        .min(SETTINGS_SAVED_MESSAGE_CHIP_MAX_WIDTH)
+        .max(0.0)
+}
+
+fn settings_saved_messages_project_state_id(project_id: u64) -> Id {
+    Id::new(("settings-saved-messages-project", project_id))
+}
+
+fn draw_settings_saved_message_chip(
+    ui: &mut Ui,
+    message: &str,
+    chip_max_width: f32,
+    show_send_action: bool,
+) -> (bool, bool) {
+    let mut send_clicked = false;
+    let mut remove_clicked = false;
+    settings_surface_frame(with_alpha(SURFACE_BG, 188), 10.0).show(ui, |ui| {
+        ui.set_min_width(0.0);
+        ui.set_max_width(chip_max_width);
+        ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(message)
+                    .size(SETTINGS_SAVED_MESSAGE_TEXT_SIZE)
+                    .color(TEXT_PRIMARY),
+            )
+            .wrap(),
+        );
+        ui.horizontal(|ui| {
+            if show_send_action
+                && styled_icon_button(
+                    ui,
+                    AppIcon::Terminal,
+                    BTN_BLUE,
+                    BTN_BLUE_HOVER,
+                    BTN_ICON_ACTIVE,
+                    "Send prompt",
+                )
+            {
+                send_clicked = true;
+            }
+            if styled_icon_button(
+                ui,
+                AppIcon::Trash,
+                BTN_RED,
+                BTN_RED_HOVER,
+                Color32::from_rgb(186, 58, 58),
+                "Remove prompt",
+            ) {
+                remove_clicked = true;
+            }
+        });
+    });
+    (send_clicked, remove_clicked)
+}
+
+fn settings_general_uses_stacked_layout(available_width: f32) -> bool {
+    available_width < SETTINGS_GENERAL_STACK_BREAKPOINT
+}
+
+fn show_settings_card<R>(
+    ui: &mut Ui,
+    icon: AppIcon,
+    title: &str,
+    description: &str,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    settings_surface_frame(with_alpha(SURFACE_BG_SOFT, 228), 12.0)
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(format!("{icon} {title}"))
+                    .strong()
+                    .size(15.0)
+                    .color(TEXT_PRIMARY),
+            );
+            if !description.is_empty() {
+                ui.label(RichText::new(description).small().color(TEXT_MUTED));
+                ui.add_space(10.0);
+            }
+            add_contents(ui)
+        })
+        .inner
 }
 
 fn resolve_ctrl_c_action(can_copy_selection: bool) -> CtrlCAction {
@@ -10221,22 +11003,25 @@ mod tests {
         next_terminal_in_direction, next_terminal_in_linear_direction,
         normalize_terminal_background, parse_branch_header, parse_git_numstat_totals,
         recent_inputs_tooltip_text, recover_config_state, resolve_ctrl_c_action,
-        should_resolve_terminal_link, source_control_badge_color, source_control_tooltip_lines,
-        terminal_cell_metric, terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect,
-        terminal_font_family, terminal_font_id, terminal_grid_dimensions, terminal_line_height,
-        terminal_link_activation_modifiers, terminal_link_at_point, terminal_logical_line,
-        terminal_logical_line_byte_index, terminal_manager_actions_width,
-        terminal_manager_diff_summary_model, terminal_manager_diff_summary_visual,
-        terminal_manager_row_chrome, terminal_manager_row_widths, terminal_output_surface_size,
-        terminal_output_viewport_size, terminal_secondary_click_action,
-        terminal_selection_point_from_pointer, terminal_selection_text, to_egui_color,
-        update_stable_cursor_row, visible_terminal_cursor, AdeApp, AiBadgeModel, AiBadgeVisual,
-        CodexCliStatusSource, CtrlCAction, DirectoryIndexSnapshot, DirectoryNode,
-        FactoryDroidHookInboxEvent, FactoryDroidManagedInstallComponent,
-        FactoryDroidManagedInstallDiagnostics, FactoryDroidStatusSource,
-        FactoryDroidTransportDiagnostics, PendingConfigChanges, PendingTerminalLinkClick,
-        SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
-        SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
+        settings_diagnostics_uses_single_column, settings_general_uses_stacked_layout,
+        settings_popup_uses_stacked_layout, settings_saved_message_chip_max_width,
+        settings_saved_messages_project_state_id, settings_saved_messages_stacks_draft_row,
+        settings_window_size_for_screen, should_resolve_terminal_link, source_control_badge_color,
+        source_control_tooltip_lines, terminal_cell_metric, terminal_cursor_blink_phase_visible,
+        terminal_cursor_overlay_rect, terminal_font_family, terminal_font_id,
+        terminal_grid_dimensions, terminal_line_height, terminal_link_activation_modifiers,
+        terminal_link_at_point, terminal_logical_line, terminal_logical_line_byte_index,
+        terminal_manager_actions_width, terminal_manager_diff_summary_model,
+        terminal_manager_diff_summary_visual, terminal_manager_row_chrome,
+        terminal_manager_row_widths, terminal_output_surface_size, terminal_output_viewport_size,
+        terminal_secondary_click_action, terminal_selection_point_from_pointer,
+        terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
+        AdeApp, AiBadgeModel, AiBadgeVisual, CodexCliStatusSource, CtrlCAction,
+        DirectoryIndexSnapshot, DirectoryNode, FactoryDroidHookInboxEvent,
+        FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
+        FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, PendingConfigChanges,
+        PendingTerminalLinkClick, SettingsSection, SourceControlBadgeState, SourceControlFile,
+        SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
         TerminalSecondaryClickAction, TerminalSelection, TerminalSelectionPoint, TransientToast,
         CODEX_LAUNCH_GRACE_MS, CODEX_PROCESS_POLL_MS, CODEX_TRAILING_OUTPUT_GRACE_MS,
@@ -10817,14 +11602,207 @@ mod tests {
     }
 
     #[test]
-    fn opening_settings_popup_resets_diagnostics_to_collapsed() {
+    fn opening_settings_popup_resets_section_and_diagnostics_state() {
         let mut app = test_app([], None);
+        app.active_settings_section = SettingsSection::Diagnostics;
         app.settings_diagnostics_expanded = true;
 
         app.open_settings_popup();
 
         assert!(app.show_settings_popup);
+        assert_eq!(app.active_settings_section, SettingsSection::General);
         assert!(!app.settings_diagnostics_expanded);
+    }
+
+    #[test]
+    fn settings_window_size_stays_compact_on_1366x768_screen() {
+        let size = settings_window_size_for_screen(
+            egui::vec2(1366.0, 768.0),
+            egui::Margin::symmetric(12.0, 10.0),
+        );
+
+        assert_eq!(size, egui::vec2(760.0, 520.0));
+    }
+
+    #[test]
+    fn settings_window_size_accounts_for_window_margin_on_small_screens() {
+        let size = settings_window_size_for_screen(
+            egui::vec2(700.0, 500.0),
+            egui::Margin::symmetric(12.0, 10.0),
+        );
+
+        assert_eq!(size, egui::vec2(628.0, 432.0));
+    }
+
+    #[test]
+    fn settings_popup_layout_switches_to_stacked_when_space_is_narrow() {
+        assert!(settings_popup_uses_stacked_layout(679.0));
+        assert!(!settings_popup_uses_stacked_layout(680.0));
+    }
+
+    #[test]
+    fn settings_diagnostics_layout_switches_to_single_column_when_space_is_narrow() {
+        assert!(settings_diagnostics_uses_single_column(559.0));
+        assert!(!settings_diagnostics_uses_single_column(560.0));
+    }
+
+    #[test]
+    fn settings_saved_messages_draft_row_stacks_when_space_is_narrow() {
+        assert!(settings_saved_messages_stacks_draft_row(519.0));
+        assert!(!settings_saved_messages_stacks_draft_row(520.0));
+    }
+
+    #[test]
+    fn settings_saved_messages_layout_switches_to_compact_rows_when_space_is_narrow() {
+        assert!(settings_saved_messages_stacks_draft_row(519.0));
+        assert!(!settings_saved_messages_stacks_draft_row(520.0));
+    }
+
+    #[test]
+    fn settings_saved_message_chip_width_clamps_to_available_space() {
+        assert_eq!(settings_saved_message_chip_max_width(280.0), 280.0);
+        assert_eq!(settings_saved_message_chip_max_width(480.0), 320.0);
+    }
+
+    #[test]
+    fn settings_navigation_uses_compact_saved_messages_label() {
+        assert_eq!(SettingsSection::General.navigation_title(), "General");
+        assert_eq!(SettingsSection::SavedMessages.navigation_title(), "Prompts");
+        assert_eq!(
+            SettingsSection::Diagnostics.navigation_title(),
+            "Diagnostics"
+        );
+    }
+
+    #[test]
+    fn settings_general_layout_switches_to_stacked_only_when_space_is_narrow() {
+        assert!(settings_general_uses_stacked_layout(479.0));
+        assert!(!settings_general_uses_stacked_layout(480.0));
+    }
+
+    fn draw_settings_popup_in_test_ui(
+        ctx: &Context,
+        raw_input: RawInput,
+        app: &mut AdeApp,
+    ) -> egui::FullOutput {
+        app.ensure_theme_initialized(ctx);
+        ctx.run(raw_input, |ctx| {
+            app.draw_settings_popup(ctx);
+        })
+    }
+
+    #[test]
+    fn settings_popup_stays_within_narrow_viewport() {
+        let ctx = Context::default();
+        let screen_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(600.0, 420.0));
+        let mut app = test_app([], None);
+        app.show_settings_popup = true;
+        app.active_settings_section = SettingsSection::Diagnostics;
+        app.settings_diagnostics_expanded = true;
+
+        let raw_input = RawInput {
+            screen_rect: Some(screen_rect),
+            ..RawInput::default()
+        };
+        let _ = draw_settings_popup_in_test_ui(&ctx, raw_input.clone(), &mut app);
+        let _ = draw_settings_popup_in_test_ui(&ctx, raw_input, &mut app);
+
+        let window_rect = ctx
+            .memory(|mem| mem.area_rect(egui::Id::new(super::SETTINGS_WINDOW_ID)))
+            .expect("settings window rect");
+        assert!(
+            window_rect.left() >= screen_rect.left(),
+            "window_rect={window_rect:?} screen_rect={screen_rect:?}"
+        );
+        assert!(
+            window_rect.right() <= screen_rect.right(),
+            "window_rect={window_rect:?} screen_rect={screen_rect:?}"
+        );
+        assert!(
+            window_rect.top() >= screen_rect.top(),
+            "window_rect={window_rect:?} screen_rect={screen_rect:?}"
+        );
+        assert!(
+            window_rect.bottom() <= screen_rect.bottom(),
+            "window_rect={window_rect:?} screen_rect={screen_rect:?}"
+        );
+    }
+
+    #[test]
+    fn settings_saved_messages_selected_project_starts_open() {
+        let ctx = Context::default();
+        let screen_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(760.0, 520.0));
+        let mut app = test_app([], None);
+        app.projects = BTreeMap::from([
+            (7, test_project(7, "Demo", "C:/demo", &["git status"])),
+            (9, test_project(9, "Docs", "C:/docs", &["pnpm build"])),
+        ]);
+        app.selected_project = Some(9);
+        app.show_settings_popup = true;
+        app.active_settings_section = SettingsSection::SavedMessages;
+
+        let raw_input = RawInput {
+            screen_rect: Some(screen_rect),
+            ..RawInput::default()
+        };
+        let _ = draw_settings_popup_in_test_ui(&ctx, raw_input.clone(), &mut app);
+        let _ = draw_settings_popup_in_test_ui(&ctx, raw_input, &mut app);
+
+        let selected_state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            &ctx,
+            settings_saved_messages_project_state_id(9),
+            false,
+        );
+        let unselected_state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            &ctx,
+            settings_saved_messages_project_state_id(7),
+            false,
+        );
+        assert!(selected_state.is_open());
+        assert!(!unselected_state.is_open());
+    }
+
+    #[test]
+    fn settings_saved_messages_long_prompt_keeps_popup_within_viewport() {
+        let ctx = Context::default();
+        let screen_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(600.0, 420.0));
+        let long_prompt =
+            "npm run lint && cargo test --workspace --all-features -- --nocapture && echo finish";
+        let mut app = test_app([], None);
+        app.projects = BTreeMap::from([(
+            7,
+            test_project(7, "Demo", "C:/demo", &[long_prompt, long_prompt]),
+        )]);
+        app.selected_project = Some(7);
+        app.show_settings_popup = true;
+        app.active_settings_section = SettingsSection::SavedMessages;
+
+        let raw_input = RawInput {
+            screen_rect: Some(screen_rect),
+            ..RawInput::default()
+        };
+        let _ = draw_settings_popup_in_test_ui(&ctx, raw_input.clone(), &mut app);
+        let _ = draw_settings_popup_in_test_ui(&ctx, raw_input, &mut app);
+
+        let window_rect = ctx
+            .memory(|mem| mem.area_rect(egui::Id::new(super::SETTINGS_WINDOW_ID)))
+            .expect("settings window rect");
+        assert!(
+            window_rect.left() >= screen_rect.left(),
+            "window_rect={window_rect:?} screen_rect={screen_rect:?}"
+        );
+        assert!(
+            window_rect.right() <= screen_rect.right(),
+            "window_rect={window_rect:?} screen_rect={screen_rect:?}"
+        );
+        assert!(
+            window_rect.top() >= screen_rect.top(),
+            "window_rect={window_rect:?} screen_rect={screen_rect:?}"
+        );
+        assert!(
+            window_rect.bottom() <= screen_rect.bottom(),
+            "window_rect={window_rect:?} screen_rect={screen_rect:?}"
+        );
     }
 
     #[test]
@@ -12039,6 +13017,138 @@ mod tests {
         changed
     }
 
+    struct TerminalManagerRowTestLayout {
+        selection_rect: egui::Rect,
+        title_click_pos: egui::Pos2,
+        visibility_button_rect: Option<egui::Rect>,
+    }
+
+    fn terminal_manager_row_test_layout(
+        ctx: &Context,
+        row_width: f32,
+        show_visibility_toggle: bool,
+    ) -> TerminalManagerRowTestLayout {
+        let mut observed = None;
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let test_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(320.0, 72.0));
+                let child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(test_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                let section_gap = child.spacing().item_spacing.x;
+                let row_height = child
+                    .spacing()
+                    .interact_size
+                    .y
+                    .max(super::CONTROL_ROW_HEIGHT);
+                let actions_width =
+                    super::terminal_manager_actions_width(section_gap, show_visibility_toggle);
+                let (_, row_actions_width) =
+                    super::terminal_manager_row_widths(row_width, actions_width, section_gap);
+                let row_rect =
+                    egui::Rect::from_min_size(test_rect.min, egui::vec2(row_width, row_height));
+                let selection_rect =
+                    super::terminal_manager_row_selection_rect(row_rect, row_actions_width);
+                let title_x = (row_rect.left() + super::SIDEBAR_ROW_LEADING_INSET + 16.0)
+                    .min(selection_rect.right() - 4.0)
+                    .max(selection_rect.left() + 1.0);
+                let close_button_rect = egui::Rect::from_min_size(
+                    egui::pos2(row_rect.right() - super::CONTROL_ROW_HEIGHT, row_rect.top()),
+                    egui::vec2(super::CONTROL_ROW_HEIGHT, row_height),
+                );
+                let visibility_button_rect = show_visibility_toggle.then(|| {
+                    let max_x = close_button_rect.left() - section_gap;
+                    egui::Rect::from_min_max(
+                        egui::pos2(max_x - super::CONTROL_ROW_HEIGHT, row_rect.top()),
+                        egui::pos2(max_x, row_rect.bottom()),
+                    )
+                });
+                observed = Some(TerminalManagerRowTestLayout {
+                    selection_rect,
+                    title_click_pos: pos2(title_x, row_rect.center().y),
+                    visibility_button_rect,
+                });
+            });
+        });
+
+        observed.expect("expected terminal manager row layout")
+    }
+
+    fn draw_terminal_rows_in_test_ui(
+        ctx: &Context,
+        raw_input: RawInput,
+        app: &mut AdeApp,
+    ) -> egui::FullOutput {
+        ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let test_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(320.0, 72.0));
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(test_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                app.draw_terminal_rows(ctx, &mut child, 7, TerminalKind::Foreground);
+            });
+        })
+    }
+
+    fn terminal_manager_row_test_app(active_terminal: Option<u64>) -> AdeApp {
+        let mut app = test_app([(2, test_terminal_entry(2, 7))], active_terminal);
+        let terminal = app.terminals.get_mut(&2).expect("terminal");
+        terminal.title = "Short".to_owned();
+        terminal.full_title = "Short".to_owned();
+        app.projects
+            .insert(7, test_project(7, "Demo", "C:/demo", &["git status"]));
+        app
+    }
+
+    fn terminal_saved_message_button_rect(ctx: &Context) -> egui::Rect {
+        let mut observed = None;
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(120.0, super::CONTROL_ROW_HEIGHT),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let mut send_message = None;
+                        let response = super::draw_terminal_saved_message_menu_button(
+                            ui,
+                            &[String::from("git status")],
+                            &mut send_message,
+                        );
+                        observed = Some(response.rect);
+                    },
+                );
+            });
+        });
+
+        observed.expect("expected saved message button rect")
+    }
+
+    fn draw_terminal_saved_message_button_in_test_ui(
+        ctx: &Context,
+        raw_input: RawInput,
+    ) -> egui::FullOutput {
+        ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(120.0, super::CONTROL_ROW_HEIGHT),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let mut send_message = None;
+                        let _ = super::draw_terminal_saved_message_menu_button(
+                            ui,
+                            &[String::from("git status")],
+                            &mut send_message,
+                        );
+                    },
+                );
+            });
+        })
+    }
+
     #[test]
     fn terminal_manager_filter_clicking_blank_space_in_background_slot_switches_selection() {
         let ctx = Context::default();
@@ -12118,6 +13228,114 @@ mod tests {
 
         assert!(!changed);
         assert_eq!(selected_filter, TerminalManagerFilter::Background);
+    }
+
+    #[test]
+    fn terminal_manager_row_clicking_blank_space_selects_terminal() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let layout = terminal_manager_row_test_layout(&ctx, 320.0, false);
+        let click_pos = layout.selection_rect.center();
+        let mut app = terminal_manager_row_test_app(None);
+        let _ = draw_terminal_rows_in_test_ui(&ctx, RawInput::default(), &mut app);
+
+        let _ = draw_terminal_rows_in_test_ui(
+            &ctx,
+            terminal_manager_filter_click_input(click_pos),
+            &mut app,
+        );
+
+        assert_eq!(app.active_terminal, Some(2));
+    }
+
+    #[test]
+    fn terminal_manager_row_clicking_title_text_selects_terminal() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let layout = terminal_manager_row_test_layout(&ctx, 320.0, false);
+        let mut app = terminal_manager_row_test_app(None);
+        let _ = draw_terminal_rows_in_test_ui(&ctx, RawInput::default(), &mut app);
+
+        let _ = draw_terminal_rows_in_test_ui(
+            &ctx,
+            terminal_manager_filter_click_input(layout.title_click_pos),
+            &mut app,
+        );
+
+        assert_eq!(app.active_terminal, Some(2));
+    }
+
+    #[test]
+    fn terminal_manager_row_action_button_click_does_not_activate_terminal() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let layout = terminal_manager_row_test_layout(&ctx, 320.0, true);
+        let click_pos = layout
+            .visibility_button_rect
+            .expect("expected visibility button rect")
+            .center();
+        let mut app = terminal_manager_row_test_app(None);
+        app.config.ui.multi_terminal_view_enabled = true;
+        let _ = draw_terminal_rows_in_test_ui(&ctx, RawInput::default(), &mut app);
+
+        let _ = draw_terminal_rows_in_test_ui(
+            &ctx,
+            terminal_manager_filter_click_input(click_pos),
+            &mut app,
+        );
+
+        assert_eq!(app.active_terminal, None);
+        assert!(
+            !app.terminals
+                .get(&2)
+                .expect("terminal should remain open")
+                .in_main_view
+        );
+    }
+
+    #[test]
+    fn terminal_manager_row_hovering_blank_space_uses_pointing_hand() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let layout = terminal_manager_row_test_layout(&ctx, 320.0, false);
+        let mut app = terminal_manager_row_test_app(None);
+        let output = draw_terminal_rows_in_test_ui(
+            &ctx,
+            RawInput {
+                events: vec![Event::PointerMoved(layout.selection_rect.center())],
+                ..RawInput::default()
+            },
+            &mut app,
+        );
+
+        assert_eq!(
+            output.platform_output.cursor_icon,
+            egui::CursorIcon::PointingHand
+        );
+    }
+
+    #[test]
+    fn terminal_manager_saved_message_button_hover_uses_pointing_hand() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let button_rect = terminal_saved_message_button_rect(&ctx);
+        let output = draw_terminal_saved_message_button_in_test_ui(
+            &ctx,
+            RawInput {
+                events: vec![Event::PointerMoved(button_rect.center())],
+                ..RawInput::default()
+            },
+        );
+
+        assert_eq!(
+            output.platform_output.cursor_icon,
+            egui::CursorIcon::PointingHand
+        );
     }
 
     #[test]
@@ -12221,6 +13439,7 @@ mod tests {
                             false,
                             super::CONTROL_ROW_HEIGHT,
                             &diff_summary,
+                            false,
                         );
                         observed = Some((layout.title_rect, layout.diff_summary_rect));
                     },
@@ -12230,6 +13449,151 @@ mod tests {
 
         let (title_rect, diff_summary_rect) = observed.expect("expected title layout");
         assert!(title_rect.max.x <= diff_summary_rect.min.x);
+    }
+
+    fn project_group_header_test_diff_summary() -> super::TerminalManagerDiffSummaryModel {
+        let mut snapshot =
+            test_source_control_snapshot("main", &[("src/app.rs", "Modified", false)]);
+        snapshot.added_lines = Some(24);
+        snapshot.removed_lines = Some(7);
+        terminal_manager_diff_summary_model(Some(&snapshot))
+    }
+
+    fn project_group_header_hover_targets(
+        ctx: &Context,
+        row_width: f32,
+        diff_summary: &super::TerminalManagerDiffSummaryModel,
+    ) -> (egui::Pos2, egui::Pos2) {
+        let mut observed = None;
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(row_width, super::CONTROL_ROW_HEIGHT),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        let (response, _, _) = super::draw_project_group_header(
+                            ui,
+                            "Demo Project",
+                            false,
+                            false,
+                            TerminalKind::Foreground,
+                            diff_summary,
+                            false,
+                        );
+                        observed = Some(response.rect);
+                    },
+                );
+            });
+        });
+
+        let row_rect = observed.expect("expected project group header rect");
+        let title_hover_pos = pos2(row_rect.left() + 28.0, row_rect.center().y);
+        let action_hover_pos = pos2(
+            row_rect.right() - (super::CONTROL_ROW_HEIGHT * 0.5),
+            row_rect.center().y,
+        );
+
+        (title_hover_pos, action_hover_pos)
+    }
+
+    fn project_group_header_cursor_icon_for_hover(
+        ctx: &Context,
+        row_width: f32,
+        hover_pos: egui::Pos2,
+        can_expand: bool,
+        diff_summary: &super::TerminalManagerDiffSummaryModel,
+        has_live_terminal: bool,
+    ) -> egui::CursorIcon {
+        let output = ctx.run(
+            RawInput {
+                events: vec![Event::PointerMoved(hover_pos)],
+                ..RawInput::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(row_width, super::CONTROL_ROW_HEIGHT),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            let _ = super::draw_project_group_header(
+                                ui,
+                                "Demo Project",
+                                false,
+                                can_expand,
+                                TerminalKind::Foreground,
+                                diff_summary,
+                                has_live_terminal,
+                            );
+                        },
+                    );
+                });
+            },
+        );
+
+        output.platform_output.cursor_icon
+    }
+
+    #[test]
+    fn empty_project_title_hover_keeps_default_cursor() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let row_width = 240.0;
+        let diff_summary = project_group_header_test_diff_summary();
+        let (hover_pos, _) = project_group_header_hover_targets(&ctx, row_width, &diff_summary);
+
+        let cursor = project_group_header_cursor_icon_for_hover(
+            &ctx,
+            row_width,
+            hover_pos,
+            false,
+            &diff_summary,
+            false,
+        );
+
+        assert_eq!(cursor, egui::CursorIcon::Default);
+    }
+
+    #[test]
+    fn expandable_project_title_hover_uses_pointing_hand() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let row_width = 240.0;
+        let diff_summary = project_group_header_test_diff_summary();
+        let (hover_pos, _) = project_group_header_hover_targets(&ctx, row_width, &diff_summary);
+
+        let cursor = project_group_header_cursor_icon_for_hover(
+            &ctx,
+            row_width,
+            hover_pos,
+            true,
+            &diff_summary,
+            true,
+        );
+
+        assert_eq!(cursor, egui::CursorIcon::PointingHand);
+    }
+
+    #[test]
+    fn empty_project_action_button_still_uses_pointing_hand() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let row_width = 240.0;
+        let diff_summary = project_group_header_test_diff_summary();
+        let (_, hover_pos) = project_group_header_hover_targets(&ctx, row_width, &diff_summary);
+
+        let cursor = project_group_header_cursor_icon_for_hover(
+            &ctx,
+            row_width,
+            hover_pos,
+            false,
+            &diff_summary,
+            false,
+        );
+
+        assert_eq!(cursor, egui::CursorIcon::PointingHand);
     }
 
     #[test]
@@ -16090,6 +17454,7 @@ mod tests {
             terminal_events_tx,
             terminal_events_rx,
             show_settings_popup: false,
+            active_settings_section: SettingsSection::General,
             settings_diagnostics_expanded: false,
             saved_message_drafts: BTreeMap::new(),
             directory_search_query: String::new(),

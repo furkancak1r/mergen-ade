@@ -886,3 +886,73 @@
   - Keep both blank-space and direct-text click regression tests for tab controls that mix layout rects with overlaid labels.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: 2026-04-09 follow-up user report after the slot-hit-area fix; regression tests `terminal_manager_filter_clicking_background_label_text_switches_selection`, `terminal_manager_filter_clicking_foreground_label_text_switches_selection`, and `terminal_manager_filter_clicking_selected_label_text_is_no_op`
+
+#### Empty Terminal Manager project headers showed a hand cursor over non-expandable titles {#empty-terminal-manager-project-headers-showed-a-hand-cursor-over-non-expandable-titles}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Terminal Manager project headers when the selected foreground/background filter had no terminals under a project
+- Error signature: `Hovering a project title still showed the hand cursor even though there was nothing to expand.`
+- Symptoms/Impact: Empty project rows looked actionable in the wrong place. Users saw a link/button-style cursor over the title area, but clicking there could not expand anything because no terminal rows existed yet.
+- Root cause: `src/app.rs` correctly limited the row-level header cursor to expandable projects, but `draw_terminal_manager_title_and_diff_summary` independently forced `PointingHand` on the overlaid title label, reintroducing a fake affordance on top of non-expandable rows.
+- Resolution: The title helper now applies the hand cursor only when the project row can actually expand, the title label is rendered as non-selectable so empty rows fall back to the default cursor instead of text-selection affordances, and the inline spawn/action button keeps its own pointing-hand cursor. Regression tests now cover empty-title default cursor, expandable-title pointing hand, and empty-row action-button pointing hand.
+- Prevent recurrence:
+  - Keep project-header cursor semantics driven by actual available actions, not by shared title rendering helpers.
+  - When a row mixes non-clickable text and clickable inline actions, test their cursor outputs separately.
+  - Treat hover cursor changes as UX behavior that deserves regression coverage, especially when overlapping widgets are involved.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 user-reported Terminal Manager empty-project cursor bug; regression tests `empty_project_title_hover_keeps_default_cursor`, `expandable_project_title_hover_uses_pointing_hand`, and `empty_project_action_button_still_uses_pointing_hand`
+
+#### Terminal Manager terminal rows only activated on title text instead of the whole left row area {#terminal-manager-terminal-rows-only-activated-on-title-text-instead-of-the-whole-left-row-area}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Terminal Manager terminal rows with short labels
+- Error signature: `Clicking the blank space inside a terminal row did nothing unless the pointer was directly on the terminal title text.`
+- Symptoms/Impact: Short terminal titles were unnecessarily hard to target. The row chrome visually implied that the whole terminal row was selectable, but users had to click directly on the label text instead of anywhere in the row's left content area.
+- Root cause: `src/app.rs` allocated a full-row clickable response for hover styling, but activation only listened to the overlaid title-label response. The empty space between a short title and the action buttons never participated in terminal selection.
+- Resolution: Terminal rows now define a dedicated non-action selection rect that covers the title area plus the blank gap before the action cluster, merge that response with the title response, keep the hand cursor aligned to the same left-side hit area, and explicitly prevent right-side action-button clicks from also activating the terminal. Regression tests now cover blank-space selection, direct title selection, blank-space hover cursor, and action-button no-op activation behavior.
+- Prevent recurrence:
+  - Keep terminal-row hit-testing tied to the visible left content slot, not just the text widget.
+  - When rows mix selection and inline actions, gate activation so action clicks cannot trigger both behaviors.
+  - Add pointer regression tests whenever row affordance is visually wider than the label itself.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 user-reported Terminal Manager terminal-row hit-area bug; regression tests `terminal_manager_row_clicking_blank_space_selects_terminal`, `terminal_manager_row_clicking_title_text_selects_terminal`, `terminal_manager_row_action_button_click_does_not_activate_terminal`, and `terminal_manager_row_hovering_blank_space_uses_pointing_hand`
+
+#### Settings modal width could overflow the viewport on narrow windows {#settings-modal-width-could-overflow-the-viewport-on-narrow-windows}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Settings modal on narrow app windows and smaller laptop displays
+- Error signature: `Settings opened too wide and extended past the visible screen area.`
+- Symptoms/Impact: The Settings modal could render partially off-screen, making navigation and diagnostics awkward or inaccessible on narrower viewports.
+- Root cause: `src/app.rs` sized the modal from `screen_rect - 48px` alone, kept a forced side-by-side nav/content layout, and left diagnostics/actions in always-wide layouts. The fixed window width did not account for window chrome margins, and narrow content could still pressure the modal horizontally.
+- Resolution: The Settings modal now subtracts the current egui window margins when computing its fixed size, switches to a stacked navigation-above-content layout on narrow widths, collapses diagnostics to a single column when space is tight, and stacks Codex setup actions vertically instead of forcing a wide row. Regression tests now cover size calculation, layout breakpoints, and a narrow-viewport modal bounds check.
+- Prevent recurrence:
+  - Include current egui window margins in viewport-constrained modal size calculations.
+  - When a modal has a sidebar-style navigation, add an explicit narrow-width stacked layout instead of relying on content shrinkage.
+  - Add viewport-bounds tests for fixed-size popups that mix navigation, scroll areas, and wide diagnostic content.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 user-reported Settings overflow bug; regression tests `settings_window_size_accounts_for_window_margin_on_small_screens`, `settings_popup_layout_switches_to_stacked_when_space_is_narrow`, `settings_diagnostics_layout_switches_to_single_column_when_space_is_narrow`, and `settings_popup_stays_within_narrow_viewport`
+
+#### Settings modal body inherited the wrong layout and collapsed content into the middle of the window {#settings-modal-body-inherited-the-wrong-layout-and-collapsed-content-into-the-middle-of-the-window}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Settings modal after the narrow-window width clamp fix
+- Error signature: `Settings no longer overflowed the viewport, but the inner content collapsed into the middle of the modal and left a large empty area above it.`
+- Symptoms/Impact: The modal frame fit on screen, but the navigation and section controls looked broken: buttons lined up across the middle instead of top-to-bottom, the right pane appeared mostly empty, and Saved Messages became brittle on narrow widths.
+- Root cause: `src/app.rs` bounded the modal body correctly but rendered the split layout with `body_ui.horizontal(...)`, so both inner frames inherited a left-to-right layout from the parent row. At the same time `draw_settings_section_panel()` forced a full-height section UI before measuring its own header and scroll area, which inflated blank space and pushed the actual content away from the top.
+- Resolution: The settings nav and content frames now render inside explicit `top_down(Align::Min)` child layouts, the section panel no longer hard-sets its height before measuring content, the scroll area only consumes the remaining height after the section header, and Saved Messages switches to compact stacked rows on narrower widths. Regression coverage now includes the compact Saved Messages breakpoint in addition to the existing settings viewport/layout tests.
+- Prevent recurrence:
+  - Do not rely on `Frame::show(...)` inheriting the “right” layout when the parent UI is horizontal; explicitly set the child layout for each panel.
+  - Avoid `ui.set_height(...)` on section containers before titles, descriptions, and scroll areas have been measured.
+  - Add compact-row fallbacks for settings subsections that mix long text with inline action buttons.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 screenshot-backed user report after the initial settings width fix; regression tests `settings_saved_messages_layout_switches_to_compact_rows_when_space_is_narrow` and `settings_popup_stays_within_narrow_viewport`
+
+#### Settings Prompts used stretched full-width rows and cramped text instead of compact wrapped prompt chips {#settings-prompts-used-stretched-full-width-rows-and-cramped-text-instead-of-compact-wrapped-prompt-chips}
+- Date: 2026-04-09T00:00:00Z
+- Context: main/Windows local Settings modal, `Prompts` section after the settings width/body fixes
+- Error signature: `Saved prompts looked too wide, used undersized text, and still nested an extra manage-prompts disclosure instead of behaving like a compact accordion list.`
+- Symptoms/Impact: The saved prompt area felt heavy and wasted horizontal space. Prompt text was harder to scan than necessary, long entries looked like stretched rows instead of reusable snippets, and the extra nested disclosure layer made the section feel more complex than it needed to be.
+- Root cause: `src/app.rs` still rendered each saved prompt as a full-width row with truncation-first message labels and a secondary `Manage prompts` accordion inside an already grouped project card. The layout logic was width-threshold-based, so prompt rows stayed stretched even when a natural wrapped size would have fit better.
+- Resolution: The `Prompts` section now uses project-level accordions directly, removes the extra `Manage prompts` wrapper, renders each saved prompt as a wrapped chip that sizes to its content up to a capped width, and bumps the prompt text size for readability while keeping add/remove/send behavior deferred until after render. Regression coverage now includes chip-width clamping, selected-project default-open behavior, and a long-prompt viewport bounds check.
+- Prevent recurrence:
+  - Prefer content-sized wrapped chips over full-width rows for reusable snippet/prompt collections.
+  - Avoid stacking multiple disclosure layers when the outer project grouping can own the accordion interaction.
+  - Add viewport-bounds coverage for long prompt text whenever Settings layout changes touch wrapped content.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-09 user-reported `Settings > Prompts` follow-up; regression tests `settings_saved_message_chip_width_clamps_to_available_space`, `settings_saved_messages_selected_project_starts_open`, and `settings_saved_messages_long_prompt_keeps_popup_within_viewport`
