@@ -4284,7 +4284,7 @@ impl AdeApp {
     fn cycle_terminal_manager_filter(
         &mut self,
         direction: TerminalNavigationDirection,
-        _ctx: &egui::Context,
+        ctx: &egui::Context,
     ) {
         use crate::models::TerminalManagerFilter;
         let next_filter = match (self.config.ui.terminal_manager_filter, direction) {
@@ -4299,6 +4299,17 @@ impl AdeApp {
         self.config.ui.terminal_manager_filter = next_filter;
         self.note_ui_config_changed();
         self.persist_config();
+
+        let new_kind = next_filter.terminal_kind();
+        let first_of_kind = self
+            .terminal_ids_for_single_view_navigation()
+            .into_iter()
+            .find(|id| {
+                self.terminals
+                    .get(id)
+                    .is_some_and(|t| t.kind == new_kind && !t.exited)
+            });
+        self.set_active_terminal(ctx, first_of_kind);
     }
 
     fn active_terminal_accepts_input(&self) -> Option<u64> {
@@ -17174,6 +17185,130 @@ mod tests {
             app.config.ui.terminal_manager_filter,
             TerminalManagerFilter::Background
         );
+    }
+
+    #[test]
+    fn handle_shortcuts_ctrl_right_focuses_background_terminal_on_switch() {
+        let ctx = Context::default();
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        let fg_terminal = test_terminal_entry_with_kind(1, 7, TerminalKind::Foreground);
+        let bg_terminal = test_terminal_entry_with_kind(2, 7, TerminalKind::Background);
+        let mut app = test_app([(1, fg_terminal), (2, bg_terminal)], Some(1));
+        app.config.ui.terminal_manager_filter = TerminalManagerFilter::Foreground;
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(
+            app.config.ui.terminal_manager_filter,
+            TerminalManagerFilter::Background
+        );
+        assert_eq!(app.active_terminal, Some(2));
+    }
+
+    #[test]
+    fn handle_shortcuts_ctrl_left_focuses_foreground_terminal_on_switch() {
+        let ctx = Context::default();
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowLeft,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        let fg_terminal = test_terminal_entry_with_kind(1, 7, TerminalKind::Foreground);
+        let bg_terminal = test_terminal_entry_with_kind(2, 7, TerminalKind::Background);
+        let mut app = test_app([(1, fg_terminal), (2, bg_terminal)], Some(2));
+        app.config.ui.terminal_manager_filter = TerminalManagerFilter::Background;
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(
+            app.config.ui.terminal_manager_filter,
+            TerminalManagerFilter::Foreground
+        );
+        assert_eq!(app.active_terminal, Some(1));
+    }
+
+    #[test]
+    fn handle_shortcuts_ctrl_right_focuses_first_background_when_multiple_exist() {
+        let ctx = Context::default();
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        let fg_terminal = test_terminal_entry_with_kind(1, 7, TerminalKind::Foreground);
+        let bg_terminal1 = test_terminal_entry_with_kind(2, 7, TerminalKind::Background);
+        let bg_terminal2 = test_terminal_entry_with_kind(3, 7, TerminalKind::Background);
+        let mut app = test_app(
+            [(1, fg_terminal), (2, bg_terminal1), (3, bg_terminal2)],
+            Some(1),
+        );
+        app.config.ui.terminal_manager_filter = TerminalManagerFilter::Foreground;
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(
+            app.config.ui.terminal_manager_filter,
+            TerminalManagerFilter::Background
+        );
+        assert_eq!(app.active_terminal, Some(2));
+    }
+
+    #[test]
+    fn handle_shortcuts_ctrl_right_stays_on_active_if_already_correct_kind() {
+        let ctx = Context::default();
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        let fg_terminal = test_terminal_entry_with_kind(1, 7, TerminalKind::Foreground);
+        let bg_terminal = test_terminal_entry_with_kind(2, 7, TerminalKind::Background);
+        let mut app = test_app([(1, fg_terminal), (2, bg_terminal)], Some(2));
+        app.config.ui.terminal_manager_filter = TerminalManagerFilter::Foreground;
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(
+            app.config.ui.terminal_manager_filter,
+            TerminalManagerFilter::Background
+        );
+        assert_eq!(app.active_terminal, Some(2));
     }
 
     #[test]
