@@ -2797,6 +2797,7 @@ impl AdeApp {
                 FactoryDroidStatusSource::PtyHookEvent
                     | FactoryDroidStatusSource::TerminalTitle
                     | FactoryDroidStatusSource::Inbox
+                    | FactoryDroidStatusSource::PtyNotification
             )
             && Self::terminal_has_factory_droid_interactive_attention(current_entry);
         if should_preserve_interactive_attention {
@@ -23538,6 +23539,102 @@ mod tests {
         assert!(
             !entry.snapshot_refresh_deferred,
             "deferred snapshot flag must be cleared on activation"
+        );
+    }
+
+    #[test]
+    fn pty_notification_running_does_not_override_ask_user_attention() {
+        // Regression: after droid-ask-user-prompt sets Attention, a subsequent Running
+        // event from PtyNotification source should NOT override the pulse state.
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let _ctx = Context::default();
+
+        // Seed AskUser attention state (simulates droid-ask-user-prompt detection)
+        seed_factory_droid_ask_user_attention(&mut app, 1);
+        let entry_before = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(entry_before.ai_session.status, AiCliStatus::Attention);
+
+        // Simulate a Running event from PtyNotification (e.g., UserPromptSubmit after UI detection)
+        app.apply_factory_droid_status(
+            1,
+            AiCliStatus::Running,
+            FactoryDroidStatusSource::PtyNotification,
+            None,
+        );
+
+        // Status should remain Attention, not be overridden to Running
+        let entry_after = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            entry_after.ai_session.status,
+            AiCliStatus::Attention,
+            "PtyNotification Running should not override AskUser Attention"
+        );
+        assert_eq!(
+            entry_after.factory_droid_attention_reason,
+            Some(FactoryDroidAttentionReason::AskUser),
+            "Attention reason should be preserved"
+        );
+    }
+
+    #[test]
+    fn pty_notification_running_does_not_override_spec_approval_attention() {
+        // Regression: after droid-spec-approval-prompt sets Attention, a subsequent Running
+        // event from PtyNotification source should NOT override the pulse state.
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let _ctx = Context::default();
+
+        // Seed SpecApproval attention state (simulates droid-spec-approval-prompt detection)
+        seed_factory_droid_spec_approval_attention(&mut app, 1);
+        let entry_before = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(entry_before.ai_session.status, AiCliStatus::Attention);
+
+        // Simulate a Running event from PtyNotification
+        app.apply_factory_droid_status(
+            1,
+            AiCliStatus::Running,
+            FactoryDroidStatusSource::PtyNotification,
+            None,
+        );
+
+        // Status should remain Attention, not be overridden to Running
+        let entry_after = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            entry_after.ai_session.status,
+            AiCliStatus::Attention,
+            "PtyNotification Running should not override SpecApproval Attention"
+        );
+        assert_eq!(
+            entry_after.factory_droid_attention_reason,
+            Some(FactoryDroidAttentionReason::SpecificationApproval),
+            "Attention reason should be preserved"
+        );
+    }
+
+    #[test]
+    fn non_interactive_attention_allows_running_override() {
+        // Verify that non-interactive attention (e.g., simple Stop) CAN be overridden by Running
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let _ctx = Context::default();
+
+        // Set non-interactive attention (no persists_on_focus reason)
+        seed_ai_attention(&mut app, 1);
+        let entry_before = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(entry_before.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(entry_before.factory_droid_attention_reason, None);
+
+        // Running event should be allowed
+        app.apply_factory_droid_status(
+            1,
+            AiCliStatus::Running,
+            FactoryDroidStatusSource::PtyHookEvent,
+            None,
+        );
+
+        let entry_after = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            entry_after.ai_session.status,
+            AiCliStatus::Running,
+            "Running should be allowed for non-interactive attention"
         );
     }
 }
