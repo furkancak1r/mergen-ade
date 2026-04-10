@@ -11616,10 +11616,8 @@ fn draw_project_group_header(
 
     // Project header is bright only when it has at least one live (non-exited) terminal.
     // When all terminals are closed/exited, the project header dims back to muted color.
-    let text_color = if has_live_terminal && open {
+    let text_color = if has_live_terminal {
         TEXT_PRIMARY
-    } else if has_live_terminal && response.hovered() && can_expand {
-        with_alpha(TEXT_PRIMARY, 180)
     } else if response.hovered() {
         with_alpha(TEXT_MUTED, 180)
     } else {
