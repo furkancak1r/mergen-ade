@@ -58,14 +58,18 @@ const TERMINAL_EVENT_BUDGET: usize = 4096;
 const TERMINAL_EVENT_QUEUE_CAPACITY: usize = 512;
 const TERMINAL_RETRY_MS: u64 = 8;
 const TERMINAL_FALLBACK_REFRESH_MS: u64 = 16;
+const TERMINAL_FALLBACK_REFRESH_MAX_MS: u64 = 64;
+const TERMINAL_SNAPSHOT_BUDGET_PER_FRAME: usize = 2;
+const REPAINT_DEBOUNCE_MS: u64 = 5;
+const INPUT_ROUTING_GATE_MS: u64 = 75;
 const TERMINAL_PENDING_LINE_MAX_CHARS: usize = 512;
-const FACTORY_DROID_HOOK_POLL_MS: u64 = 75;
-const FACTORY_DROID_PROCESS_POLL_MS: u64 = 75;
+const FACTORY_DROID_HOOK_POLL_MS: u64 = 150;
+const FACTORY_DROID_PROCESS_POLL_MS: u64 = 150;
 const FACTORY_DROID_LAUNCH_GRACE_MS: u64 = 5_000;
 const FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS: u64 = 750;
 const FACTORY_DROID_MANAGED_DIAGNOSTICS_REFRESH_MS: u64 = 2_000;
-const CODEX_NOTIFY_POLL_MS: u64 = 75;
-const CODEX_PROCESS_POLL_MS: u64 = 75;
+const CODEX_NOTIFY_POLL_MS: u64 = 150;
+const CODEX_PROCESS_POLL_MS: u64 = 150;
 const CODEX_LAUNCH_GRACE_MS: u64 = 5_000;
 const CODEX_TRAILING_OUTPUT_GRACE_MS: u64 = 750;
 const CURSOR_BLINK_STEP_SECS: f64 = 0.6;
@@ -100,7 +104,7 @@ const SOURCE_CONTROL_PRIORITY_REFRESH_SECS: f64 = 5.0;
 const SOURCE_CONTROL_BACKGROUND_REFRESH_SECS: f64 = 20.0;
 const SOURCE_CONTROL_CHANNEL_CAPACITY: usize = 1;
 const SOURCE_CONTROL_MAX_FILES: usize = 2_000;
-const SOURCE_CONTROL_POLL_TICK_MS: u64 = 250;
+const SOURCE_CONTROL_POLL_TICK_MS: u64 = 500;
 const SOURCE_CONTROL_TOOLTIP_FILE_LIMIT: usize = 12;
 const DIRECTORY_ENTRY_TOOLTIP_MAX_CHARS: usize = 500;
 // Pure Dark Theme colors
@@ -549,6 +553,7 @@ enum CodexAttentionReason {
     UserInputRequested,
     PlanModePrompt,
     TurnComplete,
+    ExecutionError,
     UnknownNotify,
 }
 
@@ -568,6 +573,7 @@ impl CodexAttentionReason {
             }
             "planmodeprompt" => Self::PlanModePrompt,
             "agentturncomplete" | "turncompleted" | "turncomplete" => Self::TurnComplete,
+            "executionerror" | "executionerrorfault" | "toolexecutionerror" => Self::ExecutionError,
             _ => Self::UnknownNotify,
         }
     }
@@ -593,6 +599,7 @@ impl CodexAttentionReason {
             Self::UserInputRequested => "Codex CLI - Waiting for your reply...",
             Self::PlanModePrompt => "Codex CLI - Waiting for plan approval...",
             Self::TurnComplete => "Codex CLI - Turn complete; waiting for your next prompt...",
+            Self::ExecutionError => "Codex CLI - Execution failed; review output above",
             Self::UnknownNotify => "Codex CLI - Waiting for you...",
         }
     }
@@ -781,6 +788,11 @@ pub struct AdeApp {
     next_terminal_id: u64,
     selected_project: Option<u64>,
     active_terminal: Option<u64>,
+    terminal_snapshot_frame_budget_used: bool,
+    snapshot_budget_count: usize,
+    terminal_refresh_backoff_ms: u64,
+    last_repaint_request_at: Instant,
+    input_routing_gate_ms: u64,
     buffered_terminal_input: Vec<Event>,
     buffered_terminal_navigation: Vec<TerminalNavigationShortcut>,
     terminal_held_key_repeat: Option<TerminalHeldKeyRepeat>,
@@ -1140,8 +1152,7 @@ fn draw_ai_badge(ui: &mut Ui, badge: &AiBadgeModel) -> egui::Response {
     if ui.is_rect_visible(rect) {
         match visual {
             AiBadgeVisual::Spinner(color) => {
-                egui::Spinner::new().color(color).paint_at(ui, rect);
-                ui.ctx().request_repaint_after(Duration::from_millis(100));
+                ui.put(rect, egui::Spinner::new().color(color).size(14.0));
             }
             AiBadgeVisual::Pulse(color) => {
                 let time_seconds = ui.ctx().input(|i| i.time);
@@ -1161,7 +1172,7 @@ fn draw_ai_badge(ui: &mut Ui, badge: &AiBadgeModel) -> egui::Response {
                     egui::Stroke::new(0.0, Color32::TRANSPARENT),
                 );
 
-                ui.ctx().request_repaint_after(Duration::from_millis(100));
+                ui.ctx().request_repaint_after(Duration::from_millis(250));
             }
         }
     }
@@ -2064,6 +2075,11 @@ impl AdeApp {
             next_terminal_id: 1,
             selected_project,
             active_terminal: None,
+            terminal_snapshot_frame_budget_used: false,
+            last_repaint_request_at: Instant::now(),
+            snapshot_budget_count: 0,
+            terminal_refresh_backoff_ms: TERMINAL_FALLBACK_REFRESH_MS,
+            input_routing_gate_ms: 0,
             buffered_terminal_input: Vec::new(),
             buffered_terminal_navigation: Vec::new(),
             terminal_held_key_repeat: None,
@@ -2564,6 +2580,13 @@ impl AdeApp {
                 Some(FactoryDroidAttentionReason::SpecificationApproval),
             ));
         }
+        if chunk == "droid-interrupted-banner" {
+            return Some((
+                AiCliStatus::Inactive,
+                FactoryDroidStatusSource::PtyNotification,
+                None,
+            ));
+        }
 
         let source = Self::factory_droid_attention_source_from_chunk(chunk)?;
         Some((AiCliStatus::Attention, source, None))
@@ -2571,16 +2594,38 @@ impl AdeApp {
 
     fn factory_droid_attention_source_from_chunk(chunk: &str) -> Option<FactoryDroidStatusSource> {
         let lower = chunk.to_ascii_lowercase();
-        // Match "HOOKS  Stop" (visible script output), "hook stop" variants,
-        // "stop - <type>" hook screen headers, and raw
+        // Match Droid hook screen headers: "HOOKS  Stop" (two-space variant from
+        // visible script output), "hook stop" script output, and raw
         // [droid-hook:event=Stop] / [factory-droid-hook:event=Stop] markers.
+        // "stop - <type>" is NOT matched here to avoid false positives from
+        // error/failure messages that happen to contain "stop" in a different
+        // context; hook screen headers are identified by the exact "stop - "
+        // prefix with known tool-type suffixes detected via context markers.
         if lower.contains("hooks  stop")
             || lower.contains("hooks stop")
             || lower.contains("hook stop")
-            || lower.contains("stop - ")
-            || lower.contains("stop -")
             || lower.contains("[droid-hook:event=stop]")
             || lower.contains("[factory-droid-hook:event=stop]")
+        {
+            return Some(FactoryDroidStatusSource::PtyStop);
+        }
+
+        // Match "stop - <type>" only when it appears as a Droid hook screen header,
+        // identified by a known tool-type suffix (matcher, plan, planner, tool,
+        // code, test, apply, review, etc.) followed by end-of-line or specific
+        // context. This avoids false positives from error messages like
+        // "Tool failed: Stop reason" where "stop" is part of a natural-language
+        // phrase rather than a hook screen title.
+        if lower.contains("stop - matcher")
+            || lower.contains("stop - plan")
+            || lower.contains("stop - planner")
+            || lower.contains("stop - tool")
+            || lower.contains("stop - code")
+            || lower.contains("stop - test")
+            || lower.contains("stop - apply")
+            || lower.contains("stop - review")
+            || lower.contains("stop - spec")
+            || lower.contains("stop - confirm")
         {
             return Some(FactoryDroidStatusSource::PtyStop);
         }
@@ -8604,6 +8649,11 @@ impl AdeApp {
             .unwrap_or_else(|| "Unknown Project".to_owned());
         let is_active = self.active_terminal == Some(terminal_id);
 
+        // Frame budget: skip full snapshot for background terminals if budget exhausted
+        let visible_in_main =
+            self.terminal_visible_in_main(self.terminals.get(&terminal_id).expect("terminal"));
+        let is_active_or_visible = is_active || visible_in_main;
+
         let (clicked, close_requested, copied_selection, paste_requested, link_to_open) = {
             let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
                 return;
@@ -8714,8 +8764,12 @@ impl AdeApp {
                         pixel_height: output_size.y.round().clamp(1.0, u16::MAX as f32) as u16,
                     });
                     if !resize_applied {
-                        ui.ctx()
-                            .request_repaint_after(Duration::from_millis(TERMINAL_RETRY_MS));
+                        if self.last_repaint_request_at.elapsed()
+                            >= Duration::from_millis(REPAINT_DEBOUNCE_MS)
+                        {
+                            ui.ctx()
+                                .request_repaint_after(Duration::from_millis(TERMINAL_RETRY_MS));
+                        }
                     }
                 }
 
@@ -8725,25 +8779,66 @@ impl AdeApp {
                     terminal.dirty = true;
                 }
 
+                // Frame budget: only process TERMINAL_SNAPSHOT_BUDGET_PER_FRAME terminals per frame.
+                // Active/visible terminals get priority; background terminals wait if budget is exhausted.
+                let budget_exhausted =
+                    self.snapshot_budget_count >= TERMINAL_SNAPSHOT_BUDGET_PER_FRAME;
+                let skip_full_snapshot = !is_active_or_visible
+                    && budget_exhausted
+                    && terminal.render_cache.lines.is_empty();
+
                 if terminal.dirty
                     || terminal.snapshot_refresh_deferred
                     || terminal.render_cache.lines.is_empty()
                 {
-                    if Self::should_defer_terminal_snapshot(terminal.selection.as_ref()) {
+                    if skip_full_snapshot {
+                        // Sync seqno but defer full snapshot to reduce per-frame load
+                        // Use exponential backoff to reduce repaint storm under load
+                        if self.last_repaint_request_at.elapsed()
+                            >= Duration::from_millis(REPAINT_DEBOUNCE_MS)
+                        {
+                            ui.ctx().request_repaint_after(Duration::from_millis(
+                                self.terminal_refresh_backoff_ms,
+                            ));
+                            // Increase backoff for next time if budget keeps being exhausted
+                            if budget_exhausted {
+                                self.terminal_refresh_backoff_ms =
+                                    (self.terminal_refresh_backoff_ms * 2)
+                                        .min(TERMINAL_FALLBACK_REFRESH_MAX_MS);
+                            }
+                        }
+                    } else if Self::should_defer_terminal_snapshot(terminal.selection.as_ref()) {
                         Self::acknowledge_deferred_terminal_snapshot(
                             &mut terminal.dirty,
                             &mut terminal.snapshot_refresh_deferred,
                         );
-                        ui.ctx().request_repaint_after(Duration::from_millis(
-                            TERMINAL_FALLBACK_REFRESH_MS,
-                        ));
+                        if self.last_repaint_request_at.elapsed()
+                            >= Duration::from_millis(REPAINT_DEBOUNCE_MS)
+                        {
+                            ui.ctx().request_repaint_after(Duration::from_millis(
+                                self.terminal_refresh_backoff_ms,
+                            ));
+                            // Increase backoff for next time if budget keeps being exhausted
+                            if budget_exhausted {
+                                self.terminal_refresh_backoff_ms =
+                                    (self.terminal_refresh_backoff_ms * 2)
+                                        .min(TERMINAL_FALLBACK_REFRESH_MAX_MS);
+                            }
+                        }
                     } else if let Some((snapshot, selection_snapshot)) =
                         try_terminal_snapshots(&terminal.runtime)
                     {
                         Self::apply_terminal_snapshot(terminal, snapshot, selection_snapshot);
+                        self.snapshot_budget_count += 1;
+                        // Reset backoff on successful snapshot
+                        self.terminal_refresh_backoff_ms = TERMINAL_FALLBACK_REFRESH_MS;
                     } else {
-                        ui.ctx()
-                            .request_repaint_after(Duration::from_millis(TERMINAL_RETRY_MS));
+                        if self.last_repaint_request_at.elapsed()
+                            >= Duration::from_millis(REPAINT_DEBOUNCE_MS)
+                        {
+                            ui.ctx()
+                                .request_repaint_after(Duration::from_millis(TERMINAL_RETRY_MS));
+                        }
                     }
                 }
 
@@ -9284,20 +9379,43 @@ impl eframe::App for AdeApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.terminal_snapshot_frame_budget_used = false;
+        self.snapshot_budget_count = 0;
+        self.terminal_refresh_backoff_ms = TERMINAL_FALLBACK_REFRESH_MS;
+        self.last_repaint_request_at = Instant::now();
         self.ensure_theme_initialized(ctx);
         self.apply_initial_window_bounds(ctx);
+
+        // Phase 1: Capture and route input BEFORE polling/rendering
+        // This reduces input→echo latency by handling input before heavy per-frame work
+        let mut terminal_events = self.take_buffered_terminal_input();
+        terminal_events.extend(self.capture_active_terminal_input(ctx));
+        terminal_events = self.preprocess_terminal_input_with_held_repeat(ctx, terminal_events);
+        self.route_active_terminal_input(ctx, terminal_events);
+        self.flush_pending_terminal_pastes(ctx);
+
+        // Phase 2: Terminal event processing
         self.process_terminal_events(ctx);
+
+        // Phase 3: AI polling with input gating to reduce work during typing bursts
+        // Skip or throttle expensive process probing when input was recently sent
+        let input_gate_elapsed = self.input_routing_gate_ms;
+        self.input_routing_gate_ms = INPUT_ROUTING_GATE_MS;
         self.poll_factory_droid_hook_inboxes(ctx);
-        self.poll_factory_droid_processes(ctx);
         self.poll_codex_notify_inboxes(ctx);
-        self.poll_codex_processes(ctx);
+        if input_gate_elapsed == 0 || self.factory_droid_process_last_poll_at.is_none() {
+            self.poll_factory_droid_processes(ctx);
+        }
+        if input_gate_elapsed == 0 || self.codex_process_last_poll_at.is_none() {
+            self.poll_codex_processes(ctx);
+        }
+
         self.process_source_control_events(ctx);
         self.process_directory_index_events(ctx);
         self.schedule_source_control_refresh(ctx);
         self.schedule_terminal_refresh(ctx);
-        let mut terminal_events = self.take_buffered_terminal_input();
-        terminal_events.extend(self.capture_active_terminal_input(ctx));
-        terminal_events = self.preprocess_terminal_input_with_held_repeat(ctx, terminal_events);
+
+        // Phase 4: UI rendering
         let activity_rect = self.draw_activity_rail(ctx);
         let explorer_rect = self.draw_project_explorer(ctx);
         let main_area_size =
@@ -9309,8 +9427,6 @@ impl eframe::App for AdeApp {
         }
         self.draw_settings_popup(ctx);
 
-        self.route_active_terminal_input(ctx, terminal_events);
-        self.flush_pending_terminal_pastes(ctx);
         self.draw_transient_toast(ctx);
     }
 
@@ -13138,8 +13254,8 @@ mod tests {
         DIRECTORY_INDEX_CHANNEL_CAPACITY, FACTORY_DROID_HOOK_POLL_MS,
         FACTORY_DROID_PROCESS_POLL_MS, FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS,
         SOURCE_CONTROL_CHANNEL_CAPACITY, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG,
-        TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_OUTPUT_BG,
-        TRANSIENT_TOAST_SECS,
+        TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS,
+        TERMINAL_OUTPUT_BG, TRANSIENT_TOAST_SECS,
     };
     use crate::codex::{
         CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent,
@@ -19277,6 +19393,120 @@ mod tests {
     }
 
     #[test]
+    fn running_factory_droid_interrupt_banner_sets_inactive_without_clearing_session() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.factory_droid_session_active = true;
+            entry.factory_droid_last_status_source = Some(FactoryDroidStatusSource::PromptSubmit);
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "droid-interrupted-banner".to_owned(),
+                },
+            })
+            .expect("send droid interrupted banner chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::FactoryDroid));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(terminal.factory_droid_session_active);
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::PtyNotification)
+        );
+        assert_eq!(terminal.factory_droid_attention_reason, None);
+    }
+
+    #[test]
+    fn attention_factory_droid_interrupt_banner_sets_inactive_without_clearing_session() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            entry.ai_session.status = AiCliStatus::Attention;
+            entry.factory_droid_session_active = true;
+            entry.factory_droid_attention_reason = Some(FactoryDroidAttentionReason::AskUser);
+            entry.factory_droid_last_status_source =
+                Some(FactoryDroidStatusSource::PtyNotification);
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "droid-interrupted-banner".to_owned(),
+                },
+            })
+            .expect("send droid interrupted banner chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::FactoryDroid));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(terminal.factory_droid_session_active);
+        assert_eq!(
+            terminal.factory_droid_last_status_source,
+            Some(FactoryDroidStatusSource::PtyNotification)
+        );
+        assert_eq!(terminal.factory_droid_attention_reason, None);
+    }
+
+    #[test]
+    fn factory_droid_interrupt_banner_allows_later_running_resumption() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.factory_droid_session_active = true;
+            entry.factory_droid_last_status_source = Some(FactoryDroidStatusSource::PromptSubmit);
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "droid-interrupted-banner".to_owned(),
+                },
+            })
+            .expect("send droid interrupted banner chunk");
+        app.process_terminal_events(&ctx);
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "droid-ask-user-prompt".to_owned(),
+                },
+            })
+            .expect("send droid ask user prompt chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::FactoryDroid));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert!(terminal.factory_droid_session_active);
+        assert_eq!(
+            terminal.factory_droid_attention_reason,
+            Some(FactoryDroidAttentionReason::AskUser)
+        );
+    }
+
+    #[test]
     fn codex_status_lifecycle_transitions_running_attention_idle_running_and_inactive() {
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
@@ -21375,6 +21605,11 @@ mod tests {
             next_terminal_id: 3,
             selected_project: None,
             active_terminal,
+            terminal_snapshot_frame_budget_used: false,
+            last_repaint_request_at: Instant::now(),
+            snapshot_budget_count: 0,
+            terminal_refresh_backoff_ms: TERMINAL_FALLBACK_REFRESH_MS,
+            input_routing_gate_ms: 0,
             buffered_terminal_input: Vec::new(),
             buffered_terminal_navigation: Vec::new(),
             terminal_held_key_repeat: None,
@@ -22971,5 +23206,159 @@ mod tests {
         config.ai_hooks.global_enabled = false;
 
         assert!(AdeApp::ai_hook_manager_from_config(&config).is_none());
+    }
+
+    #[test]
+    fn factory_droid_pty_stop_requires_tool_type_suffix() {
+        // "stop - " WITHOUT a known tool-type suffix should NOT be treated as PtyStop
+        // (these are error/failure messages, not hook screen headers)
+        assert_eq!(
+            AdeApp::factory_droid_attention_source_from_chunk("error: stop - the command failed"),
+            None
+        );
+        assert_eq!(
+            AdeApp::factory_droid_attention_source_from_chunk("Tool failed. Stop reason: killed"),
+            None
+        );
+        assert_eq!(
+            AdeApp::factory_droid_attention_source_from_chunk("failed stop - npm ERR!"),
+            None
+        );
+        assert_eq!(
+            AdeApp::factory_droid_attention_source_from_chunk("stop - unknowntype"),
+            None
+        );
+        assert_eq!(
+            AdeApp::factory_droid_attention_source_from_chunk("stop - customtool"),
+            None
+        );
+
+        // "stop - " WITH a known tool-type suffix SHOULD be treated as PtyStop
+        assert_eq!(
+            AdeApp::factory_droid_attention_source_from_chunk("─\nstop - tool\n│"),
+            Some(FactoryDroidStatusSource::PtyStop)
+        );
+        assert_eq!(
+            AdeApp::factory_droid_attention_source_from_chunk("Stop - Matcher"),
+            Some(FactoryDroidStatusSource::PtyStop)
+        );
+        assert_eq!(
+            AdeApp::factory_droid_attention_source_from_chunk("stop - plan"),
+            Some(FactoryDroidStatusSource::PtyStop)
+        );
+        assert_eq!(
+            AdeApp::factory_droid_attention_source_from_chunk("STOP - TEST"),
+            Some(FactoryDroidStatusSource::PtyStop)
+        );
+        assert_eq!(
+            AdeApp::factory_droid_attention_source_from_chunk("stop - planner"),
+            Some(FactoryDroidStatusSource::PtyStop)
+        );
+    }
+
+    #[test]
+    fn factory_droid_pty_stop_detects_hooks_stop_patterns() {
+        // HOOKS Stop variants should always be treated as PtyStop
+        assert_eq!(
+            AdeApp::factory_droid_attention_source_from_chunk("HOOKS  Stop"),
+            Some(FactoryDroidStatusSource::PtyStop)
+        );
+        assert_eq!(
+            AdeApp::factory_droid_attention_source_from_chunk("HOOKS Stop"),
+            Some(FactoryDroidStatusSource::PtyStop)
+        );
+        assert_eq!(
+            AdeApp::factory_droid_attention_source_from_chunk("hook stop"),
+            Some(FactoryDroidStatusSource::PtyStop)
+        );
+        assert_eq!(
+            AdeApp::factory_droid_attention_source_from_chunk("[droid-hook:event=stop]"),
+            Some(FactoryDroidStatusSource::PtyStop)
+        );
+        assert_eq!(
+            AdeApp::factory_droid_attention_source_from_chunk("[factory-droid-hook:event=Stop]"),
+            Some(FactoryDroidStatusSource::PtyStop)
+        );
+    }
+
+    #[test]
+    fn codex_attention_reason_execution_error_classification() {
+        // ExecutionError is classified from notify event_kind
+        assert_eq!(
+            CodexAttentionReason::from_event_kind(Some("execution-error")),
+            CodexAttentionReason::ExecutionError
+        );
+        assert_eq!(
+            CodexAttentionReason::from_event_kind(Some("executionErrorFault")),
+            CodexAttentionReason::ExecutionError
+        );
+        assert_eq!(
+            CodexAttentionReason::from_event_kind(Some("ToolExecutionError")),
+            CodexAttentionReason::ExecutionError
+        );
+
+        // ExecutionError does NOT persist after session exit or clear on acknowledge
+        // (unlike TurnComplete) — this prevents it from silencing the spinner
+        assert!(!CodexAttentionReason::persists_after_session_exit(
+            CodexAttentionReason::ExecutionError
+        ));
+        assert!(!CodexAttentionReason::clears_on_terminal_acknowledge(
+            CodexAttentionReason::ExecutionError
+        ));
+
+        // TurnComplete still persists
+        assert!(CodexAttentionReason::persists_after_session_exit(
+            CodexAttentionReason::TurnComplete
+        ));
+
+        // UnknownNotify does NOT persist (was previously treated like TurnComplete)
+        assert!(!CodexAttentionReason::persists_after_session_exit(
+            CodexAttentionReason::UnknownNotify
+        ));
+        assert!(!CodexAttentionReason::clears_on_terminal_acknowledge(
+            CodexAttentionReason::UnknownNotify
+        ));
+    }
+
+    #[test]
+    fn codex_notify_execution_error_inbox_event_sets_execution_error_reason() {
+        let ctx = Context::default();
+        let temp_dir = TestTempDir::new("codex-notify-execution-error");
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.codex_cli_runtime_dir = Some(temp_dir.path.clone());
+
+        write_test_codex_notify_events(
+            &temp_dir.path,
+            1,
+            &test_codex_inbox_token(1),
+            &[CodexNotifyInboxEvent {
+                terminal_id: "1".to_owned(),
+                tool: "codex".to_owned(),
+                status: "attention".to_owned(),
+                inbox_token: Some(test_codex_inbox_token(1)),
+                event_kind: Some("execution-error".to_owned()),
+                raw_json: r#"{"event":"execution-error"}"#.to_owned(),
+                timestamp_utc: "2026-04-10T00:00:00Z".to_owned(),
+            }],
+        );
+
+        app.poll_codex_notify_inboxes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::ExecutionError)
+        );
+        // ExecutionError tooltip should mention failure
+        let lines = ai_badge_tooltip_lines(
+            terminal.ai_session.tool,
+            terminal.ai_session.status,
+            terminal.factory_droid_attention_reason,
+            terminal.codex_attention_reason,
+        );
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("failed") || l.contains("Execution failed")));
     }
 }
