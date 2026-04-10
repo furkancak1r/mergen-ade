@@ -1,5 +1,20 @@
 ### Known Issues & Fix Log
 
+#### Terminal switches could reopen the transcript at a blank bottom offset instead of the live prompt {#terminal-switches-could-reopen-the-transcript-at-a-blank-bottom-offset-instead-of-the-live-prompt}
+- Date: 2026-04-10T00:00:00Z
+- Context: main terminal pane scroll behavior while switching the active terminal
+- Error signature: `After changing terminals, the viewport could land at the bottom of the rendered transcript with no useful text visible until the user manually scrolled back up.`
+- Symptoms/Impact: Terminal changes intermittently reopened a pane in a visually empty lower region, making the current prompt/output appear lost until the user scrolled upward.
+- Root cause: The terminal `ScrollArea` persisted per-terminal scroll state and stayed bottom-sticky for any non-empty transcript, but activation did not issue a one-shot realignment to the current prompt/cursor row.
+- Resolution:
+  - Added an activation-only scroll-alignment flag on terminal entries.
+  - On first render after activation, the terminal pane now disables bottom stickiness and applies a vertical offset that targets the stable input cursor row, falling back to the live cursor row or last non-empty line.
+  - Once content has been aligned, normal bottom-follow behavior resumes for ongoing terminal output.
+- Prevent recurrence:
+  - When restoring terminal-scoped scroll state, explicitly decide activation behavior instead of inheriting sticky log-view defaults.
+  - Keep pure helper coverage for prompt-target selection and offset clamping so viewport regressions do not depend on ad hoc manual testing.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+
 #### Crash-resistance hardening now keeps startup and config persistence alive under unwind-safe panic handling {#crash-resistance-hardening-now-keeps-startup-and-config-persistence-alive-under-unwind-safe-panic-handling}
 - Date: 2026-04-09T00:00:00Z
 - Context: main startup path and config persistence on Windows and non-Windows targets
@@ -1430,3 +1445,17 @@
   - Re-check cursor affordance after converting button-based flows into full-row click targets.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: 2026-04-09 user-reported launcher menu hover cursor mismatch
+
+#### Codex could flip from running spinner to pulse on a stray BEL or title-driven idle update {#codex-could-flip-from-running-spinner-to-pulse-on-a-stray-bel-or-title-driven-idle-update}
+- Date: 2026-04-10T00:00:00Z
+- Context: main/Windows local Codex CLI integration while an active Codex turn is still running
+- Error signature: `Codex was still working, but the Mergen badge switched from spinner to pulse.`
+- Symptoms/Impact: Users could misread an active Codex turn as blocked on input, especially when no real prompt or approval screen was visible. This made the activity rail and terminal badges unreliable during long-running Codex work.
+- Root cause: `src/app.rs` treated any Codex raw PTY chunk containing `[bell]` as `Attention`, even though `src/terminal.rs` emits `[bell]` for every non-title BEL and not only for actionable Codex waits. Separately, the generic `AiStatusChange` branch accepted title-derived Codex status changes directly, so a transient idle-like title update could also overwrite a live running session.
+- Resolution: Codex now ignores bare BEL chunks for badge-state transitions and also ignores title-derived `AiStatusChange` updates. Codex pulse states remain driven by explicit visible Codex wait UI, notify inbox events, and interrupt-banner handling instead of generic terminal noise.
+- Prevent recurrence:
+  - Keep generic BEL handling lossy for Codex unless it is paired with a concrete wait-state reason.
+  - Do not let title-derived Codex status updates override explicit process- and prompt-driven state.
+  - Add regression coverage for non-authoritative terminal noise during active Codex runs.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-10 user-reported Codex spinner-to-pulse regression; regression tests `codex_running_spinner_is_not_downgraded_by_bell_chunk` and `codex_title_attention_update_does_not_override_active_running_session`

@@ -534,7 +534,6 @@ enum CodexCliStatusSource {
     PromptSubmit,
     Notify,
     VisibleUi,
-    Bell,
 }
 
 impl CodexCliStatusSource {
@@ -543,7 +542,6 @@ impl CodexCliStatusSource {
             Self::PromptSubmit => "prompt_submit",
             Self::Notify => "notify",
             Self::VisibleUi => "visible_ui",
-            Self::Bell => "bell",
         }
     }
 }
@@ -853,6 +851,7 @@ struct TerminalEntry {
     pending_link_click: Option<PendingTerminalLinkClick>,
     selection_drag_active: bool,
     snapshot_refresh_deferred: bool,
+    activation_scroll_align_pending: bool,
     exited: bool,
     runtime: TerminalRuntime,
     ai_session: AiCliSession,
@@ -2415,6 +2414,7 @@ impl AdeApp {
             pending_link_click: None,
             selection_drag_active: false,
             snapshot_refresh_deferred: false,
+            activation_scroll_align_pending: false,
             exited: false,
             runtime,
             ai_session: AiCliSession::default(),
@@ -3174,9 +3174,6 @@ impl AdeApp {
         CodexCliStatusSource,
         Option<CodexAttentionReason>,
     )> {
-        if chunk.contains("[bell]") {
-            return Some((AiCliStatus::Attention, CodexCliStatusSource::Bell, None));
-        }
         if chunk == "codex-question-prompt" {
             return Some((
                 AiCliStatus::Attention,
@@ -3388,14 +3385,6 @@ impl AdeApp {
             && entry.ai_session.tool == Some(AiCliTool::CodexCli)
             && entry.ai_session.status == AiCliStatus::Attention
             && match source {
-                CodexCliStatusSource::Bell => matches!(
-                    entry.codex_last_status_source,
-                    Some(
-                        CodexCliStatusSource::Notify
-                            | CodexCliStatusSource::VisibleUi
-                            | CodexCliStatusSource::Bell
-                    )
-                ),
                 CodexCliStatusSource::VisibleUi => {
                     (entry.codex_last_status_source == Some(CodexCliStatusSource::Notify)
                         && entry.codex_attention_reason == attention_reason)
@@ -3834,6 +3823,9 @@ impl AdeApp {
                             dirty_ids.insert(terminal_id);
                         }
                     } else if tool == Some(AiCliTool::CodexCli) {
+                        if from_title {
+                            continue;
+                        }
                         if let Some(entry) = self.terminals.get_mut(&terminal_id) {
                             entry.ai_session.tool = Some(AiCliTool::CodexCli);
                             entry.ai_session.status = status;
@@ -5696,6 +5688,7 @@ impl AdeApp {
             // briefly flash a stale/empty scroll viewport on the next frame.
             if let Some(entry) = self.terminals.get_mut(&terminal_id) {
                 entry.snapshot_refresh_deferred = false;
+                entry.activation_scroll_align_pending = true;
                 entry.dirty = true;
             }
         }
@@ -8745,13 +8738,23 @@ impl AdeApp {
                             }
 
                             ui.add_space(8.0);
-                            ui.add(
+                            let project_label_text = format!("{}  {}", icons::FOLDER, project_name);
+                            let project_label_font = egui::TextStyle::Small.resolve(ui.style());
+                            let project_label_response = ui.add(
                                 egui::Label::new(
-                                    RichText::new(format!("{}  {}", icons::FOLDER, project_name))
+                                    RichText::new(&project_label_text)
                                         .small()
                                         .color(header_chrome.detail_color),
                                 )
                                 .truncate(),
+                            );
+                            let _project_label_response = with_truncation_tooltip(
+                                ui,
+                                project_label_response,
+                                &project_name,
+                                &project_label_font,
+                                header_chrome.detail_color,
+                                ui.available_width(),
                             );
                             ui.add_space(6.0);
                             ui.add(
@@ -8894,281 +8897,284 @@ impl AdeApp {
 
                 // Avoid jumping the scroll position when the cache is empty (e.g. right
                 // after a terminal switch before the first snapshot arrives).
-                let has_content = !terminal.render_cache.lines.is_empty();
-                egui::ScrollArea::vertical()
+                let scroll_behavior =
+                    terminal_output_scroll_behavior(terminal, line_height, output_height);
+                terminal.activation_scroll_align_pending =
+                    scroll_behavior.keep_activation_alignment_pending;
+                let mut scroll_area = egui::ScrollArea::vertical()
                     .id_salt(format!("term-output-{terminal_id}"))
                     .max_height(output_height)
                     .auto_shrink([false, false])
-                    .stick_to_bottom(has_content)
-                    .show(&mut output_ui, |ui| {
-                        ui.set_width(output_size.x);
-                        ui.set_min_width(output_size.x);
-                        ui.set_min_height(output_size.y);
-                        if terminal.render_cache.lines.is_empty() {
-                            let mut layout_job = LayoutJob::default();
-                            layout_job.wrap.max_width = f32::INFINITY;
-                            layout_job.append(
-                                "Terminal is resizing...",
-                                0.0,
-                                TextFormat {
-                                    font_id: font_id.clone(),
-                                    color: TEXT_MUTED,
-                                    ..TextFormat::default()
-                                },
-                            );
-                            let galley = ui.painter().layout_job(layout_job);
-                            let (rect, response) = allocate_terminal_output_surface(
-                                ui,
-                                output_size,
-                                galley.size().y,
-                                Sense::click(),
-                            );
-                            ui.painter().galley(rect.min, galley, TEXT_MUTED);
-                            if response.clicked() {
-                                pane_clicked = true;
-                            }
-                            if response.secondary_clicked() {
-                                pane_clicked = true;
-                            }
-                            let can_paste = !terminal.exited;
-                            if response.secondary_clicked() && can_paste {
-                                paste_requested = true;
-                            }
-                        } else {
-                            let render = build_terminal_render(
-                                &terminal.render_cache,
-                                &font_id,
-                                terminal.exited,
-                                terminal.shell,
-                                terminal.stable_input_cursor_row,
-                                ui.ctx().input(|input| input.time),
-                            );
-                            let TerminalRenderModel {
-                                layout_job,
-                                cursor_overlay,
-                            } = render;
-                            let galley = ui.painter().layout_job(layout_job);
-                            let (rect, response) = allocate_terminal_output_surface(
-                                ui,
-                                output_size,
-                                galley.size().y,
-                                Sense::click_and_drag(),
-                            );
-                            let (primary_pressed, primary_down, primary_released) =
-                                ui.ctx().input(|input| {
-                                    (
-                                        input.pointer.primary_pressed(),
-                                        input.pointer.primary_down(),
-                                        input.pointer.primary_released(),
-                                    )
-                                });
-                            let link_activation_modifiers_active = ui
-                                .ctx()
-                                .input(|input| terminal_link_activation_modifiers(input.modifiers));
-                            let primary_drag_started =
-                                response.drag_started_by(egui::PointerButton::Primary);
-                            let primary_dragged = response.dragged_by(egui::PointerButton::Primary);
-                            let primary_clicked = response.clicked_by(egui::PointerButton::Primary);
-                            let primary_pressed_on_terminal =
-                                response.is_pointer_button_down_on() && primary_pressed;
-                            let should_resolve_link = should_resolve_terminal_link(
-                                link_activation_modifiers_active,
-                                primary_pressed_on_terminal,
-                                terminal.pending_link_click.is_some(),
-                            );
-                            let should_track_pointer =
-                                primary_drag_started || primary_dragged || should_resolve_link;
-                            if should_track_pointer || terminal.selection.is_some() {
-                                Self::ensure_terminal_selection_snapshot(terminal);
-                            }
-                            let pointer_pos =
-                                response.hover_pos().or(response.interact_pointer_pos());
-                            let pointer_point = should_track_pointer
-                                .then(|| {
+                    .stick_to_bottom(scroll_behavior.stick_to_bottom);
+                if let Some(offset) = scroll_behavior.vertical_offset {
+                    scroll_area = scroll_area.vertical_scroll_offset(offset);
+                }
+                scroll_area.show(&mut output_ui, |ui| {
+                    ui.set_width(output_size.x);
+                    ui.set_min_width(output_size.x);
+                    ui.set_min_height(output_size.y);
+                    if terminal.render_cache.lines.is_empty() {
+                        let mut layout_job = LayoutJob::default();
+                        layout_job.wrap.max_width = f32::INFINITY;
+                        layout_job.append(
+                            "Terminal is resizing...",
+                            0.0,
+                            TextFormat {
+                                font_id: font_id.clone(),
+                                color: TEXT_MUTED,
+                                ..TextFormat::default()
+                            },
+                        );
+                        let galley = ui.painter().layout_job(layout_job);
+                        let (rect, response) = allocate_terminal_output_surface(
+                            ui,
+                            output_size,
+                            galley.size().y,
+                            Sense::click(),
+                        );
+                        ui.painter().galley(rect.min, galley, TEXT_MUTED);
+                        if response.clicked() {
+                            pane_clicked = true;
+                        }
+                        if response.secondary_clicked() {
+                            pane_clicked = true;
+                        }
+                        let can_paste = !terminal.exited;
+                        if response.secondary_clicked() && can_paste {
+                            paste_requested = true;
+                        }
+                    } else {
+                        let render = build_terminal_render(
+                            &terminal.render_cache,
+                            &font_id,
+                            terminal.exited,
+                            terminal.shell,
+                            terminal.stable_input_cursor_row,
+                            ui.ctx().input(|input| input.time),
+                        );
+                        let TerminalRenderModel {
+                            layout_job,
+                            cursor_overlay,
+                        } = render;
+                        let galley = ui.painter().layout_job(layout_job);
+                        let (rect, response) = allocate_terminal_output_surface(
+                            ui,
+                            output_size,
+                            galley.size().y,
+                            Sense::click_and_drag(),
+                        );
+                        let (primary_pressed, primary_down, primary_released) =
+                            ui.ctx().input(|input| {
+                                (
+                                    input.pointer.primary_pressed(),
+                                    input.pointer.primary_down(),
+                                    input.pointer.primary_released(),
+                                )
+                            });
+                        let link_activation_modifiers_active = ui
+                            .ctx()
+                            .input(|input| terminal_link_activation_modifiers(input.modifiers));
+                        let primary_drag_started =
+                            response.drag_started_by(egui::PointerButton::Primary);
+                        let primary_dragged = response.dragged_by(egui::PointerButton::Primary);
+                        let primary_clicked = response.clicked_by(egui::PointerButton::Primary);
+                        let primary_pressed_on_terminal =
+                            response.is_pointer_button_down_on() && primary_pressed;
+                        let should_resolve_link = should_resolve_terminal_link(
+                            link_activation_modifiers_active,
+                            primary_pressed_on_terminal,
+                            terminal.pending_link_click.is_some(),
+                        );
+                        let should_track_pointer =
+                            primary_drag_started || primary_dragged || should_resolve_link;
+                        if should_track_pointer || terminal.selection.is_some() {
+                            Self::ensure_terminal_selection_snapshot(terminal);
+                        }
+                        let pointer_pos = response.hover_pos().or(response.interact_pointer_pos());
+                        let pointer_point = should_track_pointer
+                            .then(|| {
+                                terminal.selection_snapshot.as_ref().and_then(
+                                    |selection_snapshot| {
+                                        terminal_selection_point_from_pointer(
+                                            pointer_pos,
+                                            rect.min,
+                                            selection_snapshot,
+                                            char_width,
+                                            &galley,
+                                        )
+                                    },
+                                )
+                            })
+                            .flatten();
+                        let link_under_pointer = should_resolve_link
+                            .then(|| {
+                                pointer_point.and_then(|point| {
                                     terminal.selection_snapshot.as_ref().and_then(
                                         |selection_snapshot| {
-                                            terminal_selection_point_from_pointer(
-                                                pointer_pos,
-                                                rect.min,
-                                                selection_snapshot,
-                                                char_width,
-                                                &galley,
-                                            )
+                                            terminal_link_at_point(selection_snapshot, point)
                                         },
                                     )
                                 })
-                                .flatten();
-                            let link_under_pointer = should_resolve_link
-                                .then(|| {
-                                    pointer_point.and_then(|point| {
-                                        terminal.selection_snapshot.as_ref().and_then(
-                                            |selection_snapshot| {
-                                                terminal_link_at_point(selection_snapshot, point)
-                                            },
-                                        )
-                                    })
-                                })
-                                .flatten();
-                            let link_activation_active =
-                                link_activation_modifiers_active && link_under_pointer.is_some();
-                            let response = if link_activation_active {
-                                response.on_hover_cursor(egui::CursorIcon::PointingHand)
-                            } else {
-                                response
-                            };
-                            ui.painter().galley(rect.min, galley.clone(), TEXT_PRIMARY);
-                            if response.is_pointer_button_down_on() && primary_down {
-                                pane_clicked = true;
-                            }
-                            if primary_pressed_on_terminal {
-                                if let Some(point) = pointer_point {
-                                    Self::begin_terminal_primary_interaction(
-                                        terminal,
-                                        point,
-                                        link_under_pointer.clone(),
-                                    );
-                                }
-                            }
-                            if primary_drag_started {
-                                if let Some(point) = pointer_point {
-                                    Self::update_terminal_primary_drag(terminal, point);
-                                }
-                            }
-                            if primary_dragged {
-                                if let Some(point) = pointer_point {
-                                    Self::update_terminal_primary_drag(terminal, point);
-                                }
-                            }
-                            if !primary_down {
-                                terminal.selection_drag_active = false;
-                            }
-                            if response.drag_stopped_by(egui::PointerButton::Primary)
-                                && terminal
-                                    .selection
-                                    .as_ref()
-                                    .is_some_and(|selection| !selection.has_selection())
-                            {
-                                Self::clear_terminal_selection(terminal);
-                            } else if response.drag_stopped_by(egui::PointerButton::Primary) {
-                                terminal.selection_drag_active = false;
-                            }
-                            if primary_clicked {
-                                pane_clicked = true;
-                                link_to_open = Self::take_terminal_primary_clicked_link(
+                            })
+                            .flatten();
+                        let link_activation_active =
+                            link_activation_modifiers_active && link_under_pointer.is_some();
+                        let response = if link_activation_active {
+                            response.on_hover_cursor(egui::CursorIcon::PointingHand)
+                        } else {
+                            response
+                        };
+                        ui.painter().galley(rect.min, galley.clone(), TEXT_PRIMARY);
+                        if response.is_pointer_button_down_on() && primary_down {
+                            pane_clicked = true;
+                        }
+                        if primary_pressed_on_terminal {
+                            if let Some(point) = pointer_point {
+                                Self::begin_terminal_primary_interaction(
                                     terminal,
-                                    link_under_pointer.as_deref(),
-                                    link_activation_active,
+                                    point,
+                                    link_under_pointer.clone(),
                                 );
-                                if link_to_open.is_none() {
-                                    Self::clear_terminal_selection(terminal);
-                                }
-                            } else if response.clicked() {
-                                pane_clicked = true;
-                                Self::clear_terminal_selection(terminal);
                             }
-                            if primary_released {
-                                Self::clear_pending_terminal_link_click(terminal);
+                        }
+                        if primary_drag_started {
+                            if let Some(point) = pointer_point {
+                                Self::update_terminal_primary_drag(terminal, point);
                             }
-
-                            let has_selection = terminal
+                        }
+                        if primary_dragged {
+                            if let Some(point) = pointer_point {
+                                Self::update_terminal_primary_drag(terminal, point);
+                            }
+                        }
+                        if !primary_down {
+                            terminal.selection_drag_active = false;
+                        }
+                        if response.drag_stopped_by(egui::PointerButton::Primary)
+                            && terminal
                                 .selection
                                 .as_ref()
-                                .is_some_and(TerminalSelection::has_selection);
-                            if has_selection {
-                                Self::ensure_terminal_selection_snapshot(terminal);
-                            }
-                            let can_copy = has_selection && terminal.selection_snapshot.is_some();
-                            let can_paste = !terminal.exited;
-                            let mut copy_requested = false;
-                            let secondary_click_action = if response.secondary_clicked() {
-                                pane_clicked = true;
-                                terminal_secondary_click_action(has_selection, can_paste)
-                            } else {
-                                TerminalSecondaryClickAction::None
-                            };
-                            if matches!(
-                                secondary_click_action,
-                                TerminalSecondaryClickAction::PasteImmediately
-                            ) {
-                                paste_requested = true;
-                            }
-                            if has_selection {
-                                response.context_menu(|ui| {
-                                    with_minimal_button_chrome(ui, |ui| {
-                                        ui.add_enabled_ui(can_copy, |ui| {
-                                            if ui.button(format!("{} Copy", icons::COPY)).clicked()
-                                            {
-                                                copy_requested = true;
-                                                ui.close_menu();
-                                            }
-                                        });
-                                    });
-                                });
-                            }
-                            if copy_requested {
-                                copied_selection = Self::selected_terminal_text(terminal);
+                                .is_some_and(|selection| !selection.has_selection())
+                        {
+                            Self::clear_terminal_selection(terminal);
+                        } else if response.drag_stopped_by(egui::PointerButton::Primary) {
+                            terminal.selection_drag_active = false;
+                        }
+                        if primary_clicked {
+                            pane_clicked = true;
+                            link_to_open = Self::take_terminal_primary_clicked_link(
+                                terminal,
+                                link_under_pointer.as_deref(),
+                                link_activation_active,
+                            );
+                            if link_to_open.is_none() {
                                 Self::clear_terminal_selection(terminal);
                             }
-                            let empty_selection_snapshot = TerminalSelectionSnapshot::default();
-                            let selection_snapshot = terminal
-                                .selection_snapshot
-                                .as_ref()
-                                .unwrap_or(&empty_selection_snapshot);
-                            paint_terminal_selection(
+                        } else if response.clicked() {
+                            pane_clicked = true;
+                            Self::clear_terminal_selection(terminal);
+                        }
+                        if primary_released {
+                            Self::clear_pending_terminal_link_click(terminal);
+                        }
+
+                        let has_selection = terminal
+                            .selection
+                            .as_ref()
+                            .is_some_and(TerminalSelection::has_selection);
+                        if has_selection {
+                            Self::ensure_terminal_selection_snapshot(terminal);
+                        }
+                        let can_copy = has_selection && terminal.selection_snapshot.is_some();
+                        let can_paste = !terminal.exited;
+                        let mut copy_requested = false;
+                        let secondary_click_action = if response.secondary_clicked() {
+                            pane_clicked = true;
+                            terminal_secondary_click_action(has_selection, can_paste)
+                        } else {
+                            TerminalSecondaryClickAction::None
+                        };
+                        if matches!(
+                            secondary_click_action,
+                            TerminalSecondaryClickAction::PasteImmediately
+                        ) {
+                            paste_requested = true;
+                        }
+                        if has_selection {
+                            response.context_menu(|ui| {
+                                with_minimal_button_chrome(ui, |ui| {
+                                    ui.add_enabled_ui(can_copy, |ui| {
+                                        if ui.button(format!("{} Copy", icons::COPY)).clicked() {
+                                            copy_requested = true;
+                                            ui.close_menu();
+                                        }
+                                    });
+                                });
+                            });
+                        }
+                        if copy_requested {
+                            copied_selection = Self::selected_terminal_text(terminal);
+                            Self::clear_terminal_selection(terminal);
+                        }
+                        let empty_selection_snapshot = TerminalSelectionSnapshot::default();
+                        let selection_snapshot = terminal
+                            .selection_snapshot
+                            .as_ref()
+                            .unwrap_or(&empty_selection_snapshot);
+                        paint_terminal_selection(
+                            ui,
+                            rect.min,
+                            selection_snapshot,
+                            terminal.selection.as_ref(),
+                            char_width,
+                            &galley,
+                        );
+                        if let Some(cursor_overlay) = cursor_overlay {
+                            paint_terminal_cursor(
                                 ui,
                                 rect.min,
-                                selection_snapshot,
-                                terminal.selection.as_ref(),
                                 char_width,
-                                &galley,
+                                line_height,
+                                cursor_overlay,
                             );
-                            if let Some(cursor_overlay) = cursor_overlay {
-                                paint_terminal_cursor(
-                                    ui,
-                                    rect.min,
-                                    char_width,
-                                    line_height,
-                                    cursor_overlay,
-                                );
-                            }
-                            let wheel_delta = ui.ctx().input(|input| input.smooth_scroll_delta);
-                            if wheel_delta != Vec2::ZERO {
-                                if let Some(pointer_pos) =
-                                    ui.ctx().input(|input| input.pointer.interact_pos())
+                        }
+                        let wheel_delta = ui.ctx().input(|input| input.smooth_scroll_delta);
+                        if wheel_delta != Vec2::ZERO {
+                            if let Some(pointer_pos) =
+                                ui.ctx().input(|input| input.pointer.interact_pos())
+                            {
+                                if rect.contains(pointer_pos)
+                                    && terminal.runtime.is_mouse_reporting_active()
                                 {
-                                    if rect.contains(pointer_pos)
-                                        && terminal.runtime.is_mouse_reporting_active()
-                                    {
-                                        let direction = if wheel_delta.y > 0.0 {
-                                            WheelDirection::Up
-                                        } else if wheel_delta.y < 0.0 {
-                                            WheelDirection::Down
-                                        } else if wheel_delta.x > 0.0 {
-                                            WheelDirection::Right
-                                        } else {
-                                            WheelDirection::Left
-                                        };
-                                        let cell_x = ((pointer_pos.x - rect.min.x) / char_width)
-                                            .floor()
-                                            as usize;
-                                        let cell_y = ((pointer_pos.y - rect.min.y) / line_height)
-                                            .floor()
-                                            as usize;
-                                        terminal.runtime.send_mouse_wheel(TerminalWheelEvent {
-                                            direction,
-                                            x: cell_x,
-                                            y: cell_y,
-                                            x_pixel_offset: 0,
-                                            y_pixel_offset: 0,
-                                        });
-                                        ui.ctx().input_mut(|input| {
-                                            input.smooth_scroll_delta = Vec2::ZERO;
-                                        });
-                                    }
+                                    let direction = if wheel_delta.y > 0.0 {
+                                        WheelDirection::Up
+                                    } else if wheel_delta.y < 0.0 {
+                                        WheelDirection::Down
+                                    } else if wheel_delta.x > 0.0 {
+                                        WheelDirection::Right
+                                    } else {
+                                        WheelDirection::Left
+                                    };
+                                    let cell_x = ((pointer_pos.x - rect.min.x) / char_width).floor()
+                                        as usize;
+                                    let cell_y = ((pointer_pos.y - rect.min.y) / line_height)
+                                        .floor()
+                                        as usize;
+                                    terminal.runtime.send_mouse_wheel(TerminalWheelEvent {
+                                        direction,
+                                        x: cell_x,
+                                        y: cell_y,
+                                        x_pixel_offset: 0,
+                                        y_pixel_offset: 0,
+                                    });
+                                    ui.ctx().input_mut(|input| {
+                                        input.smooth_scroll_delta = Vec2::ZERO;
+                                    });
                                 }
                             }
                         }
-                    });
+                    }
+                });
                 ui.expand_to_include_x(pane_right);
             }
 
@@ -11390,11 +11396,13 @@ fn draw_terminal_manager_title_and_diff_summary(
     row_height: f32,
     #[allow(unused_variables)] diff_summary: &TerminalManagerDiffSummaryModel,
     show_pointing_cursor: bool,
+    tooltip_text: Option<&str>,
 ) -> TerminalManagerTitleSummaryLayout {
     ui.allocate_ui_with_layout(
         egui::vec2(ui.available_width().max(0.0), row_height),
         Layout::left_to_right(Align::Center),
         |ui| {
+            let font_id = egui::TextStyle::Body.resolve(ui.style());
             let title_label = egui::Label::new(RichText::new(title).color(text_color).strong())
                 .truncate()
                 .selectable(false)
@@ -11409,14 +11417,23 @@ fn draw_terminal_manager_title_and_diff_summary(
                 );
                 title_response.widget_info(|| info.clone());
             }
-            if show_pointing_cursor {
-                title_response
-                    .clone()
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .on_hover_text(title);
+            let title_response = if show_pointing_cursor {
+                title_response.on_hover_cursor(egui::CursorIcon::PointingHand)
             } else {
-                title_response.clone().on_hover_text(title);
-            }
+                title_response
+            };
+            let title_response = if let Some(tooltip) = tooltip_text {
+                with_truncation_tooltip(
+                    ui,
+                    title_response,
+                    tooltip,
+                    &font_id,
+                    text_color,
+                    ui.available_width(),
+                )
+            } else {
+                title_response.on_hover_text(title)
+            };
 
             ui.add_space(6.0);
 
@@ -11807,6 +11824,7 @@ fn draw_project_group_header(
                     row_height,
                     diff_summary,
                     can_expand,
+                    Some(project_name),
                 );
             },
         );
@@ -12848,6 +12866,65 @@ fn terminal_output_surface_size(output_size: Vec2, content_height: f32) -> Vec2 
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TerminalOutputScrollBehavior {
+    vertical_offset: Option<f32>,
+    stick_to_bottom: bool,
+    keep_activation_alignment_pending: bool,
+}
+
+fn terminal_output_scroll_behavior(
+    terminal: &TerminalEntry,
+    line_height: f32,
+    viewport_height: f32,
+) -> TerminalOutputScrollBehavior {
+    let has_content = !terminal.render_cache.lines.is_empty();
+    let activation_offset = terminal
+        .activation_scroll_align_pending
+        .then(|| {
+            terminal_activation_scroll_offset(
+                &terminal.render_cache,
+                terminal.stable_input_cursor_row,
+                line_height,
+                viewport_height,
+            )
+        })
+        .flatten();
+
+    TerminalOutputScrollBehavior {
+        vertical_offset: activation_offset,
+        stick_to_bottom: has_content && activation_offset.is_none(),
+        keep_activation_alignment_pending: terminal.activation_scroll_align_pending && !has_content,
+    }
+}
+
+fn terminal_activation_scroll_offset(
+    snapshot: &TerminalSnapshot,
+    stable_input_cursor_row: Option<usize>,
+    line_height: f32,
+    viewport_height: f32,
+) -> Option<f32> {
+    if snapshot.lines.is_empty() {
+        return None;
+    }
+
+    let target_row = stable_input_cursor_row
+        .or_else(|| snapshot.cursor.map(|cursor| cursor.y))
+        .or_else(|| terminal_last_non_empty_row(snapshot))?;
+    let preferred_top_row = target_row.saturating_sub(2);
+    let content_height = snapshot.lines.len() as f32 * line_height.max(0.0);
+    let max_offset = (content_height - viewport_height.max(0.0)).max(0.0);
+    Some((preferred_top_row as f32 * line_height.max(0.0)).clamp(0.0, max_offset))
+}
+
+fn terminal_last_non_empty_row(snapshot: &TerminalSnapshot) -> Option<usize> {
+    snapshot.lines.iter().rposition(|line| {
+        line.runs
+            .iter()
+            .any(|run| !run.text.trim_end_matches(' ').is_empty())
+    })
+}
+
 fn allocate_terminal_output_surface(
     ui: &mut Ui,
     output_size: Vec2,
@@ -13269,13 +13346,14 @@ mod tests {
         settings_saved_messages_project_header_layout, settings_saved_messages_project_state_id,
         settings_saved_messages_stacks_draft_row, settings_text_edit_chrome,
         settings_window_size_for_screen, should_resolve_terminal_link, source_control_badge_color,
-        source_control_tooltip_lines, terminal_cell_metric, terminal_cursor_blink_phase_visible,
-        terminal_cursor_overlay_rect, terminal_font_family, terminal_font_id,
-        terminal_grid_dimensions, terminal_line_height, terminal_link_activation_modifiers,
-        terminal_link_at_point, terminal_logical_line, terminal_logical_line_byte_index,
-        terminal_manager_actions_width, terminal_manager_diff_summary_model,
-        terminal_manager_diff_summary_visual, terminal_manager_row_chrome,
-        terminal_manager_row_widths, terminal_output_surface_size, terminal_output_viewport_size,
+        source_control_tooltip_lines, terminal_activation_scroll_offset, terminal_cell_metric,
+        terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect, terminal_font_family,
+        terminal_font_id, terminal_grid_dimensions, terminal_line_height,
+        terminal_link_activation_modifiers, terminal_link_at_point, terminal_logical_line,
+        terminal_logical_line_byte_index, terminal_manager_actions_width,
+        terminal_manager_diff_summary_model, terminal_manager_diff_summary_visual,
+        terminal_manager_row_chrome, terminal_manager_row_widths, terminal_output_scroll_behavior,
+        terminal_output_surface_size, terminal_output_viewport_size,
         terminal_secondary_click_action, terminal_selection_point_from_pointer,
         terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
         with_settings_text_edit_chrome, AdeApp, AiBadgeModel, AiBadgeVisual, CodexAttentionReason,
@@ -13286,9 +13364,9 @@ mod tests {
         PendingTerminalLinkClick, SettingsSection, SourceControlBadgeState, SourceControlFile,
         SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
-        TerminalSecondaryClickAction, TerminalSelection, TerminalSelectionPoint, TransientToast,
-        CODEX_LAUNCH_GRACE_MS, CODEX_PROCESS_POLL_MS, CODEX_RUNNING_GRACE_MS,
-        CODEX_TRAILING_OUTPUT_GRACE_MS, DIRECTORY_INDEX_CHANNEL_CAPACITY,
+        TerminalOutputScrollBehavior, TerminalSecondaryClickAction, TerminalSelection,
+        TerminalSelectionPoint, TransientToast, CODEX_LAUNCH_GRACE_MS, CODEX_PROCESS_POLL_MS,
+        CODEX_RUNNING_GRACE_MS, CODEX_TRAILING_OUTPUT_GRACE_MS, DIRECTORY_INDEX_CHANNEL_CAPACITY,
         FACTORY_DROID_HOOK_POLL_MS, FACTORY_DROID_PROCESS_POLL_MS,
         FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS, SOURCE_CONTROL_CHANNEL_CAPACITY,
         SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG, TERMINAL_COPY_FEEDBACK_TEXT,
@@ -15901,6 +15979,7 @@ mod tests {
                             super::CONTROL_ROW_HEIGHT,
                             &diff_summary,
                             false,
+                            Some("project name that should truncate"),
                         );
                         observed = Some((layout.title_rect, layout.diff_summary_rect));
                     },
@@ -16628,6 +16707,89 @@ mod tests {
 
         assert_eq!(size.x, 320.0);
         assert_eq!(size.y, 260.0);
+    }
+
+    #[test]
+    fn terminal_activation_scroll_offset_prefers_stable_input_cursor_row() {
+        let snapshot = TerminalSnapshot {
+            lines: vec![TerminalStyledLine::default(); 12],
+            cursor: Some(TerminalCursor {
+                x: 0,
+                y: 9,
+                shape: TerminalCursorShape::Block,
+                blinking: false,
+            }),
+            cursor_line: None,
+        };
+
+        let offset = terminal_activation_scroll_offset(&snapshot, Some(6), 10.0, 40.0);
+
+        assert_eq!(offset, Some(40.0));
+    }
+
+    #[test]
+    fn terminal_activation_scroll_offset_falls_back_to_last_non_empty_row_and_clamps() {
+        let snapshot = TerminalSnapshot {
+            lines: vec![
+                TerminalStyledLine::default(),
+                TerminalStyledLine {
+                    runs: vec![TerminalStyledRun {
+                        text: "prompt".to_owned(),
+                        style: test_terminal_style(),
+                        column: 0,
+                        display_width: 6,
+                    }],
+                },
+                TerminalStyledLine::default(),
+                TerminalStyledLine::default(),
+            ],
+            cursor: None,
+            cursor_line: None,
+        };
+
+        let offset = terminal_activation_scroll_offset(&snapshot, None, 12.0, 60.0);
+
+        assert_eq!(offset, Some(0.0));
+    }
+
+    #[test]
+    fn terminal_output_scroll_behavior_keeps_pending_until_content_arrives() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.activation_scroll_align_pending = true;
+
+        let behavior = terminal_output_scroll_behavior(&terminal, 14.0, 140.0);
+
+        assert_eq!(
+            behavior,
+            TerminalOutputScrollBehavior {
+                vertical_offset: None,
+                stick_to_bottom: false,
+                keep_activation_alignment_pending: true,
+            }
+        );
+    }
+
+    #[test]
+    fn terminal_output_scroll_behavior_disables_stick_to_bottom_for_activation_alignment() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.activation_scroll_align_pending = true;
+        terminal.stable_input_cursor_row = Some(8);
+        terminal.render_cache = TerminalSnapshot {
+            lines: vec![TerminalStyledLine::default(); 20],
+            cursor: Some(TerminalCursor {
+                x: 0,
+                y: 10,
+                shape: TerminalCursorShape::Block,
+                blinking: false,
+            }),
+            cursor_line: None,
+        };
+
+        let behavior = terminal_output_scroll_behavior(&terminal, 10.0, 50.0);
+
+        assert_eq!(behavior.vertical_offset, Some(60.0));
+        assert!(!behavior.stick_to_bottom);
+        assert!(!behavior.keep_activation_alignment_pending);
     }
 
     #[test]
@@ -19545,7 +19707,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_status_lifecycle_transitions_running_attention_idle_running_and_inactive() {
+    fn codex_running_spinner_is_not_downgraded_by_bell_chunk() {
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
         let baseline_identity = TrackedProcessIdentity {
@@ -19617,10 +19779,10 @@ mod tests {
         app.process_terminal_events(&ctx);
         {
             let terminal = app.terminals.get(&1).expect("terminal 1");
-            assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+            assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
             assert_eq!(
                 terminal.codex_last_status_source,
-                Some(CodexCliStatusSource::Bell)
+                Some(CodexCliStatusSource::PromptSubmit)
             );
         }
 
@@ -19628,7 +19790,7 @@ mod tests {
         {
             let terminal = app.terminals.get(&1).expect("terminal 1");
             assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
-            assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+            assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
             assert_eq!(terminal.pending_line_for_title, "continue");
         }
 
@@ -19674,6 +19836,42 @@ mod tests {
             AiCliStatus::Running,
             "status stays Running within grace period"
         );
+    }
+
+    #[test]
+    fn codex_title_attention_update_does_not_override_active_running_session() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+            entry.codex_last_status_source = Some(CodexCliStatusSource::PromptSubmit);
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiStatusChange {
+                    terminal_id: 1,
+                    tool: Some(AiCliTool::CodexCli),
+                    status: AiCliStatus::Attention,
+                    event: None,
+                    from_title: true,
+                },
+            })
+            .expect("send codex title attention update");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+        assert_eq!(
+            terminal.codex_last_status_source,
+            Some(CodexCliStatusSource::PromptSubmit)
+        );
+        assert_eq!(terminal.codex_attention_reason, None);
     }
 
     #[test]
@@ -21064,7 +21262,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_bell_is_deduped_after_notify_attention() {
+    fn codex_bell_does_not_override_notify_attention() {
         let ctx = Context::default();
         let temp_dir = TestTempDir::new("codex-notify-bell-dedupe");
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
@@ -21680,6 +21878,7 @@ mod tests {
             pending_link_click: None,
             selection_drag_active: false,
             snapshot_refresh_deferred: false,
+            activation_scroll_align_pending: false,
             exited: false,
             runtime,
             ai_session: AiCliSession::default(),
@@ -23539,6 +23738,26 @@ mod tests {
         assert!(
             !entry.snapshot_refresh_deferred,
             "deferred snapshot flag must be cleared on activation"
+        );
+        assert!(
+            entry.activation_scroll_align_pending,
+            "newly active terminal should request a prompt-aligned scroll on first render"
+        );
+    }
+
+    #[test]
+    fn set_active_terminal_same_terminal_does_not_rearm_activation_scroll_alignment() {
+        let mut entry = test_terminal_entry_with_runtime(1, 7, test_terminal_runtime());
+        entry.activation_scroll_align_pending = false;
+        let mut app = test_app([(1, entry)], Some(1));
+
+        let ctx = Context::default();
+        app.set_active_terminal(&ctx, Some(1));
+
+        let entry = app.terminals.get(&1).unwrap();
+        assert!(
+            !entry.activation_scroll_align_pending,
+            "reselecting the active terminal should not force a fresh activation scroll"
         );
     }
 
