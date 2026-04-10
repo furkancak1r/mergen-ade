@@ -367,19 +367,19 @@ default_shell = "powershell"
         assert_eq!(config.launchers.len(), 4);
         assert_eq!(
             config.launchers[0].builtin,
-            Some(BuiltinLauncherKind::Codex)
-        );
-        assert_eq!(
-            config.launchers[1].builtin,
-            Some(BuiltinLauncherKind::Claude)
-        );
-        assert_eq!(
-            config.launchers[2].builtin,
             Some(BuiltinLauncherKind::Droid)
         );
         assert_eq!(
-            config.launchers[3].builtin,
+            config.launchers[1].builtin,
+            Some(BuiltinLauncherKind::Codex)
+        );
+        assert_eq!(
+            config.launchers[2].builtin,
             Some(BuiltinLauncherKind::OpenCode)
+        );
+        assert_eq!(
+            config.launchers[3].builtin,
+            Some(BuiltinLauncherKind::Claude)
         );
 
         let _ = fs::remove_file(path);

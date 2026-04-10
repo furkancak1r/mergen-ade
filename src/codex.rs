@@ -24,6 +24,7 @@ pub const CODEX_TURN_COMPLETE_EVENT: &str = "agent-turn-complete";
 pub const CODEX_APPROVAL_REQUESTED_EVENT: &str = "approval-requested";
 pub const CODEX_USER_INPUT_REQUESTED_EVENT: &str = "user-input-requested";
 pub const CODEX_PLAN_MODE_PROMPT_EVENT: &str = "plan-mode-prompt";
+pub const CODEX_EXECUTION_ERROR_EVENT: &str = "execution-error";
 pub const CODEX_UNKNOWN_NOTIFY_EVENT: &str = "unknown-notify";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -361,6 +362,16 @@ fn classify_codex_notify_payload(payload: &str) -> Option<String> {
         return Some(CODEX_TURN_COMPLETE_EVENT.to_owned());
     }
 
+    if lower.contains("execution error")
+        || lower.contains("execution_error")
+        || lower.contains("tool execution error")
+        || lower.contains("tool_execution_error")
+        || lower.contains("execution-failure")
+        || lower.contains("execution_failure")
+    {
+        return Some(CODEX_EXECUTION_ERROR_EVENT.to_owned());
+    }
+
     None
 }
 
@@ -408,6 +419,9 @@ fn classify_codex_notify_event_name(event_name: &str) -> Option<String> {
         "planmodeprompt" => Some(CODEX_PLAN_MODE_PROMPT_EVENT.to_owned()),
         "agentturncomplete" | "turncompleted" | "turncomplete" => {
             Some(CODEX_TURN_COMPLETE_EVENT.to_owned())
+        }
+        "executionerror" | "executionerrorfault" | "toolexecutionerror" => {
+            Some(CODEX_EXECUTION_ERROR_EVENT.to_owned())
         }
         _ => None,
     }

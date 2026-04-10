@@ -72,6 +72,7 @@ const CODEX_NOTIFY_POLL_MS: u64 = 150;
 const CODEX_PROCESS_POLL_MS: u64 = 150;
 const CODEX_LAUNCH_GRACE_MS: u64 = 5_000;
 const CODEX_TRAILING_OUTPUT_GRACE_MS: u64 = 750;
+const CODEX_RUNNING_GRACE_MS: u64 = 2_000;
 const CURSOR_BLINK_STEP_SECS: f64 = 0.6;
 const TRANSIENT_TOAST_SECS: f64 = 1.75;
 const TERMINAL_COPY_FEEDBACK_TEXT: &str = "Copied terminal selection";
@@ -871,6 +872,7 @@ struct TerminalEntry {
     codex_process_missing_since: Option<Instant>,
     codex_last_status_source: Option<CodexCliStatusSource>,
     codex_attention_reason: Option<CodexAttentionReason>,
+    codex_prompt_submit_since: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2432,6 +2434,7 @@ impl AdeApp {
             codex_process_missing_since: None,
             codex_last_status_source: None,
             codex_attention_reason: None,
+            codex_prompt_submit_since: None,
         };
 
         self.terminals.insert(terminal_id, entry);
@@ -3252,7 +3255,8 @@ impl AdeApp {
             || entry.codex_process_identity.is_some()
             || entry.codex_process_missing_since.is_some()
             || entry.codex_last_status_source.is_some()
-            || entry.codex_attention_reason.is_some();
+            || entry.codex_attention_reason.is_some()
+            || entry.codex_prompt_submit_since.is_some();
 
         if entry.ai_session.tool == Some(AiCliTool::CodexCli) {
             entry.ai_session = AiCliSession::default();
@@ -3265,6 +3269,7 @@ impl AdeApp {
         entry.codex_process_missing_since = None;
         entry.codex_last_status_source = None;
         entry.codex_attention_reason = None;
+        entry.codex_prompt_submit_since = None;
         entry.dirty = true;
         changed
     }
@@ -3468,6 +3473,10 @@ impl AdeApp {
         if entry.codex_launch_pending_since.take().is_some() {
             changed = true;
         }
+        if status == AiCliStatus::Running && source == CodexCliStatusSource::PromptSubmit {
+            entry.codex_prompt_submit_since = Some(Instant::now());
+            changed = true;
+        }
         entry.dirty = true;
         changed
     }
@@ -3571,7 +3580,9 @@ impl AdeApp {
                 }
                 Some(None) => {
                     if tool_is_codex {
-                        changed |= self.note_codex_process_missing(terminal_id);
+                        if status != AiCliStatus::Running {
+                            changed |= self.note_codex_process_missing(terminal_id);
+                        }
 
                         match status {
                             AiCliStatus::Attention => {
@@ -3600,7 +3611,17 @@ impl AdeApp {
                                     .get(&terminal_id)
                                     .is_some_and(Self::codex_trailing_grace_elapsed)
                                 {
-                                    changed |= self.clear_codex_state(terminal_id);
+                                    let within_running_grace = self
+                                        .terminals
+                                        .get(&terminal_id)
+                                        .and_then(|entry| entry.codex_prompt_submit_since)
+                                        .is_some_and(|since| {
+                                            since.elapsed()
+                                                < Duration::from_millis(CODEX_RUNNING_GRACE_MS)
+                                        });
+                                    if !within_running_grace {
+                                        changed |= self.clear_codex_state(terminal_id);
+                                    }
                                 }
                             }
                             AiCliStatus::Inactive => {
@@ -5669,6 +5690,13 @@ impl AdeApp {
 
         if let Some(terminal_id) = terminal_id {
             self.acknowledge_terminal_attention(terminal_id);
+
+            // Stabilize the newly active terminal's render state so it doesn't
+            // briefly flash a stale/empty scroll viewport on the next frame.
+            if let Some(entry) = self.terminals.get_mut(&terminal_id) {
+                entry.snapshot_refresh_deferred = false;
+                entry.dirty = true;
+            }
         }
 
         self.active_terminal = terminal_id;
@@ -7496,7 +7524,12 @@ impl AdeApp {
 
                     if let Some(ai_badge) = activity_ai_badge.as_ref() {
                         ui.vertical_centered(|ui| {
-                            let _ = draw_ai_badge(ui, ai_badge);
+                            let response = draw_ai_badge(ui, ai_badge);
+                            response.on_hover_ui(|ui| {
+                                for line in &ai_badge.tooltip_lines {
+                                    ui.label(line);
+                                }
+                            });
                         });
                         ui.add_space(6.0);
                     }
@@ -8858,11 +8891,14 @@ impl AdeApp {
                 output_ui.set_clip_rect(viewport_rect);
                 output_ui.set_min_size(viewport_size);
 
+                // Avoid jumping the scroll position when the cache is empty (e.g. right
+                // after a terminal switch before the first snapshot arrives).
+                let has_content = !terminal.render_cache.lines.is_empty();
                 egui::ScrollArea::vertical()
                     .id_salt(format!("term-output-{terminal_id}"))
                     .max_height(output_height)
                     .auto_shrink([false, false])
-                    .stick_to_bottom(true)
+                    .stick_to_bottom(has_content)
                     .show(&mut output_ui, |ui| {
                         ui.set_width(output_size.x);
                         ui.set_min_width(output_size.x);
@@ -13250,12 +13286,13 @@ mod tests {
         SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
         TerminalSecondaryClickAction, TerminalSelection, TerminalSelectionPoint, TransientToast,
-        CODEX_LAUNCH_GRACE_MS, CODEX_PROCESS_POLL_MS, CODEX_TRAILING_OUTPUT_GRACE_MS,
-        DIRECTORY_INDEX_CHANNEL_CAPACITY, FACTORY_DROID_HOOK_POLL_MS,
-        FACTORY_DROID_PROCESS_POLL_MS, FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS,
-        SOURCE_CONTROL_CHANNEL_CAPACITY, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG,
-        TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS,
-        TERMINAL_OUTPUT_BG, TRANSIENT_TOAST_SECS,
+        CODEX_LAUNCH_GRACE_MS, CODEX_PROCESS_POLL_MS, CODEX_RUNNING_GRACE_MS,
+        CODEX_TRAILING_OUTPUT_GRACE_MS, DIRECTORY_INDEX_CHANNEL_CAPACITY,
+        FACTORY_DROID_HOOK_POLL_MS, FACTORY_DROID_PROCESS_POLL_MS,
+        FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS, SOURCE_CONTROL_CHANNEL_CAPACITY,
+        SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG, TERMINAL_COPY_FEEDBACK_TEXT,
+        TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS, TERMINAL_OUTPUT_BG,
+        TRANSIENT_TOAST_SECS,
     };
     use crate::codex::{
         CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent,
@@ -19626,11 +19663,16 @@ mod tests {
         app.poll_codex_processes(&ctx);
 
         let terminal = app.terminals.get(&1).expect("terminal 1");
-        assert_eq!(terminal.ai_session.tool, None);
-        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
-        assert!(!terminal.codex_session_active);
-        assert!(terminal.codex_launch_pending_since.is_none());
-        assert!(terminal.codex_process_missing_since.is_none());
+        assert_eq!(
+            terminal.ai_session.tool,
+            Some(AiCliTool::CodexCli),
+            "tool stays within running grace period"
+        );
+        assert_eq!(
+            terminal.ai_session.status,
+            AiCliStatus::Running,
+            "status stays Running within grace period"
+        );
     }
 
     #[test]
@@ -19836,9 +19878,12 @@ mod tests {
         app.poll_codex_processes(&ctx);
 
         let terminal = app.terminals.get(&1).expect("terminal 1");
-        assert!(!terminal.codex_session_active);
+        assert!(
+            terminal.codex_session_active,
+            "session stays active within running grace period"
+        );
         assert_eq!(terminal.codex_process_identity, Some(tracked_identity));
-        assert!(terminal.codex_process_missing_since.is_some());
+        assert!(terminal.codex_process_missing_since.is_none());
     }
 
     #[test]
@@ -20198,6 +20243,111 @@ mod tests {
         assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
         assert_eq!(terminal.codex_last_status_source, None);
         assert_eq!(terminal.codex_attention_reason, None);
+    }
+
+    #[test]
+    fn codex_running_spinner_preserved_shortly_after_prompt_submit() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+            entry.codex_process_identity = Some(TrackedProcessIdentity {
+                pid: 7001,
+                creation_time: Some(8001),
+            });
+            entry.codex_prompt_submit_since = Some(Instant::now());
+            entry.codex_last_status_source = Some(CodexCliStatusSource::PromptSubmit);
+            entry.runtime.set_codex_process_identity_for_test(None);
+            entry.codex_process_missing_since =
+                Some(Instant::now() - Duration::from_millis(CODEX_TRAILING_OUTPUT_GRACE_MS + 25));
+        }
+
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.ai_session.tool,
+            Some(AiCliTool::CodexCli),
+            "tool should stay Codex within grace period"
+        );
+        assert_eq!(
+            terminal.ai_session.status,
+            AiCliStatus::Running,
+            "status should stay Running within grace period"
+        );
+        assert!(terminal.codex_session_active, "session should stay active");
+    }
+
+    #[test]
+    fn codex_running_clears_after_submit_grace_expires() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+            entry.codex_process_identity = Some(TrackedProcessIdentity {
+                pid: 7001,
+                creation_time: Some(8001),
+            });
+            entry.codex_prompt_submit_since =
+                Some(Instant::now() - Duration::from_millis(CODEX_RUNNING_GRACE_MS + 100));
+            entry.codex_last_status_source = Some(CodexCliStatusSource::PromptSubmit);
+            entry.runtime.set_codex_process_identity_for_test(None);
+            entry.codex_process_missing_since =
+                Some(Instant::now() - Duration::from_millis(CODEX_TRAILING_OUTPUT_GRACE_MS + 25));
+        }
+
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.ai_session.tool, None,
+            "tool should be cleared after grace expires"
+        );
+        assert_eq!(
+            terminal.ai_session.status,
+            AiCliStatus::Inactive,
+            "status should be Inactive after grace expires"
+        );
+        assert!(!terminal.codex_session_active, "session should be inactive");
+    }
+
+    #[test]
+    fn codex_running_with_prompt_submit_sets_grace_timestamp() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.codex_session_active = true;
+        }
+
+        let changed = app.apply_codex_status(
+            1,
+            AiCliStatus::Running,
+            CodexCliStatusSource::PromptSubmit,
+            None,
+        );
+        assert!(changed, "status change should be reported");
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(
+            terminal.codex_prompt_submit_since.is_some(),
+            "submit timestamp should be set on PromptSubmit"
+        );
+        assert_eq!(
+            terminal.ai_session.status,
+            AiCliStatus::Running,
+            "status should be Running"
+        );
     }
 
     #[test]
@@ -21548,6 +21698,7 @@ mod tests {
             codex_process_missing_since: None,
             codex_last_status_source: None,
             codex_attention_reason: None,
+            codex_prompt_submit_since: None,
         }
     }
 
@@ -23360,5 +23511,33 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| l.contains("failed") || l.contains("Execution failed")));
+    }
+
+    #[test]
+    fn set_active_terminal_stabilizes_newly_active_render_state() {
+        // Terminal 2 starts with a deferred snapshot (e.g. mid-selection state).
+        let mut entry1 = test_terminal_entry_with_runtime(1, 7, test_terminal_runtime());
+        entry1.dirty = false;
+        entry1.snapshot_refresh_deferred = false;
+
+        let mut entry2 = test_terminal_entry_with_runtime(2, 7, test_terminal_runtime());
+        entry2.dirty = false;
+        entry2.snapshot_refresh_deferred = true; // deferred from prior state
+
+        let mut app = test_app([(1, entry1), (2, entry2)], Some(1));
+
+        let ctx = Context::default();
+        app.set_active_terminal(&ctx, Some(2));
+
+        let entry = app.terminals.get(&2).unwrap();
+        // New active terminal must be forced to refresh so it doesn't flash stale content.
+        assert!(
+            entry.dirty,
+            "newly active terminal should be marked dirty for immediate refresh"
+        );
+        assert!(
+            !entry.snapshot_refresh_deferred,
+            "deferred snapshot flag must be cleared on activation"
+        );
     }
 }

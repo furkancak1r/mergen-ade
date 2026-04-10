@@ -52,6 +52,7 @@ use windows_sys::Win32::System::Threading::{
 use crate::models::ShellKind;
 
 const DEFAULT_SCROLLBACK: usize = 1000;
+const MAX_SNAPSHOT_ROWS: usize = 500;
 const IO_BUFFER_SIZE: usize = 16 * 1024;
 #[cfg(target_os = "windows")]
 const GRACEFUL_TERMINATION_TIMEOUT_MS: u32 = 300;
@@ -1869,6 +1870,12 @@ fn detect_visible_factory_status_with_end(text: &str) -> Option<(&'static str, u
         return Some(("droid-spec-approval-prompt", end_offset));
     }
 
+    if let Some(end_offset) =
+        detect_visible_factory_interrupted_banner_with_end(&collapsed, &collapsed_offsets)
+    {
+        return Some(("droid-interrupted-banner", end_offset));
+    }
+
     for (display, needle) in [
         ("HOOKS Stop", "hooks stop"),
         ("hook stop", "hook stop"),
@@ -1925,6 +1932,28 @@ fn detect_visible_factory_ask_user_prompt_with_end(
         .max()?;
     let latest_end = optional_end.max(esc_start + "esc cancel".len());
     let end_char_index = collapsed[..latest_end].chars().count().saturating_sub(1);
+    collapsed_offsets.get(end_char_index).copied()
+}
+
+fn detect_visible_factory_interrupted_banner_with_end(
+    collapsed: &str,
+    collapsed_offsets: &[usize],
+) -> Option<usize> {
+    let interrupted_start = collapsed.find("interrupted")?;
+    let interrupted_end = interrupted_start + "interrupted".len();
+
+    // Droid interrupt screens are followed by a footer line with a "for help" marker,
+    // IDE indicator, and optional MCP indicator.
+    let help_end = ["for help", "? for help"]
+        .into_iter()
+        .filter_map(|needle| {
+            collapsed[interrupted_end..]
+                .find(needle)
+                .map(|offset| interrupted_end + offset + needle.len())
+        })
+        .max()?;
+
+    let end_char_index = collapsed[..help_end].chars().count().saturating_sub(1);
     collapsed_offsets.get(end_char_index).copied()
 }
 
@@ -2534,6 +2563,7 @@ fn ai_raw_chunk_requires_reliable_delivery(chunk: &str) -> bool {
             | "idle"
             | "droid-ask-user-prompt"
             | "droid-spec-approval-prompt"
+            | "droid-interrupted-banner"
             | "codex-question-prompt"
             | "codex-plan-mode-prompt"
             | "codex-interrupted-banner"
@@ -2664,19 +2694,33 @@ fn snapshot_from_terminal(terminal: &Terminal) -> TerminalSnapshot {
     }
 
     let total_rows = screen.scrollback_rows().max(rows);
-    let viewport_top_row = total_rows.saturating_sub(rows);
+    // Limit snapshot to MAX_SNAPSHOT_ROWS to prevent performance issues with large scrollback
+    // Always include the visible viewport (last `rows` rows)
+    let snapshot_total_rows = total_rows.min(MAX_SNAPSHOT_ROWS);
+    let scrollback_rows = total_rows.saturating_sub(rows);
+    let viewport_top_row = scrollback_rows;
+    let snapshot_start_row = if total_rows > MAX_SNAPSHOT_ROWS {
+        // Skip older scrollback rows, but always include at least some scrollback context
+        (total_rows - MAX_SNAPSHOT_ROWS).max(scrollback_rows.saturating_sub(rows / 2))
+    } else {
+        0
+    };
     let default_style = default_style(&palette);
     let cursor = snapshot_cursor(terminal, rows, cols, viewport_top_row);
     let cursor_row = cursor.map(|cursor| cursor.y);
-    let mut lines = Vec::with_capacity(total_rows);
+    let mut lines = Vec::with_capacity(snapshot_total_rows);
     let mut cursor_line = None;
 
     screen.for_each_phys_line(|row_index, line| {
+        // Skip rows before our snapshot window
+        if row_index < snapshot_start_row {
+            return;
+        }
         if row_index >= total_rows {
             return;
         }
 
-        while lines.len() < row_index {
+        while lines.len() < (row_index - snapshot_start_row) {
             let snapshot_row = lines.len();
             let min_columns_to_keep = cursor_columns_to_keep(cursor, snapshot_row, cols);
             let (line, blank_cursor_line) =
@@ -2753,7 +2797,7 @@ fn snapshot_from_terminal(terminal: &Terminal) -> TerminalSnapshot {
         }
     });
 
-    while lines.len() < total_rows {
+    while lines.len() < snapshot_total_rows {
         let snapshot_row = lines.len();
         let min_columns_to_keep = cursor_columns_to_keep(cursor, snapshot_row, cols);
         let (line, blank_cursor_line) =
@@ -2777,18 +2821,30 @@ fn selection_snapshot_from_terminal(terminal: &Terminal) -> TerminalSelectionSna
     let rows = screen.physical_rows;
     let cols = screen.physical_cols;
     let total_rows = screen.scrollback_rows().max(rows);
-    let viewport_top_row = total_rows.saturating_sub(rows);
+    // Limit snapshot to MAX_SNAPSHOT_ROWS to prevent performance issues with large scrollback
+    let snapshot_total_rows = total_rows.min(MAX_SNAPSHOT_ROWS);
+    let scrollback_rows = total_rows.saturating_sub(rows);
+    let viewport_top_row = scrollback_rows;
+    let snapshot_start_row = if total_rows > MAX_SNAPSHOT_ROWS {
+        (total_rows - MAX_SNAPSHOT_ROWS).max(scrollback_rows.saturating_sub(rows / 2))
+    } else {
+        0
+    };
     let cursor = snapshot_cursor(terminal, rows, cols, viewport_top_row);
     let default_style = default_style(&palette);
 
-    let mut lines = Vec::with_capacity(total_rows);
+    let mut lines = Vec::with_capacity(snapshot_total_rows);
 
     screen.for_each_phys_line(|row_index, line| {
+        // Skip rows before our snapshot window
+        if row_index < snapshot_start_row {
+            return;
+        }
         if row_index >= total_rows {
             return;
         }
 
-        while lines.len() < row_index {
+        while lines.len() < (row_index - snapshot_start_row) {
             lines.push(TerminalSelectionLine {
                 width: cols,
                 wraps_to_next: false,
@@ -2843,7 +2899,7 @@ fn selection_snapshot_from_terminal(terminal: &Terminal) -> TerminalSelectionSna
         });
     });
 
-    while lines.len() < total_rows {
+    while lines.len() < snapshot_total_rows {
         lines.push(TerminalSelectionLine {
             width: cols,
             wraps_to_next: false,
@@ -3518,6 +3574,46 @@ mod tests {
             None
         );
         assert_eq!(pending.extract_from_text("ESC cancel"), None);
+    }
+
+    #[test]
+    fn pending_visible_factory_status_detects_split_interrupted_banner_across_reads() {
+        let mut pending = PendingVisibleFactoryStatus::default();
+
+        assert_eq!(pending.extract_from_text("Interrupted - tell the mo"), None);
+        assert_eq!(
+            pending.extract_from_text("del what to do differently. ? for help | IDE ◌ | MCP ✗"),
+            Some("droid-interrupted-banner".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_factory_status_detects_interrupted_banner_with_ansi_and_crlf() {
+        let mut pending = PendingVisibleFactoryStatus::default();
+
+        assert_eq!(
+            pending.extract_from_text("\u{1b}[1mInterrupted\u{1b}[0m\r\nfor help | IDE ◌ | MCP ✗"),
+            Some("droid-interrupted-banner".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_factory_status_requires_interrupted_help_marker() {
+        // "interrupted" alone is not enough — must have a trailing help footer.
+        assert_eq!(
+            PendingVisibleFactoryStatus::default().extract_from_text("Interrupted"),
+            None
+        );
+        assert_eq!(
+            PendingVisibleFactoryStatus::default()
+                .extract_from_text("Interrupted\r\nAuto (High) - allow all commands"),
+            None
+        );
+        assert_eq!(
+            PendingVisibleFactoryStatus::default()
+                .extract_from_text("Interrupted\r\n? for help | IDE ◌ | MCP ✗"),
+            Some("droid-interrupted-banner".to_string())
+        );
     }
 
     #[test]

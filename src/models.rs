@@ -86,14 +86,14 @@ impl Default for ShellKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BuiltinLauncherKind {
-    Codex,
-    Claude,
     Droid,
+    Codex,
     OpenCode,
+    Claude,
 }
 
 impl BuiltinLauncherKind {
-    pub const ALL: [Self; 4] = [Self::Codex, Self::Claude, Self::Droid, Self::OpenCode];
+    pub const ALL: [Self; 4] = [Self::Droid, Self::Codex, Self::OpenCode, Self::Claude];
 
     pub const fn id(self) -> &'static str {
         match self {
@@ -423,19 +423,19 @@ mod tests {
         assert_eq!(launchers.len(), 4);
         assert_eq!(
             launchers[0],
-            LauncherEntry::builtin(BuiltinLauncherKind::Codex)
-        );
-        assert_eq!(
-            launchers[1],
-            LauncherEntry::builtin(BuiltinLauncherKind::Claude)
-        );
-        assert_eq!(
-            launchers[2],
             LauncherEntry::builtin(BuiltinLauncherKind::Droid)
         );
         assert_eq!(
-            launchers[3],
+            launchers[1],
+            LauncherEntry::builtin(BuiltinLauncherKind::Codex)
+        );
+        assert_eq!(
+            launchers[2],
             LauncherEntry::builtin(BuiltinLauncherKind::OpenCode)
+        );
+        assert_eq!(
+            launchers[3],
+            LauncherEntry::builtin(BuiltinLauncherKind::Claude)
         );
     }
 
@@ -453,7 +453,7 @@ mod tests {
         normalize_launcher_entries(&mut launchers);
 
         assert_eq!(launchers.len(), 5);
-        assert_eq!(launchers[0].builtin, Some(BuiltinLauncherKind::Codex));
+        assert_eq!(launchers[0].builtin, Some(BuiltinLauncherKind::Droid));
         assert_eq!(launchers[4].builtin, None);
         assert_eq!(launchers[4].display_name, "Custom");
     }
