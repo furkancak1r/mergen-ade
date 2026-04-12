@@ -22,15 +22,56 @@ pub const OPENCODE_TURN_COMPLETE_EVENT: &str = "turn-complete";
 pub const OPENCODE_QUESTION_PROMPT_EVENT: &str = "question-prompt";
 pub const OPENCODE_APPROVAL_PROMPT_EVENT: &str = "approval-prompt";
 
+/// Normalized OpenCode status values (Orca-compatible)
+/// These are the canonical states transported from OpenCode plugin/notify mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenCodeTransportStatus {
+    Working,
+    Idle,
+    Permission,
+}
+
+impl OpenCodeTransportStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Idle => "idle",
+            Self::Permission => "permission",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "working" => Some(Self::Working),
+            "idle" => Some(Self::Idle),
+            "permission" => Some(Self::Permission),
+            _ => None,
+        }
+    }
+
+    /// Map transport status to the generic status string for legacy consumers
+    pub fn to_generic_status(&self) -> String {
+        match self {
+            Self::Working => "running".to_owned(),
+            Self::Idle | Self::Permission => "attention".to_owned(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenCodeNotifyInboxEvent {
     pub terminal_id: String,
     pub tool: String,
+    /// Generic status for legacy compatibility ("running" | "attention")
     pub status: String,
     #[serde(default)]
     pub inbox_token: Option<String>,
     #[serde(default)]
     pub event_kind: Option<String>,
+    /// Normalized OpenCode status (working | idle | permission) - Orca-compatible
+    #[serde(default)]
+    pub opencode_status: Option<OpenCodeTransportStatus>,
     pub raw_json: String,
     pub timestamp_utc: String,
 }
@@ -84,12 +125,67 @@ pub fn write_opencode_notify_event(
         }
     }
 
+    // Extract event kind and map to normalized status
+    let event_kind = extract_event_kind(payload);
+    let opencode_status = event_kind.as_ref().and_then(|kind| {
+        match kind.as_str() {
+            // Working signals
+            k if k == OPENCODE_TOOL_EXECUTE_BEFORE_EVENT => Some(OpenCodeTransportStatus::Working),
+            // Permission signals
+            k if k == OPENCODE_PERMISSION_ASKED_EVENT
+                || k == "permission_asked"
+                || k == "permission-asked"
+                || k == OPENCODE_APPROVAL_PROMPT_EVENT
+                || k == "approval_prompt"
+                || k == "approval-prompt" =>
+            {
+                Some(OpenCodeTransportStatus::Permission)
+            }
+            // Question signals also map to permission (user interaction needed)
+            k if k == "question.asked"
+                || k == "question_asked"
+                || k == "question-asked"
+                || k == OPENCODE_QUESTION_PROMPT_EVENT
+                || k == "question_prompt"
+                || k == "question-prompt" =>
+            {
+                Some(OpenCodeTransportStatus::Permission)
+            }
+            // Idle/completion signals
+            k if k == OPENCODE_SESSION_IDLE_EVENT
+                || k == "session_idle"
+                || k == "session-idle"
+                || k == OPENCODE_TURN_COMPLETE_EVENT
+                || k == "turn_complete"
+                || k == "turn-complete" =>
+            {
+                Some(OpenCodeTransportStatus::Idle)
+            }
+            // Error signals - still idle but with error context
+            k if k == OPENCODE_SESSION_ERROR_EVENT
+                || k == "session_error"
+                || k == "session-error"
+                || k == "error" =>
+            {
+                Some(OpenCodeTransportStatus::Idle)
+            }
+            _ => None,
+        }
+    });
+
+    // Legacy status for backward compatibility
+    let legacy_status = opencode_status
+        .as_ref()
+        .map(|s| s.to_generic_status())
+        .unwrap_or_else(|| "attention".to_owned());
+
     let event = OpenCodeNotifyInboxEvent {
         terminal_id: terminal_id.to_string(),
         tool: MERGEN_AI_TOOL_HINT_OPENCODE.to_owned(),
-        status: "attention".to_owned(),
+        status: legacy_status,
         inbox_token: Some(inbox_token.to_owned()),
-        event_kind: extract_event_kind(payload),
+        event_kind,
+        opencode_status,
         raw_json: payload.to_owned(),
         timestamp_utc: format_iso_timestamp(),
     };
@@ -158,12 +254,55 @@ pub fn maybe_handle_opencode_notify_mode() -> io::Result<Option<OpenCodeNotifyIn
                 let path = PathBuf::from(dir);
                 write_opencode_notify_event(&payload, &tid, &path, &token, tool_hint.as_deref())?;
 
+                // Re-parse to get the normalized status for the returned event
+                let event_kind = extract_event_kind(&payload);
+                let opencode_status = event_kind.as_ref().and_then(|kind| match kind.as_str() {
+                    k if k == OPENCODE_TOOL_EXECUTE_BEFORE_EVENT => {
+                        Some(OpenCodeTransportStatus::Working)
+                    }
+                    k if k == OPENCODE_PERMISSION_ASKED_EVENT
+                        || k == "permission_asked"
+                        || k == "permission-asked"
+                        || k == OPENCODE_APPROVAL_PROMPT_EVENT =>
+                    {
+                        Some(OpenCodeTransportStatus::Permission)
+                    }
+                    k if k == "question.asked"
+                        || k == "question_asked"
+                        || k == "question-asked"
+                        || k == OPENCODE_QUESTION_PROMPT_EVENT =>
+                    {
+                        Some(OpenCodeTransportStatus::Permission)
+                    }
+                    k if k == OPENCODE_SESSION_IDLE_EVENT
+                        || k == "session_idle"
+                        || k == "session-idle"
+                        || k == OPENCODE_TURN_COMPLETE_EVENT =>
+                    {
+                        Some(OpenCodeTransportStatus::Idle)
+                    }
+                    k if k == OPENCODE_SESSION_ERROR_EVENT
+                        || k == "session_error"
+                        || k == "session-error"
+                        || k == "error" =>
+                    {
+                        Some(OpenCodeTransportStatus::Idle)
+                    }
+                    _ => None,
+                });
+
+                let legacy_status = opencode_status
+                    .as_ref()
+                    .map(|s| s.to_generic_status())
+                    .unwrap_or_else(|| "attention".to_owned());
+
                 let event = OpenCodeNotifyInboxEvent {
                     terminal_id: tid,
                     tool: MERGEN_AI_TOOL_HINT_OPENCODE.to_owned(),
-                    status: "attention".to_owned(),
+                    status: legacy_status,
                     inbox_token: Some(token),
-                    event_kind: extract_event_kind(&payload),
+                    event_kind,
+                    opencode_status,
                     raw_json: payload,
                     timestamp_utc: format_iso_timestamp(),
                 };

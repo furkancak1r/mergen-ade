@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::opencode::{OpenCodeNotifyInboxEvent, MERGEN_AI_TOOL_HINT_OPENCODE};
+use crate::opencode::{
+    OpenCodeNotifyInboxEvent, OpenCodeTransportStatus, MERGEN_AI_TOOL_HINT_OPENCODE,
+};
 
 pub const MERGEN_OPENCODE_HOOK_PORT_ENV_VAR: &str = "MERGEN_OPENCODE_HOOK_PORT";
 pub const MERGEN_OPENCODE_HOOK_TOKEN_ENV_VAR: &str = "MERGEN_OPENCODE_HOOK_TOKEN";
@@ -13,38 +15,12 @@ pub const MERGEN_OPENCODE_TERMINAL_ID_ENV_VAR: &str = "MERGEN_OPENCODE_TERMINAL_
 pub const OPENCODE_CONFIG_DIR_ENV_VAR: &str = "OPENCODE_CONFIG_DIR";
 pub const MERGEN_OPENCODE_PLUGIN_FILE: &str = "mergen-opencode-status.js";
 
-/// Status values sent by the OpenCode plugin via HTTP POST
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OpenCodeHookStatus {
-    Working,
-    Idle,
-    Permission,
-}
-
-impl OpenCodeHookStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            OpenCodeHookStatus::Working => "working",
-            OpenCodeHookStatus::Idle => "idle",
-            OpenCodeHookStatus::Permission => "permission",
-        }
-    }
-
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "working" => Some(OpenCodeHookStatus::Working),
-            "idle" => Some(OpenCodeHookStatus::Idle),
-            "permission" => Some(OpenCodeHookStatus::Permission),
-            _ => None,
-        }
-    }
-}
-
 /// Shared state for the hook service tracking last status per terminal
 #[derive(Debug, Default)]
 struct HookServiceState {
     token: String,
-    last_status_by_terminal: HashMap<u64, OpenCodeHookStatus>,
+    /// Normalized status per terminal (Orca-compatible: working | idle | permission)
+    last_status_by_terminal: HashMap<u64, OpenCodeTransportStatus>,
     pending_events: Vec<OpenCodeNotifyInboxEvent>,
 }
 
@@ -57,21 +33,30 @@ impl HookServiceState {
         }
     }
 
-    fn record_status(&mut self, terminal_id: u64, status: OpenCodeHookStatus) -> bool {
+    /// Record normalized status from OpenCode plugin
+    /// Uses OpenCodeTransportStatus to preserve Orca-compatible semantics
+    fn record_status(&mut self, terminal_id: u64, status: OpenCodeTransportStatus) -> bool {
         let changed = self.last_status_by_terminal.get(&terminal_id) != Some(&status);
         if changed {
             self.last_status_by_terminal.insert(terminal_id, status);
+
+            // Map to event kind string
+            let event_kind = status.as_str().to_owned();
+
+            // Legacy status for backward compatibility
+            let legacy_status = match status {
+                OpenCodeTransportStatus::Working => "running",
+                OpenCodeTransportStatus::Idle | OpenCodeTransportStatus::Permission => "attention",
+            }
+            .to_owned();
+
             let event = OpenCodeNotifyInboxEvent {
                 terminal_id: terminal_id.to_string(),
                 tool: MERGEN_AI_TOOL_HINT_OPENCODE.to_owned(),
-                status: match status {
-                    OpenCodeHookStatus::Working => "running".to_owned(),
-                    OpenCodeHookStatus::Idle | OpenCodeHookStatus::Permission => {
-                        "attention".to_owned()
-                    }
-                },
+                status: legacy_status,
                 inbox_token: Some(self.token.clone()),
-                event_kind: Some(status.as_str().to_owned()),
+                event_kind: Some(event_kind),
+                opencode_status: Some(status),
                 raw_json: format!("{{\"status\":\"{}\"}}", status.as_str()),
                 timestamp_utc: format_iso_timestamp(),
             };
@@ -255,7 +240,7 @@ impl OpenCodeHookService {
         Ok(())
     }
 
-    fn parse_status_from_body(body: &str) -> Option<OpenCodeHookStatus> {
+    fn parse_status_from_body(body: &str) -> Option<OpenCodeTransportStatus> {
         // Simple JSON parser for {"status":"..."}
         let status_key = "\"status\"";
         let idx = body.find(status_key)?;
@@ -269,7 +254,7 @@ impl OpenCodeHookService {
         let quote_end = after_start_quote.find('"')?;
         let status_str = &after_start_quote[..quote_end];
 
-        OpenCodeHookStatus::from_str(status_str)
+        OpenCodeTransportStatus::from_str(status_str)
     }
 
     fn write_response(stream: &mut TcpStream, code: u16, message: &str) -> io::Result<()> {
@@ -327,16 +312,37 @@ export const MergenOpenCodeStatusPlugin = async () => ({
   event: async ({ event }) => {
     if (!event?.type) return;
 
+    // Permission asked (user approval needed)
     if (event.type === "permission.asked") {
       await postStatus("permission");
       return;
     }
 
+    // Question asked (user input needed) - also maps to permission state
+    if (event.type === "question.asked") {
+      await postStatus("permission");
+      return;
+    }
+
+    // Session idle (turn complete / waiting)
     if (event.type === "session.idle") {
       await postStatus("idle");
       return;
     }
 
+    // Session error - still idle but with error context
+    if (event.type === "session.error") {
+      await postStatus("idle");
+      return;
+    }
+
+    // Tool execution signals working state
+    if (event.type === "tool.execute.before") {
+      await postStatus("working");
+      return;
+    }
+
+    // Session status updates (busy/idle)
     if (event.type === "session.status") {
       const statusType = getStatusType(event);
       if (statusType === "busy" || statusType === "retry") {
@@ -419,20 +425,21 @@ fn generate_secure_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::opencode::OpenCodeTransportStatus;
 
     #[test]
     fn hook_status_parsing_from_body() {
         assert_eq!(
             OpenCodeHookService::parse_status_from_body(r#"{"status":"working"}"#),
-            Some(OpenCodeHookStatus::Working)
+            Some(OpenCodeTransportStatus::Working)
         );
         assert_eq!(
             OpenCodeHookService::parse_status_from_body(r#"{"status":"idle"}"#),
-            Some(OpenCodeHookStatus::Idle)
+            Some(OpenCodeTransportStatus::Idle)
         );
         assert_eq!(
             OpenCodeHookService::parse_status_from_body(r#"{"status":"permission"}"#),
-            Some(OpenCodeHookStatus::Permission)
+            Some(OpenCodeTransportStatus::Permission)
         );
         assert_eq!(
             OpenCodeHookService::parse_status_from_body(r#"{"status":"unknown"}"#),

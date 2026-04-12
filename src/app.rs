@@ -46,7 +46,7 @@ use crate::models::{
     MainVisibilityMode, ProjectRecord, ShellKind, TerminalKind, TerminalManagerFilter,
 };
 use crate::opencode::{
-    self, OpenCodeNotifyInboxEvent, OPENCODE_APPROVAL_PROMPT_EVENT,
+    self, OpenCodeNotifyInboxEvent, OpenCodeTransportStatus, OPENCODE_APPROVAL_PROMPT_EVENT,
     OPENCODE_PERMISSION_ASKED_EVENT, OPENCODE_QUESTION_PROMPT_EVENT, OPENCODE_SESSION_ERROR_EVENT,
     OPENCODE_SESSION_IDLE_EVENT, OPENCODE_TOOL_EXECUTE_AFTER_EVENT,
     OPENCODE_TOOL_EXECUTE_BEFORE_EVENT, OPENCODE_TURN_COMPLETE_EVENT,
@@ -958,6 +958,9 @@ struct TerminalEntry {
     opencode_process_missing_since: Option<Instant>,
     opencode_last_status_source: Option<OpenCodeStatusSource>,
     opencode_attention_reason: Option<OpenCodeAttentionReason>,
+    /// Normalized OpenCode transport status (working | idle | permission)
+    /// This preserves Orca-compatible semantics through the state machine
+    opencode_normalized_status: Option<OpenCodeTransportStatus>,
     opencode_prompt_submit_since: Option<Instant>,
     /// When we last entered Running state (from any source). Used for grace-based
     /// cleanup when process tracking is unavailable.
@@ -1182,6 +1185,8 @@ enum TerminalManagerDiffSummaryVisual {
 struct AiBadgeModel {
     tool: Option<AiCliTool>,
     status: AiCliStatus,
+    /// Normalized OpenCode transport status for semantic UI differentiation
+    opencode_normalized_status: Option<OpenCodeTransportStatus>,
     tooltip_lines: Vec<String>,
 }
 
@@ -1199,6 +1204,7 @@ impl AiBadgeModel {
         Self {
             tool,
             status,
+            opencode_normalized_status: terminal.opencode_normalized_status,
             tooltip_lines,
         }
     }
@@ -1237,18 +1243,49 @@ fn ai_badge_tooltip_lines(
 enum AiBadgeVisual {
     Spinner(Color32),
     Pulse(Color32),
+    Solid(Color32),
 }
 
-fn ai_badge_visual(status: AiCliStatus) -> Option<AiBadgeVisual> {
+/// Determines badge visual based on status and semantic context
+/// Orca-compatible mapping:
+/// - Working -> Spinner (active work in progress)
+/// - Permission/Question -> Pulse (requires user interaction)
+/// - Idle/TurnComplete -> Solid dot (calm waiting state)
+fn ai_badge_visual(
+    status: AiCliStatus,
+    normalized_status: Option<OpenCodeTransportStatus>,
+) -> Option<AiBadgeVisual> {
     match status {
         AiCliStatus::Inactive => None,
         AiCliStatus::Running => Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180))),
-        AiCliStatus::Attention => Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 220, 220))),
+        AiCliStatus::Attention => {
+            // Use normalized status for semantic differentiation if available
+            match normalized_status {
+                Some(OpenCodeTransportStatus::Permission) => {
+                    // Permission/Question needs attention - pulse
+                    Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 180, 100)))
+                    // Amber pulse
+                }
+                Some(OpenCodeTransportStatus::Idle) => {
+                    // Idle/TurnComplete - calm solid dot
+                    Some(AiBadgeVisual::Solid(Color32::from_rgb(100, 200, 100)))
+                    // Green solid
+                }
+                Some(OpenCodeTransportStatus::Working) => {
+                    // Shouldn't be attention + working, but handle gracefully
+                    Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180)))
+                }
+                None => {
+                    // No normalized status - use generic pulse
+                    Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 220, 220)))
+                }
+            }
+        }
     }
 }
 
 fn draw_ai_badge(ui: &mut Ui, badge: &AiBadgeModel) -> egui::Response {
-    let Some(visual) = ai_badge_visual(badge.status) else {
+    let Some(visual) = ai_badge_visual(badge.status, badge.opencode_normalized_status) else {
         return ui.allocate_at_least(egui::vec2(0.0, 0.0), Sense::hover()).1;
     };
 
@@ -1278,6 +1315,16 @@ fn draw_ai_badge(ui: &mut Ui, badge: &AiBadgeModel) -> egui::Response {
                 );
 
                 ui.ctx().request_repaint_after(Duration::from_millis(250));
+            }
+            AiBadgeVisual::Solid(color) => {
+                let center = rect.center();
+                // Solid dot with fixed radius - no animation
+                ui.painter().circle(
+                    center,
+                    3.5, // Fixed radius for solid dot
+                    color,
+                    egui::Stroke::new(0.0, Color32::TRANSPARENT),
+                );
             }
         }
     }
@@ -1317,7 +1364,8 @@ struct SettingsDiagnosticsAccordionHeaderLayout {
 }
 
 fn draw_terminal_status_badges(ui: &mut Ui, ai_badge: &AiBadgeModel) -> TerminalStatusBadgeLayout {
-    let ai_response = ai_badge_visual(ai_badge.status).map(|_| draw_ai_badge(ui, ai_badge));
+    let ai_response = ai_badge_visual(ai_badge.status, ai_badge.opencode_normalized_status)
+        .map(|_| draw_ai_badge(ui, ai_badge));
     #[cfg(test)]
     let ai_rect = ai_response.as_ref().map(|response| response.rect);
     if ai_response.is_some() {
@@ -2597,6 +2645,7 @@ impl AdeApp {
             opencode_process_missing_since: None,
             opencode_last_status_source: None,
             opencode_attention_reason: None,
+            opencode_normalized_status: None,
             opencode_prompt_submit_since: None,
             opencode_running_since: None,
             opencode_last_prompt_submit_at: None,
@@ -4021,7 +4070,7 @@ impl AdeApp {
 
     /// Resolve OpenCode status based on all evidence sources.
     /// This is the single source of truth for OpenCode state transitions.
-    /// Process presence alone never produces Running - it only indicates session liveness.
+    /// Priority: normalized transport status > hook/notify > visible UI > title > running evidence
     fn resolve_opencode_status(
         &self,
         entry: &TerminalEntry,
@@ -4031,6 +4080,46 @@ impl AdeApp {
         OpenCodeStatusSource,
         Option<OpenCodeAttentionReason>,
     )> {
+        // Priority 0: Normalized transport status (Orca-compatible)
+        // This is the most authoritative signal from the OpenCode plugin/notify mode
+        if let Some(normalized) = entry.opencode_normalized_status {
+            match normalized {
+                OpenCodeTransportStatus::Working => {
+                    return Some((AiCliStatus::Running, OpenCodeStatusSource::Hook, None));
+                }
+                OpenCodeTransportStatus::Permission => {
+                    // Map to attention with appropriate reason
+                    let reason = entry.opencode_attention_reason.filter(|r| {
+                        matches!(
+                            r,
+                            OpenCodeAttentionReason::PermissionAsked
+                                | OpenCodeAttentionReason::QuestionAsked
+                        )
+                    });
+                    return Some((
+                        AiCliStatus::Attention,
+                        OpenCodeStatusSource::Hook,
+                        reason.or(Some(OpenCodeAttentionReason::PermissionAsked)),
+                    ));
+                }
+                OpenCodeTransportStatus::Idle => {
+                    // Map to attention with appropriate reason
+                    let reason = entry.opencode_attention_reason.filter(|r| {
+                        matches!(
+                            r,
+                            OpenCodeAttentionReason::TurnComplete
+                                | OpenCodeAttentionReason::SessionError
+                        )
+                    });
+                    return Some((
+                        AiCliStatus::Attention,
+                        OpenCodeStatusSource::Hook,
+                        reason.or(Some(OpenCodeAttentionReason::TurnComplete)),
+                    ));
+                }
+            }
+        }
+
         // Priority 1: Interrupted banner -> Inactive immediately
         // (checked via raw chunks, not hook attention)
 
@@ -4872,51 +4961,108 @@ impl AdeApp {
             return false;
         }
 
+        // Use normalized OpenCode status if available (Orca-compatible)
+        // This preserves the semantic distinction between idle and permission
+        let normalized_status = event.opencode_status;
+
         // Map OpenCode event kinds to status and reasons
-        // OpenCode uses session.idle for completion, permission.asked for interactive, etc.
-        let (status, reason) = match event.event_kind.as_deref() {
-            // session.idle is the canonical completion signal from OpenCode
-            Some(kind) if kind == OPENCODE_SESSION_IDLE_EVENT => (
-                AiCliStatus::Attention,
-                Some(OpenCodeAttentionReason::TurnComplete),
-            ),
-            // permission.asked is for interactive prompts
-            Some(kind) if kind == OPENCODE_PERMISSION_ASKED_EVENT => (
-                AiCliStatus::Attention,
-                Some(OpenCodeAttentionReason::PermissionAsked),
-            ),
-            // session.error indicates an error occurred
-            Some(kind) if kind == OPENCODE_SESSION_ERROR_EVENT => (
-                AiCliStatus::Attention,
-                Some(OpenCodeAttentionReason::SessionError),
-            ),
-            // tool.execute.before indicates work is starting/running
-            Some(kind) if kind == OPENCODE_TOOL_EXECUTE_BEFORE_EVENT => {
-                (AiCliStatus::Running, None)
+        // Prioritize normalized status over legacy event_kind parsing
+        let (status, reason, transport_status) = if let Some(opencode_status) = normalized_status {
+            match opencode_status {
+                OpenCodeTransportStatus::Working => {
+                    (AiCliStatus::Running, None, Some(opencode_status))
+                }
+                OpenCodeTransportStatus::Idle => {
+                    // Map to attention with appropriate reason based on event_kind
+                    let reason = match event.event_kind.as_deref() {
+                        Some(kind)
+                            if kind == OPENCODE_SESSION_ERROR_EVENT
+                                || kind == "session_error"
+                                || kind == "session-error" =>
+                        {
+                            Some(OpenCodeAttentionReason::SessionError)
+                        }
+                        _ => Some(OpenCodeAttentionReason::TurnComplete),
+                    };
+                    (AiCliStatus::Attention, reason, Some(opencode_status))
+                }
+                OpenCodeTransportStatus::Permission => {
+                    // Map to attention with appropriate reason based on event_kind
+                    let reason = match event.event_kind.as_deref() {
+                        Some(kind)
+                            if kind == OPENCODE_QUESTION_PROMPT_EVENT
+                                || kind == "question_asked"
+                                || kind == "question-asked" =>
+                        {
+                            Some(OpenCodeAttentionReason::QuestionAsked)
+                        }
+                        _ => Some(OpenCodeAttentionReason::PermissionAsked),
+                    };
+                    (AiCliStatus::Attention, reason, Some(opencode_status))
+                }
             }
-            // tool.execute.after indicates a tool finished but session may continue
-            Some(kind) if kind == OPENCODE_TOOL_EXECUTE_AFTER_EVENT => {
-                // This is NOT a completion signal - session continues
-                // Only update running timestamp, don't change status
-                return self.note_opencode_tool_activity(terminal_id);
+        } else {
+            // Fallback to legacy event_kind parsing for backward compatibility
+            match event.event_kind.as_deref() {
+                // session.idle is the canonical completion signal from OpenCode
+                Some(kind) if kind == OPENCODE_SESSION_IDLE_EVENT => (
+                    AiCliStatus::Attention,
+                    Some(OpenCodeAttentionReason::TurnComplete),
+                    Some(OpenCodeTransportStatus::Idle),
+                ),
+                // permission.asked is for interactive prompts
+                Some(kind) if kind == OPENCODE_PERMISSION_ASKED_EVENT => (
+                    AiCliStatus::Attention,
+                    Some(OpenCodeAttentionReason::PermissionAsked),
+                    Some(OpenCodeTransportStatus::Permission),
+                ),
+                // session.error indicates an error occurred
+                Some(kind) if kind == OPENCODE_SESSION_ERROR_EVENT => (
+                    AiCliStatus::Attention,
+                    Some(OpenCodeAttentionReason::SessionError),
+                    Some(OpenCodeTransportStatus::Idle),
+                ),
+                // tool.execute.before indicates work is starting/running
+                Some(kind) if kind == OPENCODE_TOOL_EXECUTE_BEFORE_EVENT => (
+                    AiCliStatus::Running,
+                    None,
+                    Some(OpenCodeTransportStatus::Working),
+                ),
+                // tool.execute.after indicates a tool finished but session may continue
+                Some(kind) if kind == OPENCODE_TOOL_EXECUTE_AFTER_EVENT => {
+                    // This is NOT a completion signal - session continues
+                    // Only update running timestamp, don't change status
+                    return self.note_opencode_tool_activity(terminal_id);
+                }
+                // Legacy/internal names for backward compatibility
+                Some(kind) if kind == OPENCODE_TURN_COMPLETE_EVENT => (
+                    AiCliStatus::Attention,
+                    Some(OpenCodeAttentionReason::TurnComplete),
+                    Some(OpenCodeTransportStatus::Idle),
+                ),
+                Some(kind) if kind == OPENCODE_QUESTION_PROMPT_EVENT => (
+                    AiCliStatus::Attention,
+                    Some(OpenCodeAttentionReason::QuestionAsked),
+                    Some(OpenCodeTransportStatus::Permission),
+                ),
+                Some(kind) if kind == OPENCODE_APPROVAL_PROMPT_EVENT => (
+                    AiCliStatus::Attention,
+                    Some(OpenCodeAttentionReason::PermissionAsked),
+                    Some(OpenCodeTransportStatus::Permission),
+                ),
+                // Generic attention fallback
+                _ if event.status == "attention" => (AiCliStatus::Attention, None, None),
+                _ => return false,
             }
-            // Legacy/internal names for backward compatibility
-            Some(kind) if kind == OPENCODE_TURN_COMPLETE_EVENT => (
-                AiCliStatus::Attention,
-                Some(OpenCodeAttentionReason::TurnComplete),
-            ),
-            Some(kind) if kind == OPENCODE_QUESTION_PROMPT_EVENT => (
-                AiCliStatus::Attention,
-                Some(OpenCodeAttentionReason::QuestionAsked),
-            ),
-            Some(kind) if kind == OPENCODE_APPROVAL_PROMPT_EVENT => (
-                AiCliStatus::Attention,
-                Some(OpenCodeAttentionReason::PermissionAsked),
-            ),
-            // Generic attention fallback
-            _ if event.status == "attention" => (AiCliStatus::Attention, None),
-            _ => return false,
         };
+
+        // Store the normalized status for resolver use
+        if let Some(entry) = self.terminals.get_mut(&terminal_id) {
+            if entry.opencode_normalized_status != transport_status {
+                entry.opencode_normalized_status = transport_status;
+                entry.dirty = true;
+            }
+        }
 
         self.apply_opencode_status(terminal_id, status, OpenCodeStatusSource::Notify, reason)
     }
@@ -5008,46 +5154,70 @@ impl AdeApp {
                             OpenCodeStatusSource::Hook
                         };
 
-                        // Map OpenCode hook event names to attention reasons
-                        // This allows proper semantic handling of session.idle vs permission.asked
-                        let attention_reason = if status == AiCliStatus::Attention && !from_title {
-                            match event_name.as_deref() {
-                                Some(name)
-                                    if name == OPENCODE_SESSION_IDLE_EVENT
-                                        || name == "session_idle"
-                                        || name == "session-idle" =>
-                                {
-                                    Some(OpenCodeAttentionReason::TurnComplete)
+                        // Map OpenCode hook event names to attention reasons and normalized status
+                        // This preserves Orca-compatible semantics through the state machine
+                        let (attention_reason, normalized_status) =
+                            if status == AiCliStatus::Attention && !from_title {
+                                match event_name.as_deref() {
+                                    Some(name)
+                                        if name == OPENCODE_SESSION_IDLE_EVENT
+                                            || name == "session_idle"
+                                            || name == "session-idle" =>
+                                    {
+                                        (
+                                            Some(OpenCodeAttentionReason::TurnComplete),
+                                            Some(OpenCodeTransportStatus::Idle),
+                                        )
+                                    }
+                                    Some(name)
+                                        if name == OPENCODE_PERMISSION_ASKED_EVENT
+                                            || name == "permission_asked"
+                                            || name == "permission-asked" =>
+                                    {
+                                        (
+                                            Some(OpenCodeAttentionReason::PermissionAsked),
+                                            Some(OpenCodeTransportStatus::Permission),
+                                        )
+                                    }
+                                    Some(name)
+                                        if name == OPENCODE_SESSION_ERROR_EVENT
+                                            || name == "session_error"
+                                            || name == "session-error" =>
+                                    {
+                                        (
+                                            Some(OpenCodeAttentionReason::SessionError),
+                                            Some(OpenCodeTransportStatus::Idle),
+                                        )
+                                    }
+                                    // Legacy names for backward compatibility
+                                    Some(name) if name == OPENCODE_TURN_COMPLETE_EVENT => (
+                                        Some(OpenCodeAttentionReason::TurnComplete),
+                                        Some(OpenCodeTransportStatus::Idle),
+                                    ),
+                                    Some(name) if name == OPENCODE_QUESTION_PROMPT_EVENT => (
+                                        Some(OpenCodeAttentionReason::QuestionAsked),
+                                        Some(OpenCodeTransportStatus::Permission),
+                                    ),
+                                    Some(name) if name == OPENCODE_APPROVAL_PROMPT_EVENT => (
+                                        Some(OpenCodeAttentionReason::PermissionAsked),
+                                        Some(OpenCodeTransportStatus::Permission),
+                                    ),
+                                    _ => (None, None),
                                 }
-                                Some(name)
-                                    if name == OPENCODE_PERMISSION_ASKED_EVENT
-                                        || name == "permission_asked"
-                                        || name == "permission-asked" =>
-                                {
-                                    Some(OpenCodeAttentionReason::PermissionAsked)
-                                }
-                                Some(name)
-                                    if name == OPENCODE_SESSION_ERROR_EVENT
-                                        || name == "session_error"
-                                        || name == "session-error" =>
-                                {
-                                    Some(OpenCodeAttentionReason::SessionError)
-                                }
-                                // Legacy names for backward compatibility
-                                Some(name) if name == OPENCODE_TURN_COMPLETE_EVENT => {
-                                    Some(OpenCodeAttentionReason::TurnComplete)
-                                }
-                                Some(name) if name == OPENCODE_QUESTION_PROMPT_EVENT => {
-                                    Some(OpenCodeAttentionReason::QuestionAsked)
-                                }
-                                Some(name) if name == OPENCODE_APPROVAL_PROMPT_EVENT => {
-                                    Some(OpenCodeAttentionReason::PermissionAsked)
-                                }
-                                _ => None,
+                            } else if status == AiCliStatus::Running && !from_title {
+                                // Running from hook - working state
+                                (None, Some(OpenCodeTransportStatus::Working))
+                            } else {
+                                (None, None)
+                            };
+
+                        // Store normalized status for resolver use
+                        if let Some(entry) = self.terminals.get_mut(&terminal_id) {
+                            if entry.opencode_normalized_status != normalized_status {
+                                entry.opencode_normalized_status = normalized_status;
+                                entry.dirty = true;
                             }
-                        } else {
-                            None
-                        };
+                        }
 
                         if self.apply_opencode_status(terminal_id, status, source, attention_reason)
                         {
@@ -9793,8 +9963,11 @@ impl AdeApp {
                                 ui.add_space(SIDEBAR_ROW_LEADING_INSET);
 
                                 let ai_badge = AiBadgeModel::from_terminal(terminal);
-                                let ai_response = ai_badge_visual(ai_badge.status)
-                                    .map(|_| draw_ai_badge(ui, &ai_badge));
+                                let ai_response = ai_badge_visual(
+                                    ai_badge.status,
+                                    ai_badge.opencode_normalized_status,
+                                )
+                                .map(|_| draw_ai_badge(ui, &ai_badge));
                                 if ai_response.is_some() {
                                     ui.add_space(4.0);
                                 }
@@ -23847,6 +24020,7 @@ mod tests {
             opencode_process_missing_since: None,
             opencode_last_status_source: None,
             opencode_attention_reason: None,
+            opencode_normalized_status: None,
             opencode_prompt_submit_since: None,
             opencode_running_since: None,
             opencode_last_prompt_submit_at: None,
@@ -25090,15 +25264,37 @@ mod tests {
 
     #[test]
     fn ai_badge_visuals_match_status() {
+        // Without normalized status
         assert_eq!(
-            ai_badge_visual(AiCliStatus::Running),
+            ai_badge_visual(AiCliStatus::Running, None),
             Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180)))
         );
         assert_eq!(
-            ai_badge_visual(AiCliStatus::Attention),
+            ai_badge_visual(AiCliStatus::Attention, None),
             Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 220, 220)))
         );
-        assert_eq!(ai_badge_visual(AiCliStatus::Inactive), None);
+        assert_eq!(ai_badge_visual(AiCliStatus::Inactive, None), None);
+
+        // With normalized status for semantic differentiation
+        use crate::opencode::OpenCodeTransportStatus;
+        assert_eq!(
+            ai_badge_visual(
+                AiCliStatus::Attention,
+                Some(OpenCodeTransportStatus::Permission)
+            ),
+            Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 180, 100)))
+        );
+        assert_eq!(
+            ai_badge_visual(AiCliStatus::Attention, Some(OpenCodeTransportStatus::Idle)),
+            Some(AiBadgeVisual::Solid(Color32::from_rgb(100, 200, 100)))
+        );
+        assert_eq!(
+            ai_badge_visual(
+                AiCliStatus::Attention,
+                Some(OpenCodeTransportStatus::Working)
+            ),
+            Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180)))
+        );
     }
 
     #[test]
@@ -25137,16 +25333,19 @@ mod tests {
         let running_badge = AiBadgeModel {
             tool: Some(AiCliTool::FactoryDroid),
             status: AiCliStatus::Running,
+            opencode_normalized_status: None,
             tooltip_lines: vec!["Factory Droid - Working...".to_string()],
         };
         let attention_badge = AiBadgeModel {
             tool: Some(AiCliTool::FactoryDroid),
             status: AiCliStatus::Attention,
+            opencode_normalized_status: None,
             tooltip_lines: vec!["Factory Droid - Waiting for you...".to_string()],
         };
         let inactive_badge = AiBadgeModel {
             tool: Some(AiCliTool::FactoryDroid),
             status: AiCliStatus::Inactive,
+            opencode_normalized_status: None,
             tooltip_lines: vec!["Factory Droid - Idle".to_string()],
         };
 
@@ -25174,6 +25373,7 @@ mod tests {
         let running_badge = AiBadgeModel {
             tool: Some(AiCliTool::FactoryDroid),
             status: AiCliStatus::Running,
+            opencode_normalized_status: None,
             tooltip_lines: vec!["Factory Droid - Working...".to_string()],
         };
 
@@ -25335,6 +25535,7 @@ mod tests {
         let inactive_badge = AiBadgeModel {
             tool: Some(AiCliTool::FactoryDroid),
             status: AiCliStatus::Inactive,
+            opencode_normalized_status: None,
             tooltip_lines: vec!["Factory Droid - Idle".to_string()],
         };
 
