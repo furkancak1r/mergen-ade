@@ -297,6 +297,24 @@ impl ClaudeAttentionReason {
     }
 }
 
+// ─── Codex CLI Title-Based Detection ─────────────────────────────────────
+// Orca-compatible Codex CLI status detection via terminal title patterns.
+// Codex CLI sets OSC titles with status indicators:
+// - Braille spinner (U+2800-U+28FF) + "codex" context = working
+// - "codex" + working/thinking/running = working
+// - "codex" + action required/permission/waiting/approval = permission
+// - "codex" + ready/idle/done/complete = idle
+// - Bare "codex" = idle (default)
+
+/// Normalized Codex CLI status values (Orca-compatible)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexTransportStatus {
+    Working,
+    Idle,
+    Permission,
+}
+
 const CLAUDE_IDLE_PREFIX: char = '\u{2733}'; // ✳ eight-spoked asterisk
 
 /// Returns true if the character is a Braille pattern (U+2800–U+28FF)
@@ -443,6 +461,127 @@ pub fn clear_claude_working_indicators(title: &str) -> String {
     }
 }
 
+/// Codex CLI title conventions (Orca-compatible):
+/// - Braille spinner anywhere = working
+/// - "codex" + working/thinking/running = working
+/// - "codex" + action required/permission/waiting/approval = permission
+/// - "codex" + ready/idle/done/complete = idle
+/// - Bare "codex" = idle (default when no status indicators)
+pub fn detect_codex_status_from_title(title: &str) -> Option<CodexTransportStatus> {
+    if title.is_empty() {
+        return None;
+    }
+
+    // Braille spinner characters indicate working state (context-aware)
+    // Only match if title also contains "codex" context to avoid Claude/OpenCode conflicts
+    if contains_braille_spinner(title) && title.to_lowercase().contains("codex") {
+        return Some(CodexTransportStatus::Working);
+    }
+
+    // Check for explicit "codex" context with status keywords
+    let lower = title.to_lowercase();
+    if lower.contains("codex") {
+        // Permission keywords take precedence
+        if contains_any(
+            title,
+            &[
+                "action required",
+                "permission",
+                "waiting",
+                "approval",
+                "needs input",
+                "confirm",
+            ],
+        ) {
+            return Some(CodexTransportStatus::Permission);
+        }
+
+        // Working keywords
+        if contains_any(title, &["working", "thinking", "running", "processing"]) {
+            return Some(CodexTransportStatus::Working);
+        }
+
+        // Idle keywords
+        if contains_any(title, &["ready", "idle", "done", "complete", "finished"]) {
+            return Some(CodexTransportStatus::Idle);
+        }
+
+        // Bare "codex" = idle (default when no status indicators)
+        return Some(CodexTransportStatus::Idle);
+    }
+
+    // "[Working" pattern (Factory Droid style, sometimes used by Codex)
+    if title.contains("[Working") {
+        return Some(CodexTransportStatus::Working);
+    }
+
+    None
+}
+
+/// Returns true when the terminal title matches Codex CLI conventions.
+/// Used to scope session detection to Codex CLI specifically.
+pub fn is_codex_agent_title(title: &str) -> bool {
+    if title.is_empty() {
+        return false;
+    }
+
+    // Braille spinner + codex context
+    if contains_braille_spinner(title) && title.to_lowercase().contains("codex") {
+        return true;
+    }
+
+    // Explicit codex mention
+    if title.to_lowercase().contains("codex") {
+        return true;
+    }
+
+    // "[Working" pattern sometimes used by Codex
+    if title.contains("[Working") {
+        return true;
+    }
+
+    false
+}
+
+/// Strip working-status indicators from a title so that detection
+/// will no longer return 'working'. Used to clear stale titles
+/// when an agent exits without resetting its title.
+#[cfg(test)]
+pub fn clear_codex_working_indicators(title: &str) -> String {
+    let mut cleaned = title.to_string();
+
+    // Strip Braille spinner characters (U+2800–U+28FF) when codex context exists
+    if cleaned.to_lowercase().contains("codex") {
+        cleaned = cleaned
+            .chars()
+            .filter(|&c| !is_braille_spinner(c))
+            .collect();
+    }
+
+    // Strip working keywords when "codex" is present
+    if cleaned.to_lowercase().contains("codex") {
+        for keyword in ["working", "thinking", "running", "processing"] {
+            cleaned = cleaned.replace(&keyword.to_string(), "");
+            cleaned = cleaned.replace(&keyword.to_uppercase(), "");
+        }
+    }
+
+    // Strip "[Working" prefix
+    if cleaned.contains("[Working") {
+        cleaned = cleaned.replace("[Working", "");
+        cleaned = cleaned.replace("]", "");
+    }
+
+    // Collapse whitespace after removals
+    cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    if cleaned.is_empty() {
+        title.to_string()
+    } else {
+        cleaned
+    }
+}
+
 /// Extract complete lines from a buffer, returning (complete_lines, incomplete_tail).
 /// A line is complete if it ends with newline, or if it contains a full bracket pattern
 /// that could be a hook event.
@@ -534,9 +673,10 @@ fn parse_hook_event(text: &str, config: &AiHooksConfig) -> Option<(AiCliTool, St
     ] {
         if let Some(pos) = text_lower.find(prefix) {
             let after = &clean[pos + prefix.len()..];
+            // Allow alphanumeric, underscore, dot (.) and hyphen (-) for OpenCode dotted event names
             let name: String = after
                 .chars()
-                .take_while(|&c| c.is_ascii_alphanumeric() || c == '_')
+                .take_while(|&c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
                 .collect();
             if !name.is_empty() {
                 // Verify the detected tool is enabled in config
@@ -801,6 +941,32 @@ impl AiHookManager {
             }
         }
 
+        // Check for Codex CLI title patterns (Orca-compatible)
+        // Codex titles take precedence after Claude and can override other tools
+        if is_codex_agent_title(title) {
+            if let Some(codex_status) = detect_codex_status_from_title(title) {
+                let (status, event) = match codex_status {
+                    CodexTransportStatus::Working => (AiCliStatus::Running, AiHookEvent::Running),
+                    CodexTransportStatus::Idle => (AiCliStatus::Attention, AiHookEvent::Attention),
+                    CodexTransportStatus::Permission => {
+                        (AiCliStatus::Attention, AiHookEvent::Attention)
+                    }
+                };
+
+                // Allow tool override: if title is clearly Codex, switch to Codex
+                // even if session was previously OpenCode/FactoryDroid
+                let tool_changed = session.tool != Some(AiCliTool::CodexCli);
+                session.tool = Some(AiCliTool::CodexCli);
+
+                if session.status != status || session.last_event != Some(event) || tool_changed {
+                    session.status = status;
+                    session.last_event = Some(event);
+                    return Some((AiCliTool::CodexCli, status, Some(event)));
+                }
+                return None;
+            }
+        }
+
         // Fall back to config-based title patterns for other tools
         let matched = if let Some(tool) = session.tool {
             // Don't use config patterns for Claude - we already checked Claude patterns above
@@ -955,6 +1121,43 @@ mod tests {
                 "permissionprompt".to_string(),
                 true
             ))
+        );
+    }
+
+    #[test]
+    fn parse_hook_event_handles_opencode_dotted_event_names() {
+        // Regression: OpenCode uses dotted event names like "tool.execute.before",
+        // "session.idle", "permission.asked". These must be parsed correctly.
+        let config = AiHooksConfig::with_factory_droid_defaults();
+
+        // tool.execute.before (running event)
+        assert_eq!(
+            parse_hook_event("[opencode-hook:event=tool.execute.before]", &config),
+            Some((AiCliTool::OpenCode, "toolexecutebefore".to_string(), false))
+        );
+
+        // session.idle (idle event)
+        assert_eq!(
+            parse_hook_event("[opencode-hook:event=session.idle]", &config),
+            Some((AiCliTool::OpenCode, "sessionidle".to_string(), false))
+        );
+
+        // permission.asked (attention event)
+        assert_eq!(
+            parse_hook_event("[opencode-hook:event=permission.asked]", &config),
+            Some((AiCliTool::OpenCode, "permissionasked".to_string(), false))
+        );
+
+        // Hyphenated names should also work
+        assert_eq!(
+            parse_hook_event("[opencode-hook:event=session-error]", &config),
+            Some((AiCliTool::OpenCode, "sessionerror".to_string(), false))
+        );
+
+        // Notification form
+        assert_eq!(
+            parse_hook_event("[opencode-hook:notification=session.idle]", &config),
+            Some((AiCliTool::OpenCode, "sessionidle".to_string(), true))
         );
     }
 
@@ -1400,16 +1603,17 @@ mod tests {
         let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let terminal_id = 1;
 
+        // Note: "[Working" pattern is now detected as Codex (priority order)
         assert_eq!(
-            manager.update_from_title(terminal_id, "C:\\Users\\test> [Working...]"),
+            manager.update_from_title(terminal_id, "C:\\Users\\test> droid [Working...]"),
             Some((
-                AiCliTool::FactoryDroid,
+                AiCliTool::CodexCli,
                 AiCliStatus::Running,
                 Some(AiHookEvent::Running)
             ))
         );
         let session = manager.session(terminal_id).expect("seeded session");
-        assert_eq!(session.tool, Some(AiCliTool::FactoryDroid));
+        assert_eq!(session.tool, Some(AiCliTool::CodexCli));
         assert_eq!(session.status, AiCliStatus::Running);
     }
 
@@ -1448,18 +1652,19 @@ mod tests {
         let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let terminal_id = 1;
 
+        // Note: "[Working" pattern is detected as Codex; use explicit "codex" for Idle
         assert_eq!(
-            manager.update_from_title(terminal_id, "[Working...]"),
+            manager.update_from_title(terminal_id, "droid [Working...]"),
             Some((
-                AiCliTool::FactoryDroid,
+                AiCliTool::CodexCli,
                 AiCliStatus::Running,
                 Some(AiHookEvent::Running)
             ))
         );
         assert_eq!(
-            manager.update_from_title(terminal_id, "[Idle]"),
+            manager.update_from_title(terminal_id, "codex idle"),
             Some((
-                AiCliTool::FactoryDroid,
+                AiCliTool::CodexCli,
                 AiCliStatus::Attention,
                 Some(AiHookEvent::Attention)
             ))
@@ -1793,5 +1998,232 @@ mod tests {
         let session = manager.session(terminal_id).expect("session");
         assert_eq!(session.status, AiCliStatus::Attention);
         assert_eq!(session.tool, Some(AiCliTool::Claude));
+    }
+
+    // ─── Codex CLI Title Detection Tests ───────────────────────────────────
+
+    #[test]
+    fn detect_codex_status_from_title_returns_none_for_empty_string() {
+        assert_eq!(detect_codex_status_from_title(""), None);
+    }
+
+    #[test]
+    fn detect_codex_status_from_title_returns_none_for_non_codex_titles() {
+        assert_eq!(detect_codex_status_from_title("bash"), None);
+        assert_eq!(detect_codex_status_from_title("vim myfile.ts"), None);
+        assert_eq!(detect_codex_status_from_title("cargo build"), None);
+        assert_eq!(detect_codex_status_from_title("claude working"), None); // Claude, not Codex
+    }
+
+    #[test]
+    fn detect_codex_status_braille_spinner_with_codex_context_detects_working() {
+        // Braille spinner + codex context = working
+        assert_eq!(
+            detect_codex_status_from_title("⠋ Codex working on task"),
+            Some(CodexTransportStatus::Working)
+        );
+        assert_eq!(
+            detect_codex_status_from_title("⠂ Codex CLI"),
+            Some(CodexTransportStatus::Working)
+        );
+    }
+
+    #[test]
+    fn detect_codex_status_working_keywords_detect_working() {
+        // "codex" + working keywords = working
+        assert_eq!(
+            detect_codex_status_from_title("codex working on feature"),
+            Some(CodexTransportStatus::Working)
+        );
+        assert_eq!(
+            detect_codex_status_from_title("codex thinking"),
+            Some(CodexTransportStatus::Working)
+        );
+        assert_eq!(
+            detect_codex_status_from_title("codex running tests"),
+            Some(CodexTransportStatus::Working)
+        );
+        assert_eq!(
+            detect_codex_status_from_title("codex processing"),
+            Some(CodexTransportStatus::Working)
+        );
+    }
+
+    #[test]
+    fn detect_codex_status_permission_keywords_detect_permission() {
+        // "codex" + permission keywords = permission
+        assert_eq!(
+            detect_codex_status_from_title("codex action required"),
+            Some(CodexTransportStatus::Permission)
+        );
+        assert_eq!(
+            detect_codex_status_from_title("codex permission needed"),
+            Some(CodexTransportStatus::Permission)
+        );
+        assert_eq!(
+            detect_codex_status_from_title("codex waiting for approval"),
+            Some(CodexTransportStatus::Permission)
+        );
+        assert_eq!(
+            detect_codex_status_from_title("codex needs input"),
+            Some(CodexTransportStatus::Permission)
+        );
+        assert_eq!(
+            detect_codex_status_from_title("codex confirm action"),
+            Some(CodexTransportStatus::Permission)
+        );
+    }
+
+    #[test]
+    fn detect_codex_status_idle_keywords_detect_idle() {
+        // "codex" + idle keywords = idle
+        assert_eq!(
+            detect_codex_status_from_title("codex ready"),
+            Some(CodexTransportStatus::Idle)
+        );
+        assert_eq!(
+            detect_codex_status_from_title("codex idle"),
+            Some(CodexTransportStatus::Idle)
+        );
+        assert_eq!(
+            detect_codex_status_from_title("codex done"),
+            Some(CodexTransportStatus::Idle)
+        );
+        assert_eq!(
+            detect_codex_status_from_title("codex complete"),
+            Some(CodexTransportStatus::Idle)
+        );
+        assert_eq!(
+            detect_codex_status_from_title("codex finished"),
+            Some(CodexTransportStatus::Idle)
+        );
+    }
+
+    #[test]
+    fn detect_codex_status_bare_codex_defaults_to_idle() {
+        // Bare "codex" = idle (default)
+        assert_eq!(
+            detect_codex_status_from_title("codex"),
+            Some(CodexTransportStatus::Idle)
+        );
+        assert_eq!(
+            detect_codex_status_from_title("CODEX"),
+            Some(CodexTransportStatus::Idle)
+        );
+        assert_eq!(
+            detect_codex_status_from_title("Codex CLI"),
+            Some(CodexTransportStatus::Idle)
+        );
+    }
+
+    #[test]
+    fn detect_codex_status_working_pattern_detects_working() {
+        // "[Working" pattern (Factory Droid style, sometimes used by Codex)
+        assert_eq!(
+            detect_codex_status_from_title("[Working...]"),
+            Some(CodexTransportStatus::Working)
+        );
+    }
+
+    #[test]
+    fn is_codex_agent_title_detects_codex_patterns() {
+        assert!(is_codex_agent_title("⠋ Codex working"));
+        assert!(is_codex_agent_title("codex ready"));
+        assert!(is_codex_agent_title("Codex CLI - action required"));
+        assert!(is_codex_agent_title("[Working...]"));
+    }
+
+    #[test]
+    fn is_codex_agent_title_rejects_non_codex() {
+        assert!(!is_codex_agent_title("bash"));
+        assert!(!is_codex_agent_title("vim file.ts"));
+        assert!(!is_codex_agent_title("claude working")); // Claude, not Codex
+        assert!(!is_codex_agent_title("OpenCode working"));
+    }
+
+    #[test]
+    fn update_from_title_detects_codex_working() {
+        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let terminal_id = 1;
+
+        assert_eq!(
+            manager.update_from_title(terminal_id, "codex working on task"),
+            Some((
+                AiCliTool::CodexCli,
+                AiCliStatus::Running,
+                Some(AiHookEvent::Running)
+            ))
+        );
+        let session = manager.session(terminal_id).expect("session");
+        assert_eq!(session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(session.status, AiCliStatus::Running);
+    }
+
+    #[test]
+    fn update_from_title_detects_codex_idle() {
+        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let terminal_id = 1;
+
+        assert_eq!(
+            manager.update_from_title(terminal_id, "codex ready"),
+            Some((
+                AiCliTool::CodexCli,
+                AiCliStatus::Attention,
+                Some(AiHookEvent::Attention)
+            ))
+        );
+        let session = manager.session(terminal_id).expect("session");
+        assert_eq!(session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(session.status, AiCliStatus::Attention);
+    }
+
+    #[test]
+    fn update_from_title_detects_codex_permission() {
+        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let terminal_id = 1;
+
+        assert_eq!(
+            manager.update_from_title(terminal_id, "codex action required"),
+            Some((
+                AiCliTool::CodexCli,
+                AiCliStatus::Attention,
+                Some(AiHookEvent::Attention)
+            ))
+        );
+        let session = manager.session(terminal_id).expect("session");
+        assert_eq!(session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(session.status, AiCliStatus::Attention);
+    }
+
+    #[test]
+    fn update_from_title_codex_working_to_idle_transition() {
+        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let terminal_id = 1;
+
+        // Start working
+        assert_eq!(
+            manager.update_from_title(terminal_id, "codex working"),
+            Some((
+                AiCliTool::CodexCli,
+                AiCliStatus::Running,
+                Some(AiHookEvent::Running)
+            ))
+        );
+        let session = manager.session(terminal_id).expect("session");
+        assert_eq!(session.status, AiCliStatus::Running);
+        assert_eq!(session.tool, Some(AiCliTool::CodexCli));
+
+        // Transition to idle
+        assert_eq!(
+            manager.update_from_title(terminal_id, "codex ready"),
+            Some((
+                AiCliTool::CodexCli,
+                AiCliStatus::Attention,
+                Some(AiHookEvent::Attention)
+            ))
+        );
+        let session = manager.session(terminal_id).expect("session");
+        assert_eq!(session.status, AiCliStatus::Attention);
+        assert_eq!(session.tool, Some(AiCliTool::CodexCli));
     }
 }

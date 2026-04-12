@@ -22,6 +22,43 @@ pub const OPENCODE_TURN_COMPLETE_EVENT: &str = "turn-complete";
 pub const OPENCODE_QUESTION_PROMPT_EVENT: &str = "question-prompt";
 pub const OPENCODE_APPROVAL_PROMPT_EVENT: &str = "approval-prompt";
 
+/// Normalized Codex CLI status values (Orca-compatible)
+/// These are the canonical states for Codex CLI semantic status tracking
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexTransportStatus {
+    Working,
+    Idle,
+    Permission,
+}
+
+impl CodexTransportStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Idle => "idle",
+            Self::Permission => "permission",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "working" => Some(Self::Working),
+            "idle" => Some(Self::Idle),
+            "permission" => Some(Self::Permission),
+            _ => None,
+        }
+    }
+
+    /// Map transport status to the generic status string for legacy consumers
+    pub fn to_generic_status(&self) -> String {
+        match self {
+            Self::Working => "running".to_owned(),
+            Self::Idle | Self::Permission => "attention".to_owned(),
+        }
+    }
+}
+
 /// Normalized OpenCode status values (Orca-compatible)
 /// These are the canonical states transported from OpenCode plugin/notify mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
