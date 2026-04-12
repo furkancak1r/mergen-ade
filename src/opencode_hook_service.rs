@@ -83,10 +83,6 @@ impl HookServiceState {
     fn drain_pending_events(&mut self) -> Vec<OpenCodeNotifyInboxEvent> {
         std::mem::take(&mut self.pending_events)
     }
-
-    fn clear_terminal(&mut self, terminal_id: u64) {
-        self.last_status_by_terminal.remove(&terminal_id);
-    }
 }
 
 /// OpenCode Hook Service implementing the Orca-style HTTP hook model
@@ -120,11 +116,6 @@ impl OpenCodeHookService {
         })
     }
 
-    /// Get the port the service is listening on
-    pub fn port(&self) -> u16 {
-        self.port
-    }
-
     /// Get the auth token for this service instance
     pub fn token(&self) -> String {
         self.state.lock().unwrap().token.clone()
@@ -135,9 +126,10 @@ impl OpenCodeHookService {
         self.state.lock().unwrap().drain_pending_events()
     }
 
-    /// Clear tracking for a specific terminal (e.g., when it closes)
-    pub fn clear_terminal(&self, terminal_id: u64) {
-        self.state.lock().unwrap().clear_terminal(terminal_id);
+    /// Get the port the service is listening on (test-only)
+    #[cfg(test)]
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     /// Build environment variables for a specific terminal's PTY
@@ -379,7 +371,8 @@ pub fn write_terminal_plugin_config(runtime_dir: &Path, terminal_id: u64) -> io:
     Ok(config_dir)
 }
 
-/// Check if the plugin config is up to date for a terminal
+/// Check if the plugin config is up to date for a terminal (test-only)
+#[cfg(test)]
 pub fn is_plugin_config_current(runtime_dir: &Path, terminal_id: u64) -> bool {
     let config_dir = runtime_dir.join("hooks").join(terminal_id.to_string());
     let plugin_path = config_dir.join("plugins").join(MERGEN_OPENCODE_PLUGIN_FILE);

@@ -333,23 +333,6 @@ fn title_status_for_config(
     None
 }
 
-fn detect_tool_from_hook_text(text: &str, config: &AiHooksConfig) -> Option<AiCliTool> {
-    let text_lower = text.to_ascii_lowercase();
-    for hook_config in &config.hooks {
-        if !hook_config.enabled {
-            continue;
-        }
-        if hook_config
-            .detection_commands
-            .iter()
-            .any(|cmd| text_lower.contains(&cmd.to_ascii_lowercase()))
-        {
-            return Some(hook_config.tool);
-        }
-    }
-    None
-}
-
 fn parse_hook_event(text: &str, config: &AiHooksConfig) -> Option<(AiCliTool, String, bool)> {
     let clean = strip_ansi(text);
     let text_lower = clean.to_ascii_lowercase();

@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -16,13 +16,11 @@ pub const OPENCODE_SESSION_ERROR_EVENT: &str = "session.error";
 pub const OPENCODE_PERMISSION_ASKED_EVENT: &str = "permission.asked";
 pub const OPENCODE_TOOL_EXECUTE_BEFORE_EVENT: &str = "tool.execute.before";
 pub const OPENCODE_TOOL_EXECUTE_AFTER_EVENT: &str = "tool.execute.after";
-pub const OPENCODE_SESSION_STATUS_EVENT: &str = "session.status";
 
 // Legacy/internal names for backward compatibility
 pub const OPENCODE_TURN_COMPLETE_EVENT: &str = "turn-complete";
 pub const OPENCODE_QUESTION_PROMPT_EVENT: &str = "question-prompt";
 pub const OPENCODE_APPROVAL_PROMPT_EVENT: &str = "approval-prompt";
-pub const OPENCODE_INTERRUPTED_EVENT: &str = "interrupted";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenCodeNotifyInboxEvent {
@@ -135,34 +133,6 @@ fn extract_event_kind(payload: &str) -> Option<String> {
     kind.and_then(|v| v.as_str()).map(|s| s.to_lowercase())
 }
 
-/// Normalize OpenCode event names to internal canonical form
-/// Handles various naming conventions: session.idle, session_idle, session-idle
-fn normalize_opencode_event_name(name: &str) -> Option<&'static str> {
-    let normalized = name.to_lowercase().replace(['_', '-'], ".");
-
-    match normalized.as_str() {
-        // Session events
-        "session.idle" | "sessionidle" => Some(OPENCODE_SESSION_IDLE_EVENT),
-        "session.error" | "sessionerror" => Some(OPENCODE_SESSION_ERROR_EVENT),
-        "session.status" | "sessionstatus" => Some(OPENCODE_SESSION_STATUS_EVENT),
-
-        // Permission events
-        "permission.asked" | "permissionasked" => Some(OPENCODE_PERMISSION_ASKED_EVENT),
-
-        // Tool events
-        "tool.execute.before" | "toolexecutebefore" => Some(OPENCODE_TOOL_EXECUTE_BEFORE_EVENT),
-        "tool.execute.after" | "toolexecuteafter" => Some(OPENCODE_TOOL_EXECUTE_AFTER_EVENT),
-
-        // Legacy/internal names
-        "turn-complete" | "turncomplete" => Some(OPENCODE_TURN_COMPLETE_EVENT),
-        "question-prompt" | "questionprompt" => Some(OPENCODE_QUESTION_PROMPT_EVENT),
-        "approval-prompt" | "approvalprompt" => Some(OPENCODE_APPROVAL_PROMPT_EVENT),
-        "interrupted" => Some(OPENCODE_INTERRUPTED_EVENT),
-
-        _ => None,
-    }
-}
-
 pub fn maybe_handle_opencode_notify_mode() -> io::Result<Option<OpenCodeNotifyInboxEvent>> {
     let mut args = std::env::args_os().peekable();
 
@@ -205,6 +175,7 @@ pub fn maybe_handle_opencode_notify_mode() -> io::Result<Option<OpenCodeNotifyIn
     Ok(None)
 }
 
+#[cfg(test)]
 pub fn read_opencode_notify_inbox(
     dir: &Path,
     terminal_id: u64,
@@ -217,7 +188,7 @@ pub fn read_opencode_notify_inbox(
         return Ok(Vec::new());
     }
 
-    let contents = fs::read_to_string(&path)?;
+    let contents = std::fs::read_to_string(&path)?;
     let mut events = Vec::new();
 
     for line in contents.lines() {
@@ -250,6 +221,7 @@ pub fn read_opencode_notify_inbox(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TestTempDir {

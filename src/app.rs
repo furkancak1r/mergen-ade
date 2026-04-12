@@ -849,7 +849,6 @@ pub struct AdeApp {
     codex_notify_last_poll_at: Option<Instant>,
     codex_process_last_poll_at: Option<Instant>,
     opencode_cli_runtime_dir: Option<PathBuf>,
-    opencode_cli_runtime_dir_error: Option<String>,
     opencode_notify_inboxes: BTreeMap<u64, OpenCodeNotifyInboxState>,
     opencode_notify_last_poll_at: Option<Instant>,
     opencode_process_last_poll_at: Option<Instant>,
@@ -2169,8 +2168,7 @@ impl AdeApp {
             Self::factory_droid_hook_runtime_state(&config);
         let (_, codex_cli_runtime_dir, codex_cli_runtime_dir_error) =
             Self::codex_cli_runtime_state(&config);
-        let (_, opencode_cli_runtime_dir, opencode_cli_runtime_dir_error) =
-            Self::opencode_cli_runtime_state(&config);
+        let (_, opencode_cli_runtime_dir, _) = Self::opencode_cli_runtime_state(&config);
 
         let (terminal_events_tx, terminal_events_rx) =
             crossbeam_channel::bounded(TERMINAL_EVENT_QUEUE_CAPACITY);
@@ -2204,7 +2202,6 @@ impl AdeApp {
             codex_notify_last_poll_at: None,
             codex_process_last_poll_at: None,
             opencode_cli_runtime_dir,
-            opencode_cli_runtime_dir_error: opencode_cli_runtime_dir_error.clone(),
             opencode_notify_inboxes: BTreeMap::new(),
             opencode_notify_last_poll_at: None,
             opencode_process_last_poll_at: None,
@@ -23857,7 +23854,6 @@ mod tests {
             codex_notify_last_poll_at: None,
             codex_process_last_poll_at: None,
             opencode_cli_runtime_dir: None,
-            opencode_cli_runtime_dir_error: None,
             opencode_notify_inboxes: BTreeMap::new(),
             opencode_notify_last_poll_at: None,
             opencode_process_last_poll_at: None,
