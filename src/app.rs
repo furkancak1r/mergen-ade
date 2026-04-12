@@ -648,6 +648,10 @@ impl OpenCodeAttentionReason {
         matches!(self, Self::PermissionAsked | Self::QuestionAsked)
     }
 
+    const fn clears_on_terminal_acknowledge(self) -> bool {
+        matches!(self, Self::TurnComplete)
+    }
+
     const fn persists_after_session_exit(self) -> bool {
         matches!(self, Self::TurnComplete)
     }
@@ -7118,12 +7122,37 @@ impl AdeApp {
         }
 
         if let Some(reason) = entry.opencode_attention_reason {
-            if !reason.allows_empty_submit() {
+            if !reason.clears_on_terminal_acknowledge() {
                 return false;
             }
         }
 
-        self.clear_opencode_state(terminal_id)
+        if let Some(manager) = &self.ai_hook_manager {
+            let _ = manager.user_interacted(terminal_id);
+        }
+
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        let mut changed = false;
+        if entry.ai_session.tool != Some(AiCliTool::OpenCode) {
+            entry.ai_session.tool = Some(AiCliTool::OpenCode);
+            changed = true;
+        }
+        if entry.ai_session.status != AiCliStatus::Inactive {
+            entry.ai_session.status = AiCliStatus::Inactive;
+            changed = true;
+        }
+        if entry.opencode_attention_reason.take().is_some() {
+            changed = true;
+        }
+        // Clear turn-complete timing to prevent pulse from reappearing
+        if entry.opencode_last_turn_complete_at.take().is_some() {
+            changed = true;
+        }
+        entry.dirty = true;
+        changed
     }
 
     fn acknowledge_terminal_attention(&mut self, terminal_id: u64) {
@@ -22969,6 +22998,90 @@ mod tests {
     }
 
     #[test]
+    fn turn_complete_opencode_attention_same_terminal_focus_acknowledges() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        let expected_identity = app
+            .terminals
+            .get(&1)
+            .expect("terminal 1")
+            .opencode_process_identity;
+
+        app.set_active_terminal(&ctx, Some(1));
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::OpenCode));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(terminal.opencode_session_active);
+        assert_eq!(terminal.opencode_process_identity, expected_identity);
+        assert_eq!(terminal.opencode_attention_reason, None);
+        assert!(terminal.opencode_last_turn_complete_at.is_none());
+    }
+
+    #[test]
+    fn question_prompt_opencode_attention_same_terminal_focus_does_not_acknowledge() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::QuestionAsked);
+
+        app.set_active_terminal(&ctx, Some(1));
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::OpenCode));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.opencode_attention_reason,
+            Some(OpenCodeAttentionReason::QuestionAsked)
+        );
+    }
+
+    #[test]
+    fn permission_prompt_opencode_attention_same_terminal_focus_does_not_acknowledge() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::PermissionAsked);
+
+        app.set_active_terminal(&ctx, Some(1));
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::OpenCode));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.opencode_attention_reason,
+            Some(OpenCodeAttentionReason::PermissionAsked)
+        );
+    }
+
+    #[test]
+    fn turn_complete_opencode_attention_same_terminal_focus_acknowledges_without_hook_manager() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::OpenCode);
+            entry.ai_session.status = AiCliStatus::Attention;
+            entry.opencode_session_active = true;
+            entry.opencode_process_identity = Some(TrackedProcessIdentity {
+                pid: 9001,
+                creation_time: Some(10001),
+            });
+            entry.opencode_attention_reason = Some(OpenCodeAttentionReason::TurnComplete);
+            entry.opencode_last_status_source = Some(OpenCodeStatusSource::Hook);
+            entry.opencode_last_turn_complete_at = Some(Instant::now());
+        }
+
+        app.set_active_terminal(&ctx, Some(1));
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::OpenCode));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(terminal.opencode_session_active);
+        assert_eq!(terminal.opencode_attention_reason, None);
+        assert!(terminal.opencode_last_turn_complete_at.is_none());
+    }
+
+    #[test]
     fn opencode_status_from_chunk_question_prompt() {
         let result = AdeApp::opencode_status_from_chunk("opencode-question-prompt");
         assert!(result.is_some());
@@ -23905,6 +24018,34 @@ mod tests {
             });
             entry.codex_last_status_source = Some(CodexCliStatusSource::Notify);
             entry.codex_attention_reason = Some(CodexAttentionReason::TurnComplete);
+        }
+    }
+
+    fn seed_opencode_attention(
+        app: &mut AdeApp,
+        terminal_id: u64,
+        reason: OpenCodeAttentionReason,
+    ) {
+        let Some(manager) = app.ai_hook_manager.as_ref().cloned() else {
+            panic!("expected ai hook manager");
+        };
+
+        manager.set_tool(terminal_id, AiCliTool::OpenCode);
+        let _ = manager.ai_waiting_for_user(terminal_id);
+
+        if let Some(entry) = app.terminals.get_mut(&terminal_id) {
+            entry.ai_session.tool = Some(AiCliTool::OpenCode);
+            entry.ai_session.status = AiCliStatus::Attention;
+            entry.opencode_session_active = true;
+            entry.opencode_process_identity = Some(TrackedProcessIdentity {
+                pid: 9001,
+                creation_time: Some(10001),
+            });
+            entry.opencode_last_status_source = Some(OpenCodeStatusSource::Hook);
+            entry.opencode_attention_reason = Some(reason);
+            if reason == OpenCodeAttentionReason::TurnComplete {
+                entry.opencode_last_turn_complete_at = Some(Instant::now());
+            }
         }
     }
 
