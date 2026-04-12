@@ -17,6 +17,8 @@ use crate::hooks::{
     AiHookManager, FACTORY_DROID_HOOKS_DIR_ENV_VAR, FACTORY_DROID_HOOK_INBOX_TOKEN_ENV_VAR,
     FACTORY_DROID_TERMINAL_ID_ENV_VAR,
 };
+use crate::opencode::opencode_env_pairs;
+use crate::opencode_hook_service::OpenCodeHookService;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tattoy_wezterm_surface::{CursorShape, CursorVisibility};
@@ -208,6 +210,8 @@ pub enum TerminalUiEventKind {
         tool: Option<AiCliTool>,
         status: AiCliStatus,
         event: Option<AiHookEvent>,
+        /// Original event name from the hook (e.g., "session.idle", "permission.asked")
+        event_name: Option<String>,
         from_title: bool,
     },
     /// Raw AI-related PTY chunk for debugging - sent for all chunks containing AI keywords
@@ -265,7 +269,9 @@ pub struct TerminalRuntime {
     latest_seqno: Arc<AtomicUsize>,
     last_size: TerminalDimensions,
     child_killer: Arc<Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     child_pid: Option<u32>,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     child_creation_time: Option<u64>,
     #[cfg(target_os = "windows")]
     child_process_handle: Mutex<Option<WinHandle>>,
@@ -323,7 +329,15 @@ struct SharedWriter {
     inner: SharedWriterHandle,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct TrackedProcessIdentity {
+    pub pid: u32,
+    pub creation_time: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 struct ProcessSnapshotEntry {
     pid: u32,
     parent_pid: u32,
@@ -331,13 +345,8 @@ struct ProcessSnapshotEntry {
     executable_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TrackedProcessIdentity {
-    pub pid: u32,
-    pub creation_time: Option<u64>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 struct NamedTrackedProcessIdentity {
     identity: TrackedProcessIdentity,
     executable_name: String,
@@ -351,6 +360,7 @@ enum TestCodexProcessProbe {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 enum RootProcessTerminationPlan {
     VerifiedProcess(ProcessSnapshotEntry),
     DirectProcess(ProcessSnapshotEntry),
@@ -359,6 +369,7 @@ enum RootProcessTerminationPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 enum VerifiedProcessLookup {
     Verified(ProcessSnapshotEntry),
     Missing,
@@ -429,6 +440,9 @@ impl TerminalRuntime {
         factory_droid_inbox_token: Option<String>,
         codex_cli_runtime_dir: Option<PathBuf>,
         codex_notify_inbox_token: Option<String>,
+        opencode_runtime_dir: Option<PathBuf>,
+        opencode_notify_inbox_token: Option<String>,
+        opencode_hook_service: Option<&OpenCodeHookService>,
     ) -> io::Result<Self> {
         let pty_system = native_pty_system();
         let pty_pair = pty_system
@@ -463,6 +477,28 @@ impl TerminalRuntime {
                 codex_env_pairs(terminal_id, codex_runtime_dir, codex_notify_inbox_token)
             {
                 command.env(name, value);
+            }
+        }
+        if let (Some(_), Some(opencode_dir), Some(opencode_token)) = (
+            &ai_hook_manager,
+            opencode_runtime_dir.as_deref(),
+            opencode_notify_inbox_token.as_deref(),
+        ) {
+            for (name, value) in opencode_env_pairs(terminal_id, opencode_dir, opencode_token) {
+                command.env(name, value);
+            }
+        }
+        // Inject Orca-style hook service env vars if available
+        // This enables the OpenCode plugin to send direct status updates via HTTP
+        if let Some(hook_service) = opencode_hook_service {
+            if let Some(opencode_dir) = opencode_runtime_dir.as_deref() {
+                let config_dir = crate::opencode_hook_service::write_terminal_plugin_config(
+                    opencode_dir,
+                    terminal_id,
+                )?;
+                for (name, value) in hook_service.build_pty_env(terminal_id, &config_dir) {
+                    command.env(name, value);
+                }
             }
         }
         // ConEmuANSI and ANSICON removed - they can interfere with ConPTY emulation
@@ -506,7 +542,7 @@ impl TerminalRuntime {
             .map_err(io_error_from_anyhow)?;
         let shared_writer = Arc::new(Mutex::new(Some(writer)));
 
-        let mut terminal = Terminal::new(
+        let terminal = Terminal::new(
             dimensions.to_term_size(),
             Arc::new(AdeTerminalConfig),
             "mergen-ade",
@@ -722,6 +758,7 @@ impl TerminalRuntime {
 
     pub fn detect_new_codex_descendant_process(
         &self,
+        #[cfg_attr(not(target_os = "windows"), allow(unused))]
         baseline: &[TrackedProcessIdentity],
     ) -> Option<Option<TrackedProcessIdentity>> {
         #[cfg(test)]
@@ -753,7 +790,10 @@ impl TerminalRuntime {
         }
     }
 
-    pub fn tracked_codex_process_present(&self, identity: TrackedProcessIdentity) -> Option<bool> {
+    pub fn tracked_codex_process_present(
+        &self,
+        #[cfg_attr(not(target_os = "windows"), allow(unused))] identity: TrackedProcessIdentity,
+    ) -> Option<bool> {
         #[cfg(test)]
         if let Some(forced_probe) = self.forced_codex_process_probe_for_test() {
             return match forced_probe {
@@ -764,6 +804,78 @@ impl TerminalRuntime {
             };
         }
 
+        #[cfg(target_os = "windows")]
+        {
+            let Ok(snapshot) = snapshot_processes() else {
+                return None;
+            };
+            return descendant_process_identity_present(
+                &snapshot,
+                self.child_pid,
+                self.child_creation_time,
+                identity,
+            );
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            None
+        }
+    }
+
+    pub fn snapshot_opencode_descendant_processes(&self) -> Option<Vec<TrackedProcessIdentity>> {
+        #[cfg(target_os = "windows")]
+        {
+            let Ok(snapshot) = snapshot_processes() else {
+                return None;
+            };
+            return opencode_named_descendant_processes(
+                &snapshot,
+                self.child_pid,
+                self.child_creation_time,
+            )
+            .map(|descendants| {
+                descendants
+                    .into_iter()
+                    .map(|entry| entry.identity)
+                    .collect()
+            });
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            None
+        }
+    }
+
+    pub fn detect_new_opencode_descendant_process(
+        &self,
+        #[cfg_attr(not(target_os = "windows"), allow(unused))]
+        baseline: &[TrackedProcessIdentity],
+    ) -> Option<Option<TrackedProcessIdentity>> {
+        #[cfg(target_os = "windows")]
+        {
+            let Ok(snapshot) = snapshot_processes() else {
+                return None;
+            };
+            return opencode_named_descendant_processes(
+                &snapshot,
+                self.child_pid,
+                self.child_creation_time,
+            )
+            .map(|descendants| select_new_opencode_descendant_process(&descendants, baseline));
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            None
+        }
+    }
+
+    pub fn tracked_opencode_process_present(
+        &self,
+        #[cfg_attr(not(target_os = "windows"), allow(unused))] identity: TrackedProcessIdentity,
+    ) -> Option<bool> {
         #[cfg(target_os = "windows")]
         {
             let Ok(snapshot) = snapshot_processes() else {
@@ -1269,6 +1381,7 @@ fn is_benign_process_exit_error(err: &io::Error) -> bool {
         )
 }
 
+#[allow(dead_code)]
 fn root_process_termination_plan(
     snapshot: Option<&[ProcessSnapshotEntry]>,
     child_pid: Option<u32>,
@@ -1301,19 +1414,7 @@ fn root_process_termination_plan(
     })
 }
 
-fn verified_process_entry(
-    entries: &[ProcessSnapshotEntry],
-    pid: u32,
-    expected_creation_time: Option<u64>,
-) -> Option<ProcessSnapshotEntry> {
-    let expected_creation_time = expected_creation_time?;
-    let entry = entries.iter().find(|entry| entry.pid == pid).cloned()?;
-    if entry.creation_time != Some(expected_creation_time) {
-        return None;
-    }
-    Some(entry)
-}
-
+#[allow(dead_code)]
 fn verified_snapshot_root_process(
     entries: &[ProcessSnapshotEntry],
     pid: u32,
@@ -1330,6 +1431,20 @@ fn verified_snapshot_root_process(
         Some(_) => VerifiedProcessLookup::Missing,
         None => VerifiedProcessLookup::Unverifiable,
     }
+}
+
+#[allow(dead_code)]
+fn verified_process_entry(
+    entries: &[ProcessSnapshotEntry],
+    pid: u32,
+    expected_creation_time: Option<u64>,
+) -> Option<ProcessSnapshotEntry> {
+    let expected_creation_time = expected_creation_time?;
+    let entry = entries.iter().find(|entry| entry.pid == pid).cloned()?;
+    if entry.creation_time != Some(expected_creation_time) {
+        return None;
+    }
+    Some(entry)
 }
 
 fn verified_process_tree_descendants(
@@ -1357,6 +1472,7 @@ fn verified_process_tree_descendants(
     )
 }
 
+#[allow(dead_code)]
 fn has_named_descendant_process(
     entries: &[ProcessSnapshotEntry],
     root_pid: Option<u32>,
@@ -1384,6 +1500,7 @@ fn has_named_descendant_process(
     })
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn named_descendant_processes(
     entries: &[ProcessSnapshotEntry],
     root_pid: Option<u32>,
@@ -1414,6 +1531,7 @@ fn named_descendant_processes(
     )
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn codex_named_descendant_processes(
     entries: &[ProcessSnapshotEntry],
     root_pid: Option<u32>,
@@ -1427,6 +1545,7 @@ fn codex_named_descendant_processes(
     )
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn select_new_codex_descendant_process(
     descendants: &[NamedTrackedProcessIdentity],
     baseline: &[TrackedProcessIdentity],
@@ -1444,6 +1563,50 @@ fn select_new_codex_descendant_process(
         .iter()
         .filter(is_new_descendant)
         .filter(|entry| entry.executable_name.eq_ignore_ascii_case("codex.exe"))
+        .min_by_key(candidate_key)
+        .map(|entry| entry.identity)
+        .or_else(|| {
+            descendants
+                .iter()
+                .filter(is_new_descendant)
+                .filter(|entry| entry.executable_name.eq_ignore_ascii_case("node.exe"))
+                .min_by_key(candidate_key)
+                .map(|entry| entry.identity)
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn opencode_named_descendant_processes(
+    entries: &[ProcessSnapshotEntry],
+    root_pid: Option<u32>,
+    expected_root_creation_time: Option<u64>,
+) -> Option<Vec<NamedTrackedProcessIdentity>> {
+    named_descendant_processes(
+        entries,
+        root_pid,
+        expected_root_creation_time,
+        &["opencode.exe", "node.exe"],
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn select_new_opencode_descendant_process(
+    descendants: &[NamedTrackedProcessIdentity],
+    baseline: &[TrackedProcessIdentity],
+) -> Option<TrackedProcessIdentity> {
+    let is_new_descendant =
+        |entry: &&NamedTrackedProcessIdentity| !baseline.contains(&entry.identity);
+    let candidate_key = |entry: &&NamedTrackedProcessIdentity| {
+        (
+            entry.identity.creation_time.unwrap_or(u64::MAX),
+            entry.identity.pid,
+        )
+    };
+
+    descendants
+        .iter()
+        .filter(is_new_descendant)
+        .filter(|entry| entry.executable_name.eq_ignore_ascii_case("opencode.exe"))
         .min_by_key(candidate_key)
         .map(|entry| entry.identity)
         .or_else(|| {
@@ -1478,6 +1641,7 @@ fn has_descendant_process_identity(
         .any(|entry| entry.pid == identity.pid && entry.creation_time == identity.creation_time)
 }
 
+#[cfg(target_os = "windows")]
 fn descendant_process_identity_present(
     entries: &[ProcessSnapshotEntry],
     root_pid: Option<u32>,
@@ -1552,6 +1716,7 @@ fn best_effort_terminate_snapshot_entries(entries: &[ProcessSnapshotEntry]) {
     best_effort_terminate_entries(entries, terminate_snapshot_process);
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn best_effort_terminate_entries<F>(entries: &[ProcessSnapshotEntry], mut terminate_entry: F)
 where
     F: FnMut(ProcessSnapshotEntry) -> io::Result<()>,
@@ -1846,6 +2011,163 @@ impl PendingVisibleCodexStatus {
             .unwrap_or(0);
         self.buffer.drain(..split_at);
     }
+}
+
+#[derive(Debug, Default)]
+struct PendingVisibleOpenCodeStatus {
+    buffer: String,
+}
+
+impl PendingVisibleOpenCodeStatus {
+    #[cfg(test)]
+    fn extract_from_text(&mut self, text: &str) -> Option<String> {
+        self.extract_from_text_with_end_offset(text)
+            .map(|(status, _)| status)
+    }
+
+    fn extract_from_text_with_end_offset(&mut self, text: &str) -> Option<(String, usize)> {
+        if text.is_empty() {
+            return None;
+        }
+
+        let previous_buffer_len = self.buffer.len();
+        self.buffer.push_str(text);
+
+        if let Some((detected, end_offset)) = detect_visible_opencode_status_with_end(&self.buffer)
+        {
+            self.buffer.clear();
+            return Some((
+                detected.to_string(),
+                end_offset
+                    .saturating_sub(previous_buffer_len)
+                    .min(text.len()),
+            ));
+        }
+
+        self.truncate_to_limit();
+        None
+    }
+
+    fn truncate_to_limit(&mut self) {
+        let overflow = self
+            .buffer
+            .chars()
+            .count()
+            .saturating_sub(MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS);
+        if overflow == 0 {
+            return;
+        }
+
+        let mut char_indices = self.buffer.char_indices();
+        let split_at = char_indices
+            .nth(overflow - 1)
+            .map(|(index, ch)| index + ch.len_utf8())
+            .unwrap_or(0);
+        self.buffer.drain(..split_at);
+    }
+}
+
+fn detect_visible_opencode_status_with_end(text: &str) -> Option<(&'static str, usize)> {
+    let (projection, projection_offsets) = build_visible_status_projection(text);
+    let (collapsed, collapsed_offsets) =
+        collapse_projection_whitespace(&projection, &projection_offsets);
+
+    if let Some(end_offset) =
+        detect_visible_opencode_question_prompt_with_end(&collapsed, &collapsed_offsets)
+    {
+        return Some(("opencode-question-prompt", end_offset));
+    }
+
+    if let Some(end_offset) =
+        detect_visible_opencode_approval_prompt_with_end(&collapsed, &collapsed_offsets)
+    {
+        return Some(("opencode-approval-prompt", end_offset));
+    }
+
+    if let Some(end_offset) =
+        detect_visible_opencode_turn_complete_with_end(&collapsed, &collapsed_offsets)
+    {
+        return Some(("opencode-turn-complete", end_offset));
+    }
+
+    if let Some(end_offset) =
+        detect_visible_opencode_interrupted_banner_with_end(&collapsed, &collapsed_offsets)
+    {
+        return Some(("opencode-interrupted-banner", end_offset));
+    }
+
+    None
+}
+
+fn detect_visible_opencode_question_prompt_with_end(
+    collapsed: &str,
+    collapsed_offsets: &[usize],
+) -> Option<usize> {
+    let question_start = collapsed.find("question")?;
+    let question_end = question_start + "question".len();
+    let enter_start = collapsed[question_end..]
+        .find("enter to submit answer")
+        .map(|offset| question_end + offset)?;
+    let esc_start = collapsed[enter_start..]
+        .find("esc ")
+        .map(|offset| enter_start + offset)?;
+    let latest_end = esc_start + "esc ".len() + 4;
+    let end_char_index = collapsed[..latest_end].chars().count().saturating_sub(1);
+    collapsed_offsets.get(end_char_index).copied()
+}
+
+fn detect_visible_opencode_approval_prompt_with_end(
+    collapsed: &str,
+    collapsed_offsets: &[usize],
+) -> Option<usize> {
+    let approve_start = collapsed.find("approve")?;
+    let options_start = approve_start + "approve".len();
+    let options_text = ["yes", "no", "confirm", "cancel"];
+    let latest_end = options_text
+        .iter()
+        .filter_map(|opt| {
+            collapsed[options_start..]
+                .find(opt)
+                .map(|offset| offset + opt.len())
+        })
+        .max()?;
+    let end_char_index = collapsed[..options_start + latest_end]
+        .chars()
+        .count()
+        .saturating_sub(1);
+    collapsed_offsets.get(end_char_index).copied()
+}
+
+fn detect_visible_opencode_turn_complete_with_end(
+    collapsed: &str,
+    collapsed_offsets: &[usize],
+) -> Option<usize> {
+    // Only accept explicit "turn complete" marker
+    // This is the authoritative OpenCode completion signal
+    // We do NOT use heuristics like "build" + timing/model because those can appear
+    // during active work (e.g., footer status display), causing false pulse.
+    let turn_end = collapsed.find("turn complete")?;
+    let end_offset = turn_end + "turn complete".len();
+    let end_char_index = collapsed[..end_offset].chars().count().saturating_sub(1);
+    collapsed_offsets.get(end_char_index).copied()
+}
+
+fn detect_visible_opencode_interrupted_banner_with_end(
+    collapsed: &str,
+    collapsed_offsets: &[usize],
+) -> Option<usize> {
+    let interrupted_start = collapsed.find("interrupted")?;
+    let interrupted_end = interrupted_start + "interrupted".len();
+    let help_end = ["for help", "? for help"]
+        .iter()
+        .filter_map(|needle| {
+            collapsed[interrupted_end..]
+                .find(needle)
+                .map(|offset| interrupted_end + offset + needle.len())
+        })
+        .max()?;
+    let end_char_index = collapsed[..help_end].chars().count().saturating_sub(1);
+    collapsed_offsets.get(end_char_index).copied()
 }
 
 fn detect_visible_factory_status_with_end(text: &str) -> Option<(&'static str, usize)> {
@@ -2251,7 +2573,7 @@ fn collapse_projection_whitespace(text: &str, offsets: &[usize]) -> (String, Vec
 fn complete_official_hook_end_offset(text: &str) -> Option<usize> {
     let lower = text.to_ascii_lowercase();
 
-    ["[droid-hook:", "[factory-droid-hook:"]
+    ["[droid-hook:", "[factory-droid-hook:", "[opencode-hook:"]
         .iter()
         .filter_map(|prefix| {
             let start = lower.find(prefix)?;
@@ -2267,6 +2589,8 @@ enum PendingAiReadSignalKind {
         tool: AiCliTool,
         status: AiCliStatus,
         event: Option<AiHookEvent>,
+        /// Original hook event name (e.g., "session.idle", "permission.asked")
+        event_name: Option<String>,
         from_title: bool,
     },
     RawChunk {
@@ -2287,6 +2611,7 @@ fn collect_ai_read_signals(
     pending_osc_title: &mut PendingOscTitle,
     pending_visible_factory_status: &mut PendingVisibleFactoryStatus,
     pending_visible_codex_status: &mut PendingVisibleCodexStatus,
+    pending_visible_opencode_status: &mut PendingVisibleOpenCodeStatus,
 ) -> Vec<PendingAiReadSignal> {
     let text = String::from_utf8_lossy(bytes);
     let mut signals = manager
@@ -2298,6 +2623,7 @@ fn collect_ai_read_signals(
                 tool: transition.tool,
                 status: transition.status,
                 event: transition.event,
+                event_name: transition.event_name,
                 from_title: false,
             },
         })
@@ -2313,6 +2639,7 @@ fn collect_ai_read_signals(
                     tool,
                     status,
                     event,
+                    event_name: None, // Title-based signals don't have original hook event names
                     from_title: true,
                 },
             });
@@ -2367,6 +2694,18 @@ fn collect_ai_read_signals(
         }
     }
 
+    // Always run OpenCode visible status detection to catch completion signals
+    // even before the tool is explicitly detected (e.g., manual launch scenarios).
+    // The patterns are OpenCode-specific and won't false-positive on other output.
+    if let Some((chunk, end_offset)) =
+        pending_visible_opencode_status.extract_from_text_with_end_offset(&text)
+    {
+        signals.push(PendingAiReadSignal {
+            text_offset: end_offset.min(text.len()),
+            kind: PendingAiReadSignalKind::RawChunk { chunk },
+        });
+    }
+
     signals.sort_by_key(|signal| signal.text_offset);
     signals
 }
@@ -2385,6 +2724,7 @@ fn spawn_reader_thread(
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
         let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+        let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         loop {
             match reader.read(&mut buffer) {
@@ -2405,12 +2745,14 @@ fn spawn_reader_thread(
                             &mut pending_osc_title,
                             &mut pending_visible_factory_status,
                             &mut pending_visible_codex_status,
+                            &mut pending_visible_opencode_status,
                         ) {
                             match signal.kind {
                                 PendingAiReadSignalKind::StatusChange {
                                     tool,
                                     status,
                                     event,
+                                    event_name,
                                     from_title,
                                 } => {
                                     send_ui_event(
@@ -2420,6 +2762,7 @@ fn spawn_reader_thread(
                                             tool: Some(tool),
                                             status,
                                             event,
+                                            event_name,
                                             from_title,
                                         },
                                         &tx,
@@ -2567,6 +2910,10 @@ fn ai_raw_chunk_requires_reliable_delivery(chunk: &str) -> bool {
             | "codex-question-prompt"
             | "codex-plan-mode-prompt"
             | "codex-interrupted-banner"
+            | "opencode-question-prompt"
+            | "opencode-approval-prompt"
+            | "opencode-turn-complete"
+            | "opencode-interrupted-banner"
     )
 }
 
@@ -3223,21 +3570,23 @@ fn io_error_from_anyhow(err: impl std::fmt::Display) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    use super::is_benign_process_exit_error;
     use super::{
         begin_termination, best_effort_terminate_entries, codex_named_descendant_processes,
         collect_ai_read_signals, default_style, extract_complete_title_from_bytes,
         factory_droid_hook_env_pairs, has_descendant_process_identity,
-        has_named_descendant_process, is_benign_process_exit_error, official_ai_debug_chunk,
-        process_tree_kill_order, root_process_termination_plan, sanitize_cell_text,
-        select_new_codex_descendant_process, selection_snapshot_from_terminal, send_ui_event,
-        snapshot_from_terminal, snapshots_from_terminal, test_terminal_runtime,
-        trim_trailing_default_cells, verified_process_entry, verified_process_tree_descendants,
-        verified_snapshot_root_process, AdeTerminalConfig, PendingAiReadSignalKind,
-        PendingOscTitle, PendingVisibleCodexStatus, PendingVisibleFactoryStatus,
-        ProcessSnapshotEntry, RootProcessTerminationPlan, RuntimeCommand, SharedWriter,
-        SharedWriterHandle, TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape,
-        TerminalDimensions, TerminalRuntime, TerminalSelectionHyperlink, TerminalStyle,
-        TerminalStyledCell, TerminalUiEventKind, TrackedProcessIdentity, VerifiedProcessLookup,
+        has_named_descendant_process, official_ai_debug_chunk, process_tree_kill_order,
+        root_process_termination_plan, sanitize_cell_text, select_new_codex_descendant_process,
+        selection_snapshot_from_terminal, send_ui_event, snapshot_from_terminal,
+        snapshots_from_terminal, test_terminal_runtime, trim_trailing_default_cells,
+        verified_process_entry, verified_process_tree_descendants, verified_snapshot_root_process,
+        AdeTerminalConfig, PendingAiReadSignalKind, PendingOscTitle, PendingVisibleCodexStatus,
+        PendingVisibleFactoryStatus, PendingVisibleOpenCodeStatus, ProcessSnapshotEntry,
+        RootProcessTerminationPlan, RuntimeCommand, SharedWriter, SharedWriterHandle,
+        TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape, TerminalDimensions,
+        TerminalRuntime, TerminalSelectionHyperlink, TerminalStyle, TerminalStyledCell,
+        TerminalUiEventKind, TrackedProcessIdentity, VerifiedProcessLookup,
         MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS,
     };
     use crate::codex::{
@@ -3805,12 +4154,32 @@ mod tests {
     }
 
     #[test]
+    fn pending_visible_opencode_status_detects_turn_complete() {
+        let mut pending = PendingVisibleOpenCodeStatus::default();
+        assert_eq!(
+            pending.extract_from_text("your turn is complete.\nturn complete"),
+            Some("opencode-turn-complete".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_opencode_status_detects_interrupted() {
+        let mut pending = PendingVisibleOpenCodeStatus::default();
+        assert_eq!(pending.extract_from_text("interrupted"), None);
+        assert_eq!(
+            pending.extract_from_text("conversation interrupted\n? for help"),
+            Some("opencode-interrupted-banner".to_string())
+        );
+    }
+
+    #[test]
     fn collect_ai_read_signals_orders_hook_before_later_title_signal_without_newline() {
         let manager =
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
         let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+        let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
         let bytes = b"[droid-hook:event=UserPromptSubmit]\x1b]0;[Idle]\x07";
 
         let signals = collect_ai_read_signals(
@@ -3820,6 +4189,7 @@ mod tests {
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
             &mut pending_visible_codex_status,
+            &mut pending_visible_opencode_status,
         );
 
         let status_changes = signals
@@ -3848,6 +4218,7 @@ mod tests {
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
         let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+        let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
         let bytes = b"[droid-hook:event=UserPromptSubmit]HOOKS  Stop";
 
         let signals = collect_ai_read_signals(
@@ -3857,6 +4228,7 @@ mod tests {
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
             &mut pending_visible_codex_status,
+            &mut pending_visible_opencode_status,
         );
 
         let ordered_kinds = signals
@@ -3886,6 +4258,7 @@ mod tests {
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
         let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+        let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
         let hook = "[droid-hook:event=UserPromptSubmit]";
         let bytes = b"[droid-hook:event=UserPromptSubmit]\xF0\x9F\x94\x94";
 
@@ -3896,6 +4269,7 @@ mod tests {
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
             &mut pending_visible_codex_status,
+            &mut pending_visible_opencode_status,
         );
 
         assert_eq!(signals.len(), 2);
@@ -3941,6 +4315,7 @@ mod tests {
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
         let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+        let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
             1,
@@ -3949,6 +4324,7 @@ mod tests {
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
             &mut pending_visible_codex_status,
+            &mut pending_visible_opencode_status,
         );
 
         assert_eq!(signals.len(), 1);
@@ -3967,6 +4343,7 @@ mod tests {
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
         let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+        let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
             1,
@@ -3975,6 +4352,7 @@ mod tests {
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
             &mut pending_visible_codex_status,
+            &mut pending_visible_opencode_status,
         );
 
         assert_eq!(
@@ -3996,6 +4374,7 @@ mod tests {
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
         let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+        let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
             1,
@@ -4004,6 +4383,7 @@ mod tests {
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
             &mut pending_visible_codex_status,
+            &mut pending_visible_opencode_status,
         );
 
         assert!(signals.iter().any(|signal| matches!(
@@ -4026,6 +4406,7 @@ mod tests {
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
         let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+        let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
             1,
@@ -4034,6 +4415,7 @@ mod tests {
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
             &mut pending_visible_codex_status,
+            &mut pending_visible_opencode_status,
         );
 
         assert!(signals.iter().any(|signal| matches!(
@@ -4070,6 +4452,7 @@ mod tests {
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
         let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+        let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
             1,
@@ -4078,6 +4461,7 @@ mod tests {
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
             &mut pending_visible_codex_status,
+            &mut pending_visible_opencode_status,
         );
 
         assert!(signals.iter().any(|signal| matches!(
@@ -4107,6 +4491,7 @@ mod tests {
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
         let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+        let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
             1,
@@ -4115,6 +4500,7 @@ mod tests {
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
             &mut pending_visible_codex_status,
+            &mut pending_visible_opencode_status,
         );
 
         assert!(signals.iter().any(|signal| matches!(
@@ -4130,6 +4516,7 @@ mod tests {
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
         let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+        let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
             1,
@@ -4138,6 +4525,7 @@ mod tests {
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
             &mut pending_visible_codex_status,
+            &mut pending_visible_opencode_status,
         );
 
         assert!(signals.iter().any(|signal| matches!(
@@ -4153,6 +4541,7 @@ mod tests {
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
         let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+        let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
             1,
@@ -4161,6 +4550,7 @@ mod tests {
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
             &mut pending_visible_codex_status,
+            &mut pending_visible_opencode_status,
         );
 
         assert!(signals.iter().any(|signal| matches!(
@@ -4285,6 +4675,7 @@ mod tests {
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
         let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+        let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
             1,
@@ -4293,6 +4684,7 @@ mod tests {
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
             &mut pending_visible_codex_status,
+            &mut pending_visible_opencode_status,
         );
 
         assert!(!signals.iter().any(|signal| matches!(
@@ -4309,6 +4701,7 @@ mod tests {
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
         let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+        let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
             1,
@@ -4317,6 +4710,7 @@ mod tests {
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
             &mut pending_visible_codex_status,
+            &mut pending_visible_opencode_status,
         );
 
         assert!(signals.iter().any(|signal| matches!(
@@ -4332,6 +4726,7 @@ mod tests {
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
         let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+        let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
             1,
@@ -4340,6 +4735,7 @@ mod tests {
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
             &mut pending_visible_codex_status,
+            &mut pending_visible_opencode_status,
         );
 
         assert!(!signals.iter().any(|signal| matches!(

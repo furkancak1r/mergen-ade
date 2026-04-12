@@ -1,5 +1,54 @@
 ### Known Issues & Fix Log
 
+#### OpenCode spinner now correctly transitions to pulse when work completes {#opencode-spinner-now-correctly-transitions-to-pulse-when-work-completes}
+- Date: 2026-04-12T00:00:00Z
+- Context: main/Windows/macOS local OpenCode CLI integration when a turn finishes
+- Error signature: `OpenCode spinner kept spinning after the turn was complete; the badge never switched to the pulse state indicating the turn was done.`
+- Symptoms/Impact: Users could not visually tell when OpenCode had finished its work because the running spinner would keep spinning indefinitely. The only completion signal was the literal text "turn complete" appearing in the terminal, but this often didn't trigger the state transition due to parsing issues or race conditions.
+- Root cause: OpenCode relied on a single fragile completion signal (literal "turn complete" text in visible UI). There was no hook-based or notify-based attention path like Codex and Factory Droid have. The hook detection for OpenCode was broken because `detection_commands` was empty and the parser didn't recognize `[opencode-hook:*]` markers. Process polling could only detect process exit, not completion with the process still alive.
+- Resolution:
+  - Fixed hook detection in `src/hooks.rs` by modifying `parse_hook_event` to directly detect the tool from the hook prefix rather than relying on `detection_commands`.
+  - Added `[opencode-hook:*]` prefix recognition in `src/terminal.rs`'s `complete_official_hook_end_offset` function.
+  - Created a new `src/opencode.rs` module with notify/inbox support similar to `src/codex.rs`, providing:
+    - `opencode_env_pairs()` for terminal spawn environment variables
+    - `write_opencode_notify_event()` for CLI notify mode
+    - `read_opencode_notify_inbox()` for polling-based event reading
+    - Event kind constants: `OPENCODE_TURN_COMPLETE_EVENT`, `OPENCODE_QUESTION_PROMPT_EVENT`, etc.
+  - Added OpenCode runtime directory configuration in `src/config.rs` (`opencode_cli_runtime_dir`).
+  - Added `poll_opencode_notify_inboxes()` in `src/app.rs` to periodically check for notify events.
+  - Strengthened the visible UI parser in `src/terminal.rs` with multi-marker detection:
+    - Primary: "turn complete" literal
+    - Secondary: "Build" pattern with timing (e.g., "1.5s") and model info
+    - Tertiary: "completed" with follow-up prompt indicators
+  - Updated `OpenCodeStatusSource` enum to include `Notify` and `Hook` variants.
+  - Updated `apply_opencode_status` to record hook attention timestamps.
+  - Updated `resolve_opencode_status` resolver priority: Hook/Notify now has highest priority, then visible UI, then title-based signals.
+  - Updated `process_terminal_events` to accept hook events (from_title=false) for OpenCode.
+- Prevent recurrence:
+  - Always provide multiple independent completion signal paths (hook/notify + visible UI + title) for AI CLI integrations.
+  - Test hook event handling explicitly in integration tests.
+  - For new AI CLI integrations, follow the Codex/Factory pattern: implement both notify-based and visible-UI-based attention signals.
+- Files/Commands touched: `src/app.rs`, `src/hooks.rs`, `src/terminal.rs`, `src/config.rs`, `src/opencode.rs` (new), `src/main.rs`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: 2026-04-12 user-reported OpenCode spinner persistence issue; regression test `opencode_pty_hook_event_is_accepted` (updated from the old `opencode_pty_hook_event_is_ignored`)
+
+#### macOS Command key now works as a primary shortcut modifier alongside Ctrl {#macos-command-key-now-works-as-a-primary-shortcut-modifier-alongside-ctrl}
+- Date: 2026-04-11T00:00:00Z
+- Context: keyboard shortcut handling on macOS vs Windows/Linux
+- Error signature: `On macOS, pressing Cmd+Arrow, Cmd+Alt+Arrow, or Cmd+letter (e.g. Cmd+C, Cmd+G) had no effect. Only the physical Ctrl key was recognized for app navigation, terminal control bytes, and Factory Droid interactive entry.`
+- Symptoms/Impact: macOS users had to use the Control key (not the natural Command key) for all Ctrl-equivalent shortcuts: terminal navigation, control-byte generation (like Ctrl+C interrupt), and Factory Droid attention gating. This broke standard macOS keyboard expectations where Cmd is the primary action modifier.
+- Root cause: All shortcut matching used bare `modifiers.ctrl` checks without considering `modifiers.command` as an equivalent primary modifier. Only terminal link activation (`Ctrl/Cmd+Click`) already handled both via `modifiers.ctrl || modifiers.command`. Navigation parsing, control-byte generation, and Factory Droid interactive entry all missed the `command` branch.
+- Resolution:
+  - Added a `primary_shortcut_modifier(modifiers)` helper that returns `modifiers.ctrl || modifiers.command`, consistent with egui's cross-platform `Modifiers::command` convention.
+  - Applied the helper to `event_terminal_navigation_shortcut` (Cmd+Arrow, Cmd+Alt+Arrow), `key_to_terminal_bytes` (Cmd+A–Z control bytes), and `event_is_factory_droid_interactive_entry` (Cmd+G).
+  - The second guard in `key_to_terminal_bytes` that suppressed all modifier combos now uses `primary_shortcut_modifier || alt` instead of the old `ctrl || alt || command` tri-check, preserving the Cmd-only passthrough for control-byte generation while still rejecting Cmd+Alt (which should not generate a control byte).
+  - Extended terminal link activation to use the shared helper for consistency.
+  - Added explicit Command-only test coverage: `maps_command_letters_to_control_bytes`, `event_terminal_navigation_shortcut_accepts_command_only_for_navigation`, `event_terminal_navigation_shortcut_recognizes_command_alt_up_down`, `primary_shortcut_modifier_accepts_ctrl_or_command`, `event_is_factory_droid_interactive_entry_accepts_command_only`, `command_arrow_shortcuts_stay_out_of_terminal_stream`, `command_vertical_arrow_shortcuts_stay_out_of_terminal_stream_in_single_view`, `handle_shortcuts_moves_active_terminal_with_command_arrow`, `raw_input_hook_buffers_command_arrow_for_active_terminal_in_multi_view`, `raw_input_hook_buffers_command_horizontal_arrow_for_filter_in_single_view`, `raw_input_hook_buffers_command_vertical_arrow_for_single_view_navigation`.
+  - Fixed a pre-existing issue where `is_benign_process_exit_error` import in `terminal.rs` tests was not gated for Windows, preventing test compilation on non-Windows targets.
+- Prevent recurrence:
+  - When adding new keyboard shortcuts that use Ctrl on Windows/Linux, always use `primary_shortcut_modifier()` instead of bare `modifiers.ctrl` so macOS Command key works automatically.
+  - Keep the `terminal_link_activation_modifiers` function as-is since it already delegates to `primary_shortcut_modifier`.
+- Files/Commands touched: `src/app.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo check --target x86_64-pc-windows-gnullvm`
+
 #### Terminal switches could reopen the transcript at a blank bottom offset instead of the live prompt {#terminal-switches-could-reopen-the-transcript-at-a-blank-bottom-offset-instead-of-the-live-prompt}
 - Date: 2026-04-10T00:00:00Z
 - Context: main terminal pane scroll behavior while switching the active terminal

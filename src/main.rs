@@ -10,6 +10,8 @@ mod config;
 mod hooks;
 mod layout;
 mod models;
+mod opencode;
+mod opencode_hook_service;
 mod terminal;
 mod title;
 
@@ -235,10 +237,40 @@ where
     maybe_handle_codex_notify_mode_with(args, codex::handle_codex_notify_from_env)
 }
 
+fn maybe_handle_opencode_notify_mode<I>(mut args: I) -> Result<bool, String>
+where
+    I: Iterator<Item = OsString>,
+{
+    let Some(mode) = args.next() else {
+        return Ok(false);
+    };
+    if mode != "--opencode-notify" {
+        return Ok(false);
+    }
+
+    match opencode::maybe_handle_opencode_notify_mode() {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
 fn main() -> Result<(), eframe::Error> {
     let mut args = std::env::args_os();
     let _ = args.next();
-    match maybe_handle_codex_notify_mode(args) {
+
+    // Try OpenCode notify mode first
+    match maybe_handle_opencode_notify_mode(&mut args) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(err) => {
+            eprintln!("Failed to process OpenCode notify payload: {err}");
+            std::process::exit(1);
+        }
+    }
+
+    // Then try Codex notify mode
+    match maybe_handle_codex_notify_mode(&mut args) {
         Ok(true) => return Ok(()),
         Ok(false) => {}
         Err(err) => {

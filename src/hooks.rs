@@ -12,6 +12,7 @@ const MAX_PENDING_HOOK_LINE_BYTES: usize = 1024;
 pub enum AiCliTool {
     FactoryDroid,
     CodexCli,
+    OpenCode,
 }
 
 impl AiCliTool {
@@ -19,6 +20,7 @@ impl AiCliTool {
         match self {
             Self::FactoryDroid => "Factory Droid",
             Self::CodexCli => "Codex CLI",
+            Self::OpenCode => "OpenCode",
         }
     }
 }
@@ -167,6 +169,29 @@ impl AiHooksConfig {
                     working_title_pattern: String::new(),
                     idle_title_pattern: String::new(),
                 },
+                AiHookConfig {
+                    tool: AiCliTool::OpenCode,
+                    enabled: true,
+                    // OpenCode is tracked through plugin-based and hook-based events per documentation
+                    // Events: session.idle (completion), permission.asked (interactive),
+                    //         tool.execute.before (running), session.error (error)
+                    detection_commands: Vec::new(),
+                    // tool.execute.before signals work is starting
+                    running_hook_events: vec!["tool.execute.before".to_string()],
+                    // session.idle is the canonical completion signal
+                    // permission.asked is for interactive prompts
+                    // session.error indicates something went wrong
+                    inactive_hook_events: vec![
+                        "session.idle".to_string(),
+                        "permission.asked".to_string(),
+                        "session.error".to_string(),
+                    ],
+                    show_indicators: true,
+                    status_indicators: AiStatusIndicators::default(),
+                    // Title patterns are secondary/backup signals
+                    working_title_pattern: "Working".to_string(),
+                    idle_title_pattern: "Idle".to_string(),
+                },
             ],
             project_overrides: BTreeMap::new(),
         }
@@ -275,7 +300,7 @@ fn complete_hook_pattern_end(text: &str) -> Option<usize> {
     let text_lower = text.to_ascii_lowercase();
     let mut match_end = None;
 
-    for pattern in ["[droid-hook:", "[factory-droid-hook:"] {
+    for pattern in ["[droid-hook:", "[factory-droid-hook:", "[opencode-hook:"] {
         if let Some(start) = text_lower.find(pattern) {
             let end = text_lower[start + pattern.len()..]
                 .find(']')
@@ -331,11 +356,17 @@ fn parse_hook_event(text: &str, config: &AiHooksConfig) -> Option<(AiCliTool, St
 
     let extract_name = |value: &str| -> String { normalize_hook_name(value) };
 
-    for (prefix, is_notification) in [
-        ("[droid-hook:event=", false),
-        ("[factory-droid-hook:event=", false),
-        ("[droid-hook:notification=", true),
-        ("[factory-droid-hook:notification=", true),
+    for (prefix, is_notification, detected_tool) in [
+        ("[droid-hook:event=", false, AiCliTool::FactoryDroid),
+        ("[factory-droid-hook:event=", false, AiCliTool::FactoryDroid),
+        ("[opencode-hook:event=", false, AiCliTool::OpenCode),
+        ("[droid-hook:notification=", true, AiCliTool::FactoryDroid),
+        (
+            "[factory-droid-hook:notification=",
+            true,
+            AiCliTool::FactoryDroid,
+        ),
+        ("[opencode-hook:notification=", true, AiCliTool::OpenCode),
     ] {
         if let Some(pos) = text_lower.find(prefix) {
             let after = &clean[pos + prefix.len()..];
@@ -344,8 +375,11 @@ fn parse_hook_event(text: &str, config: &AiHooksConfig) -> Option<(AiCliTool, St
                 .take_while(|&c| c.is_ascii_alphanumeric() || c == '_')
                 .collect();
             if !name.is_empty() {
-                let tool = detect_tool_from_hook_text(prefix, config)?;
-                return Some((tool, extract_name(&name), is_notification));
+                // Verify the detected tool is enabled in config
+                let config_for_tool = config.config_for(detected_tool);
+                if config_for_tool.map_or(false, |c| c.enabled) {
+                    return Some((detected_tool, extract_name(&name), is_notification));
+                }
             }
         }
     }
@@ -362,6 +396,8 @@ pub(crate) struct AiHookTransition {
     pub tool: AiCliTool,
     pub status: AiCliStatus,
     pub event: Option<AiHookEvent>,
+    /// Original hook event name for semantic mapping (e.g., "session.idle", "permission.asked")
+    pub event_name: Option<String>,
     pub text_offset: usize,
 }
 
@@ -535,6 +571,7 @@ impl AiHookManager {
                         tool,
                         status: AiCliStatus::Running,
                         event: Some(AiHookEvent::Running),
+                        event_name: Some(event_name.clone()),
                         text_offset: end_offset.saturating_sub(prior_pending_len).min(text.len()),
                     });
                     continue;
@@ -547,6 +584,7 @@ impl AiHookManager {
                         tool,
                         status: AiCliStatus::Attention,
                         event: Some(AiHookEvent::Attention),
+                        event_name: Some(event_name.clone()),
                         text_offset: end_offset.saturating_sub(prior_pending_len).min(text.len()),
                     });
                 }
@@ -1138,12 +1176,14 @@ mod tests {
                     tool: AiCliTool::FactoryDroid,
                     status: AiCliStatus::Running,
                     event: Some(AiHookEvent::Running),
+                    event_name: Some("userpromptsubmit".to_string()),
                     text_offset: running_prefix.len(),
                 },
                 AiHookTransition {
                     tool: AiCliTool::FactoryDroid,
                     status: AiCliStatus::Attention,
                     event: Some(AiHookEvent::Attention),
+                    event_name: Some("stop".to_string()),
                     text_offset: full_text.len(),
                 },
             ]
@@ -1223,5 +1263,62 @@ mod tests {
                 Some(AiHookEvent::Attention)
             ))
         );
+    }
+
+    #[test]
+    fn update_from_title_opencode_detects_running_pattern() {
+        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let terminal_id = 1;
+
+        assert_eq!(
+            manager.update_from_title(terminal_id, "OpenCode - Working on changes"),
+            Some((
+                AiCliTool::OpenCode,
+                AiCliStatus::Running,
+                Some(AiHookEvent::Running)
+            ))
+        );
+        let session = manager.session(terminal_id).expect("session");
+        assert_eq!(session.tool, Some(AiCliTool::OpenCode));
+        assert_eq!(session.status, AiCliStatus::Running);
+    }
+
+    #[test]
+    fn update_from_title_opencode_detects_idle_pattern() {
+        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let terminal_id = 1;
+
+        assert_eq!(
+            manager.update_from_title(terminal_id, "OpenCode - Idle; waiting for input"),
+            Some((
+                AiCliTool::OpenCode,
+                AiCliStatus::Attention,
+                Some(AiHookEvent::Attention)
+            ))
+        );
+        let session = manager.session(terminal_id).expect("session");
+        assert_eq!(session.tool, Some(AiCliTool::OpenCode));
+        assert_eq!(session.status, AiCliStatus::Attention);
+    }
+
+    #[test]
+    fn update_from_title_opencode_transitions_running_to_idle() {
+        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let terminal_id = 1;
+
+        let _ = manager.update_from_title(terminal_id, "OpenCode - Working...");
+        let session = manager.session(terminal_id).expect("session after running");
+        assert_eq!(session.status, AiCliStatus::Running);
+
+        assert_eq!(
+            manager.update_from_title(terminal_id, "OpenCode - Idle"),
+            Some((
+                AiCliTool::OpenCode,
+                AiCliStatus::Attention,
+                Some(AiHookEvent::Attention)
+            ))
+        );
+        let session = manager.session(terminal_id).expect("session after idle");
+        assert_eq!(session.status, AiCliStatus::Attention);
     }
 }

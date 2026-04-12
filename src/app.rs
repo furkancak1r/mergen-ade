@@ -45,6 +45,13 @@ use crate::models::{
     AppConfig, BuiltinLauncherKind, LauncherEntry, LauncherIconKey, LeftSidebarTab,
     MainVisibilityMode, ProjectRecord, ShellKind, TerminalKind, TerminalManagerFilter,
 };
+use crate::opencode::{
+    self, OpenCodeNotifyInboxEvent, OPENCODE_APPROVAL_PROMPT_EVENT,
+    OPENCODE_PERMISSION_ASKED_EVENT, OPENCODE_QUESTION_PROMPT_EVENT, OPENCODE_SESSION_ERROR_EVENT,
+    OPENCODE_SESSION_IDLE_EVENT, OPENCODE_TOOL_EXECUTE_AFTER_EVENT,
+    OPENCODE_TOOL_EXECUTE_BEFORE_EVENT, OPENCODE_TURN_COMPLETE_EVENT,
+};
+use crate::opencode_hook_service::OpenCodeHookService;
 use crate::terminal::{
     try_terminal_selection_snapshot, try_terminal_snapshots, TerminalColor, TerminalCursor,
     TerminalCursorShape, TerminalDimensions, TerminalRuntime, TerminalSelectionLine,
@@ -73,6 +80,12 @@ const CODEX_PROCESS_POLL_MS: u64 = 150;
 const CODEX_LAUNCH_GRACE_MS: u64 = 5_000;
 const CODEX_TRAILING_OUTPUT_GRACE_MS: u64 = 750;
 const CODEX_RUNNING_GRACE_MS: u64 = 2_000;
+const OPENCODE_PROCESS_POLL_MS: u64 = 150;
+const OPENCODE_LAUNCH_GRACE_MS: u64 = 5_000;
+const OPENCODE_TRAILING_OUTPUT_GRACE_MS: u64 = 750;
+const OPENCODE_RUNNING_GRACE_MS: u64 = 2_000;
+const OPENCODE_NOTIFY_POLL_MS: u64 = 150;
+const OPENCODE_HOOK_POLL_MS: u64 = 100;
 const CURSOR_BLINK_STEP_SECS: f64 = 0.6;
 const TRANSIENT_TOAST_SECS: f64 = 1.75;
 const TERMINAL_COPY_FEEDBACK_TEXT: &str = "Copied terminal selection";
@@ -85,8 +98,10 @@ const TERMINAL_HELD_KEY_REPEAT_FALLBACK_INITIAL_DELAY_SECS: f64 = 0.5;
 const TERMINAL_HELD_KEY_REPEAT_FALLBACK_INTERVAL_SECS: f64 = 1.0 / 30.0;
 const TERMINAL_HELD_KEY_REPEAT_MAX_SYNTHETIC_EVENTS_PER_FRAME: usize = 16;
 
-// Embedded Nerd Font for terminal icon support
+// Embedded Nerd Font for terminal icon support (Windows-only)
+#[cfg(target_os = "windows")]
 const NERD_FONT_DATA: &[u8] = include_bytes!("../assets/fonts/CaskaydiaCoveNerdFont-Regular.ttf");
+#[cfg(target_os = "windows")]
 const NERD_FONT_NAME: &str = "caskaydia-cove-nerd";
 const CODEX_LAUNCHER_ICON_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/launcher-codex.png"));
@@ -177,6 +192,7 @@ const WINDOWS_TERMINAL_FONT_CANDIDATES: [(&str, &str); 2] = [
 
 static FACTORY_DROID_INBOX_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CODEX_NOTIFY_INBOX_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
+static OPENCODE_NOTIFY_INBOX_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum AppIcon {
@@ -466,6 +482,11 @@ struct CodexNotifyInboxState {
     offset: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OpenCodeNotifyInboxState {
+    offset: u64,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 struct FactoryDroidHookInboxEvent {
     terminal_id: String,
@@ -600,6 +621,52 @@ impl CodexAttentionReason {
             Self::TurnComplete => "Codex CLI - Turn complete; waiting for your next prompt...",
             Self::ExecutionError => "Codex CLI - Execution failed; review output above",
             Self::UnknownNotify => "Codex CLI - Waiting for you...",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenCodeStatusSource {
+    PromptSubmit,
+    TerminalTitle,
+    VisibleUi,
+    Notify,
+    Hook,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum OpenCodeAttentionReason {
+    PermissionAsked,
+    QuestionAsked,
+    SessionError,
+    TurnComplete,
+}
+
+impl OpenCodeAttentionReason {
+    const fn allows_empty_submit(self) -> bool {
+        matches!(self, Self::PermissionAsked | Self::QuestionAsked)
+    }
+
+    const fn persists_after_session_exit(self) -> bool {
+        matches!(self, Self::TurnComplete)
+    }
+
+    /// Returns true if this attention state should persist even when a Running signal arrives
+    /// (e.g., from a late title update). Prevents pulse from incorrectly reverting to spinner.
+    const fn persists_on_focus(self) -> bool {
+        matches!(
+            self,
+            Self::PermissionAsked | Self::QuestionAsked | Self::TurnComplete
+        )
+    }
+
+    const fn tooltip(self) -> &'static str {
+        match self {
+            Self::PermissionAsked => "OpenCode - Waiting for approval...",
+            Self::QuestionAsked => "OpenCode - Waiting for your reply...",
+            Self::SessionError => "OpenCode - Error occurred; review output above",
+            Self::TurnComplete => "OpenCode - Turn complete; waiting for your next prompt...",
         }
     }
 }
@@ -777,6 +844,13 @@ pub struct AdeApp {
     codex_notify_inboxes: BTreeMap<u64, CodexNotifyInboxState>,
     codex_notify_last_poll_at: Option<Instant>,
     codex_process_last_poll_at: Option<Instant>,
+    opencode_cli_runtime_dir: Option<PathBuf>,
+    opencode_cli_runtime_dir_error: Option<String>,
+    opencode_notify_inboxes: BTreeMap<u64, OpenCodeNotifyInboxState>,
+    opencode_notify_last_poll_at: Option<Instant>,
+    opencode_process_last_poll_at: Option<Instant>,
+    opencode_hook_service: Option<OpenCodeHookService>,
+    opencode_hook_last_poll_at: Option<Instant>,
     config: AppConfig,
     config_load_error: Option<String>,
     config_save_requires_reload: bool,
@@ -857,6 +931,7 @@ struct TerminalEntry {
     ai_session: AiCliSession,
     factory_droid_inbox_token: Option<String>,
     codex_notify_inbox_token: Option<String>,
+    opencode_notify_inbox_token: Option<String>,
     factory_droid_launch_pending_since: Option<Instant>,
     factory_droid_session_active: bool,
     factory_droid_last_process_seen_at: Option<Instant>,
@@ -872,6 +947,25 @@ struct TerminalEntry {
     codex_last_status_source: Option<CodexCliStatusSource>,
     codex_attention_reason: Option<CodexAttentionReason>,
     codex_prompt_submit_since: Option<Instant>,
+    opencode_launch_pending_since: Option<Instant>,
+    opencode_launch_process_baseline: Option<Vec<TrackedProcessIdentity>>,
+    opencode_session_active: bool,
+    opencode_process_identity: Option<TrackedProcessIdentity>,
+    opencode_last_process_seen_at: Option<Instant>,
+    opencode_process_missing_since: Option<Instant>,
+    opencode_last_status_source: Option<OpenCodeStatusSource>,
+    opencode_attention_reason: Option<OpenCodeAttentionReason>,
+    opencode_prompt_submit_since: Option<Instant>,
+    /// When we last entered Running state (from any source). Used for grace-based
+    /// cleanup when process tracking is unavailable.
+    opencode_running_since: Option<Instant>,
+    /// Evidence-based timestamps for OpenCode state resolution
+    opencode_last_prompt_submit_at: Option<Instant>,
+    opencode_last_title_working_at: Option<Instant>,
+    opencode_last_title_idle_at: Option<Instant>,
+    opencode_last_visible_attention_at: Option<Instant>,
+    opencode_last_hook_attention_at: Option<Instant>,
+    opencode_last_turn_complete_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1097,6 +1191,7 @@ impl AiBadgeModel {
             status,
             terminal.factory_droid_attention_reason,
             terminal.codex_attention_reason,
+            terminal.opencode_attention_reason,
         );
         Self {
             tool,
@@ -1111,6 +1206,7 @@ fn ai_badge_tooltip_lines(
     status: AiCliStatus,
     factory_droid_attention_reason: Option<FactoryDroidAttentionReason>,
     codex_attention_reason: Option<CodexAttentionReason>,
+    opencode_attention_reason: Option<OpenCodeAttentionReason>,
 ) -> Vec<String> {
     match tool {
         Some(AiCliTool::FactoryDroid) if status == AiCliStatus::Attention => {
@@ -1123,6 +1219,11 @@ fn ai_badge_tooltip_lines(
                 .unwrap_or(CodexAttentionReason::UnknownNotify)
                 .tooltip()
                 .to_owned()]
+        }
+        Some(AiCliTool::OpenCode) if status == AiCliStatus::Attention => {
+            vec![opencode_attention_reason
+                .map(|reason| reason.tooltip().to_owned())
+                .unwrap_or_else(|| status.tooltip(AiCliTool::OpenCode))]
         }
         Some(tool) => vec![status.tooltip(tool)],
         None => vec!["AI: Not detected".to_owned()],
@@ -1427,6 +1528,23 @@ impl AdeApp {
             Ok(dir) => (ai_hook_manager, Some(dir), None),
             Err(err) => {
                 log::warn!("Codex CLI runtime directory unavailable: {err}");
+                (ai_hook_manager, None, Some(err.to_string()))
+            }
+        }
+    }
+
+    fn opencode_cli_runtime_state(
+        config: &AppConfig,
+    ) -> (Option<Arc<AiHookManager>>, Option<PathBuf>, Option<String>) {
+        let ai_hook_manager = Self::ai_hook_manager_from_config(config);
+        if ai_hook_manager.is_none() {
+            return (None, None, None);
+        }
+
+        match config::opencode_cli_runtime_dir() {
+            Ok(dir) => (ai_hook_manager, Some(dir), None),
+            Err(err) => {
+                log::warn!("OpenCode runtime directory unavailable: {err}");
                 (ai_hook_manager, None, Some(err.to_string()))
             }
         }
@@ -1767,6 +1885,19 @@ impl AdeApp {
         )
     }
 
+    fn next_opencode_notify_inbox_token(terminal_id: u64) -> String {
+        let counter = OPENCODE_NOTIFY_INBOX_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let timestamp_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+
+        format!(
+            "{terminal_id:016x}-{:08x}-{timestamp_nanos:032x}-{counter:016x}",
+            std::process::id()
+        )
+    }
+
     fn show_status_feedback(&mut self, ctx: &egui::Context, message: impl Into<String>) {
         let message = message.into();
         let now = ctx.input(|input| input.time);
@@ -2003,7 +2134,7 @@ impl AdeApp {
             });
     }
 
-    pub fn bootstrap(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn bootstrap(_cc: &eframe::CreationContext<'_>) -> Self {
         let config_path = config::config_path().unwrap_or_else(|_| PathBuf::from("config.toml"));
         let (mut config, config_load_error) = match config::load_config(&config_path) {
             Ok(config) => (config, None),
@@ -2034,6 +2165,8 @@ impl AdeApp {
             Self::factory_droid_hook_runtime_state(&config);
         let (_, codex_cli_runtime_dir, codex_cli_runtime_dir_error) =
             Self::codex_cli_runtime_state(&config);
+        let (_, opencode_cli_runtime_dir, opencode_cli_runtime_dir_error) =
+            Self::opencode_cli_runtime_state(&config);
 
         let (terminal_events_tx, terminal_events_rx) =
             crossbeam_channel::bounded(TERMINAL_EVENT_QUEUE_CAPACITY);
@@ -2066,6 +2199,13 @@ impl AdeApp {
             codex_notify_inboxes: BTreeMap::new(),
             codex_notify_last_poll_at: None,
             codex_process_last_poll_at: None,
+            opencode_cli_runtime_dir,
+            opencode_cli_runtime_dir_error: opencode_cli_runtime_dir_error.clone(),
+            opencode_notify_inboxes: BTreeMap::new(),
+            opencode_notify_last_poll_at: None,
+            opencode_process_last_poll_at: None,
+            opencode_hook_service: OpenCodeHookService::start().ok(),
+            opencode_hook_last_poll_at: None,
             config,
             config_load_error: config_load_error.clone(),
             config_save_requires_reload: config_load_error.is_some(),
@@ -2362,6 +2502,7 @@ impl AdeApp {
         self.next_terminal_id += 1;
         self.reset_factory_droid_hook_inbox(terminal_id);
         self.reset_codex_notify_inbox(terminal_id);
+        self.reset_opencode_notify_inbox(terminal_id);
         let factory_droid_inbox_token = self
             .ai_hook_manager
             .as_ref()
@@ -2370,6 +2511,10 @@ impl AdeApp {
             .ai_hook_manager
             .as_ref()
             .map(|_| Self::next_codex_notify_inbox_token(terminal_id));
+        let opencode_notify_inbox_token = self
+            .ai_hook_manager
+            .as_ref()
+            .map(|_| Self::next_opencode_notify_inbox_token(terminal_id));
 
         let dimensions = TerminalDimensions::default();
         let runtime = match TerminalRuntime::spawn(
@@ -2384,6 +2529,9 @@ impl AdeApp {
             factory_droid_inbox_token.clone(),
             self.codex_cli_runtime_dir.clone(),
             codex_notify_inbox_token.clone(),
+            self.opencode_cli_runtime_dir.clone(),
+            opencode_notify_inbox_token.clone(),
+            self.opencode_hook_service.as_ref(),
         ) {
             Ok(runtime) => runtime,
             Err(err) => {
@@ -2420,6 +2568,7 @@ impl AdeApp {
             ai_session: AiCliSession::default(),
             factory_droid_inbox_token,
             codex_notify_inbox_token,
+            opencode_notify_inbox_token,
             factory_droid_launch_pending_since: None,
             factory_droid_session_active: false,
             factory_droid_last_process_seen_at: None,
@@ -2435,6 +2584,22 @@ impl AdeApp {
             codex_last_status_source: None,
             codex_attention_reason: None,
             codex_prompt_submit_since: None,
+            opencode_launch_pending_since: None,
+            opencode_launch_process_baseline: None,
+            opencode_session_active: false,
+            opencode_process_identity: None,
+            opencode_last_process_seen_at: None,
+            opencode_process_missing_since: None,
+            opencode_last_status_source: None,
+            opencode_attention_reason: None,
+            opencode_prompt_submit_since: None,
+            opencode_running_since: None,
+            opencode_last_prompt_submit_at: None,
+            opencode_last_title_working_at: None,
+            opencode_last_title_idle_at: None,
+            opencode_last_visible_attention_at: None,
+            opencode_last_hook_attention_at: None,
+            opencode_last_turn_complete_at: None,
         };
 
         self.terminals.insert(terminal_id, entry);
@@ -2453,6 +2618,14 @@ impl AdeApp {
                         .map(|terminal| terminal.runtime.snapshot_codex_descendant_processes())
                         .unwrap_or(None);
                     let _ = self.mark_codex_launch_pending(terminal_id, baseline);
+                }
+                Some(BuiltinLauncherKind::OpenCode) => {
+                    let baseline = self
+                        .terminals
+                        .get(&terminal_id)
+                        .map(|terminal| terminal.runtime.snapshot_opencode_descendant_processes())
+                        .unwrap_or(None);
+                    let _ = self.mark_opencode_launch_pending(terminal_id, baseline);
                 }
                 _ => {}
             }
@@ -2489,6 +2662,14 @@ impl AdeApp {
         codex::codex_notify_inbox_path_for_dir(dir, terminal_id, inbox_token)
     }
 
+    fn opencode_notify_inbox_path_for_dir(
+        dir: &Path,
+        terminal_id: u64,
+        inbox_token: &str,
+    ) -> PathBuf {
+        opencode::opencode_notify_inbox_path_for_dir(dir, terminal_id, inbox_token)
+    }
+
     fn factory_droid_hook_inbox_path(&self, terminal_id: u64) -> Option<PathBuf> {
         self.factory_droid_hooks_dir
             .as_deref()
@@ -2504,6 +2685,17 @@ impl AdeApp {
         self.codex_cli_runtime_dir
             .as_deref()
             .map(|dir| Self::codex_notify_inbox_path_for_dir(dir, terminal_id, inbox_token))
+    }
+
+    fn opencode_notify_inbox_path(&self, terminal_id: u64) -> Option<PathBuf> {
+        let inbox_token = self
+            .terminals
+            .get(&terminal_id)?
+            .opencode_notify_inbox_token
+            .as_deref()?;
+        self.opencode_cli_runtime_dir
+            .as_deref()
+            .map(|dir| Self::opencode_notify_inbox_path_for_dir(dir, terminal_id, inbox_token))
     }
 
     fn launch_command_stem(line: &str) -> Option<&str> {
@@ -2530,7 +2722,16 @@ impl AdeApp {
             return None;
         }
 
-        Path::new(command)
+        // Normalize path separators: extract basename from both Windows (\) and Unix (/)
+        // paths so that "C:\Program Files\OpenAI\codex.exe" correctly yields "codex"
+        // even on non-Windows hosts where Path::file_stem would not treat \ as separators.
+        let basename = command
+            .rsplit(['\\', '/'])
+            .next()
+            .filter(|segment| !segment.is_empty())
+            .unwrap_or(command);
+
+        Path::new(basename)
             .file_stem()
             .and_then(|stem| stem.to_str())
     }
@@ -3194,6 +3395,40 @@ impl AdeApp {
         None
     }
 
+    fn opencode_status_from_chunk(
+        chunk: &str,
+    ) -> Option<(
+        AiCliStatus,
+        OpenCodeStatusSource,
+        Option<OpenCodeAttentionReason>,
+    )> {
+        if chunk == "opencode-question-prompt" {
+            return Some((
+                AiCliStatus::Attention,
+                OpenCodeStatusSource::VisibleUi,
+                Some(OpenCodeAttentionReason::QuestionAsked),
+            ));
+        }
+        if chunk == "opencode-approval-prompt" {
+            return Some((
+                AiCliStatus::Attention,
+                OpenCodeStatusSource::VisibleUi,
+                Some(OpenCodeAttentionReason::PermissionAsked),
+            ));
+        }
+        if chunk == "opencode-turn-complete" {
+            return Some((
+                AiCliStatus::Attention,
+                OpenCodeStatusSource::VisibleUi,
+                Some(OpenCodeAttentionReason::TurnComplete),
+            ));
+        }
+        if chunk == "opencode-interrupted-banner" {
+            return Some((AiCliStatus::Inactive, OpenCodeStatusSource::VisibleUi, None));
+        }
+        None
+    }
+
     fn mark_codex_launch_pending(
         &mut self,
         terminal_id: u64,
@@ -3471,10 +3706,474 @@ impl AdeApp {
         changed
     }
 
+    fn mark_opencode_launch_pending(
+        &mut self,
+        terminal_id: u64,
+        baseline: Option<Vec<TrackedProcessIdentity>>,
+    ) -> bool {
+        if self.ai_hook_manager.is_none() {
+            return false;
+        }
+
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        if let Some(manager) = &self.ai_hook_manager {
+            manager.set_tool(terminal_id, AiCliTool::OpenCode);
+        }
+
+        let mut changed = false;
+        if entry.ai_session.tool != Some(AiCliTool::OpenCode) {
+            entry.ai_session.tool = Some(AiCliTool::OpenCode);
+            changed = true;
+        }
+        if entry.ai_session.status != AiCliStatus::Inactive {
+            entry.ai_session.status = AiCliStatus::Inactive;
+            changed = true;
+        }
+        if entry.opencode_launch_pending_since.is_none() {
+            changed = true;
+        }
+        entry.opencode_launch_pending_since = Some(Instant::now());
+        if entry.opencode_launch_process_baseline != baseline {
+            changed = true;
+        }
+        entry.opencode_launch_process_baseline = baseline;
+        entry.opencode_session_active = false;
+        entry.opencode_process_identity = None;
+        entry.opencode_last_process_seen_at = None;
+        entry.opencode_process_missing_since = None;
+        entry.opencode_attention_reason = None;
+        entry.dirty = true;
+        changed
+    }
+
+    fn clear_opencode_state(&mut self, terminal_id: u64) -> bool {
+        if let Some(manager) = &self.ai_hook_manager {
+            manager.reset_session(terminal_id);
+        }
+
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        let changed = entry.ai_session.tool == Some(AiCliTool::OpenCode)
+            || entry.opencode_launch_pending_since.is_some()
+            || entry.opencode_launch_process_baseline.is_some()
+            || entry.opencode_session_active
+            || entry.opencode_process_identity.is_some()
+            || entry.opencode_process_missing_since.is_some()
+            || entry.opencode_last_status_source.is_some()
+            || entry.opencode_attention_reason.is_some()
+            || entry.opencode_prompt_submit_since.is_some()
+            || entry.opencode_running_since.is_some();
+
+        if entry.ai_session.tool == Some(AiCliTool::OpenCode) {
+            entry.ai_session = AiCliSession::default();
+        }
+        entry.opencode_launch_pending_since = None;
+        entry.opencode_launch_process_baseline = None;
+        entry.opencode_session_active = false;
+        entry.opencode_process_identity = None;
+        entry.opencode_last_process_seen_at = None;
+        entry.opencode_process_missing_since = None;
+        entry.opencode_last_status_source = None;
+        entry.opencode_attention_reason = None;
+        entry.opencode_prompt_submit_since = None;
+        entry.opencode_running_since = None;
+        entry.dirty = true;
+        changed
+    }
+
+    fn clear_opencode_process_tracking(&mut self, terminal_id: u64) -> bool {
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        let changed = entry.opencode_session_active
+            || entry.opencode_launch_process_baseline.is_some()
+            || entry.opencode_process_identity.is_some()
+            || entry.opencode_last_process_seen_at.is_some()
+            || entry.opencode_process_missing_since.is_some();
+
+        entry.opencode_launch_process_baseline = None;
+        entry.opencode_session_active = false;
+        entry.opencode_process_identity = None;
+        entry.opencode_last_process_seen_at = None;
+        entry.opencode_process_missing_since = None;
+        entry.dirty = true;
+        changed
+    }
+
+    fn note_opencode_session_active(
+        &mut self,
+        terminal_id: u64,
+        identity: TrackedProcessIdentity,
+    ) -> bool {
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        if let Some(manager) = &self.ai_hook_manager {
+            manager.set_tool(terminal_id, AiCliTool::OpenCode);
+        }
+
+        let mut changed = false;
+        if entry.ai_session.tool != Some(AiCliTool::OpenCode) {
+            entry.ai_session.tool = Some(AiCliTool::OpenCode);
+            changed = true;
+        }
+        if !entry.opencode_session_active {
+            entry.opencode_session_active = true;
+            changed = true;
+        }
+        if entry.opencode_process_identity != Some(identity) {
+            entry.opencode_process_identity = Some(identity);
+            changed = true;
+        }
+        if entry.opencode_launch_process_baseline.take().is_some() {
+            changed = true;
+        }
+        if entry.opencode_process_missing_since.take().is_some() {
+            changed = true;
+        }
+        if entry.opencode_launch_pending_since.take().is_some() {
+            changed = true;
+        }
+        entry.opencode_last_process_seen_at = Some(Instant::now());
+        entry.dirty = true;
+        changed
+    }
+
+    fn note_opencode_process_missing(&mut self, terminal_id: u64) -> bool {
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        let mut changed = false;
+        if entry.opencode_session_active {
+            entry.opencode_session_active = false;
+            changed = true;
+        }
+        if entry.opencode_process_missing_since.is_none() {
+            entry.opencode_process_missing_since = Some(Instant::now());
+            changed = true;
+        }
+        entry.dirty = true;
+        changed
+    }
+
+    fn opencode_trailing_grace_elapsed(entry: &TerminalEntry) -> bool {
+        entry
+            .opencode_process_missing_since
+            .is_some_and(|missing_since| {
+                missing_since.elapsed() >= Duration::from_millis(OPENCODE_TRAILING_OUTPUT_GRACE_MS)
+            })
+    }
+
+    fn apply_opencode_status(
+        &mut self,
+        terminal_id: u64,
+        status: AiCliStatus,
+        source: OpenCodeStatusSource,
+        attention_reason: Option<OpenCodeAttentionReason>,
+    ) -> bool {
+        let Some(manager) = self.ai_hook_manager.as_ref().cloned() else {
+            return false;
+        };
+
+        // Protect interactive attention states from being overridden by title-based Running
+        // This matches the behavior in Factory Droid and Codex
+        if status == AiCliStatus::Running && source == OpenCodeStatusSource::TerminalTitle {
+            if let Some(entry) = self.terminals.get(&terminal_id) {
+                if entry.ai_session.status == AiCliStatus::Attention {
+                    // Check if current attention is interactive (should not be overridden)
+                    let is_interactive_attention = entry
+                        .opencode_attention_reason
+                        .is_some_and(|reason| reason.persists_on_focus());
+                    if is_interactive_attention {
+                        return false; // Do not override interactive attention with title Running
+                    }
+                }
+            }
+        }
+
+        manager.set_tool(terminal_id, AiCliTool::OpenCode);
+
+        let update = match status {
+            AiCliStatus::Running => manager.ai_activity_started(terminal_id),
+            AiCliStatus::Attention => manager.ai_waiting_for_user(terminal_id),
+            AiCliStatus::Inactive => None,
+        };
+
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        let now = Instant::now();
+        let mut changed = false;
+
+        // Record evidence timestamps for resolver
+        match (status, source) {
+            (AiCliStatus::Running, OpenCodeStatusSource::PromptSubmit) => {
+                entry.opencode_last_prompt_submit_at = Some(now);
+            }
+            (AiCliStatus::Running, OpenCodeStatusSource::TerminalTitle) => {
+                entry.opencode_last_title_working_at = Some(now);
+            }
+            (AiCliStatus::Attention, OpenCodeStatusSource::TerminalTitle) => {
+                entry.opencode_last_title_idle_at = Some(now);
+            }
+            (AiCliStatus::Attention, OpenCodeStatusSource::VisibleUi) => {
+                entry.opencode_last_visible_attention_at = Some(now);
+                if let Some(reason) = attention_reason {
+                    entry.opencode_attention_reason = Some(reason);
+                    if reason == OpenCodeAttentionReason::TurnComplete {
+                        entry.opencode_last_turn_complete_at = Some(now);
+                    }
+                }
+            }
+            (AiCliStatus::Attention, OpenCodeStatusSource::Hook) => {
+                entry.opencode_last_hook_attention_at = Some(now);
+                if let Some(reason) = attention_reason {
+                    entry.opencode_attention_reason = Some(reason);
+                    if reason == OpenCodeAttentionReason::TurnComplete {
+                        entry.opencode_last_turn_complete_at = Some(now);
+                    }
+                }
+            }
+            (AiCliStatus::Attention, OpenCodeStatusSource::Notify) => {
+                entry.opencode_last_hook_attention_at = Some(now); // Notify treated similarly to hook
+                if let Some(reason) = attention_reason {
+                    entry.opencode_attention_reason = Some(reason);
+                    if reason == OpenCodeAttentionReason::TurnComplete {
+                        entry.opencode_last_turn_complete_at = Some(now);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        if entry.ai_session.tool != Some(AiCliTool::OpenCode) {
+            entry.ai_session.tool = Some(AiCliTool::OpenCode);
+            changed = true;
+        }
+        if let Some((tool, next_status)) = update {
+            if entry.ai_session.tool != Some(tool) || entry.ai_session.status != next_status {
+                entry.ai_session.tool = Some(tool);
+                entry.ai_session.status = next_status;
+                changed = true;
+            }
+        } else if entry.ai_session.status != status {
+            entry.ai_session.status = status;
+            changed = true;
+        }
+        match status {
+            AiCliStatus::Attention => {
+                if let Some(reason) = attention_reason {
+                    if entry.opencode_attention_reason != Some(reason) {
+                        entry.opencode_attention_reason = Some(reason);
+                        changed = true;
+                    }
+                }
+            }
+            AiCliStatus::Running | AiCliStatus::Inactive => {
+                if entry.opencode_attention_reason.take().is_some() {
+                    changed = true;
+                }
+            }
+        }
+        if entry.opencode_last_status_source != Some(source) {
+            entry.opencode_last_status_source = Some(source);
+            changed = true;
+        }
+        if entry.opencode_launch_process_baseline.take().is_some() {
+            changed = true;
+        }
+        if !entry.opencode_session_active {
+            entry.opencode_session_active = true;
+            changed = true;
+        }
+        if entry.opencode_process_missing_since.take().is_some() {
+            changed = true;
+        }
+        entry.opencode_last_process_seen_at = Some(now);
+        if entry.opencode_launch_pending_since.take().is_some() {
+            changed = true;
+        }
+        if status == AiCliStatus::Running {
+            // Track when we entered Running state (from any source) for grace-based cleanup
+            entry.opencode_running_since = Some(now);
+            if source == OpenCodeStatusSource::PromptSubmit {
+                entry.opencode_prompt_submit_since = Some(now);
+            }
+            changed = true;
+        }
+        entry.dirty = true;
+        changed
+    }
+
+    /// Resolve OpenCode status based on all evidence sources.
+    /// This is the single source of truth for OpenCode state transitions.
+    /// Process presence alone never produces Running - it only indicates session liveness.
+    fn resolve_opencode_status(
+        &self,
+        entry: &TerminalEntry,
+        now: Instant,
+    ) -> Option<(
+        AiCliStatus,
+        OpenCodeStatusSource,
+        Option<OpenCodeAttentionReason>,
+    )> {
+        // Priority 1: Interrupted banner -> Inactive immediately
+        // (checked via raw chunks, not hook attention)
+
+        // Find the latest running evidence timestamp for freshness comparison
+        let latest_running_evidence = [
+            entry.opencode_last_prompt_submit_at,
+            entry.opencode_last_title_working_at,
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+
+        // Priority 2: Hook/Notify-based attention signal -> Attention (most authoritative)
+        // Only if newer than any running evidence to prevent false pulse during active work
+        if let Some(last_hook) = entry.opencode_last_hook_attention_at {
+            let is_fresh = now.duration_since(last_hook)
+                < Duration::from_millis(OPENCODE_TRAILING_OUTPUT_GRACE_MS);
+            let is_newer_than_running =
+                latest_running_evidence.map_or(true, |running_time| last_hook > running_time);
+
+            if is_fresh && is_newer_than_running {
+                let source = entry
+                    .opencode_last_status_source
+                    .filter(|s| {
+                        matches!(s, OpenCodeStatusSource::Hook | OpenCodeStatusSource::Notify)
+                    })
+                    .unwrap_or(OpenCodeStatusSource::Hook);
+                return Some((
+                    AiCliStatus::Attention,
+                    source,
+                    entry.opencode_attention_reason,
+                ));
+            }
+        }
+
+        // Priority 3: Visible UI evidence -> Attention
+        // Only if newer than any running evidence to prevent false pulse during active work
+        if let Some(last_visible) = entry.opencode_last_visible_attention_at {
+            let is_fresh = now.duration_since(last_visible)
+                < Duration::from_millis(OPENCODE_TRAILING_OUTPUT_GRACE_MS);
+            let is_newer_than_running =
+                latest_running_evidence.map_or(true, |running_time| last_visible > running_time);
+
+            if is_fresh && is_newer_than_running {
+                let reason = entry.opencode_attention_reason;
+                return Some((
+                    AiCliStatus::Attention,
+                    OpenCodeStatusSource::VisibleUi,
+                    reason,
+                ));
+            }
+        }
+
+        // Priority 4: Turn complete signal -> Attention
+        // Only if newer than any running evidence to prevent false pulse during active work
+        if let Some(last_turn_complete) = entry.opencode_last_turn_complete_at {
+            let is_fresh = now.duration_since(last_turn_complete)
+                < Duration::from_millis(OPENCODE_TRAILING_OUTPUT_GRACE_MS);
+            let is_newer_than_running = latest_running_evidence
+                .map_or(true, |running_time| last_turn_complete > running_time);
+
+            if is_fresh && is_newer_than_running {
+                return Some((
+                    AiCliStatus::Attention,
+                    OpenCodeStatusSource::VisibleUi,
+                    Some(OpenCodeAttentionReason::TurnComplete),
+                ));
+            }
+        }
+
+        // Priority 5: Title-based idle signal -> Attention (weakest signal)
+        // Must be both fresh AND strictly newer than any Working signal
+        if let Some(last_idle) = entry.opencode_last_title_idle_at {
+            let is_fresh = now.duration_since(last_idle)
+                < Duration::from_millis(OPENCODE_TRAILING_OUTPUT_GRACE_MS);
+            let last_working = entry.opencode_last_title_working_at;
+            let is_newer_than_working = last_working.map_or(true, |t| last_idle > t);
+            let is_newer_than_running_evidence =
+                latest_running_evidence.map_or(true, |t| last_idle > t);
+
+            if is_fresh && is_newer_than_working && is_newer_than_running_evidence {
+                return Some((
+                    AiCliStatus::Attention,
+                    OpenCodeStatusSource::TerminalTitle,
+                    None, // Generic idle attention
+                ));
+            }
+        }
+
+        // Priority 6: Fresh running evidence -> Running
+        // Only if we have recent evidence of actual work happening
+        let running_candidates = [
+            entry
+                .opencode_last_prompt_submit_at
+                .map(|t| (t, OpenCodeStatusSource::PromptSubmit)),
+            entry
+                .opencode_last_title_working_at
+                .map(|t| (t, OpenCodeStatusSource::TerminalTitle)),
+        ];
+
+        if let Some((latest_running_time, source)) = running_candidates
+            .into_iter()
+            .flatten()
+            .max_by_key(|(time, _)| *time)
+        {
+            // Check if running evidence is fresh (within grace period)
+            if now.duration_since(latest_running_time)
+                < Duration::from_millis(OPENCODE_RUNNING_GRACE_MS)
+            {
+                return Some((AiCliStatus::Running, source, None));
+            }
+        }
+
+        // Priority 7: If we have interactive attention that should persist, keep it
+        if entry.ai_session.status == AiCliStatus::Attention {
+            if let Some(reason) = entry.opencode_attention_reason {
+                if reason.persists_on_focus() {
+                    // Check if process is still alive
+                    if entry.opencode_session_active {
+                        return Some((
+                            AiCliStatus::Attention,
+                            entry
+                                .opencode_last_status_source
+                                .unwrap_or(OpenCodeStatusSource::VisibleUi),
+                            Some(reason),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Priority 8: No reliable evidence -> Inactive
+        // This prevents stuck spinner when process is alive but no fresh work evidence
+        None
+    }
+
     fn reset_codex_notify_inbox(&mut self, terminal_id: u64) {
         self.codex_notify_inboxes.remove(&terminal_id);
 
         if let Some(path) = self.codex_notify_inbox_path(terminal_id) {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    fn reset_opencode_notify_inbox(&mut self, terminal_id: u64) {
+        self.opencode_notify_inboxes.remove(&terminal_id);
+
+        if let Some(path) = self.opencode_notify_inbox_path(terminal_id) {
             let _ = fs::remove_file(path);
         }
     }
@@ -3623,6 +4322,284 @@ impl AdeApp {
                     }
                 }
                 None => {
+                    if tool_is_codex && status == AiCliStatus::Running {
+                        let should_clear = self.terminals.get(&terminal_id).is_some_and(|entry| {
+                            entry.codex_prompt_submit_since.is_some_and(|since| {
+                                since.elapsed() >= Duration::from_millis(CODEX_RUNNING_GRACE_MS)
+                            })
+                        });
+                        if should_clear {
+                            changed |= self.clear_codex_state(terminal_id);
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+
+        if changed {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Poll the Orca-style HTTP hook service for direct OpenCode status updates.
+    /// This receives working/idle/permission status from the OpenCode plugin
+    /// via local HTTP POST requests, bypassing the need for PTY text parsing.
+    fn poll_opencode_hook_service(&mut self, ctx: &egui::Context) {
+        let Some(hook_service) = self.opencode_hook_service.as_ref() else {
+            return;
+        };
+
+        if self.opencode_hook_last_poll_at.is_some_and(|last_poll| {
+            last_poll.elapsed() < Duration::from_millis(OPENCODE_HOOK_POLL_MS)
+        }) {
+            return;
+        }
+
+        self.opencode_hook_last_poll_at = Some(Instant::now());
+
+        let events = hook_service.drain_pending_events();
+        let mut changed = false;
+
+        for event in events {
+            if let Ok(terminal_id) = event.terminal_id.parse::<u64>() {
+                // Map the hook status to our internal representation
+                let (status, reason) = match event.event_kind.as_deref() {
+                    Some("working") => (AiCliStatus::Running, None),
+                    Some("idle") => (
+                        AiCliStatus::Attention,
+                        Some(OpenCodeAttentionReason::TurnComplete),
+                    ),
+                    Some("permission") => (
+                        AiCliStatus::Attention,
+                        Some(OpenCodeAttentionReason::PermissionAsked),
+                    ),
+                    _ => continue,
+                };
+
+                // Record the hook attention timestamp for resolver priority
+                if let Some(entry) = self.terminals.get_mut(&terminal_id) {
+                    entry.opencode_last_hook_attention_at = Some(Instant::now());
+                    if let Some(r) = reason {
+                        entry.opencode_attention_reason = Some(r);
+                    }
+                }
+
+                changed |= self.apply_opencode_status(
+                    terminal_id,
+                    status,
+                    OpenCodeStatusSource::Hook,
+                    reason,
+                );
+            }
+        }
+
+        if changed {
+            ctx.request_repaint();
+        }
+    }
+
+    fn poll_opencode_processes(&mut self, ctx: &egui::Context) {
+        if self.ai_hook_manager.is_none() || self.terminals.is_empty() {
+            return;
+        }
+
+        if self.opencode_process_last_poll_at.is_some_and(|last_poll| {
+            last_poll.elapsed() < Duration::from_millis(OPENCODE_PROCESS_POLL_MS)
+        }) {
+            return;
+        }
+
+        self.opencode_process_last_poll_at = Some(Instant::now());
+
+        let mut changed = false;
+        let terminal_ids = self.terminals.keys().copied().collect::<Vec<_>>();
+        for terminal_id in terminal_ids {
+            let Some((
+                process_identity,
+                recovered_baseline,
+                launch_expired,
+                session_active,
+                is_candidate,
+                tool_is_opencode,
+                status,
+                exited,
+            )) = self.terminals.get(&terminal_id).map(|entry| {
+                let mut recovered_baseline = None;
+                let process_identity = if entry.exited {
+                    Some(None)
+                } else if let Some(identity) = entry.opencode_process_identity {
+                    entry
+                        .runtime
+                        .tracked_opencode_process_present(identity)
+                        .map(|present| present.then_some(identity))
+                } else if entry.opencode_launch_pending_since.is_some() {
+                    if let Some(baseline) = entry.opencode_launch_process_baseline.as_deref() {
+                        entry
+                            .runtime
+                            .detect_new_opencode_descendant_process(baseline)
+                    } else {
+                        recovered_baseline = entry.runtime.snapshot_opencode_descendant_processes();
+                        match recovered_baseline.as_ref() {
+                            Some(baseline) if baseline.is_empty() => Some(None),
+                            _ => None,
+                        }
+                    }
+                } else {
+                    None
+                };
+                let launch_expired =
+                    entry
+                        .opencode_launch_pending_since
+                        .is_some_and(|started_at| {
+                            started_at.elapsed() >= Duration::from_millis(OPENCODE_LAUNCH_GRACE_MS)
+                        });
+                (
+                    process_identity,
+                    recovered_baseline,
+                    launch_expired,
+                    entry.opencode_session_active,
+                    entry.opencode_launch_pending_since.is_some(),
+                    entry.ai_session.tool == Some(AiCliTool::OpenCode),
+                    entry.ai_session.status,
+                    entry.exited,
+                )
+            })
+            else {
+                continue;
+            };
+
+            if let Some(baseline) = recovered_baseline {
+                if let Some(entry) = self.terminals.get_mut(&terminal_id) {
+                    if entry.opencode_launch_process_baseline.is_none() {
+                        entry.opencode_launch_process_baseline = Some(baseline);
+                        entry.dirty = true;
+                        changed = true;
+                    }
+                }
+            }
+
+            if is_candidate && !launch_expired && process_identity == Some(None) && !exited {
+                continue;
+            }
+
+            if is_candidate && launch_expired && process_identity == Some(None) {
+                changed |= self.clear_opencode_state(terminal_id);
+                continue;
+            }
+
+            match process_identity {
+                Some(Some(identity)) => {
+                    // Update process liveness but don't decide status solely from presence
+                    changed |= self.note_opencode_session_active(terminal_id, identity);
+
+                    // Now use resolver to determine actual status based on evidence
+                    let now = Instant::now();
+                    let resolved = self
+                        .terminals
+                        .get(&terminal_id)
+                        .and_then(|entry| self.resolve_opencode_status(entry, now));
+
+                    if let Some((resolved_status, resolved_source, resolved_reason)) = resolved {
+                        // Apply resolved status if different from current
+                        if tool_is_opencode && status != resolved_status {
+                            changed |= self.apply_opencode_status(
+                                terminal_id,
+                                resolved_status,
+                                resolved_source,
+                                resolved_reason,
+                            );
+                        }
+                    } else {
+                        // No reliable evidence - clear to inactive (prevents stuck spinner)
+                        if tool_is_opencode && status == AiCliStatus::Running {
+                            // Only clear if running grace has expired
+                            let should_clear =
+                                self.terminals.get(&terminal_id).is_some_and(|entry| {
+                                    entry.opencode_running_since.is_some_and(|since| {
+                                        since.elapsed()
+                                            >= Duration::from_millis(OPENCODE_RUNNING_GRACE_MS)
+                                    })
+                                });
+                            if should_clear {
+                                changed |= self.clear_opencode_state(terminal_id);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                Some(None) => {
+                    if tool_is_opencode {
+                        // CRITICAL FIX: Always call note_opencode_process_missing when process
+                        // disappears, regardless of current status. This ensures the grace period
+                        // starts even when we're in Running state.
+                        changed |= self.note_opencode_process_missing(terminal_id);
+
+                        match status {
+                            AiCliStatus::Attention => {
+                                if self
+                                    .terminals
+                                    .get(&terminal_id)
+                                    .is_some_and(Self::opencode_trailing_grace_elapsed)
+                                {
+                                    let persists_after_session_exit = self
+                                        .terminals
+                                        .get(&terminal_id)
+                                        .and_then(|entry| entry.opencode_attention_reason)
+                                        .is_some_and(
+                                            OpenCodeAttentionReason::persists_after_session_exit,
+                                        );
+                                    if persists_after_session_exit {
+                                        changed |=
+                                            self.clear_opencode_process_tracking(terminal_id);
+                                    } else {
+                                        changed |= self.clear_opencode_state(terminal_id);
+                                    }
+                                }
+                            }
+                            AiCliStatus::Running => {
+                                if self
+                                    .terminals
+                                    .get(&terminal_id)
+                                    .is_some_and(Self::opencode_trailing_grace_elapsed)
+                                {
+                                    let within_running_grace = self
+                                        .terminals
+                                        .get(&terminal_id)
+                                        .and_then(|entry| entry.opencode_prompt_submit_since)
+                                        .is_some_and(|since| {
+                                            since.elapsed()
+                                                < Duration::from_millis(OPENCODE_RUNNING_GRACE_MS)
+                                        });
+                                    if !within_running_grace {
+                                        changed |= self.clear_opencode_state(terminal_id);
+                                    }
+                                }
+                            }
+                            AiCliStatus::Inactive => {
+                                changed |= self.clear_opencode_state(terminal_id);
+                            }
+                        }
+                    } else if session_active {
+                        changed |= self.clear_opencode_state(terminal_id);
+                    }
+                }
+                None => {
+                    // Fallback: process tracking unavailable (e.g., non-Windows platforms).
+                    // Prevent stuck spinner by checking if we have been Running for too long
+                    // without any process evidence.
+                    if tool_is_opencode && status == AiCliStatus::Running {
+                        let should_clear = self.terminals.get(&terminal_id).is_some_and(|entry| {
+                            // Use opencode_running_since which is set whenever we enter Running
+                            // state (from PromptSubmit, Title, or any other source).
+                            entry.opencode_running_since.is_some_and(|since| {
+                                since.elapsed() >= Duration::from_millis(OPENCODE_RUNNING_GRACE_MS)
+                            })
+                        });
+                        if should_clear {
+                            changed |= self.clear_opencode_state(terminal_id);
+                        }
+                    }
                     continue;
                 }
             }
@@ -3771,6 +4748,190 @@ impl AdeApp {
         }
     }
 
+    fn poll_opencode_notify_inboxes(&mut self, ctx: &egui::Context) {
+        if self.ai_hook_manager.is_none()
+            || self.opencode_cli_runtime_dir.is_none()
+            || self.terminals.is_empty()
+        {
+            return;
+        }
+
+        if self.opencode_notify_last_poll_at.is_some_and(|last_poll| {
+            last_poll.elapsed() < Duration::from_millis(OPENCODE_NOTIFY_POLL_MS)
+        }) {
+            return;
+        }
+
+        self.opencode_notify_last_poll_at = Some(Instant::now());
+
+        let terminal_ids = self.terminals.keys().copied().collect::<Vec<_>>();
+        let mut changed = false;
+        for terminal_id in terminal_ids {
+            changed |= self.process_opencode_notify_inbox(terminal_id);
+        }
+
+        if changed {
+            ctx.request_repaint();
+        }
+    }
+
+    fn process_opencode_notify_inbox(&mut self, terminal_id: u64) -> bool {
+        let Some(path) = self.opencode_notify_inbox_path(terminal_id) else {
+            return false;
+        };
+
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.opencode_notify_inboxes
+                    .entry(terminal_id)
+                    .or_default()
+                    .offset = 0;
+                return false;
+            }
+            Err(err) => {
+                log::warn!(
+                    "Failed to read OpenCode notify inbox for terminal {terminal_id} at {}: {err}",
+                    path.display()
+                );
+                return false;
+            }
+        };
+
+        let previous_offset = self
+            .opencode_notify_inboxes
+            .get(&terminal_id)
+            .map(|state| state.offset)
+            .unwrap_or(0);
+        let start = if previous_offset as usize <= bytes.len() {
+            previous_offset as usize
+        } else {
+            0
+        };
+        let unread = &bytes[start..];
+        let Some(last_newline) = unread.iter().rposition(|byte| *byte == b'\n') else {
+            if previous_offset as usize > bytes.len() {
+                self.opencode_notify_inboxes
+                    .entry(terminal_id)
+                    .or_default()
+                    .offset = 0;
+            }
+            return false;
+        };
+
+        let processed_end = start + last_newline + 1;
+        let mut changed = false;
+        for line in bytes[start..processed_end].split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+
+            match serde_json::from_slice::<OpenCodeNotifyInboxEvent>(line) {
+                Ok(event) => {
+                    changed |= self.apply_opencode_notify_inbox_event(terminal_id, &event);
+                }
+                Err(err) => {
+                    log::warn!(
+                        "Ignoring malformed OpenCode notify inbox event for terminal {terminal_id} at {}: {err}",
+                        path.display()
+                    );
+                }
+            }
+        }
+
+        self.opencode_notify_inboxes
+            .entry(terminal_id)
+            .or_default()
+            .offset = processed_end as u64;
+
+        changed
+    }
+
+    fn apply_opencode_notify_inbox_event(
+        &mut self,
+        terminal_id: u64,
+        event: &OpenCodeNotifyInboxEvent,
+    ) -> bool {
+        let expected_inbox_token = self
+            .terminals
+            .get(&terminal_id)
+            .and_then(|entry| entry.opencode_notify_inbox_token.as_deref());
+
+        if event.terminal_id != terminal_id.to_string() {
+            return false;
+        }
+        if !event.tool.eq_ignore_ascii_case("opencode") {
+            return false;
+        }
+        if event.inbox_token.as_deref() != expected_inbox_token {
+            return false;
+        }
+
+        // Map OpenCode event kinds to status and reasons
+        // OpenCode uses session.idle for completion, permission.asked for interactive, etc.
+        let (status, reason) = match event.event_kind.as_deref() {
+            // session.idle is the canonical completion signal from OpenCode
+            Some(kind) if kind == OPENCODE_SESSION_IDLE_EVENT => (
+                AiCliStatus::Attention,
+                Some(OpenCodeAttentionReason::TurnComplete),
+            ),
+            // permission.asked is for interactive prompts
+            Some(kind) if kind == OPENCODE_PERMISSION_ASKED_EVENT => (
+                AiCliStatus::Attention,
+                Some(OpenCodeAttentionReason::PermissionAsked),
+            ),
+            // session.error indicates an error occurred
+            Some(kind) if kind == OPENCODE_SESSION_ERROR_EVENT => (
+                AiCliStatus::Attention,
+                Some(OpenCodeAttentionReason::SessionError),
+            ),
+            // tool.execute.before indicates work is starting/running
+            Some(kind) if kind == OPENCODE_TOOL_EXECUTE_BEFORE_EVENT => {
+                (AiCliStatus::Running, None)
+            }
+            // tool.execute.after indicates a tool finished but session may continue
+            Some(kind) if kind == OPENCODE_TOOL_EXECUTE_AFTER_EVENT => {
+                // This is NOT a completion signal - session continues
+                // Only update running timestamp, don't change status
+                return self.note_opencode_tool_activity(terminal_id);
+            }
+            // Legacy/internal names for backward compatibility
+            Some(kind) if kind == OPENCODE_TURN_COMPLETE_EVENT => (
+                AiCliStatus::Attention,
+                Some(OpenCodeAttentionReason::TurnComplete),
+            ),
+            Some(kind) if kind == OPENCODE_QUESTION_PROMPT_EVENT => (
+                AiCliStatus::Attention,
+                Some(OpenCodeAttentionReason::QuestionAsked),
+            ),
+            Some(kind) if kind == OPENCODE_APPROVAL_PROMPT_EVENT => (
+                AiCliStatus::Attention,
+                Some(OpenCodeAttentionReason::PermissionAsked),
+            ),
+            // Generic attention fallback
+            _ if event.status == "attention" => (AiCliStatus::Attention, None),
+            _ => return false,
+        };
+
+        self.apply_opencode_status(terminal_id, status, OpenCodeStatusSource::Notify, reason)
+    }
+
+    fn note_opencode_tool_activity(&mut self, terminal_id: u64) -> bool {
+        let now = Instant::now();
+        if let Some(entry) = self.terminals.get_mut(&terminal_id) {
+            if entry.ai_session.tool != Some(AiCliTool::OpenCode) {
+                entry.ai_session.tool = Some(AiCliTool::OpenCode);
+            }
+            // Update running timestamp to prevent premature idle detection
+            entry.opencode_running_since = Some(now);
+            entry.opencode_last_process_seen_at = Some(now);
+            entry.dirty = true;
+            true
+        } else {
+            false
+        }
+    }
+
     fn terminal_count_for_project_kind(&self, project_id: u64, kind: TerminalKind) -> usize {
         terminal_ids_for_project_kind(&self.terminals, project_id, kind).len()
     }
@@ -3811,6 +4972,7 @@ impl AdeApp {
                     tool,
                     status,
                     event: _,
+                    event_name,
                     from_title,
                 } => {
                     if tool == Some(AiCliTool::FactoryDroid) {
@@ -3829,6 +4991,61 @@ impl AdeApp {
                         if let Some(entry) = self.terminals.get_mut(&terminal_id) {
                             entry.ai_session.tool = Some(AiCliTool::CodexCli);
                             entry.ai_session.status = status;
+                            dirty_ids.insert(terminal_id);
+                        }
+                    } else if tool == Some(AiCliTool::OpenCode) {
+                        // OpenCode now supports both title-based and hook-based status.
+                        // Hook events (from_title=false with official hook prefix) are treated
+                        // as authoritative attention signals from the OpenCode CLI.
+                        let source = if from_title {
+                            OpenCodeStatusSource::TerminalTitle
+                        } else {
+                            OpenCodeStatusSource::Hook
+                        };
+
+                        // Map OpenCode hook event names to attention reasons
+                        // This allows proper semantic handling of session.idle vs permission.asked
+                        let attention_reason = if status == AiCliStatus::Attention && !from_title {
+                            match event_name.as_deref() {
+                                Some(name)
+                                    if name == OPENCODE_SESSION_IDLE_EVENT
+                                        || name == "session_idle"
+                                        || name == "session-idle" =>
+                                {
+                                    Some(OpenCodeAttentionReason::TurnComplete)
+                                }
+                                Some(name)
+                                    if name == OPENCODE_PERMISSION_ASKED_EVENT
+                                        || name == "permission_asked"
+                                        || name == "permission-asked" =>
+                                {
+                                    Some(OpenCodeAttentionReason::PermissionAsked)
+                                }
+                                Some(name)
+                                    if name == OPENCODE_SESSION_ERROR_EVENT
+                                        || name == "session_error"
+                                        || name == "session-error" =>
+                                {
+                                    Some(OpenCodeAttentionReason::SessionError)
+                                }
+                                // Legacy names for backward compatibility
+                                Some(name) if name == OPENCODE_TURN_COMPLETE_EVENT => {
+                                    Some(OpenCodeAttentionReason::TurnComplete)
+                                }
+                                Some(name) if name == OPENCODE_QUESTION_PROMPT_EVENT => {
+                                    Some(OpenCodeAttentionReason::QuestionAsked)
+                                }
+                                Some(name) if name == OPENCODE_APPROVAL_PROMPT_EVENT => {
+                                    Some(OpenCodeAttentionReason::PermissionAsked)
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+
+                        if self.apply_opencode_status(terminal_id, status, source, attention_reason)
+                        {
                             dirty_ids.insert(terminal_id);
                         }
                     } else if let Some(entry) = self.terminals.get_mut(&terminal_id) {
@@ -3875,6 +5092,30 @@ impl AdeApp {
                             }
                         }
                     }
+
+                    // Only apply visible completion detection if terminal is already
+                    // firmly in an OpenCode session. Do NOT claim new sessions based on
+                    // completion text to avoid false positives.
+                    let should_apply_opencode =
+                        self.terminals.get(&terminal_id).is_some_and(|entry| {
+                            if entry.exited {
+                                return false;
+                            }
+                            // Only if already recognized as OpenCode session
+                            // (not just candidate/pending)
+                            entry.opencode_session_active
+                                || entry.ai_session.tool == Some(AiCliTool::OpenCode)
+                        });
+
+                    if should_apply_opencode {
+                        if let Some((status, source, reason)) =
+                            Self::opencode_status_from_chunk(&chunk)
+                        {
+                            if self.apply_opencode_status(terminal_id, status, source, reason) {
+                                dirty_ids.insert(terminal_id);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3901,6 +5142,7 @@ impl AdeApp {
         for terminal_id in exited_ids {
             changed |= self.clear_factory_droid_state(terminal_id);
             changed |= self.clear_codex_state(terminal_id);
+            changed |= self.clear_opencode_state(terminal_id);
         }
 
         if changed {
@@ -4532,7 +5774,7 @@ impl AdeApp {
                 pressed: true,
                 modifiers,
                 ..
-            } if modifiers.ctrl && !modifiers.alt => true,
+            } if primary_shortcut_modifier(*modifiers) && !modifiers.alt => true,
             _ => false,
         }
     }
@@ -4551,6 +5793,14 @@ impl AdeApp {
             && terminal
                 .codex_attention_reason
                 .is_some_and(CodexAttentionReason::clears_on_terminal_acknowledge)
+    }
+
+    fn terminal_has_opencode_interactive_attention(terminal: &TerminalEntry) -> bool {
+        terminal.ai_session.tool == Some(AiCliTool::OpenCode)
+            && terminal.ai_session.status == AiCliStatus::Attention
+            && terminal
+                .opencode_attention_reason
+                .is_some_and(OpenCodeAttentionReason::allows_empty_submit)
     }
 
     fn should_steal_attention_terminal_input(&self, ctx: &egui::Context, events: &[Event]) -> bool {
@@ -4583,6 +5833,10 @@ impl AdeApp {
                 events
                     .iter()
                     .any(Self::event_is_factory_droid_interactive_entry)
+            } else if Self::terminal_has_opencode_interactive_attention(terminal) {
+                events
+                    .iter()
+                    .any(Self::event_is_factory_droid_interactive_entry)
             } else {
                 events.iter().any(Self::event_is_terminal_text_entry)
             }
@@ -4595,35 +5849,39 @@ impl AdeApp {
                 pressed: true,
                 modifiers,
                 ..
-            } if modifiers.ctrl && !modifiers.alt && !modifiers.shift => match key {
-                Key::ArrowLeft => Some(TerminalNavigationShortcut::Grid(
-                    TerminalNavigationDirection::Left,
-                )),
-                Key::ArrowRight => Some(TerminalNavigationShortcut::Grid(
-                    TerminalNavigationDirection::Right,
-                )),
-                Key::ArrowUp => Some(TerminalNavigationShortcut::Grid(
-                    TerminalNavigationDirection::Up,
-                )),
-                Key::ArrowDown => Some(TerminalNavigationShortcut::Grid(
-                    TerminalNavigationDirection::Down,
-                )),
-                _ => None,
-            },
+            } if primary_shortcut_modifier(*modifiers) && !modifiers.alt && !modifiers.shift => {
+                match key {
+                    Key::ArrowLeft => Some(TerminalNavigationShortcut::Grid(
+                        TerminalNavigationDirection::Left,
+                    )),
+                    Key::ArrowRight => Some(TerminalNavigationShortcut::Grid(
+                        TerminalNavigationDirection::Right,
+                    )),
+                    Key::ArrowUp => Some(TerminalNavigationShortcut::Grid(
+                        TerminalNavigationDirection::Up,
+                    )),
+                    Key::ArrowDown => Some(TerminalNavigationShortcut::Grid(
+                        TerminalNavigationDirection::Down,
+                    )),
+                    _ => None,
+                }
+            }
             Event::Key {
                 key,
                 pressed: true,
                 modifiers,
                 ..
-            } if modifiers.ctrl && modifiers.alt && !modifiers.shift => match key {
-                Key::ArrowUp => Some(TerminalNavigationShortcut::SingleViewLinear(
-                    TerminalNavigationDirection::Up,
-                )),
-                Key::ArrowDown => Some(TerminalNavigationShortcut::SingleViewLinear(
-                    TerminalNavigationDirection::Down,
-                )),
-                _ => None,
-            },
+            } if primary_shortcut_modifier(*modifiers) && modifiers.alt && !modifiers.shift => {
+                match key {
+                    Key::ArrowUp => Some(TerminalNavigationShortcut::SingleViewLinear(
+                        TerminalNavigationDirection::Up,
+                    )),
+                    Key::ArrowDown => Some(TerminalNavigationShortcut::SingleViewLinear(
+                        TerminalNavigationDirection::Down,
+                    )),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -5058,15 +6316,26 @@ impl AdeApp {
             .filter_map(|launcher| Self::launch_command_stem(&launcher.launch_command))
             .map(|stem| stem.to_ascii_lowercase())
             .collect::<HashSet<_>>();
+        let opencode_launcher_stems = self
+            .config
+            .launchers
+            .iter()
+            .filter(|launcher| launcher.builtin == Some(BuiltinLauncherKind::OpenCode))
+            .filter_map(|launcher| Self::launch_command_stem(&launcher.launch_command))
+            .map(|stem| stem.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
 
         let mut outbound = Vec::new();
         let mut copied_selection = None;
         let mut last_key_was_alt_m = false;
         let mut launched_factory_droid = false;
         let mut launched_codex_cli = false;
+        let mut launched_opencode = false;
         let mut codex_launch_baseline = None;
+        let mut opencode_launch_baseline = None;
         let mut submitted_factory_prompt = false;
         let mut submitted_codex_prompt = false;
+        let mut submitted_opencode_prompt = false;
         let mut committed_codex_reply = false;
         let mut cancelled_factory_interactive_prompt = false;
         let mut sent_terminal_input = false;
@@ -5149,6 +6418,13 @@ impl AdeApp {
                                 codex_launch_baseline =
                                     terminal.runtime.snapshot_codex_descendant_processes();
                             }
+                            if line_stem.as_ref().is_some_and(|stem| {
+                                opencode_launcher_stems.contains(stem) || stem == "opencode"
+                            }) {
+                                launched_opencode = true;
+                                opencode_launch_baseline =
+                                    terminal.runtime.snapshot_opencode_descendant_processes();
+                            }
                             let sanitized_line = terminal_title_candidate(&line);
                             let has_non_empty_line = sanitized_line
                                 .as_ref()
@@ -5167,9 +6443,17 @@ impl AdeApp {
                                 && terminal.ai_session.status == AiCliStatus::Attention;
                             let submitted_codex_interaction =
                                 has_non_empty_line || allows_empty_codex_submit;
+                            let allows_empty_opencode_submit = terminal
+                                .opencode_attention_reason
+                                .is_some_and(OpenCodeAttentionReason::allows_empty_submit)
+                                && terminal.ai_session.tool == Some(AiCliTool::OpenCode)
+                                && terminal.ai_session.status == AiCliStatus::Attention;
+                            let submitted_opencode_interaction =
+                                has_non_empty_line || allows_empty_opencode_submit;
                             if terminal.factory_droid_session_active
                                 && !launched_factory_droid
                                 && !launched_codex_cli
+                                && !launched_opencode
                                 && submitted_factory_interaction
                             {
                                 submitted_factory_prompt = true;
@@ -5178,6 +6462,7 @@ impl AdeApp {
                                 && terminal.ai_session.status == AiCliStatus::Attention
                                 && !launched_factory_droid
                                 && !launched_codex_cli
+                                && !launched_opencode
                                 && submitted_codex_interaction
                             {
                                 committed_codex_reply = true;
@@ -5185,9 +6470,18 @@ impl AdeApp {
                             if terminal.codex_session_active
                                 && !launched_factory_droid
                                 && !launched_codex_cli
+                                && !launched_opencode
                                 && submitted_codex_interaction
                             {
                                 submitted_codex_prompt = true;
+                            }
+                            if terminal.ai_session.tool == Some(AiCliTool::OpenCode)
+                                && !launched_factory_droid
+                                && !launched_codex_cli
+                                && !launched_opencode
+                                && submitted_opencode_interaction
+                            {
+                                submitted_opencode_prompt = true;
                             }
                             if let Some(sanitized) = sanitized_line {
                                 terminal.full_title = sanitized.clone();
@@ -5237,12 +6531,19 @@ impl AdeApp {
 
         if launched_factory_droid {
             self.clear_codex_state(active_terminal_id);
+            self.clear_opencode_state(active_terminal_id);
             self.mark_factory_droid_launch_pending(active_terminal_id);
         }
         if launched_codex_cli {
             self.clear_factory_droid_state(active_terminal_id);
+            self.clear_opencode_state(active_terminal_id);
             self.prepare_codex_cli_integration_for_launch();
             self.mark_codex_launch_pending(active_terminal_id, codex_launch_baseline);
+        }
+        if launched_opencode {
+            self.clear_factory_droid_state(active_terminal_id);
+            self.clear_codex_state(active_terminal_id);
+            self.mark_opencode_launch_pending(active_terminal_id, opencode_launch_baseline);
         }
 
         if let Some(ref text) = copied_selection {
@@ -5251,6 +6552,9 @@ impl AdeApp {
         }
 
         if sent_terminal_input && self.clear_codex_attention_on_interaction(active_terminal_id) {
+            ctx.request_repaint();
+        }
+        if sent_terminal_input && self.clear_opencode_attention_on_interaction(active_terminal_id) {
             ctx.request_repaint();
         }
 
@@ -5262,7 +6566,9 @@ impl AdeApp {
                     .get(&active_terminal_id)
                     .is_some_and(|entry| {
                         entry.ai_session.tool != Some(AiCliTool::CodexCli)
+                            && entry.ai_session.tool != Some(AiCliTool::OpenCode)
                             && !Self::terminal_has_factory_droid_interactive_attention(entry)
+                            && !Self::terminal_has_opencode_interactive_attention(entry)
                             && (sent_terminal_input || has_copied)
                     });
             if should_clear_attention {
@@ -5314,6 +6620,16 @@ impl AdeApp {
                 active_terminal_id,
                 AiCliStatus::Running,
                 CodexCliStatusSource::PromptSubmit,
+                None,
+            )
+        {
+            ctx.request_repaint();
+        }
+        if submitted_opencode_prompt
+            && self.apply_opencode_status(
+                active_terminal_id,
+                AiCliStatus::Running,
+                OpenCodeStatusSource::PromptSubmit,
                 None,
             )
         {
@@ -5470,11 +6786,6 @@ impl AdeApp {
     }
 
     #[cfg(not(target_os = "windows"))]
-    fn extract_window_hwnd(_cc: &eframe::CreationContext<'_>) -> Option<isize> {
-        None
-    }
-
-    #[cfg(not(target_os = "windows"))]
     fn apply_initial_window_bounds(&mut self, _ctx: &egui::Context) {}
 
     fn append_pending_line(pending: &mut String, text: &str) {
@@ -5577,13 +6888,13 @@ impl AdeApp {
     }
 
     fn key_to_terminal_bytes(key: Key, modifiers: egui::Modifiers) -> Option<Vec<u8>> {
-        if modifiers.ctrl && !modifiers.alt {
+        if primary_shortcut_modifier(modifiers) && !modifiers.alt {
             if let Some(ctrl) = Self::ctrl_key_to_byte(key) {
                 return Some(vec![ctrl]);
             }
         }
 
-        if modifiers.ctrl || modifiers.alt || modifiers.command {
+        if primary_shortcut_modifier(modifiers) || modifiers.alt {
             return None;
         }
 
@@ -5795,6 +7106,26 @@ impl AdeApp {
         changed
     }
 
+    fn clear_opencode_attention_on_interaction(&mut self, terminal_id: u64) -> bool {
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        if entry.ai_session.tool != Some(AiCliTool::OpenCode)
+            || entry.ai_session.status != AiCliStatus::Attention
+        {
+            return false;
+        }
+
+        if let Some(reason) = entry.opencode_attention_reason {
+            if !reason.allows_empty_submit() {
+                return false;
+            }
+        }
+
+        self.clear_opencode_state(terminal_id)
+    }
+
     fn acknowledge_terminal_attention(&mut self, terminal_id: u64) {
         if self.terminals.get(&terminal_id).is_some_and(|entry| {
             (entry.ai_session.tool == Some(AiCliTool::CodexCli)
@@ -5803,12 +7134,16 @@ impl AdeApp {
                 || entry
                     .factory_droid_attention_reason
                     .is_some_and(FactoryDroidAttentionReason::persists_on_focus)
+                || (entry.ai_session.tool == Some(AiCliTool::OpenCode)
+                    && entry.ai_session.status == AiCliStatus::Attention
+                    && Self::terminal_has_opencode_interactive_attention(entry))
         }) {
             return;
         }
 
         let _ = self.clear_codex_attention_on_interaction(terminal_id);
         let _ = self.clear_factory_droid_attention_on_interaction(terminal_id);
+        let _ = self.clear_opencode_attention_on_interaction(terminal_id);
         let Some(manager) = &self.ai_hook_manager else {
             return;
         };
@@ -5980,6 +7315,7 @@ impl AdeApp {
     fn send_saved_message_to_terminal(&mut self, terminal_id: u64, message: &str) {
         let mut submitted_factory_prompt = false;
         let mut submitted_codex_prompt = false;
+        let mut submitted_opencode_prompt = false;
         let mut committed_codex_reply = false;
         let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
             self.status_line = "Target terminal not found".to_owned();
@@ -6015,6 +7351,9 @@ impl AdeApp {
         if terminal.codex_session_active && has_non_empty_line {
             submitted_codex_prompt = true;
         }
+        if terminal.ai_session.tool == Some(AiCliTool::OpenCode) && has_non_empty_line {
+            submitted_opencode_prompt = true;
+        }
 
         Self::push_recent_input(&mut terminal.recent_inputs, message);
 
@@ -6037,6 +7376,14 @@ impl AdeApp {
                 terminal_id,
                 AiCliStatus::Running,
                 CodexCliStatusSource::PromptSubmit,
+                None,
+            );
+        }
+        if submitted_opencode_prompt {
+            let _ = self.apply_opencode_status(
+                terminal_id,
+                AiCliStatus::Running,
+                OpenCodeStatusSource::PromptSubmit,
                 None,
             );
         }
@@ -9446,11 +10793,17 @@ impl eframe::App for AdeApp {
         self.input_routing_gate_ms = INPUT_ROUTING_GATE_MS;
         self.poll_factory_droid_hook_inboxes(ctx);
         self.poll_codex_notify_inboxes(ctx);
+        self.poll_opencode_notify_inboxes(ctx);
+        // Poll the Orca-style HTTP hook service for direct OpenCode status
+        self.poll_opencode_hook_service(ctx);
         if input_gate_elapsed == 0 || self.factory_droid_process_last_poll_at.is_none() {
             self.poll_factory_droid_processes(ctx);
         }
         if input_gate_elapsed == 0 || self.codex_process_last_poll_at.is_none() {
             self.poll_codex_processes(ctx);
+        }
+        if input_gate_elapsed == 0 || self.opencode_process_last_poll_at.is_none() {
+            self.poll_opencode_processes(ctx);
         }
 
         self.process_source_control_events(ctx);
@@ -11422,7 +12775,21 @@ fn draw_terminal_manager_title_and_diff_summary(
             } else {
                 title_response
             };
+            #[cfg(test)]
             let title_response = if let Some(tooltip) = tooltip_text {
+                with_truncation_tooltip(
+                    ui,
+                    title_response,
+                    tooltip,
+                    &font_id,
+                    text_color,
+                    ui.available_width(),
+                )
+            } else {
+                title_response.on_hover_text(title)
+            };
+            #[cfg(not(test))]
+            let _title_response = if let Some(tooltip) = tooltip_text {
                 with_truncation_tooltip(
                     ui,
                     title_response,
@@ -12445,8 +13812,12 @@ fn terminal_secondary_click_action(
     }
 }
 
+fn primary_shortcut_modifier(modifiers: egui::Modifiers) -> bool {
+    modifiers.ctrl || modifiers.command
+}
+
 fn terminal_link_activation_modifiers(modifiers: egui::Modifiers) -> bool {
-    (modifiers.ctrl || modifiers.command) && !modifiers.alt && !modifiers.shift
+    primary_shortcut_modifier(modifiers) && !modifiers.alt && !modifiers.shift
 }
 
 fn terminal_link_rules() -> &'static [Rule] {
@@ -13338,15 +14709,16 @@ mod tests {
         merge_source_control_refresh_result, next_active_terminal_after_close,
         next_terminal_in_direction, next_terminal_in_linear_direction,
         normalize_terminal_background, parse_branch_header, parse_git_numstat_totals,
-        recent_inputs_tooltip_text, recover_config_state, resolve_ctrl_c_action,
-        settings_accordion_disclosure_icon_rect, settings_diagnostics_accordion_header_layout,
-        settings_diagnostics_uses_single_column, settings_general_inline_control_width,
-        settings_general_uses_stacked_layout, settings_popup_uses_stacked_layout,
-        settings_saved_message_card_width, settings_saved_message_text_width,
-        settings_saved_messages_project_header_layout, settings_saved_messages_project_state_id,
-        settings_saved_messages_stacks_draft_row, settings_text_edit_chrome,
-        settings_window_size_for_screen, should_resolve_terminal_link, source_control_badge_color,
-        source_control_tooltip_lines, terminal_activation_scroll_offset, terminal_cell_metric,
+        primary_shortcut_modifier, recent_inputs_tooltip_text, recover_config_state,
+        resolve_ctrl_c_action, settings_accordion_disclosure_icon_rect,
+        settings_diagnostics_accordion_header_layout, settings_diagnostics_uses_single_column,
+        settings_general_inline_control_width, settings_general_uses_stacked_layout,
+        settings_popup_uses_stacked_layout, settings_saved_message_card_width,
+        settings_saved_message_text_width, settings_saved_messages_project_header_layout,
+        settings_saved_messages_project_state_id, settings_saved_messages_stacks_draft_row,
+        settings_text_edit_chrome, settings_window_size_for_screen, should_resolve_terminal_link,
+        source_control_badge_color, source_control_tooltip_lines,
+        terminal_activation_scroll_offset, terminal_cell_metric,
         terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect, terminal_font_family,
         terminal_font_id, terminal_grid_dimensions, terminal_line_height,
         terminal_link_activation_modifiers, terminal_link_at_point, terminal_logical_line,
@@ -13360,18 +14732,20 @@ mod tests {
         CodexCliStatusSource, CtrlCAction, DirectoryIndexSnapshot, DirectoryNode,
         FactoryDroidAttentionReason, FactoryDroidHookInboxEvent,
         FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
-        FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, PendingConfigChanges,
-        PendingTerminalLinkClick, SettingsSection, SourceControlBadgeState, SourceControlFile,
-        SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
+        FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, OpenCodeAttentionReason,
+        OpenCodeStatusSource, PendingConfigChanges, PendingTerminalLinkClick, SettingsSection,
+        SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
+        SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
         TerminalOutputScrollBehavior, TerminalSecondaryClickAction, TerminalSelection,
         TerminalSelectionPoint, TransientToast, CODEX_LAUNCH_GRACE_MS, CODEX_PROCESS_POLL_MS,
         CODEX_RUNNING_GRACE_MS, CODEX_TRAILING_OUTPUT_GRACE_MS, DIRECTORY_INDEX_CHANNEL_CAPACITY,
-        FACTORY_DROID_HOOK_POLL_MS, FACTORY_DROID_PROCESS_POLL_MS,
-        FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS, SOURCE_CONTROL_CHANNEL_CAPACITY,
-        SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG, TERMINAL_COPY_FEEDBACK_TEXT,
-        TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS, TERMINAL_OUTPUT_BG,
-        TRANSIENT_TOAST_SECS,
+        FACTORY_DROID_HOOK_POLL_MS, FACTORY_DROID_LAUNCH_GRACE_MS, FACTORY_DROID_PROCESS_POLL_MS,
+        FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS, OPENCODE_PROCESS_POLL_MS,
+        OPENCODE_RUNNING_GRACE_MS, OPENCODE_TRAILING_OUTPUT_GRACE_MS,
+        SOURCE_CONTROL_CHANNEL_CAPACITY, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG,
+        TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS,
+        TERMINAL_OUTPUT_BG, TRANSIENT_TOAST_SECS,
     };
     use crate::codex::{
         CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent,
@@ -13699,6 +15073,26 @@ mod tests {
     }
 
     #[test]
+    fn command_arrow_shortcuts_stay_out_of_terminal_stream() {
+        let cmd_right = Event::Key {
+            key: Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                command: true,
+                ..Modifiers::default()
+            },
+        };
+
+        let (terminal_events, remaining_events) =
+            AdeApp::partition_terminal_input_events(vec![cmd_right.clone()], true);
+
+        assert!(terminal_events.is_empty());
+        assert_eq!(remaining_events, vec![cmd_right]);
+    }
+
+    #[test]
     fn ctrl_vertical_arrow_shortcuts_stay_out_of_terminal_stream_in_single_view() {
         let ctrl_down = Event::Key {
             key: Key::ArrowDown,
@@ -13716,6 +15110,26 @@ mod tests {
 
         assert!(terminal_events.is_empty());
         assert_eq!(remaining_events, vec![ctrl_down]);
+    }
+
+    #[test]
+    fn command_vertical_arrow_shortcuts_stay_out_of_terminal_stream_in_single_view() {
+        let cmd_down = Event::Key {
+            key: Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                command: true,
+                ..Modifiers::default()
+            },
+        };
+
+        let (terminal_events, remaining_events) =
+            AdeApp::partition_terminal_input_events(vec![cmd_down.clone()], true);
+
+        assert!(terminal_events.is_empty());
+        assert_eq!(remaining_events, vec![cmd_down]);
     }
 
     #[test]
@@ -13797,6 +15211,20 @@ mod tests {
 
         assert_eq!(ctrl_c, Some(vec![0x03]));
         assert_eq!(ctrl_z, Some(vec![0x1a]));
+    }
+
+    #[test]
+    fn maps_command_letters_to_control_bytes() {
+        let modifiers = Modifiers {
+            command: true,
+            ..Modifiers::default()
+        };
+
+        let cmd_c = AdeApp::key_to_terminal_bytes(Key::C, modifiers);
+        let cmd_z = AdeApp::key_to_terminal_bytes(Key::Z, modifiers);
+
+        assert_eq!(cmd_c, Some(vec![0x03]));
+        assert_eq!(cmd_z, Some(vec![0x1a]));
     }
 
     #[test]
@@ -15208,6 +16636,40 @@ mod tests {
         assert!(should_resolve_terminal_link(true, false, false));
         assert!(should_resolve_terminal_link(false, true, false));
         assert!(should_resolve_terminal_link(false, false, true));
+    }
+
+    #[test]
+    fn primary_shortcut_modifier_accepts_ctrl_or_command() {
+        assert!(!primary_shortcut_modifier(Modifiers::default()));
+        assert!(primary_shortcut_modifier(Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        }));
+        assert!(primary_shortcut_modifier(Modifiers {
+            command: true,
+            ..Modifiers::default()
+        }));
+        assert!(primary_shortcut_modifier(Modifiers {
+            ctrl: true,
+            command: true,
+            ..Modifiers::default()
+        }));
+    }
+
+    #[test]
+    fn event_is_factory_droid_interactive_entry_accepts_command_only() {
+        assert!(AdeApp::event_is_factory_droid_interactive_entry(
+            &Event::Key {
+                key: Key::G,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    command: true,
+                    ..Modifiers::default()
+                },
+            }
+        ));
     }
 
     #[test]
@@ -17021,6 +18483,38 @@ mod tests {
     }
 
     #[test]
+    fn handle_shortcuts_moves_active_terminal_with_command_arrow() {
+        let ctx = Context::default();
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    command: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+                (3, test_terminal_entry(3, 7)),
+                (4, test_terminal_entry(4, 7)),
+            ],
+            Some(1),
+        );
+        app.config.ui.multi_terminal_view_enabled = true;
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(app.active_terminal, Some(2));
+    }
+
+    #[test]
     fn handle_shortcuts_moves_single_view_terminal_with_ctrl_down() {
         let ctx = Context::default();
         ctx.input_mut(|input| {
@@ -17792,6 +19286,97 @@ mod tests {
     }
 
     #[test]
+    fn raw_input_hook_buffers_command_arrow_for_active_terminal_in_multi_view() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.config.ui.multi_terminal_view_enabled = true;
+        let cmd_right = Event::Key {
+            key: Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                command: true,
+                ..Modifiers::default()
+            },
+        };
+        let mut raw_input = RawInput {
+            events: vec![cmd_right],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(raw_input.events.is_empty());
+        assert_eq!(
+            app.buffered_terminal_navigation,
+            vec![TerminalNavigationShortcut::Grid(
+                TerminalNavigationDirection::Right,
+            )]
+        );
+    }
+
+    #[test]
+    fn raw_input_hook_buffers_command_horizontal_arrow_for_filter_in_single_view() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let cmd_right = Event::Key {
+            key: Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                command: true,
+                ..Modifiers::default()
+            },
+        };
+        let mut raw_input = RawInput {
+            events: vec![cmd_right],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(raw_input.events.is_empty());
+        assert_eq!(
+            app.buffered_terminal_navigation,
+            vec![TerminalNavigationShortcut::SingleViewFilter(
+                TerminalNavigationDirection::Right,
+            )]
+        );
+    }
+
+    #[test]
+    fn raw_input_hook_buffers_command_vertical_arrow_for_single_view_navigation() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let cmd_down = Event::Key {
+            key: Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                command: true,
+                ..Modifiers::default()
+            },
+        };
+        let mut raw_input = RawInput {
+            events: vec![cmd_down],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(raw_input.events.is_empty());
+        assert_eq!(
+            app.buffered_terminal_navigation,
+            vec![TerminalNavigationShortcut::SingleViewLinear(
+                TerminalNavigationDirection::Down,
+            )]
+        );
+    }
+
+    #[test]
     fn surrender_ui_text_focus_allows_ctrl_horizontal_arrow_buffering_for_filter() {
         let ctx = Context::default();
         let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
@@ -18194,6 +19779,7 @@ mod tests {
             .send(TerminalUiEvent {
                 terminal_id: 1,
                 kind: TerminalUiEventKind::AiStatusChange {
+                    event_name: None,
                     terminal_id: 1,
                     tool: Some(AiCliTool::FactoryDroid),
                     status: AiCliStatus::Running,
@@ -18223,6 +19809,7 @@ mod tests {
             .send(TerminalUiEvent {
                 terminal_id: 1,
                 kind: TerminalUiEventKind::AiStatusChange {
+                    event_name: None,
                     terminal_id: 1,
                     tool: Some(AiCliTool::FactoryDroid),
                     status: AiCliStatus::Attention,
@@ -18369,6 +19956,7 @@ mod tests {
             .send(TerminalUiEvent {
                 terminal_id: 1,
                 kind: TerminalUiEventKind::AiStatusChange {
+                    event_name: None,
                     terminal_id: 1,
                     tool: Some(AiCliTool::FactoryDroid),
                     status: AiCliStatus::Running,
@@ -18402,6 +19990,7 @@ mod tests {
             .send(TerminalUiEvent {
                 terminal_id: 1,
                 kind: TerminalUiEventKind::AiStatusChange {
+                    event_name: None,
                     terminal_id: 1,
                     tool: Some(AiCliTool::FactoryDroid),
                     status: AiCliStatus::Running,
@@ -18435,6 +20024,7 @@ mod tests {
             .send(TerminalUiEvent {
                 terminal_id: 1,
                 kind: TerminalUiEventKind::AiStatusChange {
+                    event_name: None,
                     terminal_id: 1,
                     tool: Some(AiCliTool::FactoryDroid),
                     status: AiCliStatus::Running,
@@ -18489,6 +20079,7 @@ mod tests {
             .send(TerminalUiEvent {
                 terminal_id: 1,
                 kind: TerminalUiEventKind::AiStatusChange {
+                    event_name: None,
                     terminal_id: 1,
                     tool: Some(AiCliTool::FactoryDroid),
                     status: AiCliStatus::Running,
@@ -19153,6 +20744,7 @@ mod tests {
             .send(TerminalUiEvent {
                 terminal_id: 1,
                 kind: TerminalUiEventKind::AiStatusChange {
+                    event_name: None,
                     terminal_id: 1,
                     tool: Some(AiCliTool::FactoryDroid),
                     status: AiCliStatus::Running,
@@ -19344,6 +20936,32 @@ mod tests {
     }
 
     #[test]
+    fn codex_launch_detection_handles_edge_cases() {
+        // Single-quoted Windows path
+        assert!(AdeApp::is_codex_launch_command(
+            r#"'C:\Program Files\OpenAI\codex.exe' --version"#
+        ));
+        // Forward-slash Windows-like path
+        assert!(AdeApp::is_codex_launch_command(
+            r#""C:/Program Files/OpenAI/codex.exe" --version"#
+        ));
+        // Unix absolute path
+        assert!(AdeApp::is_codex_launch_command(
+            "\"/usr/local/bin/codex\" --help"
+        ));
+        // Mixed separators
+        assert!(AdeApp::is_codex_launch_command(
+            r#""C:\Program Files/OpenAI\codex.exe" --version"#
+        ));
+        // False positive: npm exec codex should NOT match
+        assert!(!AdeApp::is_codex_launch_command("npm exec codex"));
+        // False positive: ./codex-helper should NOT match
+        assert!(!AdeApp::is_codex_launch_command("./codex-helper"));
+        // False positive: ~/bin/codex-cli should NOT match
+        assert!(!AdeApp::is_codex_launch_command("~/bin/codex-cli"));
+    }
+
+    #[test]
     fn factory_droid_launch_detection_matches_expected_commands() {
         assert!(AdeApp::is_factory_droid_launch_command("droid"));
         assert!(AdeApp::is_factory_droid_launch_command("factory --help"));
@@ -19353,6 +20971,30 @@ mod tests {
         assert!(!AdeApp::is_factory_droid_launch_command("droid-helper"));
         assert!(!AdeApp::is_factory_droid_launch_command("npm exec droid"));
         assert!(!AdeApp::is_factory_droid_launch_command("git factory"));
+    }
+
+    #[test]
+    fn factory_droid_launch_detection_handles_edge_cases() {
+        // Single-quoted Windows path
+        assert!(AdeApp::is_factory_droid_launch_command(
+            r#"'C:\Program Files\Factory Droid\droid.exe' --version"#
+        ));
+        // Forward-slash Windows-like path
+        assert!(AdeApp::is_factory_droid_launch_command(
+            r#""C:/Program Files/Factory Droid/droid.exe" --version"#
+        ));
+        // Unix absolute path for droid
+        assert!(AdeApp::is_factory_droid_launch_command(
+            "\"/usr/local/bin/droid\" --help"
+        ));
+        // Unix absolute path for factory
+        assert!(AdeApp::is_factory_droid_launch_command(
+            "\"/usr/local/bin/factory\" --help"
+        ));
+        // False positive: npm exec droid should NOT match
+        assert!(!AdeApp::is_factory_droid_launch_command("npm exec droid"));
+        // False positive: ./droid-helper should NOT match
+        assert!(!AdeApp::is_factory_droid_launch_command("./droid-helper"));
     }
 
     #[test]
@@ -19854,6 +21496,7 @@ mod tests {
             .send(TerminalUiEvent {
                 terminal_id: 1,
                 kind: TerminalUiEventKind::AiStatusChange {
+                    event_name: None,
                     terminal_id: 1,
                     tool: Some(AiCliTool::CodexCli),
                     status: AiCliStatus::Attention,
@@ -21326,6 +22969,83 @@ mod tests {
     }
 
     #[test]
+    fn opencode_status_from_chunk_question_prompt() {
+        let result = AdeApp::opencode_status_from_chunk("opencode-question-prompt");
+        assert!(result.is_some());
+        let (status, source, reason) = result.unwrap();
+        assert_eq!(status, AiCliStatus::Attention);
+        assert_eq!(source, OpenCodeStatusSource::VisibleUi);
+        assert_eq!(reason, Some(OpenCodeAttentionReason::QuestionAsked));
+    }
+
+    #[test]
+    fn opencode_status_from_chunk_approval_prompt() {
+        let result = AdeApp::opencode_status_from_chunk("opencode-approval-prompt");
+        assert!(result.is_some());
+        let (status, source, reason) = result.unwrap();
+        assert_eq!(status, AiCliStatus::Attention);
+        assert_eq!(source, OpenCodeStatusSource::VisibleUi);
+        assert_eq!(reason, Some(OpenCodeAttentionReason::PermissionAsked));
+    }
+
+    #[test]
+    fn opencode_status_from_chunk_turn_complete() {
+        let result = AdeApp::opencode_status_from_chunk("opencode-turn-complete");
+        assert!(result.is_some());
+        let (status, source, reason) = result.unwrap();
+        assert_eq!(status, AiCliStatus::Attention);
+        assert_eq!(source, OpenCodeStatusSource::VisibleUi);
+        assert_eq!(reason, Some(OpenCodeAttentionReason::TurnComplete));
+    }
+
+    #[test]
+    fn opencode_status_from_chunk_interrupted_banner() {
+        let result = AdeApp::opencode_status_from_chunk("opencode-interrupted-banner");
+        assert!(result.is_some());
+        let (status, source, reason) = result.unwrap();
+        assert_eq!(status, AiCliStatus::Inactive);
+        assert_eq!(source, OpenCodeStatusSource::VisibleUi);
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn opencode_status_from_chunk_unknown() {
+        let result = AdeApp::opencode_status_from_chunk("some-random-chunk");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn visible_opencode_question_prompt_sets_attention() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::OpenCode);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.opencode_session_active = true;
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "opencode-question-prompt".to_owned(),
+                },
+            })
+            .expect("send opencode question prompt chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::OpenCode));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.opencode_attention_reason,
+            Some(OpenCodeAttentionReason::QuestionAsked)
+        );
+    }
+
+    #[test]
     fn event_terminal_navigation_shortcut_accepts_egui_command_alias_for_ctrl() {
         let shortcut = AdeApp::event_terminal_navigation_shortcut(&Event::Key {
             key: Key::ArrowDown,
@@ -21334,6 +23054,27 @@ mod tests {
             repeat: false,
             modifiers: Modifiers {
                 ctrl: true,
+                command: true,
+                ..Modifiers::default()
+            },
+        });
+
+        assert_eq!(
+            shortcut,
+            Some(TerminalNavigationShortcut::Grid(
+                TerminalNavigationDirection::Down,
+            ))
+        );
+    }
+
+    #[test]
+    fn event_terminal_navigation_shortcut_accepts_command_only_for_navigation() {
+        let shortcut = AdeApp::event_terminal_navigation_shortcut(&Event::Key {
+            key: Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
                 command: true,
                 ..Modifiers::default()
             },
@@ -21367,6 +23108,45 @@ mod tests {
             repeat: false,
             modifiers: Modifiers {
                 ctrl: true,
+                alt: true,
+                ..Modifiers::default()
+            },
+        });
+
+        assert_eq!(
+            down,
+            Some(TerminalNavigationShortcut::SingleViewLinear(
+                TerminalNavigationDirection::Down,
+            ))
+        );
+        assert_eq!(
+            up,
+            Some(TerminalNavigationShortcut::SingleViewLinear(
+                TerminalNavigationDirection::Up,
+            ))
+        );
+    }
+
+    #[test]
+    fn event_terminal_navigation_shortcut_recognizes_command_alt_up_down() {
+        let down = AdeApp::event_terminal_navigation_shortcut(&Event::Key {
+            key: Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                command: true,
+                alt: true,
+                ..Modifiers::default()
+            },
+        });
+        let up = AdeApp::event_terminal_navigation_shortcut(&Event::Key {
+            key: Key::ArrowUp,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                command: true,
                 alt: true,
                 ..Modifiers::default()
             },
@@ -21884,6 +23664,7 @@ mod tests {
             ai_session: AiCliSession::default(),
             factory_droid_inbox_token: Some(test_factory_droid_inbox_token(id)),
             codex_notify_inbox_token: Some(test_codex_inbox_token(id)),
+            opencode_notify_inbox_token: Some(test_opencode_inbox_token(id)),
             factory_droid_launch_pending_since: None,
             factory_droid_session_active: false,
             factory_droid_last_process_seen_at: None,
@@ -21899,6 +23680,22 @@ mod tests {
             codex_last_status_source: None,
             codex_attention_reason: None,
             codex_prompt_submit_since: None,
+            opencode_launch_pending_since: None,
+            opencode_launch_process_baseline: None,
+            opencode_session_active: false,
+            opencode_process_identity: None,
+            opencode_last_process_seen_at: None,
+            opencode_process_missing_since: None,
+            opencode_last_status_source: None,
+            opencode_attention_reason: None,
+            opencode_prompt_submit_since: None,
+            opencode_running_since: None,
+            opencode_last_prompt_submit_at: None,
+            opencode_last_title_working_at: None,
+            opencode_last_title_idle_at: None,
+            opencode_last_visible_attention_at: None,
+            opencode_last_hook_attention_at: None,
+            opencode_last_turn_complete_at: None,
         }
     }
 
@@ -21946,6 +23743,13 @@ mod tests {
             codex_notify_inboxes: BTreeMap::new(),
             codex_notify_last_poll_at: None,
             codex_process_last_poll_at: None,
+            opencode_cli_runtime_dir: None,
+            opencode_cli_runtime_dir_error: None,
+            opencode_notify_inboxes: BTreeMap::new(),
+            opencode_notify_last_poll_at: None,
+            opencode_process_last_poll_at: None,
+            opencode_hook_service: None,
+            opencode_hook_last_poll_at: None,
             config: AppConfig::default(),
             config_load_error: None,
             config_save_requires_reload: false,
@@ -22140,6 +23944,10 @@ mod tests {
 
     fn test_codex_inbox_token(terminal_id: u64) -> String {
         format!("test-codex-inbox-token-{terminal_id}")
+    }
+
+    fn test_opencode_inbox_token(terminal_id: u64) -> String {
+        format!("test-opencode-inbox-token-{terminal_id}")
     }
 
     struct TestTempDir {
@@ -23115,6 +24923,7 @@ mod tests {
                 AiCliStatus::Attention,
                 Some(FactoryDroidAttentionReason::AskUser),
                 None,
+                None,
             ),
             vec!["Factory Droid - Waiting for your reply...".to_owned()]
         );
@@ -23127,6 +24936,7 @@ mod tests {
                 Some(AiCliTool::FactoryDroid),
                 AiCliStatus::Attention,
                 Some(FactoryDroidAttentionReason::SpecificationApproval),
+                None,
                 None,
             ),
             vec!["Factory Droid - Waiting for specification approval...".to_owned()]
@@ -23707,6 +25517,7 @@ mod tests {
             terminal.ai_session.status,
             terminal.factory_droid_attention_reason,
             terminal.codex_attention_reason,
+            terminal.opencode_attention_reason,
         );
         assert!(lines
             .iter()
@@ -23855,5 +25666,204 @@ mod tests {
             AiCliStatus::Running,
             "Running should be allowed for non-interactive attention"
         );
+    }
+
+    #[test]
+    fn opencode_running_without_process_tracking_clears_after_grace() {
+        // Regression: when process tracking is unavailable (e.g., non-Windows),
+        // Running state should clear after grace period expires without
+        // requiring process disappearance signal.
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+
+        // Seed OpenCode Running state with prompt submit but no process identity
+        seed_opencode_running_without_process(&mut app, 1);
+        let entry_before = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(entry_before.ai_session.status, AiCliStatus::Running);
+        assert!(entry_before.opencode_prompt_submit_since.is_some());
+        assert!(entry_before.opencode_process_identity.is_none());
+
+        // Advance time past the running grace period
+        app.opencode_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(OPENCODE_PROCESS_POLL_MS + 1));
+        let running_since = Instant::now() - Duration::from_millis(OPENCODE_RUNNING_GRACE_MS + 100);
+        app.terminals
+            .get_mut(&1)
+            .expect("terminal 1")
+            .opencode_prompt_submit_since = Some(running_since);
+        app.terminals
+            .get_mut(&1)
+            .expect("terminal 1")
+            .opencode_running_since = Some(running_since);
+
+        // Poll should clear the stuck Running state
+        app.poll_opencode_processes(&ctx);
+
+        let entry_after = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            entry_after.ai_session.status,
+            AiCliStatus::Inactive,
+            "Running should clear after grace expires without process evidence"
+        );
+        assert!(!entry_after.opencode_session_active);
+    }
+
+    #[test]
+    fn opencode_title_idle_sets_attention() {
+        // Verify that OpenCode title-based Idle detection sets Attention state
+        // with correct source attribution.
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+
+        // Simulate title-based Idle event
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiStatusChange {
+                    event_name: None,
+                    terminal_id: 1,
+                    tool: Some(AiCliTool::OpenCode),
+                    status: AiCliStatus::Attention,
+                    event: None,
+                    from_title: true,
+                },
+            })
+            .expect("send title idle event");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::OpenCode));
+        assert_eq!(
+            terminal.opencode_last_status_source,
+            Some(OpenCodeStatusSource::TerminalTitle)
+        );
+    }
+
+    #[test]
+    fn opencode_pty_hook_event_is_accepted() {
+        // Verify that OpenCode now accepts PTY hook events (from_title=false)
+        // as authoritative signals. This is the new behavior after implementing
+        // proper hook support for OpenCode.
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+
+        // Set OpenCode as inactive initially
+        app.apply_opencode_status(
+            1,
+            AiCliStatus::Inactive,
+            OpenCodeStatusSource::VisibleUi,
+            None,
+        );
+
+        // Simulate PTY hook event (from_title=false) - should now be accepted
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiStatusChange {
+                    event_name: None,
+                    terminal_id: 1,
+                    tool: Some(AiCliTool::OpenCode),
+                    status: AiCliStatus::Running,
+                    event: None,
+                    from_title: false,
+                },
+            })
+            .expect("send PTY hook event");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        // Status should now be Running because PTY hook events are accepted
+        assert_eq!(
+            terminal.ai_session.status,
+            AiCliStatus::Running,
+            "PTY hook events should now be accepted for OpenCode"
+        );
+        assert_eq!(
+            terminal.opencode_last_status_source,
+            Some(OpenCodeStatusSource::Hook),
+            "Status source should be Hook"
+        );
+    }
+
+    #[test]
+    fn opencode_turn_complete_preserves_attention_after_process_exit() {
+        // Verify TurnComplete attention persists after process exit.
+        let _ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+
+        // Seed TurnComplete attention state with process identity
+        seed_opencode_turn_complete_with_process(&mut app, 1);
+        let entry_before = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(entry_before.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            entry_before.opencode_attention_reason,
+            Some(OpenCodeAttentionReason::TurnComplete)
+        );
+        assert!(entry_before.opencode_process_identity.is_some());
+
+        // Simulate process disappearance after grace period
+        app.opencode_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(OPENCODE_PROCESS_POLL_MS + 1));
+        app.terminals
+            .get_mut(&1)
+            .expect("terminal 1")
+            .opencode_process_missing_since =
+            Some(Instant::now() - Duration::from_millis(OPENCODE_TRAILING_OUTPUT_GRACE_MS + 100));
+
+        // Clear process tracking (simulates process exit)
+        app.clear_opencode_process_tracking(1);
+
+        let entry_after = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            entry_after.ai_session.status,
+            AiCliStatus::Attention,
+            "TurnComplete attention should persist after process exit"
+        );
+        assert_eq!(
+            entry_after.opencode_attention_reason,
+            Some(OpenCodeAttentionReason::TurnComplete)
+        );
+        assert!(entry_after.opencode_process_identity.is_none());
+    }
+
+    fn seed_opencode_running_without_process(app: &mut AdeApp, terminal_id: u64) {
+        let Some(manager) = app.ai_hook_manager.as_ref().cloned() else {
+            panic!("expected ai hook manager");
+        };
+
+        manager.set_tool(terminal_id, AiCliTool::OpenCode);
+        let _ = manager.ai_activity_started(terminal_id);
+
+        if let Some(entry) = app.terminals.get_mut(&terminal_id) {
+            entry.ai_session.tool = Some(AiCliTool::OpenCode);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.opencode_session_active = true;
+            entry.opencode_prompt_submit_since = Some(Instant::now());
+            entry.opencode_running_since = Some(Instant::now());
+            // Explicitly NO process identity to simulate tracking unavailability
+            entry.opencode_process_identity = None;
+        }
+    }
+
+    fn seed_opencode_turn_complete_with_process(app: &mut AdeApp, terminal_id: u64) {
+        let Some(manager) = app.ai_hook_manager.as_ref().cloned() else {
+            panic!("expected ai hook manager");
+        };
+
+        manager.set_tool(terminal_id, AiCliTool::OpenCode);
+        let _ = manager.ai_waiting_for_user(terminal_id);
+
+        if let Some(entry) = app.terminals.get_mut(&terminal_id) {
+            entry.ai_session.tool = Some(AiCliTool::OpenCode);
+            entry.ai_session.status = AiCliStatus::Attention;
+            entry.opencode_session_active = true;
+            entry.opencode_process_identity = Some(TrackedProcessIdentity {
+                pid: 7001,
+                creation_time: Some(8001),
+            });
+            entry.opencode_last_status_source = Some(OpenCodeStatusSource::VisibleUi);
+            entry.opencode_attention_reason = Some(OpenCodeAttentionReason::TurnComplete);
+        }
     }
 }

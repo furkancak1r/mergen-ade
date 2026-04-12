@@ -67,8 +67,9 @@ If `cargo` is not on PATH in PowerShell, use:
 - In handoff/final notes, summarize which subagents were used and what each one produced.
 
 ## AI CLI Integration
-- **Supported AI tools:** `Factory Droid` and `Codex CLI` are supported. Codex support is limited to native Windows sessions. Claude Code, `cc`, and other AI CLI integrations are not supported.
+- **Supported AI tools:** `Factory Droid`, `Codex CLI`, and `OpenCode` are supported. Codex support is limited to native Windows sessions. Claude Code, `cc`, and other AI CLI integrations are not supported.
 - **Factory Droid hook format:** Only `droid-hook:*` and `factory-droid-hook:*` format patterns are recognized for Factory Droid. The `claude-hook:*` format is not supported.
 - **Factory Droid detection commands:** Only `droid` and `factory` trigger Factory Droid session detection. Do not add `cc`, `claude`, or other AI CLI commands.
-- **UI labels:** Use "Droid", "Factory Droid", and "Codex CLI" terminology. Do not use "Claude" or "claude" references in user-facing text.
-- **Event triggers:** Factory Droid uses `UserPromptSubmit` → Running (green pulse) and `Stop`/notification → Attention (yellow pulse). Codex CLI uses explicit launch detection plus notify/BEL-backed attention on native Windows.
+- **OpenCode detection commands:** `opencode` triggers OpenCode session detection. OpenCode is tracked through explicit launch detection and process-based status, similar to Codex CLI. OpenCode does not use PTY hook events.
+- **UI labels:** Use "Droid", "Factory Droid", "Codex CLI", and "OpenCode" terminology. Do not use "Claude" or "claude" references in user-facing text.
+- **Event triggers:** Factory Droid uses `UserPromptSubmit` → Running (green pulse) and `Stop`/notification → Attention (yellow pulse). Codex CLI uses explicit launch detection plus notify/BEL-backed attention on native Windows. OpenCode uses explicit launch detection plus process-based tracking for spinner/pulse status.

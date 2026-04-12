@@ -15,6 +15,7 @@ const ORGANIZATION: &str = "Mergen";
 const APPLICATION: &str = "MergenADE";
 const FACTORY_DROID_HOOK_RUNTIME_DIR: &str = "runtime/factory-droid-hooks";
 const CODEX_CLI_RUNTIME_DIR: &str = "runtime/codex-cli";
+const OPENCODE_RUNTIME_DIR: &str = "runtime/opencode";
 
 fn project_dirs() -> io::Result<ProjectDirs> {
     ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
@@ -37,6 +38,12 @@ pub fn factory_droid_hook_runtime_dir() -> io::Result<PathBuf> {
 
 pub fn codex_cli_runtime_dir() -> io::Result<PathBuf> {
     let runtime_dir = project_dirs()?.config_dir().join(CODEX_CLI_RUNTIME_DIR);
+    fs::create_dir_all(&runtime_dir)?;
+    Ok(runtime_dir)
+}
+
+pub fn opencode_cli_runtime_dir() -> io::Result<PathBuf> {
+    let runtime_dir = project_dirs()?.config_dir().join(OPENCODE_RUNTIME_DIR);
     fs::create_dir_all(&runtime_dir)?;
     Ok(runtime_dir)
 }
@@ -367,7 +374,7 @@ default_shell = "powershell"
         assert_eq!(config.launchers.len(), 4);
         assert_eq!(
             config.launchers[0].builtin,
-            Some(BuiltinLauncherKind::Droid)
+            Some(BuiltinLauncherKind::OpenCode)
         );
         assert_eq!(
             config.launchers[1].builtin,
@@ -375,7 +382,7 @@ default_shell = "powershell"
         );
         assert_eq!(
             config.launchers[2].builtin,
-            Some(BuiltinLauncherKind::OpenCode)
+            Some(BuiltinLauncherKind::Droid)
         );
         assert_eq!(
             config.launchers[3].builtin,

@@ -93,7 +93,7 @@ pub enum BuiltinLauncherKind {
 }
 
 impl BuiltinLauncherKind {
-    pub const ALL: [Self; 4] = [Self::Droid, Self::Codex, Self::OpenCode, Self::Claude];
+    pub const ALL: [Self; 4] = [Self::OpenCode, Self::Codex, Self::Droid, Self::Claude];
 
     pub const fn id(self) -> &'static str {
         match self {
@@ -423,7 +423,7 @@ mod tests {
         assert_eq!(launchers.len(), 4);
         assert_eq!(
             launchers[0],
-            LauncherEntry::builtin(BuiltinLauncherKind::Droid)
+            LauncherEntry::builtin(BuiltinLauncherKind::OpenCode)
         );
         assert_eq!(
             launchers[1],
@@ -431,7 +431,7 @@ mod tests {
         );
         assert_eq!(
             launchers[2],
-            LauncherEntry::builtin(BuiltinLauncherKind::OpenCode)
+            LauncherEntry::builtin(BuiltinLauncherKind::Droid)
         );
         assert_eq!(
             launchers[3],
@@ -453,7 +453,7 @@ mod tests {
         normalize_launcher_entries(&mut launchers);
 
         assert_eq!(launchers.len(), 5);
-        assert_eq!(launchers[0].builtin, Some(BuiltinLauncherKind::Droid));
+        assert_eq!(launchers[0].builtin, Some(BuiltinLauncherKind::OpenCode));
         assert_eq!(launchers[4].builtin, None);
         assert_eq!(launchers[4].display_name, "Custom");
     }
