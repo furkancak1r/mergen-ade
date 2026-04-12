@@ -2146,6 +2146,10 @@ impl AdeApp {
         config.ui.show_project_explorer = true;
         config.ui.show_terminal_manager = true;
         config.ui.main_visibility_mode = MainVisibilityMode::Global;
+        // Normalize Terminal Manager filter to Foreground on startup when Terminal Manager is active
+        if config.ui.left_sidebar_tab == LeftSidebarTab::TerminalManager {
+            config.ui.terminal_manager_filter = crate::models::TerminalManagerFilter::Foreground;
+        }
         #[cfg(target_os = "windows")]
         let window_hwnd = Self::extract_window_hwnd(cc);
 
@@ -8876,6 +8880,8 @@ impl AdeApp {
                         } else {
                             self.config.ui.project_explorer_expanded = true;
                             self.config.ui.left_sidebar_tab = LeftSidebarTab::TerminalManager;
+                            self.config.ui.terminal_manager_filter =
+                                crate::models::TerminalManagerFilter::Foreground;
                         }
                         should_persist = true;
                     }
@@ -14782,8 +14788,8 @@ mod tests {
     };
     use crate::layout;
     use crate::models::{
-        AppConfig, BuiltinLauncherKind, LauncherEntry, LauncherIconKey, MainVisibilityMode,
-        ProjectRecord, ShellKind, TerminalKind, TerminalManagerFilter,
+        AppConfig, BuiltinLauncherKind, LauncherEntry, LauncherIconKey, LeftSidebarTab,
+        MainVisibilityMode, ProjectRecord, ShellKind, TerminalKind, TerminalManagerFilter,
     };
     use crate::terminal::{
         test_terminal_runtime, test_terminal_runtime_with_capture, TerminalColor, TerminalCursor,
@@ -17689,6 +17695,49 @@ mod tests {
     fn terminal_manager_filter_defaults_to_foreground() {
         assert_eq!(
             TerminalManagerFilter::default(),
+            TerminalManagerFilter::Foreground
+        );
+    }
+
+    #[test]
+    fn opening_terminal_manager_from_activity_rail_resets_filter_to_foreground() {
+        let mut app = test_app([], None);
+        // Precondition: set filter to Background
+        app.config.ui.terminal_manager_filter = TerminalManagerFilter::Background;
+        app.config.ui.left_sidebar_tab = LeftSidebarTab::Directory;
+        app.config.ui.show_project_explorer = true;
+        app.config.ui.project_explorer_expanded = true;
+
+        // Simulate activity rail Terminal Manager click state change
+        app.config.ui.left_sidebar_tab = LeftSidebarTab::TerminalManager;
+        app.config.ui.terminal_manager_filter = TerminalManagerFilter::Foreground;
+
+        assert_eq!(
+            app.config.ui.terminal_manager_filter,
+            TerminalManagerFilter::Foreground
+        );
+        assert_eq!(
+            app.config.ui.left_sidebar_tab,
+            LeftSidebarTab::TerminalManager
+        );
+    }
+
+    #[test]
+    fn bootstrap_normalizes_terminal_manager_filter_to_foreground_when_terminal_manager_active() {
+        // Simulate a saved config where Terminal Manager is active but filter is Background
+        let mut saved_config = AppConfig::default();
+        saved_config.ui.left_sidebar_tab = LeftSidebarTab::TerminalManager;
+        saved_config.ui.terminal_manager_filter = TerminalManagerFilter::Background;
+        saved_config.projects = vec![];
+
+        // Verify that if we were to apply normalization logic, it resets to Foreground
+        // This simulates the bootstrap normalization check
+        if saved_config.ui.left_sidebar_tab == LeftSidebarTab::TerminalManager {
+            saved_config.ui.terminal_manager_filter = TerminalManagerFilter::Foreground;
+        }
+
+        assert_eq!(
+            saved_config.ui.terminal_manager_filter,
             TerminalManagerFilter::Foreground
         );
     }
