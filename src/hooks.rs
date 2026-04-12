@@ -13,6 +13,7 @@ pub enum AiCliTool {
     FactoryDroid,
     CodexCli,
     OpenCode,
+    Claude,
 }
 
 impl AiCliTool {
@@ -21,6 +22,7 @@ impl AiCliTool {
             Self::FactoryDroid => "Factory Droid",
             Self::CodexCli => "Codex CLI",
             Self::OpenCode => "OpenCode",
+            Self::Claude => "Claude Code",
         }
     }
 }
@@ -260,6 +262,185 @@ fn normalize_hook_name(name: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_lowercase())
         .collect()
+}
+
+// ─── Claude Code Title-Based Detection ─────────────────────────────────────
+// Orca-compatible Claude Code status detection via terminal title patterns.
+// Claude Code sets OSC titles to task descriptions with status prefixes:
+// - ✳ (eight-spoked asterisk) = idle
+// - . (dot space) = working
+// - * (asterisk space) = idle
+// - Braille spinner (U+2800-U+28FF) = working
+// - "action required"/"permission"/"waiting" + agent name = permission
+
+/// Normalized Claude Code status values (Orca-compatible)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeTransportStatus {
+    Working,
+    Idle,
+    Permission,
+}
+
+/// Claude Code attention reasons for UI differentiation.
+/// Simplified to minimal variants needed for current behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeAttentionReason {
+    PermissionAsked,
+}
+
+impl ClaudeAttentionReason {
+    pub fn tooltip(&self) -> &'static str {
+        match self {
+            Self::PermissionAsked => "Claude Code - Permission needed",
+        }
+    }
+}
+
+const CLAUDE_IDLE_PREFIX: char = '\u{2733}'; // ✳ eight-spoked asterisk
+
+/// Returns true if the character is a Braille pattern (U+2800–U+28FF)
+fn is_braille_spinner(c: char) -> bool {
+    let code_point = c as u32;
+    (0x2800..=0x28FF).contains(&code_point)
+}
+
+/// Check if title contains any Braille spinner characters
+fn contains_braille_spinner(title: &str) -> bool {
+    title.chars().any(is_braille_spinner)
+}
+
+/// Returns true if the title contains an agent name (case-insensitive)
+fn contains_agent_name(title: &str) -> bool {
+    let lower = title.to_lowercase();
+    ["claude", "codex", "gemini", "opencode", "aider"]
+        .iter()
+        .any(|name| lower.contains(name))
+}
+
+/// Returns true if the title contains any of the given keywords (case-insensitive)
+fn contains_any(title: &str, keywords: &[&str]) -> bool {
+    let lower = title.to_lowercase();
+    keywords.iter().any(|kw| lower.contains(kw))
+}
+
+/// Detect Claude Code status from terminal title (Orca-compatible).
+/// Returns None if the title does not match Claude Code conventions.
+///
+/// Claude Code title conventions:
+/// - "✳ " prefix = idle (task description follows)
+/// - ". " prefix = working
+/// - "* " prefix = idle
+/// - Braille spinner anywhere = working
+/// - "claude" + action/permission/waiting = permission
+/// - "claude" + ready/idle/done = idle
+/// - "claude" + working/thinking/running = working
+/// - Bare "claude" = idle (default when no status indicators)
+pub fn detect_claude_status_from_title(title: &str) -> Option<ClaudeTransportStatus> {
+    if title.is_empty() {
+        return None;
+    }
+
+    // Claude Code uses ✳ prefix for idle - check before braille/agent-name
+    // because the title text is the task description, not "Claude Code"
+    if title.starts_with(CLAUDE_IDLE_PREFIX) || title == CLAUDE_IDLE_PREFIX.to_string() {
+        return Some(ClaudeTransportStatus::Idle);
+    }
+
+    // Braille spinner characters indicate working state
+    if contains_braille_spinner(title) {
+        return Some(ClaudeTransportStatus::Working);
+    }
+
+    // Claude Code title prefixes: ". " = working, "* " = idle
+    if title.starts_with(". ") {
+        return Some(ClaudeTransportStatus::Working);
+    }
+    if title.starts_with("* ") {
+        return Some(ClaudeTransportStatus::Idle);
+    }
+
+    // Check for agent names with status keywords
+    if contains_agent_name(title) {
+        if contains_any(title, &["action required", "permission", "waiting"]) {
+            return Some(ClaudeTransportStatus::Permission);
+        }
+        if contains_any(title, &["ready", "idle", "done"]) {
+            return Some(ClaudeTransportStatus::Idle);
+        }
+        if contains_any(title, &["working", "thinking", "running"]) {
+            return Some(ClaudeTransportStatus::Working);
+        }
+
+        // Permission/action-required Claude titles can omit the usual prefixes
+        // but start with "claude" keyword
+        if title.to_lowercase().starts_with("claude") {
+            return Some(ClaudeTransportStatus::Idle);
+        }
+    }
+
+    None
+}
+
+/// Returns true when the terminal title matches Claude Code's conventions.
+/// Used to scope session detection to Claude Code specifically.
+pub fn is_claude_agent_title(title: &str) -> bool {
+    if title.is_empty() {
+        return false;
+    }
+
+    // Claude-specific prefixes must win over other agents
+    if title.starts_with(CLAUDE_IDLE_PREFIX) || title == CLAUDE_IDLE_PREFIX.to_string() {
+        return true;
+    }
+    if title.starts_with(". ") || title.starts_with("* ") {
+        return true;
+    }
+    if contains_braille_spinner(title) {
+        return true;
+    }
+    // Permission/action-required Claude titles can omit the usual prefixes
+    if title.to_lowercase().starts_with("claude") {
+        return true;
+    }
+
+    false
+}
+
+/// Strip working-status indicators from a title so that detection
+/// will no longer return 'working'. Used to clear stale titles
+/// when an agent exits without resetting its title.
+#[cfg(test)]
+pub fn clear_claude_working_indicators(title: &str) -> String {
+    let mut cleaned = title.to_string();
+
+    // Strip Braille spinner characters (U+2800–U+28FF)
+    cleaned = cleaned
+        .chars()
+        .filter(|&c| !is_braille_spinner(c))
+        .collect();
+
+    // Strip Claude Code ". " working prefix
+    if cleaned.starts_with(". ") {
+        cleaned = cleaned[2..].to_string();
+    }
+
+    // Strip working keywords when agent name is present
+    if contains_agent_name(&cleaned) {
+        for keyword in ["working", "thinking", "running"] {
+            cleaned = cleaned.replace(&keyword.to_string(), "");
+            cleaned = cleaned.replace(&keyword.to_uppercase(), "");
+        }
+    }
+
+    // Collapse whitespace after removals
+    cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    if cleaned.is_empty() {
+        title.to_string()
+    } else {
+        cleaned
+    }
 }
 
 /// Extract complete lines from a buffer, returning (complete_lines, incomplete_tail).
@@ -581,6 +762,11 @@ impl AiHookManager {
 
     /// Update AI status based on terminal title changes.
     /// This is called when the terminal title changes and checks for AI-specific patterns.
+    ///
+    /// Claude Code detection: Uses Orca-compatible title-based detection when the title
+    /// matches Claude conventions (✳ prefix, braille spinner, ./* prefixes, or "claude" keyword).
+    /// This allows Claude to be detected even when the session was previously attributed
+    /// to another tool (e.g., if the user switched from Codex to Claude in the same terminal).
     pub fn update_from_title(
         &self,
         terminal_id: u64,
@@ -588,7 +774,39 @@ impl AiHookManager {
     ) -> Option<(AiCliTool, AiCliStatus, Option<AiHookEvent>)> {
         let mut sessions = self.lock_sessions()?;
         let session = sessions.entry(terminal_id).or_default();
+
+        // Check for Claude Code title patterns first (Orca-compatible)
+        // Claude titles take precedence and can override other tools
+        if is_claude_agent_title(title) {
+            if let Some(claude_status) = detect_claude_status_from_title(title) {
+                let (status, event) = match claude_status {
+                    ClaudeTransportStatus::Working => (AiCliStatus::Running, AiHookEvent::Running),
+                    ClaudeTransportStatus::Idle => (AiCliStatus::Attention, AiHookEvent::Attention),
+                    ClaudeTransportStatus::Permission => {
+                        (AiCliStatus::Attention, AiHookEvent::Attention)
+                    }
+                };
+
+                // Allow tool override: if title is clearly Claude, switch to Claude
+                // even if session was previously Codex/OpenCode/FactoryDroid
+                let tool_changed = session.tool != Some(AiCliTool::Claude);
+                session.tool = Some(AiCliTool::Claude);
+
+                if session.status != status || session.last_event != Some(event) || tool_changed {
+                    session.status = status;
+                    session.last_event = Some(event);
+                    return Some((AiCliTool::Claude, status, Some(event)));
+                }
+                return None;
+            }
+        }
+
+        // Fall back to config-based title patterns for other tools
         let matched = if let Some(tool) = session.tool {
+            // Don't use config patterns for Claude - we already checked Claude patterns above
+            if tool == AiCliTool::Claude {
+                return None;
+            }
             let config = self.config.config_for(tool)?;
             title_status_for_config(config, title).map(|(status, event)| (tool, status, event))
         } else {
@@ -1303,5 +1521,277 @@ mod tests {
         );
         let session = manager.session(terminal_id).expect("session after idle");
         assert_eq!(session.status, AiCliStatus::Attention);
+    }
+
+    // ─── Claude Code Title Detection Tests ───────────────────────────────────
+    // Orca-compatible detection via terminal title patterns
+
+    #[test]
+    fn detect_claude_status_from_title_returns_none_for_empty_string() {
+        assert_eq!(detect_claude_status_from_title(""), None);
+    }
+
+    #[test]
+    fn detect_claude_status_from_title_returns_none_for_non_agent_titles() {
+        assert_eq!(detect_claude_status_from_title("bash"), None);
+        assert_eq!(detect_claude_status_from_title("vim myfile.ts"), None);
+        assert_eq!(detect_claude_status_from_title("cargo build"), None);
+    }
+
+    #[test]
+    fn detect_claude_status_idle_prefix_detects_idle() {
+        // ✳ (eight-spoked asterisk) is Claude idle prefix
+        assert_eq!(
+            detect_claude_status_from_title("✳ User acknowledgment and confirmation"),
+            Some(ClaudeTransportStatus::Idle)
+        );
+        assert_eq!(
+            detect_claude_status_from_title("✳ Claude Code"),
+            Some(ClaudeTransportStatus::Idle)
+        );
+        assert_eq!(
+            detect_claude_status_from_title("✳"),
+            Some(ClaudeTransportStatus::Idle)
+        );
+    }
+
+    #[test]
+    fn detect_claude_status_braille_spinner_detects_working() {
+        // Braille patterns (U+2800-U+28FF) indicate working state
+        assert_eq!(
+            detect_claude_status_from_title("⠋ Fixing the bug"),
+            Some(ClaudeTransportStatus::Working)
+        );
+        assert_eq!(
+            detect_claude_status_from_title("⠂ Claude Code"),
+            Some(ClaudeTransportStatus::Working)
+        );
+        assert_eq!(
+            detect_claude_status_from_title("⠐ User acknowledgment and confirmation"),
+            Some(ClaudeTransportStatus::Working)
+        );
+    }
+
+    #[test]
+    fn detect_claude_status_dot_prefix_detects_working() {
+        // ". " prefix = working (Claude Code convention)
+        assert_eq!(
+            detect_claude_status_from_title(". claude"),
+            Some(ClaudeTransportStatus::Working)
+        );
+        assert_eq!(
+            detect_claude_status_from_title(". Implementing feature"),
+            Some(ClaudeTransportStatus::Working)
+        );
+    }
+
+    #[test]
+    fn detect_claude_status_asterisk_prefix_detects_idle() {
+        // "* " prefix = idle (Claude Code convention)
+        assert_eq!(
+            detect_claude_status_from_title("* claude"),
+            Some(ClaudeTransportStatus::Idle)
+        );
+        assert_eq!(
+            detect_claude_status_from_title("* Waiting for input"),
+            Some(ClaudeTransportStatus::Idle)
+        );
+    }
+
+    #[test]
+    fn detect_claude_status_permission_keywords_detect_permission() {
+        // Permission keywords with agent name
+        assert_eq!(
+            detect_claude_status_from_title("Claude Code - action required"),
+            Some(ClaudeTransportStatus::Permission)
+        );
+        assert_eq!(
+            detect_claude_status_from_title("claude - permission needed"),
+            Some(ClaudeTransportStatus::Permission)
+        );
+        assert_eq!(
+            detect_claude_status_from_title("claude waiting for input"),
+            Some(ClaudeTransportStatus::Permission)
+        );
+    }
+
+    #[test]
+    fn detect_claude_status_idle_keywords_detect_idle() {
+        // Idle keywords with agent name
+        assert_eq!(
+            detect_claude_status_from_title("claude ready"),
+            Some(ClaudeTransportStatus::Idle)
+        );
+        assert_eq!(
+            detect_claude_status_from_title("claude idle"),
+            Some(ClaudeTransportStatus::Idle)
+        );
+        assert_eq!(
+            detect_claude_status_from_title("claude done"),
+            Some(ClaudeTransportStatus::Idle)
+        );
+    }
+
+    #[test]
+    fn detect_claude_status_working_keywords_detect_working() {
+        // Working keywords with agent name
+        assert_eq!(
+            detect_claude_status_from_title("claude working on task"),
+            Some(ClaudeTransportStatus::Working)
+        );
+        assert_eq!(
+            detect_claude_status_from_title("claude thinking"),
+            Some(ClaudeTransportStatus::Working)
+        );
+        assert_eq!(
+            detect_claude_status_from_title("claude running tests"),
+            Some(ClaudeTransportStatus::Working)
+        );
+    }
+
+    #[test]
+    fn detect_claude_status_bare_agent_name_defaults_to_idle() {
+        // Bare agent name without status indicators = idle
+        assert_eq!(
+            detect_claude_status_from_title("claude"),
+            Some(ClaudeTransportStatus::Idle)
+        );
+        assert_eq!(
+            detect_claude_status_from_title("CLAUDE"),
+            Some(ClaudeTransportStatus::Idle)
+        );
+    }
+
+    #[test]
+    fn is_claude_agent_title_detects_claude_patterns() {
+        assert!(is_claude_agent_title("✳ User acknowledgment"));
+        assert!(is_claude_agent_title("⠂ Claude Code"));
+        assert!(is_claude_agent_title(". claude"));
+        assert!(is_claude_agent_title("* claude"));
+        assert!(is_claude_agent_title("claude ready"));
+        assert!(is_claude_agent_title("Claude Code - action required"));
+    }
+
+    #[test]
+    fn is_claude_agent_title_rejects_non_claude() {
+        assert!(!is_claude_agent_title("bash"));
+        assert!(!is_claude_agent_title("vim file.ts"));
+        assert!(!is_claude_agent_title("codex")); // Not Claude specifically
+        assert!(!is_claude_agent_title("OpenCode working"));
+    }
+
+    #[test]
+    fn update_from_title_detects_claude_idle() {
+        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let terminal_id = 1;
+
+        assert_eq!(
+            manager.update_from_title(terminal_id, "✳ User acknowledgment and confirmation"),
+            Some((
+                AiCliTool::Claude,
+                AiCliStatus::Attention,
+                Some(AiHookEvent::Attention)
+            ))
+        );
+        let session = manager.session(terminal_id).expect("session");
+        assert_eq!(session.tool, Some(AiCliTool::Claude));
+        assert_eq!(session.status, AiCliStatus::Attention);
+    }
+
+    #[test]
+    fn update_from_title_detects_claude_working() {
+        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let terminal_id = 1;
+
+        assert_eq!(
+            manager.update_from_title(terminal_id, "⠂ User acknowledgment and confirmation"),
+            Some((
+                AiCliTool::Claude,
+                AiCliStatus::Running,
+                Some(AiHookEvent::Running)
+            ))
+        );
+        let session = manager.session(terminal_id).expect("session");
+        assert_eq!(session.tool, Some(AiCliTool::Claude));
+        assert_eq!(session.status, AiCliStatus::Running);
+    }
+
+    #[test]
+    fn update_from_title_detects_claude_permission() {
+        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let terminal_id = 1;
+
+        assert_eq!(
+            manager.update_from_title(terminal_id, "Claude Code - action required"),
+            Some((
+                AiCliTool::Claude,
+                AiCliStatus::Attention,
+                Some(AiHookEvent::Attention)
+            ))
+        );
+        let session = manager.session(terminal_id).expect("session");
+        assert_eq!(session.tool, Some(AiCliTool::Claude));
+        assert_eq!(session.status, AiCliStatus::Attention);
+    }
+
+    #[test]
+    fn update_from_title_claude_overrides_previous_tool() {
+        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let terminal_id = 1;
+
+        // First detect as OpenCode
+        manager.update_with_text_offsets(terminal_id, "[opencode-hook:event=tool.execute.before]");
+        let session = manager.session(terminal_id).expect("session");
+        assert_eq!(session.tool, Some(AiCliTool::OpenCode));
+
+        // Then switch to Claude via title
+        assert_eq!(
+            manager.update_from_title(terminal_id, "✳ Switching to Claude"),
+            Some((
+                AiCliTool::Claude,
+                AiCliStatus::Attention,
+                Some(AiHookEvent::Attention)
+            ))
+        );
+        let session = manager.session(terminal_id).expect("session");
+        assert_eq!(session.tool, Some(AiCliTool::Claude));
+    }
+
+    #[test]
+    fn clear_claude_working_indicators_strips_braille_and_prefixes() {
+        let cleared = clear_claude_working_indicators("⠂ Claude Code");
+        assert!(!cleared.contains('⠂'));
+        assert!(!contains_braille_spinner(&cleared));
+
+        let cleared = clear_claude_working_indicators(". claude");
+        assert!(!cleared.starts_with(". "));
+
+        let cleared = clear_claude_working_indicators("⠋ Working on feature");
+        assert!(!cleared.contains("working"));
+    }
+
+    #[test]
+    fn update_from_title_claude_working_to_idle_transition() {
+        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        let terminal_id = 1;
+
+        // Start working
+        manager.update_from_title(terminal_id, "⠂ Implementing feature");
+        let session = manager.session(terminal_id).expect("session");
+        assert_eq!(session.status, AiCliStatus::Running);
+        assert_eq!(session.tool, Some(AiCliTool::Claude));
+
+        // Transition to idle
+        assert_eq!(
+            manager.update_from_title(terminal_id, "✳ Implementing feature"),
+            Some((
+                AiCliTool::Claude,
+                AiCliStatus::Attention,
+                Some(AiHookEvent::Attention)
+            ))
+        );
+        let session = manager.session(terminal_id).expect("session");
+        assert_eq!(session.status, AiCliStatus::Attention);
+        assert_eq!(session.tool, Some(AiCliTool::Claude));
     }
 }

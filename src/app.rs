@@ -39,7 +39,10 @@ use crate::codex::{
     CODEX_UNKNOWN_NOTIFY_EVENT,
 };
 use crate::config;
-use crate::hooks::{AiCliSession, AiCliStatus, AiCliTool, AiHookManager};
+use crate::hooks::{
+    AiCliSession, AiCliStatus, AiCliTool, AiHookManager, ClaudeAttentionReason,
+    ClaudeTransportStatus,
+};
 use crate::layout;
 use crate::models::{
     AppConfig, BuiltinLauncherKind, LauncherEntry, LauncherIconKey, LeftSidebarTab,
@@ -635,6 +638,12 @@ enum OpenCodeStatusSource {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeStatusSource {
+    TerminalTitle,
+    Hook,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 enum OpenCodeAttentionReason {
     PermissionAsked,
@@ -972,6 +981,16 @@ struct TerminalEntry {
     opencode_last_visible_attention_at: Option<Instant>,
     opencode_last_hook_attention_at: Option<Instant>,
     opencode_last_turn_complete_at: Option<Instant>,
+    /// Claude Code normalized transport status (working | idle | permission)
+    /// This preserves Orca-compatible semantics through the state machine
+    claude_normalized_status: Option<ClaudeTransportStatus>,
+    claude_attention_reason: Option<ClaudeAttentionReason>,
+    /// When we last entered Running state (from title detection)
+    claude_running_since: Option<Instant>,
+    /// Evidence-based timestamps for Claude state resolution
+    claude_last_title_working_at: Option<Instant>,
+    claude_last_title_idle_at: Option<Instant>,
+    claude_last_permission_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1187,6 +1206,8 @@ struct AiBadgeModel {
     status: AiCliStatus,
     /// Normalized OpenCode transport status for semantic UI differentiation
     opencode_normalized_status: Option<OpenCodeTransportStatus>,
+    /// Normalized Claude transport status for semantic UI differentiation
+    claude_normalized_status: Option<ClaudeTransportStatus>,
     tooltip_lines: Vec<String>,
 }
 
@@ -1200,11 +1221,13 @@ impl AiBadgeModel {
             terminal.factory_droid_attention_reason,
             terminal.codex_attention_reason,
             terminal.opencode_attention_reason,
+            terminal.claude_attention_reason,
         );
         Self {
             tool,
             status,
             opencode_normalized_status: terminal.opencode_normalized_status,
+            claude_normalized_status: terminal.claude_normalized_status,
             tooltip_lines,
         }
     }
@@ -1216,6 +1239,7 @@ fn ai_badge_tooltip_lines(
     factory_droid_attention_reason: Option<FactoryDroidAttentionReason>,
     codex_attention_reason: Option<CodexAttentionReason>,
     opencode_attention_reason: Option<OpenCodeAttentionReason>,
+    claude_attention_reason: Option<ClaudeAttentionReason>,
 ) -> Vec<String> {
     match tool {
         Some(AiCliTool::FactoryDroid) if status == AiCliStatus::Attention => {
@@ -1233,6 +1257,11 @@ fn ai_badge_tooltip_lines(
             vec![opencode_attention_reason
                 .map(|reason| reason.tooltip().to_owned())
                 .unwrap_or_else(|| status.tooltip(AiCliTool::OpenCode))]
+        }
+        Some(AiCliTool::Claude) if status == AiCliStatus::Attention => {
+            vec![claude_attention_reason
+                .map(|reason| reason.tooltip().to_owned())
+                .unwrap_or_else(|| status.tooltip(AiCliTool::Claude))]
         }
         Some(tool) => vec![status.tooltip(tool)],
         None => vec!["AI: Not detected".to_owned()],
@@ -1254,13 +1283,23 @@ enum AiBadgeVisual {
 fn ai_badge_visual(
     status: AiCliStatus,
     normalized_status: Option<OpenCodeTransportStatus>,
+    claude_normalized_status: Option<ClaudeTransportStatus>,
 ) -> Option<AiBadgeVisual> {
     match status {
         AiCliStatus::Inactive => None,
         AiCliStatus::Running => Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180))),
         AiCliStatus::Attention => {
+            // Prefer Claude normalized status if available, otherwise use OpenCode
+            let effective_status = claude_normalized_status
+                .map(|s| match s {
+                    ClaudeTransportStatus::Working => OpenCodeTransportStatus::Working,
+                    ClaudeTransportStatus::Idle => OpenCodeTransportStatus::Idle,
+                    ClaudeTransportStatus::Permission => OpenCodeTransportStatus::Permission,
+                })
+                .or(normalized_status);
+
             // Use normalized status for semantic differentiation if available
-            match normalized_status {
+            match effective_status {
                 Some(OpenCodeTransportStatus::Permission) => {
                     // Permission/Question needs attention - pulse
                     Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 180, 100)))
@@ -1285,7 +1324,11 @@ fn ai_badge_visual(
 }
 
 fn draw_ai_badge(ui: &mut Ui, badge: &AiBadgeModel) -> egui::Response {
-    let Some(visual) = ai_badge_visual(badge.status, badge.opencode_normalized_status) else {
+    let Some(visual) = ai_badge_visual(
+        badge.status,
+        badge.opencode_normalized_status,
+        badge.claude_normalized_status,
+    ) else {
         return ui.allocate_at_least(egui::vec2(0.0, 0.0), Sense::hover()).1;
     };
 
@@ -1364,8 +1407,12 @@ struct SettingsDiagnosticsAccordionHeaderLayout {
 }
 
 fn draw_terminal_status_badges(ui: &mut Ui, ai_badge: &AiBadgeModel) -> TerminalStatusBadgeLayout {
-    let ai_response = ai_badge_visual(ai_badge.status, ai_badge.opencode_normalized_status)
-        .map(|_| draw_ai_badge(ui, ai_badge));
+    let ai_response = ai_badge_visual(
+        ai_badge.status,
+        ai_badge.opencode_normalized_status,
+        ai_badge.claude_normalized_status,
+    )
+    .map(|_| draw_ai_badge(ui, ai_badge));
     #[cfg(test)]
     let ai_rect = ai_response.as_ref().map(|response| response.rect);
     if ai_response.is_some() {
@@ -2654,6 +2701,13 @@ impl AdeApp {
             opencode_last_visible_attention_at: None,
             opencode_last_hook_attention_at: None,
             opencode_last_turn_complete_at: None,
+            // Claude Code state (Orca-compatible title-based detection)
+            claude_normalized_status: None,
+            claude_attention_reason: None,
+            claude_running_since: None,
+            claude_last_title_working_at: None,
+            claude_last_title_idle_at: None,
+            claude_last_permission_at: None,
         };
 
         self.terminals.insert(terminal_id, entry);
@@ -3840,6 +3894,33 @@ impl AdeApp {
         changed
     }
 
+    fn clear_claude_state(&mut self, terminal_id: u64) -> bool {
+        if let Some(manager) = &self.ai_hook_manager {
+            manager.reset_session(terminal_id);
+        }
+
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        let changed = entry.ai_session.tool == Some(AiCliTool::Claude)
+            || entry.claude_normalized_status.is_some()
+            || entry.claude_attention_reason.is_some()
+            || entry.claude_running_since.is_some();
+
+        if entry.ai_session.tool == Some(AiCliTool::Claude) {
+            entry.ai_session = AiCliSession::default();
+        }
+        entry.claude_normalized_status = None;
+        entry.claude_attention_reason = None;
+        entry.claude_running_since = None;
+        entry.claude_last_title_working_at = None;
+        entry.claude_last_title_idle_at = None;
+        entry.claude_last_permission_at = None;
+        entry.dirty = true;
+        changed
+    }
+
     fn clear_opencode_process_tracking(&mut self, terminal_id: u64) -> bool {
         let Some(entry) = self.terminals.get_mut(&terminal_id) else {
             return false;
@@ -4064,6 +4145,109 @@ impl AdeApp {
             }
             changed = true;
         }
+        entry.dirty = true;
+        changed
+    }
+
+    /// Apply Claude Code status to a terminal entry.
+    /// This handles title-based detection and maintains Claude-specific state.
+    fn apply_claude_status(
+        &mut self,
+        terminal_id: u64,
+        status: AiCliStatus,
+        source: ClaudeStatusSource,
+        attention_reason: Option<ClaudeAttentionReason>,
+    ) -> bool {
+        let Some(manager) = self.ai_hook_manager.as_ref().cloned() else {
+            return false;
+        };
+
+        manager.set_tool(terminal_id, AiCliTool::Claude);
+
+        let update = match status {
+            AiCliStatus::Running => manager.ai_activity_started(terminal_id),
+            AiCliStatus::Attention => manager.ai_waiting_for_user(terminal_id),
+            AiCliStatus::Inactive => None,
+        };
+
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        let now = Instant::now();
+        let mut changed = false;
+
+        // Record evidence timestamps for state resolution
+        match (status, source) {
+            (AiCliStatus::Running, ClaudeStatusSource::TerminalTitle) => {
+                entry.claude_last_title_working_at = Some(now);
+                entry.claude_normalized_status = Some(ClaudeTransportStatus::Working);
+            }
+            (AiCliStatus::Attention, ClaudeStatusSource::TerminalTitle) => {
+                // Infer normalized status from title context
+                if attention_reason == Some(ClaudeAttentionReason::PermissionAsked) {
+                    entry.claude_normalized_status = Some(ClaudeTransportStatus::Permission);
+                    entry.claude_last_permission_at = Some(now);
+                } else {
+                    entry.claude_normalized_status = Some(ClaudeTransportStatus::Idle);
+                    entry.claude_last_title_idle_at = Some(now);
+                }
+            }
+            (AiCliStatus::Attention, ClaudeStatusSource::Hook) => {
+                if let Some(reason) = attention_reason {
+                    entry.claude_attention_reason = Some(reason);
+                    // Only PermissionAsked is supported; all other attention states default to Idle
+                    match reason {
+                        ClaudeAttentionReason::PermissionAsked => {
+                            entry.claude_normalized_status =
+                                Some(ClaudeTransportStatus::Permission);
+                            entry.claude_last_permission_at = Some(now);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        if entry.ai_session.tool != Some(AiCliTool::Claude) {
+            entry.ai_session.tool = Some(AiCliTool::Claude);
+            changed = true;
+        }
+        if let Some((tool, next_status)) = update {
+            if entry.ai_session.tool != Some(tool) || entry.ai_session.status != next_status {
+                entry.ai_session.tool = Some(tool);
+                entry.ai_session.status = next_status;
+                changed = true;
+            }
+        } else if entry.ai_session.status != status {
+            entry.ai_session.status = status;
+            changed = true;
+        }
+
+        match status {
+            AiCliStatus::Attention => {
+                if let Some(reason) = attention_reason {
+                    if entry.claude_attention_reason != Some(reason) {
+                        entry.claude_attention_reason = Some(reason);
+                        changed = true;
+                    }
+                }
+            }
+            AiCliStatus::Running => {
+                entry.claude_running_since = Some(now);
+                // Clear attention reason when transitioning to running
+                if entry.claude_attention_reason.take().is_some() {
+                    changed = true;
+                }
+            }
+            AiCliStatus::Inactive => {
+                if entry.claude_attention_reason.take().is_some() {
+                    changed = true;
+                }
+                entry.claude_normalized_status = None;
+            }
+        }
+
         entry.dirty = true;
         changed
     }
@@ -5223,6 +5407,43 @@ impl AdeApp {
                         {
                             dirty_ids.insert(terminal_id);
                         }
+                    } else if tool == Some(AiCliTool::Claude) {
+                        // Claude Code uses title-based detection (Orca-compatible)
+                        let source = if from_title {
+                            ClaudeStatusSource::TerminalTitle
+                        } else {
+                            ClaudeStatusSource::Hook
+                        };
+
+                        // Map status to normalized status and attention reason
+                        let (normalized_status, attention_reason) = match status {
+                            AiCliStatus::Running => (Some(ClaudeTransportStatus::Working), None),
+                            AiCliStatus::Attention => {
+                                // Infer reason from context if available
+                                let reason = if from_title {
+                                    // Title detection doesn't have explicit event names
+                                    // Use heuristics based on what triggered the attention
+                                    None
+                                } else {
+                                    None
+                                };
+                                // Default to Idle for attention state unless we know it's permission
+                                (Some(ClaudeTransportStatus::Idle), reason)
+                            }
+                            AiCliStatus::Inactive => (None, None),
+                        };
+
+                        // Store normalized status for UI use
+                        if let Some(entry) = self.terminals.get_mut(&terminal_id) {
+                            if entry.claude_normalized_status != normalized_status {
+                                entry.claude_normalized_status = normalized_status;
+                                entry.dirty = true;
+                            }
+                        }
+
+                        if self.apply_claude_status(terminal_id, status, source, attention_reason) {
+                            dirty_ids.insert(terminal_id);
+                        }
                     } else if let Some(entry) = self.terminals.get_mut(&terminal_id) {
                         if tool.is_some() {
                             entry.ai_session.tool = tool;
@@ -5318,6 +5539,7 @@ impl AdeApp {
             changed |= self.clear_factory_droid_state(terminal_id);
             changed |= self.clear_codex_state(terminal_id);
             changed |= self.clear_opencode_state(terminal_id);
+            changed |= self.clear_claude_state(terminal_id);
         }
 
         if changed {
@@ -6499,6 +6721,14 @@ impl AdeApp {
             .filter_map(|launcher| Self::launch_command_stem(&launcher.launch_command))
             .map(|stem| stem.to_ascii_lowercase())
             .collect::<HashSet<_>>();
+        let claude_launcher_stems = self
+            .config
+            .launchers
+            .iter()
+            .filter(|launcher| launcher.builtin == Some(BuiltinLauncherKind::Claude))
+            .filter_map(|launcher| Self::launch_command_stem(&launcher.launch_command))
+            .map(|stem| stem.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
 
         let mut outbound = Vec::new();
         let mut copied_selection = None;
@@ -6506,6 +6736,7 @@ impl AdeApp {
         let mut launched_factory_droid = false;
         let mut launched_codex_cli = false;
         let mut launched_opencode = false;
+        let mut launched_claude = false;
         let mut codex_launch_baseline = None;
         let mut opencode_launch_baseline = None;
         let mut submitted_factory_prompt = false;
@@ -6599,6 +6830,13 @@ impl AdeApp {
                                 launched_opencode = true;
                                 opencode_launch_baseline =
                                     terminal.runtime.snapshot_opencode_descendant_processes();
+                            }
+                            if line_stem.as_ref().is_some_and(|stem| {
+                                claude_launcher_stems.contains(stem)
+                                    || stem == "claude"
+                                    || stem == "cc"
+                            }) {
+                                launched_claude = true;
                             }
                             let sanitized_line = terminal_title_candidate(&line);
                             let has_non_empty_line = sanitized_line
@@ -6719,6 +6957,14 @@ impl AdeApp {
             self.clear_factory_droid_state(active_terminal_id);
             self.clear_codex_state(active_terminal_id);
             self.mark_opencode_launch_pending(active_terminal_id, opencode_launch_baseline);
+        }
+        if launched_claude {
+            // Clear other tool states when launching Claude
+            // Claude detection is title-based (Orca-compatible), so we don't need process tracking
+            // But we clear other states to ensure clean transitions
+            self.clear_factory_droid_state(active_terminal_id);
+            self.clear_codex_state(active_terminal_id);
+            self.clear_opencode_state(active_terminal_id);
         }
 
         if let Some(ref text) = copied_selection {
@@ -9966,6 +10212,7 @@ impl AdeApp {
                                 let ai_response = ai_badge_visual(
                                     ai_badge.status,
                                     ai_badge.opencode_normalized_status,
+                                    ai_badge.claude_normalized_status,
                                 )
                                 .map(|_| draw_ai_badge(ui, &ai_badge));
                                 if ai_response.is_some() {
@@ -24029,6 +24276,13 @@ mod tests {
             opencode_last_visible_attention_at: None,
             opencode_last_hook_attention_at: None,
             opencode_last_turn_complete_at: None,
+            // Claude Code state (Orca-compatible title-based detection)
+            claude_normalized_status: None,
+            claude_attention_reason: None,
+            claude_running_since: None,
+            claude_last_title_working_at: None,
+            claude_last_title_idle_at: None,
+            claude_last_permission_at: None,
         }
     }
 
@@ -25264,36 +25518,62 @@ mod tests {
 
     #[test]
     fn ai_badge_visuals_match_status() {
+        use crate::hooks::ClaudeTransportStatus;
+
         // Without normalized status
         assert_eq!(
-            ai_badge_visual(AiCliStatus::Running, None),
+            ai_badge_visual(AiCliStatus::Running, None, None),
             Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180)))
         );
         assert_eq!(
-            ai_badge_visual(AiCliStatus::Attention, None),
+            ai_badge_visual(AiCliStatus::Attention, None, None),
             Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 220, 220)))
         );
-        assert_eq!(ai_badge_visual(AiCliStatus::Inactive, None), None);
+        assert_eq!(ai_badge_visual(AiCliStatus::Inactive, None, None), None);
 
-        // With normalized status for semantic differentiation
+        // With OpenCode normalized status for semantic differentiation
         use crate::opencode::OpenCodeTransportStatus;
         assert_eq!(
             ai_badge_visual(
                 AiCliStatus::Attention,
-                Some(OpenCodeTransportStatus::Permission)
+                Some(OpenCodeTransportStatus::Permission),
+                None
             ),
             Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 180, 100)))
         );
         assert_eq!(
-            ai_badge_visual(AiCliStatus::Attention, Some(OpenCodeTransportStatus::Idle)),
+            ai_badge_visual(
+                AiCliStatus::Attention,
+                Some(OpenCodeTransportStatus::Idle),
+                None
+            ),
             Some(AiBadgeVisual::Solid(Color32::from_rgb(100, 200, 100)))
         );
         assert_eq!(
             ai_badge_visual(
                 AiCliStatus::Attention,
-                Some(OpenCodeTransportStatus::Working)
+                Some(OpenCodeTransportStatus::Working),
+                None
             ),
             Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180)))
+        );
+
+        // With Claude normalized status (takes precedence over OpenCode)
+        assert_eq!(
+            ai_badge_visual(
+                AiCliStatus::Attention,
+                Some(OpenCodeTransportStatus::Idle),
+                Some(ClaudeTransportStatus::Permission)
+            ),
+            Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 180, 100)))
+        );
+        assert_eq!(
+            ai_badge_visual(
+                AiCliStatus::Attention,
+                None,
+                Some(ClaudeTransportStatus::Idle)
+            ),
+            Some(AiBadgeVisual::Solid(Color32::from_rgb(100, 200, 100)))
         );
     }
 
@@ -25304,6 +25584,7 @@ mod tests {
                 Some(AiCliTool::FactoryDroid),
                 AiCliStatus::Attention,
                 Some(FactoryDroidAttentionReason::AskUser),
+                None,
                 None,
                 None,
             ),
@@ -25320,6 +25601,7 @@ mod tests {
                 Some(FactoryDroidAttentionReason::SpecificationApproval),
                 None,
                 None,
+                None,
             ),
             vec!["Factory Droid - Waiting for specification approval...".to_owned()]
         );
@@ -25334,18 +25616,21 @@ mod tests {
             tool: Some(AiCliTool::FactoryDroid),
             status: AiCliStatus::Running,
             opencode_normalized_status: None,
+            claude_normalized_status: None,
             tooltip_lines: vec!["Factory Droid - Working...".to_string()],
         };
         let attention_badge = AiBadgeModel {
             tool: Some(AiCliTool::FactoryDroid),
             status: AiCliStatus::Attention,
             opencode_normalized_status: None,
+            claude_normalized_status: None,
             tooltip_lines: vec!["Factory Droid - Waiting for you...".to_string()],
         };
         let inactive_badge = AiBadgeModel {
             tool: Some(AiCliTool::FactoryDroid),
             status: AiCliStatus::Inactive,
             opencode_normalized_status: None,
+            claude_normalized_status: None,
             tooltip_lines: vec!["Factory Droid - Idle".to_string()],
         };
 
@@ -25374,6 +25659,7 @@ mod tests {
             tool: Some(AiCliTool::FactoryDroid),
             status: AiCliStatus::Running,
             opencode_normalized_status: None,
+            claude_normalized_status: None,
             tooltip_lines: vec!["Factory Droid - Working...".to_string()],
         };
 
@@ -25536,6 +25822,7 @@ mod tests {
             tool: Some(AiCliTool::FactoryDroid),
             status: AiCliStatus::Inactive,
             opencode_normalized_status: None,
+            claude_normalized_status: None,
             tooltip_lines: vec!["Factory Droid - Idle".to_string()],
         };
 
@@ -25905,6 +26192,7 @@ mod tests {
             terminal.factory_droid_attention_reason,
             terminal.codex_attention_reason,
             terminal.opencode_attention_reason,
+            terminal.claude_attention_reason,
         );
         assert!(lines
             .iter()

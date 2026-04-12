@@ -1,5 +1,52 @@
 ### Known Issues & Fix Log
 
+#### Claude Code title-based detection and spinner/pulse now supported {#claude-code-title-based-detection-and-spinner-pulse-now-supported}
+- Date: 2026-04-12T00:00:00Z
+- Context: main/Windows/macOS local Claude Code CLI integration via terminal title-based detection (Orca-compatible)
+- Error signature: `Claude Code sessions were not detected; the badge showed no spinner during work and no pulse/idle state when complete; the UI treated Claude as "Not detected" even when running.`
+- Symptoms/Impact: Users running `claude` or `cc` in Mergen ADE terminals saw no AI activity badge. There was no visual feedback when Claude was working (spinner), when it needed permission (pulse), or when it completed (idle). AGENTS.md explicitly stated "Claude Code, `cc`, and other AI CLI integrations are not supported."
+- Root cause: The codebase lacked Claude-specific runtime integration. `AiCliTool` enum did not include Claude, hook/title detection only recognized Factory Droid and OpenCode patterns, and the UI badge logic had no Claude branch. The `update_from_title` function used only simple substring matching that couldn't handle Claude's OSC title conventions (✳ prefix, braille spinner, ./* prefixes).
+- Resolution:
+  - Added `Claude` variant to `AiCliTool` enum in `src/hooks.rs`.
+  - Implemented Orca-compatible Claude title detection in `src/hooks.rs`:
+    - `ClaudeTransportStatus` enum (Working, Idle, Permission) for semantic state differentiation
+    - `ClaudeAttentionReason` enum for UI tooltip context
+    - `detect_claude_status_from_title()` recognizes Claude Code title patterns:
+      - ✳ (U+2733) prefix = idle
+      - Braille patterns (U+2800-U+28FF) = working
+      - ". " prefix = working
+      - "* " prefix = idle
+      - "claude" + permission/permission/waiting keywords = permission
+      - "claude" + ready/idle/done keywords = idle
+      - Bare "claude" = idle
+    - `is_claude_agent_title()` for fast pre-filtering
+    - `clear_claude_working_indicators()` for stale title cleanup
+  - Updated `update_from_title()` in `src/hooks.rs` to prioritize Claude title detection over other tools, allowing tool override when a title clearly indicates Claude.
+  - Added Claude state fields to `TerminalEntry` in `src/app.rs`:
+    - `claude_normalized_status: Option<ClaudeTransportStatus>`
+    - `claude_attention_reason: Option<ClaudeAttentionReason>`
+    - Timestamps for evidence-based state resolution
+  - Added `ClaudeStatusSource` enum and `apply_claude_status()` function in `src/app.rs` for state machine management.
+  - Updated `process_terminal_events()` in `src/app.rs` to handle Claude `AiStatusChange` events.
+  - Updated badge rendering:
+    - `AiBadgeModel` now includes `claude_normalized_status`
+    - `ai_badge_visual()` maps Claude states to visuals: Working=spinner, Idle=solid dot, Permission=pulse
+    - `ai_badge_tooltip_lines()` handles Claude attention reasons
+    - `draw_ai_badge()` receives Claude normalized status
+  - Added launch detection for `claude` and `cc` commands with state clearing to ensure clean transitions from other tools.
+  - Added `clear_claude_state()` for exit cleanup.
+  - Added comprehensive tests for Claude detection:
+    - `detect_claude_status_from_title` tests for all patterns
+    - `is_claude_agent_title` tests
+    - `update_from_title` tests for Claude idle, working, permission, and tool override scenarios
+    - `ai_badge_visuals_match_status` tests for Claude state mapping
+- Prevent recurrence:
+  - Title-based detection (Orca pattern) should be preferred over hook-based detection for tools that set OSC titles.
+  - New AI CLI integrations require: (1) tool enum variant, (2) detection logic, (3) state machine integration, (4) UI badge mapping, (5) cleanup paths, (6) comprehensive tests.
+  - When AGENTS.md says a tool is "not supported," either remove the launcher entirely or implement full runtime integration—don't leave a launcher that can't function.
+- Files/Commands touched: `src/hooks.rs`, `src/app.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`, `cargo build --release`
+- References: 2026-04-12 user request for Orca-compatible Claude spinner/pulse logic; Claude title patterns from `orca/src/shared/agent-detection.ts`
+
 #### OpenCode spinner now correctly transitions to pulse when work completes {#opencode-spinner-now-correctly-transitions-to-pulse-when-work-completes}
 - Date: 2026-04-12T00:00:00Z
 - Context: main/Windows/macOS local OpenCode CLI integration when a turn finishes
