@@ -15,7 +15,7 @@ pub fn terminal_title_text(input: &str, fallback_index: usize) -> String {
 pub fn terminal_title_candidate(input: &str) -> Option<String> {
     let sanitized = sanitize_input(input);
     let trimmed = sanitized.trim_start();
-    if trimmed.is_empty() || trimmed.starts_with('$') {
+    if trimmed.is_empty() || trimmed.starts_with('$') || trimmed.starts_with('/') {
         None
     } else {
         Some(sanitized)
@@ -103,6 +103,17 @@ mod tests {
     #[test]
     fn title_candidate_returns_none_for_whitespace_then_dollar() {
         assert!(terminal_title_candidate("   $ git status").is_none());
+    }
+
+    #[test]
+    fn title_candidate_returns_none_for_slash_prefix() {
+        assert!(terminal_title_candidate("/help").is_none());
+        assert!(terminal_title_candidate("/some command").is_none());
+    }
+
+    #[test]
+    fn title_candidate_returns_none_for_whitespace_then_slash() {
+        assert!(terminal_title_candidate("   /help").is_none());
     }
 
     #[test]

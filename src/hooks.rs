@@ -177,7 +177,7 @@ impl AiHooksConfig {
                     // OpenCode is tracked through plugin-based and hook-based events per documentation
                     // Events: session.idle (completion), permission.asked (interactive),
                     //         tool.execute.before (running), session.error (error)
-                    detection_commands: Vec::new(),
+                    detection_commands: vec!["opencode".to_string()],
                     // tool.execute.before signals work is starting
                     running_hook_events: vec!["tool.execute.before".to_string()],
                     // session.idle is the canonical completion signal

@@ -73,3 +73,10 @@ If `cargo` is not on PATH in PowerShell, use:
 - **OpenCode detection commands:** `opencode` triggers OpenCode session detection. OpenCode is tracked through explicit launch detection and process-based status, similar to Codex CLI. OpenCode does not use PTY hook events.
 - **UI labels:** Use "Droid", "Factory Droid", "Codex CLI", and "OpenCode" terminology. Do not use "Claude" or "claude" references in user-facing text.
 - **Event triggers:** Factory Droid uses `UserPromptSubmit` → Running (green pulse) and `Stop`/notification → Attention (yellow pulse). Codex CLI uses explicit launch detection plus notify/BEL-backed attention on native Windows. OpenCode uses explicit launch detection plus process-based tracking for spinner/pulse status.
+- **Plan mode skill restriction:** If you are Codex, OpenCode, or Droid, do not use the plan mode skill from Claude Code's configuration. The plan mode skill is exclusively for `cc` (Claude Code) sessions only.
+
+## Concurrent AI Sessions
+- Sen (AI agent) çalışırken başka bir AI agent'ı da aynı anda çalışıyor olabilir.
+- Eğer dosyalarda veya kodda başka birinin yaptığı değişiklikleri fark edersen, bu değişikliklere müdahale etme.
+- Kendi işlemlerine devam et; başkasının yaptığı değişiklikleri değiştirme, silme veya üzerine yazma.
+- Çakışma olursa kullanıcıya danış; tek başına karar verip başkasının işini bozma.

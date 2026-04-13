@@ -1033,6 +1033,19 @@ struct TerminalHeldKeyRepeatTiming {
     interval_secs: f64,
 }
 
+/// Data extracted from TerminalEntry for rendering terminal manager rows.
+/// Used to avoid borrow issues when calling self methods while terminal is borrowed.
+#[derive(Debug, Clone)]
+struct TerminalRowData {
+    id: u64,
+    full_title: String,
+    exited: bool,
+    recent_inputs: VecDeque<String>,
+    in_main_view: bool,
+    ai_tool: Option<AiCliTool>,
+    ai_status: AiCliStatus,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct TransientToast {
     message: String,
@@ -1382,6 +1395,23 @@ fn ai_badge_visual(
                 }
             }
         }
+    }
+}
+
+/// Returns the launcher icon key for a running AI CLI tool.
+/// Only returns Some when the tool is in Running state (to show the logo at title start).
+fn launcher_icon_for_ai_tool(
+    tool: Option<AiCliTool>,
+    status: AiCliStatus,
+) -> Option<LauncherIconKey> {
+    if status != AiCliStatus::Running {
+        return None;
+    }
+    match tool {
+        Some(AiCliTool::FactoryDroid) => Some(LauncherIconKey::Droid),
+        Some(AiCliTool::CodexCli) => Some(LauncherIconKey::Codex),
+        Some(AiCliTool::OpenCode) => Some(LauncherIconKey::OpenCode),
+        None => None,
     }
 }
 
@@ -10792,13 +10822,28 @@ impl AdeApp {
             let mut close_terminal = false;
             let mut visibility_changed = false;
             let mut send_message: Option<String> = None;
-            let terminal_entry_id = {
+
+            // Extract all terminal data first to avoid borrow issues with self
+            let terminal_data: TerminalRowData = {
                 let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
                     continue;
                 };
-                let terminal_entry_id = terminal.id;
-                let active = current_active == Some(terminal_entry_id);
-                let label = terminal_display_label(&terminal.full_title, terminal.exited);
+                TerminalRowData {
+                    id: terminal.id,
+                    full_title: terminal.full_title.clone(),
+                    exited: terminal.exited,
+                    recent_inputs: terminal.recent_inputs.clone(),
+                    in_main_view: terminal.in_main_view,
+                    ai_tool: terminal.ai_session.tool,
+                    ai_status: terminal.ai_session.status,
+                }
+            };
+
+            let terminal_entry_id = {
+                let active = current_active == Some(terminal_data.id);
+                let label = terminal_display_label(&terminal_data.full_title, terminal_data.exited);
+                let launcher_icon_key =
+                    launcher_icon_for_ai_tool(terminal_data.ai_tool, terminal_data.ai_status);
                 let section_gap = ui.spacing().item_spacing.x;
                 let actions_width =
                     terminal_manager_actions_width(section_gap, show_visibility_toggle);
@@ -10808,17 +10853,17 @@ impl AdeApp {
                 let row_height = ui.spacing().interact_size.y.max(CONTROL_ROW_HEIGHT);
                 let (row_rect, row_response) =
                     ui.allocate_exact_size(egui::vec2(row_width, row_height), Sense::click());
-                let hover_text = if terminal.exited {
+                let hover_text = if terminal_data.exited {
                     format!("{} (Exited)", label)
                 } else {
                     let base_text = label.clone();
-                    if terminal.recent_inputs.is_empty() {
+                    if terminal_data.recent_inputs.is_empty() {
                         base_text
                     } else {
                         format!(
                             "{}\n\n{}",
                             base_text,
-                            recent_inputs_tooltip_text(&terminal.recent_inputs)
+                            recent_inputs_tooltip_text(&terminal_data.recent_inputs)
                         )
                     }
                 };
@@ -10830,7 +10875,7 @@ impl AdeApp {
                     ui.interact(
                         selection_rect,
                         ui.id()
-                            .with(("terminal_manager_row_select", terminal_entry_id)),
+                            .with(("terminal_manager_row_select", terminal_data.id)),
                         Sense::click(),
                     )
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -10881,7 +10926,14 @@ impl AdeApp {
                                     ui.add_space(4.0);
                                 }
 
-                                let text_color = if terminal.exited {
+                                // Draw launcher icon for running AI CLI before title
+                                let launcher_response = launcher_icon_key
+                                    .map(|icon_key| self.draw_launcher_icon(ui, icon_key, 16.0));
+                                if launcher_response.is_some() {
+                                    ui.add_space(4.0);
+                                }
+
+                                let text_color = if terminal_data.exited {
                                     with_alpha(TEXT_MUTED, 160)
                                 } else {
                                     row_chrome.title_color
@@ -10902,16 +10954,21 @@ impl AdeApp {
                                 )
                                 .on_hover_cursor(egui::CursorIcon::PointingHand);
                                 // Add recent inputs tooltip
-                                if !terminal.recent_inputs.is_empty() {
+                                if !terminal_data.recent_inputs.is_empty() {
                                     title_response.clone().on_hover_text(
-                                        recent_inputs_tooltip_text(&terminal.recent_inputs),
+                                        recent_inputs_tooltip_text(&terminal_data.recent_inputs),
                                     );
                                 }
 
-                                match ai_response {
-                                    Some(response) => response.union(title_response),
-                                    None => title_response,
+                                // Union all responses: ai badge, launcher icon, and title
+                                let mut combined_response = title_response;
+                                if let Some(response) = ai_response {
+                                    combined_response = response.union(combined_response);
                                 }
+                                if let Some(response) = launcher_response {
+                                    combined_response = response.union(combined_response);
+                                }
+                                combined_response
                             },
                         )
                         .inner;
@@ -10944,23 +11001,22 @@ impl AdeApp {
                         }
 
                         if show_visibility_toggle {
-                            let visibility_icon = if terminal.in_main_view {
+                            let visibility_icon = if terminal_data.in_main_view {
                                 icons::EYE
                             } else {
                                 icons::EYE_OFF
                             };
-                            let visibility_tooltip = if terminal.in_main_view {
+                            let visibility_tooltip = if terminal_data.in_main_view {
                                 "Hide from main area"
                             } else {
                                 "Show in main area"
                             };
                             if styled_icon_toggle(
                                 ui,
-                                terminal.in_main_view,
+                                terminal_data.in_main_view,
                                 visibility_icon,
                                 visibility_tooltip,
                             ) {
-                                terminal.in_main_view = !terminal.in_main_view;
                                 visibility_changed = true;
                                 action_clicked = true;
                             }
@@ -10982,7 +11038,7 @@ impl AdeApp {
                     set_active = true;
                 }
 
-                terminal_entry_id
+                terminal_data.id
             };
 
             if let Some(message) = send_message {
@@ -10990,6 +11046,9 @@ impl AdeApp {
             }
 
             if visibility_changed {
+                if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                    terminal.in_main_view = !terminal.in_main_view;
+                }
                 self.bump_layout_epoch();
             }
             if set_active {
@@ -11142,6 +11201,21 @@ impl AdeApp {
             self.terminal_visible_in_main(self.terminals.get(&terminal_id).expect("terminal"));
         let is_active_or_visible = is_active || visible_in_main;
 
+        // Extract launcher icon key first to avoid borrow issues
+        let launcher_icon_key = {
+            let Some(terminal) = self.terminals.get(&terminal_id) else {
+                return;
+            };
+            launcher_icon_for_ai_tool(terminal.ai_session.tool, terminal.ai_session.status)
+        };
+
+        // Now fetch the texture after the terminal borrow is ended
+        let launcher_texture = if let Some(key) = launcher_icon_key {
+            self.builtin_launcher_icon_texture(ui.ctx(), key).cloned()
+        } else {
+            None
+        };
+
         let (clicked, close_requested, copied_selection, paste_requested, link_to_open) = {
             let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
                 return;
@@ -11173,6 +11247,24 @@ impl AdeApp {
 
                             let ai_badge = AiBadgeModel::from_terminal(terminal);
                             draw_terminal_status_badges(ui, &ai_badge);
+
+                            // Draw launcher icon for running AI CLI before title
+                            if launcher_icon_key.is_some() {
+                                let size = 16.0f32;
+                                let (rect, response) =
+                                    ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
+                                if let Some(ref texture) = launcher_texture {
+                                    paint_builtin_launcher_icon(
+                                        ui,
+                                        rect,
+                                        texture,
+                                        response.hovered(),
+                                    );
+                                } else if let Some(key) = launcher_icon_key {
+                                    paint_launcher_icon_badge(ui, rect, key, response.hovered());
+                                }
+                                ui.add_space(4.0);
+                            }
 
                             let title = terminal_display_label(&terminal.title, terminal.exited);
                             let title_font = egui::TextStyle::Body.resolve(ui.style());
@@ -15819,7 +15911,7 @@ mod tests {
         collect_source_control_snapshot, configure_terminal_font_family, count_text_line_bytes,
         cursor_hidden_by_row_filter, default_app_open_command, draw_ai_badge,
         draw_terminal_manager_title_and_diff_summary, draw_terminal_status_badges,
-        force_terminal_pane_width, install_terminal_font_family,
+        force_terminal_pane_width, install_terminal_font_family, launcher_icon_for_ai_tool,
         merge_source_control_refresh_result, next_active_terminal_after_close,
         next_terminal_in_direction, next_terminal_in_linear_direction,
         normalize_terminal_background, parse_branch_header, parse_git_numstat_totals,
@@ -24499,6 +24591,58 @@ mod tests {
 
         let (ai_rect, title_rect) = observed.expect("expected badge layout");
         assert!(ai_rect.center().x < title_rect.min.x);
+    }
+
+    #[test]
+    fn launcher_icon_for_ai_tool_returns_correct_icon_when_running() {
+        assert_eq!(
+            launcher_icon_for_ai_tool(Some(AiCliTool::FactoryDroid), AiCliStatus::Running),
+            Some(LauncherIconKey::Droid)
+        );
+        assert_eq!(
+            launcher_icon_for_ai_tool(Some(AiCliTool::CodexCli), AiCliStatus::Running),
+            Some(LauncherIconKey::Codex)
+        );
+        assert_eq!(
+            launcher_icon_for_ai_tool(Some(AiCliTool::OpenCode), AiCliStatus::Running),
+            Some(LauncherIconKey::OpenCode)
+        );
+    }
+
+    #[test]
+    fn launcher_icon_for_ai_tool_returns_none_when_not_running() {
+        // Inactive status should return None for all tools
+        assert_eq!(
+            launcher_icon_for_ai_tool(Some(AiCliTool::FactoryDroid), AiCliStatus::Inactive),
+            None
+        );
+        assert_eq!(
+            launcher_icon_for_ai_tool(Some(AiCliTool::CodexCli), AiCliStatus::Inactive),
+            None
+        );
+        assert_eq!(
+            launcher_icon_for_ai_tool(Some(AiCliTool::OpenCode), AiCliStatus::Inactive),
+            None
+        );
+        // Attention status should also return None (logo only shown when Running)
+        assert_eq!(
+            launcher_icon_for_ai_tool(Some(AiCliTool::FactoryDroid), AiCliStatus::Attention),
+            None
+        );
+        assert_eq!(
+            launcher_icon_for_ai_tool(Some(AiCliTool::CodexCli), AiCliStatus::Attention),
+            None
+        );
+    }
+
+    #[test]
+    fn launcher_icon_for_ai_tool_returns_none_when_tool_is_none() {
+        assert_eq!(launcher_icon_for_ai_tool(None, AiCliStatus::Running), None);
+        assert_eq!(launcher_icon_for_ai_tool(None, AiCliStatus::Inactive), None);
+        assert_eq!(
+            launcher_icon_for_ai_tool(None, AiCliStatus::Attention),
+            None
+        );
     }
 
     #[test]

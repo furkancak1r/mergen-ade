@@ -1555,3 +1555,22 @@
   - Add regression coverage for non-authoritative terminal noise during active Codex runs.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: 2026-04-10 user-reported Codex spinner-to-pulse regression; regression tests `codex_running_spinner_is_not_downgraded_by_bell_chunk` and `codex_title_attention_update_does_not_override_active_running_session`
+
+#### Ctrl+V and right-click paste not working properly in OpenCode sessions {#ctrl-v-and-right-click-paste-not-working-properly-in-opencode-sessions}
+- Date: 2026-04-13T00:00:00Z
+- Context: main/Windows local terminal paste path with OpenCode CLI/readline-style TUIs
+- Error signature: `Ctrl+V ve sag tik yapistir opencode uzerinde calismiyor, diger terminallerde calisiyordu.`
+- Symptoms/Impact: OpenCode gibi readline-tabanli TUI oturumlarinda Ctrl+V ve sag tik yapistirma calismiyordu. Bu terminalde kontrol karakterleri (^V) veya canli newline akisi olarak iletiliyordu.
+- Root cause: `src/app.rs` icindeki `key_to_terminal_bytes()` fonksiyonu Ctrl+V'yi her zaman kontrol karakteri `0x16` (`^V`) olarak terminal'e gonderiyordu. Ancak semantic `Event::Paste` olayi ayni batch icinde de geldiginde, bu cift yapistirma veya karisik davranisla sonuclaniyordu. Ayrica sag tik secim menusunde secim varken sadece Copy secenegi gorunuyordu.
+- Resolution: 
+  1. `normalize_terminal_clipboard_events()` fonksiyonu eklendi. Ayni input batch'i icinde `Event::Paste` varsa, ham `Ctrl+V`/`Cmd+V`/`Shift+Insert` tuslarini filtreleyerek cift yapistirma onleniyor.
+  2. Semantic paste olayi yoksa, ham kontrol karakteri davranisi korunuyor (geriye uyumluluk).
+  3. Sag tik secim menusune `Paste` secenegi eklendi; artik secim varken de Copy+Paste birlikte erisilebilir.
+  4. `icons::PASTE` iconu ve `AppIcon::Paste` eklendi.
+- Prevent recurrence:
+  - Klavye kisayollarinin semantik olaylarla cakismasini onlemek icin batch-bazli normalizasyon kullan.
+  - Paste yolunu bracketed paste uzerinden koru; karisikliga neden olan key stream birlestirmelerinden kacin.
+  - Sag tik menude secim varken de Paste erisimini koru.
+  - Yeni paste davranisi icin platform farkliliklarini (Ctrl vs Cmd) test et.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-13 user-reported paste issue; regression tests `normalize_terminal_clipboard_events_*` (7 tests)
