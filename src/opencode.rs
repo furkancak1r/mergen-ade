@@ -33,6 +33,7 @@ pub enum CodexTransportStatus {
 }
 
 impl CodexTransportStatus {
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Working => "working",
@@ -41,6 +42,7 @@ impl CodexTransportStatus {
         }
     }
 
+    #[allow(dead_code)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "working" => Some(Self::Working),
@@ -51,6 +53,7 @@ impl CodexTransportStatus {
     }
 
     /// Map transport status to the generic status string for legacy consumers
+    #[allow(dead_code)]
     pub fn to_generic_status(&self) -> String {
         match self {
             Self::Working => "running".to_owned(),

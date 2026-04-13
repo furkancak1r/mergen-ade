@@ -542,7 +542,7 @@ impl TerminalRuntime {
             .map_err(io_error_from_anyhow)?;
         let shared_writer = Arc::new(Mutex::new(Some(writer)));
 
-        let terminal = Terminal::new(
+        let mut terminal = Terminal::new(
             dimensions.to_term_size(),
             Arc::new(AdeTerminalConfig),
             "mergen-ade",

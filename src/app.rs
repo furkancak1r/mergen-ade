@@ -588,6 +588,7 @@ enum CodexAttentionReason {
 }
 
 impl CodexAttentionReason {
+    #[allow(dead_code)]
     fn from_event_kind(event_kind: Option<&str>) -> Self {
         let normalized = event_kind
             .unwrap_or(CODEX_UNKNOWN_NOTIFY_EVENT)
@@ -1044,6 +1045,7 @@ struct TerminalRowData {
     in_main_view: bool,
     ai_tool: Option<AiCliTool>,
     ai_status: AiCliStatus,
+    ai_badge: AiBadgeModel,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1238,6 +1240,7 @@ enum TerminalManagerDiffSummaryVisual {
     },
 }
 
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct AiBadgeModel {
     tool: Option<AiCliTool>,
@@ -1254,6 +1257,9 @@ struct AiBadgeModel {
     /// Pending attention flag for pulse/unread semantics (Orca-compatible)
     /// True when user needs to acknowledge attention (shown as pulse)
     opencode_attention_pending: bool,
+    /// OpenCode attention reason for badge visibility decisions
+    /// Used to hide badge for TurnComplete after acknowledge, keep for interactive reasons
+    opencode_attention_reason: Option<OpenCodeAttentionReason>,
     tooltip_lines: Vec<String>,
 }
 
@@ -1277,6 +1283,7 @@ impl AiBadgeModel {
             claude_normalized_status: terminal.claude_normalized_status,
             codex_attention_pending: terminal.codex_attention_pending,
             opencode_attention_pending: terminal.opencode_attention_pending,
+            opencode_attention_reason: terminal.opencode_attention_reason,
             tooltip_lines,
         }
     }
@@ -1330,14 +1337,17 @@ enum AiBadgeVisual {
 /// - Permission/Question + pending -> Pulse (requires user interaction)
 /// - Permission/Question + acknowledged -> Solid dot (calm state)
 /// - Idle/TurnComplete + pending -> Pulse (turn complete notification)
-/// - Idle/TurnComplete + acknowledged -> Solid dot (calm waiting state)
+/// - Idle/TurnComplete + pending -> Green pulse (turn complete notification)
+/// - Idle/TurnComplete + acknowledged -> Hidden (turn complete done)
+/// - Idle/PermissionAsked|QuestionAsked + acknowledged -> Amber solid (still needs action)
 fn ai_badge_visual(
     status: AiCliStatus,
     codex_normalized_status: Option<CodexTransportStatus>,
     normalized_status: Option<OpenCodeTransportStatus>,
     claude_normalized_status: Option<ClaudeTransportStatus>,
-    codex_attention_pending: bool,
+    _codex_attention_pending: bool,
     opencode_attention_pending: bool,
+    opencode_attention_reason: Option<OpenCodeAttentionReason>,
 ) -> Option<AiBadgeVisual> {
     match status {
         AiCliStatus::Inactive => None,
@@ -1372,13 +1382,20 @@ fn ai_badge_visual(
                     }
                 }
                 Some(OpenCodeTransportStatus::Idle) => {
-                    // Idle/TurnComplete: pulse if pending, solid if acknowledged
+                    // Idle/TurnComplete: pulse if pending, hidden if acknowledged
                     if opencode_attention_pending {
                         Some(AiBadgeVisual::Pulse(Color32::from_rgb(100, 200, 100)))
                         // Green pulse (turn complete notification)
                     } else {
-                        Some(AiBadgeVisual::Solid(Color32::from_rgb(100, 200, 100)))
-                        // Green solid (calm waiting)
+                        // Hide badge for TurnComplete after acknowledge
+                        // Keep badge for other Idle reasons (SessionError etc)
+                        if opencode_attention_reason == Some(OpenCodeAttentionReason::TurnComplete)
+                        {
+                            None // Turn complete acknowledged - badge hidden
+                        } else {
+                            Some(AiBadgeVisual::Solid(Color32::from_rgb(100, 200, 100)))
+                            // Green solid (non-TurnComplete Idle states)
+                        }
                     }
                 }
                 Some(OpenCodeTransportStatus::Working) => {
@@ -1411,6 +1428,7 @@ fn launcher_icon_for_ai_tool(
         Some(AiCliTool::FactoryDroid) => Some(LauncherIconKey::Droid),
         Some(AiCliTool::CodexCli) => Some(LauncherIconKey::Codex),
         Some(AiCliTool::OpenCode) => Some(LauncherIconKey::OpenCode),
+        Some(AiCliTool::Claude) => Some(LauncherIconKey::Claude),
         None => None,
     }
 }
@@ -1423,6 +1441,7 @@ fn draw_ai_badge(ui: &mut Ui, badge: &AiBadgeModel) -> egui::Response {
         badge.claude_normalized_status,
         badge.codex_attention_pending,
         badge.opencode_attention_pending,
+        badge.opencode_attention_reason,
     ) else {
         return ui.allocate_at_least(egui::vec2(0.0, 0.0), Sense::hover()).1;
     };
@@ -1509,6 +1528,7 @@ fn draw_terminal_status_badges(ui: &mut Ui, ai_badge: &AiBadgeModel) -> Terminal
         ai_badge.claude_normalized_status,
         ai_badge.codex_attention_pending,
         ai_badge.opencode_attention_pending,
+        ai_badge.opencode_attention_reason,
     )
     .map(|_| draw_ai_badge(ui, ai_badge));
     #[cfg(test)]
@@ -2344,7 +2364,7 @@ impl AdeApp {
             config.ui.terminal_manager_filter = crate::models::TerminalManagerFilter::Foreground;
         }
         #[cfg(target_os = "windows")]
-        let window_hwnd = Self::extract_window_hwnd(cc);
+        let window_hwnd = Self::extract_window_hwnd(_cc);
 
         let projects = config
             .projects
@@ -7374,6 +7394,9 @@ impl AdeApp {
         let mut committed_codex_reply = false;
         let mut cancelled_factory_interactive_prompt = false;
         let mut sent_terminal_input = false;
+        // Track ANY terminal interaction separately from sent_terminal_input
+        // This ensures pulse clears even for interactions that don't send bytes
+        let mut terminal_interaction = false;
         {
             let Some(terminal) = self.terminals.get_mut(&active_terminal_id) else {
                 return;
@@ -7382,6 +7405,7 @@ impl AdeApp {
             for event in events {
                 match event {
                     Event::Copy => {
+                        terminal_interaction = true;
                         let copied_text = terminal
                             .selection
                             .as_ref()
@@ -7402,6 +7426,7 @@ impl AdeApp {
                         }
                     }
                     Event::Text(text) => {
+                        terminal_interaction = true;
                         if text.is_empty() {
                             continue;
                         }
@@ -7416,6 +7441,7 @@ impl AdeApp {
                         Self::append_pending_line(&mut terminal.pending_line_for_title, &text);
                     }
                     Event::Paste(text) => {
+                        terminal_interaction = true;
                         if text.is_empty() {
                             continue;
                         }
@@ -7430,6 +7456,7 @@ impl AdeApp {
                         modifiers,
                         ..
                     } if pressed => {
+                        terminal_interaction = true;
                         last_key_was_alt_m = false;
 
                         if key == Key::Enter {
@@ -7601,10 +7628,13 @@ impl AdeApp {
             self.show_terminal_copy_feedback(ctx);
         }
 
-        if sent_terminal_input && self.clear_codex_attention_on_interaction(active_terminal_id) {
+        // Clear pulse on any terminal interaction (not just when bytes sent)
+        // This ensures the green pulse disappears immediately on click/keyboard input
+        if terminal_interaction && self.clear_opencode_attention_on_interaction(active_terminal_id)
+        {
             ctx.request_repaint();
         }
-        if sent_terminal_input && self.clear_opencode_attention_on_interaction(active_terminal_id) {
+        if sent_terminal_input && self.clear_codex_attention_on_interaction(active_terminal_id) {
             ctx.request_repaint();
         }
         if sent_terminal_input && self.clear_claude_attention_on_interaction(active_terminal_id) {
@@ -7679,10 +7709,11 @@ impl AdeApp {
         {
             ctx.request_repaint();
         }
+        // Use transport status for OpenCode submit to properly set normalized state
         if submitted_opencode_prompt
-            && self.apply_opencode_status(
+            && self.apply_opencode_transport_status(
                 active_terminal_id,
-                AiCliStatus::Running,
+                OpenCodeTransportStatus::Working,
                 OpenCodeStatusSource::PromptSubmit,
                 None,
             )
@@ -8515,9 +8546,10 @@ impl AdeApp {
             );
         }
         if submitted_opencode_prompt {
-            let _ = self.apply_opencode_status(
+            // Use transport status for consistent state machine behavior
+            let _ = self.apply_opencode_transport_status(
                 terminal_id,
-                AiCliStatus::Running,
+                OpenCodeTransportStatus::Working,
                 OpenCodeStatusSource::PromptSubmit,
                 None,
             );
@@ -10836,6 +10868,7 @@ impl AdeApp {
                     in_main_view: terminal.in_main_view,
                     ai_tool: terminal.ai_session.tool,
                     ai_status: terminal.ai_session.status,
+                    ai_badge: AiBadgeModel::from_terminal(terminal),
                 }
             };
 
@@ -10912,16 +10945,16 @@ impl AdeApp {
                             |ui| {
                                 ui.add_space(SIDEBAR_ROW_LEADING_INSET);
 
-                                let ai_badge = AiBadgeModel::from_terminal(terminal);
                                 let ai_response = ai_badge_visual(
-                                    ai_badge.status,
-                                    ai_badge.codex_normalized_status,
-                                    ai_badge.opencode_normalized_status,
-                                    ai_badge.claude_normalized_status,
-                                    ai_badge.codex_attention_pending,
-                                    ai_badge.opencode_attention_pending,
+                                    terminal_data.ai_badge.status,
+                                    terminal_data.ai_badge.codex_normalized_status,
+                                    terminal_data.ai_badge.opencode_normalized_status,
+                                    terminal_data.ai_badge.claude_normalized_status,
+                                    terminal_data.ai_badge.codex_attention_pending,
+                                    terminal_data.ai_badge.opencode_attention_pending,
+                                    terminal_data.ai_badge.opencode_attention_reason,
                                 )
-                                .map(|_| draw_ai_badge(ui, &ai_badge));
+                                .map(|_| draw_ai_badge(ui, &terminal_data.ai_badge));
                                 if ai_response.is_some() {
                                     ui.add_space(4.0);
                                 }
@@ -22310,6 +22343,27 @@ mod tests {
         assert!(terminal.opencode_last_turn_complete_at.is_none());
         assert!(terminal.opencode_last_hook_attention_at.is_none());
         assert!(terminal.opencode_last_visible_attention_at.is_none());
+
+        // Badge should be hidden for acknowledged TurnComplete
+        let badge = AiBadgeModel::from_terminal(terminal);
+        assert_eq!(
+            badge.opencode_attention_reason,
+            Some(OpenCodeAttentionReason::TurnComplete)
+        );
+        assert!(!badge.opencode_attention_pending);
+        let visual = ai_badge_visual(
+            badge.status,
+            badge.codex_normalized_status,
+            badge.opencode_normalized_status,
+            badge.claude_normalized_status,
+            badge.codex_attention_pending,
+            badge.opencode_attention_pending,
+            badge.opencode_attention_reason,
+        );
+        assert_eq!(
+            visual, None,
+            "TurnComplete badge should be hidden after acknowledge"
+        );
     }
 
     #[test]
@@ -22326,6 +22380,28 @@ mod tests {
         assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
         // Pending attention should be cleared (pulse stops) even for QuestionAsked
         assert!(!terminal.opencode_attention_pending);
+
+        // Badge should remain visible (amber solid) for acknowledged QuestionAsked
+        let badge = AiBadgeModel::from_terminal(terminal);
+        assert_eq!(
+            badge.opencode_attention_reason,
+            Some(OpenCodeAttentionReason::QuestionAsked)
+        );
+        assert!(!badge.opencode_attention_pending);
+        let visual = ai_badge_visual(
+            badge.status,
+            badge.codex_normalized_status,
+            badge.opencode_normalized_status,
+            badge.claude_normalized_status,
+            badge.codex_attention_pending,
+            badge.opencode_attention_pending,
+            badge.opencode_attention_reason,
+        );
+        assert_eq!(
+            visual,
+            Some(AiBadgeVisual::Solid(Color32::from_rgb(220, 180, 100))),
+            "QuestionAsked badge should remain visible (amber solid) after acknowledge"
+        );
     }
 
     #[test]
@@ -22342,6 +22418,28 @@ mod tests {
         assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
         // Pending attention should be cleared (pulse stops) even for PermissionAsked
         assert!(!terminal.opencode_attention_pending);
+
+        // Badge should remain visible (amber solid) for acknowledged PermissionAsked
+        let badge = AiBadgeModel::from_terminal(terminal);
+        assert_eq!(
+            badge.opencode_attention_reason,
+            Some(OpenCodeAttentionReason::PermissionAsked)
+        );
+        assert!(!badge.opencode_attention_pending);
+        let visual = ai_badge_visual(
+            badge.status,
+            badge.codex_normalized_status,
+            badge.opencode_normalized_status,
+            badge.claude_normalized_status,
+            badge.codex_attention_pending,
+            badge.opencode_attention_pending,
+            badge.opencode_attention_reason,
+        );
+        assert_eq!(
+            visual,
+            Some(AiBadgeVisual::Solid(Color32::from_rgb(220, 180, 100))),
+            "PermissionAsked badge should remain visible (amber solid) after acknowledge"
+        );
     }
 
     #[test]
@@ -22419,6 +22517,98 @@ mod tests {
     fn opencode_status_from_chunk_unknown() {
         let result = AdeApp::opencode_status_from_chunk("some-random-chunk");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn turn_complete_opencode_attention_cleared_by_keyboard_interaction() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        // Verify initial state: pulse is visible
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(terminal.opencode_attention_pending);
+        let initial_badge = AiBadgeModel::from_terminal(terminal);
+        let initial_visual = ai_badge_visual(
+            initial_badge.status,
+            initial_badge.codex_normalized_status,
+            initial_badge.opencode_normalized_status,
+            initial_badge.claude_normalized_status,
+            initial_badge.codex_attention_pending,
+            initial_badge.opencode_attention_pending,
+            initial_badge.opencode_attention_reason,
+        );
+        assert_eq!(
+            initial_visual,
+            Some(AiBadgeVisual::Pulse(Color32::from_rgb(100, 200, 100))),
+            "Initial state should show green pulse"
+        );
+
+        // Send keyboard input (Text event)
+        app.route_active_terminal_input(&ctx, vec![Event::Text("hello".to_owned())]);
+
+        // Verify after interaction: pulse cleared and badge hidden
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(!terminal.opencode_attention_pending);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.opencode_attention_reason,
+            Some(OpenCodeAttentionReason::TurnComplete)
+        );
+
+        let badge = AiBadgeModel::from_terminal(terminal);
+        let visual = ai_badge_visual(
+            badge.status,
+            badge.codex_normalized_status,
+            badge.opencode_normalized_status,
+            badge.claude_normalized_status,
+            badge.codex_attention_pending,
+            badge.opencode_attention_pending,
+            badge.opencode_attention_reason,
+        );
+        assert_eq!(
+            visual, None,
+            "TurnComplete badge should be hidden after keyboard interaction"
+        );
+    }
+
+    #[test]
+    fn question_asked_opencode_attention_keeps_badge_after_keyboard_interaction() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::QuestionAsked);
+
+        // Verify initial state: amber pulse is visible
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(terminal.opencode_attention_pending);
+
+        // Send keyboard input
+        app.route_active_terminal_input(&ctx, vec![Event::Text("yes".to_owned())]);
+
+        // Verify after interaction: pulse cleared but badge remains visible (amber solid)
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(!terminal.opencode_attention_pending);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.opencode_attention_reason,
+            Some(OpenCodeAttentionReason::QuestionAsked)
+        );
+
+        let badge = AiBadgeModel::from_terminal(terminal);
+        let visual = ai_badge_visual(
+            badge.status,
+            badge.codex_normalized_status,
+            badge.opencode_normalized_status,
+            badge.claude_normalized_status,
+            badge.codex_attention_pending,
+            badge.opencode_attention_pending,
+            badge.opencode_attention_reason,
+        );
+        assert_eq!(
+            visual,
+            Some(AiBadgeVisual::Solid(Color32::from_rgb(220, 180, 100))),
+            "QuestionAsked badge should remain visible (amber solid) after keyboard interaction"
+        );
     }
 
     #[test]
@@ -24373,20 +24563,20 @@ mod tests {
 
         // Without normalized status - pending=true shows pulse
         assert_eq!(
-            ai_badge_visual(AiCliStatus::Running, None, None, None, false, false),
+            ai_badge_visual(AiCliStatus::Running, None, None, None, false, false, None),
             Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180)))
         );
         assert_eq!(
-            ai_badge_visual(AiCliStatus::Attention, None, None, None, false, true),
+            ai_badge_visual(AiCliStatus::Attention, None, None, None, false, true, None),
             Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 220, 220)))
         );
         // Without normalized status - pending=false shows solid
         assert_eq!(
-            ai_badge_visual(AiCliStatus::Attention, None, None, None, false, false),
+            ai_badge_visual(AiCliStatus::Attention, None, None, None, false, false, None),
             Some(AiBadgeVisual::Solid(Color32::from_rgb(180, 180, 180)))
         );
         assert_eq!(
-            ai_badge_visual(AiCliStatus::Inactive, None, None, None, false, false),
+            ai_badge_visual(AiCliStatus::Inactive, None, None, None, false, false, None),
             None
         );
 
@@ -24400,7 +24590,8 @@ mod tests {
                 Some(OpenCodeTransportStatus::Permission),
                 None,
                 false,
-                true
+                true,
+                None
             ),
             Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 180, 100)))
         );
@@ -24412,7 +24603,8 @@ mod tests {
                 Some(OpenCodeTransportStatus::Permission),
                 None,
                 false,
-                false
+                false,
+                None
             ),
             Some(AiBadgeVisual::Solid(Color32::from_rgb(220, 180, 100)))
         );
@@ -24424,11 +24616,12 @@ mod tests {
                 Some(OpenCodeTransportStatus::Idle),
                 None,
                 false,
-                true
+                true,
+                Some(OpenCodeAttentionReason::TurnComplete)
             ),
             Some(AiBadgeVisual::Pulse(Color32::from_rgb(100, 200, 100)))
         );
-        // Idle + pending=false -> solid (calm waiting)
+        // Idle + pending=false + TurnComplete -> hidden (acknowledged turn complete)
         assert_eq!(
             ai_badge_visual(
                 AiCliStatus::Attention,
@@ -24436,10 +24629,38 @@ mod tests {
                 Some(OpenCodeTransportStatus::Idle),
                 None,
                 false,
-                false
+                false,
+                Some(OpenCodeAttentionReason::TurnComplete)
             ),
-            Some(AiBadgeVisual::Solid(Color32::from_rgb(100, 200, 100)))
+            None
         );
+        // Idle + pending=false + PermissionAsked -> amber solid (acknowledged but still needs action)
+        assert_eq!(
+            ai_badge_visual(
+                AiCliStatus::Attention,
+                None,
+                Some(OpenCodeTransportStatus::Permission),
+                None,
+                false,
+                false,
+                Some(OpenCodeAttentionReason::PermissionAsked)
+            ),
+            Some(AiBadgeVisual::Solid(Color32::from_rgb(220, 180, 100)))
+        );
+        // Idle + pending=false + QuestionAsked -> amber solid (acknowledged but still needs action)
+        assert_eq!(
+            ai_badge_visual(
+                AiCliStatus::Attention,
+                None,
+                Some(OpenCodeTransportStatus::Permission),
+                None,
+                false,
+                false,
+                Some(OpenCodeAttentionReason::QuestionAsked)
+            ),
+            Some(AiBadgeVisual::Solid(Color32::from_rgb(220, 180, 100)))
+        );
+        // Working status
         assert_eq!(
             ai_badge_visual(
                 AiCliStatus::Attention,
@@ -24447,7 +24668,8 @@ mod tests {
                 Some(OpenCodeTransportStatus::Working),
                 None,
                 false,
-                false
+                false,
+                None
             ),
             Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180)))
         );
@@ -24460,7 +24682,8 @@ mod tests {
                 Some(OpenCodeTransportStatus::Idle),
                 Some(ClaudeTransportStatus::Permission),
                 false,
-                true
+                true,
+                None
             ),
             Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 180, 100)))
         );
@@ -24471,7 +24694,8 @@ mod tests {
                 None,
                 Some(ClaudeTransportStatus::Idle),
                 false,
-                false
+                false,
+                None
             ),
             Some(AiBadgeVisual::Solid(Color32::from_rgb(100, 200, 100)))
         );
@@ -24520,6 +24744,7 @@ mod tests {
             claude_normalized_status: None,
             codex_attention_pending: false,
             opencode_attention_pending: false,
+            opencode_attention_reason: None,
             tooltip_lines: vec!["Factory Droid - Working...".to_string()],
         };
         let attention_badge = AiBadgeModel {
@@ -24530,6 +24755,7 @@ mod tests {
             claude_normalized_status: None,
             codex_attention_pending: false,
             opencode_attention_pending: true,
+            opencode_attention_reason: None,
             tooltip_lines: vec!["Factory Droid - Waiting for you...".to_string()],
         };
         let inactive_badge = AiBadgeModel {
@@ -24540,6 +24766,7 @@ mod tests {
             claude_normalized_status: None,
             codex_attention_pending: false,
             opencode_attention_pending: false,
+            opencode_attention_reason: None,
             tooltip_lines: vec!["Factory Droid - Idle".to_string()],
         };
 
@@ -24572,6 +24799,7 @@ mod tests {
             claude_normalized_status: None,
             codex_attention_pending: false,
             opencode_attention_pending: false,
+            opencode_attention_reason: None,
             tooltip_lines: vec!["Factory Droid - Working...".to_string()],
         };
 
@@ -24607,6 +24835,10 @@ mod tests {
             launcher_icon_for_ai_tool(Some(AiCliTool::OpenCode), AiCliStatus::Running),
             Some(LauncherIconKey::OpenCode)
         );
+        assert_eq!(
+            launcher_icon_for_ai_tool(Some(AiCliTool::Claude), AiCliStatus::Running),
+            Some(LauncherIconKey::Claude)
+        );
     }
 
     #[test]
@@ -24624,6 +24856,10 @@ mod tests {
             launcher_icon_for_ai_tool(Some(AiCliTool::OpenCode), AiCliStatus::Inactive),
             None
         );
+        assert_eq!(
+            launcher_icon_for_ai_tool(Some(AiCliTool::Claude), AiCliStatus::Inactive),
+            None
+        );
         // Attention status should also return None (logo only shown when Running)
         assert_eq!(
             launcher_icon_for_ai_tool(Some(AiCliTool::FactoryDroid), AiCliStatus::Attention),
@@ -24631,6 +24867,10 @@ mod tests {
         );
         assert_eq!(
             launcher_icon_for_ai_tool(Some(AiCliTool::CodexCli), AiCliStatus::Attention),
+            None
+        );
+        assert_eq!(
+            launcher_icon_for_ai_tool(Some(AiCliTool::Claude), AiCliStatus::Attention),
             None
         );
     }
@@ -24790,6 +25030,7 @@ mod tests {
             claude_normalized_status: None,
             codex_attention_pending: false,
             opencode_attention_pending: false,
+            opencode_attention_reason: None,
             tooltip_lines: vec!["Factory Droid - Idle".to_string()],
         };
 
