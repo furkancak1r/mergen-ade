@@ -1043,8 +1043,7 @@ struct TerminalRowData {
     exited: bool,
     recent_inputs: VecDeque<String>,
     in_main_view: bool,
-    ai_tool: Option<AiCliTool>,
-    ai_status: AiCliStatus,
+    ai_logo_key: Option<LauncherIconKey>,
     ai_badge: AiBadgeModel,
 }
 
@@ -1429,6 +1428,62 @@ fn launcher_icon_for_ai_tool(
         Some(AiCliTool::CodexCli) => Some(LauncherIconKey::Codex),
         Some(AiCliTool::OpenCode) => Some(LauncherIconKey::OpenCode),
         Some(AiCliTool::Claude) => Some(LauncherIconKey::Claude),
+        None => None,
+    }
+}
+
+/// Returns the launcher icon key for an AI CLI session if it is still "alive".
+/// Logo remains visible after the spinner stops (Attention state) as long as the
+/// CLI session has not actually exited. It disappears only when the session ends
+/// (e.g., after clear_*_process_tracking or clear_*_state).
+fn ai_cli_logo_key_for_terminal(entry: &TerminalEntry) -> Option<LauncherIconKey> {
+    // Map tool to icon key, but only show if session appears live per tool-specific tracking.
+    match entry.ai_session.tool {
+        Some(AiCliTool::FactoryDroid) => {
+            // Session is live if: launch pending, session active, or process missing but not yet cleared.
+            let is_live = entry.factory_droid_launch_pending_since.is_some()
+                || entry.factory_droid_session_active
+                || entry.factory_droid_process_missing_since.is_some();
+            if is_live {
+                Some(LauncherIconKey::Droid)
+            } else {
+                None
+            }
+        }
+        Some(AiCliTool::CodexCli) => {
+            // Session is live if: launch pending, session active, process present, or process missing but not yet cleared.
+            let is_live = entry.codex_launch_pending_since.is_some()
+                || entry.codex_session_active
+                || entry.codex_process_identity.is_some()
+                || entry.codex_process_missing_since.is_some();
+            if is_live {
+                Some(LauncherIconKey::Codex)
+            } else {
+                None
+            }
+        }
+        Some(AiCliTool::OpenCode) => {
+            // Session is live if: launch pending, session active, process present, or process missing but not yet cleared.
+            let is_live = entry.opencode_launch_pending_since.is_some()
+                || entry.opencode_session_active
+                || entry.opencode_process_identity.is_some()
+                || entry.opencode_process_missing_since.is_some();
+            if is_live {
+                Some(LauncherIconKey::OpenCode)
+            } else {
+                None
+            }
+        }
+        Some(AiCliTool::Claude) => {
+            // Claude has no separate process tracking; session is live if not Inactive and not exited.
+            // The terminal exit handler clears Claude state, so this stays visible until then.
+            let is_live = entry.ai_session.status != AiCliStatus::Inactive && !entry.exited;
+            if is_live {
+                Some(LauncherIconKey::Claude)
+            } else {
+                None
+            }
+        }
         None => None,
     }
 }
@@ -10866,8 +10921,7 @@ impl AdeApp {
                     exited: terminal.exited,
                     recent_inputs: terminal.recent_inputs.clone(),
                     in_main_view: terminal.in_main_view,
-                    ai_tool: terminal.ai_session.tool,
-                    ai_status: terminal.ai_session.status,
+                    ai_logo_key: ai_cli_logo_key_for_terminal(terminal),
                     ai_badge: AiBadgeModel::from_terminal(terminal),
                 }
             };
@@ -10875,8 +10929,7 @@ impl AdeApp {
             let terminal_entry_id = {
                 let active = current_active == Some(terminal_data.id);
                 let label = terminal_display_label(&terminal_data.full_title, terminal_data.exited);
-                let launcher_icon_key =
-                    launcher_icon_for_ai_tool(terminal_data.ai_tool, terminal_data.ai_status);
+                let launcher_icon_key = terminal_data.ai_logo_key;
                 let section_gap = ui.spacing().item_spacing.x;
                 let actions_width =
                     terminal_manager_actions_width(section_gap, show_visibility_toggle);
@@ -11239,7 +11292,7 @@ impl AdeApp {
             let Some(terminal) = self.terminals.get(&terminal_id) else {
                 return;
             };
-            launcher_icon_for_ai_tool(terminal.ai_session.tool, terminal.ai_session.status)
+            ai_cli_logo_key_for_terminal(terminal)
         };
 
         // Now fetch the texture after the terminal borrow is ended
@@ -15939,17 +15992,17 @@ fn normalize_terminal_background(color: TerminalColor) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ai_badge_tooltip_lines, ai_badge_visual, average_terminal_cell_width,
-        build_terminal_cursor_overlay, build_terminal_render, collect_source_control_line_totals,
-        collect_source_control_snapshot, configure_terminal_font_family, count_text_line_bytes,
-        cursor_hidden_by_row_filter, default_app_open_command, draw_ai_badge,
-        draw_terminal_manager_title_and_diff_summary, draw_terminal_status_badges,
-        force_terminal_pane_width, install_terminal_font_family, launcher_icon_for_ai_tool,
-        merge_source_control_refresh_result, next_active_terminal_after_close,
-        next_terminal_in_direction, next_terminal_in_linear_direction,
-        normalize_terminal_background, parse_branch_header, parse_git_numstat_totals,
-        primary_shortcut_modifier, recent_inputs_tooltip_text, recover_config_state,
-        resolve_ctrl_c_action, settings_accordion_disclosure_icon_rect,
+        ai_badge_tooltip_lines, ai_badge_visual, ai_cli_logo_key_for_terminal,
+        average_terminal_cell_width, build_terminal_cursor_overlay, build_terminal_render,
+        collect_source_control_line_totals, collect_source_control_snapshot,
+        configure_terminal_font_family, count_text_line_bytes, cursor_hidden_by_row_filter,
+        default_app_open_command, draw_ai_badge, draw_terminal_manager_title_and_diff_summary,
+        draw_terminal_status_badges, force_terminal_pane_width, install_terminal_font_family,
+        launcher_icon_for_ai_tool, merge_source_control_refresh_result,
+        next_active_terminal_after_close, next_terminal_in_direction,
+        next_terminal_in_linear_direction, normalize_terminal_background, parse_branch_header,
+        parse_git_numstat_totals, primary_shortcut_modifier, recent_inputs_tooltip_text,
+        recover_config_state, resolve_ctrl_c_action, settings_accordion_disclosure_icon_rect,
         settings_diagnostics_accordion_header_layout, settings_diagnostics_uses_single_column,
         settings_general_inline_control_width, settings_general_uses_stacked_layout,
         settings_popup_uses_stacked_layout, settings_saved_message_card_width,
@@ -24883,6 +24936,168 @@ mod tests {
             launcher_icon_for_ai_tool(None, AiCliStatus::Attention),
             None
         );
+    }
+
+    // Tests for ai_cli_logo_key_for_terminal - logo visibility based on session liveness
+
+    #[test]
+    fn ai_cli_logo_key_shows_codex_logo_while_session_active() {
+        let mut entry = test_terminal_entry(1, 1);
+        entry.ai_session.tool = Some(AiCliTool::CodexCli);
+        entry.ai_session.status = AiCliStatus::Attention; // Not Running
+        entry.codex_session_active = true; // But session is still alive
+
+        assert_eq!(
+            ai_cli_logo_key_for_terminal(&entry),
+            Some(LauncherIconKey::Codex)
+        );
+    }
+
+    #[test]
+    fn ai_cli_logo_key_shows_codex_logo_while_launch_pending() {
+        let mut entry = test_terminal_entry(1, 1);
+        entry.ai_session.tool = Some(AiCliTool::CodexCli);
+        entry.ai_session.status = AiCliStatus::Inactive;
+        entry.codex_launch_pending_since = Some(Instant::now());
+
+        assert_eq!(
+            ai_cli_logo_key_for_terminal(&entry),
+            Some(LauncherIconKey::Codex)
+        );
+    }
+
+    #[test]
+    fn ai_cli_logo_key_shows_codex_logo_during_process_missing_grace() {
+        let mut entry = test_terminal_entry(1, 1);
+        entry.ai_session.tool = Some(AiCliTool::CodexCli);
+        entry.ai_session.status = AiCliStatus::Attention;
+        entry.codex_process_missing_since = Some(Instant::now());
+
+        assert_eq!(
+            ai_cli_logo_key_for_terminal(&entry),
+            Some(LauncherIconKey::Codex)
+        );
+    }
+
+    #[test]
+    fn ai_cli_logo_key_hides_codex_logo_after_process_tracking_cleared() {
+        let mut entry = test_terminal_entry(1, 1);
+        entry.ai_session.tool = Some(AiCliTool::CodexCli);
+        entry.ai_session.status = AiCliStatus::Attention;
+        entry.codex_session_active = false;
+        entry.codex_process_identity = None;
+        entry.codex_process_missing_since = None;
+        entry.codex_launch_pending_since = None;
+        // Simulating state after clear_codex_process_tracking() - only tool and status remain
+
+        assert_eq!(ai_cli_logo_key_for_terminal(&entry), None);
+    }
+
+    #[test]
+    fn ai_cli_logo_key_shows_opencode_logo_while_session_active() {
+        let mut entry = test_terminal_entry(1, 1);
+        entry.ai_session.tool = Some(AiCliTool::OpenCode);
+        entry.ai_session.status = AiCliStatus::Attention;
+        entry.opencode_session_active = true;
+
+        assert_eq!(
+            ai_cli_logo_key_for_terminal(&entry),
+            Some(LauncherIconKey::OpenCode)
+        );
+    }
+
+    #[test]
+    fn ai_cli_logo_key_hides_opencode_logo_after_process_tracking_cleared() {
+        let mut entry = test_terminal_entry(1, 1);
+        entry.ai_session.tool = Some(AiCliTool::OpenCode);
+        entry.ai_session.status = AiCliStatus::Attention;
+        entry.opencode_session_active = false;
+        entry.opencode_process_identity = None;
+        entry.opencode_process_missing_since = None;
+        entry.opencode_launch_pending_since = None;
+        // Simulating state after clear_opencode_process_tracking()
+
+        assert_eq!(ai_cli_logo_key_for_terminal(&entry), None);
+    }
+
+    #[test]
+    fn ai_cli_logo_key_shows_droid_logo_while_session_active() {
+        let mut entry = test_terminal_entry(1, 1);
+        entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+        entry.ai_session.status = AiCliStatus::Attention;
+        entry.factory_droid_session_active = true;
+
+        assert_eq!(
+            ai_cli_logo_key_for_terminal(&entry),
+            Some(LauncherIconKey::Droid)
+        );
+    }
+
+    #[test]
+    fn ai_cli_logo_key_hides_droid_logo_after_session_cleared() {
+        let mut entry = test_terminal_entry(1, 1);
+        entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+        entry.ai_session.status = AiCliStatus::Attention;
+        entry.factory_droid_session_active = false;
+        entry.factory_droid_process_missing_since = None;
+        entry.factory_droid_launch_pending_since = None;
+
+        assert_eq!(ai_cli_logo_key_for_terminal(&entry), None);
+    }
+
+    #[test]
+    fn ai_cli_logo_key_shows_claude_logo_while_active() {
+        let mut entry = test_terminal_entry(1, 1);
+        entry.ai_session.tool = Some(AiCliTool::Claude);
+        entry.ai_session.status = AiCliStatus::Running;
+        entry.exited = false;
+
+        assert_eq!(
+            ai_cli_logo_key_for_terminal(&entry),
+            Some(LauncherIconKey::Claude)
+        );
+    }
+
+    #[test]
+    fn ai_cli_logo_key_shows_claude_logo_in_attention_state() {
+        let mut entry = test_terminal_entry(1, 1);
+        entry.ai_session.tool = Some(AiCliTool::Claude);
+        entry.ai_session.status = AiCliStatus::Attention;
+        entry.exited = false;
+
+        assert_eq!(
+            ai_cli_logo_key_for_terminal(&entry),
+            Some(LauncherIconKey::Claude)
+        );
+    }
+
+    #[test]
+    fn ai_cli_logo_key_hides_claude_logo_when_inactive() {
+        let mut entry = test_terminal_entry(1, 1);
+        entry.ai_session.tool = Some(AiCliTool::Claude);
+        entry.ai_session.status = AiCliStatus::Inactive;
+        entry.exited = false;
+
+        assert_eq!(ai_cli_logo_key_for_terminal(&entry), None);
+    }
+
+    #[test]
+    fn ai_cli_logo_key_hides_claude_logo_when_terminal_exited() {
+        let mut entry = test_terminal_entry(1, 1);
+        entry.ai_session.tool = Some(AiCliTool::Claude);
+        entry.ai_session.status = AiCliStatus::Running;
+        entry.exited = true;
+
+        assert_eq!(ai_cli_logo_key_for_terminal(&entry), None);
+    }
+
+    #[test]
+    fn ai_cli_logo_key_returns_none_when_no_tool() {
+        let mut entry = test_terminal_entry(1, 1);
+        entry.ai_session.tool = None;
+        entry.ai_session.status = AiCliStatus::Running;
+
+        assert_eq!(ai_cli_logo_key_for_terminal(&entry), None);
     }
 
     #[test]
