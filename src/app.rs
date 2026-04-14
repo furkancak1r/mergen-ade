@@ -11636,81 +11636,93 @@ impl AdeApp {
                             let title_response =
                                 title_response.on_hover_cursor(egui::CursorIcon::PointingHand);
 
-                            // Calculate click timing to close tooltip after click
-                            let (time_since_last_click, time_since_last_pointer_movement) =
-                                ui.ctx().input(|input| {
-                                    (
-                                        input.pointer.time_since_last_click(),
-                                        input.pointer.time_since_last_movement(),
-                                    )
-                                });
+                            // Calculate click timing and pointer position
+                            let (
+                                time_since_last_click,
+                                time_since_last_pointer_movement,
+                                pointer_pos,
+                            ) = ui.ctx().input(|input| {
+                                (
+                                    input.pointer.time_since_last_click(),
+                                    input.pointer.time_since_last_movement(),
+                                    input.pointer.hover_pos(),
+                                )
+                            });
                             let clicked_recently =
                                 time_since_last_click < time_since_last_pointer_movement + 0.1;
 
+                            // Check if pointer is on tooltip (for keeping it open like Terminal Manager)
+                            let tooltip_area_id = egui::tooltip_id(title_id, 0);
+                            let tooltip_rect = egui::AreaState::load(ui.ctx(), tooltip_area_id)
+                                .map(|state| state.rect());
+                            let pointer_on_tooltip = pointer_pos
+                                .zip(tooltip_rect)
+                                .map_or(false, |(pos, rect)| rect.contains(pos));
+
                             // Show centered tooltip under title when hovered
-                            // Close after click
-                            if is_title_hovered && !clicked_recently {
-                                if !terminal.exited && !terminal.recent_inputs.is_empty() {
-                                    let tooltip_pos = egui::pos2(
-                                        title_rect.center().x,
-                                        title_rect.bottom() + 4.0,
-                                    );
-                                    egui::show_tooltip_at(
-                                        ui.ctx(),
-                                        ui.layer_id(),
-                                        title_id,
-                                        tooltip_pos,
-                                        |ui| {
-                                            // Show title if different from most recent
-                                            let most_recent = terminal
-                                                .recent_inputs
-                                                .front()
-                                                .map(|s| s.as_str())
-                                                .unwrap_or("");
-                                            if most_recent != terminal.full_title {
-                                                ui.label(
-                                                    egui::RichText::new(&terminal.full_title)
-                                                        .strong()
-                                                        .color(TEXT_PRIMARY),
-                                                );
-                                                ui.add_space(4.0);
-                                            }
-                                            // Show each recent input as clickable row
-                                            for (idx, message) in
-                                                terminal.recent_inputs.iter().enumerate()
-                                            {
-                                                let msg_response = ui
-                                                    .add_sized(
-                                                        egui::vec2(ui.available_width(), 20.0),
-                                                        egui::Label::new(
-                                                            egui::RichText::new(message)
-                                                                .color(TEXT_PRIMARY)
-                                                                .size(13.0),
-                                                        )
-                                                        .sense(egui::Sense::click()),
+                            // Keep open when pointer moves to tooltip, close after click
+                            let should_show_tooltip =
+                                !clicked_recently && (is_title_hovered || pointer_on_tooltip);
+
+                            if should_show_tooltip
+                                && !terminal.exited
+                                && !terminal.recent_inputs.is_empty()
+                            {
+                                let tooltip_pos =
+                                    egui::pos2(title_rect.center().x, title_rect.bottom() + 4.0);
+                                egui::show_tooltip_at(
+                                    ui.ctx(),
+                                    ui.layer_id(),
+                                    title_id,
+                                    tooltip_pos,
+                                    |ui| {
+                                        // Show title if different from most recent
+                                        let most_recent = terminal
+                                            .recent_inputs
+                                            .front()
+                                            .map(|s| s.as_str())
+                                            .unwrap_or("");
+                                        if most_recent != terminal.full_title {
+                                            ui.label(
+                                                egui::RichText::new(&terminal.full_title)
+                                                    .strong()
+                                                    .color(TEXT_PRIMARY),
+                                            );
+                                            ui.add_space(4.0);
+                                        }
+                                        // Show each recent input as clickable row
+                                        for (idx, message) in
+                                            terminal.recent_inputs.iter().enumerate()
+                                        {
+                                            let msg_response = ui
+                                                .add_sized(
+                                                    egui::vec2(ui.available_width(), 20.0),
+                                                    egui::Label::new(
+                                                        egui::RichText::new(message)
+                                                            .color(TEXT_PRIMARY)
+                                                            .size(13.0),
                                                     )
-                                                    .on_hover_cursor(
-                                                        egui::CursorIcon::PointingHand,
-                                                    );
-                                                if msg_response.clicked() {
-                                                    copied_hover_message.set(Some(message.clone()));
-                                                }
-                                                if idx < terminal.recent_inputs.len() - 1 {
-                                                    ui.add_space(2.0);
-                                                }
+                                                    .sense(egui::Sense::click()),
+                                                )
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                            if msg_response.clicked() {
+                                                copied_hover_message.set(Some(message.clone()));
                                             }
-                                        },
-                                    );
-                                } else {
-                                    with_truncation_tooltip(
-                                        ui,
-                                        title_response,
-                                        &terminal.full_title,
-                                        &title_font,
-                                        TEXT_PRIMARY,
-                                        available_for_title,
-                                    );
-                                }
+                                            if idx < terminal.recent_inputs.len() - 1 {
+                                                ui.add_space(2.0);
+                                            }
+                                        }
+                                    },
+                                );
+                            } else if is_title_hovered && !clicked_recently {
+                                with_truncation_tooltip(
+                                    ui,
+                                    title_response,
+                                    &terminal.full_title,
+                                    &title_font,
+                                    TEXT_PRIMARY,
+                                    available_for_title,
+                                );
                             }
                             if is_title_clicked {
                                 pane_clicked = true;
