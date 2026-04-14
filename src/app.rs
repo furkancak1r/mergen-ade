@@ -11159,18 +11159,25 @@ impl AdeApp {
                         format!("{}\n\n{}", label, history_text)
                     }
                 };
-                // Note: Row-level hover removed; tooltip is now on title text only
+                // Tooltip on selection area (row without action buttons)
                 let row_chrome = terminal_manager_row_chrome(active, row_response.hovered());
                 let selection_rect =
                     terminal_manager_row_selection_rect(row_rect, row_actions_width);
                 let selection_response = (selection_rect.width() > 0.0).then(|| {
-                    ui.interact(
+                    let response = ui.interact(
                         selection_rect,
                         ui.id()
                             .with(("terminal_manager_row_select", terminal_data.id)),
                         Sense::click(),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    );
+                    // Apply hover tooltip to selection area (not just title text)
+                    let response =
+                        if !terminal_data.exited && !terminal_data.recent_inputs.is_empty() {
+                            response.on_hover_text(hover_text)
+                        } else {
+                            response
+                        };
+                    response.on_hover_cursor(egui::CursorIcon::PointingHand)
                 });
                 if ui
                     .ctx()
@@ -11236,19 +11243,15 @@ impl AdeApp {
                                         .truncate()
                                         .sense(Sense::click()),
                                 );
-                                // Apply recent inputs tooltip to title (not row-level)
-                                let title_response = if !terminal_data.recent_inputs.is_empty() {
-                                    title_response.on_hover_text(hover_text)
-                                } else {
-                                    with_truncation_tooltip(
-                                        ui,
-                                        title_response,
-                                        &label,
-                                        &title_font,
-                                        text_color,
-                                        row_label_width,
-                                    )
-                                }
+                                // Note: Hover tooltip is on selection area, not title text
+                                let title_response = with_truncation_tooltip(
+                                    ui,
+                                    title_response,
+                                    &label,
+                                    &title_font,
+                                    text_color,
+                                    row_label_width,
+                                )
                                 .on_hover_cursor(egui::CursorIcon::PointingHand);
 
                                 // Union all responses: ai badge, launcher icon, and title
