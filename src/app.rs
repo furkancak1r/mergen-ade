@@ -1007,6 +1007,11 @@ struct TerminalEntry {
     /// True when user needs to acknowledge attention (idle/permission after working)
     /// Cleared on terminal focus or keyboard input
     opencode_attention_pending: bool,
+    /// When we launched Claude (explicit claim of ownership)
+    /// Cleared when Claude session is confirmed active via title/hook
+    claude_launch_pending_since: Option<Instant>,
+    /// When Claude session is confirmed active (title/hook evidence received)
+    claude_session_active: bool,
     /// Claude Code normalized transport status (working | idle | permission)
     /// This preserves Orca-compatible semantics through the state machine
     claude_normalized_status: Option<ClaudeTransportStatus>,
@@ -1475,9 +1480,11 @@ fn ai_cli_logo_key_for_terminal(entry: &TerminalEntry) -> Option<LauncherIconKey
             }
         }
         Some(AiCliTool::Claude) => {
-            // Claude has no separate process tracking; session is live if not Inactive and not exited.
-            // The terminal exit handler clears Claude state, so this stays visible until then.
-            let is_live = entry.ai_session.status != AiCliStatus::Inactive && !entry.exited;
+            // Session is live if: launch pending, session active, or any normalized status present.
+            // This keeps the logo visible even after user acknowledges attention (status becomes Inactive).
+            let is_live = entry.claude_launch_pending_since.is_some()
+                || entry.claude_session_active
+                || entry.claude_normalized_status.is_some();
             if is_live {
                 Some(LauncherIconKey::Claude)
             } else {
@@ -1504,13 +1511,15 @@ fn draw_ai_badge(ui: &mut Ui, badge: &AiBadgeModel) -> egui::Response {
     let (rect, response) = ui.allocate_at_least(egui::vec2(16.0, 16.0), Sense::hover());
 
     if ui.is_rect_visible(rect) {
+        // Spinner/pulse için 16x16 alan (solda)
+        let spinner_rect = egui::Rect::from_min_size(rect.min, egui::vec2(16.0, 16.0));
         match visual {
             AiBadgeVisual::Spinner(color) => {
-                ui.put(rect, egui::Spinner::new().color(color).size(14.0));
+                ui.put(spinner_rect, egui::Spinner::new().color(color).size(14.0));
             }
             AiBadgeVisual::Pulse(color) => {
                 let time_seconds = ui.ctx().input(|i| i.time);
-                let center = rect.center();
+                let center = spinner_rect.center();
 
                 // Pulse animasyonu (büyüyüp küçülen daire)
                 let pulse = ((time_seconds * 4.0).sin() + 1.0) * 0.25 + 2.5; // 2.5 - 5 arası yarıçap
@@ -1529,7 +1538,7 @@ fn draw_ai_badge(ui: &mut Ui, badge: &AiBadgeModel) -> egui::Response {
                 ui.ctx().request_repaint_after(Duration::from_millis(250));
             }
             AiBadgeVisual::Solid(color) => {
-                let center = rect.center();
+                let center = spinner_rect.center();
                 // Solid dot with fixed radius - no animation
                 ui.painter().circle(
                     center,
@@ -1576,7 +1585,7 @@ struct SettingsDiagnosticsAccordionHeaderLayout {
 }
 
 fn draw_terminal_status_badges(ui: &mut Ui, ai_badge: &AiBadgeModel) -> TerminalStatusBadgeLayout {
-    let ai_response = ai_badge_visual(
+    let badge_visual = ai_badge_visual(
         ai_badge.status,
         ai_badge.codex_normalized_status,
         ai_badge.opencode_normalized_status,
@@ -1584,8 +1593,11 @@ fn draw_terminal_status_badges(ui: &mut Ui, ai_badge: &AiBadgeModel) -> Terminal
         ai_badge.codex_attention_pending,
         ai_badge.opencode_attention_pending,
         ai_badge.opencode_attention_reason,
-    )
-    .map(|_| draw_ai_badge(ui, ai_badge));
+    );
+
+    // Draw badge if visual is available
+    let ai_response = badge_visual.map(|_| draw_ai_badge(ui, ai_badge));
+
     #[cfg(test)]
     let ai_rect = ai_response.as_ref().map(|response| response.rect);
     if ai_response.is_some() {
@@ -2657,8 +2669,9 @@ impl AdeApp {
             ai_config: crate::hooks::ProjectAiConfig::default(),
         };
 
-        self.selected_project = Some(project.id);
-        self.projects.insert(project.id, project);
+        let new_project_id = project.id;
+        self.selected_project = Some(new_project_id);
+        self.projects.insert(new_project_id, project);
         self.next_project_id += 1;
         self.bump_layout_epoch();
         self.note_projects_changed();
@@ -2884,6 +2897,8 @@ impl AdeApp {
             opencode_last_turn_complete_at: None,
             opencode_attention_pending: false,
             // Claude Code state (Orca-compatible title-based detection)
+            claude_launch_pending_since: None,
+            claude_session_active: false,
             claude_normalized_status: None,
             claude_attention_reason: None,
             claude_running_since: None,
@@ -4293,6 +4308,47 @@ impl AdeApp {
         if entry.ai_session.tool == Some(AiCliTool::Claude) {
             entry.ai_session = AiCliSession::default();
         }
+        entry.claude_launch_pending_since = None;
+        entry.claude_session_active = false;
+        entry.claude_normalized_status = None;
+        entry.claude_attention_reason = None;
+        entry.claude_running_since = None;
+        entry.claude_last_title_working_at = None;
+        entry.claude_last_title_idle_at = None;
+        entry.claude_last_permission_at = None;
+        entry.dirty = true;
+        changed
+    }
+
+    /// Mark Claude launch as pending (explicit owner claim).
+    /// This locks the terminal to Claude ownership until confirmed via title/hook.
+    fn mark_claude_launch_pending(&mut self, terminal_id: u64) -> bool {
+        if self.ai_hook_manager.is_none() {
+            return false;
+        }
+
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        if let Some(manager) = &self.ai_hook_manager {
+            manager.set_tool(terminal_id, AiCliTool::Claude);
+        }
+
+        let mut changed = false;
+        if entry.ai_session.tool != Some(AiCliTool::Claude) {
+            entry.ai_session.tool = Some(AiCliTool::Claude);
+            changed = true;
+        }
+        if entry.ai_session.status != AiCliStatus::Inactive {
+            entry.ai_session.status = AiCliStatus::Inactive;
+            changed = true;
+        }
+        if entry.claude_launch_pending_since.is_none() {
+            changed = true;
+        }
+        entry.claude_launch_pending_since = Some(Instant::now());
+        entry.claude_session_active = false;
         entry.claude_normalized_status = None;
         entry.claude_attention_reason = None;
         entry.claude_running_since = None;
@@ -4774,6 +4830,15 @@ impl AdeApp {
                 }
             }
             _ => {}
+        }
+
+        // Confirm Claude session is active and clear launch pending
+        if !entry.claude_session_active {
+            entry.claude_session_active = true;
+            changed = true;
+        }
+        if entry.claude_launch_pending_since.take().is_some() {
+            changed = true;
         }
 
         if entry.ai_session.tool != Some(AiCliTool::Claude) {
@@ -5960,6 +6025,21 @@ impl AdeApp {
                     event_name,
                     from_title,
                 } => {
+                    // SAFETY GUARD: Title-based events must match current owner.
+                    // This prevents foreign title patterns (e.g., "[Working...]" or Braille spinners)
+                    // from flipping ownership to a different AI tool.
+                    if from_title {
+                        if let Some(event_tool) = tool {
+                            if let Some(entry) = self.terminals.get(&terminal_id) {
+                                // Only accept title events for the currently locked owner.
+                                // If owner is None or different, ignore this title event.
+                                if entry.ai_session.tool != Some(event_tool) {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
                     if tool == Some(AiCliTool::FactoryDroid) {
                         let source = if from_title {
                             FactoryDroidStatusSource::TerminalTitle
@@ -7374,10 +7454,7 @@ impl AdeApp {
         let kind = self.config.ui.terminal_manager_filter.terminal_kind();
         let mut result = Vec::new();
 
-        let mut project_ids = self.projects.keys().copied().collect::<Vec<_>>();
-        project_ids.sort_unstable();
-
-        for project_id in project_ids {
+        for project_id in self.projects.keys().copied().collect::<Vec<_>>() {
             let ids = terminal_ids_for_project_kind(&self.terminals, project_id, kind);
             result.extend(ids);
         }
@@ -7671,11 +7748,11 @@ impl AdeApp {
         }
         if launched_claude {
             // Clear other tool states when launching Claude
-            // Claude detection is title-based (Orca-compatible), so we don't need process tracking
-            // But we clear other states to ensure clean transitions
+            // Then explicitly claim Claude ownership (locks the terminal to Claude)
             self.clear_factory_droid_state(active_terminal_id);
             self.clear_codex_state(active_terminal_id);
             self.clear_opencode_state(active_terminal_id);
+            self.mark_claude_launch_pending(active_terminal_id);
         }
 
         if let Some(ref text) = copied_selection {
@@ -8332,16 +8409,10 @@ impl AdeApp {
         if entry.claude_attention_reason.take().is_some() {
             changed = true;
         }
-        if entry.claude_normalized_status.take().is_some() {
-            changed = true;
-        }
-        // Clear timestamps to prevent stale state from reappearing
-        if entry.claude_last_title_idle_at.take().is_some() {
-            changed = true;
-        }
-        if entry.claude_last_permission_at.take().is_some() {
-            changed = true;
-        }
+        // Note: We do NOT clear claude_normalized_status or timestamps here.
+        // The semantic status (Idle/Permission) and timestamps persist for
+        // logo visibility and state tracking. Only the attention reason is
+        // cleared to stop the pulse.
         entry.dirty = true;
         changed
     }
@@ -8611,7 +8682,7 @@ impl AdeApp {
         }
     }
 
-    const RECENT_INPUTS_MAX: usize = 4;
+    const RECENT_INPUTS_MAX: usize = 5;
 
     fn push_recent_input(recent_inputs: &mut VecDeque<String>, message: &str) {
         if message.trim().is_empty() {
@@ -9336,8 +9407,7 @@ impl AdeApp {
         ui: &mut Ui,
         changes: &mut SettingsEditOutcome,
     ) {
-        let mut project_ids = self.projects.keys().copied().collect::<Vec<_>>();
-        project_ids.sort_unstable();
+        let project_ids: Vec<u64> = self.projects.keys().copied().collect();
 
         if project_ids.is_empty() {
             show_settings_card(
@@ -10154,26 +10224,50 @@ impl AdeApp {
                             .size(15.0)
                             .color(TEXT_PRIMARY),
                     );
-                    if self.config.ui.left_sidebar_tab == LeftSidebarTab::Directory {
-                        let remaining_width = ui.available_size_before_wrap().x.max(0.0);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(remaining_width, CONTROL_ROW_HEIGHT),
-                            Layout::right_to_left(Align::Center),
-                            |ui| {
-                                if styled_icon_button(
-                                    ui,
-                                    icons::FOLDER_PLUS,
-                                    BTN_TEAL,
-                                    BTN_TEAL_HOVER,
-                                    BTN_ICON_ACTIVE,
-                                    "Add Project",
-                                ) {
-                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                        self.add_project(path);
+                    match self.config.ui.left_sidebar_tab {
+                        LeftSidebarTab::Directory => {
+                            let remaining_width = ui.available_size_before_wrap().x.max(0.0);
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(remaining_width, CONTROL_ROW_HEIGHT),
+                                Layout::right_to_left(Align::Center),
+                                |ui| {
+                                    if styled_icon_button(
+                                        ui,
+                                        icons::FOLDER_PLUS,
+                                        BTN_TEAL,
+                                        BTN_TEAL_HOVER,
+                                        BTN_ICON_ACTIVE,
+                                        "Add Project",
+                                    ) {
+                                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                            self.add_project(path);
+                                        }
                                     }
-                                }
-                            },
-                        );
+                                },
+                            );
+                        }
+                        LeftSidebarTab::TerminalManager => {
+                            let remaining_width = ui.available_size_before_wrap().x.max(0.0);
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(remaining_width, CONTROL_ROW_HEIGHT),
+                                Layout::right_to_left(Align::Center),
+                                |ui| {
+                                    let hide_inactive =
+                                        self.config.ui.terminal_manager_hide_inactive_projects;
+                                    let (icon, tooltip) = if hide_inactive {
+                                        (icons::EYE_OFF, "Show projects without live terminals")
+                                    } else {
+                                        (icons::EYE, "Hide projects without live terminals")
+                                    };
+                                    if styled_icon_toggle(ui, hide_inactive, icon, tooltip) {
+                                        self.config.ui.terminal_manager_hide_inactive_projects =
+                                            !hide_inactive;
+                                        self.note_ui_config_changed();
+                                    }
+                                },
+                            );
+                        }
+                        _ => {}
                     }
                 });
                 ui.separator();
@@ -10785,10 +10879,10 @@ impl AdeApp {
         }
         ui.add_space(8.0);
 
-        let mut project_ids = self.projects.keys().copied().collect::<Vec<_>>();
-        project_ids.sort_unstable();
         let visible_kind = self.config.ui.terminal_manager_filter.terminal_kind();
         let foreground_launchers = self.foreground_launchers();
+        let hide_inactive = self.config.ui.terminal_manager_hide_inactive_projects;
+        let project_ids: Vec<u64> = self.projects.keys().copied().collect();
 
         for project_id in project_ids {
             let Some(project_snapshot) = self.projects.get(&project_id).cloned() else {
@@ -10809,6 +10903,12 @@ impl AdeApp {
             let visible_count = self.terminal_count_for_project_kind(project_id, visible_kind);
             let has_live_terminal =
                 self.terminal_count_live_for_project_kind(project_id, visible_kind) > 0;
+
+            // Skip inactive projects when filter is enabled
+            if hide_inactive && !has_live_terminal {
+                continue;
+            }
+
             let has_children = visible_count > 0;
             let (header_response, spawn_clicked, selected_launcher_id, header_clicked) =
                 draw_project_group_header(
@@ -11331,6 +11431,27 @@ impl AdeApp {
                         .show(ui, |ui| {
                             ui.set_min_height(TERMINAL_HEADER_HEIGHT - 12.0);
 
+                            // Calculate trailing content width upfront to reserve space
+                            // This prevents the title from consuming all available width
+                            let project_label_text = format!("{}  {}", icons::FOLDER, project_name);
+                            let kind_label = terminal.kind.label();
+                            let trailing_width = {
+                                let mut width = 0.0f32;
+                                // Space before project label
+                                width += 8.0;
+                                // Project label width (approximate based on text length)
+                                let project_width = (project_label_text.len() as f32) * 6.0; // approx char width
+                                width += project_width.min(120.0); // cap at 120px
+                                                                   // Space before kind label
+                                width += 6.0;
+                                // Kind label width
+                                let kind_width = (kind_label.len() as f32) * 6.0;
+                                width += kind_width.min(60.0); // cap at 60px
+                                                               // Close button width
+                                width += 24.0;
+                                width
+                            };
+
                             let ai_badge = AiBadgeModel::from_terminal(terminal);
                             draw_terminal_status_badges(ui, &ai_badge);
 
@@ -11352,9 +11473,15 @@ impl AdeApp {
                                 ui.add_space(4.0);
                             }
 
+                            // Reserve space for trailing content by limiting title width
+                            let available_for_title =
+                                (ui.available_width() - trailing_width).max(0.0);
                             let title = terminal_display_label(&terminal.title, terminal.exited);
                             let title_font = egui::TextStyle::Body.resolve(ui.style());
-                            let title_response = ui.add(
+
+                            // Use a horizontal layout with explicit width limit for title
+                            let title_response = ui.add_sized(
+                                egui::vec2(available_for_title.max(50.0), 20.0),
                                 egui::Label::new(
                                     RichText::new(title)
                                         .color(header_chrome.title_color)
@@ -11369,15 +11496,15 @@ impl AdeApp {
                                 &terminal.full_title,
                                 &title_font,
                                 TEXT_PRIMARY,
-                                ui.available_width(),
+                                available_for_title,
                             )
                             .on_hover_cursor(egui::CursorIcon::PointingHand);
                             if title_response.clicked() {
                                 pane_clicked = true;
                             }
 
+                            // Now add trailing labels with proper spacing
                             ui.add_space(8.0);
-                            let project_label_text = format!("{}  {}", icons::FOLDER, project_name);
                             let project_label_font = egui::TextStyle::Small.resolve(ui.style());
                             let project_label_response = ui.add(
                                 egui::Label::new(
@@ -11398,7 +11525,7 @@ impl AdeApp {
                             ui.add_space(6.0);
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(terminal.kind.label())
+                                    RichText::new(kind_label)
                                         .small()
                                         .color(header_chrome.detail_color),
                                 )
@@ -12162,6 +12289,8 @@ fn recover_config_state(
         config.ui.terminal_manager_expanded = current_config.ui.terminal_manager_expanded;
         config.ui.multi_terminal_view_enabled = current_config.ui.multi_terminal_view_enabled;
         config.ui.terminal_manager_filter = current_config.ui.terminal_manager_filter;
+        config.ui.terminal_manager_hide_inactive_projects =
+            current_config.ui.terminal_manager_hide_inactive_projects;
         config.ui.left_sidebar_tab = current_config.ui.left_sidebar_tab;
     }
 
@@ -13729,15 +13858,11 @@ fn recent_inputs_tooltip_text(recent_inputs: &VecDeque<String>) -> String {
         return String::new();
     }
 
-    let mut lines = Vec::with_capacity(recent_inputs.len() + 2);
-
-    lines.push("─ Recent Inputs ─".to_owned());
-    for (i, input) in recent_inputs.iter().enumerate() {
-        let truncated = capped_hover_text(input, RECENT_INPUTS_HOVER_MAX_CHARS);
-        lines.push(format!("{}: {}", i + 1, truncated));
-    }
-
-    lines.join("\n")
+    recent_inputs
+        .iter()
+        .map(|input| capped_hover_text(input, RECENT_INPUTS_HOVER_MAX_CHARS))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn with_truncation_tooltip(
@@ -14445,20 +14570,47 @@ fn draw_project_group_header(
     let section_gap = ui.spacing().item_spacing.x;
     let (label_width, actions_width) = project_group_header_row_layout(row_width, section_gap);
     let row_height = CONTROL_ROW_HEIGHT;
-    let (row_rect, response) =
-        ui.allocate_exact_size(egui::vec2(row_width, row_height), Sense::click());
 
-    let response = if can_expand {
-        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    // Allocate the full row for visual layout, but we'll create separate interactions
+    let (_, row_rect) = ui.allocate_space(egui::vec2(row_width, row_height));
+
+    // Calculate action buttons rect
+    let actions_rect = egui::Rect::from_min_size(
+        egui::pos2(row_rect.right() - actions_width, row_rect.top()),
+        egui::vec2(actions_width, row_height),
+    );
+    let _action_hover_response = ui
+        .interact(
+            actions_rect,
+            ui.id().with(("project_group_action", project_name)),
+            Sense::hover(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    // Create interaction area for the non-button portion of the row (for click)
+    let body_rect = egui::Rect::from_min_size(
+        row_rect.min,
+        egui::vec2(row_width - actions_width, row_height),
+    );
+
+    let body_response = ui.interact(
+        body_rect,
+        ui.id().with(("project_group_body", project_name)),
+        Sense::click(),
+    );
+
+    // Set hover cursor based on expandability
+    let body_response = if can_expand {
+        body_response.on_hover_cursor(egui::CursorIcon::PointingHand)
     } else {
-        response
+        body_response
     };
 
     // Project header is bright only when it has at least one live (non-exited) terminal.
     // When all terminals are closed/exited, the project header dims back to muted color.
     let text_color = if has_live_terminal {
         TEXT_PRIMARY
-    } else if response.hovered() {
+    } else if body_response.hovered() {
         with_alpha(TEXT_MUTED, 180)
     } else {
         with_alpha(TEXT_MUTED, 180)
@@ -14467,8 +14619,12 @@ fn draw_project_group_header(
     let mut spawn_clicked = false;
     let mut selected_launcher_id = None;
 
-    let label_rect = egui::Rect::from_min_size(row_rect.min, egui::vec2(label_width, row_height));
-    if label_width > 0.0 && ui.is_rect_visible(label_rect) {
+    // Draw label content
+    let label_rect = egui::Rect::from_min_size(
+        body_rect.min,
+        egui::vec2(body_rect.width().max(0.0), row_height),
+    );
+    if label_rect.width() > 0.0 && ui.is_rect_visible(label_rect) {
         ui.scope_builder(
             egui::UiBuilder::new()
                 .max_rect(label_rect)
@@ -14489,10 +14645,7 @@ fn draw_project_group_header(
         );
     }
 
-    let actions_rect = egui::Rect::from_min_size(
-        egui::pos2(row_rect.right() - actions_width, row_rect.top()),
-        egui::vec2(actions_width, row_height),
-    );
+    // Draw action buttons in separate scope
     ui.scope_builder(
         egui::UiBuilder::new()
             .max_rect(actions_rect)
@@ -14516,10 +14669,12 @@ fn draw_project_group_header(
         },
     );
 
-    let header_clicked = response.clicked() && !spawn_clicked && selected_launcher_id.is_none();
+    // Determine header click - only if body was clicked and no action was taken
+    let header_clicked =
+        body_response.clicked() && !spawn_clicked && selected_launcher_id.is_none();
 
     (
-        response,
+        body_response,
         spawn_clicked,
         selected_launcher_id,
         header_clicked,
@@ -14574,50 +14729,65 @@ fn styled_launcher_menu_button(
     launchers: &[LauncherEntry],
 ) -> Option<String> {
     let mut selected_launcher = None;
-    let menu = with_minimal_button_chrome(ui, |ui| {
-        ui.menu_button(format!("{icon}"), |ui| {
-            with_minimal_button_chrome(ui, |ui| {
-                if launchers.is_empty() {
-                    ui.label(
-                        RichText::new("Enable a launcher in Settings > Launchers")
-                            .small()
-                            .color(TEXT_MUTED),
-                    );
-                    return;
-                }
+    let (slot_rect, slot_response) = ui.allocate_exact_size(
+        egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT),
+        Sense::hover(),
+    );
+    let slot_response = slot_response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let menu = ui
+        .scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(slot_rect)
+                .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
+            |ui| {
+                with_minimal_button_chrome(ui, |ui| {
+                    ui.menu_button(format!("{icon}"), |ui| {
+                        with_minimal_button_chrome(ui, |ui| {
+                            if launchers.is_empty() {
+                                ui.label(
+                                    RichText::new("Enable a launcher in Settings > Launchers")
+                                        .small()
+                                        .color(TEXT_MUTED),
+                                );
+                                return;
+                            }
 
-                for launcher in launchers {
-                    let response = ui.horizontal(|ui| {
-                        let _ = app.draw_launcher_icon(ui, launcher.icon_key, 20.0);
-                        ui.add_space(6.0);
-                        ui.vertical(|ui| {
-                            ui.label(
-                                RichText::new(&launcher.display_name)
-                                    .strong()
-                                    .color(TEXT_PRIMARY),
-                            );
-                            ui.label(
-                                RichText::new(&launcher.launch_command)
-                                    .small()
-                                    .color(TEXT_MUTED),
-                            );
+                            for launcher in launchers {
+                                let response = ui.horizontal(|ui| {
+                                    let _ = app.draw_launcher_icon(ui, launcher.icon_key, 20.0);
+                                    ui.add_space(6.0);
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            RichText::new(&launcher.display_name)
+                                                .strong()
+                                                .color(TEXT_PRIMARY),
+                                        );
+                                        ui.label(
+                                            RichText::new(&launcher.launch_command)
+                                                .small()
+                                                .color(TEXT_MUTED),
+                                        );
+                                    });
+                                });
+                                let row_id =
+                                    ui.make_persistent_id(("foreground-launcher", &launcher.id));
+                                let row_response = ui
+                                    .interact(response.response.rect, row_id, Sense::click())
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if row_response.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if row_response.clicked() {
+                                    selected_launcher = Some(launcher.id.clone());
+                                    ui.close_menu();
+                                }
+                            }
                         });
-                    });
-                    let row_id = ui.make_persistent_id(("foreground-launcher", &launcher.id));
-                    let row_response = ui
-                        .interact(response.response.rect, row_id, Sense::click())
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if row_response.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                    if row_response.clicked() {
-                        selected_launcher = Some(launcher.id.clone());
-                        ui.close_menu();
-                    }
-                }
-            });
-        })
-    });
+                    })
+                })
+            },
+        )
+        .inner;
 
     let response = menu
         .response
@@ -14626,7 +14796,8 @@ fn styled_launcher_menu_button(
         } else {
             tooltip
         })
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .union(slot_response);
 
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -15574,7 +15745,12 @@ fn terminal_activation_scroll_offset(
     let target_row = stable_input_cursor_row
         .or_else(|| snapshot.cursor.map(|cursor| cursor.y))
         .or_else(|| terminal_last_non_empty_row(snapshot))?;
-    let preferred_top_row = target_row.saturating_sub(2);
+    // Defensive clamp: ensure target row is within snapshot bounds to avoid
+    // scrolling too far down when cursor coordinate is stale/absolute (issue: Codex
+    // terminal opens too far scrolled).
+    let max_row = snapshot.lines.len().saturating_sub(1);
+    let clamped_target_row = target_row.min(max_row);
+    let preferred_top_row = clamped_target_row.saturating_sub(2);
     let content_height = snapshot.lines.len() as f32 * line_height.max(0.0);
     let max_offset = (content_height - viewport_height.max(0.0)).max(0.0);
     Some((preferred_top_row as f32 * line_height.max(0.0)).clamp(0.0, max_offset))
@@ -18784,11 +18960,11 @@ mod tests {
             });
         });
 
-        let row_rect = observed.expect("expected project group header rect");
-        let title_hover_pos = pos2(row_rect.left() + 28.0, row_rect.center().y);
+        let body_rect = observed.expect("expected project group header rect");
+        let title_hover_pos = pos2(body_rect.left() + 28.0, body_rect.center().y);
         let action_hover_pos = pos2(
-            row_rect.right() - (super::CONTROL_ROW_HEIGHT * 0.5),
-            row_rect.center().y,
+            body_rect.right() + (super::CONTROL_ROW_HEIGHT * 0.5),
+            body_rect.center().y,
         );
 
         (title_hover_pos, action_hover_pos)
@@ -19548,6 +19724,113 @@ mod tests {
         let offset = terminal_activation_scroll_offset(&snapshot, None, 12.0, 60.0);
 
         assert_eq!(offset, Some(0.0));
+    }
+
+    #[test]
+    fn terminal_activation_scroll_offset_clamps_out_of_bounds_cursor() {
+        // Regression: when cursor.y is absolute (e.g., 1200) but snapshot is truncated
+        // to fewer lines (e.g., 10), the offset should clamp to visible bounds instead
+        // of scrolling far down toward the absolute row.
+        let snapshot = TerminalSnapshot {
+            lines: vec![
+                TerminalStyledLine {
+                    runs: vec![TerminalStyledRun {
+                        text: "line0".to_owned(),
+                        style: test_terminal_style(),
+                        column: 0,
+                        display_width: 5,
+                    }],
+                },
+                TerminalStyledLine {
+                    runs: vec![TerminalStyledRun {
+                        text: "line1".to_owned(),
+                        style: test_terminal_style(),
+                        column: 0,
+                        display_width: 5,
+                    }],
+                },
+                TerminalStyledLine {
+                    runs: vec![TerminalStyledRun {
+                        text: "line2".to_owned(),
+                        style: test_terminal_style(),
+                        column: 0,
+                        display_width: 5,
+                    }],
+                },
+                TerminalStyledLine {
+                    runs: vec![TerminalStyledRun {
+                        text: "line3".to_owned(),
+                        style: test_terminal_style(),
+                        column: 0,
+                        display_width: 5,
+                    }],
+                },
+                TerminalStyledLine {
+                    runs: vec![TerminalStyledRun {
+                        text: "line4".to_owned(),
+                        style: test_terminal_style(),
+                        column: 0,
+                        display_width: 5,
+                    }],
+                },
+                TerminalStyledLine {
+                    runs: vec![TerminalStyledRun {
+                        text: "line5".to_owned(),
+                        style: test_terminal_style(),
+                        column: 0,
+                        display_width: 5,
+                    }],
+                },
+                TerminalStyledLine {
+                    runs: vec![TerminalStyledRun {
+                        text: "line6".to_owned(),
+                        style: test_terminal_style(),
+                        column: 0,
+                        display_width: 5,
+                    }],
+                },
+                TerminalStyledLine {
+                    runs: vec![TerminalStyledRun {
+                        text: "line7".to_owned(),
+                        style: test_terminal_style(),
+                        column: 0,
+                        display_width: 5,
+                    }],
+                },
+                TerminalStyledLine {
+                    runs: vec![TerminalStyledRun {
+                        text: "line8".to_owned(),
+                        style: test_terminal_style(),
+                        column: 0,
+                        display_width: 5,
+                    }],
+                },
+                TerminalStyledLine {
+                    runs: vec![TerminalStyledRun {
+                        text: "prompt".to_owned(),
+                        style: test_terminal_style(),
+                        column: 0,
+                        display_width: 6,
+                    }],
+                },
+            ],
+            // Cursor at absolute row 100, but snapshot only has 10 lines
+            cursor: Some(TerminalCursor {
+                x: 0,
+                y: 100,
+                shape: TerminalCursorShape::Block,
+                blinking: false,
+            }),
+            cursor_line: None,
+        };
+
+        let offset = terminal_activation_scroll_offset(&snapshot, None, 10.0, 60.0);
+
+        // Without clamping, this would try to scroll to row 98 (100 - 2 padding).
+        // With clamping, target_row (100) is clamped to max_row (9),
+        // then preferred_top_row = 9 - 2 = 7,
+        // Expected offset: 7 * 10.0 = 70.0 (clamped to max_offset which is 100 - 60 = 40)
+        assert_eq!(offset, Some(40.0));
     }
 
     #[test]
@@ -21140,6 +21423,11 @@ mod tests {
     fn ai_status_change_event_from_title_records_terminal_title_source() {
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+
+        // Pre-lock the owner to FactoryDroid so title-based events are accepted
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
+        }
 
         app.terminal_events_tx
             .send(TerminalUiEvent {
@@ -23357,6 +23645,8 @@ mod tests {
             opencode_last_turn_complete_at: None,
             opencode_attention_pending: false,
             // Claude Code state (Orca-compatible title-based detection)
+            claude_launch_pending_since: None,
+            claude_session_active: false,
             claude_normalized_status: None,
             claude_attention_reason: None,
             claude_running_since: None,
@@ -23818,7 +24108,7 @@ mod tests {
     }
 
     #[test]
-    fn push_recent_input_keeps_last_4() {
+    fn push_recent_input_keeps_last_5() {
         let mut recent_inputs = VecDeque::new();
 
         AdeApp::push_recent_input(&mut recent_inputs, "first");
@@ -23832,12 +24122,13 @@ mod tests {
 
         AdeApp::push_recent_input(&mut recent_inputs, "third");
         AdeApp::push_recent_input(&mut recent_inputs, "fourth");
-        assert_eq!(recent_inputs.len(), 4);
-
         AdeApp::push_recent_input(&mut recent_inputs, "fifth");
-        assert_eq!(recent_inputs.len(), 4);
-        assert_eq!(recent_inputs[0], "fifth");
-        assert_eq!(recent_inputs[3], "second");
+        assert_eq!(recent_inputs.len(), 5);
+
+        AdeApp::push_recent_input(&mut recent_inputs, "sixth");
+        assert_eq!(recent_inputs.len(), 5);
+        assert_eq!(recent_inputs[0], "sixth");
+        assert_eq!(recent_inputs[4], "second");
     }
 
     #[test]
@@ -23860,11 +24151,8 @@ mod tests {
 
         let tooltip = recent_inputs_tooltip_text(&recent_inputs);
 
-        // msg2 is newest (index 0, number 1)
-        assert!(tooltip.contains("1: msg2"));
-        // msg1 is second newest (index 1, number 2)
-        assert!(tooltip.contains("2: msg1"));
-        assert!(tooltip.contains("─ Recent Inputs ─"));
+        // msg2 is newest (index 0), msg1 is second newest (index 1)
+        assert_eq!(tooltip, "msg2\nmsg1");
     }
 
     #[test]
@@ -25050,6 +25338,7 @@ mod tests {
         let mut entry = test_terminal_entry(1, 1);
         entry.ai_session.tool = Some(AiCliTool::Claude);
         entry.ai_session.status = AiCliStatus::Running;
+        entry.claude_session_active = true;
         entry.exited = false;
 
         assert_eq!(
@@ -25063,6 +25352,7 @@ mod tests {
         let mut entry = test_terminal_entry(1, 1);
         entry.ai_session.tool = Some(AiCliTool::Claude);
         entry.ai_session.status = AiCliStatus::Attention;
+        entry.claude_session_active = true;
         entry.exited = false;
 
         assert_eq!(
@@ -25813,6 +26103,11 @@ mod tests {
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
 
+        // Pre-lock the owner to OpenCode so title-based events are accepted
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::OpenCode);
+        }
+
         // Simulate title-based Idle event
         app.terminal_events_tx
             .send(TerminalUiEvent {
@@ -25976,6 +26271,7 @@ mod tests {
         if let Some(entry) = app.terminals.get_mut(&terminal_id) {
             entry.ai_session.tool = Some(AiCliTool::Claude);
             entry.ai_session.status = AiCliStatus::Attention;
+            entry.claude_session_active = true;
             entry.claude_normalized_status = Some(ClaudeTransportStatus::Idle);
             entry.claude_attention_reason = None;
         }
@@ -26003,7 +26299,11 @@ mod tests {
 
         let entry_after = app.terminals.get(&1).expect("terminal 1");
         assert_eq!(entry_after.ai_session.status, AiCliStatus::Inactive);
-        assert_eq!(entry_after.claude_normalized_status, None);
+        // Note: claude_normalized_status is NOT cleared on interaction - it persists for logo visibility
+        assert_eq!(
+            entry_after.claude_normalized_status,
+            Some(ClaudeTransportStatus::Idle)
+        );
         assert!(entry_after.dirty);
 
         // Second call should return false (already cleared)
@@ -26030,6 +26330,7 @@ mod tests {
         if let Some(entry) = app.terminals.get_mut(&1) {
             entry.ai_session.tool = Some(AiCliTool::Claude);
             entry.ai_session.status = AiCliStatus::Attention;
+            entry.claude_session_active = true;
             entry.claude_normalized_status = Some(ClaudeTransportStatus::Permission);
             entry.claude_attention_reason = Some(ClaudeAttentionReason::PermissionAsked);
             entry.claude_last_permission_at = Some(Instant::now());
@@ -26051,8 +26352,13 @@ mod tests {
         let entry_after = app.terminals.get(&1).expect("terminal 1");
         assert_eq!(entry_after.ai_session.status, AiCliStatus::Inactive);
         assert_eq!(entry_after.claude_attention_reason, None);
-        assert_eq!(entry_after.claude_normalized_status, None);
-        assert_eq!(entry_after.claude_last_permission_at, None);
+        // Note: claude_normalized_status and timestamps are NOT cleared on interaction
+        // They persist for logo visibility and state tracking
+        assert_eq!(
+            entry_after.claude_normalized_status,
+            Some(ClaudeTransportStatus::Permission)
+        );
+        assert!(entry_after.claude_last_permission_at.is_some());
     }
 
     #[test]

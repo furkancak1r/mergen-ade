@@ -3053,7 +3053,7 @@ fn snapshot_from_terminal(terminal: &Terminal) -> TerminalSnapshot {
         0
     };
     let default_style = default_style(&palette);
-    let cursor = snapshot_cursor(terminal, rows, cols, viewport_top_row);
+    let cursor = snapshot_cursor(terminal, rows, cols, viewport_top_row, snapshot_start_row);
     let cursor_row = cursor.map(|cursor| cursor.y);
     let mut lines = Vec::with_capacity(snapshot_total_rows);
     let mut cursor_line = None;
@@ -3177,7 +3177,7 @@ fn selection_snapshot_from_terminal(terminal: &Terminal) -> TerminalSelectionSna
     } else {
         0
     };
-    let cursor = snapshot_cursor(terminal, rows, cols, viewport_top_row);
+    let cursor = snapshot_cursor(terminal, rows, cols, viewport_top_row, snapshot_start_row);
     let default_style = default_style(&palette);
 
     let mut lines = Vec::with_capacity(snapshot_total_rows);
@@ -3270,6 +3270,7 @@ fn snapshot_cursor(
     rows: usize,
     cols: usize,
     viewport_top_row: usize,
+    snapshot_start_row: usize,
 ) -> Option<TerminalCursor> {
     if rows == 0 || cols == 0 {
         return None;
@@ -3286,9 +3287,12 @@ fn snapshot_cursor(
     }
 
     let (shape, blinking) = map_cursor_shape(cursor.shape);
+    // Cursor y is relative to truncated snapshot (0-based within snapshot.lines)
+    let absolute_row = viewport_top_row.saturating_add(row);
+    let relative_row = absolute_row.saturating_sub(snapshot_start_row);
     Some(TerminalCursor {
         x: cursor.x.min(cols.saturating_sub(1)),
-        y: viewport_top_row.saturating_add(row),
+        y: relative_row,
         shape,
         blinking,
     })
@@ -4371,6 +4375,7 @@ mod tests {
     fn collect_ai_read_signals_ignores_title_terminator_bell_without_extra_bell() {
         let manager =
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        manager.set_tool(1, AiCliTool::FactoryDroid);
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
         let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
@@ -4403,6 +4408,7 @@ mod tests {
     fn collect_ai_read_signals_emits_bell_after_title_when_extra_bell_is_present() {
         let manager =
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        manager.set_tool(1, AiCliTool::FactoryDroid);
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
         let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
@@ -4449,6 +4455,7 @@ mod tests {
     fn collect_ai_read_signals_ignores_title_terminator_bell_but_keeps_later_bells() {
         let manager =
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
+        manager.set_tool(1, AiCliTool::FactoryDroid);
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
         let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
@@ -5712,6 +5719,44 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_cursor_row_is_relative_to_truncated_window() {
+        // Regression: when scrollback exceeds MAX_SNAPSHOT_ROWS, cursor.y must be
+        // relative to the truncated snapshot window (0..lines.len()), not absolute.
+        // This prevents activation scroll from targeting a row far below visible content.
+        use super::snapshot_cursor;
+
+        let mut terminal = make_test_terminal(TerminalSize {
+            rows: 2,
+            cols: 12,
+            pixel_width: 96,
+            pixel_height: 32,
+            dpi: 96,
+        });
+        // Simulate content that would exceed MAX_SNAPSHOT_ROWS in a real scenario.
+        // Here we test the coordinate transformation directly.
+        terminal.advance_bytes(b"line1\r\nline2\r\nline3");
+
+        let screen = terminal.screen();
+        let rows = screen.physical_rows;
+        let cols = screen.physical_cols;
+        let total_rows = screen.scrollback_rows().max(rows);
+        let scrollback_rows = total_rows.saturating_sub(rows);
+        let viewport_top_row = scrollback_rows;
+        // Simulate truncation by pretending snapshot_start_row is > 0
+        let snapshot_start_row = 1usize; // Skip first line
+
+        let cursor = snapshot_cursor(&terminal, rows, cols, viewport_top_row, snapshot_start_row);
+        let cursor = cursor.expect("expected cursor");
+
+        // With 3 total rows and snapshot_start_row=1, the truncated snapshot has 2 lines.
+        // Cursor should be at row 1 (relative within truncated snapshot), not 2 (absolute).
+        assert_eq!(
+            cursor.y, 1,
+            "cursor.y should be relative to truncated window"
+        );
+    }
+
+    #[test]
     fn plain_text_with_backslash_renders_correctly() {
         let mut terminal = make_test_terminal(TerminalSize {
             rows: 2,
@@ -5726,6 +5771,28 @@ mod tests {
         let first_line = &snapshot.lines[0];
         let line_text = snapshot_line_text(first_line);
         assert_eq!(line_text, "path\\to\\file");
+    }
+
+    #[test]
+    fn pending_visible_opencode_status_detects_plan_mode_with_system_reminder() {
+        let mut pending = PendingVisibleOpenCodeStatus::default();
+        // Exact upstream pattern: "Plan Mode - System Reminder"
+        assert_eq!(
+            pending.extract_from_text("plan mode - system reminder"),
+            Some("opencode-plan-mode".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_visible_opencode_status_rejects_loose_plan_mode_mentions() {
+        let mut pending = PendingVisibleOpenCodeStatus::default();
+        // Should NOT detect casual mentions of "plan mode" without "system reminder"
+        assert_eq!(
+            pending.extract_from_text("I will enter plan mode now"),
+            None
+        );
+        assert_eq!(pending.extract_from_text("plan mode is active"), None);
+        assert_eq!(pending.extract_from_text("plan mode active planning"), None);
     }
 
     fn make_test_terminal(size: TerminalSize) -> Terminal {

@@ -1,5 +1,26 @@
 ### Known Issues & Fix Log
 
+#### Codex terminal scrolls too far down on activation when in bottom row {#codex-terminal-scroll-issue-fixed}
+- Date: 2026-04-13
+- Context: main/Windows terminal manager with Codex CLI sessions in bottom-row tiles
+- Error signature: `Codex terminal opens too far scrolled down; user needs to scroll up to see the prompt.`
+- Symptoms/Impact: When activating a Codex terminal (especially in bottom row tiles with less height), the viewport would open scrolled too far down, making the prompt invisible. Users had to manually scroll up to see their cursor/input line.
+- Root cause: Coordinate system mismatch in truncated snapshots. When terminal scrollback exceeds `MAX_SNAPSHOT_ROWS` (500), the snapshot truncates to a window of recent rows. The cursor `y` coordinate was stored as an **absolute** screen row (including scrollback), while `snapshot.lines` became **relative** to the truncation start. This caused `terminal_activation_scroll_offset()` to calculate an offset targeting a row far outside the visible snapshot bounds, resulting in the viewport being clamped to the bottom.
+  - `snapshot_from_terminal()` in `src/terminal.rs:3056` called `snapshot_cursor()` which returned absolute coordinates.
+  - `terminal_activation_scroll_offset()` in `src/app.rs:15765` used `snapshot.cursor.map(|c| c.y)` without clamping against `snapshot.lines.len()`.
+  - This was more noticeable for Codex because Codex produces more output during startup, hitting the truncation threshold more easily.
+- Resolution:
+  - Fixed `snapshot_cursor()` in `src/terminal.rs:3268` to accept `snapshot_start_row` parameter and return cursor coordinates **relative to the truncated snapshot window** instead of absolute screen coordinates.
+  - Updated call sites in `snapshot_from_terminal()` (line 3056) and `selection_snapshot_from_terminal()` (line 3180) to pass `snapshot_start_row`.
+  - Added defensive clamping in `terminal_activation_scroll_offset()` in `src/app.rs:15781-15782` to ensure `target_row` never exceeds `snapshot.lines.len() - 1`.
+  - Added regression test `snapshot_cursor_row_is_relative_to_truncated_window` in `src/terminal.rs:5721` to verify cursor coordinates are relative after truncation.
+  - Added regression test `terminal_activation_scroll_offset_clamps_out_of_bounds_cursor` in `src/app.rs:19762` to verify activation scroll clamps out-of-bounds cursor rows.
+- Prevent recurrence:
+  - When working with truncated snapshots, always ensure cursor coordinates are in the same coordinate space as `snapshot.lines` (0-based relative to the truncated window).
+  - Activation scroll offset calculations should always clamp against visible bounds to avoid scrolling beyond content.
+  - When `MAX_SNAPSHOT_ROWS` truncation is active, any code comparing cursor row to line indices must account for the truncation offset.
+- Files/Commands touched: `src/terminal.rs`, `src/app.rs`, `cargo test`, `cargo fmt`
+
 #### Claude Code title-based detection and spinner/pulse now supported {#claude-code-title-based-detection-and-spinner-pulse-now-supported}
 - Date: 2026-04-12T00:00:00Z
 - Context: main/Windows/macOS local Claude Code CLI integration via terminal title-based detection (Orca-compatible)

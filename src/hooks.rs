@@ -903,10 +903,9 @@ impl AiHookManager {
     /// Update AI status based on terminal title changes.
     /// This is called when the terminal title changes and checks for AI-specific patterns.
     ///
-    /// Claude Code detection: Uses Orca-compatible title-based detection when the title
-    /// matches Claude conventions (✳ prefix, braille spinner, ./* prefixes, or "claude" keyword).
-    /// This allows Claude to be detected even when the session was previously attributed
-    /// to another tool (e.g., if the user switched from Codex to Claude in the same terminal).
+    /// IMPORTANT: Title-based detection NEVER changes the tool owner. It only updates status
+    /// for the currently locked owner. Owner is only set via explicit launch detection,
+    /// official hook events, or process tracking.
     pub fn update_from_title(
         &self,
         terminal_id: u64,
@@ -915,87 +914,74 @@ impl AiHookManager {
         let mut sessions = self.lock_sessions()?;
         let session = sessions.entry(terminal_id).or_default();
 
-        // Check for Claude Code title patterns first (Orca-compatible)
-        // Claude titles take precedence and can override other tools
-        if is_claude_agent_title(title) {
-            if let Some(claude_status) = detect_claude_status_from_title(title) {
-                let (status, event) = match claude_status {
-                    ClaudeTransportStatus::Working => (AiCliStatus::Running, AiHookEvent::Running),
-                    ClaudeTransportStatus::Idle => (AiCliStatus::Attention, AiHookEvent::Attention),
-                    ClaudeTransportStatus::Permission => {
-                        (AiCliStatus::Attention, AiHookEvent::Attention)
+        // Title-based detection only updates status for the CURRENT owner.
+        // It NEVER claims a new owner or switches owners.
+        let current_tool = session.tool?;
+
+        match current_tool {
+            AiCliTool::Claude => {
+                // Only check Claude title patterns if Claude is the current owner
+                if is_claude_agent_title(title) {
+                    if let Some(claude_status) = detect_claude_status_from_title(title) {
+                        let (status, event) = match claude_status {
+                            ClaudeTransportStatus::Working => {
+                                (AiCliStatus::Running, AiHookEvent::Running)
+                            }
+                            ClaudeTransportStatus::Idle => {
+                                (AiCliStatus::Attention, AiHookEvent::Attention)
+                            }
+                            ClaudeTransportStatus::Permission => {
+                                (AiCliStatus::Attention, AiHookEvent::Attention)
+                            }
+                        };
+
+                        if session.status != status || session.last_event != Some(event) {
+                            session.status = status;
+                            session.last_event = Some(event);
+                            return Some((AiCliTool::Claude, status, Some(event)));
+                        }
                     }
-                };
+                }
+                None
+            }
+            AiCliTool::CodexCli => {
+                // Only check Codex title patterns if Codex is the current owner
+                if is_codex_agent_title(title) {
+                    if let Some(codex_status) = detect_codex_status_from_title(title) {
+                        let (status, event) = match codex_status {
+                            CodexTransportStatus::Working => {
+                                (AiCliStatus::Running, AiHookEvent::Running)
+                            }
+                            CodexTransportStatus::Idle => {
+                                (AiCliStatus::Attention, AiHookEvent::Attention)
+                            }
+                            CodexTransportStatus::Permission => {
+                                (AiCliStatus::Attention, AiHookEvent::Attention)
+                            }
+                        };
 
-                // Allow tool override: if title is clearly Claude, switch to Claude
-                // even if session was previously Codex/OpenCode/FactoryDroid
-                let tool_changed = session.tool != Some(AiCliTool::Claude);
-                session.tool = Some(AiCliTool::Claude);
+                        if session.status != status || session.last_event != Some(event) {
+                            session.status = status;
+                            session.last_event = Some(event);
+                            return Some((AiCliTool::CodexCli, status, Some(event)));
+                        }
+                    }
+                }
+                None
+            }
+            AiCliTool::FactoryDroid | AiCliTool::OpenCode => {
+                // For Factory Droid and OpenCode, only use config-based title patterns
+                let config = self.config.config_for(current_tool)?;
+                let (status, event) = title_status_for_config(config, title)?;
 
-                if session.status != status || session.last_event != Some(event) || tool_changed {
+                if session.status != status || session.last_event != Some(event) {
                     session.status = status;
                     session.last_event = Some(event);
-                    return Some((AiCliTool::Claude, status, Some(event)));
+                    return Some((current_tool, status, Some(event)));
                 }
-                return None;
+                None
             }
         }
-
-        // Check for Codex CLI title patterns (Orca-compatible)
-        // Codex titles take precedence after Claude and can override other tools
-        if is_codex_agent_title(title) {
-            if let Some(codex_status) = detect_codex_status_from_title(title) {
-                let (status, event) = match codex_status {
-                    CodexTransportStatus::Working => (AiCliStatus::Running, AiHookEvent::Running),
-                    CodexTransportStatus::Idle => (AiCliStatus::Attention, AiHookEvent::Attention),
-                    CodexTransportStatus::Permission => {
-                        (AiCliStatus::Attention, AiHookEvent::Attention)
-                    }
-                };
-
-                // Allow tool override: if title is clearly Codex, switch to Codex
-                // even if session was previously OpenCode/FactoryDroid
-                let tool_changed = session.tool != Some(AiCliTool::CodexCli);
-                session.tool = Some(AiCliTool::CodexCli);
-
-                if session.status != status || session.last_event != Some(event) || tool_changed {
-                    session.status = status;
-                    session.last_event = Some(event);
-                    return Some((AiCliTool::CodexCli, status, Some(event)));
-                }
-                return None;
-            }
-        }
-
-        // Fall back to config-based title patterns for other tools
-        let matched = if let Some(tool) = session.tool {
-            // Don't use config patterns for Claude - we already checked Claude patterns above
-            if tool == AiCliTool::Claude {
-                return None;
-            }
-            let config = self.config.config_for(tool)?;
-            title_status_for_config(config, title).map(|(status, event)| (tool, status, event))
-        } else {
-            self.config.hooks.iter().find_map(|config| {
-                if !config.enabled {
-                    return None;
-                }
-
-                title_status_for_config(config, title)
-                    .map(|(status, event)| (config.tool, status, event))
-            })
-        }?;
-
-        let (tool, status, event) = matched;
-        session.tool = Some(tool);
-
-        if session.status != status || session.last_event != Some(event) {
-            session.status = status;
-            session.last_event = Some(event);
-            return Some((tool, status, Some(event)));
-        }
-
-        None
     }
 
     pub fn session(&self, terminal_id: u64) -> Option<AiCliSession> {
@@ -1603,7 +1589,9 @@ mod tests {
         let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let terminal_id = 1;
 
-        // Note: "[Working" pattern is now detected as Codex (priority order)
+        // Set the tool owner first - title detection only updates status for locked owner
+        manager.set_tool(terminal_id, AiCliTool::CodexCli);
+
         assert_eq!(
             manager.update_from_title(terminal_id, "C:\\Users\\test> droid [Working...]"),
             Some((
@@ -1621,6 +1609,9 @@ mod tests {
     fn update_from_title_detects_idle_pattern_without_prior_detection() {
         let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let terminal_id = 1;
+
+        // Set the tool owner first - title detection only updates status for locked owner
+        manager.set_tool(terminal_id, AiCliTool::FactoryDroid);
 
         assert_eq!(
             manager.update_from_title(terminal_id, "C:\\Users\\test> [Idle]"),
@@ -1652,7 +1643,9 @@ mod tests {
         let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let terminal_id = 1;
 
-        // Note: "[Working" pattern is detected as Codex; use explicit "codex" for Idle
+        // Set the tool owner first - title detection only updates status for locked owner
+        manager.set_tool(terminal_id, AiCliTool::CodexCli);
+
         assert_eq!(
             manager.update_from_title(terminal_id, "droid [Working...]"),
             Some((
@@ -1676,6 +1669,9 @@ mod tests {
         let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let terminal_id = 1;
 
+        // Set the tool owner first - title detection only updates status for locked owner
+        manager.set_tool(terminal_id, AiCliTool::OpenCode);
+
         assert_eq!(
             manager.update_from_title(terminal_id, "OpenCode - Working on changes"),
             Some((
@@ -1694,6 +1690,9 @@ mod tests {
         let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let terminal_id = 1;
 
+        // Set the tool owner first - title detection only updates status for locked owner
+        manager.set_tool(terminal_id, AiCliTool::OpenCode);
+
         assert_eq!(
             manager.update_from_title(terminal_id, "OpenCode - Idle; waiting for input"),
             Some((
@@ -1711,6 +1710,9 @@ mod tests {
     fn update_from_title_opencode_transitions_running_to_idle() {
         let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let terminal_id = 1;
+
+        // Set the tool owner first - title detection only updates status for locked owner
+        manager.set_tool(terminal_id, AiCliTool::OpenCode);
 
         let _ = manager.update_from_title(terminal_id, "OpenCode - Working...");
         let session = manager.session(terminal_id).expect("session after running");
@@ -1890,6 +1892,9 @@ mod tests {
         let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let terminal_id = 1;
 
+        // Title-based detection requires owner to be pre-locked via explicit claim
+        manager.set_tool(terminal_id, AiCliTool::Claude);
+
         assert_eq!(
             manager.update_from_title(terminal_id, "✳ User acknowledgment and confirmation"),
             Some((
@@ -1907,6 +1912,9 @@ mod tests {
     fn update_from_title_detects_claude_working() {
         let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let terminal_id = 1;
+
+        // Set the tool owner first - title detection only updates status for locked owner
+        manager.set_tool(terminal_id, AiCliTool::Claude);
 
         assert_eq!(
             manager.update_from_title(terminal_id, "⠂ User acknowledgment and confirmation"),
@@ -1926,6 +1934,9 @@ mod tests {
         let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let terminal_id = 1;
 
+        // Set the tool owner first - title detection only updates status for locked owner
+        manager.set_tool(terminal_id, AiCliTool::Claude);
+
         assert_eq!(
             manager.update_from_title(terminal_id, "Claude Code - action required"),
             Some((
@@ -1944,22 +1955,20 @@ mod tests {
         let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let terminal_id = 1;
 
-        // First detect as OpenCode
-        manager.update_with_text_offsets(terminal_id, "[opencode-hook:event=tool.execute.before]");
+        // First set OpenCode as owner
+        manager.set_tool(terminal_id, AiCliTool::OpenCode);
         let session = manager.session(terminal_id).expect("session");
         assert_eq!(session.tool, Some(AiCliTool::OpenCode));
 
-        // Then switch to Claude via title
+        // Title detection CANNOT override a different owner - should return None
+        // because title-based detection only updates status for the current owner
         assert_eq!(
-            manager.update_from_title(terminal_id, "✳ Switching to Claude"),
-            Some((
-                AiCliTool::Claude,
-                AiCliStatus::Attention,
-                Some(AiHookEvent::Attention)
-            ))
+            manager.update_from_title(terminal_id, "✳ Trying to switch to Claude"),
+            None
         );
         let session = manager.session(terminal_id).expect("session");
-        assert_eq!(session.tool, Some(AiCliTool::Claude));
+        // Owner should remain OpenCode, not switch to Claude
+        assert_eq!(session.tool, Some(AiCliTool::OpenCode));
     }
 
     #[test]
@@ -1979,6 +1988,9 @@ mod tests {
     fn update_from_title_claude_working_to_idle_transition() {
         let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let terminal_id = 1;
+
+        // Set the tool owner first - title detection only updates status for locked owner
+        manager.set_tool(terminal_id, AiCliTool::Claude);
 
         // Start working
         manager.update_from_title(terminal_id, "⠂ Implementing feature");
@@ -2146,6 +2158,9 @@ mod tests {
         let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let terminal_id = 1;
 
+        // Set the tool owner first - title detection only updates status for locked owner
+        manager.set_tool(terminal_id, AiCliTool::CodexCli);
+
         assert_eq!(
             manager.update_from_title(terminal_id, "codex working on task"),
             Some((
@@ -2163,6 +2178,9 @@ mod tests {
     fn update_from_title_detects_codex_idle() {
         let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let terminal_id = 1;
+
+        // Set the tool owner first - title detection only updates status for locked owner
+        manager.set_tool(terminal_id, AiCliTool::CodexCli);
 
         assert_eq!(
             manager.update_from_title(terminal_id, "codex ready"),
@@ -2182,6 +2200,9 @@ mod tests {
         let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let terminal_id = 1;
 
+        // Set the tool owner first - title detection only updates status for locked owner
+        manager.set_tool(terminal_id, AiCliTool::CodexCli);
+
         assert_eq!(
             manager.update_from_title(terminal_id, "codex action required"),
             Some((
@@ -2199,6 +2220,9 @@ mod tests {
     fn update_from_title_codex_working_to_idle_transition() {
         let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let terminal_id = 1;
+
+        // Set the tool owner first - title detection only updates status for locked owner
+        manager.set_tool(terminal_id, AiCliTool::CodexCli);
 
         // Start working
         assert_eq!(
