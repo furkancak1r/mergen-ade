@@ -11636,34 +11636,42 @@ impl AdeApp {
                             let title_response =
                                 title_response.on_hover_cursor(egui::CursorIcon::PointingHand);
 
-                            // Calculate click timing and pointer position
+                            // Calculate click timing, pointer position and direction
                             let (
                                 time_since_last_click,
                                 time_since_last_pointer_movement,
                                 pointer_pos,
+                                pointer_dir,
                             ) = ui.ctx().input(|input| {
                                 (
                                     input.pointer.time_since_last_click(),
                                     input.pointer.time_since_last_movement(),
                                     input.pointer.hover_pos(),
+                                    input.pointer.direction(),
                                 )
                             });
                             let clicked_recently =
                                 time_since_last_click < time_since_last_pointer_movement + 0.1;
 
-                            // Check if pointer is on tooltip (for keeping it open like Terminal Manager)
+                            // Check if pointer is on tooltip or moving toward it
+                            // (for keeping it open like Terminal Manager)
                             let tooltip_area_id = egui::tooltip_id(title_id, 0);
                             let tooltip_rect = egui::AreaState::load(ui.ctx(), tooltip_area_id)
                                 .map(|state| state.rect());
                             let pointer_on_tooltip = pointer_pos
                                 .zip(tooltip_rect)
                                 .map_or(false, |(pos, rect)| rect.contains(pos));
+                            // Check if moving toward tooltip (handles gap between title and tooltip)
+                            let moving_toward_tooltip = pointer_dir != Vec2::ZERO
+                                && pointer_pos.zip(tooltip_rect).map_or(false, |(pos, rect)| {
+                                    rect.intersects_ray(pos, pointer_dir.normalized())
+                                });
 
                             // Show centered tooltip under title when hovered
-                            // Keep open when pointer moves to tooltip (even when clicking)
-                            // This ensures clicks inside tooltip are captured before closing
-                            let should_show_tooltip =
-                                pointer_on_tooltip || (!clicked_recently && is_title_hovered);
+                            // Keep open when pointer moves to tooltip or is on the way to it
+                            let should_show_tooltip = pointer_on_tooltip
+                                || moving_toward_tooltip
+                                || (!clicked_recently && is_title_hovered);
 
                             if should_show_tooltip
                                 && !terminal.exited
