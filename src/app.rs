@@ -11632,14 +11632,24 @@ impl AdeApp {
                             let title_rect = title_response.rect;
                             let title_id = title_response.id;
                             let is_title_hovered = title_response.hovered();
-                            let is_tooltip_open = title_response.is_tooltip_open();
                             let is_title_clicked = title_response.clicked();
                             let title_response =
                                 title_response.on_hover_cursor(egui::CursorIcon::PointingHand);
 
+                            // Calculate click timing to close tooltip after click
+                            let (time_since_last_click, time_since_last_pointer_movement) =
+                                ui.ctx().input(|input| {
+                                    (
+                                        input.pointer.time_since_last_click(),
+                                        input.pointer.time_since_last_movement(),
+                                    )
+                                });
+                            let clicked_recently =
+                                time_since_last_click < time_since_last_pointer_movement + 0.1;
+
                             // Show centered tooltip under title when hovered
-                            // Use title_response.id so is_tooltip_open() works correctly
-                            if is_title_hovered || is_tooltip_open {
+                            // Close after click
+                            if is_title_hovered && !clicked_recently {
                                 if !terminal.exited && !terminal.recent_inputs.is_empty() {
                                     let tooltip_pos = egui::pos2(
                                         title_rect.center().x,
@@ -11691,7 +11701,7 @@ impl AdeApp {
                                             }
                                         },
                                     );
-                                } else if is_title_hovered {
+                                } else {
                                     with_truncation_tooltip(
                                         ui,
                                         title_response,
