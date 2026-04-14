@@ -11668,6 +11668,7 @@ impl AdeApp {
                             );
                             // Save values before title_response is potentially moved
                             let title_rect = title_response.rect;
+                            let title_id = title_response.id;
                             let is_title_hovered = title_response.hovered();
                             let is_tooltip_open = title_response.is_tooltip_open();
                             let is_title_clicked = title_response.clicked();
@@ -11675,6 +11676,7 @@ impl AdeApp {
                                 title_response.on_hover_cursor(egui::CursorIcon::PointingHand);
 
                             // Show centered tooltip under title when hovered
+                            // Use title_response.id so is_tooltip_open() works correctly
                             if is_title_hovered || is_tooltip_open {
                                 if !terminal.exited && !terminal.recent_inputs.is_empty() {
                                     let tooltip_pos = egui::pos2(
@@ -11684,7 +11686,7 @@ impl AdeApp {
                                     egui::show_tooltip_at(
                                         ui.ctx(),
                                         ui.layer_id(),
-                                        ui.id().with(("recent_inputs_tooltip", terminal_id)),
+                                        title_id,
                                         tooltip_pos,
                                         |ui| {
                                             // Show title if different from most recent
