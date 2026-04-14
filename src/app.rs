@@ -11759,7 +11759,8 @@ impl AdeApp {
 
                             // Project name takes remaining space and truncates
                             ui.add_space(8.0);
-                            let project_label_response = ui.add(
+                            let project_label_response = ui.add_sized(
+                                egui::vec2(project_available_width, 20.0),
                                 egui::Label::new(
                                     RichText::new(&project_label_text)
                                         .size(14.5)
