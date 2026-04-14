@@ -13447,15 +13447,36 @@ fn next_terminal_in_linear_direction(
         .position(|terminal_id| *terminal_id == active_terminal)?;
 
     match direction {
-        TerminalNavigationDirection::Up => terminal_ids[..active_index]
-            .iter()
-            .rev()
-            .copied()
-            .find(|terminal_id| is_selectable(*terminal_id)),
-        TerminalNavigationDirection::Down => terminal_ids[active_index + 1..]
-            .iter()
-            .copied()
-            .find(|terminal_id| is_selectable(*terminal_id)),
+        TerminalNavigationDirection::Up => {
+            // First try to find a selectable terminal before the active one
+            let before = terminal_ids[..active_index]
+                .iter()
+                .rev()
+                .copied()
+                .find(|terminal_id| is_selectable(*terminal_id));
+            // If none found, wrap around to the end of the list
+            before.or_else(|| {
+                terminal_ids[active_index + 1..]
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|terminal_id| is_selectable(*terminal_id))
+            })
+        }
+        TerminalNavigationDirection::Down => {
+            // First try to find a selectable terminal after the active one
+            let after = terminal_ids[active_index + 1..]
+                .iter()
+                .copied()
+                .find(|terminal_id| is_selectable(*terminal_id));
+            // If none found, wrap around to the start of the list
+            after.or_else(|| {
+                terminal_ids[..active_index]
+                    .iter()
+                    .copied()
+                    .find(|terminal_id| is_selectable(*terminal_id))
+            })
+        }
         _ => None,
     }
 }
@@ -19985,9 +20006,10 @@ mod tests {
     }
 
     #[test]
-    fn next_terminal_in_linear_direction_stops_at_edges() {
+    fn next_terminal_in_linear_direction_wraps_around_at_edges() {
         let ids = [1, 2, 3];
 
+        // At first terminal, Up should wrap to last
         assert_eq!(
             next_terminal_in_linear_direction(
                 Some(1),
@@ -19995,8 +20017,9 @@ mod tests {
                 |_| true,
                 TerminalNavigationDirection::Up
             ),
-            None
+            Some(3)
         );
+        // At last terminal, Down should wrap to first
         assert_eq!(
             next_terminal_in_linear_direction(
                 Some(3),
@@ -20004,7 +20027,7 @@ mod tests {
                 |_| true,
                 TerminalNavigationDirection::Down,
             ),
-            None
+            Some(1)
         );
     }
 
@@ -20441,7 +20464,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_shortcuts_keeps_single_view_terminal_at_navigation_edges() {
+    fn handle_shortcuts_wraps_single_view_terminal_at_navigation_edges() {
         let ctx = Context::default();
         let mut app = test_app(
             [
@@ -20451,14 +20474,17 @@ mod tests {
             ],
             Some(1),
         );
+        // At first terminal, Up should wrap to last (3)
         app.buffered_terminal_navigation = vec![TerminalNavigationShortcut::SingleViewLinear(
             TerminalNavigationDirection::Up,
         )];
 
         app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
 
-        assert_eq!(app.active_terminal, Some(1));
+        assert_eq!(app.active_terminal, Some(3));
+        assert_eq!(app.visible_terminal_ids_for_main(), vec![3]);
 
+        // At last terminal, Down should wrap to first (1)
         app.set_active_terminal(&ctx, Some(3));
         app.buffered_terminal_navigation = vec![TerminalNavigationShortcut::SingleViewLinear(
             TerminalNavigationDirection::Down,
@@ -20466,12 +20492,12 @@ mod tests {
 
         app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
 
-        assert_eq!(app.active_terminal, Some(3));
-        assert_eq!(app.visible_terminal_ids_for_main(), vec![3]);
+        assert_eq!(app.active_terminal, Some(1));
+        assert_eq!(app.visible_terminal_ids_for_main(), vec![1]);
     }
 
     #[test]
-    fn handle_shortcuts_keeps_exited_single_view_terminal_when_no_live_neighbor_exists() {
+    fn handle_shortcuts_wraps_from_exited_terminal_to_live_terminal() {
         let ctx = Context::default();
         let mut exited_terminal = test_terminal_entry(2, 7);
         exited_terminal.exited = true;
@@ -20479,12 +20505,34 @@ mod tests {
             [(1, test_terminal_entry(1, 7)), (2, exited_terminal)],
             Some(2),
         );
+        // At exited terminal 2, Down should wrap to terminal 1 (the only live terminal)
         app.buffered_terminal_navigation = vec![TerminalNavigationShortcut::SingleViewLinear(
             TerminalNavigationDirection::Down,
         )];
 
         app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
 
+        assert_eq!(app.active_terminal, Some(1));
+        assert_eq!(app.visible_terminal_ids_for_main(), vec![1]);
+        assert_eq!(app.active_terminal_accepts_input(), Some(1));
+    }
+
+    #[test]
+    fn handle_shortcuts_keeps_exited_terminal_when_all_terminals_exited() {
+        let ctx = Context::default();
+        let mut exited_terminal1 = test_terminal_entry(1, 7);
+        exited_terminal1.exited = true;
+        let mut exited_terminal2 = test_terminal_entry(2, 7);
+        exited_terminal2.exited = true;
+        let mut app = test_app([(1, exited_terminal1), (2, exited_terminal2)], Some(2));
+        // When all terminals are exited, wrap-around finds nothing selectable
+        app.buffered_terminal_navigation = vec![TerminalNavigationShortcut::SingleViewLinear(
+            TerminalNavigationDirection::Down,
+        )];
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        // No selectable terminal found, stays on current (even though exited)
         assert_eq!(app.active_terminal, Some(2));
         assert_eq!(app.visible_terminal_ids_for_main(), vec![2]);
         assert_eq!(app.active_terminal_accepts_input(), None);
