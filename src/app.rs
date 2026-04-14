@@ -11578,13 +11578,14 @@ impl AdeApp {
                                 // Space before project label
                                 width += 8.0;
                                 // Project label width (approximate based on text length)
-                                let project_width = (project_label_text.len() as f32) * 6.0; // approx char width
-                                width += project_width.min(120.0); // cap at 120px
+                                // Increased char width for larger font (14.5px)
+                                let project_width = (project_label_text.len() as f32) * 7.5;
+                                width += project_width.min(140.0); // cap at 140px
                                                                    // Space before kind label
                                 width += 6.0;
                                 // Kind label width
-                                let kind_width = (kind_label.len() as f32) * 6.0;
-                                width += kind_width.min(60.0); // cap at 60px
+                                let kind_width = (kind_label.len() as f32) * 7.5;
+                                width += kind_width.min(70.0); // cap at 70px
                                                                // Close button width
                                 width += 24.0;
                                 width
@@ -11737,13 +11738,13 @@ impl AdeApp {
                                 pane_clicked = true;
                             }
 
-                            // Now add trailing labels with proper spacing
+                            // Now add trailing labels with proper spacing (centered vertically)
                             ui.add_space(8.0);
-                            let project_label_font = egui::TextStyle::Small.resolve(ui.style());
+                            let project_label_font = egui::TextStyle::Body.resolve(ui.style());
                             let project_label_response = ui.add(
                                 egui::Label::new(
                                     RichText::new(&project_label_text)
-                                        .small()
+                                        .size(14.5)
                                         .color(header_chrome.detail_color),
                                 )
                                 .truncate(),
@@ -11760,7 +11761,7 @@ impl AdeApp {
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(kind_label)
-                                        .small()
+                                        .size(14.5)
                                         .color(header_chrome.detail_color),
                                 )
                                 .truncate(),
