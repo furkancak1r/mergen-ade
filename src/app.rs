@@ -2430,6 +2430,8 @@ impl AdeApp {
         if config.ui.left_sidebar_tab == LeftSidebarTab::TerminalManager {
             config.ui.terminal_manager_filter = crate::models::TerminalManagerFilter::Foreground;
         }
+        // Always show projects without live terminals on startup
+        config.ui.terminal_manager_hide_inactive_projects = false;
         #[cfg(target_os = "windows")]
         let window_hwnd = Self::extract_window_hwnd(_cc);
 
@@ -12298,6 +12300,9 @@ fn recover_config_state(
 
     config.projects = projects.values().cloned().collect();
     config.ui.last_selected_project_id = selected_project;
+
+    // Always show projects without live terminals on startup
+    config.ui.terminal_manager_hide_inactive_projects = false;
 
     config
 }
@@ -23441,6 +23446,64 @@ mod tests {
         );
 
         assert_eq!(recovered.default_shell, ShellKind::default());
+    }
+
+    #[test]
+    fn recovered_config_always_shows_projects_without_live_terminals_on_startup() {
+        // Config kayıtlı olarak hide_inactive = true olsa bile
+        let loaded_config = AppConfig {
+            ui: crate::models::UiConfig {
+                terminal_manager_hide_inactive_projects: true,
+                ..boot_failed_current_config().ui
+            },
+            ..AppConfig::default()
+        };
+
+        let recovered = recover_config_state(
+            &boot_failed_current_config(),
+            &BTreeMap::new(),
+            None,
+            loaded_config,
+            PendingConfigChanges::default(),
+        );
+
+        // Startup'ta her zaman projeler görünür olmalı (hide_inactive = false)
+        assert!(
+            !recovered.ui.terminal_manager_hide_inactive_projects,
+            "Projects without live terminals should be visible on startup"
+        );
+    }
+
+    #[test]
+    fn recovered_config_shows_projects_without_live_terminals_even_when_ui_changed() {
+        // pending_config_changes.ui = true ve current'te hide_inactive = true olsa bile
+        let loaded_config = AppConfig {
+            ui: crate::models::UiConfig {
+                terminal_manager_hide_inactive_projects: false,
+                ..boot_failed_current_config().ui
+            },
+            ..AppConfig::default()
+        };
+
+        let mut current_config = boot_failed_current_config();
+        current_config.ui.terminal_manager_hide_inactive_projects = true;
+
+        let recovered = recover_config_state(
+            &current_config,
+            &BTreeMap::new(),
+            None,
+            loaded_config,
+            PendingConfigChanges {
+                ui: true,
+                ..PendingConfigChanges::default()
+            },
+        );
+
+        // Startup override her zaman uygulanmalı
+        assert!(
+            !recovered.ui.terminal_manager_hide_inactive_projects,
+            "Startup should always show projects without live terminals"
+        );
     }
 
     fn boot_failed_current_config() -> AppConfig {
