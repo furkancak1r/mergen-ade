@@ -2424,7 +2424,7 @@ impl AdeApp {
         let window_size = egui::vec2(400.0, 150.0);
 
         // Window without close button (.open() removed) and simpler title
-        egui::Window::new("Kapatma Onayı")
+        egui::Window::new("Confirm Exit")
             .id(egui::Id::new("exit_confirm_window"))
             .resizable(false)
             .collapsible(false)
@@ -2435,14 +2435,14 @@ impl AdeApp {
                 ui.vertical_centered(|ui| {
                     ui.add_space(12.0);
                     ui.label(
-                        egui::RichText::new("Program kapatılacaktır, emin misiniz?")
+                        egui::RichText::new("Are you sure you want to close the application?")
                             .size(16.0)
                             .color(TEXT_PRIMARY),
                     );
                     ui.add_space(20.0);
                 });
 
-                // Full-width row with Vazgeç on left, Evet kapat on right
+                // Full-width row with Cancel on left, Yes, close on right
                 let row_width = ui.available_width();
                 let button_width = 120.0;
                 let gap = 24.0;
@@ -2452,25 +2452,25 @@ impl AdeApp {
                     egui::vec2(row_width, CONTROL_ROW_HEIGHT),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
-                        // Vazgeç button - leftmost
+                        // Cancel button - leftmost
                         if ui
                             .add_sized(
                                 [button_width, CONTROL_ROW_HEIGHT],
-                                egui::Button::new("Vazgeç"),
+                                egui::Button::new("Cancel"),
                             )
                             .clicked()
                         {
                             open.set(false);
                         }
-                        // Spacer to push Evet kapat to the right
+                        // Spacer to push Yes, close to the right
                         ui.add_space(remaining_space);
                         // Gap between buttons
                         ui.add_space(gap);
-                        // Evet, kapat button - rightmost (primary action)
+                        // Yes, close button - rightmost (primary action)
                         if ui
                             .add_sized(
                                 [button_width, CONTROL_ROW_HEIGHT],
-                                egui::Button::new("Evet, kapat"),
+                                egui::Button::new("Yes, close"),
                             )
                             .clicked()
                         {
@@ -11159,7 +11159,7 @@ impl AdeApp {
                         format!("{}\n\n{}", label, history_text)
                     }
                 };
-                let row_response = row_response.on_hover_text(hover_text);
+                // Note: Row-level hover removed; tooltip is now on title text only
                 let row_chrome = terminal_manager_row_chrome(active, row_response.hovered());
                 let selection_rect =
                     terminal_manager_row_selection_rect(row_rect, row_actions_width);
@@ -11236,17 +11236,20 @@ impl AdeApp {
                                         .truncate()
                                         .sense(Sense::click()),
                                 );
-                                let title_response = with_truncation_tooltip(
-                                    ui,
-                                    title_response,
-                                    &label,
-                                    &title_font,
-                                    text_color,
-                                    row_label_width,
-                                )
+                                // Apply recent inputs tooltip to title (not row-level)
+                                let title_response = if !terminal_data.recent_inputs.is_empty() {
+                                    title_response.on_hover_text(hover_text)
+                                } else {
+                                    with_truncation_tooltip(
+                                        ui,
+                                        title_response,
+                                        &label,
+                                        &title_font,
+                                        text_color,
+                                        row_label_width,
+                                    )
+                                }
                                 .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                // Note: Recent inputs tooltip is handled by row-level hover,
-                                // not duplicated here to avoid showing duplicate info
 
                                 // Union all responses: ai badge, launcher icon, and title
                                 let mut combined_response = title_response;
