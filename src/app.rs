@@ -1423,6 +1423,7 @@ fn ai_badge_visual(
 
 /// Returns the launcher icon key for a running AI CLI tool.
 /// Only returns Some when the tool is in Running state (to show the logo at title start).
+#[cfg(test)]
 fn launcher_icon_for_ai_tool(
     tool: Option<AiCliTool>,
     status: AiCliStatus,
@@ -14708,7 +14709,7 @@ fn draw_project_group_header(
 ) -> (egui::Response, bool, Option<String>, bool) {
     let row_width = ui.available_width();
     let section_gap = ui.spacing().item_spacing.x;
-    let (label_width, actions_width) = project_group_header_row_layout(row_width, section_gap);
+    let (_label_width, actions_width) = project_group_header_row_layout(row_width, section_gap);
     let row_height = CONTROL_ROW_HEIGHT;
 
     // Allocate the full row for visual layout, but we'll create separate interactions
