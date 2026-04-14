@@ -11111,6 +11111,8 @@ impl AdeApp {
             let mut close_terminal = false;
             let mut visibility_changed = false;
             let mut send_message: Option<String> = None;
+            // Track which message was clicked for copying (use Cell for interior mutability)
+            let copied_message: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
 
             // Extract all terminal data first to avoid borrow issues with self
             let terminal_data: TerminalRowData = {
@@ -11159,6 +11161,7 @@ impl AdeApp {
                         format!("{}\n\n{}", label, history_text)
                     }
                 };
+
                 // Tooltip on selection area (row without action buttons)
                 let row_chrome = terminal_manager_row_chrome(active, row_response.hovered());
                 let selection_rect =
@@ -11170,13 +11173,45 @@ impl AdeApp {
                             .with(("terminal_manager_row_select", terminal_data.id)),
                         Sense::click(),
                     );
-                    // Apply hover tooltip to selection area (not just title text)
-                    let response =
-                        if !terminal_data.exited && !terminal_data.recent_inputs.is_empty() {
-                            response.on_hover_text(hover_text)
-                        } else {
-                            response
-                        };
+                    // Apply interactive hover tooltip to selection area
+                    let response = if !terminal_data.exited
+                        && !terminal_data.recent_inputs.is_empty()
+                    {
+                        response.on_hover_ui(|ui| {
+                            // Show title if different from most recent
+                            let most_recent = terminal_data
+                                .recent_inputs
+                                .front()
+                                .map(|s| s.as_str())
+                                .unwrap_or("");
+                            if most_recent != label {
+                                ui.label(egui::RichText::new(&label).strong().color(TEXT_PRIMARY));
+                                ui.add_space(4.0);
+                            }
+                            // Show each recent input as clickable row
+                            for (idx, message) in terminal_data.recent_inputs.iter().enumerate() {
+                                let msg_response = ui
+                                    .add_sized(
+                                        egui::vec2(ui.available_width(), 20.0),
+                                        egui::Label::new(
+                                            egui::RichText::new(message)
+                                                .color(TEXT_PRIMARY)
+                                                .size(13.0),
+                                        )
+                                        .sense(egui::Sense::click()),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if msg_response.clicked() {
+                                    copied_message.set(Some(message.clone()));
+                                }
+                                if idx < terminal_data.recent_inputs.len() - 1 {
+                                    ui.add_space(2.0);
+                                }
+                            }
+                        })
+                    } else {
+                        response
+                    };
                     response.on_hover_cursor(egui::CursorIcon::PointingHand)
                 });
                 if ui
@@ -11348,6 +11383,11 @@ impl AdeApp {
             if set_active {
                 self.set_active_terminal(ctx, Some(terminal_entry_id));
             }
+            // Handle copied message from tooltip click
+            if let Some(message) = copied_message.take() {
+                ctx.copy_text(message);
+                self.show_status_feedback(ctx, "Copied message");
+            }
             if close_terminal {
                 self.close_terminal(ctx, terminal_entry_id);
             }
@@ -11510,7 +11550,14 @@ impl AdeApp {
             None
         };
 
-        let (clicked, close_requested, copied_selection, paste_requested, link_to_open) = {
+        let (
+            clicked,
+            close_requested,
+            copied_selection,
+            copied_hover_message,
+            paste_requested,
+            link_to_open,
+        ) = {
             let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
                 return;
             };
@@ -11518,6 +11565,7 @@ impl AdeApp {
             let mut close_requested = false;
             let mut pane_clicked = false;
             let mut copied_selection = None;
+            let copied_hover_message: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
             let mut paste_requested = false;
             let mut link_to_open = None;
             let header_chrome = terminal_header_chrome(is_active);
@@ -11618,21 +11666,58 @@ impl AdeApp {
                                 .truncate()
                                 .sense(Sense::click()),
                             );
-                            // Apply hover tooltip (recent inputs or truncation)
-                            let title_response =
-                                if !terminal.exited && !terminal.recent_inputs.is_empty() {
-                                    title_response.on_hover_text(hover_text)
-                                } else {
-                                    with_truncation_tooltip(
-                                        ui,
-                                        title_response,
-                                        &terminal.full_title,
-                                        &title_font,
-                                        TEXT_PRIMARY,
-                                        available_for_title,
-                                    )
-                                }
-                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            // Apply interactive hover tooltip (recent inputs or truncation)
+                            let title_response = if !terminal.exited
+                                && !terminal.recent_inputs.is_empty()
+                            {
+                                title_response.on_hover_ui(|ui| {
+                                    // Show title if different from most recent
+                                    let most_recent = terminal
+                                        .recent_inputs
+                                        .front()
+                                        .map(|s| s.as_str())
+                                        .unwrap_or("");
+                                    if most_recent != terminal.full_title {
+                                        ui.label(
+                                            egui::RichText::new(&terminal.full_title)
+                                                .strong()
+                                                .color(TEXT_PRIMARY),
+                                        );
+                                        ui.add_space(4.0);
+                                    }
+                                    // Show each recent input as clickable row
+                                    for (idx, message) in terminal.recent_inputs.iter().enumerate()
+                                    {
+                                        let msg_response = ui
+                                            .add_sized(
+                                                egui::vec2(ui.available_width(), 20.0),
+                                                egui::Label::new(
+                                                    egui::RichText::new(message)
+                                                        .color(TEXT_PRIMARY)
+                                                        .size(13.0),
+                                                )
+                                                .sense(egui::Sense::click()),
+                                            )
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                        if msg_response.clicked() {
+                                            copied_hover_message.set(Some(message.clone()));
+                                        }
+                                        if idx < terminal.recent_inputs.len() - 1 {
+                                            ui.add_space(2.0);
+                                        }
+                                    }
+                                })
+                            } else {
+                                with_truncation_tooltip(
+                                    ui,
+                                    title_response,
+                                    &terminal.full_title,
+                                    &title_font,
+                                    TEXT_PRIMARY,
+                                    available_for_title,
+                                )
+                            }
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
                             if title_response.clicked() {
                                 pane_clicked = true;
                             }
@@ -12082,6 +12167,7 @@ impl AdeApp {
                 pane_clicked,
                 close_requested,
                 copied_selection,
+                copied_hover_message.take(),
                 paste_requested,
                 link_to_open,
             )
@@ -12103,6 +12189,11 @@ impl AdeApp {
         if let Some(text) = copied_selection {
             ui.ctx().copy_text(text);
             self.finalize_pointer_selection_copy(ui.ctx());
+        }
+
+        if let Some(message) = copied_hover_message {
+            ui.ctx().copy_text(message);
+            self.show_status_feedback(ui.ctx(), "Copied message");
         }
 
         if paste_requested {
