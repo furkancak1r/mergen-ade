@@ -7691,6 +7691,8 @@ impl AdeApp {
                                     terminal.id as usize,
                                     TITLE_MAX_LEN,
                                 );
+                                // Track recent inputs for tooltip history (filters "/" commands)
+                                Self::push_recent_input(&mut terminal.recent_inputs, &sanitized);
                             }
                             terminal.dirty = true;
                             continue;
@@ -7905,6 +7907,9 @@ impl AdeApp {
         style.spacing.item_spacing = egui::vec2(10.0, 8.0);
         style.spacing.button_padding = egui::vec2(12.0, 7.0);
         style.spacing.window_margin = egui::Margin::symmetric(12.0, 10.0);
+        // Immediate tooltips on hover (no delay, show while moving)
+        style.interaction.show_tooltips_only_when_still = false;
+        style.interaction.tooltip_delay = 0.0;
         let mut scroll_style = egui::style::ScrollStyle::floating();
         // Keep scrollbars thin and low-contrast, even while hovered.
         scroll_style.bar_width = 3.2;
@@ -8604,52 +8609,65 @@ impl AdeApp {
         }
     }
 
-    fn send_saved_message_to_terminal(&mut self, terminal_id: u64, message: &str) {
+    fn send_saved_message_to_terminal(
+        &mut self,
+        ctx: &egui::Context,
+        terminal_id: u64,
+        message: &str,
+    ) {
         let mut submitted_factory_prompt = false;
         let mut submitted_codex_prompt = false;
         let mut submitted_opencode_prompt = false;
         let mut committed_codex_reply = false;
-        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
-            self.status_line = "Target terminal not found".to_owned();
-            return;
+        let destination_title = {
+            let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+                self.status_line = "Target terminal not found".to_owned();
+                return;
+            };
+
+            if terminal.exited {
+                self.status_line = format!("{} is exited", terminal.title);
+                return;
+            }
+
+            let destination_title = terminal.title.clone();
+            let mut outbound = message.as_bytes().to_vec();
+            outbound.push(b'\r');
+            terminal.runtime.send_bytes(outbound);
+            Self::clear_terminal_selection(terminal);
+            Self::append_pending_line(&mut terminal.pending_line_for_title, message);
+            let line = std::mem::take(&mut terminal.pending_line_for_title);
+            if let Some(sanitized) = terminal_title_candidate(&line) {
+                terminal.full_title = sanitized;
+                terminal.title = update_terminal_title(&line, terminal.id as usize, TITLE_MAX_LEN);
+            }
+            let has_non_empty_line = !message.trim().is_empty();
+            if terminal.factory_droid_session_active && has_non_empty_line {
+                submitted_factory_prompt = true;
+            }
+            if terminal.ai_session.tool == Some(AiCliTool::CodexCli)
+                && terminal.ai_session.status == AiCliStatus::Attention
+                && has_non_empty_line
+            {
+                committed_codex_reply = true;
+            }
+            if terminal.codex_session_active && has_non_empty_line {
+                submitted_codex_prompt = true;
+            }
+            if terminal.ai_session.tool == Some(AiCliTool::OpenCode) && has_non_empty_line {
+                submitted_opencode_prompt = true;
+            }
+
+            // Ensure the terminal is visible and collect recent_inputs reference
+            terminal.in_main_view = true;
+            Self::push_recent_input(&mut terminal.recent_inputs, message);
+            terminal.dirty = true;
+            destination_title
         };
 
-        if terminal.exited {
-            self.status_line = format!("{} is exited", terminal.title);
-            return;
-        }
-
-        let destination_title = terminal.title.clone();
-        let mut outbound = message.as_bytes().to_vec();
-        outbound.push(b'\r');
-        terminal.runtime.send_bytes(outbound);
-        Self::clear_terminal_selection(terminal);
-        Self::append_pending_line(&mut terminal.pending_line_for_title, message);
-        let line = std::mem::take(&mut terminal.pending_line_for_title);
-        if let Some(sanitized) = terminal_title_candidate(&line) {
-            terminal.full_title = sanitized;
-            terminal.title = update_terminal_title(&line, terminal.id as usize, TITLE_MAX_LEN);
-        }
-        let has_non_empty_line = !message.trim().is_empty();
-        if terminal.factory_droid_session_active && has_non_empty_line {
-            submitted_factory_prompt = true;
-        }
-        if terminal.ai_session.tool == Some(AiCliTool::CodexCli)
-            && terminal.ai_session.status == AiCliStatus::Attention
-            && has_non_empty_line
-        {
-            committed_codex_reply = true;
-        }
-        if terminal.codex_session_active && has_non_empty_line {
-            submitted_codex_prompt = true;
-        }
-        if terminal.ai_session.tool == Some(AiCliTool::OpenCode) && has_non_empty_line {
-            submitted_opencode_prompt = true;
-        }
-
-        Self::push_recent_input(&mut terminal.recent_inputs, message);
-
-        terminal.dirty = true;
+        // Update layout and activate terminal so user sees the result
+        self.bump_layout_epoch();
+        self.set_active_terminal(ctx, Some(terminal_id));
         self.status_line = format!("Sent saved message to {}", destination_title);
 
         if committed_codex_reply && !submitted_codex_prompt {
@@ -8685,10 +8703,15 @@ impl AdeApp {
     const RECENT_INPUTS_MAX: usize = 5;
 
     fn push_recent_input(recent_inputs: &mut VecDeque<String>, message: &str) {
-        if message.trim().is_empty() {
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
             return;
         }
-        recent_inputs.push_front(message.to_owned());
+        // Skip messages starting with "/" (commands/slashes)
+        if trimmed.starts_with('/') {
+            return;
+        }
+        recent_inputs.push_front(trimmed.to_owned());
         while recent_inputs.len() > Self::RECENT_INPUTS_MAX {
             recent_inputs.pop_back();
         }
@@ -8978,7 +9001,7 @@ impl AdeApp {
                                 self.draw_settings_launchers_section(ui, changes);
                             }
                             SettingsSection::SavedMessages => {
-                                self.draw_settings_saved_messages_section(ui, changes);
+                                self.draw_settings_saved_messages_section(ctx, ui, changes);
                             }
                             SettingsSection::Diagnostics => {
                                 self.draw_settings_diagnostics_section(ctx, ui, diagnostics);
@@ -9404,6 +9427,7 @@ impl AdeApp {
 
     fn draw_settings_saved_messages_section(
         &mut self,
+        ctx: &egui::Context,
         ui: &mut Ui,
         changes: &mut SettingsEditOutcome,
     ) {
@@ -9587,7 +9611,9 @@ impl AdeApp {
 
             if let (Some(terminal_id), Some(message)) = (send_target_terminal, send_message_request)
             {
-                self.send_saved_message_to_terminal(terminal_id, &message);
+                self.send_saved_message_to_terminal(ctx, terminal_id, &message);
+                // Close settings popup so the terminal becomes visible to the user
+                self.show_settings_popup = false;
             }
         }
     }
@@ -10044,31 +10070,6 @@ impl AdeApp {
         egui::vec2(width.max(1.0), height.max(1.0))
     }
 
-    fn activity_rail_ai_badge_model(&self) -> Option<AiBadgeModel> {
-        let selected_terminal = self
-            .terminals
-            .values()
-            .filter(|terminal| terminal.ai_session.status != AiCliStatus::Inactive)
-            .min_by_key(|terminal| {
-                (
-                    match terminal.ai_session.status {
-                        AiCliStatus::Attention => 0u8,
-                        AiCliStatus::Running => 1,
-                        AiCliStatus::Inactive => 2,
-                    },
-                    (self.active_terminal != Some(terminal.id)) as u8,
-                    terminal.id,
-                )
-            })?;
-
-        let mut badge = AiBadgeModel::from_terminal(selected_terminal);
-        badge.tooltip_lines.push(format!(
-            "Terminal: {}",
-            terminal_display_label(&selected_terminal.full_title, selected_terminal.exited)
-        ));
-        Some(badge)
-    }
-
     fn draw_activity_rail(&mut self, ctx: &egui::Context) -> Option<egui::Rect> {
         let response = egui::SidePanel::left("activity_rail")
             .resizable(false)
@@ -10095,7 +10096,6 @@ impl AdeApp {
                 let diagnostics = self.factory_droid_transport_diagnostics();
                 let settings_tooltip = diagnostics.settings_tooltip_text();
                 let shows_settings_warning_badge = diagnostics.shows_settings_warning_badge();
-                let activity_ai_badge = self.activity_rail_ai_badge_model();
 
                 ui.with_layout(Layout::top_down(Align::Center), |ui| {
                     ui.add_space(4.0);
@@ -10148,26 +10148,8 @@ impl AdeApp {
                         should_persist = true;
                     }
 
-                    let badge_slot_height = if activity_ai_badge.is_some() {
-                        22.0
-                    } else {
-                        0.0
-                    };
-                    let footer_space =
-                        (ui.available_height() - CONTROL_ROW_HEIGHT - badge_slot_height).max(0.0);
+                    let footer_space = (ui.available_height() - CONTROL_ROW_HEIGHT).max(0.0);
                     ui.add_space(footer_space);
-
-                    if let Some(ai_badge) = activity_ai_badge.as_ref() {
-                        ui.vertical_centered(|ui| {
-                            let response = draw_ai_badge(ui, ai_badge);
-                            response.on_hover_ui(|ui| {
-                                for line in &ai_badge.tooltip_lines {
-                                    ui.label(line);
-                                }
-                            });
-                        });
-                        ui.add_space(6.0);
-                    }
 
                     let settings_response = activity_rail_icon_button(
                         ui,
@@ -11228,7 +11210,7 @@ impl AdeApp {
             };
 
             if let Some(message) = send_message {
-                self.send_saved_message_to_terminal(terminal_entry_id, &message);
+                self.send_saved_message_to_terminal(ctx, terminal_entry_id, &message);
             }
 
             if visibility_changed {
@@ -17309,18 +17291,69 @@ mod tests {
 
     #[test]
     fn empty_saved_message_keeps_previous_title() {
+        let ctx = Context::default();
         let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
         let terminal = app.terminals.get_mut(&1).expect("terminal 1");
         terminal.title = "git status".to_owned();
         terminal.full_title = "git status".to_owned();
 
-        app.send_saved_message_to_terminal(1, "   ");
+        app.send_saved_message_to_terminal(&ctx, 1, "   ");
 
         let terminal = app.terminals.get(&1).expect("terminal 1");
         assert_eq!(terminal.title, "git status");
         assert_eq!(terminal.full_title, "git status");
         assert!(terminal.pending_line_for_title.is_empty());
         assert!(terminal.dirty);
+    }
+
+    #[test]
+    fn enter_key_adds_message_to_recent_inputs() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+        assert!(terminal.recent_inputs.is_empty());
+
+        // Type a message and press Enter
+        app.route_active_terminal_input(&ctx, vec![Event::Text("cargo test".to_owned())]);
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.recent_inputs.len(), 1);
+        assert_eq!(terminal.recent_inputs[0], "cargo test");
+    }
+
+    #[test]
+    fn enter_key_does_not_add_slash_commands_to_recent_inputs() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+        assert!(terminal.recent_inputs.is_empty());
+
+        // Type a slash command and press Enter
+        app.route_active_terminal_input(&ctx, vec![Event::Text("/help".to_owned())]);
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        // Slash commands should NOT be added to recent_inputs
+        assert!(terminal.recent_inputs.is_empty());
     }
 
     #[test]
@@ -17350,12 +17383,13 @@ mod tests {
 
     #[test]
     fn saved_message_dollar_prefix_keeps_previous_title() {
+        let ctx = Context::default();
         let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
         let terminal = app.terminals.get_mut(&1).expect("terminal 1");
         terminal.title = "git status".to_owned();
         terminal.full_title = "git status".to_owned();
 
-        app.send_saved_message_to_terminal(1, "$ git status");
+        app.send_saved_message_to_terminal(&ctx, 1, "$ git status");
 
         let terminal = app.terminals.get(&1).expect("terminal 1");
         assert_eq!(terminal.title, "git status");
@@ -24143,6 +24177,50 @@ mod tests {
     }
 
     #[test]
+    fn push_recent_input_skips_slash_commands() {
+        let mut recent_inputs = VecDeque::new();
+
+        // Slash commands should be ignored
+        AdeApp::push_recent_input(&mut recent_inputs, "/help");
+        assert!(recent_inputs.is_empty());
+
+        AdeApp::push_recent_input(&mut recent_inputs, "/config");
+        assert!(recent_inputs.is_empty());
+
+        AdeApp::push_recent_input(&mut recent_inputs, "/");
+        assert!(recent_inputs.is_empty());
+
+        // Valid messages should still work
+        AdeApp::push_recent_input(&mut recent_inputs, "git status");
+        assert_eq!(recent_inputs.len(), 1);
+        assert_eq!(recent_inputs[0], "git status");
+
+        // Mixed: slash after valid should still be ignored
+        AdeApp::push_recent_input(&mut recent_inputs, "/settings");
+        assert_eq!(recent_inputs.len(), 1);
+
+        // Another valid message
+        AdeApp::push_recent_input(&mut recent_inputs, "cargo build");
+        assert_eq!(recent_inputs.len(), 2);
+        assert_eq!(recent_inputs[0], "cargo build");
+    }
+
+    #[test]
+    fn push_recent_input_trims_whitespace() {
+        let mut recent_inputs = VecDeque::new();
+
+        // Leading/trailing whitespace should be trimmed
+        AdeApp::push_recent_input(&mut recent_inputs, "  hello world  ");
+        assert_eq!(recent_inputs.len(), 1);
+        assert_eq!(recent_inputs[0], "hello world");
+
+        // Tabs and newlines should also be trimmed
+        AdeApp::push_recent_input(&mut recent_inputs, "\t\nclean message\n\t");
+        assert_eq!(recent_inputs.len(), 2);
+        assert_eq!(recent_inputs[0], "clean message");
+    }
+
+    #[test]
     fn recent_inputs_tooltip_text_shows_all_inputs() {
         let mut recent_inputs = VecDeque::new();
         // push_front: newest first
@@ -25428,79 +25506,6 @@ mod tests {
             &output,
             Color32::from_rgb(232, 184, 76)
         ));
-    }
-
-    #[test]
-    fn activity_rail_ai_badge_prefers_attention_and_includes_terminal_label() {
-        let mut app = test_app_with_ai_hooks(
-            [
-                (1, test_terminal_entry(1, 7)),
-                (2, test_terminal_entry(2, 7)),
-            ],
-            Some(1),
-        );
-        if let Some(entry) = app.terminals.get_mut(&1) {
-            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
-            entry.ai_session.status = AiCliStatus::Running;
-        }
-        if let Some(entry) = app.terminals.get_mut(&2) {
-            entry.ai_session.tool = Some(AiCliTool::CodexCli);
-            entry.ai_session.status = AiCliStatus::Attention;
-            entry.title = "Codex Wait".to_owned();
-            entry.full_title = "Codex Wait".to_owned();
-            entry.codex_attention_reason = Some(CodexAttentionReason::UserInputRequested);
-        }
-
-        let badge = app
-            .activity_rail_ai_badge_model()
-            .expect("expected global ai badge");
-
-        assert_eq!(badge.tool, Some(AiCliTool::CodexCli));
-        assert_eq!(badge.status, AiCliStatus::Attention);
-        assert_eq!(
-            badge.tooltip_lines,
-            vec![
-                "Codex CLI - Waiting for your reply...".to_owned(),
-                "Terminal: Codex Wait".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn activity_rail_ai_badge_prefers_active_terminal_for_status_ties() {
-        let mut app = test_app_with_ai_hooks(
-            [
-                (1, test_terminal_entry(1, 7)),
-                (2, test_terminal_entry(2, 7)),
-            ],
-            Some(2),
-        );
-        if let Some(entry) = app.terminals.get_mut(&1) {
-            entry.ai_session.tool = Some(AiCliTool::FactoryDroid);
-            entry.ai_session.status = AiCliStatus::Running;
-            entry.title = "First".to_owned();
-            entry.full_title = "First".to_owned();
-        }
-        if let Some(entry) = app.terminals.get_mut(&2) {
-            entry.ai_session.tool = Some(AiCliTool::CodexCli);
-            entry.ai_session.status = AiCliStatus::Running;
-            entry.title = "Second".to_owned();
-            entry.full_title = "Second".to_owned();
-        }
-
-        let badge = app
-            .activity_rail_ai_badge_model()
-            .expect("expected global ai badge");
-
-        assert_eq!(badge.tool, Some(AiCliTool::CodexCli));
-        assert_eq!(badge.status, AiCliStatus::Running);
-        assert_eq!(
-            badge.tooltip_lines,
-            vec![
-                "Codex CLI - Working...".to_owned(),
-                "Terminal: Second".to_owned(),
-            ]
-        );
     }
 
     #[test]
