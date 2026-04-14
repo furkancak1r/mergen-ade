@@ -354,6 +354,7 @@ struct NamedTrackedProcessIdentity {
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 enum TestCodexProcessProbe {
     Unavailable,
     Descendants(Vec<NamedTrackedProcessIdentity>),
@@ -1125,10 +1126,12 @@ impl TerminalRuntime {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn set_factory_droid_process_active_for_test(&mut self, active: Option<bool>) {
         self.forced_factory_droid_process_active = active;
     }
 
+    #[allow(dead_code)]
     pub(crate) fn set_codex_process_active_for_test(&mut self, active: Option<bool>) {
         self.set_forced_codex_process_probe_for_test(active.map(|active| {
             TestCodexProcessProbe::Descendants(
@@ -1160,6 +1163,7 @@ impl TerminalRuntime {
         )));
     }
 
+    #[allow(dead_code)]
     pub(crate) fn set_codex_descendant_processes_for_test(
         &mut self,
         descendants: Option<Vec<(TrackedProcessIdentity, &str)>>,
@@ -1177,6 +1181,7 @@ impl TerminalRuntime {
         }));
     }
 
+    #[allow(dead_code)]
     pub(crate) fn queue_codex_descendant_processes_after_next_input_for_test(
         &self,
         descendants: Vec<(TrackedProcessIdentity, &str)>,
@@ -1194,6 +1199,7 @@ impl TerminalRuntime {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn set_codex_process_probe_unavailable_for_test(&mut self) {
         self.set_forced_codex_process_probe_for_test(Some(TestCodexProcessProbe::Unavailable));
     }

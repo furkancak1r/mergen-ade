@@ -2420,7 +2420,6 @@ impl AdeApp {
 
         // Use local mutable variable for Window open state
         let open = Cell::new(true);
-        let screen = ctx.screen_rect();
         let window_size = egui::vec2(400.0, 150.0);
 
         // Window without close button (.open() removed) and simpler title
@@ -2442,29 +2441,43 @@ impl AdeApp {
                     ui.add_space(20.0);
                 });
 
-                // Right-aligned buttons: Evet, kapat on the right
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Evet, kapat button - rightmost (primary action)
-                    if ui
-                        .add_sized(
-                            [120.0, CONTROL_ROW_HEIGHT],
-                            egui::Button::new("Evet, kapat"),
-                        )
-                        .clicked()
-                    {
-                        open.set(false);
-                        should_exit.set(true);
-                    }
-                    // Spacing between buttons
-                    ui.add_space(24.0);
-                    // Vazgeç button - left of primary action
-                    if ui
-                        .add_sized([120.0, CONTROL_ROW_HEIGHT], egui::Button::new("Vazgeç"))
-                        .clicked()
-                    {
-                        open.set(false);
-                    }
-                });
+                // Full-width row with Vazgeç on left, Evet kapat on right
+                let row_width = ui.available_width();
+                let button_width = 120.0;
+                let gap = 24.0;
+                let remaining_space = (row_width - (button_width * 2.0) - gap).max(0.0);
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(row_width, CONTROL_ROW_HEIGHT),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        // Vazgeç button - leftmost
+                        if ui
+                            .add_sized(
+                                [button_width, CONTROL_ROW_HEIGHT],
+                                egui::Button::new("Vazgeç"),
+                            )
+                            .clicked()
+                        {
+                            open.set(false);
+                        }
+                        // Spacer to push Evet kapat to the right
+                        ui.add_space(remaining_space);
+                        // Gap between buttons
+                        ui.add_space(gap);
+                        // Evet, kapat button - rightmost (primary action)
+                        if ui
+                            .add_sized(
+                                [button_width, CONTROL_ROW_HEIGHT],
+                                egui::Button::new("Evet, kapat"),
+                            )
+                            .clicked()
+                        {
+                            open.set(false);
+                            should_exit.set(true);
+                        }
+                    },
+                );
             });
 
         // Handle exit after the closure
