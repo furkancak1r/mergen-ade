@@ -11660,9 +11660,10 @@ impl AdeApp {
                                 .map_or(false, |(pos, rect)| rect.contains(pos));
 
                             // Show centered tooltip under title when hovered
-                            // Keep open when pointer moves to tooltip, close after click
+                            // Keep open when pointer moves to tooltip (even when clicking)
+                            // This ensures clicks inside tooltip are captured before closing
                             let should_show_tooltip =
-                                !clicked_recently && (is_title_hovered || pointer_on_tooltip);
+                                pointer_on_tooltip || (!clicked_recently && is_title_hovered);
 
                             if should_show_tooltip
                                 && !terminal.exited
