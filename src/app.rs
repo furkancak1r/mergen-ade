@@ -11143,24 +11143,6 @@ impl AdeApp {
                 let row_height = ui.spacing().interact_size.y.max(CONTROL_ROW_HEIGHT);
                 let (row_rect, row_response) =
                     ui.allocate_exact_size(egui::vec2(row_width, row_height), Sense::click());
-                let hover_text = if terminal_data.exited {
-                    format!("{} (Exited)", label)
-                } else if terminal_data.recent_inputs.is_empty() {
-                    label.clone()
-                } else {
-                    // Avoid duplicate: if current label matches most recent input, just show history
-                    let history_text = recent_inputs_tooltip_text(&terminal_data.recent_inputs);
-                    let most_recent = terminal_data
-                        .recent_inputs
-                        .front()
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
-                    if most_recent == label {
-                        history_text
-                    } else {
-                        format!("{}\n\n{}", label, history_text)
-                    }
-                };
 
                 // Tooltip on selection area (row without action buttons)
                 let row_chrome = terminal_manager_row_chrome(active, row_response.hovered());
@@ -11634,26 +11616,6 @@ impl AdeApp {
                                 (ui.available_width() - trailing_width).max(0.0);
                             let title = terminal_display_label(&terminal.title, terminal.exited);
                             let title_font = egui::TextStyle::Body.resolve(ui.style());
-
-                            // Build hover text with recent inputs (same logic as Terminal Manager)
-                            let hover_text = if terminal.exited {
-                                format!("{} (Exited)", terminal.full_title)
-                            } else if terminal.recent_inputs.is_empty() {
-                                terminal.full_title.clone()
-                            } else {
-                                let history_text =
-                                    recent_inputs_tooltip_text(&terminal.recent_inputs);
-                                let most_recent = terminal
-                                    .recent_inputs
-                                    .front()
-                                    .map(|s| s.as_str())
-                                    .unwrap_or("");
-                                if most_recent == terminal.full_title {
-                                    history_text
-                                } else {
-                                    format!("{}\n\n{}", terminal.full_title, history_text)
-                                }
-                            };
 
                             // Use a horizontal layout with explicit width limit for title
                             let title_response = ui.add_sized(
@@ -14137,8 +14099,10 @@ fn capped_hover_text(text: &str, max_chars: usize) -> String {
     result
 }
 
+#[allow(dead_code)]
 const RECENT_INPUTS_HOVER_MAX_CHARS: usize = 100;
 
+#[allow(dead_code)]
 fn recent_inputs_tooltip_text(recent_inputs: &VecDeque<String>) -> String {
     if recent_inputs.is_empty() {
         return String::new();
