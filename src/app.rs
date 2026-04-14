@@ -2422,11 +2422,10 @@ impl AdeApp {
         let open = Cell::new(true);
         let screen = ctx.screen_rect();
         let window_size = egui::vec2(400.0, 150.0);
-        let mut open_ref = true;
 
-        egui::Window::new(format!("{} Kapat", icons::X))
+        // Window without close button (.open() removed) and simpler title
+        egui::Window::new("Kapatma Onayı")
             .id(egui::Id::new("exit_confirm_window"))
-            .open(&mut open_ref)
             .resizable(false)
             .collapsible(false)
             .movable(false)
@@ -2441,44 +2440,43 @@ impl AdeApp {
                             .color(TEXT_PRIMARY),
                     );
                     ui.add_space(20.0);
-                    ui.horizontal_centered(|ui| {
-                        // Vazgeç button - left side, fixed width
-                        if ui
-                            .add_sized([120.0, CONTROL_ROW_HEIGHT], egui::Button::new("Vazgeç"))
-                            .clicked()
-                        {
-                            open.set(false);
-                        }
-                        // Spacing between buttons
-                        ui.add_space(24.0);
-                        // Evet, kapat button - right side, fixed width
-                        if ui
-                            .add_sized(
-                                [120.0, CONTROL_ROW_HEIGHT],
-                                egui::Button::new("Evet, kapat"),
-                            )
-                            .clicked()
-                        {
-                            open.set(false);
-                            should_exit.set(true);
-                        }
-                    });
+                });
+
+                // Right-aligned buttons: Evet, kapat on the right
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Evet, kapat button - rightmost (primary action)
+                    if ui
+                        .add_sized(
+                            [120.0, CONTROL_ROW_HEIGHT],
+                            egui::Button::new("Evet, kapat"),
+                        )
+                        .clicked()
+                    {
+                        open.set(false);
+                        should_exit.set(true);
+                    }
+                    // Spacing between buttons
+                    ui.add_space(24.0);
+                    // Vazgeç button - left of primary action
+                    if ui
+                        .add_sized([120.0, CONTROL_ROW_HEIGHT], egui::Button::new("Vazgeç"))
+                        .clicked()
+                    {
+                        open.set(false);
+                    }
                 });
             });
 
-        // Sync the open_ref with Cell value
-        if !open.get() {
-            open_ref = false;
-        }
-
-        // Handle exit after the closure to avoid borrow issues
+        // Handle exit after the closure
         if should_exit.get() {
             self.allow_confirmed_close = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
-        // Update popup state based on Window close or button clicks
-        self.show_exit_confirm_popup = open_ref;
+        // Update popup state based on button clicks
+        if !open.get() {
+            self.show_exit_confirm_popup = false;
+        }
     }
 
     fn draw_transient_toast(&mut self, ctx: &egui::Context) {
