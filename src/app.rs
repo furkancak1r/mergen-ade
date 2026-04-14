@@ -11738,9 +11738,27 @@ impl AdeApp {
                                 pane_clicked = true;
                             }
 
-                            // Now add trailing labels with proper spacing (centered vertically)
+                            // Trailing labels with dynamic layout: kind label always visible, project name truncates
+                            // Use right-to-left layout to prioritize kind label visibility
+                            let trailing_available_width = ui.available_width();
+
+                            // Measure kind label width (always visible)
+                            let kind_galley =
+                                WidgetText::from(RichText::new(kind_label).size(14.5)).into_galley(
+                                    ui,
+                                    Some(egui::TextWrapMode::Extend),
+                                    f32::INFINITY,
+                                    egui::TextStyle::Body,
+                                );
+                            let kind_width = kind_galley.size().x;
+
+                            // Close button + spacing + kind label + spacing
+                            let reserved_width = 24.0 + 8.0 + kind_width + 6.0;
+                            let project_available_width =
+                                (trailing_available_width - reserved_width).max(50.0);
+
+                            // Project name takes remaining space and truncates
                             ui.add_space(8.0);
-                            let project_label_font = egui::TextStyle::Body.resolve(ui.style());
                             let project_label_response = ui.add(
                                 egui::Label::new(
                                     RichText::new(&project_label_text)
@@ -11749,23 +11767,23 @@ impl AdeApp {
                                 )
                                 .truncate(),
                             );
+                            let project_label_font = egui::TextStyle::Body.resolve(ui.style());
                             let _project_label_response = with_truncation_tooltip(
                                 ui,
                                 project_label_response,
                                 &project_name,
                                 &project_label_font,
                                 header_chrome.detail_color,
-                                ui.available_width(),
+                                project_available_width,
                             );
+
+                            // Kind label (Foreground/Background) - always visible
                             ui.add_space(6.0);
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(kind_label)
-                                        .size(14.5)
-                                        .color(header_chrome.detail_color),
-                                )
-                                .truncate(),
-                            );
+                            ui.add(egui::Label::new(
+                                RichText::new(kind_label)
+                                    .size(14.5)
+                                    .color(header_chrome.detail_color),
+                            ));
 
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if styled_icon_button(
