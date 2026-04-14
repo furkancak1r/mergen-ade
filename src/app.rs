@@ -11143,16 +11143,20 @@ impl AdeApp {
                     ui.allocate_exact_size(egui::vec2(row_width, row_height), Sense::click());
                 let hover_text = if terminal_data.exited {
                     format!("{} (Exited)", label)
+                } else if terminal_data.recent_inputs.is_empty() {
+                    label.clone()
                 } else {
-                    let base_text = label.clone();
-                    if terminal_data.recent_inputs.is_empty() {
-                        base_text
+                    // Avoid duplicate: if current label matches most recent input, just show history
+                    let history_text = recent_inputs_tooltip_text(&terminal_data.recent_inputs);
+                    let most_recent = terminal_data
+                        .recent_inputs
+                        .front()
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
+                    if most_recent == label {
+                        history_text
                     } else {
-                        format!(
-                            "{}\n\n{}",
-                            base_text,
-                            recent_inputs_tooltip_text(&terminal_data.recent_inputs)
-                        )
+                        format!("{}\n\n{}", label, history_text)
                     }
                 };
                 let row_response = row_response.on_hover_text(hover_text);
@@ -11241,12 +11245,8 @@ impl AdeApp {
                                     row_label_width,
                                 )
                                 .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                // Add recent inputs tooltip
-                                if !terminal_data.recent_inputs.is_empty() {
-                                    title_response.clone().on_hover_text(
-                                        recent_inputs_tooltip_text(&terminal_data.recent_inputs),
-                                    );
-                                }
+                                // Note: Recent inputs tooltip is handled by row-level hover,
+                                // not duplicated here to avoid showing duplicate info
 
                                 // Union all responses: ai badge, launcher icon, and title
                                 let mut combined_response = title_response;
@@ -17553,6 +17553,54 @@ mod tests {
         let terminal = app.terminals.get(&1).expect("terminal 1");
         assert_eq!(terminal.recent_inputs.len(), 1);
         assert_eq!(terminal.recent_inputs[0], "cargo test");
+    }
+
+    #[test]
+    fn sequential_messages_add_to_recent_inputs_in_order() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+        assert!(terminal.recent_inputs.is_empty());
+
+        // First message: "y"
+        app.route_active_terminal_input(&ctx, vec![Event::Text("y".to_owned())]);
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.recent_inputs.len(), 1);
+        assert_eq!(terminal.recent_inputs[0], "y");
+
+        // Second message: "x"
+        app.route_active_terminal_input(&ctx, vec![Event::Text("x".to_owned())]);
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.recent_inputs.len(), 2);
+        // push_front puts newest first: x, then y
+        assert_eq!(terminal.recent_inputs[0], "x");
+        assert_eq!(terminal.recent_inputs[1], "y");
+
+        // Tooltip should show "x\ny" without duplication
+        let tooltip = recent_inputs_tooltip_text(&terminal.recent_inputs);
+        assert_eq!(tooltip, "x\ny");
     }
 
     #[test]
