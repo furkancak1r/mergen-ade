@@ -11587,6 +11587,26 @@ impl AdeApp {
                             let title = terminal_display_label(&terminal.title, terminal.exited);
                             let title_font = egui::TextStyle::Body.resolve(ui.style());
 
+                            // Build hover text with recent inputs (same logic as Terminal Manager)
+                            let hover_text = if terminal.exited {
+                                format!("{} (Exited)", terminal.full_title)
+                            } else if terminal.recent_inputs.is_empty() {
+                                terminal.full_title.clone()
+                            } else {
+                                let history_text =
+                                    recent_inputs_tooltip_text(&terminal.recent_inputs);
+                                let most_recent = terminal
+                                    .recent_inputs
+                                    .front()
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("");
+                                if most_recent == terminal.full_title {
+                                    history_text
+                                } else {
+                                    format!("{}\n\n{}", terminal.full_title, history_text)
+                                }
+                            };
+
                             // Use a horizontal layout with explicit width limit for title
                             let title_response = ui.add_sized(
                                 egui::vec2(available_for_title.max(50.0), 20.0),
@@ -11598,15 +11618,21 @@ impl AdeApp {
                                 .truncate()
                                 .sense(Sense::click()),
                             );
-                            let title_response = with_truncation_tooltip(
-                                ui,
-                                title_response,
-                                &terminal.full_title,
-                                &title_font,
-                                TEXT_PRIMARY,
-                                available_for_title,
-                            )
-                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            // Apply hover tooltip (recent inputs or truncation)
+                            let title_response =
+                                if !terminal.exited && !terminal.recent_inputs.is_empty() {
+                                    title_response.on_hover_text(hover_text)
+                                } else {
+                                    with_truncation_tooltip(
+                                        ui,
+                                        title_response,
+                                        &terminal.full_title,
+                                        &title_font,
+                                        TEXT_PRIMARY,
+                                        available_for_title,
+                                    )
+                                }
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
                             if title_response.clicked() {
                                 pane_clicked = true;
                             }
