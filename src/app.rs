@@ -896,6 +896,8 @@ pub struct AdeApp {
     terminal_events_rx: Receiver<TerminalUiEvent>,
     ai_hook_manager: Option<Arc<AiHookManager>>,
     show_settings_popup: bool,
+    show_exit_confirm_popup: bool,
+    allow_confirmed_close: bool,
     active_settings_section: SettingsSection,
     settings_diagnostics_expanded: bool,
     saved_message_drafts: BTreeMap<u64, String>,
@@ -2380,6 +2382,74 @@ impl AdeApp {
             .and_then(|toast| (now <= toast.expires_at).then_some(toast.message.as_str()))
     }
 
+    fn draw_exit_confirm_popup(&mut self, ctx: &egui::Context) {
+        if !self.show_exit_confirm_popup {
+            return;
+        }
+
+        // Dark overlay backdrop
+        egui::Area::new("exit_confirm_overlay".into())
+            .fixed_pos(egui::pos2(0.0, 0.0))
+            .order(egui::Order::Background)
+            .interactable(true)
+            .show(ctx, |ui| {
+                let screen = ctx.screen_rect();
+                let response = ui.allocate_rect(screen, egui::Sense::click());
+                ui.painter().rect_filled(
+                    screen,
+                    0.0,
+                    Color32::from_rgba_premultiplied(0, 0, 0, 140),
+                );
+                // Click outside closes popup without exiting
+                if response.clicked() {
+                    self.show_exit_confirm_popup = false;
+                }
+            });
+
+        let mut open = self.show_exit_confirm_popup;
+        if !open {
+            return;
+        }
+
+        let screen = ctx.screen_rect();
+        let window_size = egui::vec2(360.0, 140.0);
+
+        egui::Window::new(format!("{} Kapat", icons::X))
+            .id(egui::Id::new("exit_confirm_window"))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .movable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size(window_size)
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Program kapatılacaktır, emin misiniz?")
+                            .size(16.0)
+                            .color(TEXT_PRIMARY),
+                    );
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(20.0);
+                        if ui.button("Vazgeç").clicked() {
+                            self.show_exit_confirm_popup = false;
+                        }
+                        ui.add_space(16.0);
+                        if ui.button("Evet, kapat").clicked() {
+                            self.show_exit_confirm_popup = false;
+                            self.allow_confirmed_close = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        ui.add_space(20.0);
+                    });
+                });
+            });
+
+        self.show_exit_confirm_popup = open;
+    }
+
     fn draw_transient_toast(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|input| input.time);
         let Some(message) =
@@ -2517,6 +2587,8 @@ impl AdeApp {
             terminal_events_rx,
             ai_hook_manager,
             show_settings_popup: false,
+            show_exit_confirm_popup: false,
+            allow_confirmed_close: false,
             active_settings_section: SettingsSection::General,
             settings_diagnostics_expanded: false,
             saved_message_drafts: BTreeMap::new(),
@@ -6851,11 +6923,13 @@ impl AdeApp {
         popup_open: bool,
         context_menu_open: bool,
         show_settings_popup: bool,
+        show_exit_confirm_popup: bool,
         wants_keyboard_input: bool,
     ) -> bool {
         text_input_has_focus
             || popup_open
             || context_menu_open
+            || show_exit_confirm_popup
             || (show_settings_popup && wants_keyboard_input)
     }
 
@@ -6865,6 +6939,7 @@ impl AdeApp {
             ctx.memory(|mem| mem.any_popup_open()),
             ctx.is_context_menu_open(),
             self.show_settings_popup,
+            self.show_exit_confirm_popup,
             ctx.wants_keyboard_input(),
         )
     }
@@ -12179,6 +12254,20 @@ impl eframe::App for AdeApp {
         self.ensure_theme_initialized(ctx);
         self.apply_initial_window_bounds(ctx);
 
+        // Handle window close request - show confirmation dialog unless already confirmed
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.allow_confirmed_close {
+                // User confirmed - allow close to proceed, reset flag
+                self.allow_confirmed_close = false;
+            } else {
+                // Cancel the close and show confirmation popup
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.show_exit_confirm_popup = true;
+                ctx.request_repaint();
+                return;
+            }
+        }
+
         // Phase 1: Capture and route input BEFORE polling/rendering
         // This reduces input→echo latency by handling input before heavy per-frame work
         let mut terminal_events = self.take_buffered_terminal_input();
@@ -12225,6 +12314,7 @@ impl eframe::App for AdeApp {
             self.draw_sidebar_seam_fix(ctx, activity_rect, explorer_rect);
         }
         self.draw_settings_popup(ctx);
+        self.draw_exit_confirm_popup(ctx);
 
         self.draw_transient_toast(ctx);
     }
@@ -16653,20 +16743,29 @@ mod tests {
 
     #[test]
     fn ui_keyboard_ownership_blocks_terminal_capture() {
+        // text_input_has_focus
         assert!(AdeApp::ui_owns_keyboard_state(
-            true, false, false, false, false
+            true, false, false, false, false, false
         ));
+        // popup_open
         assert!(AdeApp::ui_owns_keyboard_state(
-            false, true, false, false, false
+            false, true, false, false, false, false
         ));
+        // context_menu_open
         assert!(AdeApp::ui_owns_keyboard_state(
-            false, false, true, false, false
+            false, false, true, false, false, false
         ));
+        // show_settings_popup && wants_keyboard_input
         assert!(AdeApp::ui_owns_keyboard_state(
-            false, false, false, true, true
+            false, false, false, true, false, true
         ));
+        // show_exit_confirm_popup
+        assert!(AdeApp::ui_owns_keyboard_state(
+            false, false, false, false, true, false
+        ));
+        // none - should not own keyboard
         assert!(!AdeApp::ui_owns_keyboard_state(
-            false, false, false, false, false
+            false, false, false, false, false, false
         ));
 
         assert!(!AdeApp::should_capture_terminal_keyboard_state(true, true));
@@ -17221,6 +17320,62 @@ mod tests {
             window_rect.bottom() <= screen_rect.bottom(),
             "window_rect={window_rect:?} screen_rect={screen_rect:?}"
         );
+    }
+
+    #[test]
+    fn exit_confirm_popup_initial_state_is_hidden() {
+        let app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        assert!(!app.show_exit_confirm_popup);
+        assert!(!app.allow_confirmed_close);
+    }
+
+    #[test]
+    fn exit_confirm_popup_can_be_shown() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.show_exit_confirm_popup = true;
+        assert!(app.show_exit_confirm_popup);
+    }
+
+    #[test]
+    fn exit_confirm_popup_allows_confirmed_close() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.allow_confirmed_close = true;
+        assert!(app.allow_confirmed_close);
+    }
+
+    #[test]
+    fn exit_confirm_popup_blocks_terminal_keyboard_capture() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.show_exit_confirm_popup = true;
+
+        // UI should own keyboard when exit confirm popup is shown
+        assert!(app.ui_owns_keyboard(&ctx));
+    }
+
+    #[test]
+    fn exit_confirm_popup_closes_on_cancel() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.show_exit_confirm_popup = true;
+
+        // Simulate clicking cancel
+        app.show_exit_confirm_popup = false;
+
+        assert!(!app.show_exit_confirm_popup);
+        assert!(!app.allow_confirmed_close);
+    }
+
+    #[test]
+    fn exit_confirm_popup_triggers_close_when_confirmed() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.show_exit_confirm_popup = true;
+
+        // Simulate clicking "Yes, close"
+        app.show_exit_confirm_popup = false;
+        app.allow_confirmed_close = true;
+
+        assert!(!app.show_exit_confirm_popup);
+        assert!(app.allow_confirmed_close);
     }
 
     #[test]
@@ -23874,6 +24029,8 @@ mod tests {
             terminal_events_tx,
             terminal_events_rx,
             show_settings_popup: false,
+            show_exit_confirm_popup: false,
+            allow_confirmed_close: false,
             active_settings_section: SettingsSection::General,
             settings_diagnostics_expanded: false,
             saved_message_drafts: BTreeMap::new(),
