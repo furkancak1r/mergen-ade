@@ -2387,6 +2387,12 @@ impl AdeApp {
             return;
         }
 
+        use std::cell::Cell;
+
+        // Track if popup should close (from overlay click or button clicks)
+        let should_close = Cell::new(false);
+        let should_exit = Cell::new(false);
+
         // Dark overlay backdrop
         egui::Area::new("exit_confirm_overlay".into())
             .fixed_pos(egui::pos2(0.0, 0.0))
@@ -2402,21 +2408,25 @@ impl AdeApp {
                 );
                 // Click outside closes popup without exiting
                 if response.clicked() {
-                    self.show_exit_confirm_popup = false;
+                    should_close.set(true);
                 }
             });
 
-        let mut open = self.show_exit_confirm_popup;
-        if !open {
+        // If overlay was clicked, close popup immediately
+        if should_close.get() {
+            self.show_exit_confirm_popup = false;
             return;
         }
 
+        // Use local mutable variable for Window open state
+        let open = Cell::new(true);
         let screen = ctx.screen_rect();
-        let window_size = egui::vec2(360.0, 140.0);
+        let window_size = egui::vec2(400.0, 150.0);
+        let mut open_ref = true;
 
         egui::Window::new(format!("{} Kapat", icons::X))
             .id(egui::Id::new("exit_confirm_window"))
-            .open(&mut open)
+            .open(&mut open_ref)
             .resizable(false)
             .collapsible(false)
             .movable(false)
@@ -2424,30 +2434,51 @@ impl AdeApp {
             .fixed_size(window_size)
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(8.0);
+                    ui.add_space(12.0);
                     ui.label(
                         egui::RichText::new("Program kapatılacaktır, emin misiniz?")
                             .size(16.0)
                             .color(TEXT_PRIMARY),
                     );
-                    ui.add_space(16.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(20.0);
-                        if ui.button("Vazgeç").clicked() {
-                            self.show_exit_confirm_popup = false;
+                    ui.add_space(20.0);
+                    ui.horizontal_centered(|ui| {
+                        // Vazgeç button - left side, fixed width
+                        if ui
+                            .add_sized([120.0, CONTROL_ROW_HEIGHT], egui::Button::new("Vazgeç"))
+                            .clicked()
+                        {
+                            open.set(false);
                         }
-                        ui.add_space(16.0);
-                        if ui.button("Evet, kapat").clicked() {
-                            self.show_exit_confirm_popup = false;
-                            self.allow_confirmed_close = true;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        // Spacing between buttons
+                        ui.add_space(24.0);
+                        // Evet, kapat button - right side, fixed width
+                        if ui
+                            .add_sized(
+                                [120.0, CONTROL_ROW_HEIGHT],
+                                egui::Button::new("Evet, kapat"),
+                            )
+                            .clicked()
+                        {
+                            open.set(false);
+                            should_exit.set(true);
                         }
-                        ui.add_space(20.0);
                     });
                 });
             });
 
-        self.show_exit_confirm_popup = open;
+        // Sync the open_ref with Cell value
+        if !open.get() {
+            open_ref = false;
+        }
+
+        // Handle exit after the closure to avoid borrow issues
+        if should_exit.get() {
+            self.allow_confirmed_close = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        // Update popup state based on Window close or button clicks
+        self.show_exit_confirm_popup = open_ref;
     }
 
     fn draw_transient_toast(&mut self, ctx: &egui::Context) {
