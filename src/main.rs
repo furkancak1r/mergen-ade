@@ -23,6 +23,111 @@ use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::time::Duration;
 
+/// Renderer backend selection modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RendererMode {
+    /// Try wgpu first, fall back to glow on failure.
+    Auto,
+    /// Force wgpu backend.
+    Wgpu,
+    /// Force glow (OpenGL) backend.
+    Glow,
+}
+
+impl RendererMode {
+    /// Parse from environment variable `MERGEN_RENDERER`.
+    fn from_env() -> Self {
+        match std::env::var("MERGEN_RENDERER").as_deref() {
+            Ok("wgpu") => Self::Wgpu,
+            Ok("glow") => Self::Glow,
+            Ok("auto") => Self::Auto,
+            _ => {
+                // Default: auto mode (wgpu preferred, fallback to glow)
+                Self::Auto
+            }
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Wgpu => "wgpu",
+            Self::Glow => "glow",
+        }
+    }
+}
+
+/// Build NativeOptions with the specified renderer.
+fn build_native_options(renderer: eframe::Renderer) -> eframe::NativeOptions {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1600.0, 980.0])
+        .with_min_inner_size([980.0, 620.0])
+        .with_clamp_size_to_monitor_size(true)
+        .with_title("Mergen ADE");
+    if let Some(app_icon) = load_app_icon() {
+        viewport = viewport.with_icon(app_icon);
+    }
+
+    eframe::NativeOptions {
+        viewport,
+        centered: true,
+        persist_window: false,
+        renderer,
+        ..Default::default()
+    }
+}
+
+/// Create the app creator closure for eframe.
+fn make_app_creator() -> eframe::AppCreator<'static> {
+    Box::new(|cc| {
+        let shield = match panic::catch_unwind(AssertUnwindSafe(|| app::AdeApp::bootstrap(cc))) {
+            Ok(app) => CrashShieldApp::new(app),
+            Err(payload) => CrashShieldApp::from_startup_error(format!(
+                "startup panicked: {}",
+                panic_payload_to_string(&*payload)
+            )),
+        };
+        Ok(Box::new(shield))
+    })
+}
+
+/// Run the app with the specified renderer mode.
+fn run_with_renderer(mode: RendererMode) -> Result<(), eframe::Error> {
+    match mode {
+        RendererMode::Wgpu => {
+            log::info!("Starting Mergen ADE with wgpu renderer (forced)");
+            let options = build_native_options(eframe::Renderer::Wgpu);
+            eframe::run_native("Mergen ADE", options, make_app_creator())
+        }
+        RendererMode::Glow => {
+            log::info!("Starting Mergen ADE with glow renderer (forced)");
+            let options = build_native_options(eframe::Renderer::Glow);
+            eframe::run_native("Mergen ADE", options, make_app_creator())
+        }
+        RendererMode::Auto => {
+            log::info!("Starting Mergen ADE in auto mode (wgpu preferred, fallback to glow)");
+
+            // First try: wgpu
+            log::info!("Attempting wgpu renderer...");
+            let wgpu_options = build_native_options(eframe::Renderer::Wgpu);
+            match eframe::run_native("Mergen ADE", wgpu_options, make_app_creator()) {
+                Ok(()) => {
+                    log::info!("wgpu renderer initialized successfully");
+                    Ok(())
+                }
+                Err(e) => {
+                    log::warn!("wgpu renderer failed to initialize: {e}");
+                    log::info!("Falling back to glow (OpenGL) renderer...");
+
+                    // Second try: glow fallback
+                    let glow_options = build_native_options(eframe::Renderer::Glow);
+                    eframe::run_native("Mergen ADE", glow_options, make_app_creator())
+                }
+            }
+        }
+    }
+}
+
 fn setup_panic_hook() {
     use std::io::Write as _;
 
@@ -282,37 +387,15 @@ fn main() -> Result<(), eframe::Error> {
     setup_panic_hook();
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1600.0, 980.0])
-        .with_min_inner_size([980.0, 620.0])
-        .with_clamp_size_to_monitor_size(true)
-        .with_title("Mergen ADE");
-    if let Some(app_icon) = load_app_icon() {
-        viewport = viewport.with_icon(app_icon);
-    }
 
-    let options = eframe::NativeOptions {
-        viewport,
-        centered: true,
-        persist_window: false,
-        ..Default::default()
-    };
+    // Determine renderer mode from environment
+    let renderer_mode = RendererMode::from_env();
+    log::info!(
+        "Renderer mode: {} (from MERGEN_RENDERER env var)",
+        renderer_mode.as_str()
+    );
 
-    eframe::run_native(
-        "Mergen ADE",
-        options,
-        Box::new(|cc| {
-            let shield = match panic::catch_unwind(AssertUnwindSafe(|| app::AdeApp::bootstrap(cc)))
-            {
-                Ok(app) => CrashShieldApp::new(app),
-                Err(payload) => CrashShieldApp::from_startup_error(format!(
-                    "startup panicked: {}",
-                    panic_payload_to_string(&*payload)
-                )),
-            };
-            Ok(Box::new(shield))
-        }),
-    )
+    run_with_renderer(renderer_mode)
 }
 
 #[cfg(test)]

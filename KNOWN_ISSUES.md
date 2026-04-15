@@ -1,5 +1,29 @@
 ### Known Issues & Fix Log
 
+#### Renderer backend selection now supports wgpu with glow fallback {#renderer-backend-wgpu-glow-fallback}
+- Date: 2026-04-15
+- Context: main/Windows rendering backend stability
+- Error signature: `Application crashes in igxelpicd64.dll (Intel OpenGL driver) during extended overnight sessions; no fallback to safer rendering backend.`
+- Symptoms/Impact: Mergen ADE would crash when left open overnight on systems with Intel Iris Xe Graphics using OpenGL backend. Crash dumps showed faults in `igxelpicd64.dll` with exception `0xc0000005`. No automatic recovery or fallback mechanism existed.
+- Root cause: 
+  - The application was compiled with only the `glow` (OpenGL) backend enabled in `eframe`.
+  - Intel's OpenGL driver (`igxelpicd64.dll` v32.0.101.5542) showed instability during extended GPU-intensive sessions with continuous repaint cycles (16ms fallback refresh).
+  - No mechanism existed to automatically fall back to a more stable backend when the primary backend failed.
+- Resolution:
+  - Added `wgpu` feature alongside existing `glow` in `Cargo.toml` to enable dual-backend support.
+  - Implemented `RendererMode` enum with three modes: `Auto`, `Wgpu`, `Glow`.
+  - Created `MERGEN_RENDERER` environment variable for user control (`auto`, `wgpu`, `glow`).
+  - In `Auto` mode: attempts `wgpu` first (better stability on Intel), falls back to `glow` on failure.
+  - Extracted `NativeOptions` construction to `build_native_options()` helper for DRY code.
+  - Extracted app creator closure to `make_app_creator()` function to allow multiple launch attempts.
+  - Added startup logging to track which renderer was selected and whether fallback occurred.
+- Prevent recurrence:
+  - Always test renderer changes on target hardware (especially Intel integrated graphics).
+  - Monitor `WER` (Windows Error Reporting) logs for `igxelpicd64.dll` or similar driver crashes.
+  - When adding new GPU-intensive features, consider testing with both `wgpu` and `glow` backends.
+  - Document renderer override environment variable in user-facing documentation.
+- Files/Commands touched: `Cargo.toml`, `src/main.rs`, `cargo build --release --target x86_64-pc-windows-msvc`
+
 #### Codex terminal scrolls too far down on activation when in bottom row {#codex-terminal-scroll-issue-fixed}
 - Date: 2026-04-13
 - Context: main/Windows terminal manager with Codex CLI sessions in bottom-row tiles
