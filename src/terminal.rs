@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -10,6 +11,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::codex::codex_env_pairs;
 use crate::hooks::{AiCliStatus, AiCliTool, AiHookEvent};
@@ -54,7 +56,7 @@ use windows_sys::Win32::System::Threading::{
 use crate::models::ShellKind;
 
 const DEFAULT_SCROLLBACK: usize = 1000;
-const MAX_SNAPSHOT_ROWS: usize = 500;
+const MAX_SNAPSHOT_ROWS: usize = 1000;
 const IO_BUFFER_SIZE: usize = 16 * 1024;
 #[cfg(target_os = "windows")]
 const GRACEFUL_TERMINATION_TIMEOUT_MS: u32 = 300;
@@ -661,7 +663,7 @@ impl TerminalRuntime {
         let Some(terminal) = terminal else {
             return false;
         };
-        terminal.is_mouse_grabbed() || terminal.is_alt_screen_active()
+        terminal.is_mouse_grabbed()
     }
 
     pub fn send_mouse_wheel(&self, event: TerminalWheelEvent) {
@@ -677,7 +679,7 @@ impl TerminalRuntime {
         }
 
         #[cfg(target_os = "windows")]
-        let snapshot = snapshot_processes().ok();
+        let snapshot = snapshot_processes_cached().ok();
 
         #[cfg(target_os = "windows")]
         if terminate_job_handle(&self.job_handle)? {
@@ -705,7 +707,7 @@ impl TerminalRuntime {
 
         #[cfg(target_os = "windows")]
         {
-            let Ok(snapshot) = snapshot_processes() else {
+            let Ok(snapshot) = snapshot_processes_cached() else {
                 return Some(false);
             };
             return Some(has_named_descendant_process(
@@ -735,7 +737,7 @@ impl TerminalRuntime {
 
         #[cfg(target_os = "windows")]
         {
-            let Ok(snapshot) = snapshot_processes() else {
+            let Ok(snapshot) = snapshot_processes_cached() else {
                 return None;
             };
             return codex_named_descendant_processes(
@@ -774,7 +776,7 @@ impl TerminalRuntime {
 
         #[cfg(target_os = "windows")]
         {
-            let Ok(snapshot) = snapshot_processes() else {
+            let Ok(snapshot) = snapshot_processes_cached() else {
                 return None;
             };
             return codex_named_descendant_processes(
@@ -807,7 +809,7 @@ impl TerminalRuntime {
 
         #[cfg(target_os = "windows")]
         {
-            let Ok(snapshot) = snapshot_processes() else {
+            let Ok(snapshot) = snapshot_processes_cached() else {
                 return None;
             };
             return descendant_process_identity_present(
@@ -827,7 +829,7 @@ impl TerminalRuntime {
     pub fn snapshot_opencode_descendant_processes(&self) -> Option<Vec<TrackedProcessIdentity>> {
         #[cfg(target_os = "windows")]
         {
-            let Ok(snapshot) = snapshot_processes() else {
+            let Ok(snapshot) = snapshot_processes_cached() else {
                 return None;
             };
             return opencode_named_descendant_processes(
@@ -856,7 +858,7 @@ impl TerminalRuntime {
     ) -> Option<Option<TrackedProcessIdentity>> {
         #[cfg(target_os = "windows")]
         {
-            let Ok(snapshot) = snapshot_processes() else {
+            let Ok(snapshot) = snapshot_processes_cached() else {
                 return None;
             };
             return opencode_named_descendant_processes(
@@ -879,7 +881,7 @@ impl TerminalRuntime {
     ) -> Option<bool> {
         #[cfg(target_os = "windows")]
         {
-            let Ok(snapshot) = snapshot_processes() else {
+            let Ok(snapshot) = snapshot_processes_cached() else {
                 return None;
             };
             return descendant_process_identity_present(
@@ -1703,6 +1705,45 @@ fn snapshot_processes() -> io::Result<Vec<ProcessSnapshotEntry>> {
     }
 }
 
+// Thread-local cache for process snapshots to avoid redundant syscalls
+// when multiple terminals are probed in the same poll tick.
+#[cfg(target_os = "windows")]
+thread_local! {
+    static PROCESS_SNAPSHOT_CACHE: RefCell<Option<(Instant, Vec<ProcessSnapshotEntry>)>> = RefCell::new(None);
+}
+
+#[cfg(target_os = "windows")]
+const PROCESS_SNAPSHOT_CACHE_TTL_MS: u64 = 250; // Cache valid for 250ms (increased from 50ms for better memory efficiency)
+
+/// Get process snapshot with caching - multiple calls within TTL return cached result.
+/// This significantly reduces overhead when probing multiple terminals in one poll tick.
+#[cfg(target_os = "windows")]
+fn snapshot_processes_cached() -> io::Result<Vec<ProcessSnapshotEntry>> {
+    PROCESS_SNAPSHOT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let now = Instant::now();
+
+        // Check if cache is still valid
+        if let Some((timestamp, entries)) = cache.as_ref() {
+            if now.duration_since(*timestamp) < Duration::from_millis(PROCESS_SNAPSHOT_CACHE_TTL_MS)
+            {
+                return Ok(entries.clone());
+            }
+        }
+
+        // Cache miss or expired - take fresh snapshot
+        let entries = snapshot_processes()?;
+        *cache = Some((now, entries.clone()));
+        Ok(entries)
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn snapshot_processes_cached() -> io::Result<Vec<ProcessSnapshotEntry>> {
+    // On non-Windows platforms, just return empty (no process tracking)
+    Ok(Vec::new())
+}
+
 #[cfg(target_os = "windows")]
 fn process_entry_executable_name(entry: &PROCESSENTRY32W) -> Option<String> {
     let len = entry
@@ -1966,58 +2007,8 @@ impl PendingVisibleFactoryStatus {
     }
 }
 
-#[derive(Debug, Default)]
-struct PendingVisibleCodexStatus {
-    buffer: String,
-}
-
-impl PendingVisibleCodexStatus {
-    #[cfg(test)]
-    fn extract_from_text(&mut self, text: &str) -> Option<String> {
-        self.extract_from_text_with_end_offset(text)
-            .map(|(status, _)| status)
-    }
-
-    fn extract_from_text_with_end_offset(&mut self, text: &str) -> Option<(String, usize)> {
-        if text.is_empty() {
-            return None;
-        }
-
-        let previous_buffer_len = self.buffer.len();
-        self.buffer.push_str(text);
-
-        if let Some((detected, end_offset)) = detect_visible_codex_status_with_end(&self.buffer) {
-            self.buffer.clear();
-            return Some((
-                detected.to_string(),
-                end_offset
-                    .saturating_sub(previous_buffer_len)
-                    .min(text.len()),
-            ));
-        }
-
-        self.truncate_to_limit();
-        None
-    }
-
-    fn truncate_to_limit(&mut self) {
-        let overflow = self
-            .buffer
-            .chars()
-            .count()
-            .saturating_sub(MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS);
-        if overflow == 0 {
-            return;
-        }
-
-        let mut char_indices = self.buffer.char_indices();
-        let split_at = char_indices
-            .nth(overflow - 1)
-            .map(|(index, ch)| index + ch.len_utf8())
-            .unwrap_or(0);
-        self.buffer.drain(..split_at);
-    }
-}
+// NOTE: PendingVisibleCodexStatus removed - Codex uses hook-only integration.
+// Visible UI detection is disabled for Codex to ensure strict hook-authoritative behavior.
 
 #[derive(Debug, Default)]
 struct PendingVisibleOpenCodeStatus {
@@ -2102,6 +2093,12 @@ fn detect_visible_opencode_status_with_end(text: &str) -> Option<(&'static str, 
         return Some(("opencode-interrupted-banner", end_offset));
     }
 
+    if let Some(end_offset) =
+        detect_visible_opencode_plan_mode_with_end(&collapsed, &collapsed_offsets)
+    {
+        return Some(("opencode-plan-mode", end_offset));
+    }
+
     None
 }
 
@@ -2173,6 +2170,19 @@ fn detect_visible_opencode_interrupted_banner_with_end(
         })
         .max()?;
     let end_char_index = collapsed[..help_end].chars().count().saturating_sub(1);
+    collapsed_offsets.get(end_char_index).copied()
+}
+
+fn detect_visible_opencode_plan_mode_with_end(
+    collapsed: &str,
+    collapsed_offsets: &[usize],
+) -> Option<usize> {
+    // OpenCode plan mode pattern: "plan mode - system reminder" (as a single header line)
+    // Require the strict hyphen-separated form so transcript text that casually mentions
+    // "plan mode" or quotes "system reminder" cannot flip the session into PlanModePrompt.
+    let plan_start = collapsed.find("plan mode - system reminder")?;
+    let end_offset = plan_start + "plan mode - system reminder".len();
+    let end_char_index = collapsed[..end_offset].chars().count().saturating_sub(1);
     collapsed_offsets.get(end_char_index).copied()
 }
 
@@ -2390,103 +2400,9 @@ fn find_prefixed_numeric_token_end(text: &str, prefix: char) -> Option<usize> {
     None
 }
 
-fn detect_visible_codex_status_with_end(text: &str) -> Option<(&'static str, usize)> {
-    let (projection, projection_offsets) = build_visible_status_projection(text);
-    let (collapsed, collapsed_offsets) =
-        collapse_projection_whitespace(&projection, &projection_offsets);
-
-    if let Some(end_offset) =
-        detect_visible_codex_interrupted_banner_with_end(&collapsed, &collapsed_offsets)
-    {
-        return Some(("codex-interrupted-banner", end_offset));
-    }
-
-    if let Some(end_offset) =
-        detect_visible_codex_question_prompt_with_end(&collapsed, &collapsed_offsets)
-    {
-        return Some(("codex-question-prompt", end_offset));
-    }
-
-    if let Some(end_offset) =
-        detect_visible_codex_plan_mode_prompt_with_end(&collapsed, &collapsed_offsets)
-    {
-        return Some(("codex-plan-mode-prompt", end_offset));
-    }
-
-    None
-}
-
-fn detect_visible_codex_question_prompt_with_end(
-    collapsed: &str,
-    collapsed_offsets: &[usize],
-) -> Option<usize> {
-    let question_start = collapsed.find("question ")?;
-    let counter_start = question_start + "question ".len();
-    let unanswered_start = collapsed[counter_start..]
-        .find("unanswered")
-        .map(|offset| counter_start + offset)?;
-    if !collapsed[counter_start..unanswered_start].contains('/') {
-        return None;
-    }
-
-    let enter_start = collapsed[unanswered_start..]
-        .find("enter to submit answer")
-        .map(|offset| unanswered_start + offset)?;
-    let esc_start = collapsed[enter_start..]
-        .find("esc to interrupt")
-        .map(|offset| enter_start + offset)?;
-    let latest_end = esc_start + "esc to interrupt".len();
-    let end_char_index = collapsed[..latest_end].chars().count().saturating_sub(1);
-    collapsed_offsets.get(end_char_index).copied()
-}
-
-fn detect_visible_codex_plan_mode_prompt_with_end(
-    collapsed: &str,
-    collapsed_offsets: &[usize],
-) -> Option<usize> {
-    let prompt_start = collapsed.find("implement this plan?")?;
-    let prompt_end = prompt_start + "implement this plan?".len();
-
-    let yes_end = collapsed[prompt_end..]
-        .find("yes, implement this plan")
-        .map(|offset| prompt_end + offset + "yes, implement this plan".len())?;
-    let no_end = collapsed[yes_end..]
-        .find("no, stay in plan mode")
-        .map(|offset| yes_end + offset + "no, stay in plan mode".len())?;
-    let confirm_end = collapsed[no_end..]
-        .find("press enter to confirm")
-        .map(|offset| no_end + offset + "press enter to confirm".len())?;
-    let escape_end = collapsed[confirm_end..]
-        .find("esc to go back")
-        .map(|offset| confirm_end + offset + "esc to go back".len())?;
-
-    let end_char_index = collapsed[..escape_end].chars().count().saturating_sub(1);
-    collapsed_offsets.get(end_char_index).copied()
-}
-
-fn detect_visible_codex_interrupted_banner_with_end(
-    collapsed: &str,
-    collapsed_offsets: &[usize],
-) -> Option<usize> {
-    let interrupted_start = collapsed.find("conversation interrupted")?;
-    let interrupted_end = interrupted_start + "conversation interrupted".len();
-
-    let detail_end = [
-        "tell the model what to do differently",
-        "something went wrong",
-        "/feedback",
-    ]
-    .into_iter()
-    .filter_map(|needle| {
-        collapsed[interrupted_end..]
-            .find(needle)
-            .map(|offset| interrupted_end + offset + needle.len())
-    })
-    .max()?;
-
-    let end_char_index = collapsed[..detail_end].chars().count().saturating_sub(1);
-    collapsed_offsets.get(end_char_index).copied()
-}
+// NOTE: All Codex visible UI detection functions removed.
+// Codex uses hook-only integration. Visible UI detection is disabled
+// to ensure strict hook-authoritative behavior.
 
 fn build_visible_status_projection(text: &str) -> (String, Vec<usize>) {
     let mut projection = String::with_capacity(text.len());
@@ -2616,7 +2532,6 @@ fn collect_ai_read_signals(
     manager: &AiHookManager,
     pending_osc_title: &mut PendingOscTitle,
     pending_visible_factory_status: &mut PendingVisibleFactoryStatus,
-    pending_visible_codex_status: &mut PendingVisibleCodexStatus,
     pending_visible_opencode_status: &mut PendingVisibleOpenCodeStatus,
 ) -> Vec<PendingAiReadSignal> {
     let text = String::from_utf8_lossy(bytes);
@@ -2685,22 +2600,8 @@ fn collect_ai_read_signals(
         });
     }
 
-    if manager
-        .session(terminal_id)
-        .and_then(|session| session.tool)
-        == Some(AiCliTool::CodexCli)
-    {
-        if let Some((chunk, end_offset)) =
-            pending_visible_codex_status.extract_from_text_with_end_offset(&text)
-        {
-            signals.push(PendingAiReadSignal {
-                text_offset: end_offset.min(text.len()),
-                kind: PendingAiReadSignalKind::RawChunk { chunk },
-            });
-        }
-    }
-
-    // Always run OpenCode visible status detection to catch completion signals
+    // NOTE: Codex visible status detection removed - hook-only integration.
+    // OpenCode visible status detection is preserved for manual launch scenarios.
     // even before the tool is explicitly detected (e.g., manual launch scenarios).
     // The patterns are OpenCode-specific and won't false-positive on other output.
     if let Some((chunk, end_offset)) =
@@ -2729,7 +2630,7 @@ fn spawn_reader_thread(
         let mut buffer = vec![0u8; IO_BUFFER_SIZE];
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
-        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
+        // NOTE: pending_visible_codex_status removed - Codex uses hook-only integration
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         loop {
@@ -2750,7 +2651,6 @@ fn spawn_reader_thread(
                             manager,
                             &mut pending_osc_title,
                             &mut pending_visible_factory_status,
-                            &mut pending_visible_codex_status,
                             &mut pending_visible_opencode_status,
                         ) {
                             match signal.kind {
@@ -2913,27 +2813,45 @@ fn ai_raw_chunk_requires_reliable_delivery(chunk: &str) -> bool {
             | "droid-ask-user-prompt"
             | "droid-spec-approval-prompt"
             | "droid-interrupted-banner"
-            | "codex-question-prompt"
-            | "codex-plan-mode-prompt"
-            | "codex-interrupted-banner"
+            // NOTE: Codex visible UI chunks removed - hook-only integration
             | "opencode-question-prompt"
             | "opencode-approval-prompt"
+            | "opencode-plan-mode"
             | "opencode-turn-complete"
             | "opencode-interrupted-banner"
     )
 }
 
+/// Capture terminal snapshot(s) atomically under a single lock.
+/// When `needs_selection` is true, both render and selection snapshots are captured
+/// from the same locked state so hit-testing matches the rendered frame.
+/// When `needs_selection` is false, returns `None` for selection to avoid caching
+/// an empty snapshot that would prevent lazy selection generation later.
 pub fn try_terminal_snapshots(
     runtime: &TerminalRuntime,
-) -> Option<(TerminalSnapshot, TerminalSelectionSnapshot)> {
+    needs_selection: bool,
+) -> Option<(TerminalSnapshot, Option<TerminalSelectionSnapshot>)> {
     let terminal = runtime.term.lock().ok()?;
-    Some(snapshots_from_terminal(&terminal))
+    let render = snapshot_from_terminal(&terminal);
+    let selection = if needs_selection {
+        Some(selection_snapshot_from_terminal(&terminal))
+    } else {
+        None
+    };
+    Some((render, selection))
+}
+
+/// Single snapshot without selection - cheaper for normal rendering
+pub fn try_terminal_snapshot(runtime: &TerminalRuntime) -> Option<TerminalSnapshot> {
+    let terminal = runtime.term.lock().ok()?;
+    Some(snapshot_from_terminal(&terminal))
 }
 
 pub fn try_terminal_selection_snapshot(
     runtime: &TerminalRuntime,
 ) -> Option<TerminalSelectionSnapshot> {
-    try_terminal_snapshots(runtime).map(|(_, selection_snapshot)| selection_snapshot)
+    let terminal = runtime.term.lock().ok()?;
+    Some(selection_snapshot_from_terminal(&terminal))
 }
 
 fn process_tree_kill_order(entries: &[ProcessSnapshotEntry], root_pid: u32) -> Option<Vec<u32>> {
@@ -3591,13 +3509,12 @@ mod tests {
         selection_snapshot_from_terminal, send_ui_event, snapshot_from_terminal,
         snapshots_from_terminal, test_terminal_runtime, trim_trailing_default_cells,
         verified_process_entry, verified_process_tree_descendants, verified_snapshot_root_process,
-        AdeTerminalConfig, PendingAiReadSignalKind, PendingOscTitle, PendingVisibleCodexStatus,
-        PendingVisibleFactoryStatus, PendingVisibleOpenCodeStatus, ProcessSnapshotEntry,
-        RootProcessTerminationPlan, RuntimeCommand, SharedWriter, SharedWriterHandle,
-        TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape, TerminalDimensions,
-        TerminalRuntime, TerminalSelectionHyperlink, TerminalStyle, TerminalStyledCell,
-        TerminalUiEventKind, TrackedProcessIdentity, VerifiedProcessLookup,
-        MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS,
+        AdeTerminalConfig, PendingAiReadSignalKind, PendingOscTitle, PendingVisibleFactoryStatus,
+        PendingVisibleOpenCodeStatus, ProcessSnapshotEntry, RootProcessTerminationPlan,
+        RuntimeCommand, SharedWriter, SharedWriterHandle, TerminalColor, TerminalCursor,
+        TerminalCursorLine, TerminalCursorShape, TerminalDimensions, TerminalRuntime,
+        TerminalSelectionHyperlink, TerminalStyle, TerminalStyledCell, TerminalUiEventKind,
+        TrackedProcessIdentity, VerifiedProcessLookup, MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS,
     };
     use crate::codex::{
         codex_env_pairs, MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR, MERGEN_AI_INBOX_DIR_ENV_VAR,
@@ -3976,151 +3893,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_visible_codex_status_detects_split_question_prompt_across_reads() {
-        let mut pending = PendingVisibleCodexStatus::default();
-
-        assert_eq!(pending.extract_from_text("Question 1/1 (1 una"), None);
-        assert_eq!(
-            pending.extract_from_text(
-                "nswered)\n tab to add notes | enter to submit answer | esc to interrupt"
-            ),
-            Some("codex-question-prompt".to_string())
-        );
-    }
-
-    #[test]
-    fn pending_visible_codex_status_normalizes_ansi_and_crlf() {
-        let mut pending = PendingVisibleCodexStatus::default();
-
-        assert_eq!(
-            pending.extract_from_text(
-                "\u{1b}[1mQuestion 1/1\u{1b}[0m\r\n(1 unanswered)\r\ntab to add notes | enter to submit answer | esc to interrupt"
-            ),
-            Some("codex-question-prompt".to_string())
-        );
-    }
-
-    #[test]
-    fn pending_visible_codex_status_detects_split_plan_mode_prompt_across_reads() {
-        let mut pending = PendingVisibleCodexStatus::default();
-
-        assert_eq!(
-            pending.extract_from_text("Implement this plan?\n 1. Yes, imple"),
-            None
-        );
-        assert_eq!(
-            pending.extract_from_text(
-                "ment this plan\n 2. No, stay in Plan mode\n Press enter to confirm or esc to go back"
-            ),
-            Some("codex-plan-mode-prompt".to_string())
-        );
-    }
-
-    #[test]
-    fn pending_visible_codex_status_normalizes_plan_mode_prompt_ansi_and_crlf() {
-        let mut pending = PendingVisibleCodexStatus::default();
-
-        assert_eq!(
-            pending.extract_from_text(
-                "\u{1b}[1mImplement this plan?\u{1b}[0m\r\nYes, implement this plan\r\nNo, stay in Plan mode\r\nPress enter to confirm or esc to go back"
-            ),
-            Some("codex-plan-mode-prompt".to_string())
-        );
-    }
-
-    #[test]
-    fn pending_visible_codex_status_requires_full_plan_mode_prompt_chrome() {
-        assert_eq!(
-            PendingVisibleCodexStatus::default().extract_from_text("Implement this plan?"),
-            None
-        );
-        assert_eq!(
-            PendingVisibleCodexStatus::default()
-                .extract_from_text("Yes, implement this plan\nPress enter to confirm"),
-            None
-        );
-        assert_eq!(
-            PendingVisibleCodexStatus::default().extract_from_text(
-                "Implement this plan?\nNo, stay in Plan mode\nPress enter to confirm or esc to go back"
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn pending_visible_codex_status_requires_full_prompt_chrome() {
-        assert_eq!(
-            PendingVisibleCodexStatus::default().extract_from_text("question"),
-            None
-        );
-        assert_eq!(
-            PendingVisibleCodexStatus::default()
-                .extract_from_text("Question about unanswered work items"),
-            None
-        );
-        assert_eq!(
-            PendingVisibleCodexStatus::default()
-                .extract_from_text("enter to submit answer without question footer"),
-            None
-        );
-        assert_eq!(
-            PendingVisibleCodexStatus::default().extract_from_text(
-                "Question about unanswered work items | enter to submit answer | esc to interrupt"
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn pending_visible_codex_status_detects_split_interrupted_banner_across_reads() {
-        let mut pending = PendingVisibleCodexStatus::default();
-
-        assert_eq!(
-            pending.extract_from_text("Conversation interrupted - tell "),
-            None
-        );
-        assert_eq!(
-            pending.extract_from_text(
-                "the model what to do differently. Something went wrong? Hit `/feedback` to report the issue."
-            ),
-            Some("codex-interrupted-banner".to_string())
-        );
-    }
-
-    #[test]
-    fn pending_visible_codex_status_normalizes_interrupted_banner_ansi_and_crlf() {
-        let mut pending = PendingVisibleCodexStatus::default();
-
-        assert_eq!(
-            pending.extract_from_text(
-                "\u{1b}[1mConversation interrupted\u{1b}[0m\r\nSomething went wrong? Hit `/feedback` to report the issue."
-            ),
-            Some("codex-interrupted-banner".to_string())
-        );
-    }
-
-    #[test]
-    fn pending_visible_codex_status_does_not_treat_question_footer_as_interrupted_banner() {
-        let mut pending = PendingVisibleCodexStatus::default();
-
-        assert_eq!(
-            pending.extract_from_text(
-                "Question 1/1 (1 unanswered)\n tab to add notes | enter to submit answer | esc to interrupt"
-            ),
-            Some("codex-question-prompt".to_string())
-        );
-        assert_eq!(
-            PendingVisibleCodexStatus::default().extract_from_text("Conversation interrupted"),
-            None
-        );
-        assert_eq!(
-            PendingVisibleCodexStatus::default()
-                .extract_from_text("Something went wrong? Hit `/feedback`"),
-            None
-        );
-    }
-
-    #[test]
     fn extract_title_from_bytes_only_reads_osc_sequences() {
         assert_eq!(
             extract_complete_title_from_bytes(b"\x1b]0;[Working...]\x07"),
@@ -4188,7 +3960,6 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
-        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
         let bytes = b"[droid-hook:event=UserPromptSubmit]\x1b]0;[Idle]\x07";
 
@@ -4198,7 +3969,6 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
-            &mut pending_visible_codex_status,
             &mut pending_visible_opencode_status,
         );
 
@@ -4227,7 +3997,6 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
-        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
         let bytes = b"[droid-hook:event=UserPromptSubmit]HOOKS  Stop";
 
@@ -4237,7 +4006,6 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
-            &mut pending_visible_codex_status,
             &mut pending_visible_opencode_status,
         );
 
@@ -4267,7 +4035,6 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
-        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
         let hook = "[droid-hook:event=UserPromptSubmit]";
         let bytes = b"[droid-hook:event=UserPromptSubmit]\xF0\x9F\x94\x94";
@@ -4278,7 +4045,6 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
-            &mut pending_visible_codex_status,
             &mut pending_visible_opencode_status,
         );
 
@@ -4324,7 +4090,6 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
-        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
@@ -4333,7 +4098,6 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
-            &mut pending_visible_codex_status,
             &mut pending_visible_opencode_status,
         );
 
@@ -4352,7 +4116,6 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
-        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
@@ -4361,7 +4124,6 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
-            &mut pending_visible_codex_status,
             &mut pending_visible_opencode_status,
         );
 
@@ -4384,7 +4146,6 @@ mod tests {
         manager.set_tool(1, AiCliTool::FactoryDroid);
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
-        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
@@ -4393,7 +4154,6 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
-            &mut pending_visible_codex_status,
             &mut pending_visible_opencode_status,
         );
 
@@ -4417,7 +4177,6 @@ mod tests {
         manager.set_tool(1, AiCliTool::FactoryDroid);
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
-        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
@@ -4426,7 +4185,6 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
-            &mut pending_visible_codex_status,
             &mut pending_visible_opencode_status,
         );
 
@@ -4464,7 +4222,6 @@ mod tests {
         manager.set_tool(1, AiCliTool::FactoryDroid);
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
-        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
@@ -4473,7 +4230,6 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
-            &mut pending_visible_codex_status,
             &mut pending_visible_opencode_status,
         );
 
@@ -4497,38 +4253,11 @@ mod tests {
     }
 
     #[test]
-    fn collect_ai_read_signals_emits_visible_codex_question_prompt_for_codex_sessions() {
-        let manager =
-            crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
-        manager.set_tool(1, AiCliTool::CodexCli);
-        let mut pending_osc_title = PendingOscTitle::default();
-        let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
-        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
-        let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
-
-        let signals = collect_ai_read_signals(
-            1,
-            b"Question 1/1 (1 unanswered)\n tab to add notes | enter to submit answer | esc to interrupt",
-            &manager,
-            &mut pending_osc_title,
-            &mut pending_visible_factory_status,
-            &mut pending_visible_codex_status,
-            &mut pending_visible_opencode_status,
-        );
-
-        assert!(signals.iter().any(|signal| matches!(
-            &signal.kind,
-            PendingAiReadSignalKind::RawChunk { chunk } if chunk == "codex-question-prompt"
-        )));
-    }
-
-    #[test]
     fn collect_ai_read_signals_emits_visible_droid_ask_user_prompt() {
         let manager =
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
-        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
@@ -4537,7 +4266,6 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
-            &mut pending_visible_codex_status,
             &mut pending_visible_opencode_status,
         );
 
@@ -4553,7 +4281,6 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
-        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
@@ -4562,7 +4289,6 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
-            &mut pending_visible_codex_status,
             &mut pending_visible_opencode_status,
         );
 
@@ -4679,82 +4405,6 @@ mod tests {
             TerminalUiEventKind::AiRawChunk { chunk, .. } if chunk == "droid-spec-approval-prompt"
         ));
         assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn collect_ai_read_signals_ignores_visible_codex_question_prompt_for_non_codex_sessions() {
-        let manager =
-            crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
-        let mut pending_osc_title = PendingOscTitle::default();
-        let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
-        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
-        let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
-
-        let signals = collect_ai_read_signals(
-            1,
-            b"Question 1/1 (1 unanswered)\n tab to add notes | enter to submit answer | esc to interrupt",
-            &manager,
-            &mut pending_osc_title,
-            &mut pending_visible_factory_status,
-            &mut pending_visible_codex_status,
-            &mut pending_visible_opencode_status,
-        );
-
-        assert!(!signals.iter().any(|signal| matches!(
-            &signal.kind,
-            PendingAiReadSignalKind::RawChunk { chunk } if chunk == "codex-question-prompt"
-        )));
-    }
-
-    #[test]
-    fn collect_ai_read_signals_emits_visible_codex_interrupted_banner_for_codex_sessions() {
-        let manager =
-            crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
-        manager.set_tool(1, AiCliTool::CodexCli);
-        let mut pending_osc_title = PendingOscTitle::default();
-        let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
-        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
-        let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
-
-        let signals = collect_ai_read_signals(
-            1,
-            b"Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.",
-            &manager,
-            &mut pending_osc_title,
-            &mut pending_visible_factory_status,
-            &mut pending_visible_codex_status,
-            &mut pending_visible_opencode_status,
-        );
-
-        assert!(signals.iter().any(|signal| matches!(
-            &signal.kind,
-            PendingAiReadSignalKind::RawChunk { chunk } if chunk == "codex-interrupted-banner"
-        )));
-    }
-
-    #[test]
-    fn collect_ai_read_signals_ignores_visible_codex_interrupted_banner_for_non_codex_sessions() {
-        let manager =
-            crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
-        let mut pending_osc_title = PendingOscTitle::default();
-        let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
-        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
-        let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
-
-        let signals = collect_ai_read_signals(
-            1,
-            b"Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.",
-            &manager,
-            &mut pending_osc_title,
-            &mut pending_visible_factory_status,
-            &mut pending_visible_codex_status,
-            &mut pending_visible_opencode_status,
-        );
-
-        assert!(!signals.iter().any(|signal| matches!(
-            &signal.kind,
-            PendingAiReadSignalKind::RawChunk { chunk } if chunk == "codex-interrupted-banner"
-        )));
     }
 
     fn snapshot_entry(
@@ -5799,6 +5449,16 @@ mod tests {
         );
         assert_eq!(pending.extract_from_text("plan mode is active"), None);
         assert_eq!(pending.extract_from_text("plan mode active planning"), None);
+        // Should NOT detect when "plan mode" and "system reminder" appear separately
+        // (the strict hyphen-separated pattern is required)
+        assert_eq!(
+            pending.extract_from_text("plan mode\n\nsystem reminder"),
+            None
+        );
+        assert_eq!(
+            pending.extract_from_text("entered plan mode. System reminder: foo"),
+            None
+        );
     }
 
     fn make_test_terminal(size: TerminalSize) -> Terminal {

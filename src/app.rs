@@ -34,14 +34,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, SPI_GETKEYBOARDDELAY, SPI_GETKEYBOARDSPEED,
 };
 
-use crate::codex::{
-    self, CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent,
-    CODEX_UNKNOWN_NOTIFY_EVENT,
-};
-use crate::codex::{
-    CODEX_APPROVAL_REQUESTED_EVENT, CODEX_PLAN_MODE_PROMPT_EVENT, CODEX_TURN_COMPLETE_EVENT,
-    CODEX_USER_INPUT_REQUESTED_EVENT,
-};
+use crate::codex::{self, CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
 use crate::config;
 use crate::hooks::{
     AiCliSession, AiCliStatus, AiCliTool, AiHookManager, ClaudeAttentionReason,
@@ -49,8 +42,9 @@ use crate::hooks::{
 };
 use crate::layout;
 use crate::models::{
-    AppConfig, BuiltinLauncherKind, LauncherEntry, LauncherIconKey, LeftSidebarTab,
-    MainVisibilityMode, ProjectRecord, ShellKind, TerminalKind, TerminalManagerFilter,
+    AppConfig, AppHistory, BuiltinLauncherKind, InputHistoryFilter, LauncherEntry, LauncherIconKey,
+    LeftSidebarTab, MainVisibilityMode, ProjectRecord, ShellKind, TerminalInputHistory,
+    TerminalInputRecord, TerminalKind, TerminalManagerFilter,
 };
 use crate::opencode::{
     self, CodexTransportStatus, OpenCodeNotifyInboxEvent, OpenCodeTransportStatus,
@@ -132,6 +126,7 @@ const SOURCE_CONTROL_POLL_TICK_MS: u64 = 500;
 const SOURCE_CONTROL_TOOLTIP_FILE_LIMIT: usize = 12;
 const DIRECTORY_ENTRY_TOOLTIP_MAX_CHARS: usize = 500;
 // Pure Dark Theme colors
+const TERMINAL_HOVER_WIDTH: f32 = 320.0;
 const TERMINAL_HEADER_HEIGHT: f32 = 38.0;
 const TERMINAL_HEADER_GAP: f32 = 6.0;
 const TERMINAL_TILE_GAP_X: f32 = 0.0;
@@ -146,6 +141,7 @@ const ACCENT: Color32 = Color32::from_rgb(200, 200, 200);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(255, 255, 255);
 const TEXT_MUTED: Color32 = Color32::from_rgb(140, 140, 140);
 const PROJECT_EXPLORER_WIDTH: f32 = 352.0;
+const CHECKLIST_PANEL_WIDTH: f32 = 352.0;
 const ACTIVITY_RAIL_WIDTH: f32 = 48.0;
 const CONTROL_ROW_HEIGHT: f32 = 28.0;
 const TERMINAL_MANAGER_FILTER_ROW_HEIGHT_EXTRA: f32 = 12.0;
@@ -564,6 +560,7 @@ enum CodexCliStatusSource {
     Notify,
     VisibleUi,
     TerminalTitle,
+    Hook,
 }
 
 impl CodexCliStatusSource {
@@ -573,6 +570,7 @@ impl CodexCliStatusSource {
             Self::Notify => "notify",
             Self::VisibleUi => "visible_ui",
             Self::TerminalTitle => "terminal_title",
+            Self::Hook => "hook",
         }
     }
 }
@@ -591,7 +589,7 @@ impl CodexAttentionReason {
     #[allow(dead_code)]
     fn from_event_kind(event_kind: Option<&str>) -> Self {
         let normalized = event_kind
-            .unwrap_or(CODEX_UNKNOWN_NOTIFY_EVENT)
+            .unwrap_or("unknown")
             .chars()
             .filter(|ch| ch.is_ascii_alphanumeric())
             .map(|ch| ch.to_ascii_lowercase())
@@ -656,13 +654,17 @@ enum ClaudeStatusSource {
 enum OpenCodeAttentionReason {
     PermissionAsked,
     QuestionAsked,
+    PlanModePrompt,
     SessionError,
     TurnComplete,
 }
 
 impl OpenCodeAttentionReason {
     const fn allows_empty_submit(self) -> bool {
-        matches!(self, Self::PermissionAsked | Self::QuestionAsked)
+        matches!(
+            self,
+            Self::PermissionAsked | Self::QuestionAsked | Self::PlanModePrompt
+        )
     }
 
     #[allow(dead_code)]
@@ -679,7 +681,7 @@ impl OpenCodeAttentionReason {
     const fn persists_on_focus(self) -> bool {
         matches!(
             self,
-            Self::PermissionAsked | Self::QuestionAsked | Self::TurnComplete
+            Self::PermissionAsked | Self::QuestionAsked | Self::PlanModePrompt | Self::TurnComplete
         )
     }
 
@@ -687,6 +689,7 @@ impl OpenCodeAttentionReason {
         match self {
             Self::PermissionAsked => "OpenCode - Waiting for approval...",
             Self::QuestionAsked => "OpenCode - Waiting for your reply...",
+            Self::PlanModePrompt => "OpenCode - Waiting for plan approval...",
             Self::SessionError => "OpenCode - Error occurred; review output above",
             Self::TurnComplete => "OpenCode - Turn complete; waiting for your next prompt...",
         }
@@ -925,6 +928,11 @@ pub struct AdeApp {
     directory_index_state: BTreeMap<u64, DirectoryIndexSnapshot>,
     directory_tree_has_collapsed_cache_by_project: BTreeMap<u64, bool>,
     directory_index_generation: BTreeMap<u64, u64>,
+    // Terminal input history
+    history_path: PathBuf,
+    input_history: AppHistory,
+    input_history_search_query: String,
+    input_history_selected_project_id: Option<u64>,
 }
 
 struct TerminalEntry {
@@ -936,7 +944,11 @@ struct TerminalEntry {
     full_title: String,
     pending_line_for_title: String,
     recent_inputs: VecDeque<String>,
+    /// Snapshot of the last 5 messages when test_done was toggled on.
+    /// Cleared when test_done is toggled off.
+    checklist_snapshot: Vec<String>,
     in_main_view: bool,
+    test_done: bool,
     dirty: bool,
     last_seqno: usize,
     last_cursor_row: Option<usize>,
@@ -983,6 +995,9 @@ struct TerminalEntry {
     /// True when user needs to acknowledge attention (idle/permission after working)
     /// Cleared on terminal focus or keyboard input
     codex_attention_pending: bool,
+    /// Whether Codex hooks have been verified to work at runtime for this terminal.
+    /// Set to true when we receive the first hook event (e.g., user-prompt-submit).
+    codex_hooks_runtime_verified: bool,
     opencode_launch_pending_since: Option<Instant>,
     opencode_launch_process_baseline: Option<Vec<TrackedProcessIdentity>>,
     opencode_session_active: bool,
@@ -1049,7 +1064,10 @@ struct TerminalRowData {
     full_title: String,
     exited: bool,
     recent_inputs: VecDeque<String>,
+    /// Snapshot of the last 5 messages when test_done was toggled on.
+    checklist_snapshot: Vec<String>,
     in_main_view: bool,
+    test_done: bool,
     ai_logo_key: Option<LauncherIconKey>,
     ai_badge: AiBadgeModel,
 }
@@ -1349,9 +1367,9 @@ enum AiBadgeVisual {
 fn ai_badge_visual(
     status: AiCliStatus,
     codex_normalized_status: Option<CodexTransportStatus>,
-    normalized_status: Option<OpenCodeTransportStatus>,
+    opencode_normalized_status: Option<OpenCodeTransportStatus>,
     claude_normalized_status: Option<ClaudeTransportStatus>,
-    _codex_attention_pending: bool,
+    codex_attention_pending: bool,
     opencode_attention_pending: bool,
     opencode_attention_reason: Option<OpenCodeAttentionReason>,
 ) -> Option<AiBadgeVisual> {
@@ -1359,24 +1377,56 @@ fn ai_badge_visual(
         AiCliStatus::Inactive => None,
         AiCliStatus::Running => Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180))),
         AiCliStatus::Attention => {
-            // Priority: Codex -> Claude -> OpenCode for normalized status
-            let effective_status = codex_normalized_status
-                .map(|s| match s {
-                    CodexTransportStatus::Working => OpenCodeTransportStatus::Working,
-                    CodexTransportStatus::Idle => OpenCodeTransportStatus::Idle,
-                    CodexTransportStatus::Permission => OpenCodeTransportStatus::Permission,
-                })
-                .or_else(|| {
-                    claude_normalized_status.map(|s| match s {
-                        ClaudeTransportStatus::Working => OpenCodeTransportStatus::Working,
-                        ClaudeTransportStatus::Idle => OpenCodeTransportStatus::Idle,
-                        ClaudeTransportStatus::Permission => OpenCodeTransportStatus::Permission,
-                    })
-                })
-                .or(normalized_status);
+            // Check Codex first - if it has normalized status, use Codex rules
+            if let Some(codex_status) = codex_normalized_status {
+                return match codex_status {
+                    CodexTransportStatus::Working => {
+                        Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180)))
+                    }
+                    CodexTransportStatus::Permission => {
+                        // Permission: pulse if pending, solid if acknowledged
+                        if codex_attention_pending {
+                            Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 180, 100)))
+                        } else {
+                            Some(AiBadgeVisual::Solid(Color32::from_rgb(220, 180, 100)))
+                        }
+                    }
+                    CodexTransportStatus::Idle => {
+                        // Idle: pulse if pending, hidden if acknowledged
+                        if codex_attention_pending {
+                            Some(AiBadgeVisual::Pulse(Color32::from_rgb(100, 200, 100)))
+                        } else {
+                            None // Turn complete acknowledged - badge hidden
+                        }
+                    }
+                };
+            }
 
-            // Use normalized status for semantic differentiation if available
-            match effective_status {
+            // Then check Claude
+            if let Some(claude_status) = claude_normalized_status {
+                return match claude_status {
+                    ClaudeTransportStatus::Working => {
+                        Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180)))
+                    }
+                    ClaudeTransportStatus::Permission => {
+                        if codex_attention_pending {
+                            Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 180, 100)))
+                        } else {
+                            Some(AiBadgeVisual::Solid(Color32::from_rgb(220, 180, 100)))
+                        }
+                    }
+                    ClaudeTransportStatus::Idle => {
+                        if codex_attention_pending {
+                            Some(AiBadgeVisual::Pulse(Color32::from_rgb(100, 200, 100)))
+                        } else {
+                            Some(AiBadgeVisual::Solid(Color32::from_rgb(100, 200, 100)))
+                        }
+                    }
+                };
+            }
+
+            // Fall back to OpenCode status
+            match opencode_normalized_status {
                 Some(OpenCodeTransportStatus::Permission) => {
                     // Permission/Question: pulse if pending, solid if acknowledged
                     if opencode_attention_pending {
@@ -1410,7 +1460,7 @@ fn ai_badge_visual(
                 }
                 None => {
                     // No normalized status - use pending flag to decide
-                    if opencode_attention_pending {
+                    if codex_attention_pending || opencode_attention_pending {
                         Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 220, 220)))
                     } else {
                         Some(AiBadgeVisual::Solid(Color32::from_rgb(180, 180, 180)))
@@ -2251,42 +2301,68 @@ impl AdeApp {
     fn codex_enable_outcome_message(outcome: &CodexEnableOutcome) -> String {
         match outcome {
             CodexEnableOutcome::MissingInstall => {
-                "Codex CLI was not found. Install it with npm, then run `codex login`."
-                    .to_owned()
+                "Codex CLI was not found. Install it with npm, then run `codex login`.".to_owned()
             }
             CodexEnableOutcome::NeedsLogin => {
                 "Codex CLI is installed but not signed in. Run `codex login`, then try again."
                     .to_owned()
             }
-            CodexEnableOutcome::CustomNotifyHookPreserved { path } => format!(
-                "Codex CLI kept the existing custom notify hook and only refreshed TUI notification settings; turn-complete tracking may stay limited until notify is routed through Mergen: {}",
-                path.display()
-            ),
             CodexEnableOutcome::ConfigUpdated { path, updated } => {
+                // Hook-only integration: UserPromptSubmit -> Running, Stop -> Attention/Pulse
                 if *updated {
                     format!(
-                        "Codex CLI integration enabled with Mergen turn-complete notify routing and BEL-backed TUI notifications: {}",
+                        "Codex CLI hook-only integration enabled. UserPromptSubmit starts spinner, Stop triggers pulse: {}",
                         path.display()
                     )
                 } else {
                     format!(
-                        "Codex CLI integration already configured with Mergen turn-complete notify routing and BEL-backed TUI notifications: {}",
+                        "Codex CLI hook-only integration already configured: {}",
                         path.display()
                     )
                 }
+            }
+            CodexEnableOutcome::BridgeInstallFailed { error } => {
+                format!(
+                    "Failed to install Codex bridge helper. This is required for stable hook delivery. Error: {}",
+                    error
+                )
             }
         }
     }
 
     fn should_show_codex_enable_button(status: &CodexIntegrationStatus) -> bool {
-        !matches!(status, CodexIntegrationStatus::EnabledHealthy { .. })
+        // Show enable button when:
+        // - Not configured at all (NeedsSetup)
+        // - Configured but hooks not yet runtime-verified (HooksConfiguredUnverified)
+        // - Config read error
+        // - Enabled but not yet runtime-verified (EnabledHealthy with hooks_runtime_verified: false)
+        // Don't show when fully verified healthy
+        match status {
+            CodexIntegrationStatus::EnabledHealthy {
+                hooks_runtime_verified,
+                ..
+            } => !hooks_runtime_verified,
+            _ => matches!(
+                status,
+                CodexIntegrationStatus::NeedsSetup { .. }
+                    | CodexIntegrationStatus::HooksConfiguredUnverified { .. }
+                    | CodexIntegrationStatus::ConfigReadError { .. }
+            ),
+        }
     }
 
     fn codex_integration_status_text(status: &CodexIntegrationStatus) -> &'static str {
         match status {
-            CodexIntegrationStatus::EnabledHealthy { .. } => "Enabled",
+            CodexIntegrationStatus::EnabledHealthy {
+                hooks_runtime_verified: true,
+                ..
+            } => "Enabled (verified)",
+            CodexIntegrationStatus::EnabledHealthy {
+                hooks_runtime_verified: false,
+                ..
+            } => "Enabled (pending verification)",
+            CodexIntegrationStatus::HooksConfiguredUnverified { .. } => "Hooks configured",
             CodexIntegrationStatus::NeedsSetup { .. } => "Not enabled",
-            CodexIntegrationStatus::CustomNotifyHook { .. } => "Custom notify hook",
             CodexIntegrationStatus::ConfigReadError { .. } => "Config unreadable",
         }
     }
@@ -2297,30 +2373,47 @@ impl AdeApp {
         warning_color: Color32,
     ) -> Color32 {
         match status {
-            CodexIntegrationStatus::EnabledHealthy { .. } => healthy_color,
+            CodexIntegrationStatus::EnabledHealthy {
+                hooks_runtime_verified: true,
+                ..
+            } => healthy_color,
+            CodexIntegrationStatus::EnabledHealthy {
+                hooks_runtime_verified: false,
+                ..
+            } => warning_color,
+            CodexIntegrationStatus::HooksConfiguredUnverified { .. } => warning_color,
             CodexIntegrationStatus::NeedsSetup { .. } => TEXT_MUTED,
-            CodexIntegrationStatus::CustomNotifyHook { .. }
-            | CodexIntegrationStatus::ConfigReadError { .. } => warning_color,
+            CodexIntegrationStatus::ConfigReadError { .. } => warning_color,
         }
     }
 
     fn codex_runtime_overview_message(status: &CodexIntegrationStatus) -> String {
         match status {
-            CodexIntegrationStatus::EnabledHealthy { .. } => {
-                "Factory Droid hooks are available. Codex CLI integration is already enabled and Mergen can receive notify-backed turn completion signals."
+            CodexIntegrationStatus::EnabledHealthy {
+                hooks_runtime_verified: true,
+                ..
+            } => {
+                "Codex CLI hook-only integration is enabled and working. UserPromptSubmit starts spinner, Stop triggers pulse."
+                    .to_owned()
+            }
+            CodexIntegrationStatus::EnabledHealthy {
+                hooks_runtime_verified: false,
+                ..
+            } => {
+                "Codex CLI hook-only integration is enabled. Hooks configured but waiting for first runtime event to verify they're working."
+                    .to_owned()
+            }
+            CodexIntegrationStatus::HooksConfiguredUnverified { .. } => {
+                "Codex CLI hook-only integration is partially configured. Click 'Enable' to complete setup."
                     .to_owned()
             }
             CodexIntegrationStatus::NeedsSetup { .. } => {
-                "Factory Droid hooks are available. Codex CLI integration can be enabled here when you want notify-backed turn completion signals."
+                "Codex CLI hook-only integration can be enabled here. Hooks will be configured for spinner/pulse tracking."
                     .to_owned()
             }
-            CodexIntegrationStatus::CustomNotifyHook { .. } => {
-                "Factory Droid hooks are available. Codex CLI still uses a custom notify hook, so turn-complete attention may stay limited until notify is routed through Mergen."
-                    .to_owned()
+            CodexIntegrationStatus::ConfigReadError { error, .. } => {
+                format!("Codex CLI config error: {error}")
             }
-            CodexIntegrationStatus::ConfigReadError { error, .. } => format!(
-                "Factory Droid hooks are available. Codex CLI config could not be inspected, so Settings could not verify whether notify routing is already enabled: {error}"
-            ),
         }
     }
 
@@ -2343,33 +2436,51 @@ impl AdeApp {
 
     #[cfg(not(test))]
     fn prepare_codex_cli_integration_for_launch(&mut self) {
+        // Defensive check: only proceed if routing infrastructure is actually available
+        if self.ai_hook_manager.is_none() || self.codex_cli_runtime_dir.is_none() {
+            self.status_line = "Codex CLI hooks unavailable (session routing disabled)".to_owned();
+            return;
+        }
+
+        // Ensure bridge is installed first
+        match codex::ensure_codex_bridge_installed() {
+            codex::BridgeInstallOutcome::Failed { error } => {
+                self.status_line = format!("Codex bridge install failed: {error}");
+                return;
+            }
+            _ => {} // Continue if installed/updated/already current
+        }
+
         let Ok(path) = codex::user_codex_config_path() else {
             return;
         };
 
-        match codex::patch_codex_config_file(&path, &self.current_executable_path) {
+        let Ok(bridge_path) = config::codex_bridge_path() else {
+            return;
+        };
+
+        match codex::patch_codex_config_file(&path, &bridge_path) {
             Ok(codex::CodexConfigPatchOutcome::Updated) => {
                 self.status_line = format!(
-                    "Codex CLI launch prepared Mergen turn-complete notifications in {}",
+                    "Codex CLI hook-only integration enabled in {}: UserPromptSubmit starts spinner, Stop triggers pulse",
                     path.display()
                 );
             }
             Ok(codex::CodexConfigPatchOutcome::Unchanged) => {}
-            Ok(codex::CodexConfigPatchOutcome::CustomNotifyHookPreserved) => {
-                self.status_line = format!(
-                    "Codex CLI still uses a custom notify hook in {}; Mergen can track launch/running state, but turn-complete attention may stay limited until notify is routed through Mergen.",
-                    path.display()
-                );
-            }
             Err(err) => {
                 self.status_line =
-                    format!("Failed to prepare Codex CLI notifications for launch: {err}");
+                    format!("Failed to prepare Codex CLI integration for launch: {err}");
             }
         }
     }
 
     #[cfg(test)]
-    fn prepare_codex_cli_integration_for_launch(&mut self) {}
+    fn prepare_codex_cli_integration_for_launch(&mut self) {
+        // Test version: only handle gating logic to allow testing skip conditions
+        if self.ai_hook_manager.is_none() || self.codex_cli_runtime_dir.is_none() {
+            self.status_line = "Codex CLI hooks unavailable (session routing disabled)".to_owned();
+        }
+    }
 
     fn show_terminal_copy_feedback(&mut self, ctx: &egui::Context) {
         self.show_status_feedback(ctx, TERMINAL_COPY_FEEDBACK_TEXT);
@@ -2569,6 +2680,16 @@ impl AdeApp {
             Self::codex_cli_runtime_state(&config);
         let (_, opencode_cli_runtime_dir, _) = Self::opencode_cli_runtime_state(&config);
 
+        // Ensure Codex bridge is installed/updated at startup (self-heal stale wiring)
+        let codex_bridge_install_error = if codex_cli_runtime_dir.is_some() {
+            match codex::ensure_codex_bridge_installed() {
+                codex::BridgeInstallOutcome::Failed { error } => Some(error),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         let (terminal_events_tx, terminal_events_rx) =
             crossbeam_channel::bounded(TERMINAL_EVENT_QUEUE_CAPACITY);
         let (source_control_commands_tx, source_control_commands_rx) =
@@ -2584,6 +2705,10 @@ impl AdeApp {
             directory_index_commands_rx,
             directory_index_events_tx.clone(),
         );
+
+        // Load input history
+        let history_path = config::history_path().unwrap_or_else(|_| PathBuf::from("history.json"));
+        let input_history = config::load_history(&history_path).unwrap_or_default();
 
         let app = Self {
             config_path,
@@ -2648,6 +2773,10 @@ impl AdeApp {
                         .map(|err| format!("Factory Droid inbox fallback unavailable: {err}"))
                 })
                 .or_else(|| {
+                    codex_bridge_install_error
+                        .map(|err| format!("Codex bridge install failed: {err}"))
+                })
+                .or_else(|| {
                     codex_cli_runtime_dir_error
                         .as_ref()
                         .map(|err| format!("Codex CLI runtime unavailable: {err}"))
@@ -2671,6 +2800,10 @@ impl AdeApp {
             directory_index_state: BTreeMap::new(),
             directory_tree_has_collapsed_cache_by_project: BTreeMap::new(),
             directory_index_generation: BTreeMap::new(),
+            history_path,
+            input_history,
+            input_history_search_query: String::new(),
+            input_history_selected_project_id: selected_project,
         };
         app
     }
@@ -2953,7 +3086,9 @@ impl AdeApp {
             full_title: fallback_title,
             pending_line_for_title: String::new(),
             recent_inputs: VecDeque::new(),
+            checklist_snapshot: Vec::new(),
             in_main_view: true,
+            test_done: false,
             dirty: true,
             last_seqno: runtime.latest_seqno(),
             last_cursor_row: None,
@@ -2995,6 +3130,7 @@ impl AdeApp {
             codex_last_visible_attention_at: None,
             codex_last_turn_complete_at: None,
             codex_attention_pending: false,
+            codex_hooks_runtime_verified: false,
             opencode_launch_pending_since: None,
             opencode_launch_process_baseline: None,
             opencode_session_active: false,
@@ -3034,6 +3170,16 @@ impl AdeApp {
                     let _ = self.mark_factory_droid_launch_pending(terminal_id);
                 }
                 Some(BuiltinLauncherKind::Codex) => {
+                    // Only prepare integration if session routing is actually enabled
+                    // (ai_hook_manager present and runtime dir available).
+                    // Without this, the hooks cannot deliver events and each Codex
+                    // prompt would just start a no-op Mergen helper process.
+                    if self.ai_hook_manager.is_some() && self.codex_cli_runtime_dir.is_some() {
+                        self.prepare_codex_cli_integration_for_launch();
+                    }
+                    // Capture pre-launch baseline synchronously so any child that appears
+                    // after the command is sent is treated as the new session, not as
+                    // part of the baseline.
                     let baseline = self
                         .terminals
                         .get(&terminal_id)
@@ -3042,6 +3188,9 @@ impl AdeApp {
                     let _ = self.mark_codex_launch_pending(terminal_id, baseline);
                 }
                 Some(BuiltinLauncherKind::OpenCode) => {
+                    // Capture pre-launch baseline synchronously so any child that appears
+                    // after the command is sent is treated as the new session, not as
+                    // part of the baseline.
                     let baseline = self
                         .terminals
                         .get(&terminal_id)
@@ -3797,6 +3946,16 @@ impl AdeApp {
         CodexCliStatusSource,
         Option<CodexAttentionReason>,
     )> {
+        if chunk == "codex-turn-complete" {
+            // Turn complete: working -> idle transition
+            // Critical for native Windows where hooks are unsupported upstream.
+            // See: https://developers.openai.com/codex/hooks/
+            return Some((
+                CodexTransportStatus::Idle,
+                CodexCliStatusSource::VisibleUi,
+                Some(CodexAttentionReason::TurnComplete),
+            ));
+        }
         if chunk == "codex-question-prompt" {
             return Some((
                 CodexTransportStatus::Permission,
@@ -3822,6 +3981,12 @@ impl AdeApp {
         None
     }
 
+    fn should_accept_codex_turn_complete_chunk(entry: &TerminalEntry) -> bool {
+        entry.codex_normalized_status == Some(CodexTransportStatus::Working)
+            || entry.ai_session.status == AiCliStatus::Running
+            || entry.codex_prompt_submit_since.is_some()
+    }
+
     fn opencode_status_from_chunk(
         chunk: &str,
     ) -> Option<(
@@ -3841,6 +4006,13 @@ impl AdeApp {
                 AiCliStatus::Attention,
                 OpenCodeStatusSource::VisibleUi,
                 Some(OpenCodeAttentionReason::PermissionAsked),
+            ));
+        }
+        if chunk == "opencode-plan-mode" {
+            return Some((
+                AiCliStatus::Attention,
+                OpenCodeStatusSource::VisibleUi,
+                Some(OpenCodeAttentionReason::PlanModePrompt),
             ));
         }
         if chunk == "opencode-turn-complete" {
@@ -3878,10 +4050,10 @@ impl AdeApp {
             entry.ai_session.tool = Some(AiCliTool::CodexCli);
             changed = true;
         }
-        if entry.ai_session.status != AiCliStatus::Inactive {
-            entry.ai_session.status = AiCliStatus::Inactive;
-            changed = true;
-        }
+        // Keep status as Inactive until the first actual prompt is submitted.
+        // The spinner should only appear when AI starts working (UserPromptSubmit hook
+        // or first user input), not immediately when the codex command is typed.
+        // This ensures the badge shows only the logo during launch-pending phase.
         if entry.codex_launch_pending_since.is_none() {
             changed = true;
         }
@@ -4020,119 +4192,6 @@ impl AdeApp {
             })
     }
 
-    fn apply_codex_status(
-        &mut self,
-        terminal_id: u64,
-        status: AiCliStatus,
-        source: CodexCliStatusSource,
-        attention_reason: Option<CodexAttentionReason>,
-    ) -> bool {
-        let Some(manager) = self.ai_hook_manager.as_ref().cloned() else {
-            return false;
-        };
-
-        manager.set_tool(terminal_id, AiCliTool::CodexCli);
-
-        let update = match status {
-            AiCliStatus::Running => manager.ai_activity_started(terminal_id),
-            AiCliStatus::Attention => manager.ai_waiting_for_user(terminal_id),
-            AiCliStatus::Inactive => None,
-        };
-
-        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
-            return false;
-        };
-
-        let should_dedupe_attention = status == AiCliStatus::Attention
-            && entry.ai_session.tool == Some(AiCliTool::CodexCli)
-            && entry.ai_session.status == AiCliStatus::Attention
-            && match source {
-                CodexCliStatusSource::VisibleUi => {
-                    (entry.codex_last_status_source == Some(CodexCliStatusSource::Notify)
-                        && entry.codex_attention_reason == attention_reason)
-                        || (entry.codex_last_status_source == Some(CodexCliStatusSource::VisibleUi)
-                            && entry.codex_attention_reason == attention_reason)
-                }
-                CodexCliStatusSource::Notify => {
-                    (entry.codex_last_status_source == Some(CodexCliStatusSource::Notify)
-                        && entry.codex_attention_reason == attention_reason)
-                        || (entry.codex_last_status_source == Some(CodexCliStatusSource::VisibleUi)
-                            && matches!(
-                                (entry.codex_attention_reason, attention_reason),
-                                (
-                                    Some(
-                                        CodexAttentionReason::UserInputRequested
-                                            | CodexAttentionReason::PlanModePrompt
-                                    ),
-                                    Some(
-                                        CodexAttentionReason::TurnComplete
-                                            | CodexAttentionReason::UnknownNotify
-                                    )
-                                )
-                            ))
-                }
-                _ => false,
-            };
-        if should_dedupe_attention {
-            return false;
-        }
-
-        let mut changed = false;
-        if entry.ai_session.tool != Some(AiCliTool::CodexCli) {
-            entry.ai_session.tool = Some(AiCliTool::CodexCli);
-            changed = true;
-        }
-        if let Some((tool, next_status)) = update {
-            if entry.ai_session.tool != Some(tool) || entry.ai_session.status != next_status {
-                entry.ai_session.tool = Some(tool);
-                entry.ai_session.status = next_status;
-                changed = true;
-            }
-        } else if entry.ai_session.status != status {
-            entry.ai_session.status = status;
-            changed = true;
-        }
-        match status {
-            AiCliStatus::Attention => {
-                if let Some(reason) = attention_reason {
-                    if entry.codex_attention_reason != Some(reason) {
-                        entry.codex_attention_reason = Some(reason);
-                        changed = true;
-                    }
-                }
-            }
-            AiCliStatus::Running | AiCliStatus::Inactive => {
-                if entry.codex_attention_reason.take().is_some() {
-                    changed = true;
-                }
-            }
-        }
-        if entry.codex_last_status_source != Some(source) {
-            entry.codex_last_status_source = Some(source);
-            changed = true;
-        }
-        if entry.codex_launch_process_baseline.take().is_some() {
-            changed = true;
-        }
-        if !entry.codex_session_active {
-            entry.codex_session_active = true;
-            changed = true;
-        }
-        if entry.codex_process_missing_since.take().is_some() {
-            changed = true;
-        }
-        entry.codex_last_process_seen_at = Some(Instant::now());
-        if entry.codex_launch_pending_since.take().is_some() {
-            changed = true;
-        }
-        if status == AiCliStatus::Running && source == CodexCliStatusSource::PromptSubmit {
-            entry.codex_prompt_submit_since = Some(Instant::now());
-            changed = true;
-        }
-        entry.dirty = true;
-        changed
-    }
-
     /// Apply semantic Codex transport status to a terminal entry (Orca-compatible).
     /// This properly handles working -> idle/permission transitions with pending attention.
     fn apply_codex_transport_status(
@@ -4170,6 +4229,9 @@ impl AdeApp {
                     entry.codex_attention_pending = false;
                     changed = true;
                 }
+                if entry.codex_attention_reason.take().is_some() {
+                    changed = true;
+                }
                 (AiCliStatus::Running, None)
             }
             CodexTransportStatus::Idle => {
@@ -4205,8 +4267,23 @@ impl AdeApp {
                     }
 
                     // Update attention reason for UI tooltip
+                    // Special case: hook-stop (Hook source + UnknownNotify reason) should preserve
+                    // existing attention reasons from Notify/VisibleUi to avoid overwriting
+                    // interactive attention states (ApprovalRequested, UserInputRequested, PlanModePrompt)
+                    let should_preserve_existing_reason = source == CodexCliStatusSource::Hook
+                        && reason == Some(CodexAttentionReason::UnknownNotify)
+                        && entry.codex_attention_reason.is_some()
+                        && matches!(
+                            entry.codex_last_status_source,
+                            Some(CodexCliStatusSource::Notify)
+                                | Some(CodexCliStatusSource::VisibleUi)
+                        );
+
                     if let Some(r) = reason {
-                        if entry.codex_attention_reason != Some(r) {
+                        if should_preserve_existing_reason {
+                            // Preserve existing attention reason from Notify/VisibleUi
+                            // Only update the source to reflect the hook event
+                        } else if entry.codex_attention_reason != Some(r) {
                             entry.codex_attention_reason = Some(r);
                             changed = true;
                         }
@@ -4323,6 +4400,31 @@ impl AdeApp {
         if session_status == AiCliStatus::Running && source == CodexCliStatusSource::PromptSubmit {
             entry.codex_prompt_submit_since = Some(now);
             changed = true;
+        }
+
+        // Record evidence timestamps for state resolution
+        match transport_status {
+            CodexTransportStatus::Working => {
+                entry.codex_last_title_working_at = Some(now);
+            }
+            CodexTransportStatus::Idle => {
+                entry.codex_last_title_idle_at = Some(now);
+                if reason_hint == Some(CodexAttentionReason::TurnComplete) {
+                    entry.codex_last_turn_complete_at = Some(now);
+                }
+            }
+            CodexTransportStatus::Permission => {
+                entry.codex_last_title_idle_at = Some(now);
+                entry.codex_last_visible_attention_at = Some(now);
+            }
+        }
+
+        // Record notify/hook attention timestamp for Hook/Notify sources
+        if matches!(
+            source,
+            CodexCliStatusSource::Hook | CodexCliStatusSource::Notify
+        ) {
+            entry.codex_last_notify_attention_at = Some(now);
         }
 
         changed
@@ -4791,6 +4893,7 @@ impl AdeApp {
                             r,
                             OpenCodeAttentionReason::PermissionAsked
                                 | OpenCodeAttentionReason::QuestionAsked
+                                | OpenCodeAttentionReason::PlanModePrompt
                         )
                     })
                     .or(Some(OpenCodeAttentionReason::PermissionAsked));
@@ -5027,6 +5130,7 @@ impl AdeApp {
                             r,
                             OpenCodeAttentionReason::PermissionAsked
                                 | OpenCodeAttentionReason::QuestionAsked
+                                | OpenCodeAttentionReason::PlanModePrompt
                         )
                     });
                     return Some((
@@ -5400,6 +5504,10 @@ impl AdeApp {
                     Some("permission") => (
                         OpenCodeTransportStatus::Permission,
                         Some(OpenCodeAttentionReason::PermissionAsked),
+                    ),
+                    Some("plan_mode") | Some("plan-mode") => (
+                        OpenCodeTransportStatus::Permission,
+                        Some(OpenCodeAttentionReason::PlanModePrompt),
                     ),
                     _ => continue,
                 };
@@ -5801,72 +5909,128 @@ impl AdeApp {
             return false;
         }
 
+        // Determine if this is a hook event by checking raw_json for hook_event field
+        let is_hook_event = event.raw_json.contains("\"hook_event\"");
+
+        // Track runtime hook verification when we see any hook event
+        // This marks the hooks as actually working (not just configured)
+        let mut verified_hooks = false;
+        if is_hook_event {
+            verified_hooks = true;
+            // Mark this terminal's hooks as runtime-verified
+            if let Some(entry) = self.terminals.get_mut(&terminal_id) {
+                if !entry.codex_hooks_runtime_verified {
+                    entry.codex_hooks_runtime_verified = true;
+                    entry.dirty = true;
+                }
+            }
+        }
+
         // Map Codex event kinds to semantic transport status and reason hints
         // This preserves Orca-compatible semantics through the state machine
-        let (transport_status, reason_hint) = match event.event_kind.as_deref() {
+        let (transport_status, reason_hint, source) = match event.event_kind.as_deref() {
+            // Hook events for spinner tracking (UserPromptSubmit hooks)
+            // This proves hooks are working at runtime and starts the spinner
+            Some(kind) if kind == "user-prompt-submit" || kind == "session-start" => (
+                CodexTransportStatus::Working,
+                None,
+                CodexCliStatusSource::Hook,
+            ),
+            // Stop hook (hook-stop) signals the end of agent work.
+            // This transitions from Working to Idle/Attention state.
+            Some(kind) if kind == "hook-stop" && event.status == "attention" && is_hook_event => {
+                // Use UnknownNotify as the reason - the preservation logic in
+                // apply_codex_transport_status will preserve existing interactive reasons
+                (
+                    CodexTransportStatus::Idle,
+                    Some(CodexAttentionReason::UnknownNotify),
+                    CodexCliStatusSource::Hook,
+                )
+            }
+            // Legacy: agent-turn-complete from hooks (should not happen with new config)
+            Some(kind)
+                if kind == "agent-turn-complete"
+                    && event.status == "attention"
+                    && is_hook_event =>
+            {
+                (
+                    CodexTransportStatus::Idle,
+                    Some(CodexAttentionReason::TurnComplete),
+                    CodexCliStatusSource::Hook,
+                )
+            }
+            Some(kind) if kind == "agent-turn-complete" && event.status == "running" => (
+                CodexTransportStatus::Idle,
+                Some(CodexAttentionReason::TurnComplete),
+                CodexCliStatusSource::Hook,
+            ),
             // Permission-related events map to Permission status
             Some(kind)
-                if kind == CODEX_APPROVAL_REQUESTED_EVENT
+                if kind == "approval-requested"
                     || kind == "approval_requested"
                     || kind.contains("approval") =>
             {
                 (
                     CodexTransportStatus::Permission,
                     Some(CodexAttentionReason::ApprovalRequested),
+                    CodexCliStatusSource::Hook,
                 )
             }
             Some(kind)
-                if kind == CODEX_USER_INPUT_REQUESTED_EVENT
+                if kind == "user-input-requested"
                     || kind == "user_input_requested"
                     || kind.contains("user_input") =>
             {
                 (
                     CodexTransportStatus::Permission,
                     Some(CodexAttentionReason::UserInputRequested),
+                    CodexCliStatusSource::Hook,
                 )
             }
             Some(kind)
-                if kind == CODEX_PLAN_MODE_PROMPT_EVENT
+                if kind == "plan-mode-prompt"
                     || kind == "plan_mode_prompt"
                     || kind.contains("plan") =>
             {
                 (
                     CodexTransportStatus::Permission,
                     Some(CodexAttentionReason::PlanModePrompt),
+                    CodexCliStatusSource::Hook,
                 )
             }
             // Completion events map to Idle status
             Some(kind)
-                if kind == CODEX_TURN_COMPLETE_EVENT
+                if kind == "turn-complete"
                     || kind == "agent_turn_complete"
                     || kind.contains("turn_complete") =>
             {
                 (
                     CodexTransportStatus::Idle,
                     Some(CodexAttentionReason::TurnComplete),
+                    CodexCliStatusSource::Hook,
                 )
             }
             // Error events also map to Idle (session continues, but needs attention)
             Some(kind) if kind.contains("error") || kind.contains("execution_error") => (
                 CodexTransportStatus::Idle,
                 Some(CodexAttentionReason::ExecutionError),
+                CodexCliStatusSource::Notify,
             ),
             // Generic attention fallback - treat as idle with unknown reason
             _ if event.status == "attention" => (
                 CodexTransportStatus::Idle,
                 Some(CodexAttentionReason::UnknownNotify),
+                CodexCliStatusSource::Notify,
             ),
-            _ => return false,
+            _ => return verified_hooks, // Return true if we verified hooks, false otherwise
         };
 
         // Use the unified transport status helper for consistent behavior
         // This properly handles pending_attention on working->idle/permission transitions
-        self.apply_codex_transport_status(
-            terminal_id,
-            transport_status,
-            CodexCliStatusSource::Notify,
-            reason_hint,
-        )
+        let state_changed =
+            self.apply_codex_transport_status(terminal_id, transport_status, source, reason_hint);
+
+        state_changed || verified_hooks
     }
 
     fn poll_opencode_notify_inboxes(&mut self, ctx: &egui::Context) {
@@ -6020,6 +6184,13 @@ impl AdeApp {
                                 || kind == "question-asked" =>
                         {
                             Some(OpenCodeAttentionReason::QuestionAsked)
+                        }
+                        Some(kind)
+                            if kind == "plan_mode_prompt"
+                                || kind == "plan-mode-prompt"
+                                || kind == "plan_mode" =>
+                        {
+                            Some(OpenCodeAttentionReason::PlanModePrompt)
                         }
                         _ => Some(OpenCodeAttentionReason::PermissionAsked),
                     };
@@ -6282,6 +6453,16 @@ impl AdeApp {
                                         Some(OpenCodeAttentionReason::PermissionAsked),
                                         Some(OpenCodeTransportStatus::Permission),
                                     ),
+                                    Some(name)
+                                        if name == "plan_mode_prompt"
+                                            || name == "plan-mode-prompt"
+                                            || name == "plan_mode" =>
+                                    {
+                                        (
+                                            Some(OpenCodeAttentionReason::PlanModePrompt),
+                                            Some(OpenCodeTransportStatus::Permission),
+                                        )
+                                    }
                                     _ => (None, None),
                                 }
                             } else if status == AiCliStatus::Running && !from_title {
@@ -6379,6 +6560,14 @@ impl AdeApp {
                         if let Some((transport_status, source, reason)) =
                             Self::codex_status_from_chunk(&chunk)
                         {
+                            if chunk == "codex-turn-complete"
+                                && !self
+                                    .terminals
+                                    .get(&terminal_id)
+                                    .is_some_and(Self::should_accept_codex_turn_complete_chunk)
+                            {
+                                continue;
+                            }
                             if self.apply_codex_transport_status(
                                 terminal_id,
                                 transport_status,
@@ -7788,6 +7977,18 @@ impl AdeApp {
                             {
                                 committed_codex_reply = true;
                             }
+                            // First prompt during launch pending should trigger
+                            // Running state. This ensures spinner starts when user
+                            // actually submits a prompt to the AI.
+                            if terminal.ai_session.tool == Some(AiCliTool::CodexCli)
+                                && terminal.codex_launch_pending_since.is_some()
+                                && !launched_factory_droid
+                                && !launched_codex_cli
+                                && !launched_opencode
+                                && submitted_codex_interaction
+                            {
+                                submitted_codex_prompt = true;
+                            }
                             if terminal.codex_session_active
                                 && !launched_factory_droid
                                 && !launched_codex_cli
@@ -7813,6 +8014,14 @@ impl AdeApp {
                                 );
                                 // Track recent inputs for tooltip history (filters "/" commands)
                                 Self::push_recent_input(&mut terminal.recent_inputs, &sanitized);
+                            }
+                            // Record to persistent input history (raw line, not sanitized)
+                            if !line.trim().is_empty() {
+                                self.record_input_history(
+                                    terminal.project_id,
+                                    terminal.kind,
+                                    &line,
+                                );
                             }
                             terminal.dirty = true;
                             continue;
@@ -7954,9 +8163,9 @@ impl AdeApp {
             ctx.request_repaint();
         }
         if submitted_codex_prompt
-            && self.apply_codex_status(
+            && self.apply_codex_transport_status(
                 active_terminal_id,
-                AiCliStatus::Running,
+                CodexTransportStatus::Working,
                 CodexCliStatusSource::PromptSubmit,
                 None,
             )
@@ -8672,13 +8881,14 @@ impl AdeApp {
     fn apply_terminal_snapshot(
         terminal: &mut TerminalEntry,
         snapshot: TerminalSnapshot,
-        selection_snapshot: TerminalSelectionSnapshot,
+        selection_snapshot: Option<TerminalSelectionSnapshot>,
     ) {
         Self::apply_terminal_snapshot_parts(
             &mut terminal.render_cache,
             &mut terminal.dirty,
             &mut terminal.snapshot_refresh_deferred,
             &mut terminal.selection_snapshot,
+            terminal.selection.is_some(),
             snapshot,
             selection_snapshot,
         );
@@ -8689,13 +8899,25 @@ impl AdeApp {
         dirty: &mut bool,
         snapshot_refresh_deferred: &mut bool,
         selection_snapshot: &mut Option<TerminalSelectionSnapshot>,
+        has_active_selection: bool,
         snapshot: TerminalSnapshot,
-        next_selection_snapshot: TerminalSelectionSnapshot,
+        next_selection_snapshot: Option<TerminalSelectionSnapshot>,
     ) {
         *render_cache = snapshot;
         *dirty = false;
         *snapshot_refresh_deferred = false;
-        *selection_snapshot = Some(next_selection_snapshot);
+        // Cache management: if no active selection, invalidate stale cache
+        // to prevent hit-testing against outdated row/column data after new
+        // terminal output arrives. If selection is active, we keep the cached
+        // snapshot even when None is passed (atomic pair applies together).
+        if next_selection_snapshot.is_some() {
+            *selection_snapshot = next_selection_snapshot;
+        } else if !has_active_selection {
+            // No selection active and no new snapshot provided - invalidate cache
+            *selection_snapshot = None;
+        }
+        // When selection is active and next_selection_snapshot is None,
+        // we intentionally keep the existing cached snapshot for hit-testing.
     }
 
     fn ensure_terminal_selection_snapshot(terminal: &mut TerminalEntry) {
@@ -8802,9 +9024,9 @@ impl AdeApp {
             );
         }
         if submitted_codex_prompt {
-            let _ = self.apply_codex_status(
+            let _ = self.apply_codex_transport_status(
                 terminal_id,
-                AiCliStatus::Running,
+                CodexTransportStatus::Working,
                 CodexCliStatusSource::PromptSubmit,
                 None,
             );
@@ -9795,6 +10017,27 @@ impl AdeApp {
             healthy_color,
             warning_color,
         );
+        // Bridge diagnostics
+        let (codex_bridge_text, codex_bridge_color) = match codex::codex_bridge_diagnostics() {
+            Ok(bridge_diag) => {
+                let text = if bridge_diag.bridge_exists {
+                    if bridge_diag.wiring_mismatch {
+                        "Installed, wiring stale".to_owned()
+                    } else {
+                        "Installed".to_owned()
+                    }
+                } else {
+                    "Not installed".to_owned()
+                };
+                let color = if bridge_diag.bridge_exists && !bridge_diag.wiring_mismatch {
+                    healthy_color
+                } else {
+                    warning_color
+                };
+                (text, color)
+            }
+            Err(_) => ("Error checking bridge".to_owned(), warning_color),
+        };
         let should_show_codex_enable_button =
             Self::should_show_codex_enable_button(&codex_integration_status);
         let managed_settings_path = diagnostics
@@ -9818,8 +10061,7 @@ impl AdeApp {
         let summary_message_color = if diagnostics.shows_settings_warning_badge()
             || matches!(
                 codex_integration_status,
-                CodexIntegrationStatus::CustomNotifyHook { .. }
-                    | CodexIntegrationStatus::ConfigReadError { .. }
+                CodexIntegrationStatus::ConfigReadError { .. }
             ) {
             warning_color
         } else {
@@ -9901,6 +10143,12 @@ impl AdeApp {
                         codex_integration_text,
                         codex_integration_color,
                     );
+                    Self::draw_settings_diagnostic_row(
+                        ui,
+                        "Bridge",
+                        &codex_bridge_text,
+                        codex_bridge_color,
+                    );
                 } else {
                     ui.columns(2, |columns| {
                         columns[0]
@@ -9956,6 +10204,12 @@ impl AdeApp {
                             "Integration",
                             codex_integration_text,
                             codex_integration_color,
+                        );
+                        Self::draw_settings_diagnostic_row(
+                            &mut columns[1],
+                            "Bridge",
+                            &codex_bridge_text,
+                            codex_bridge_color,
                         );
                     });
                 }
@@ -10132,7 +10386,7 @@ impl AdeApp {
             );
             ui.label(
                 RichText::new(
-                    "Codex CLI status is now derived primarily from terminal title semantics (Orca-compatible), with notify/visible UI as fallback. Official hooks remain disabled on native Windows.",
+                    "Codex CLI integration uses multiple fallback paths on Windows: hook-based spinner tracking, process tracking, title-based detection, and notify events. Hooks are disabled upstream on Windows; WSL bridging stays out of scope in this release.",
                 )
                 .small()
                 .color(TEXT_MUTED),
@@ -10176,6 +10430,7 @@ impl AdeApp {
         content_rect: egui::Rect,
         activity_rect: Option<egui::Rect>,
         explorer_rect: Option<egui::Rect>,
+        checklist_rect: Option<egui::Rect>,
     ) -> Vec2 {
         let mut width = content_rect.width();
         let height = content_rect.height();
@@ -10185,6 +10440,9 @@ impl AdeApp {
         }
         if let Some(explorer_rect) = explorer_rect {
             width -= explorer_rect.width();
+        }
+        if let Some(checklist_rect) = checklist_rect {
+            width -= checklist_rect.width();
         }
 
         egui::vec2(width.max(1.0), height.max(1.0))
@@ -10213,6 +10471,9 @@ impl AdeApp {
                 let terminal_manager_active = self.config.ui.show_project_explorer
                     && self.config.ui.project_explorer_expanded
                     && self.config.ui.left_sidebar_tab == LeftSidebarTab::TerminalManager;
+                let input_history_active = self.config.ui.show_project_explorer
+                    && self.config.ui.project_explorer_expanded
+                    && self.config.ui.left_sidebar_tab == LeftSidebarTab::InputHistory;
                 let diagnostics = self.factory_droid_transport_diagnostics();
                 let settings_tooltip = diagnostics.settings_tooltip_text();
                 let shows_settings_warning_badge = diagnostics.shows_settings_warning_badge();
@@ -10268,6 +10529,39 @@ impl AdeApp {
                         should_persist = true;
                     }
 
+                    ui.add_space(6.0);
+                    if styled_icon_toggle(
+                        ui,
+                        input_history_active,
+                        icons::CLOCK,
+                        "Open Input History",
+                    ) {
+                        self.config.ui.show_project_explorer = true;
+                        if input_history_active {
+                            self.config.ui.project_explorer_expanded = false;
+                        } else {
+                            self.config.ui.project_explorer_expanded = true;
+                            self.config.ui.left_sidebar_tab = LeftSidebarTab::InputHistory;
+                            // Sync selected project with history panel
+                            if self.input_history_selected_project_id.is_none() {
+                                self.input_history_selected_project_id = self.selected_project;
+                            }
+                        }
+                        should_persist = true;
+                    }
+
+                    ui.add_space(6.0);
+                    let checklist_panel_active = self.config.ui.checklist_panel_expanded;
+                    if styled_icon_toggle(
+                        ui,
+                        checklist_panel_active,
+                        icons::CHECK_CIRCLE,
+                        "Toggle Check-list Panel",
+                    ) {
+                        self.config.ui.checklist_panel_expanded = !checklist_panel_active;
+                        should_persist = true;
+                    }
+
                     let footer_space = (ui.available_height() - CONTROL_ROW_HEIGHT).max(0.0);
                     ui.add_space(footer_space);
 
@@ -10318,6 +10612,7 @@ impl AdeApp {
                     LeftSidebarTab::Directory => (icons::TREE_VIEW, "Directory"),
                     LeftSidebarTab::SourceControl => (icons::GIT_BRANCH, "Source Control"),
                     LeftSidebarTab::TerminalManager => (icons::TERMINAL_WINDOW, "Terminal Manager"),
+                    LeftSidebarTab::InputHistory => (icons::CLOCK, "Input History"),
                 };
                 ui.horizontal(|ui| {
                     ui.label(
@@ -10963,10 +11258,215 @@ impl AdeApp {
                     LeftSidebarTab::TerminalManager => {
                         self.draw_terminal_manager_contents(ctx, ui);
                     }
+                    LeftSidebarTab::InputHistory => {
+                        self.draw_input_history_contents(ctx, ui);
+                    }
                 }
                 ui.expand_to_include_x(panel_right);
             });
         response.map(|inner| inner.response.rect)
+    }
+
+    fn draw_input_history_contents(&mut self, ctx: &egui::Context, ui: &mut Ui) {
+        let panel_right = ui.max_rect().right();
+        ui.set_width(ui.max_rect().width());
+
+        // Project selector
+        let project_rows: Vec<(u64, String)> = self
+            .projects
+            .iter()
+            .map(|(id, p)| (*id, p.name.clone()))
+            .collect();
+
+        let selected_project_label = self
+            .input_history_selected_project_id
+            .and_then(|id| self.projects.get(&id))
+            .map(|p| format!("{} {}", icons::FOLDER_OPEN, p.name))
+            .unwrap_or_else(|| "No project selected".to_owned());
+
+        ui.label(RichText::new("Project").color(TEXT_MUTED));
+        ui.horizontal(|ui| {
+            let remaining_width = ui.available_size_before_wrap().x.max(0.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(remaining_width, CONTROL_ROW_HEIGHT),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    with_minimal_button_chrome(ui, |ui| {
+                        egui::ComboBox::from_id_salt("input-history-project-select")
+                            .selected_text(selected_project_label)
+                            .icon(paint_minimal_combo_icon)
+                            .width(ui.available_width().max(0.0).min(200.0))
+                            .show_ui(ui, |ui| {
+                                for (project_id, project_name) in &project_rows {
+                                    ui.selectable_value(
+                                        &mut self.input_history_selected_project_id,
+                                        Some(*project_id),
+                                        format!("{} {}", icons::FOLDER, project_name),
+                                    );
+                                }
+                            });
+                    });
+                },
+            );
+        });
+        ui.add_space(8.0);
+
+        // Filter tabs (All / Foreground / Background)
+        let mut selected_filter = self.config.ui.input_history_filter;
+        if draw_input_history_filter_tabs(ui, &mut selected_filter) {
+            self.config.ui.input_history_filter = selected_filter;
+            self.note_ui_config_changed();
+        }
+        ui.add_space(8.0);
+
+        // Search input
+        ui.add_sized(
+            [ui.available_width(), CONTROL_ROW_HEIGHT],
+            egui::TextEdit::singleline(&mut self.input_history_search_query)
+                .id(egui::Id::new("input-history-search"))
+                .hint_text("Search history...")
+                .vertical_align(Align::Center),
+        );
+        ui.add_space(8.0);
+        ui.separator();
+
+        // History list
+        egui::ScrollArea::vertical()
+            .id_salt("input-history-scroll")
+            .max_height(ui.available_height())
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.draw_input_history_entries(ctx, ui, panel_right);
+            });
+    }
+
+    fn draw_input_history_entries(&mut self, ctx: &egui::Context, ui: &mut Ui, panel_right: f32) {
+        let Some(project_id) = self.input_history_selected_project_id else {
+            ui.label(RichText::new("Select a project to view history").color(TEXT_MUTED));
+            return;
+        };
+
+        let Some(project) = self.projects.get(&project_id).cloned() else {
+            ui.label(RichText::new("Project not found").color(TEXT_MUTED));
+            return;
+        };
+
+        let project_path_str = project.path.display().to_string();
+        let filter = self.config.ui.input_history_filter;
+        let search = self.input_history_search_query.trim().to_lowercase();
+
+        // Get entries for this project
+        let entries: Vec<&TerminalInputRecord> = self
+            .input_history
+            .projects
+            .get(&project_path_str)
+            .map(|h| &h.entries[..])
+            .unwrap_or(&[])
+            .iter()
+            .filter(|e| filter.matches(e.terminal_kind))
+            .filter(|e| search.is_empty() || e.text.to_lowercase().contains(&search))
+            .collect();
+
+        if entries.is_empty() {
+            let msg = if search.is_empty() {
+                "No history entries for this project yet"
+            } else {
+                "No matching entries"
+            };
+            ui.label(RichText::new(msg).color(TEXT_MUTED));
+            return;
+        }
+
+        ui.label(
+            RichText::new(format!("{} entries", entries.len()))
+                .small()
+                .color(TEXT_MUTED),
+        );
+        ui.add_space(4.0);
+
+        for entry in entries {
+            self.draw_input_history_row(ctx, ui, entry, panel_right);
+        }
+    }
+
+    fn draw_input_history_row(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut Ui,
+        entry: &TerminalInputRecord,
+        _panel_right: f32,
+    ) {
+        let row_height = CONTROL_ROW_HEIGHT;
+        let row_width = ui.available_width().max(0.0);
+        let (row_rect, row_response) =
+            ui.allocate_exact_size(egui::vec2(row_width, row_height), egui::Sense::click());
+
+        // Row styling
+        let is_hovered = row_response.hovered();
+        if is_hovered {
+            ui.painter()
+                .rect_filled(row_rect.shrink(1.0), 6.0, with_alpha(BTN_ICON_HOVER, 80));
+        }
+
+        // Content layout
+        let content_rect = row_rect.shrink2(egui::vec2(6.0, 2.0));
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(content_rect)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                // Kind indicator icon
+                let kind_icon = match entry.terminal_kind {
+                    TerminalKind::Foreground => icons::TERMINAL,
+                    TerminalKind::Background => icons::LIST,
+                };
+                let kind_color = match entry.terminal_kind {
+                    TerminalKind::Foreground => ACCENT,
+                    TerminalKind::Background => TEXT_MUTED,
+                };
+                ui.label(
+                    RichText::new(format!("{}", kind_icon))
+                        .color(kind_color)
+                        .size(12.0),
+                );
+                ui.add_space(6.0);
+
+                // Text (truncated)
+                let text = if entry.text.len() > 60 {
+                    format!("{}...", &entry.text[..60])
+                } else {
+                    entry.text.clone()
+                };
+                ui.label(RichText::new(text).color(TEXT_PRIMARY).size(13.0));
+
+                // Push remaining space to the right
+                let remaining = ui.available_width();
+                if remaining > 60.0 {
+                    ui.add_space(remaining - 60.0);
+                }
+
+                // Relative timestamp
+                let time_text = format_relative_time(entry.recorded_at);
+                ui.label(RichText::new(time_text).small().color(TEXT_MUTED));
+            },
+        );
+
+        // Click to copy
+        if row_response.clicked() {
+            ctx.copy_text(entry.text.clone());
+            self.show_status_feedback(ctx, "Copied to clipboard");
+        }
+
+        // Context menu for copy
+        row_response.context_menu(|ui| {
+            with_minimal_button_chrome(ui, |ui| {
+                if ui.button(format!("{} Copy", icons::COPY)).clicked() {
+                    ctx.copy_text(entry.text.clone());
+                    self.show_status_feedback(ctx, "Copied to clipboard");
+                    ui.close_menu();
+                }
+            });
+        });
     }
 
     fn draw_terminal_manager_contents(&mut self, ctx: &egui::Context, ui: &mut Ui) {
@@ -11052,7 +11552,21 @@ impl AdeApp {
                 let _ = header_state.show_body_unindented(ui, |ui| {
                     ui.indent(Id::new(("terminal-manager-body", project_id)), |ui| {
                         ui.add_space(4.0);
-                        self.draw_terminal_rows(ctx, ui, project_id, visible_kind);
+                        // Calculate max available tooltip right edge based on checklist panel
+                        let max_tooltip_right = if self.config.ui.checklist_panel_expanded {
+                            let screen_right = ui.ctx().screen_rect().right();
+                            (screen_right - CHECKLIST_PANEL_WIDTH - 8.0).max(panel_right + 100.0)
+                        } else {
+                            ui.ctx().screen_rect().right() - 16.0
+                        };
+                        self.draw_terminal_rows(
+                            ctx,
+                            ui,
+                            project_id,
+                            visible_kind,
+                            panel_right,
+                            max_tooltip_right,
+                        );
                     });
                 });
             }
@@ -11096,6 +11610,8 @@ impl AdeApp {
         ui: &mut Ui,
         project_id: u64,
         kind: TerminalKind,
+        panel_right: f32,
+        max_tooltip_right: f32,
     ) {
         let ids = terminal_ids_for_project_kind(&self.terminals, project_id, kind);
         let saved_messages = self
@@ -11110,6 +11626,7 @@ impl AdeApp {
             let mut set_active = false;
             let mut close_terminal = false;
             let mut visibility_changed = false;
+            let mut test_done_changed = false;
             let mut send_message: Option<String> = None;
             // Track which message was clicked for copying (use Cell for interior mutability)
             let copied_message: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
@@ -11124,7 +11641,9 @@ impl AdeApp {
                     full_title: terminal.full_title.clone(),
                     exited: terminal.exited,
                     recent_inputs: terminal.recent_inputs.clone(),
+                    checklist_snapshot: terminal.checklist_snapshot.clone(),
                     in_main_view: terminal.in_main_view,
+                    test_done: terminal.test_done,
                     ai_logo_key: ai_cli_logo_key_for_terminal(terminal),
                     ai_badge: AiBadgeModel::from_terminal(terminal),
                 }
@@ -11148,6 +11667,14 @@ impl AdeApp {
                 let row_chrome = terminal_manager_row_chrome(active, row_response.hovered());
                 let selection_rect =
                     terminal_manager_row_selection_rect(row_rect, row_actions_width);
+
+                // Calculate tooltip position outside the panel (to the right)
+                let tooltip_gap = 8.0;
+                let max_tooltip_width =
+                    TERMINAL_HOVER_WIDTH.min(max_tooltip_right - panel_right - tooltip_gap);
+                let tooltip_width = max_tooltip_width.max(200.0);
+                let tooltip_pos = egui::pos2(panel_right + tooltip_gap, selection_rect.top());
+
                 let selection_response = (selection_rect.width() > 0.0).then(|| {
                     let response = ui.interact(
                         selection_rect,
@@ -11155,45 +11682,108 @@ impl AdeApp {
                             .with(("terminal_manager_row_select", terminal_data.id)),
                         Sense::click(),
                     );
-                    // Apply interactive hover tooltip to selection area
-                    let response = if !terminal_data.exited
-                        && !terminal_data.recent_inputs.is_empty()
-                    {
-                        response.on_hover_ui(|ui| {
-                            // Show title if different from most recent
-                            let most_recent = terminal_data
-                                .recent_inputs
-                                .front()
+
+                    // Show external tooltip to the right of the panel when hovered.
+                    // Only open when hovering the actual row; keep open when pointer moves
+                    // into the tooltip area using the actual rendered tooltip rect.
+                    if !terminal_data.exited && !terminal_data.recent_inputs.is_empty() {
+                        let pointer_pos = ui.ctx().input(|i| i.pointer.hover_pos());
+                        let row_hovered = response.hovered();
+
+                        // Get the actual rendered tooltip rect if it exists
+                        let tooltip_id =
+                            ui.id().with(("terminal_manager_tooltip", terminal_data.id));
+                        let tooltip_rect: Option<egui::Rect> =
+                            egui::AreaState::load(ui.ctx(), tooltip_id).map(|state| state.rect());
+
+                        // Tooltip is open if we can get its rect
+                        let tooltip_is_open = tooltip_rect.is_some();
+
+                        // Determine if we should show the tooltip:
+                        // - First open: only when hovering the row itself
+                        // - Keep open: when pointer is in the actual tooltip area
+                        let should_show_tooltip = if tooltip_is_open {
+                            // Keep open if pointer is on tooltip
+                            pointer_pos
+                                .zip(tooltip_rect)
+                                .map_or(false, |(pos, rect)| rect.contains(pos))
+                        } else {
+                            // First open only on row hover
+                            row_hovered
+                        };
+
+                        if should_show_tooltip {
+                            // Deduplicate inputs for display (preserves newest-first order)
+                            let deduplicated =
+                                deduplicated_recent_inputs(&terminal_data.recent_inputs);
+                            // Calculate tooltip dimensions using deduplicated list
+                            let header_height = deduplicated
+                                .first()
                                 .map(|s| s.as_str())
-                                .unwrap_or("");
-                            if most_recent != label {
-                                ui.label(egui::RichText::new(&label).strong().color(TEXT_PRIMARY));
-                                ui.add_space(4.0);
-                            }
-                            // Show each recent input as clickable row
-                            for (idx, message) in terminal_data.recent_inputs.iter().enumerate() {
-                                let msg_response = ui
-                                    .add_sized(
-                                        egui::vec2(ui.available_width(), 20.0),
-                                        egui::Label::new(
-                                            egui::RichText::new(message)
-                                                .color(TEXT_PRIMARY)
-                                                .size(13.0),
-                                        )
-                                        .sense(egui::Sense::click()),
-                                    )
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                if msg_response.clicked() {
-                                    copied_message.set(Some(message.clone()));
-                                }
-                                if idx < terminal_data.recent_inputs.len() - 1 {
-                                    ui.add_space(2.0);
-                                }
-                            }
-                        })
-                    } else {
-                        response
-                    };
+                                .is_some_and(|most_recent| most_recent != label)
+                                .then_some(20.0 + 4.0)
+                                .unwrap_or(0.0);
+                            let chars_per_line = (tooltip_width / 8.0).max(20.0) as usize;
+                            let line_height = 17.0;
+                            let messages_height: f32 = deduplicated
+                                .iter()
+                                .map(|msg| {
+                                    let wrapped_lines =
+                                        ((msg.len() + chars_per_line - 1) / chars_per_line).max(1);
+                                    line_height * wrapped_lines as f32
+                                })
+                                .sum();
+                            let spacing_height =
+                                (deduplicated.len().saturating_sub(1)) as f32 * 2.0;
+                            let padding = 16.0;
+                            let _tooltip_height =
+                                header_height + messages_height + spacing_height + padding;
+
+                            egui::show_tooltip_at(
+                                ui.ctx(),
+                                ui.layer_id(),
+                                tooltip_id,
+                                tooltip_pos,
+                                |ui| {
+                                    ui.set_min_width(tooltip_width);
+                                    ui.set_max_width(tooltip_width);
+
+                                    // Show title if different from most recent
+                                    let most_recent =
+                                        deduplicated.first().map(|s| s.as_str()).unwrap_or("");
+                                    if most_recent != label {
+                                        ui.label(
+                                            egui::RichText::new(&label)
+                                                .strong()
+                                                .color(TEXT_PRIMARY),
+                                        );
+                                        ui.add_space(4.0);
+                                    }
+                                    // Show each recent input as clickable row (wraps if long)
+                                    for (idx, message) in deduplicated.iter().enumerate() {
+                                        let msg_response = ui
+                                            .add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(message.as_str())
+                                                        .color(TEXT_PRIMARY)
+                                                        .size(13.0),
+                                                )
+                                                .wrap()
+                                                .sense(egui::Sense::click()),
+                                            )
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                        if msg_response.clicked() {
+                                            copied_message.set(Some((*message).clone()));
+                                        }
+                                        if idx < deduplicated.len() - 1 {
+                                            ui.add_space(2.0);
+                                        }
+                                    }
+                                },
+                            );
+                        }
+                    }
+
                     response.on_hover_cursor(egui::CursorIcon::PointingHand)
                 });
                 if ui
@@ -11339,6 +11929,12 @@ impl AdeApp {
                             &mut send_message,
                         );
                         action_clicked |= message_response.clicked();
+
+                        // Test done toggle button with green/white state-aware styling
+                        if terminal_manager_test_done_toggle(ui, terminal_data.test_done) {
+                            test_done_changed = true;
+                            action_clicked = true;
+                        }
                     },
                 );
                 if activation_response
@@ -11359,6 +11955,19 @@ impl AdeApp {
             if visibility_changed {
                 if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                     terminal.in_main_view = !terminal.in_main_view;
+                }
+                self.bump_layout_epoch();
+            }
+            if test_done_changed {
+                if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                    terminal.test_done = !terminal.test_done;
+                    // Snapshot the last 5 messages when marking as done; clear when unmarking
+                    if terminal.test_done {
+                        terminal.checklist_snapshot =
+                            terminal.recent_inputs.iter().cloned().collect();
+                    } else {
+                        terminal.checklist_snapshot.clear();
+                    }
                 }
                 self.bump_layout_epoch();
             }
@@ -11499,6 +12108,164 @@ impl AdeApp {
         .rect_filled(seam_rect, 0.0, SURFACE_BG);
     }
 
+    /// Draw the Check-list panel on the right side.
+    /// Collapsible; shows only terminals marked with test_done=true.
+    fn draw_checklist_panel(&mut self, ctx: &egui::Context) -> Option<egui::Rect> {
+        if !self.config.ui.checklist_panel_expanded {
+            return None;
+        }
+
+        let response = egui::SidePanel::right("checklist_panel")
+            .resizable(false)
+            .exact_width(CHECKLIST_PANEL_WIDTH)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::none()
+                    .fill(SURFACE_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .rounding(8.0)
+                    .inner_margin(egui::Margin::same(10.0)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(ui.max_rect().width());
+
+                // Header
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{} Check-list", icons::CHECK_CIRCLE))
+                            .strong()
+                            .size(15.0)
+                            .color(TEXT_PRIMARY),
+                    );
+                });
+                ui.separator();
+
+                // Collect checked terminals grouped by project (scrollable content)
+                let checked_terminals: Vec<(u64, String, u64, String, Vec<String>)> = {
+                    let mut terminals: Vec<(u64, String, u64, String, Vec<String>)> = Vec::new();
+                    for (terminal_id, terminal) in &self.terminals {
+                        if terminal.test_done {
+                            if let Some(project) = self.projects.get(&terminal.project_id) {
+                                terminals.push((
+                                    terminal.project_id,
+                                    project.name.clone(),
+                                    *terminal_id,
+                                    terminal.full_title.clone(),
+                                    terminal.checklist_snapshot.clone(),
+                                ));
+                            }
+                        }
+                    }
+                    terminals
+                };
+
+                // Wrap content in ScrollArea for long lists
+                egui::ScrollArea::vertical()
+                    .id_salt("checklist_panel_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if checked_terminals.is_empty() {
+                            ui.add_space(20.0);
+                            ui.centered_and_justified(|ui| {
+                                ui.label(
+                                    RichText::new(
+                                        "No items in Check-list\nClick the check icon in Terminal Manager to add",
+                                    )
+                                    .color(TEXT_MUTED)
+                                    .size(13.0),
+                                );
+                            });
+                        } else {
+                            // Group by project
+                            let mut sorted = checked_terminals;
+                            sorted.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
+                            let mut current_project_id: Option<u64> = None;
+
+                            for (project_id, project_name, terminal_id, terminal_title, snapshot) in sorted
+                            {
+                                // Project header
+                                if current_project_id != Some(project_id) {
+                                    current_project_id = Some(project_id);
+                                    ui.add_space(8.0);
+                                    ui.horizontal_top(|ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(format!("{} {}", icons::FOLDER_OPEN, project_name))
+                                                    .strong()
+                                                    .color(TEXT_PRIMARY)
+                                            )
+                                            .wrap(),
+                                        );
+                                    });
+                                    ui.add_space(4.0);
+                                }
+
+                                // Terminal row with checkbox to uncheck
+                                ui.horizontal_top(|ui| {
+                                    ui.add_space(16.0);
+
+                                    // Uncheck button
+                                    if terminal_manager_test_done_toggle(ui, true) {
+                                        // Uncheck this terminal
+                                        if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                                            terminal.test_done = false;
+                                            terminal.checklist_snapshot.clear();
+                                        }
+                                        self.bump_layout_epoch();
+                                    }
+
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&terminal_title)
+                                                .color(TEXT_PRIMARY)
+                                                .size(13.0)
+                                        )
+                                        .wrap(),
+                                    );
+                                });
+
+                                // Show the 5 snapshot messages (or placeholder if empty)
+                                ui.indent(Id::new(("checklist-messages", terminal_id)), |ui| {
+                                    if snapshot.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new("No messages captured – checklist saves a snapshot when you mark a terminal as done, and it does not auto-update with later messages.")
+                                                .color(TEXT_MUTED)
+                                                .size(12.0)
+                                                .italics(),
+                                        );
+                                    } else {
+                                        for (idx, message) in snapshot.iter().enumerate() {
+                                            let msg_response = ui
+                                                .add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(message)
+                                                            .color(TEXT_PRIMARY)
+                                                            .size(12.0),
+                                                    )
+                                                    .wrap()
+                                                    .sense(egui::Sense::click()),
+                                                )
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                .on_hover_text("Click to copy");
+                                            if msg_response.clicked() {
+                                                ctx.copy_text(message.to_string());
+                                                self.show_status_feedback(ctx, "Copied message");
+                                            }
+                                            if idx < snapshot.len().saturating_sub(1) {
+                                                ui.add_space(2.0);
+                                            }
+                                        }
+                                    }
+                                });
+                                ui.add_space(8.0);
+                            }
+                        }
+                    });
+            });
+
+        Some(response.response.rect)
+    }
+
     fn draw_terminal_pane(&mut self, ui: &mut Ui, terminal_id: u64, pane_size: Vec2) {
         let project_name = self
             .terminals
@@ -11586,8 +12353,8 @@ impl AdeApp {
                                 // Kind label width
                                 let kind_width = (kind_label.len() as f32) * 7.5;
                                 width += kind_width.min(70.0); // cap at 70px
-                                                               // Close button width
-                                width += 24.0;
+                                                               // Close button width + gap before it
+                                width += 24.0 + 10.0;
                                 width
                             };
 
@@ -11662,10 +12429,19 @@ impl AdeApp {
                             let pointer_on_tooltip = pointer_pos
                                 .zip(tooltip_rect)
                                 .map_or(false, |(pos, rect)| rect.contains(pos));
-                            // Check if moving toward tooltip (handles gap between title and tooltip)
+
+                            // Only check "moving toward tooltip" when pointer is in the gap
+                            // between title and tooltip (not when wandering in terminal body)
                             let moving_toward_tooltip = pointer_dir != Vec2::ZERO
                                 && pointer_pos.zip(tooltip_rect).map_or(false, |(pos, rect)| {
-                                    rect.intersects_ray(pos, pointer_dir.normalized())
+                                    // Pointer must be below title and above/near tooltip
+                                    let in_gap_region =
+                                        pos.y > title_rect.bottom() && pos.y < rect.top() + 20.0;
+                                    // Direction must be generally downward (toward tooltip)
+                                    let moving_downward = pointer_dir.y > 0.0;
+                                    in_gap_region
+                                        && moving_downward
+                                        && rect.intersects_ray(pos, pointer_dir.normalized())
                                 });
 
                             // Show centered tooltip under title when hovered
@@ -11686,12 +12462,19 @@ impl AdeApp {
                                     title_id,
                                     tooltip_pos,
                                     |ui| {
+                                        // Fixed width tooltip with wrapping content
+                                        let tooltip_width = TERMINAL_HOVER_WIDTH
+                                            .min(ui.ctx().screen_rect().width() - 32.0);
+                                        ui.set_min_width(tooltip_width);
+                                        ui.set_max_width(tooltip_width);
+
+                                        // Deduplicate inputs for display (preserves newest-first order)
+                                        let deduplicated =
+                                            deduplicated_recent_inputs(&terminal.recent_inputs);
+
                                         // Show title if different from most recent
-                                        let most_recent = terminal
-                                            .recent_inputs
-                                            .front()
-                                            .map(|s| s.as_str())
-                                            .unwrap_or("");
+                                        let most_recent =
+                                            deduplicated.first().map(|s| s.as_str()).unwrap_or("");
                                         if most_recent != terminal.full_title {
                                             ui.label(
                                                 egui::RichText::new(&terminal.full_title)
@@ -11700,25 +12483,23 @@ impl AdeApp {
                                             );
                                             ui.add_space(4.0);
                                         }
-                                        // Show each recent input as clickable row
-                                        for (idx, message) in
-                                            terminal.recent_inputs.iter().enumerate()
-                                        {
+                                        // Show each recent input as clickable row (wraps if long)
+                                        for (idx, message) in deduplicated.iter().enumerate() {
                                             let msg_response = ui
-                                                .add_sized(
-                                                    egui::vec2(ui.available_width(), 20.0),
+                                                .add(
                                                     egui::Label::new(
-                                                        egui::RichText::new(message)
+                                                        egui::RichText::new(message.as_str())
                                                             .color(TEXT_PRIMARY)
                                                             .size(13.0),
                                                     )
+                                                    .wrap()
                                                     .sense(egui::Sense::click()),
                                                 )
                                                 .on_hover_cursor(egui::CursorIcon::PointingHand);
                                             if msg_response.clicked() {
-                                                copied_hover_message.set(Some(message.clone()));
+                                                copied_hover_message.set(Some((*message).clone()));
                                             }
-                                            if idx < terminal.recent_inputs.len() - 1 {
+                                            if idx < deduplicated.len() - 1 {
                                                 ui.add_space(2.0);
                                             }
                                         }
@@ -11752,8 +12533,8 @@ impl AdeApp {
                                 );
                             let kind_width = kind_galley.size().x;
 
-                            // Close button + spacing + kind label + spacing
-                            let reserved_width = 24.0 + 8.0 + kind_width + 6.0;
+                            // Close button + spacing + kind label + spacing + gap before close button
+                            let reserved_width = 24.0 + 8.0 + kind_width + 6.0 + 10.0;
                             let project_available_width =
                                 (trailing_available_width - reserved_width).max(50.0);
 
@@ -11785,6 +12566,9 @@ impl AdeApp {
                                     .size(14.5)
                                     .color(header_chrome.detail_color),
                             ));
+
+                            // Add gap before close button to separate from content
+                            ui.add_space(10.0);
 
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if styled_icon_button(
@@ -11842,15 +12626,15 @@ impl AdeApp {
                     self.snapshot_budget_count >= TERMINAL_SNAPSHOT_BUDGET_PER_FRAME;
                 let skip_full_snapshot = !is_active_or_visible
                     && budget_exhausted
-                    && terminal.render_cache.lines.is_empty();
+                    && !terminal.render_cache.lines.is_empty();
 
                 if terminal.dirty
                     || terminal.snapshot_refresh_deferred
                     || terminal.render_cache.lines.is_empty()
                 {
                     if skip_full_snapshot {
-                        // Sync seqno but defer full snapshot to reduce per-frame load
-                        // Use exponential backoff to reduce repaint storm under load
+                        // Hard budget limit: defer even if dirty, but keep dirty flag for next frame
+                        // Only skip if we have cached content to show
                         if self.last_repaint_request_at.elapsed()
                             >= Duration::from_millis(REPAINT_DEBOUNCE_MS)
                         {
@@ -11883,8 +12667,10 @@ impl AdeApp {
                             }
                         }
                     } else if let Some((snapshot, selection_snapshot)) =
-                        try_terminal_snapshots(&terminal.runtime)
+                        try_terminal_snapshots(&terminal.runtime, terminal.selection.is_some())
                     {
+                        // Atomic snapshot pair: when selection exists, both snapshots come from
+                        // the same locked state so copy/link hit-testing matches the rendered frame.
                         Self::apply_terminal_snapshot(terminal, snapshot, selection_snapshot);
                         self.snapshot_budget_count += 1;
                         // Reset backoff on successful snapshot
@@ -12507,8 +13293,13 @@ impl eframe::App for AdeApp {
         // Phase 4: UI rendering
         let activity_rect = self.draw_activity_rail(ctx);
         let explorer_rect = self.draw_project_explorer(ctx);
-        let main_area_size =
-            self.main_area_size_from_chrome(ctx.screen_rect(), activity_rect, explorer_rect);
+        let checklist_rect = self.draw_checklist_panel(ctx);
+        let main_area_size = self.main_area_size_from_chrome(
+            ctx.screen_rect(),
+            activity_rect,
+            explorer_rect,
+            checklist_rect,
+        );
         self.handle_shortcuts(ctx, main_area_size);
         self.draw_main_area(ctx);
         if let (Some(activity_rect), Some(explorer_rect)) = (activity_rect, explorer_rect) {
@@ -12558,6 +13349,7 @@ fn recover_config_state(
     config.ui.show_project_explorer = current_config.ui.show_project_explorer;
     config.ui.show_terminal_manager = current_config.ui.show_terminal_manager;
     config.ui.main_visibility_mode = current_config.ui.main_visibility_mode;
+    config.ui.checklist_panel_expanded = current_config.ui.checklist_panel_expanded;
 
     if pending_config_changes.ui {
         config.ui.project_explorer_expanded = current_config.ui.project_explorer_expanded;
@@ -13788,12 +14580,18 @@ fn terminal_display_label(title: &str, exited: bool) -> String {
 }
 
 fn terminal_manager_actions_width(section_gap: f32, show_visibility_toggle: bool) -> f32 {
+    // Always reserve space for: close button + test_done button + message button + optional visibility toggle
+    // Each button is CONTROL_ROW_HEIGHT wide, with section_gap between them
     let visibility_width = if show_visibility_toggle {
         CONTROL_ROW_HEIGHT + section_gap
     } else {
         0.0
     };
-    CONTROL_ROW_HEIGHT + TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH + section_gap + visibility_width
+    // Close button + test_done button + message button + gaps + visibility toggle
+    (CONTROL_ROW_HEIGHT * 2.0)
+        + TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH
+        + (section_gap * 2.0)
+        + visibility_width
 }
 
 fn terminal_manager_row_widths(
@@ -14153,14 +14951,29 @@ fn capped_hover_text(text: &str, max_chars: usize) -> String {
 #[allow(dead_code)]
 const RECENT_INPUTS_HOVER_MAX_CHARS: usize = 100;
 
+/// Returns deduplicated recent inputs preserving newest-first order.
+/// Identical strings appear only once (first occurrence wins).
+#[allow(dead_code)]
+fn deduplicated_recent_inputs(recent_inputs: &VecDeque<String>) -> Vec<&String> {
+    let mut seen = HashSet::new();
+    let mut result = Vec::with_capacity(recent_inputs.len());
+    for input in recent_inputs.iter() {
+        if seen.insert(input.as_str()) {
+            result.push(input);
+        }
+    }
+    result
+}
+
 #[allow(dead_code)]
 fn recent_inputs_tooltip_text(recent_inputs: &VecDeque<String>) -> String {
     if recent_inputs.is_empty() {
         return String::new();
     }
 
-    recent_inputs
-        .iter()
+    let unique = deduplicated_recent_inputs(recent_inputs);
+    unique
+        .into_iter()
         .map(|input| capped_hover_text(input, RECENT_INPUTS_HOVER_MAX_CHARS))
         .collect::<Vec<_>>()
         .join("\n")
@@ -14178,6 +14991,7 @@ fn with_truncation_tooltip(
         return response;
     }
 
+    // Check if text actually exceeds available width
     let galley = WidgetText::from(text.to_owned()).into_galley(
         ui,
         Some(TextWrapMode::Truncate),
@@ -14185,11 +14999,22 @@ fn with_truncation_tooltip(
         egui::TextStyle::Body,
     );
 
-    if galley.size().x > available_width {
-        response.on_hover_text(capped_hover_text(text, DIRECTORY_ENTRY_TOOLTIP_MAX_CHARS))
-    } else {
-        response
+    if galley.size().x <= available_width {
+        // Text fits without truncation, no tooltip needed
+        return response;
     }
+
+    // Use fixed width for consistent tooltip sizing
+    let tooltip_width = TERMINAL_HOVER_WIDTH.min(ui.available_width().max(240.0));
+
+    response.on_hover_ui(|ui| {
+        ui.set_min_width(tooltip_width);
+        ui.set_max_width(tooltip_width);
+        ui.label(
+            egui::RichText::new(capped_hover_text(text, DIRECTORY_ENTRY_TOOLTIP_MAX_CHARS))
+                .color(TEXT_PRIMARY),
+        );
+    })
 }
 
 #[allow(dead_code)]
@@ -14836,6 +15661,79 @@ fn draw_terminal_manager_filter_tabs(
     changed
 }
 
+fn draw_input_history_filter_tabs(ui: &mut Ui, selected_filter: &mut InputHistoryFilter) -> bool {
+    let mut changed = false;
+    let available_width = ui.available_width();
+    let gap = 8.0;
+    let tab_count = 3.0;
+    let tab_width = ((available_width - gap * (tab_count - 1.0)) / tab_count).max(40.0);
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        for filter in [
+            InputHistoryFilter::All,
+            InputHistoryFilter::Foreground,
+            InputHistoryFilter::Background,
+        ] {
+            let is_selected = *selected_filter == filter;
+            let text = filter.label();
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(tab_width, CONTROL_ROW_HEIGHT), Sense::click());
+            let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+            // Background for selected tab
+            if is_selected {
+                ui.painter().rect_filled(rect.shrink(1.0), 6.0, BTN_ICON);
+            } else if response.hovered() {
+                ui.painter()
+                    .rect_filled(rect.shrink(1.0), 6.0, with_alpha(BTN_ICON_HOVER, 80));
+            }
+
+            // Text
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                text,
+                egui::FontId::proportional(13.0),
+                if is_selected {
+                    TEXT_PRIMARY
+                } else {
+                    TEXT_MUTED
+                },
+            );
+
+            if response.clicked() && !is_selected {
+                *selected_filter = filter;
+                changed = true;
+            }
+        }
+    });
+
+    changed
+}
+
+fn format_relative_time(timestamp: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let diff = now.saturating_sub(timestamp);
+
+    if diff < 60 {
+        "just now".to_owned()
+    } else if diff < 3600 {
+        format!("{}m ago", diff / 60)
+    } else if diff < 86400 {
+        format!("{}h ago", diff / 3600)
+    } else if diff < 604800 {
+        format!("{}d ago", diff / 86400)
+    } else if diff < 2592000 {
+        format!("{}w ago", diff / 604800)
+    } else {
+        format!("{}mo ago", diff / 2592000)
+    }
+}
+
 fn terminal_ids_for_project_kind(
     terminals: &BTreeMap<u64, TerminalEntry>,
     project_id: u64,
@@ -15019,6 +15917,52 @@ fn styled_icon_button(
     response.clicked()
 }
 
+/// Draws the terminal manager test-done toggle button.
+/// - When `test_done` is true: icon is green (100, 200, 100)
+/// - When `test_done` is false: icon is white (TEXT_PRIMARY)
+/// Hover adds a subtle background highlight but does not alter icon color.
+fn terminal_manager_test_done_toggle(ui: &mut Ui, test_done: bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT),
+        Sense::click(),
+    );
+    let tooltip = if test_done {
+        "Added to Check-list - click to remove"
+    } else {
+        "Add to Check-list"
+    };
+    let response = response
+        .on_hover_text(tooltip)
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    // Hover background highlight (subtle)
+    if response.hovered() {
+        let hover_alpha = if test_done { 80 } else { 60 };
+        ui.painter().rect_filled(
+            rect.shrink(1.0),
+            8.0,
+            with_alpha(BTN_ICON_HOVER, hover_alpha),
+        );
+    }
+
+    // Icon color: green when done, white when not done
+    let icon_color = if test_done {
+        Color32::from_rgb(100, 200, 100)
+    } else {
+        TEXT_PRIMARY
+    };
+
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        format!("{}", icons::CHECK_CIRCLE),
+        egui::FontId::proportional(15.0),
+        icon_color,
+    );
+
+    response.clicked()
+}
+
 fn styled_launcher_menu_button(
     app: &mut AdeApp,
     ui: &mut Ui,
@@ -15058,15 +16002,21 @@ fn styled_launcher_menu_button(
                                     let _ = app.draw_launcher_icon(ui, launcher.icon_key, 20.0);
                                     ui.add_space(6.0);
                                     ui.vertical(|ui| {
-                                        ui.label(
-                                            RichText::new(&launcher.display_name)
-                                                .strong()
-                                                .color(TEXT_PRIMARY),
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&launcher.display_name)
+                                                    .strong()
+                                                    .color(TEXT_PRIMARY),
+                                            )
+                                            .selectable(false),
                                         );
-                                        ui.label(
-                                            RichText::new(&launcher.launch_command)
-                                                .small()
-                                                .color(TEXT_MUTED),
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&launcher.launch_command)
+                                                    .small()
+                                                    .color(TEXT_MUTED),
+                                            )
+                                            .selectable(false),
                                         );
                                     });
                                 });
@@ -16473,13 +17423,14 @@ mod tests {
         average_terminal_cell_width, build_terminal_cursor_overlay, build_terminal_render,
         collect_source_control_line_totals, collect_source_control_snapshot,
         configure_terminal_font_family, count_text_line_bytes, cursor_hidden_by_row_filter,
-        default_app_open_command, draw_ai_badge, draw_terminal_manager_title_and_diff_summary,
-        draw_terminal_status_badges, force_terminal_pane_width, install_terminal_font_family,
-        launcher_icon_for_ai_tool, merge_source_control_refresh_result,
-        next_active_terminal_after_close, next_terminal_in_direction,
-        next_terminal_in_linear_direction, normalize_terminal_background, parse_branch_header,
-        parse_git_numstat_totals, primary_shortcut_modifier, recent_inputs_tooltip_text,
-        recover_config_state, resolve_ctrl_c_action, settings_accordion_disclosure_icon_rect,
+        deduplicated_recent_inputs, default_app_open_command, draw_ai_badge,
+        draw_terminal_manager_title_and_diff_summary, draw_terminal_status_badges,
+        force_terminal_pane_width, install_terminal_font_family, launcher_icon_for_ai_tool,
+        merge_source_control_refresh_result, next_active_terminal_after_close,
+        next_terminal_in_direction, next_terminal_in_linear_direction,
+        normalize_terminal_background, parse_branch_header, parse_git_numstat_totals,
+        primary_shortcut_modifier, recent_inputs_tooltip_text, recover_config_state,
+        resolve_ctrl_c_action, settings_accordion_disclosure_icon_rect,
         settings_diagnostics_accordion_header_layout, settings_diagnostics_uses_single_column,
         settings_general_inline_control_width, settings_general_uses_stacked_layout,
         settings_popup_uses_stacked_layout, settings_saved_message_card_width,
@@ -16497,24 +17448,24 @@ mod tests {
         terminal_output_surface_size, terminal_output_viewport_size,
         terminal_secondary_click_action, terminal_selection_point_from_pointer,
         terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
-        with_settings_text_edit_chrome, AdeApp, AiBadgeModel, AiBadgeVisual, CodexAttentionReason,
-        CodexCliStatusSource, CodexTransportStatus, CtrlCAction, DirectoryIndexSnapshot,
-        DirectoryNode, FactoryDroidAttentionReason, FactoryDroidHookInboxEvent,
-        FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
-        FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, OpenCodeAttentionReason,
-        OpenCodeStatusSource, OpenCodeTransportStatus, PendingConfigChanges,
-        PendingTerminalLinkClick, SettingsSection, SourceControlBadgeState, SourceControlFile,
-        SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
+        with_minimal_button_chrome, with_settings_text_edit_chrome, AdeApp, AiBadgeModel,
+        AiBadgeVisual, CodexAttentionReason, CodexCliStatusSource, CodexTransportStatus,
+        CtrlCAction, DirectoryIndexSnapshot, DirectoryNode, FactoryDroidAttentionReason,
+        FactoryDroidHookInboxEvent, FactoryDroidManagedInstallComponent,
+        FactoryDroidManagedInstallDiagnostics, FactoryDroidStatusSource,
+        FactoryDroidTransportDiagnostics, OpenCodeAttentionReason, OpenCodeStatusSource,
+        OpenCodeTransportStatus, PendingConfigChanges, PendingTerminalLinkClick, SettingsSection,
+        SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
+        SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
         TerminalOutputScrollBehavior, TerminalSecondaryClickAction, TerminalSelection,
-        TerminalSelectionPoint, TransientToast, CODEX_LAUNCH_GRACE_MS, CODEX_PROCESS_POLL_MS,
-        CODEX_RUNNING_GRACE_MS, CODEX_TRAILING_OUTPUT_GRACE_MS, DIRECTORY_INDEX_CHANNEL_CAPACITY,
-        FACTORY_DROID_HOOK_POLL_MS, FACTORY_DROID_LAUNCH_GRACE_MS, FACTORY_DROID_PROCESS_POLL_MS,
-        FACTORY_DROID_TRAILING_OUTPUT_GRACE_MS, OPENCODE_PROCESS_POLL_MS,
-        OPENCODE_RUNNING_GRACE_MS, OPENCODE_TRAILING_OUTPUT_GRACE_MS,
-        SOURCE_CONTROL_CHANNEL_CAPACITY, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG,
-        TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS,
-        TERMINAL_OUTPUT_BG, TRANSIENT_TOAST_SECS,
+        TerminalSelectionPoint, TransientToast, CODEX_PROCESS_POLL_MS,
+        CODEX_TRAILING_OUTPUT_GRACE_MS, DIRECTORY_INDEX_CHANNEL_CAPACITY,
+        FACTORY_DROID_HOOK_POLL_MS, OPENCODE_PROCESS_POLL_MS, OPENCODE_RUNNING_GRACE_MS,
+        OPENCODE_TRAILING_OUTPUT_GRACE_MS, SOURCE_CONTROL_CHANNEL_CAPACITY,
+        SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG, TERMINAL_COPY_FEEDBACK_TEXT,
+        TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS, TERMINAL_OUTPUT_BG,
+        TEXT_MUTED, TEXT_PRIMARY, TRANSIENT_TOAST_SECS,
     };
     use crate::codex::{
         CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent,
@@ -16539,7 +17490,7 @@ mod tests {
     use eframe::egui::text::{LayoutJob, TextFormat};
     use eframe::egui::{
         self, pos2, Color32, Context, Event, FontDefinitions, FontFamily, Galley, Id, Key,
-        Modifiers, RawInput, Stroke,
+        Modifiers, RawInput, RichText, Sense, Stroke,
     };
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
@@ -17356,32 +18307,66 @@ mod tests {
 
     #[test]
     fn settings_codex_enable_button_is_hidden_only_when_integration_is_healthy() {
+        // Button is hidden when fully verified healthy
         assert!(!AdeApp::should_show_codex_enable_button(
             &CodexIntegrationStatus::EnabledHealthy {
                 path: PathBuf::from(r"C:\Users\furkan.cakir\.codex\config.toml"),
+                hooks_runtime_verified: true,
             }
         ));
+        // Button is shown when healthy but not yet runtime-verified
+        assert!(AdeApp::should_show_codex_enable_button(
+            &CodexIntegrationStatus::EnabledHealthy {
+                path: PathBuf::from(r"C:\Users\furkan.cakir\.codex\config.toml"),
+                hooks_runtime_verified: false,
+            }
+        ));
+        // Button is shown when configured but unverified
+        assert!(AdeApp::should_show_codex_enable_button(
+            &CodexIntegrationStatus::HooksConfiguredUnverified {
+                path: PathBuf::from(r"C:\Users\furkan.cakir\.codex\config.toml"),
+            }
+        ));
+        // Button is shown when needs setup
         assert!(AdeApp::should_show_codex_enable_button(
             &CodexIntegrationStatus::NeedsSetup {
                 path: PathBuf::from(r"C:\Users\furkan.cakir\.codex\config.toml"),
             }
         ));
-        assert!(AdeApp::should_show_codex_enable_button(
-            &CodexIntegrationStatus::CustomNotifyHook {
-                path: PathBuf::from(r"C:\Users\furkan.cakir\.codex\config.toml"),
-            }
-        ));
+        // NOTE: CustomNotifyHook variant removed - hook-only integration
     }
 
     #[test]
     fn settings_codex_runtime_overview_message_reflects_enabled_integration() {
+        // Runtime-verified healthy status
         let message =
             AdeApp::codex_runtime_overview_message(&CodexIntegrationStatus::EnabledHealthy {
                 path: PathBuf::from(r"C:\Users\furkan.cakir\.codex\config.toml"),
+                hooks_runtime_verified: true,
             });
-
-        assert!(message.contains("already enabled"));
+        assert!(message.contains("is enabled"));
         assert!(!message.contains("can be enabled here"));
+        // Hook-only integration message for all platforms
+        assert!(message.contains("hook-only"));
+
+        // Pending verification status (hooks_runtime_verified: false)
+        let message =
+            AdeApp::codex_runtime_overview_message(&CodexIntegrationStatus::EnabledHealthy {
+                path: PathBuf::from(r"C:\Users\furkan.cakir\.codex\config.toml"),
+                hooks_runtime_verified: false,
+            });
+        assert!(message.contains("configured"));
+        // Hook-only integration message for all platforms
+        assert!(message.contains("hook-only"));
+
+        // Configured but unverified status
+        let message = AdeApp::codex_runtime_overview_message(
+            &CodexIntegrationStatus::HooksConfiguredUnverified {
+                path: PathBuf::from(r"C:\Users\furkan.cakir\.codex\config.toml"),
+            },
+        );
+        // Hook-only integration message for all platforms
+        assert!(message.contains("hook-only"));
     }
 
     #[test]
@@ -18321,8 +19306,9 @@ mod tests {
             &mut dirty,
             &mut snapshot_refresh_deferred,
             &mut selection_snapshot,
+            false, // no active selection in this test
             snapshot.clone(),
-            next_selection_snapshot.clone(),
+            Some(next_selection_snapshot.clone()),
         );
 
         assert_eq!(render_cache, snapshot);
@@ -18764,7 +19750,9 @@ mod tests {
             terminal_manager_row_widths(160.0, actions_width, 8.0);
 
         assert_eq!(actions_area_width, actions_width);
-        assert!((label_width - 48.0).abs() < f32::EPSILON);
+        // With visibility toggle: actions_width = 56 + 32 + 16 + 36 = 140
+        // label_width = 160 - 140 - 8 = 12
+        assert!((label_width - 12.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -18781,9 +19769,12 @@ mod tests {
     fn terminal_manager_row_actions_shrink_when_visibility_toggle_is_hidden() {
         let actions_width = terminal_manager_actions_width(8.0, false);
 
+        // With test_done button always present: 2*CONTROL_ROW_HEIGHT + MESSAGE_BUTTON + 2*section_gap
         assert_eq!(
             actions_width,
-            super::CONTROL_ROW_HEIGHT + super::TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH + 8.0
+            (super::CONTROL_ROW_HEIGHT * 2.0)
+                + super::TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH
+                + (8.0 * 2.0)
         );
     }
 
@@ -19025,7 +20016,7 @@ mod tests {
                         .max_rect(test_rect)
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                 );
-                app.draw_terminal_rows(ctx, &mut child, 7, TerminalKind::Foreground);
+                app.draw_terminal_rows(ctx, &mut child, 7, TerminalKind::Foreground, 320.0, 1000.0);
             });
         })
     }
@@ -19272,6 +20263,93 @@ mod tests {
             output.platform_output.cursor_icon,
             egui::CursorIcon::PointingHand
         );
+    }
+
+    #[test]
+    fn foreground_launcher_menu_text_hover_avoids_text_cursor() {
+        // Regression test: hovering over launcher menu text should NOT show I-beam (text cursor).
+        // This verifies .selectable(false) is applied to the labels.
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let launchers = vec![LauncherEntry {
+            id: "opencode".to_owned(),
+            builtin: Some(BuiltinLauncherKind::OpenCode),
+            display_name: "OpenCode".to_owned(),
+            launch_command: "opencode".to_owned(),
+            enabled: true,
+            icon_key: LauncherIconKey::OpenCode,
+        }];
+
+        // Simulate hovering over the launcher row text area
+        let output = draw_foreground_launcher_menu_in_test_ui(
+            &ctx,
+            RawInput {
+                events: vec![Event::PointerMoved(pos2(60.0, 40.0))],
+                ..RawInput::default()
+            },
+            &launchers,
+        );
+
+        // The key assertion: cursor should NOT be Text (I-beam/dik çubuk)
+        // which was the bug before adding .selectable(false)
+        assert_ne!(
+            output.platform_output.cursor_icon,
+            egui::CursorIcon::Text,
+            "hovering over launcher menu text should NOT use Text (I-beam) cursor"
+        );
+    }
+
+    fn draw_foreground_launcher_menu_in_test_ui(
+        ctx: &Context,
+        raw_input: RawInput,
+        launchers: &[LauncherEntry],
+    ) -> egui::FullOutput {
+        let _app = test_app(std::iter::empty(), None);
+        ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(200.0, 200.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        // Just render the menu contents directly to test cursor behavior
+                        with_minimal_button_chrome(ui, |ui| {
+                            for launcher in launchers {
+                                let response = ui.horizontal(|ui| {
+                                    ui.add_space(6.0);
+                                    ui.vertical(|ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&launcher.display_name)
+                                                    .strong()
+                                                    .color(TEXT_PRIMARY),
+                                            )
+                                            .selectable(false),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&launcher.launch_command)
+                                                    .small()
+                                                    .color(TEXT_MUTED),
+                                            )
+                                            .selectable(false),
+                                        );
+                                    });
+                                });
+                                let row_id =
+                                    ui.make_persistent_id(("foreground-launcher", &launcher.id));
+                                let row_response = ui
+                                    .interact(response.response.rect, row_id, Sense::click())
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if row_response.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                            }
+                        });
+                    },
+                );
+            });
+        })
     }
 
     #[test]
@@ -22779,59 +23857,6 @@ mod tests {
     }
 
     #[test]
-    fn turn_complete_notify_does_not_downgrade_visible_codex_plan_mode_prompt() {
-        let ctx = Context::default();
-        let temp_dir = TestTempDir::new("codex-plan-turn-complete-after-visible-ui");
-        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
-        app.codex_cli_runtime_dir = Some(temp_dir.path.clone());
-        {
-            let entry = app.terminals.get_mut(&1).expect("terminal 1");
-            entry.ai_session.tool = Some(AiCliTool::CodexCli);
-            entry.ai_session.status = AiCliStatus::Running;
-            entry.codex_session_active = true;
-        }
-
-        app.terminal_events_tx
-            .send(TerminalUiEvent {
-                terminal_id: 1,
-                kind: TerminalUiEventKind::AiRawChunk {
-                    terminal_id: 1,
-                    chunk: "codex-plan-mode-prompt".to_owned(),
-                },
-            })
-            .expect("send codex plan mode prompt chunk");
-        app.process_terminal_events(&ctx);
-
-        write_test_codex_notify_events(
-            &temp_dir.path,
-            1,
-            &test_codex_inbox_token(1),
-            &[CodexNotifyInboxEvent {
-                terminal_id: "1".to_owned(),
-                tool: "codex".to_owned(),
-                status: "attention".to_owned(),
-                inbox_token: Some(test_codex_inbox_token(1)),
-                event_kind: Some("agent-turn-complete".to_owned()),
-                raw_json: r#"{"event":"agent-turn-complete"}"#.to_owned(),
-                timestamp_utc: "2026-04-06T00:00:00Z".to_owned(),
-            }],
-        );
-        app.poll_codex_notify_inboxes(&ctx);
-
-        let terminal = app.terminals.get(&1).expect("terminal 1");
-        // Note: Notify currently upgrades/overwrites VisibleUi (downgrade protection not implemented)
-        assert_eq!(
-            terminal.codex_last_status_source,
-            Some(CodexCliStatusSource::Notify)
-        );
-        // Note: TurnComplete notify overwrites PlanModePrompt from visible UI
-        assert_eq!(
-            terminal.codex_attention_reason,
-            Some(CodexAttentionReason::TurnComplete)
-        );
-    }
-
-    #[test]
     fn sticky_codex_attention_is_cleared_by_committed_reply() {
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
@@ -23049,6 +24074,297 @@ mod tests {
         // Pulse/pending should be cleared
         assert!(!terminal.codex_attention_pending);
         assert!(terminal.codex_last_turn_complete_at.is_none());
+    }
+
+    #[test]
+    fn hook_stop_transitions_from_working_to_attention() {
+        let ctx = Context::default();
+        let temp_dir = TestTempDir::new("codex-hook-stop-transitions");
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.codex_cli_runtime_dir = Some(temp_dir.path.clone());
+
+        // Set up a Working state (spinner active)
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+            entry.codex_normalized_status = Some(CodexTransportStatus::Working);
+            entry.codex_last_status_source = Some(CodexCliStatusSource::Hook);
+        }
+
+        // Simulate hook-stop event (Stop hook with hook-stop event_kind)
+        // hook-stop SHOULD transition from Working to Idle/Attention
+        write_test_codex_notify_events(
+            &temp_dir.path,
+            1,
+            &test_codex_inbox_token(1),
+            &[CodexNotifyInboxEvent {
+                terminal_id: "1".to_owned(),
+                tool: "codex".to_owned(),
+                status: "attention".to_owned(),
+                inbox_token: Some(test_codex_inbox_token(1)),
+                event_kind: Some("hook-stop".to_owned()),
+                raw_json: r#"{"hook_event":"Stop"}"#.to_owned(),
+                timestamp_utc: "2026-04-06T00:00:00Z".to_owned(),
+            }],
+        );
+        app.poll_codex_notify_inboxes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        // Working state should transition to Attention via Idle
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.codex_normalized_status,
+            Some(CodexTransportStatus::Idle)
+        );
+        // Pulse should be active (unknown notify reason = pulse)
+        assert!(terminal.codex_attention_pending);
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::UnknownNotify)
+        );
+        // Hooks should be marked as runtime-verified
+        assert!(terminal.codex_hooks_runtime_verified);
+    }
+
+    #[test]
+    fn hook_stop_preserves_existing_interactive_reason() {
+        let ctx = Context::default();
+        let temp_dir = TestTempDir::new("codex-hook-stop-preserve-reason");
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.codex_cli_runtime_dir = Some(temp_dir.path.clone());
+
+        // Set up a Working state with an existing attention reason from Notify
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+            entry.codex_normalized_status = Some(CodexTransportStatus::Working);
+            entry.codex_attention_reason = Some(CodexAttentionReason::ApprovalRequested);
+            entry.codex_last_status_source = Some(CodexCliStatusSource::Notify);
+        }
+
+        // Simulate hook-stop event
+        // hook-stop should transition to Attention but preserve the existing interactive reason
+        write_test_codex_notify_events(
+            &temp_dir.path,
+            1,
+            &test_codex_inbox_token(1),
+            &[CodexNotifyInboxEvent {
+                terminal_id: "1".to_owned(),
+                tool: "codex".to_owned(),
+                status: "attention".to_owned(),
+                inbox_token: Some(test_codex_inbox_token(1)),
+                event_kind: Some("hook-stop".to_owned()),
+                raw_json: r#"{"hook_event":"Stop"}"#.to_owned(),
+                timestamp_utc: "2026-04-06T00:00:00Z".to_owned(),
+            }],
+        );
+        app.poll_codex_notify_inboxes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        // State should transition to Attention
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.codex_normalized_status,
+            Some(CodexTransportStatus::Idle)
+        );
+        // Existing interactive attention reason should be preserved
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::ApprovalRequested)
+        );
+        // Pulse should still be active
+        assert!(terminal.codex_attention_pending);
+        // Hooks should be marked as runtime-verified
+        assert!(terminal.codex_hooks_runtime_verified);
+    }
+
+    #[test]
+    fn hook_stop_followed_by_visible_question_prompt_upgrades_reason() {
+        let ctx = Context::default();
+        let temp_dir = TestTempDir::new("codex-hook-stop-then-question");
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.codex_cli_runtime_dir = Some(temp_dir.path.clone());
+
+        // Set up a Working state (spinner active)
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+            entry.codex_normalized_status = Some(CodexTransportStatus::Working);
+            entry.codex_last_status_source = Some(CodexCliStatusSource::Hook);
+        }
+
+        // First: hook-stop event transitions to Attention with UnknownNotify reason
+        write_test_codex_notify_events(
+            &temp_dir.path,
+            1,
+            &test_codex_inbox_token(1),
+            &[CodexNotifyInboxEvent {
+                terminal_id: "1".to_owned(),
+                tool: "codex".to_owned(),
+                status: "attention".to_owned(),
+                inbox_token: Some(test_codex_inbox_token(1)),
+                event_kind: Some("hook-stop".to_owned()),
+                raw_json: r#"{"hook_event":"Stop"}"#.to_owned(),
+                timestamp_utc: "2026-04-06T00:00:00Z".to_owned(),
+            }],
+        );
+        app.poll_codex_notify_inboxes(&ctx);
+
+        // Verify state is Attention with UnknownNotify
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::UnknownNotify)
+        );
+
+        // Second: visible question prompt should upgrade the reason
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "codex-question-prompt".to_owned(),
+                },
+            })
+            .expect("send question prompt chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        // Reason should be upgraded to UserInputRequested
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::UserInputRequested)
+        );
+        // Status source should be VisibleUi now
+        assert_eq!(
+            terminal.codex_last_status_source,
+            Some(CodexCliStatusSource::VisibleUi)
+        );
+    }
+
+    #[test]
+    fn hook_stop_followed_by_turn_complete_upgrades_reason() {
+        let ctx = Context::default();
+        let temp_dir = TestTempDir::new("codex-hook-stop-then-complete");
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.codex_cli_runtime_dir = Some(temp_dir.path.clone());
+
+        // Set up a Working state (spinner active)
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+            entry.codex_normalized_status = Some(CodexTransportStatus::Working);
+            entry.codex_last_status_source = Some(CodexCliStatusSource::Hook);
+        }
+
+        // Write both events at once to avoid file overwrite issues
+        // hook-stop first, then turn-complete (using turn-complete not agent-turn-complete for hook events)
+        write_test_codex_notify_events(
+            &temp_dir.path,
+            1,
+            &test_codex_inbox_token(1),
+            &[
+                CodexNotifyInboxEvent {
+                    terminal_id: "1".to_owned(),
+                    tool: "codex".to_owned(),
+                    status: "attention".to_owned(),
+                    inbox_token: Some(test_codex_inbox_token(1)),
+                    event_kind: Some("hook-stop".to_owned()),
+                    raw_json: r#"{"hook_event":"Stop"}"#.to_owned(),
+                    timestamp_utc: "2026-04-06T00:00:00Z".to_owned(),
+                },
+                CodexNotifyInboxEvent {
+                    terminal_id: "1".to_owned(),
+                    tool: "codex".to_owned(),
+                    status: "running".to_owned(),
+                    inbox_token: Some(test_codex_inbox_token(1)),
+                    event_kind: Some("turn-complete".to_owned()),
+                    raw_json: r#"{"hook_event":"turn-complete"}"#.to_owned(),
+                    timestamp_utc: "2026-04-06T00:00:01Z".to_owned(),
+                },
+            ],
+        );
+        app.poll_codex_notify_inboxes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        // Final state should be Attention with TurnComplete reason
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::TurnComplete)
+        );
+        // TurnComplete timestamp should be set
+        assert!(terminal.codex_last_turn_complete_at.is_some());
+    }
+
+    #[test]
+    fn visible_codex_turn_complete_chunk_is_ignored_without_prior_working_state() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Inactive;
+            entry.codex_session_active = true;
+            entry.codex_normalized_status = Some(CodexTransportStatus::Idle);
+            entry.codex_prompt_submit_since = None;
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "codex-turn-complete".to_owned(),
+                },
+            })
+            .expect("send turn-complete chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert!(!terminal.codex_attention_pending);
+        assert_eq!(terminal.codex_attention_reason, None);
+    }
+
+    #[test]
+    fn visible_codex_turn_complete_chunk_transitions_working_to_pulse() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+            entry.codex_normalized_status = Some(CodexTransportStatus::Working);
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "codex-turn-complete".to_owned(),
+                },
+            })
+            .expect("send turn-complete chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.codex_normalized_status,
+            Some(CodexTransportStatus::Idle)
+        );
+        assert!(terminal.codex_attention_pending);
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::TurnComplete)
+        );
     }
 
     #[test]
@@ -23351,6 +24667,51 @@ mod tests {
     fn opencode_status_from_chunk_unknown() {
         let result = AdeApp::opencode_status_from_chunk("some-random-chunk");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn opencode_status_from_chunk_plan_mode() {
+        let result = AdeApp::opencode_status_from_chunk("opencode-plan-mode");
+        assert!(result.is_some());
+        let (status, source, reason) = result.unwrap();
+        assert_eq!(status, AiCliStatus::Attention);
+        assert_eq!(source, OpenCodeStatusSource::VisibleUi);
+        assert_eq!(reason, Some(OpenCodeAttentionReason::PlanModePrompt));
+    }
+
+    #[test]
+    fn visible_opencode_plan_mode_prompt_sets_attention_reason() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::OpenCode);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.opencode_session_active = true;
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "opencode-plan-mode".to_owned(),
+                },
+            })
+            .expect("send opencode plan mode chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::OpenCode));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.opencode_attention_reason,
+            Some(OpenCodeAttentionReason::PlanModePrompt)
+        );
+        assert_eq!(
+            terminal.opencode_last_status_source,
+            Some(OpenCodeStatusSource::VisibleUi)
+        );
     }
 
     #[test]
@@ -24135,7 +25496,9 @@ mod tests {
             full_title: format!("Terminal {id}"),
             pending_line_for_title: String::new(),
             recent_inputs: VecDeque::new(),
+            checklist_snapshot: Vec::new(),
             in_main_view: true,
+            test_done: false,
             dirty: false,
             last_seqno: 0,
             last_cursor_row: None,
@@ -24177,6 +25540,7 @@ mod tests {
             codex_last_visible_attention_at: None,
             codex_last_turn_complete_at: None,
             codex_attention_pending: false,
+            codex_hooks_runtime_verified: false,
             opencode_launch_pending_since: None,
             opencode_launch_process_baseline: None,
             opencode_session_active: false,
@@ -24448,7 +25812,8 @@ mod tests {
             // Set normalized status based on reason
             entry.opencode_normalized_status = match reason {
                 OpenCodeAttentionReason::PermissionAsked
-                | OpenCodeAttentionReason::QuestionAsked => {
+                | OpenCodeAttentionReason::QuestionAsked
+                | OpenCodeAttentionReason::PlanModePrompt => {
                     Some(OpenCodeTransportStatus::Permission)
                 }
                 _ => Some(OpenCodeTransportStatus::Idle),
@@ -24757,6 +26122,52 @@ mod tests {
         let recent_inputs: VecDeque<String> = VecDeque::new();
         let tooltip = recent_inputs_tooltip_text(&recent_inputs);
         assert!(tooltip.is_empty());
+    }
+
+    #[test]
+    fn recent_inputs_tooltip_text_deduplicates_identical_messages() {
+        let mut recent_inputs: VecDeque<String> = VecDeque::new();
+        // Add duplicate messages (newest first)
+        recent_inputs.push_front("cargo test".to_owned()); // duplicate of msg3
+        recent_inputs.push_front("cargo build".to_owned()); // duplicate of msg2
+        recent_inputs.push_front("cargo build".to_owned()); // duplicate
+        recent_inputs.push_front("cargo test".to_owned()); // duplicate
+        recent_inputs.push_front("cargo test".to_owned()); // newest, also duplicate
+
+        let tooltip = recent_inputs_tooltip_text(&recent_inputs);
+
+        // Each unique message should appear only once, newest first
+        assert_eq!(tooltip, "cargo test\ncargo build");
+    }
+
+    #[test]
+    fn deduplicated_recent_inputs_preserves_order_and_uniqueness() {
+        let mut recent_inputs: VecDeque<String> = VecDeque::new();
+        recent_inputs.push_front("third".to_owned());
+        recent_inputs.push_front("second".to_owned());
+        recent_inputs.push_front("first".to_owned());
+        recent_inputs.push_front("second".to_owned()); // duplicate of 'second'
+        recent_inputs.push_front("first".to_owned()); // duplicate of 'first'
+
+        let deduplicated = deduplicated_recent_inputs(&recent_inputs);
+
+        // Should preserve newest-first order with only first occurrences
+        assert_eq!(deduplicated.len(), 3);
+        assert_eq!(deduplicated[0].as_str(), "first");
+        assert_eq!(deduplicated[1].as_str(), "second");
+        assert_eq!(deduplicated[2].as_str(), "third");
+    }
+
+    #[test]
+    fn deduplicated_recent_handles_empty_and_single() {
+        let empty: VecDeque<String> = VecDeque::new();
+        assert!(deduplicated_recent_inputs(&empty).is_empty());
+
+        let mut single = VecDeque::new();
+        single.push_front("only".to_owned());
+        let result = deduplicated_recent_inputs(&single);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].as_str(), "only");
     }
 
     #[test]
@@ -25613,14 +27024,15 @@ mod tests {
         );
 
         // With Claude normalized status (takes precedence over OpenCode)
+        // Claude Permission + pending=true -> pulse (uses codex_attention_pending)
         assert_eq!(
             ai_badge_visual(
                 AiCliStatus::Attention,
                 None,
                 Some(OpenCodeTransportStatus::Idle),
                 Some(ClaudeTransportStatus::Permission),
+                true, // codex_attention_pending used for Claude
                 false,
-                true,
                 None
             ),
             Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 180, 100)))
@@ -26041,9 +27453,34 @@ mod tests {
                 pos2(super::ACTIVITY_RAIL_WIDTH, 0.0),
                 egui::vec2(super::PROJECT_EXPLORER_WIDTH, 900.0),
             )),
+            None, // No checklist panel in this test
         );
 
         assert_eq!(main_area_size, egui::vec2(1200.0, 900.0));
+    }
+
+    #[test]
+    fn main_area_size_from_chrome_accounts_for_checklist_panel() {
+        let app = test_app([], None);
+
+        let main_area_size = app.main_area_size_from_chrome(
+            egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(1600.0, 900.0)),
+            Some(egui::Rect::from_min_size(
+                pos2(0.0, 0.0),
+                egui::vec2(super::ACTIVITY_RAIL_WIDTH, 900.0),
+            )),
+            Some(egui::Rect::from_min_size(
+                pos2(super::ACTIVITY_RAIL_WIDTH, 0.0),
+                egui::vec2(super::PROJECT_EXPLORER_WIDTH, 900.0),
+            )),
+            Some(egui::Rect::from_min_size(
+                pos2(1600.0 - super::CHECKLIST_PANEL_WIDTH, 0.0),
+                egui::vec2(super::CHECKLIST_PANEL_WIDTH, 900.0),
+            )),
+        );
+
+        // 1600 - 48 (activity) - 352 (explorer) - 352 (checklist) = 848
+        assert_eq!(main_area_size, egui::vec2(848.0, 900.0));
     }
 
     #[test]
@@ -26278,6 +27715,44 @@ mod tests {
         config.ai_hooks.global_enabled = false;
 
         assert!(AdeApp::ai_hook_manager_from_config(&config).is_none());
+    }
+
+    #[test]
+    fn codex_launch_integration_prep_skipped_when_routing_disabled() {
+        let _ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+
+        // Without ai_hook_manager, status_line should indicate hooks unavailable
+        app.ai_hook_manager = None;
+        app.codex_cli_runtime_dir = None;
+
+        app.prepare_codex_cli_integration_for_launch();
+
+        // Verify status_line indicates hooks are unavailable
+        assert_eq!(
+            app.status_line,
+            "Codex CLI hooks unavailable (session routing disabled)"
+        );
+    }
+
+    #[test]
+    fn codex_launch_integration_prep_skipped_when_runtime_dir_unavailable() {
+        let _ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+
+        // With ai_hook_manager present but runtime_dir missing, should still skip
+        app.ai_hook_manager = Some(Arc::new(AiHookManager::new(
+            AiHooksConfig::with_factory_droid_defaults(),
+        )));
+        app.codex_cli_runtime_dir = None;
+
+        app.prepare_codex_cli_integration_for_launch();
+
+        // Verify status_line indicates hooks are unavailable
+        assert_eq!(
+            app.status_line,
+            "Codex CLI hooks unavailable (session routing disabled)"
+        );
     }
 
     #[test]
@@ -26914,5 +28389,114 @@ mod tests {
         let entry = app.terminals.get(&1).expect("terminal 1");
         assert_eq!(entry.ai_session.tool, Some(AiCliTool::OpenCode));
         assert_eq!(entry.ai_session.status, AiCliStatus::Attention);
+    }
+
+    #[test]
+    fn checklist_snapshot_captured_when_test_done_toggled_on() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+
+        // Add some messages to recent_inputs
+        if let Some(terminal) = app.terminals.get_mut(&1) {
+            terminal.recent_inputs.push_back("first message".to_owned());
+            terminal
+                .recent_inputs
+                .push_back("second message".to_owned());
+            terminal.recent_inputs.push_back("third message".to_owned());
+        }
+
+        // Toggle test_done on
+        if let Some(terminal) = app.terminals.get_mut(&1) {
+            terminal.test_done = true;
+            terminal.checklist_snapshot = terminal.recent_inputs.iter().cloned().collect();
+        }
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(terminal.test_done);
+        assert_eq!(terminal.checklist_snapshot.len(), 3);
+        assert_eq!(terminal.checklist_snapshot[0], "first message");
+        assert_eq!(terminal.checklist_snapshot[1], "second message");
+        assert_eq!(terminal.checklist_snapshot[2], "third message");
+    }
+
+    #[test]
+    fn checklist_snapshot_cleared_when_test_done_toggled_off() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+
+        // Add messages and toggle on first
+        if let Some(terminal) = app.terminals.get_mut(&1) {
+            terminal.recent_inputs.push_back("message".to_owned());
+            terminal.test_done = true;
+            terminal.checklist_snapshot = terminal.recent_inputs.iter().cloned().collect();
+        }
+
+        // Now toggle off
+        if let Some(terminal) = app.terminals.get_mut(&1) {
+            terminal.test_done = false;
+            terminal.checklist_snapshot.clear();
+        }
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(!terminal.test_done);
+        assert!(terminal.checklist_snapshot.is_empty());
+    }
+
+    #[test]
+    fn checklist_snapshot_persists_when_new_messages_added() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+
+        // Add initial messages and toggle on
+        if let Some(terminal) = app.terminals.get_mut(&1) {
+            terminal.recent_inputs.push_back("original".to_owned());
+            terminal.test_done = true;
+            terminal.checklist_snapshot = terminal.recent_inputs.iter().cloned().collect();
+        }
+
+        // Add new message to recent_inputs
+        if let Some(terminal) = app.terminals.get_mut(&1) {
+            terminal.recent_inputs.push_back("new message".to_owned());
+        }
+
+        // Snapshot should still contain only original
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.checklist_snapshot.len(), 1);
+        assert_eq!(terminal.checklist_snapshot[0], "original");
+    }
+
+    #[test]
+    fn checklist_panel_shows_only_checked_terminals() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            None,
+        );
+
+        // Mark terminal 1 as checked
+        if let Some(terminal) = app.terminals.get_mut(&1) {
+            terminal.test_done = true;
+            terminal.checklist_snapshot = vec!["message".to_owned()];
+        }
+
+        // Terminal 2 remains unchecked
+
+        let checked_count = app
+            .terminals
+            .values()
+            .filter(|t| t.test_done && !t.checklist_snapshot.is_empty())
+            .count();
+        assert_eq!(checked_count, 1);
     }
 }

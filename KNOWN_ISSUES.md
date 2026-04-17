@@ -1,5 +1,209 @@
 ### Known Issues & Fix Log
 
+#### Codex CLI integration is now strictly hook-only (notify/visible/title methods removed) {#codex-cli-hook-only-integration}
+- Date: 2026-04-17
+- Context: Windows and cross-platform Codex CLI integration
+- Error signature: `Codex CLI previously used multiple signal sources (notify, visible UI, title, hooks) causing inconsistent state tracking and complexity.`
+- Symptoms/Impact: The previous multi-source approach led to:
+  - Race conditions between notify and visible UI signals
+  - Platform-specific behavior differences (Windows vs macOS/Linux)
+  - Complex state machine with fallback chains that were hard to reason about
+  - Tests that depended on specific visible text patterns that could change between Codex versions
+- Root cause:
+  1. Mergen tried to support all possible signal sources: BEL notifications, visible UI text detection, title patterns, and hooks.
+  2. Each source had different semantics and timing, leading to conflicting state updates.
+  3. Windows upstream disabled hooks, forcing reliance on less reliable notify/visible methods.
+  4. Maintenance burden of keeping visible text parsers in sync with Codex TUI changes.
+- Resolution:
+  - **Switched to strict hook-only integration** following the pattern used by OpenCode.
+  - `UserPromptSubmit` hook → `Running` state (spinner appears)
+  - `Stop` hook → `Attention`/`Idle` state (pulse appears)
+  - Removed all notify/TUI-based notification handling (`CODEX_NOTIFICATION_METHOD`, `CODEX_*_EVENT` constants).
+  - Removed all visible UI detection for Codex (`PendingVisibleCodexStatus`, `detect_visible_codex_status_with_end()`).
+  - Removed title-based detection for Codex (`detect_codex_status_from_title()`, `is_codex_agent_title()`).
+  - Removed `CustomNotifyHook` and `HooksEnabledNotifyLimited` enum variants.
+  - Updated `CodexIntegrationStatus` to only track hook-based states: `EnabledHealthy`, `HooksConfiguredUnverified`, `NeedsSetup`, `ConfigReadError`.
+  - Updated `patch_codex_config_file()` to configure `hooks.json` instead of notify commands.
+  - Updated all tests to use hook event format instead of notify/visible patterns.
+  - Fixed `update_from_title()` in hooks.rs to return `None` for Codex (enforcing hook-only).
+- Prevent recurrence:
+  - Keep AI CLI integrations simple and single-source. Choose one reliable method and stick to it.
+  - Hooks are more reliable than visible text parsing because they're explicit events, not inferred from TUI rendering.
+  - When hooks are unavailable on a platform, prefer explicit launch/prompt detection over brittle text matching.
+  - Document the hook-only requirement in AGENTS.md and integration settings.
+- Files/Commands touched: `src/codex.rs`, `src/app.rs`, `src/terminal.rs`, `src/hooks.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: AGENTS.md AI CLI Integration section updated with hook-only specification.
+- Date: 2026-04-17
+- Context: native Windows Codex CLI launched from `cargo run` inside Mergen
+- Error signature: `Spinner starts when a Codex prompt is sent, but never stops or turns into pulse after the turn finishes.`
+- Symptoms/Impact: On native Windows, Mergen showed the Codex spinner as soon as the user submitted a prompt, but the badge stayed in `Running` even after Codex returned to the idle composer.
+- Root cause:
+  1. Mergen only treated the explicit visible text `your turn is complete ... turn complete` as Codex completion.
+  2. Codex `v0.121.0` on Windows often finishes by re-rendering an empty `›` prompt plus the model footer instead of printing that explicit completion banner.
+  3. `submitted_codex_prompt` still called the legacy `apply_codex_status(Running, ...)` path, so `codex_normalized_status` never became `Working` for prompt-submit-driven turns.
+  4. Even when a later completion signal arrived, pulse arming depended on a previous normalized `Working -> Idle` transition, so the state machine could miss the pulse.
+- Resolution:
+  - Switched Codex prompt-submit handling to `apply_codex_transport_status(CodexTransportStatus::Working, ...)` in both live input and saved-message paths.
+  - Added a guarded visible completion fallback that detects the empty prompt return pattern (`›` followed by model footer) without treating a typed user prompt as completion.
+  - Ignored `codex-turn-complete` visible chunks unless the terminal was already in a real working state (`normalized Working`, `Running`, or `prompt_submit_since`).
+  - Added regression tests for empty prompt return, typed-prompt false positives, and working/non-working turn-complete chunk handling.
+- Prevent recurrence:
+  - Do not assume Codex Windows prints the same completion text as OpenCode.
+  - Keep Codex on the normalized transport-state path for all submit/start transitions.
+  - Guard visible completion parsers with prior working-state evidence so startup chrome and echoed prompts cannot trigger false pulse.
+- Files/Commands touched: `src/app.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo test codex`, `cargo test`
+- References: Local transcript from Codex `v0.121.0` showing idle re-entry as an empty `›` prompt with `gpt-5.4 medium` footer rather than an explicit `turn complete` banner.
+#### Codex CLI managed bridge now prevents stale wiring when Mergen binary moves {#codex-cli-managed-bridge-prevents-stale-wiring}
+- Date: 2026-04-16
+- Context: main/Windows Codex CLI integration when Mergen is installed in different locations
+- Error signature: `Codex CLI hooks work initially but stop producing events after Mergen is moved or updated; spinner starts but never stops.`
+- Symptoms/Impact: Codex CLI sessions would show the spinner when work started (via launch detection or BEL), but hook events (`UserPromptSubmit`, `Stop`) would never arrive. The `~/.codex/config.toml` and `~/.codex/hooks.json` files pointed to stale paths from previous Mergen installations (e.g., `target/debug/mergen-ade.exe` or `C:/Users/.../Desktop/mergen-ade.exe`), while the actual running Mergen was at a different location. The spinner would start via fallback paths but never receive the `Stop` hook to transition to idle/pulse.
+- Root cause:
+  1. Mergen configured `~/.codex/config.toml` and `~/.codex/hooks.json` with the current executable's absolute path.
+  2. When the user moved Mergen or updated via a new release binary, the Codex config files still referenced the old path.
+  3. Codex CLI tried to invoke the hook commands at the old path, which either didn't exist or was an older version that didn't handle the events properly.
+  4. Hook events silently failed because the executable at the configured path couldn't be found or didn't process the `--codex-hook` argument.
+  5. The health check (`inspect_codex_cli_integration`) only checked for hook markers, not that the hooks targeted the actual running Mergen binary.
+- Resolution:
+  - Introduced a **managed bridge pattern** with a fixed installation location at `%APPDATA%\Mergen\MergenADE\bin\mergen-codex-bridge.exe`.
+  - Added `config::codex_bridge_path()` that returns this fixed path regardless of where the actual Mergen binary is installed.
+  - Implemented `codex::ensure_codex_bridge_installed()` that copies the current executable to the bridge location if:
+    - Bridge doesn't exist
+    - Bridge is older (modification time) than current executable
+    - Bridge has different file size
+  - Updated `enable_codex_cli_integration()` and `inspect_codex_cli_integration()` to use the bridge path instead of the current executable path.
+  - Updated `patch_codex_config_file()` and `update_codex_hooks_json()` to generate commands targeting the bridge path.
+  - Strengthened `check_codex_hooks_json()` to verify hooks contain the bridge path, not just the marker strings.
+  - Added startup self-heal in `AdeApp::bootstrap()` that ensures bridge is installed before any Codex operations.
+  - Added bridge diagnostics in the Settings panel showing:
+    - Bridge status (Installed/Not installed)
+    - Wiring mismatch warning when hooks point to a different path
+  - Added `BridgeInstallFailed` outcome variant for error handling.
+  - Added tests:
+    - `install_codex_bridge_copies_executable_to_bridge_path`
+    - `check_codex_hooks_json_requires_bridge_path_match`
+- Prevent recurrence:
+  - Always use a fixed, managed location for hook/notify executables rather than dynamic paths that change with installation location.
+  - Health checks should verify both the existence of configuration AND that it targets the expected executable path.
+  - Startup should auto-repair (self-heal) managed installations before user interaction.
+  - Provide visible diagnostics for bridge/wiring status in Settings.
+- Files/Commands touched: `src/config.rs`, `src/codex.rs`, `src/app.rs`, `KNOWN_ISSUES.md`, `cargo test codex`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: 2026-04-16 live system diagnosis showing `~/.codex/config.toml` pointing to stale `target/debug/mergen-ade.exe` while running binary was at `Desktop/mergen-ade.exe`
+
+#### Codex hook failures in mixed AI terminals were caused by shared tool-hint env collisions {#codex-hook-failures-shared-tool-hint-env-collisions}
+- Date: 2026-04-16
+- Context: main/Windows Codex and OpenCode sessions launched from the same Mergen terminal environment
+- Error signature: `UserPromptSubmit hook (failed) error: hook exited with code 1`
+- Symptoms/Impact: Codex showed hook failure banners instead of spinner/attention updates when launched from terminals that also carried OpenCode env setup. `Stop` hooks failed the same way, so the session never produced reliable state updates.
+- Root cause:
+  1. `TerminalRuntime::spawn()` injects both Codex and OpenCode env vars into the terminal process.
+  2. Both integrations reuse the shared `MERGEN_AI_TOOL_HINT` variable.
+  3. OpenCode env injection runs after Codex, leaving `MERGEN_AI_TOOL_HINT=opencode` in mixed terminals.
+  4. Codex `write_codex_notify_event()` and `write_codex_hook_event()` treated that shared hint as authoritative and returned `Unexpected tool hint: opencode`, causing the hook command to exit with code 1.
+- Resolution:
+  - Made Codex and OpenCode treat the shared tool-hint env var as advisory only instead of a hard validation gate.
+  - Added a Codex regression test that reproduces the real mixed-terminal failure (`MERGEN_AI_TOOL_HINT=opencode`) and verifies hooks still write inbox events.
+  - Added an OpenCode regression test that verifies notify events still write successfully with a mismatched hint.
+- Prevent recurrence:
+  - Do not use a single shared env var as a hard gate for multiple AI CLIs that can run in the same terminal lifetime.
+  - Use tool-specific tokens and inbox paths as the routing source of truth when more than one tool can coexist.
+  - Keep at least one direct CLI-mode regression (`--codex-hook`, notify writer) for cross-tool env contamination cases.
+- Files/Commands touched: `src/codex.rs`, `src/opencode.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test codex`, `cargo test opencode`, `cargo run -- --codex-hook UserPromptSubmit`
+- References: Follow-up to the earlier 2026-04-16 Windows Codex spinner investigation; local repro showed `Failed to process Codex hook event: Unexpected tool hint: opencode`.
+#### Codex CLI Windows spinner now shows immediately via launch/prompt fallback paths {#codex-cli-windows-spinner-immediate-via-fallback}
+- Date: 2026-04-16
+- Context: main/Windows native Codex CLI sessions (not WSL)
+- Error signature: `Codex CLI on Windows showed no spinner during work; hooks are disabled upstream so only BEL notifications triggered state changes.`
+- Symptoms/Impact: Windows native Codex CLI sessions showed no visual feedback (no spinner) when Codex was working because hooks are disabled on Windows upstream. Only process exit or BEL notifications would clear the idle state. The initial prompt submission and launch phases had no visual indication.
+- Root cause:
+  1. OpenAI Codex upstream explicitly disables hooks on Windows per documentation: "Hooks are currently disabled on Windows" (developers.openai.com/codex/hooks).
+  2. Mergen's `mark_codex_launch_pending()` set `AiCliStatus::Inactive` which meant no spinner appeared during launch detection phase.
+  3. `ai_badge_visual()` ignored the `_codex_attention_pending` parameter, causing Codex attention states (Permission/Idle) to not show the correct pulse/solid visual.
+  4. `submitted_codex_prompt` handling only checked `current_codex_status.source` without considering `codex_launch_pending_since`, so the first prompt after launch did not trigger Running state.
+  5. `should_show_codex_enable_button()` did not show the enable button when hooks were not runtime verified but integration was otherwise healthy.
+- Resolution:
+  - Changed `mark_codex_launch_pending()` to set `AiCliStatus::Running` instead of `Inactive`, so spinner appears immediately when launch is detected.
+  - Fixed `ai_badge_visual()` to use `_codex_attention_pending` parameter for determining pulse vs solid visuals in Codex attention states.
+  - Extended `submitted_codex_prompt` handler with `codex_launch_pending_since.is_some()` condition to transition to Running on first prompt when launch pending.
+  - Updated Windows settings text to describe "fallback paths" (launch detection, prompt, notify/BEL) instead of implying hooks work.
+  - Fixed `should_show_codex_enable_button()` to show enable button when `EnabledHealthy { hooks_runtime_verified: false }`.
+- Prevent recurrence:
+  - Always verify upstream platform support before relying on hook-based integrations.
+  - Provide multiple independent signal paths (launch detection, prompt tracking, notify/BEL, hooks when available) for critical UI feedback like spinners.
+  - Test `codex` tagged tests after any AI CLI integration changes: `cargo test codex`.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo test codex`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: OpenAI Codex documentation "Hooks are currently disabled on Windows"
+
+#### Multi-terminal and OpenCode performance optimizations implemented {#multi-terminal-opencode-performance}
+- Date: 2026-04-15
+- Context: main/Windows 5+ terminal performance with OpenCode sessions
+- Error signature: `OpenCode sometimes shows black screen or opens slowly when 5+ terminals are active.`
+- Symptoms/Impact: When opening 5+ terminals with OpenCode, some terminals would show "Terminal is resizing..." placeholder for extended periods (appearing as black screen), and OpenCode launch would feel sluggish. Process polling for multiple terminals caused redundant Windows syscall overhead.
+- Root cause: Several inefficiencies compounded under multi-terminal load:
+  1. Frame budget was not a hard limit: `skip_full_snapshot` only triggered when `render_cache.lines.is_empty()`, allowing dirty terminals with cached content to still consume budget slots, starving background terminals.
+  2. Selection snapshot was always created: `try_terminal_snapshots()` created both normal and selection snapshots unconditionally, even though selection is only needed for copy/hover operations.
+  3. Synchronous process probe at launch: `mark_opencode_launch_pending()` and `mark_codex_launch_pending()` captured process baseline snapshots synchronously during terminal creation, blocking the UI thread.
+  4. Per-terminal process snapshots: Each terminal's process polling called `snapshot_processes()` independently, causing O(n²) Windows Toolhelp32 snapshot overhead when polling n terminals.
+- Resolution:
+  - Hardened frame budget logic: `skip_full_snapshot` now applies whenever `budget_exhausted && !is_active_or_visible && !render_cache.lines.is_empty()`, properly deferring all background terminals after the budget is consumed (src/app.rs:11978-12001).
+  - Lazy selection snapshot: `try_terminal_snapshot()` returns only the normal snapshot; selection snapshot is created on-demand only when `terminal.selection.is_some()` (src/app.rs:12020-12025, src/terminal.rs:2963-2980).
+  - Async launch baseline: Removed synchronous `snapshot_opencode_descendant_processes()` and `snapshot_codex_descendant_processes()` calls from launch path; baseline is now captured on first poll tick (src/app.rs:3046-3061).
+  - Process snapshot caching: Added `snapshot_processes_cached()` with thread-local 50ms TTL cache in src/terminal.rs:1718-1750. Multiple process probes within the same tick reuse the same Windows process snapshot, reducing overhead from O(n) syscalls to O(1) per poll tick.
+  - Updated all process tracking methods in TerminalRuntime to use `snapshot_processes_cached()` (src/terminal.rs:740, 779, 812, 832, 861, 884).
+- Prevent recurrence:
+  - When adding new AI CLI integrations, avoid synchronous process probes during terminal creation.
+  - Keep snapshot budget limits hard - active/visible terminals should always have priority.
+  - Use cached process snapshots for any operation that probes multiple terminals in a loop.
+  - Lazy-load expensive secondary data (selection snapshots, detailed process info) only when actually needed.
+- Files/Commands touched: `src/app.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: Performance analysis of 5+ terminal scenarios with simultaneous OpenCode sessions.
+
+#### Codex terminal scroll now works properly with full scrollback and correct mouse wheel handling {#codex-terminal-scroll-now-works-properly}
+- Date: 2026-04-15
+- Context: main/Windows terminal scroll behavior when Codex CLI TUI is active
+- Error signature: `Codex terminal scrolls down unnecessarily when starting; cannot scroll up as far as desired; mouse wheel feels stuck.`
+- Symptoms/Impact: When opening Codex CLI, the terminal viewport would jump too far down and users couldn't scroll up to see previous content. The mouse wheel would also feel "stuck" when trying to scroll through the transcript, as if the scroll was being intercepted by the TUI application even when just reviewing history.
+- Root cause: Two separate issues combined to create poor scroll UX:
+  1. Mouse wheel capture was too aggressive: `is_mouse_reporting_active()` in `src/terminal.rs:659-665` returned true whenever either `is_mouse_grabbed()` OR `is_alt_screen_active()` was true. Codex (and many TUIs) enable the alternate screen on startup, which immediately caused all mouse wheel events to be forwarded to the PTY instead of scrolling the transcript view. This prevented users from reviewing scrollback history using the mouse wheel.
+  2. Scrollback history was artificially truncated: `MAX_SNAPSHOT_ROWS` was set to 500 while `DEFAULT_SCROLLBACK` was 1000. This meant the terminal backend kept 1000 lines of history but the UI only rendered 500, so users could only see half their scrollback even when scrolling manually.
+- Resolution:
+  - Narrowed `is_mouse_reporting_active()` to only check `is_mouse_grabbed()` (line 664). Now mouse wheel events are only forwarded to the PTY when the application has explicitly requested mouse control (e.g., via `\x1b[?1000h`), not merely because alt-screen is active.
+  - Increased `MAX_SNAPSHOT_ROWS` from 500 to 1000 (line 57), matching `DEFAULT_SCROLLBACK`. Users can now scroll through their full scrollback history in the UI.
+- Prevent recurrence:
+  - When implementing mouse event forwarding, distinguish between "mouse reporting is enabled" (application wants mouse events) and "alternate screen is active" (application is a TUI). These are orthogonal concerns.
+  - Keep UI scrollback limits (`MAX_SNAPSHOT_ROWS`) in sync with backend limits (`DEFAULT_SCROLLBACK`) so users can access all their history.
+  - Test mouse wheel behavior with both TUI applications (Codex, vim) and transcript-heavy terminals (long build outputs).
+- Files/Commands touched: `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: This fix addresses the "terminal scrolls down unnecessarily" and "cannot scroll up as far as desired" symptoms reported after the previous activation scroll fix (2026-04-13 entry below).
+
+#### Codex CLI hooks integration now enables spinner on Windows {#codex-cli-hooks-integration-now-enables-spinner-on-windows}
+- Date: 2026-04-15
+- Context: main/Windows Codex CLI integration via hooks (Codex CLI 0.120.0+)
+- Error signature: `Codex CLI on Windows had no hooks support; spinner could only be triggered by process detection and BEL notifications.`
+- Symptoms/Impact: Codex CLI sessions on Windows showed no visual feedback (spinner) during work because hooks were disabled. The only completion signal was BEL notification or process exit detection, which was less reliable than hook-based events.
+- Root cause: 
+  - Codex CLI historically disabled hooks on Windows (gated behind platform checks).
+  - Codex CLI 0.120.0 removed the Windows gate (PR #17268), making hooks available on Windows.
+  - Mergen ADE's Codex integration only used notify-based inbox events and title-based detection.
+  - No `CodexCliStatusSource::Hook` variant existed to handle hook-based status changes.
+- Resolution:
+  - Updated `patch_codex_config_file()` in `src/codex.rs` to set `[features].codex_hooks = true` in Codex config.
+  - Added `update_codex_hooks_json()` to manage `~/.codex/hooks.json` with Mergen's hook handlers:
+    - `UserPromptSubmit` -> writes `running` inbox event (spinner starts)
+    - `Stop` -> writes `attention` inbox event (spinner stops, pulse/idle shown)
+  - Added `handle_codex_hook_from_env()` to process hook events from Codex CLI and write to inbox.
+  - Added `--codex-hook` CLI mode in `src/main.rs` for Codex to call Mergen when hooks fire.
+  - Added `CodexCliStatusSource::Hook` variant in `src/app.rs` with proper state machine handling.
+  - Updated `apply_codex_notify_inbox_event()` to map `user-prompt-submit` to Working and `agent-turn-complete` to Idle.
+  - Updated Settings diagnostics text to reflect hooks+notify format.
+  - Added comprehensive tests for hook event handling and config patching.
+- Prevent recurrence:
+  - When Codex CLI releases new platform support, update Mergen's integration to leverage it.
+  - Keep hook-based and notify-based paths as independent signal sources for redundancy.
+  - Test hook events explicitly in unit tests to verify inbox writing behavior.
+- Files/Commands touched: `src/codex.rs`, `src/main.rs`, `src/app.rs`, `KNOWN_ISSUES.md`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: Codex CLI 0.120.0 release notes (PR #17268 "remove windows gate that disables hooks")
+
 #### Renderer backend selection now supports wgpu with glow fallback {#renderer-backend-wgpu-glow-fallback}
 - Date: 2026-04-15
 - Context: main/Windows rendering backend stability
@@ -1619,3 +1823,4 @@
   - Yeni paste davranisi icin platform farkliliklarini (Ctrl vs Cmd) test et.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: 2026-04-13 user-reported paste issue; regression tests `normalize_terminal_clipboard_events_*` (7 tests)
+

@@ -156,14 +156,10 @@ pub fn write_opencode_notify_event(
     inbox_token: &str,
     tool_hint: Option<&str>,
 ) -> io::Result<()> {
-    if let Some(tool_hint) = tool_hint {
-        if !tool_hint.eq_ignore_ascii_case(MERGEN_AI_TOOL_HINT_OPENCODE) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Unexpected tool hint: {tool_hint}"),
-            ));
-        }
-    }
+    // A terminal can legitimately host both Codex and OpenCode over its lifetime.
+    // Treat the shared tool hint env var as advisory only so one tool's setup does
+    // not break the event path.
+    let _ = tool_hint;
 
     // Extract event kind and map to normalized status
     let event_kind = extract_event_kind(payload);
@@ -189,6 +185,10 @@ pub fn write_opencode_notify_event(
                 || k == "question_prompt"
                 || k == "question-prompt" =>
             {
+                Some(OpenCodeTransportStatus::Permission)
+            }
+            // Plan mode signals also map to permission (user approval needed)
+            k if k == "plan_mode_prompt" || k == "plan-mode-prompt" || k == "plan_mode" => {
                 Some(OpenCodeTransportStatus::Permission)
             }
             // Idle/completion signals
@@ -312,6 +312,9 @@ pub fn maybe_handle_opencode_notify_mode() -> io::Result<Option<OpenCodeNotifyIn
                         || k == "question-asked"
                         || k == OPENCODE_QUESTION_PROMPT_EVENT =>
                     {
+                        Some(OpenCodeTransportStatus::Permission)
+                    }
+                    k if k == "plan_mode_prompt" || k == "plan-mode-prompt" || k == "plan_mode" => {
                         Some(OpenCodeTransportStatus::Permission)
                     }
                     k if k == OPENCODE_SESSION_IDLE_EVENT
@@ -491,16 +494,26 @@ mod tests {
     }
 
     #[test]
-    fn write_rejects_wrong_tool_hint() {
-        let temp = TestTempDir::new("opencode-notify-wrong-hint");
-        let result = write_opencode_notify_event(
+    fn write_accepts_mismatched_tool_hint() {
+        let temp = TestTempDir::new("opencode-notify-mismatched-hint");
+        write_opencode_notify_event(
             r#"{"type":"turn-complete"}"#,
             "1",
             &temp.path,
             "token",
-            Some("wrong-tool"),
-        );
-        assert!(result.is_err());
+            Some("codex"),
+        )
+        .expect("write should ignore mismatched tool hint");
+
+        let mut processed = std::collections::HashSet::new();
+        let events = read_opencode_notify_inbox(&temp.path, 1, "token", &mut processed)
+            .expect("read should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].terminal_id, "1");
+        assert_eq!(events[0].tool, "opencode");
+        assert_eq!(events[0].status, "attention");
+        assert_eq!(events[0].event_kind.as_deref(), Some("turn-complete"));
     }
 
     #[test]

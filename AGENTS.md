@@ -67,12 +67,16 @@ If `cargo` is not on PATH in PowerShell, use:
 - In handoff/final notes, summarize which subagents were used and what each one produced.
 
 ## AI CLI Integration
-- **Supported AI tools:** `Factory Droid`, `Codex CLI`, and `OpenCode` are supported. Codex support is limited to native Windows sessions. Claude Code, `cc`, and other AI CLI integrations are not supported.
+- **Supported AI tools:** `Factory Droid`, `Codex CLI`, and `OpenCode` are supported. Codex CLI uses hook-only integration. Claude Code, `cc`, and other AI CLI integrations are not supported.
 - **Factory Droid hook format:** Only `droid-hook:*` and `factory-droid-hook:*` format patterns are recognized for Factory Droid. The `claude-hook:*` format is not supported.
 - **Factory Droid detection commands:** Only `droid` and `factory` trigger Factory Droid session detection. Do not add `cc`, `claude`, or other AI CLI commands.
 - **OpenCode detection commands:** `opencode` triggers OpenCode session detection. OpenCode is tracked through explicit launch detection and process-based status, similar to Codex CLI. OpenCode does not use PTY hook events.
+- **Codex CLI integration:** Codex uses strict hook-only integration. Mergen configures `hooks.json` with `UserPromptSubmit` and `Stop` events that route to the Mergen bridge. The status transitions are:
+  - `UserPromptSubmit` hook → Running (spinner)
+  - `Stop` hook → Attention/Pulse (waiting for user)
+  - No notify, BEL, title, or visible UI fallback is used for Codex.
 - **UI labels:** Use "Droid", "Factory Droid", "Codex CLI", and "OpenCode" terminology. Do not use "Claude" or "claude" references in user-facing text.
-- **Event triggers:** Factory Droid uses `UserPromptSubmit` → Running (green pulse) and `Stop`/notification → Attention (yellow pulse). Codex CLI uses explicit launch detection plus notify/BEL-backed attention on native Windows. OpenCode uses explicit launch detection plus process-based tracking for spinner/pulse status.
+- **Event triggers:** Factory Droid uses `UserPromptSubmit` → Running (green pulse) and `Stop`/notification → Attention (yellow pulse). Codex CLI uses hook-only: `UserPromptSubmit` → Running and `Stop` → Attention. OpenCode uses explicit launch detection plus process-based tracking for spinner/pulse status.
 - **Plan mode skill restriction:** If you are Codex, OpenCode, or Droid, do not use the plan mode skill from Claude Code's configuration. The plan mode skill is exclusively for `cc` (Claude Code) sessions only.
 
 ## Concurrent AI Sessions

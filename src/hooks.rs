@@ -298,15 +298,11 @@ impl ClaudeAttentionReason {
 }
 
 // ─── Codex CLI Title-Based Detection ─────────────────────────────────────
-// Orca-compatible Codex CLI status detection via terminal title patterns.
-// Codex CLI sets OSC titles with status indicators:
-// - Braille spinner (U+2800-U+28FF) + "codex" context = working
-// - "codex" + working/thinking/running = working
-// - "codex" + action required/permission/waiting/approval = permission
-// - "codex" + ready/idle/done/complete = idle
-// - Bare "codex" = idle (default)
+// NOTE: Codex uses hook-only integration. Title-based detection is intentionally
+// disabled for Codex to ensure strict hook-authoritative behavior.
+// Only Claude Code uses title-based detection as a fallback.
 
-/// Normalized Codex CLI status values (Orca-compatible)
+/// Normalized Codex CLI status values (kept for compatibility with existing code)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodexTransportStatus {
@@ -449,127 +445,6 @@ pub fn clear_claude_working_indicators(title: &str) -> String {
             cleaned = cleaned.replace(&keyword.to_string(), "");
             cleaned = cleaned.replace(&keyword.to_uppercase(), "");
         }
-    }
-
-    // Collapse whitespace after removals
-    cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-
-    if cleaned.is_empty() {
-        title.to_string()
-    } else {
-        cleaned
-    }
-}
-
-/// Codex CLI title conventions (Orca-compatible):
-/// - Braille spinner anywhere = working
-/// - "codex" + working/thinking/running = working
-/// - "codex" + action required/permission/waiting/approval = permission
-/// - "codex" + ready/idle/done/complete = idle
-/// - Bare "codex" = idle (default when no status indicators)
-pub fn detect_codex_status_from_title(title: &str) -> Option<CodexTransportStatus> {
-    if title.is_empty() {
-        return None;
-    }
-
-    // Braille spinner characters indicate working state (context-aware)
-    // Only match if title also contains "codex" context to avoid Claude/OpenCode conflicts
-    if contains_braille_spinner(title) && title.to_lowercase().contains("codex") {
-        return Some(CodexTransportStatus::Working);
-    }
-
-    // Check for explicit "codex" context with status keywords
-    let lower = title.to_lowercase();
-    if lower.contains("codex") {
-        // Permission keywords take precedence
-        if contains_any(
-            title,
-            &[
-                "action required",
-                "permission",
-                "waiting",
-                "approval",
-                "needs input",
-                "confirm",
-            ],
-        ) {
-            return Some(CodexTransportStatus::Permission);
-        }
-
-        // Working keywords
-        if contains_any(title, &["working", "thinking", "running", "processing"]) {
-            return Some(CodexTransportStatus::Working);
-        }
-
-        // Idle keywords
-        if contains_any(title, &["ready", "idle", "done", "complete", "finished"]) {
-            return Some(CodexTransportStatus::Idle);
-        }
-
-        // Bare "codex" = idle (default when no status indicators)
-        return Some(CodexTransportStatus::Idle);
-    }
-
-    // "[Working" pattern (Factory Droid style, sometimes used by Codex)
-    if title.contains("[Working") {
-        return Some(CodexTransportStatus::Working);
-    }
-
-    None
-}
-
-/// Returns true when the terminal title matches Codex CLI conventions.
-/// Used to scope session detection to Codex CLI specifically.
-pub fn is_codex_agent_title(title: &str) -> bool {
-    if title.is_empty() {
-        return false;
-    }
-
-    // Braille spinner + codex context
-    if contains_braille_spinner(title) && title.to_lowercase().contains("codex") {
-        return true;
-    }
-
-    // Explicit codex mention
-    if title.to_lowercase().contains("codex") {
-        return true;
-    }
-
-    // "[Working" pattern sometimes used by Codex
-    if title.contains("[Working") {
-        return true;
-    }
-
-    false
-}
-
-/// Strip working-status indicators from a title so that detection
-/// will no longer return 'working'. Used to clear stale titles
-/// when an agent exits without resetting its title.
-#[cfg(test)]
-pub fn clear_codex_working_indicators(title: &str) -> String {
-    let mut cleaned = title.to_string();
-
-    // Strip Braille spinner characters (U+2800–U+28FF) when codex context exists
-    if cleaned.to_lowercase().contains("codex") {
-        cleaned = cleaned
-            .chars()
-            .filter(|&c| !is_braille_spinner(c))
-            .collect();
-    }
-
-    // Strip working keywords when "codex" is present
-    if cleaned.to_lowercase().contains("codex") {
-        for keyword in ["working", "thinking", "running", "processing"] {
-            cleaned = cleaned.replace(&keyword.to_string(), "");
-            cleaned = cleaned.replace(&keyword.to_uppercase(), "");
-        }
-    }
-
-    // Strip "[Working" prefix
-    if cleaned.contains("[Working") {
-        cleaned = cleaned.replace("[Working", "");
-        cleaned = cleaned.replace("]", "");
     }
 
     // Collapse whitespace after removals
@@ -945,28 +820,8 @@ impl AiHookManager {
                 None
             }
             AiCliTool::CodexCli => {
-                // Only check Codex title patterns if Codex is the current owner
-                if is_codex_agent_title(title) {
-                    if let Some(codex_status) = detect_codex_status_from_title(title) {
-                        let (status, event) = match codex_status {
-                            CodexTransportStatus::Working => {
-                                (AiCliStatus::Running, AiHookEvent::Running)
-                            }
-                            CodexTransportStatus::Idle => {
-                                (AiCliStatus::Attention, AiHookEvent::Attention)
-                            }
-                            CodexTransportStatus::Permission => {
-                                (AiCliStatus::Attention, AiHookEvent::Attention)
-                            }
-                        };
-
-                        if session.status != status || session.last_event != Some(event) {
-                            session.status = status;
-                            session.last_event = Some(event);
-                            return Some((AiCliTool::CodexCli, status, Some(event)));
-                        }
-                    }
-                }
+                // Codex uses hook-only integration. Title-based detection is disabled
+                // to ensure strict hook-authoritative behavior.
                 None
             }
             AiCliTool::FactoryDroid | AiCliTool::OpenCode => {
@@ -1590,18 +1445,19 @@ mod tests {
         let terminal_id = 1;
 
         // Set the tool owner first - title detection only updates status for locked owner
-        manager.set_tool(terminal_id, AiCliTool::CodexCli);
+        // NOTE: Using FactoryDroid instead of Codex since Codex now uses hook-only integration
+        manager.set_tool(terminal_id, AiCliTool::FactoryDroid);
 
         assert_eq!(
             manager.update_from_title(terminal_id, "C:\\Users\\test> droid [Working...]"),
             Some((
-                AiCliTool::CodexCli,
+                AiCliTool::FactoryDroid,
                 AiCliStatus::Running,
                 Some(AiHookEvent::Running)
             ))
         );
         let session = manager.session(terminal_id).expect("seeded session");
-        assert_eq!(session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(session.tool, Some(AiCliTool::FactoryDroid));
         assert_eq!(session.status, AiCliStatus::Running);
     }
 
@@ -1644,20 +1500,21 @@ mod tests {
         let terminal_id = 1;
 
         // Set the tool owner first - title detection only updates status for locked owner
-        manager.set_tool(terminal_id, AiCliTool::CodexCli);
+        // NOTE: Using FactoryDroid instead of Codex since Codex now uses hook-only integration
+        manager.set_tool(terminal_id, AiCliTool::FactoryDroid);
 
         assert_eq!(
             manager.update_from_title(terminal_id, "droid [Working...]"),
             Some((
-                AiCliTool::CodexCli,
+                AiCliTool::FactoryDroid,
                 AiCliStatus::Running,
                 Some(AiHookEvent::Running)
             ))
         );
         assert_eq!(
-            manager.update_from_title(terminal_id, "codex idle"),
+            manager.update_from_title(terminal_id, "droid [Idle]"),
             Some((
-                AiCliTool::CodexCli,
+                AiCliTool::FactoryDroid,
                 AiCliStatus::Attention,
                 Some(AiHookEvent::Attention)
             ))
@@ -2013,241 +1870,7 @@ mod tests {
     }
 
     // ─── Codex CLI Title Detection Tests ───────────────────────────────────
-
-    #[test]
-    fn detect_codex_status_from_title_returns_none_for_empty_string() {
-        assert_eq!(detect_codex_status_from_title(""), None);
-    }
-
-    #[test]
-    fn detect_codex_status_from_title_returns_none_for_non_codex_titles() {
-        assert_eq!(detect_codex_status_from_title("bash"), None);
-        assert_eq!(detect_codex_status_from_title("vim myfile.ts"), None);
-        assert_eq!(detect_codex_status_from_title("cargo build"), None);
-        assert_eq!(detect_codex_status_from_title("claude working"), None); // Claude, not Codex
-    }
-
-    #[test]
-    fn detect_codex_status_braille_spinner_with_codex_context_detects_working() {
-        // Braille spinner + codex context = working
-        assert_eq!(
-            detect_codex_status_from_title("⠋ Codex working on task"),
-            Some(CodexTransportStatus::Working)
-        );
-        assert_eq!(
-            detect_codex_status_from_title("⠂ Codex CLI"),
-            Some(CodexTransportStatus::Working)
-        );
-    }
-
-    #[test]
-    fn detect_codex_status_working_keywords_detect_working() {
-        // "codex" + working keywords = working
-        assert_eq!(
-            detect_codex_status_from_title("codex working on feature"),
-            Some(CodexTransportStatus::Working)
-        );
-        assert_eq!(
-            detect_codex_status_from_title("codex thinking"),
-            Some(CodexTransportStatus::Working)
-        );
-        assert_eq!(
-            detect_codex_status_from_title("codex running tests"),
-            Some(CodexTransportStatus::Working)
-        );
-        assert_eq!(
-            detect_codex_status_from_title("codex processing"),
-            Some(CodexTransportStatus::Working)
-        );
-    }
-
-    #[test]
-    fn detect_codex_status_permission_keywords_detect_permission() {
-        // "codex" + permission keywords = permission
-        assert_eq!(
-            detect_codex_status_from_title("codex action required"),
-            Some(CodexTransportStatus::Permission)
-        );
-        assert_eq!(
-            detect_codex_status_from_title("codex permission needed"),
-            Some(CodexTransportStatus::Permission)
-        );
-        assert_eq!(
-            detect_codex_status_from_title("codex waiting for approval"),
-            Some(CodexTransportStatus::Permission)
-        );
-        assert_eq!(
-            detect_codex_status_from_title("codex needs input"),
-            Some(CodexTransportStatus::Permission)
-        );
-        assert_eq!(
-            detect_codex_status_from_title("codex confirm action"),
-            Some(CodexTransportStatus::Permission)
-        );
-    }
-
-    #[test]
-    fn detect_codex_status_idle_keywords_detect_idle() {
-        // "codex" + idle keywords = idle
-        assert_eq!(
-            detect_codex_status_from_title("codex ready"),
-            Some(CodexTransportStatus::Idle)
-        );
-        assert_eq!(
-            detect_codex_status_from_title("codex idle"),
-            Some(CodexTransportStatus::Idle)
-        );
-        assert_eq!(
-            detect_codex_status_from_title("codex done"),
-            Some(CodexTransportStatus::Idle)
-        );
-        assert_eq!(
-            detect_codex_status_from_title("codex complete"),
-            Some(CodexTransportStatus::Idle)
-        );
-        assert_eq!(
-            detect_codex_status_from_title("codex finished"),
-            Some(CodexTransportStatus::Idle)
-        );
-    }
-
-    #[test]
-    fn detect_codex_status_bare_codex_defaults_to_idle() {
-        // Bare "codex" = idle (default)
-        assert_eq!(
-            detect_codex_status_from_title("codex"),
-            Some(CodexTransportStatus::Idle)
-        );
-        assert_eq!(
-            detect_codex_status_from_title("CODEX"),
-            Some(CodexTransportStatus::Idle)
-        );
-        assert_eq!(
-            detect_codex_status_from_title("Codex CLI"),
-            Some(CodexTransportStatus::Idle)
-        );
-    }
-
-    #[test]
-    fn detect_codex_status_working_pattern_detects_working() {
-        // "[Working" pattern (Factory Droid style, sometimes used by Codex)
-        assert_eq!(
-            detect_codex_status_from_title("[Working...]"),
-            Some(CodexTransportStatus::Working)
-        );
-    }
-
-    #[test]
-    fn is_codex_agent_title_detects_codex_patterns() {
-        assert!(is_codex_agent_title("⠋ Codex working"));
-        assert!(is_codex_agent_title("codex ready"));
-        assert!(is_codex_agent_title("Codex CLI - action required"));
-        assert!(is_codex_agent_title("[Working...]"));
-    }
-
-    #[test]
-    fn is_codex_agent_title_rejects_non_codex() {
-        assert!(!is_codex_agent_title("bash"));
-        assert!(!is_codex_agent_title("vim file.ts"));
-        assert!(!is_codex_agent_title("claude working")); // Claude, not Codex
-        assert!(!is_codex_agent_title("OpenCode working"));
-    }
-
-    #[test]
-    fn update_from_title_detects_codex_working() {
-        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
-        let terminal_id = 1;
-
-        // Set the tool owner first - title detection only updates status for locked owner
-        manager.set_tool(terminal_id, AiCliTool::CodexCli);
-
-        assert_eq!(
-            manager.update_from_title(terminal_id, "codex working on task"),
-            Some((
-                AiCliTool::CodexCli,
-                AiCliStatus::Running,
-                Some(AiHookEvent::Running)
-            ))
-        );
-        let session = manager.session(terminal_id).expect("session");
-        assert_eq!(session.tool, Some(AiCliTool::CodexCli));
-        assert_eq!(session.status, AiCliStatus::Running);
-    }
-
-    #[test]
-    fn update_from_title_detects_codex_idle() {
-        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
-        let terminal_id = 1;
-
-        // Set the tool owner first - title detection only updates status for locked owner
-        manager.set_tool(terminal_id, AiCliTool::CodexCli);
-
-        assert_eq!(
-            manager.update_from_title(terminal_id, "codex ready"),
-            Some((
-                AiCliTool::CodexCli,
-                AiCliStatus::Attention,
-                Some(AiHookEvent::Attention)
-            ))
-        );
-        let session = manager.session(terminal_id).expect("session");
-        assert_eq!(session.tool, Some(AiCliTool::CodexCli));
-        assert_eq!(session.status, AiCliStatus::Attention);
-    }
-
-    #[test]
-    fn update_from_title_detects_codex_permission() {
-        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
-        let terminal_id = 1;
-
-        // Set the tool owner first - title detection only updates status for locked owner
-        manager.set_tool(terminal_id, AiCliTool::CodexCli);
-
-        assert_eq!(
-            manager.update_from_title(terminal_id, "codex action required"),
-            Some((
-                AiCliTool::CodexCli,
-                AiCliStatus::Attention,
-                Some(AiHookEvent::Attention)
-            ))
-        );
-        let session = manager.session(terminal_id).expect("session");
-        assert_eq!(session.tool, Some(AiCliTool::CodexCli));
-        assert_eq!(session.status, AiCliStatus::Attention);
-    }
-
-    #[test]
-    fn update_from_title_codex_working_to_idle_transition() {
-        let manager = AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
-        let terminal_id = 1;
-
-        // Set the tool owner first - title detection only updates status for locked owner
-        manager.set_tool(terminal_id, AiCliTool::CodexCli);
-
-        // Start working
-        assert_eq!(
-            manager.update_from_title(terminal_id, "codex working"),
-            Some((
-                AiCliTool::CodexCli,
-                AiCliStatus::Running,
-                Some(AiHookEvent::Running)
-            ))
-        );
-        let session = manager.session(terminal_id).expect("session");
-        assert_eq!(session.status, AiCliStatus::Running);
-        assert_eq!(session.tool, Some(AiCliTool::CodexCli));
-
-        // Transition to idle
-        assert_eq!(
-            manager.update_from_title(terminal_id, "codex ready"),
-            Some((
-                AiCliTool::CodexCli,
-                AiCliStatus::Attention,
-                Some(AiHookEvent::Attention)
-            ))
-        );
-        let session = manager.session(terminal_id).expect("session");
-        assert_eq!(session.status, AiCliStatus::Attention);
-        assert_eq!(session.tool, Some(AiCliTool::CodexCli));
-    }
+    // NOTE: Codex uses hook-only integration. Title-based detection tests are removed
+    // because title detection is intentionally disabled for Codex.
+    // Hook-only behavior is tested in codex.rs and app.rs module tests.
 }

@@ -7,7 +7,8 @@ use directories::ProjectDirs;
 use serde::Deserialize;
 
 use crate::models::{
-    default_launchers, normalize_launcher_entries, AppConfig, ProjectRecord, ShellKind, UiConfig,
+    default_launchers, normalize_launcher_entries, AppConfig, AppHistory, ProjectRecord, ShellKind,
+    UiConfig,
 };
 
 const QUALIFIER: &str = "com";
@@ -16,6 +17,8 @@ const APPLICATION: &str = "MergenADE";
 const FACTORY_DROID_HOOK_RUNTIME_DIR: &str = "runtime/factory-droid-hooks";
 const CODEX_CLI_RUNTIME_DIR: &str = "runtime/codex-cli";
 const OPENCODE_RUNTIME_DIR: &str = "runtime/opencode";
+const CODEX_BRIDGE_DIR: &str = "bin";
+const CODEX_BRIDGE_EXE: &str = "mergen-codex-bridge.exe";
 
 fn project_dirs() -> io::Result<ProjectDirs> {
     ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
@@ -46,6 +49,46 @@ pub fn opencode_cli_runtime_dir() -> io::Result<PathBuf> {
     let runtime_dir = project_dirs()?.config_dir().join(OPENCODE_RUNTIME_DIR);
     fs::create_dir_all(&runtime_dir)?;
     Ok(runtime_dir)
+}
+
+/// Path to the terminal input history file (JSON).
+pub fn history_path() -> io::Result<PathBuf> {
+    let data_dir = project_dirs()?.data_dir().to_path_buf();
+    fs::create_dir_all(&data_dir)?;
+    Ok(data_dir.join("history.json"))
+}
+
+pub fn load_history(path: &Path) -> io::Result<AppHistory> {
+    if !path.exists() {
+        return Ok(AppHistory::default());
+    }
+    let text = fs::read_to_string(path)?;
+    let history: AppHistory = serde_json::from_str(&text)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok(history)
+}
+
+pub fn save_history(path: &Path, history: &AppHistory) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_path = temp_save_path(path);
+    let data = serde_json::to_string_pretty(history)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    fs::write(&tmp_path, data)?;
+    atomic_replace_file(&tmp_path, path)?;
+    Ok(())
+}
+
+/// Returns the fixed bridge path used for Codex CLI hooks.
+/// This is `%APPDATA%\Mergen\MergenADE\bin\mergen-codex-bridge.exe`
+/// The bridge is a copy of the main executable that serves as a stable
+/// target for ~/.codex/config.toml and ~/.codex/hooks.json, independent
+/// of where the actual Mergen binary is installed.
+pub fn codex_bridge_path() -> io::Result<PathBuf> {
+    let bridge_dir = project_dirs()?.data_dir().join(CODEX_BRIDGE_DIR);
+    fs::create_dir_all(&bridge_dir)?;
+    Ok(bridge_dir.join(CODEX_BRIDGE_EXE))
 }
 
 pub fn load_config(path: &Path) -> io::Result<AppConfig> {

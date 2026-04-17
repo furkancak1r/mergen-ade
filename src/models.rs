@@ -302,6 +302,34 @@ impl TerminalManagerFilter {
     }
 }
 
+/// Filter for input history panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InputHistoryFilter {
+    #[default]
+    All,
+    Foreground,
+    Background,
+}
+
+impl InputHistoryFilter {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Foreground => "Foreground",
+            Self::Background => "Background",
+        }
+    }
+
+    pub fn matches(self, kind: TerminalKind) -> bool {
+        match self {
+            Self::All => true,
+            Self::Foreground => kind == TerminalKind::Foreground,
+            Self::Background => kind == TerminalKind::Background,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MainVisibilityMode {
@@ -317,6 +345,7 @@ pub enum LeftSidebarTab {
     Directory,
     SourceControl,
     TerminalManager,
+    InputHistory,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,6 +361,8 @@ pub struct UiConfig {
     pub last_selected_project_id: Option<u64>,
     pub main_visibility_mode: MainVisibilityMode,
     pub left_sidebar_tab: LeftSidebarTab,
+    pub checklist_panel_expanded: bool,
+    pub input_history_filter: InputHistoryFilter,
 }
 
 impl Default for UiConfig {
@@ -347,6 +378,8 @@ impl Default for UiConfig {
             last_selected_project_id: None,
             main_visibility_mode: MainVisibilityMode::Global,
             left_sidebar_tab: LeftSidebarTab::Directory,
+            checklist_panel_expanded: false,
+            input_history_filter: InputHistoryFilter::default(),
         }
     }
 }
@@ -360,6 +393,47 @@ pub struct ProjectRecord {
     pub saved_messages: Vec<String>,
     #[serde(default)]
     pub ai_config: ProjectAiConfig,
+}
+
+/// A single recorded terminal input.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalInputRecord {
+    /// Project path (stable across restarts).
+    pub project_path: PathBuf,
+    /// Project name at time of recording.
+    pub project_name: String,
+    /// Terminal kind when recorded.
+    pub terminal_kind: TerminalKind,
+    /// Raw input text (may include $ prefix, etc).
+    pub text: String,
+    /// Unix timestamp (seconds since epoch) when recorded.
+    pub recorded_at: u64,
+}
+
+/// Per-project terminal input history.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TerminalInputHistory {
+    /// Maximum entries to keep per project.
+    #[serde(default = "default_history_limit")]
+    pub max_entries: usize,
+    /// Recorded inputs (newest first).
+    #[serde(default)]
+    pub entries: Vec<TerminalInputRecord>,
+}
+
+const fn default_history_limit() -> usize {
+    500
+}
+
+/// Root history file container.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AppHistory {
+    /// Version for future migrations.
+    #[serde(default)]
+    pub version: u32,
+    /// Per-project history keyed by project path string.
+    #[serde(default)]
+    pub projects: std::collections::BTreeMap<String, TerminalInputHistory>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

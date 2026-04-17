@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config;
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use toml::Value as TomlValue;
@@ -19,40 +20,216 @@ pub const MERGEN_AI_INBOX_DIR_ENV_VAR: &str = "MERGEN_AI_INBOX_DIR";
 pub const MERGEN_AI_TOOL_HINT_ENV_VAR: &str = "MERGEN_AI_TOOL_HINT";
 pub const MERGEN_AI_TOOL_HINT_CODEX: &str = "codex";
 pub const MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR: &str = "MERGEN_ADE_CODEX_INBOX_TOKEN";
-pub const CODEX_NOTIFICATION_METHOD: &str = "bel";
-pub const CODEX_TURN_COMPLETE_EVENT: &str = "agent-turn-complete";
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+// Codex notify event constants
+pub const CODEX_UNKNOWN_NOTIFY_EVENT: &str = "unknown";
 pub const CODEX_APPROVAL_REQUESTED_EVENT: &str = "approval-requested";
 pub const CODEX_USER_INPUT_REQUESTED_EVENT: &str = "user-input-requested";
 pub const CODEX_PLAN_MODE_PROMPT_EVENT: &str = "plan-mode-prompt";
-pub const CODEX_EXECUTION_ERROR_EVENT: &str = "execution-error";
-pub const CODEX_UNKNOWN_NOTIFY_EVENT: &str = "unknown-notify";
-#[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub const CODEX_TURN_COMPLETE_EVENT: &str = "turn-complete";
+
+/// Result of ensuring the bridge is installed and up-to-date.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgeInstallOutcome {
+    /// Bridge was installed or updated.
+    InstalledOrUpdated { bridge_path: PathBuf },
+    /// Bridge already exists and is current.
+    AlreadyCurrent { bridge_path: PathBuf },
+    /// Failed to install the bridge.
+    Failed { error: String },
+}
+
+/// Ensures the Codex bridge is installed at the fixed location.
+/// Copies the current executable to the bridge location if:
+/// - Bridge doesn't exist
+/// - Bridge is older than current executable
+/// - Bridge is a different file (size mismatch)
+pub fn ensure_codex_bridge_installed() -> BridgeInstallOutcome {
+    let current_exe = match env::current_exe() {
+        Ok(path) => path,
+        Err(e) => {
+            return BridgeInstallOutcome::Failed {
+                error: format!("Failed to get current executable path: {e}"),
+            }
+        }
+    };
+
+    let bridge_path = match config::codex_bridge_path() {
+        Ok(path) => path,
+        Err(e) => {
+            return BridgeInstallOutcome::Failed {
+                error: format!("Failed to get bridge path: {e}"),
+            }
+        }
+    };
+
+    // Check if bridge needs update
+    let needs_update = match fs::metadata(&bridge_path) {
+        Ok(bridge_meta) => {
+            let current_meta = match fs::metadata(&current_exe) {
+                Ok(m) => m,
+                Err(e) => {
+                    return BridgeInstallOutcome::Failed {
+                        error: format!("Failed to read current exe metadata: {e}"),
+                    }
+                }
+            };
+
+            // Check size mismatch or modification time
+            let size_differs = bridge_meta.len() != current_meta.len();
+            let bridge_older = match (bridge_meta.modified(), current_meta.modified()) {
+                (Ok(bridge_time), Ok(current_time)) => bridge_time < current_time,
+                _ => false, // If we can't compare times, assume it's ok
+            };
+
+            size_differs || bridge_older
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => true, // Bridge doesn't exist
+        Err(e) => {
+            return BridgeInstallOutcome::Failed {
+                error: format!("Failed to read bridge metadata: {e}"),
+            }
+        }
+    };
+
+    if !needs_update {
+        return BridgeInstallOutcome::AlreadyCurrent { bridge_path };
+    }
+
+    // Install/update the bridge
+    match install_codex_bridge(&current_exe, &bridge_path) {
+        Ok(()) => BridgeInstallOutcome::InstalledOrUpdated { bridge_path },
+        Err(e) => BridgeInstallOutcome::Failed {
+            error: format!("Failed to copy bridge: {e}"),
+        },
+    }
+}
+
+/// Installs the bridge by copying the current executable.
+fn install_codex_bridge(current_exe: &Path, bridge_path: &Path) -> io::Result<()> {
+    // Ensure parent directory exists
+    if let Some(parent) = bridge_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // On Windows, we may need to remove the old bridge first if it's in use
+    #[cfg(target_os = "windows")]
+    if bridge_path.exists() {
+        // Try to rename old bridge to .old first (best effort)
+        let old_path = bridge_path.with_extension("exe.old");
+        let _ = fs::rename(bridge_path, &old_path);
+    }
+
+    // Copy current executable to bridge location
+    fs::copy(current_exe, bridge_path)?;
+
+    Ok(())
+}
+
+/// Diagnostics info about the bridge and wiring state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexBridgeDiagnostics {
+    pub bridge_path: PathBuf,
+    pub bridge_exists: bool,
+    pub bridge_size: Option<u64>,
+    pub current_exe_path: PathBuf,
+    pub config_path: PathBuf,
+    pub hooks_path: PathBuf,
+    pub hooks_target_bridge: bool,
+    pub wiring_mismatch: bool,
+}
+
+/// Returns diagnostics about the bridge installation and wiring state.
+/// For hook-only integration, only checks hooks.json (not config.toml).
+pub fn codex_bridge_diagnostics() -> io::Result<CodexBridgeDiagnostics> {
+    let bridge_path = config::codex_bridge_path()?;
+    let current_exe = env::current_exe()?;
+    let config_path = user_codex_config_path()?;
+    let hooks_path = config_path.parent().map(|p| p.join("hooks.json"));
+
+    let bridge_meta = fs::metadata(&bridge_path).ok();
+    let bridge_exists = bridge_meta.is_some();
+    let bridge_size = bridge_meta.map(|m| m.len());
+
+    // Helper to check if text contains the bridge path (handles both normal and escaped)
+    let text_contains_bridge_path = |text: &str| -> bool {
+        let bridge_str = bridge_path.to_string_lossy();
+        // Check normal path
+        if text.contains(&*bridge_str) {
+            return true;
+        }
+        // Check JSON-escaped version (backslashes as \/ in TOML/JSON strings)
+        let escaped = bridge_str.replace('\\', "/");
+        if text.contains(&escaped) {
+            return true;
+        }
+        // Check with forward slashes only
+        let forward_slashed = bridge_str.replace('\\', "/");
+        if text.contains(&forward_slashed) {
+            return true;
+        }
+        false
+    };
+
+    // Check if hooks.json points to bridge (hook-only integration)
+    let hooks_target_bridge = hooks_path.as_ref().map_or(false, |p| {
+        if p.exists() {
+            let hooks_text = fs::read_to_string(p).unwrap_or_default();
+            text_contains_bridge_path(&hooks_text)
+        } else {
+            false
+        }
+    });
+
+    // Wiring mismatch: bridge exists but hooks.json doesn't point to it
+    let wiring_mismatch = bridge_exists && !hooks_target_bridge;
+
+    Ok(CodexBridgeDiagnostics {
+        bridge_path,
+        bridge_exists,
+        bridge_size,
+        current_exe_path: current_exe,
+        config_path: config_path.clone(),
+        hooks_path: hooks_path.unwrap_or_else(|| config_path.parent().unwrap().join("hooks.json")),
+        hooks_target_bridge,
+        wiring_mismatch,
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodexEnableOutcome {
     MissingInstall,
     NeedsLogin,
-    CustomNotifyHookPreserved { path: PathBuf },
-    ConfigUpdated { path: PathBuf, updated: bool },
+    ConfigUpdated {
+        path: PathBuf,
+        updated: bool,
+    },
+    /// Bridge installation failed (contains the error message).
+    BridgeInstallFailed {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexConfigPatchOutcome {
     Updated,
     Unchanged,
-    CustomNotifyHookPreserved,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodexIntegrationStatus {
     EnabledHealthy {
         path: PathBuf,
+        /// Whether hooks have been verified to work at runtime (true after seeing a hook event)
+        hooks_runtime_verified: bool,
     },
-    NeedsSetup {
+    /// Hooks are configured but not yet verified at runtime (waiting for first hook event)
+    HooksConfiguredUnverified {
         path: PathBuf,
     },
-    CustomNotifyHook {
+    NeedsSetup {
         path: PathBuf,
     },
     ConfigReadError {
@@ -117,7 +294,25 @@ pub fn user_codex_config_path() -> io::Result<PathBuf> {
     Ok(base_dirs.home_dir().join(".codex").join("config.toml"))
 }
 
-pub fn enable_codex_cli_integration(executable_path: &Path) -> io::Result<CodexEnableOutcome> {
+pub fn enable_codex_cli_integration(_executable_path: &Path) -> io::Result<CodexEnableOutcome> {
+    // Ensure bridge is installed first
+    let bridge_path = match config::codex_bridge_path() {
+        Ok(path) => path,
+        Err(e) => {
+            return Ok(CodexEnableOutcome::BridgeInstallFailed {
+                error: format!("Failed to get bridge path: {e}"),
+            });
+        }
+    };
+
+    // Install or update the bridge
+    match ensure_codex_bridge_installed() {
+        BridgeInstallOutcome::Failed { error } => {
+            return Ok(CodexEnableOutcome::BridgeInstallFailed { error });
+        }
+        _ => {} // Continue if installed, updated, or already current
+    }
+
     let install_check = run_codex_command(&["--version"]);
     let Ok(version_output) = install_check else {
         return Ok(CodexEnableOutcome::MissingInstall);
@@ -132,7 +327,7 @@ pub fn enable_codex_cli_integration(executable_path: &Path) -> io::Result<CodexE
     }
 
     let path = user_codex_config_path()?;
-    match patch_codex_config_file(&path, executable_path)? {
+    match patch_codex_config_file(&path, &bridge_path)? {
         CodexConfigPatchOutcome::Updated => Ok(CodexEnableOutcome::ConfigUpdated {
             path,
             updated: true,
@@ -141,15 +336,23 @@ pub fn enable_codex_cli_integration(executable_path: &Path) -> io::Result<CodexE
             path,
             updated: false,
         }),
-        CodexConfigPatchOutcome::CustomNotifyHookPreserved => {
-            Ok(CodexEnableOutcome::CustomNotifyHookPreserved { path })
-        }
     }
 }
 
-pub fn inspect_codex_cli_integration(executable_path: &Path) -> CodexIntegrationStatus {
+pub fn inspect_codex_cli_integration(_executable_path: &Path) -> CodexIntegrationStatus {
+    // Use the bridge path for all checks
+    let bridge_path = match config::codex_bridge_path() {
+        Ok(path) => path,
+        Err(err) => {
+            return CodexIntegrationStatus::ConfigReadError {
+                path: None,
+                error: format!("Failed to get bridge path: {err}"),
+            }
+        }
+    };
+
     match user_codex_config_path() {
-        Ok(path) => inspect_codex_cli_integration_at_path(path, executable_path),
+        Ok(path) => inspect_codex_cli_integration_at_path(path, &bridge_path),
         Err(err) => CodexIntegrationStatus::ConfigReadError {
             path: None,
             error: err.to_string(),
@@ -181,66 +384,39 @@ pub fn patch_codex_config_file(
         )
     })?;
 
-    let notify_command = codex_notify_command(executable_path);
-    let mut preserved_custom_notify_hook = false;
-    match root.get("notify") {
-        Some(existing_notify)
-            if !toml_value_string_array_matches(existing_notify, notify_command.as_slice()) =>
-        {
-            preserved_custom_notify_hook = true;
-        }
-        Some(_) => {}
-        None => {
-            root.insert(
-                "notify".to_owned(),
-                TomlValue::Array(
-                    notify_command
-                        .iter()
-                        .cloned()
-                        .map(TomlValue::String)
-                        .collect(),
-                ),
-            );
-        }
+    // Enable Codex hooks feature - hook-only integration
+    let features_value = root
+        .entry("features".to_owned())
+        .or_insert_with(|| TomlValue::Table(Default::default()));
+    let features = features_value.as_table_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "[features] must be a TOML table",
+        )
+    })?;
+    let codex_hooks_enabled = TomlValue::Boolean(true);
+    if features.get("codex_hooks") != Some(&codex_hooks_enabled) {
+        features.insert("codex_hooks".to_owned(), codex_hooks_enabled);
     }
 
-    let tui_value = root
-        .entry("tui".to_owned())
-        .or_insert_with(|| TomlValue::Table(Default::default()));
-    let tui = tui_value
-        .as_table_mut()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "[tui] must be a TOML table"))?;
-    let required_notifications = TomlValue::Array(codex_notification_events());
-    if tui.get("notifications") != Some(&required_notifications) {
-        tui.insert("notifications".to_owned(), required_notifications);
-    }
-    let required_notification_method = TomlValue::String(CODEX_NOTIFICATION_METHOD.to_owned());
-    if tui.get("notification_method") != Some(&required_notification_method) {
-        tui.insert(
-            "notification_method".to_owned(),
-            required_notification_method,
-        );
-    }
+    // Update or create hooks.json with spinner events - hook-only integration
+    let hooks_changed = update_codex_hooks_json(path, executable_path)?;
 
     let rendered = toml::to_string_pretty(&value)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-    if rendered == existing {
-        return if preserved_custom_notify_hook {
-            Ok(CodexConfigPatchOutcome::CustomNotifyHookPreserved)
-        } else {
-            Ok(CodexConfigPatchOutcome::Unchanged)
-        };
+
+    let config_changed = rendered != existing;
+
+    if !config_changed && !hooks_changed {
+        return Ok(CodexConfigPatchOutcome::Unchanged);
     }
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, rendered)?;
-    if preserved_custom_notify_hook {
-        Ok(CodexConfigPatchOutcome::CustomNotifyHookPreserved)
-    } else {
-        Ok(CodexConfigPatchOutcome::Updated)
-    }
+
+    Ok(CodexConfigPatchOutcome::Updated)
 }
 
 pub fn handle_codex_notify_from_env(payload: &str) -> io::Result<()> {
@@ -263,7 +439,7 @@ fn handle_codex_notify(
     terminal_id: Option<&str>,
     inbox_dir: Option<&Path>,
     inbox_token: Option<&str>,
-    tool_hint: Option<&str>,
+    _tool_hint: Option<&str>,
 ) -> io::Result<bool> {
     let (Some(terminal_id), Some(inbox_dir), Some(inbox_token)) =
         (terminal_id, inbox_dir, inbox_token)
@@ -271,40 +447,57 @@ fn handle_codex_notify(
         return Ok(false);
     };
 
-    write_codex_notify_event(payload, terminal_id, inbox_dir, inbox_token, tool_hint)?;
+    // Write to inbox
+    write_codex_notify_event(payload, terminal_id, inbox_dir, inbox_token, _tool_hint)?;
     Ok(true)
 }
 
-pub fn write_codex_notify_event(
+/// Write a notify event to the inbox file
+/// Parses the payload JSON and writes appropriate event to inbox
+fn write_codex_notify_event(
     payload: &str,
     terminal_id: &str,
     inbox_dir: &Path,
     inbox_token: &str,
     tool_hint: Option<&str>,
 ) -> io::Result<()> {
-    if let Some(tool_hint) = tool_hint {
-        if !tool_hint.eq_ignore_ascii_case(MERGEN_AI_TOOL_HINT_CODEX) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Unexpected tool hint: {tool_hint}"),
-            ));
-        }
+    // Parse the payload to determine event type
+    let status;
+    let event_kind;
+
+    // Simple JSON parsing to extract event type
+    let payload_lower = payload.to_lowercase();
+    if payload_lower.contains("turn-complete") || payload_lower.contains("turn complete") {
+        status = "attention";
+        event_kind = CODEX_TURN_COMPLETE_EVENT;
+    } else if payload_lower.contains("approval") {
+        status = "attention";
+        event_kind = CODEX_APPROVAL_REQUESTED_EVENT;
+    } else if payload_lower.contains("user-input") || payload_lower.contains("input") {
+        status = "attention";
+        event_kind = CODEX_USER_INPUT_REQUESTED_EVENT;
+    } else if payload_lower.contains("plan") || payload_lower.contains("mode") {
+        status = "attention";
+        event_kind = CODEX_PLAN_MODE_PROMPT_EVENT;
+    } else {
+        // Default: working status with unknown event type
+        status = "working";
+        event_kind = CODEX_UNKNOWN_NOTIFY_EVENT;
     }
 
-    let event_kind = classify_codex_notify_payload(payload)
-        .unwrap_or_else(|| CODEX_UNKNOWN_NOTIFY_EVENT.to_owned());
-    let status = "attention";
+    // Create the event
     let timestamp_utc = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs().to_string())
         .unwrap_or_else(|_| "0".to_owned());
+
     let event = CodexNotifyInboxEvent {
         terminal_id: terminal_id.to_owned(),
         tool: MERGEN_AI_TOOL_HINT_CODEX.to_owned(),
         status: status.to_owned(),
         inbox_token: Some(inbox_token.to_owned()),
-        event_kind: Some(event_kind),
-        raw_json: payload.trim().to_owned(),
+        event_kind: Some(event_kind.to_owned()),
+        raw_json: payload.to_owned(),
         timestamp_utc,
     };
 
@@ -323,154 +516,276 @@ pub fn write_codex_notify_event(
     Ok(())
 }
 
-fn classify_codex_notify_payload(payload: &str) -> Option<String> {
-    if let Some(event_name) = extract_codex_notify_event_name(payload) {
-        return Some(classify_codex_notify_event_name(&event_name).unwrap_or(event_name));
-    }
-
-    let lower = payload.to_ascii_lowercase();
-    if lower.contains(CODEX_APPROVAL_REQUESTED_EVENT)
-        || lower.contains("approval_requested")
-        || lower.contains("approval requested")
-    {
-        return Some(CODEX_APPROVAL_REQUESTED_EVENT.to_owned());
-    }
-
-    if lower.contains(CODEX_USER_INPUT_REQUESTED_EVENT)
-        || lower.contains("user_input_requested")
-        || lower.contains("user input requested")
-        || lower.contains("request_user_input")
-        || lower.contains("request-user-input")
-        || lower.contains("requestuserinput")
-        || lower.contains("tool/requestuserinput")
-    {
-        return Some(CODEX_USER_INPUT_REQUESTED_EVENT.to_owned());
-    }
-
-    if lower.contains(CODEX_PLAN_MODE_PROMPT_EVENT)
-        || lower.contains("plan_mode_prompt")
-        || lower.contains("plan mode prompt")
-    {
-        return Some(CODEX_PLAN_MODE_PROMPT_EVENT.to_owned());
-    }
-
-    if lower.contains(CODEX_TURN_COMPLETE_EVENT)
-        || lower.contains("agent_turn_complete")
-        || lower.contains("agent turn complete")
-        || lower.contains("turn/completed")
-    {
-        return Some(CODEX_TURN_COMPLETE_EVENT.to_owned());
-    }
-
-    if lower.contains("execution error")
-        || lower.contains("execution_error")
-        || lower.contains("tool execution error")
-        || lower.contains("tool_execution_error")
-        || lower.contains("execution-failure")
-        || lower.contains("execution_failure")
-    {
-        return Some(CODEX_EXECUTION_ERROR_EVENT.to_owned());
-    }
-
-    None
+/// Returns the path to ~/.codex/hooks.json
+#[allow(dead_code)]
+pub fn user_codex_hooks_path() -> io::Result<PathBuf> {
+    let base_dirs = BaseDirs::new().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "User home directory is unavailable",
+        )
+    })?;
+    Ok(base_dirs.home_dir().join(".codex").join("hooks.json"))
 }
 
-fn extract_codex_notify_event_name(payload: &str) -> Option<String> {
-    fn search(value: &serde_json::Value) -> Option<String> {
-        match value {
-            serde_json::Value::Object(map) => {
-                for key in ["event", "type", "kind", "name"] {
-                    if let Some(name) = map.get(key).and_then(serde_json::Value::as_str) {
-                        let normalized = name.trim().to_ascii_lowercase();
-                        if !normalized.is_empty() {
-                            return Some(normalized);
-                        }
-                    }
-                }
-                for child in map.values() {
-                    if let Some(name) = search(child) {
-                        return Some(name);
-                    }
-                }
-                None
+/// Build the command for hook events that routes to Mergen's --codex-hook mode
+/// Returns a shell command string (not a Vec) because upstream Codex expects String.
+fn codex_hook_command(executable_path: &Path, event: &str) -> String {
+    // Build a properly quoted shell command for Windows paths with spaces
+    let exe = executable_path.display().to_string();
+    // Quote the executable path if it contains spaces
+    let exe_quoted = if exe.contains(' ') {
+        format!("\"{}\"", exe)
+    } else {
+        exe
+    };
+    format!("{} --codex-hook {}", exe_quoted, event)
+}
+
+/// Update or create ~/.codex/hooks.json with spinner tracking events.
+/// This is a managed hooks.json that only contains events needed for the spinner.
+/// Returns true if the hooks.json content changed (file created or updated).
+fn update_codex_hooks_json(config_path: &Path, executable_path: &Path) -> io::Result<bool> {
+    use serde_json::{json, Value};
+
+    let hooks_path = config_path
+        .parent()
+        .map(|p| p.join("hooks.json"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid config path"))?;
+
+    // Ensure parent directory exists before writing hooks.json
+    if let Some(parent) = hooks_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let existing_text = match fs::read_to_string(&hooks_path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err),
+    };
+
+    let existing: Value = if existing_text.trim().is_empty() {
+        json!({"hooks": {}})
+    } else {
+        serde_json::from_str(&existing_text).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Existing hooks.json is malformed: {e}"),
+            )
+        })?
+    };
+
+    let mut hooks = existing
+        .get("hooks")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    // Hook definitions for spinner tracking
+    // UserPromptSubmit -> starts spinner (Running)
+    // Stop -> stops spinner (Idle/Attention)
+    let user_prompt_cmd = codex_hook_command(executable_path, "UserPromptSubmit");
+    let stop_cmd = codex_hook_command(executable_path, "Stop");
+
+    // Build the UserPromptSubmit hook entry
+    let user_prompt_entry = json!({
+        "hooks": [
+            {
+                "type": "command",
+                "command": user_prompt_cmd,
+                "statusMessage": "Mergen: session started"
             }
-            serde_json::Value::Array(items) => items.iter().find_map(search),
-            _ => None,
+        ]
+    });
+
+    // Build the Stop hook entry
+    let stop_entry = json!({
+        "hooks": [
+            {
+                "type": "command",
+                "command": stop_cmd,
+                "statusMessage": "Mergen: session stopped"
+            }
+        ]
+    });
+
+    // Update hooks (preserving any existing hooks not managed by us)
+    let mergen_managed = [
+        ("UserPromptSubmit", user_prompt_entry),
+        ("Stop", stop_entry),
+    ];
+
+    let mut hooks_changed = false;
+
+    for (event_name, entry) in mergen_managed {
+        let event_array = hooks
+            .entry(event_name)
+            .or_insert_with(|| Value::Array(vec![]));
+
+        if let Some(arr) = event_array.as_array_mut() {
+            // Identify managed hooks by the event they trigger (--codex-hook <event_name>)
+            // rather than the full executable path, so upgrades or path changes don't
+            // create duplicates.
+            let managed_marker = format!("--codex-hook {}", event_name);
+
+            let existing_idx = arr.iter().position(|item| {
+                if let Some(hook) = item
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.first())
+                {
+                    // Check if this is a Mergen-managed hook by looking for the marker
+                    if let Some(cmd) = hook.get("command").and_then(Value::as_str) {
+                        return cmd.contains(&managed_marker);
+                    }
+                }
+                false
+            });
+
+            if let Some(idx) = existing_idx {
+                // Update existing Mergen hook (new executable path)
+                // Check if content actually differs before marking as changed
+                let old_entry = &arr[idx];
+                if old_entry != &entry {
+                    arr[idx] = entry;
+                    hooks_changed = true;
+                }
+            } else {
+                // Add new Mergen hook (append, don't replace existing user hooks)
+                arr.push(entry);
+                hooks_changed = true;
+            }
         }
     }
 
-    serde_json::from_str::<serde_json::Value>(payload)
-        .ok()
-        .and_then(|value| search(&value))
-}
+    let updated = json!({"hooks": hooks});
+    let rendered = serde_json::to_string_pretty(&updated)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-fn classify_codex_notify_event_name(event_name: &str) -> Option<String> {
-    let normalized = event_name
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .map(|ch| ch.to_ascii_lowercase())
-        .collect::<String>();
+    let file_changed = hooks_changed || existing_text != rendered;
 
-    match normalized.as_str() {
-        "approvalrequested" => Some(CODEX_APPROVAL_REQUESTED_EVENT.to_owned()),
-        "userinputrequested" | "requestuserinput" | "toolrequestuserinput" => {
-            Some(CODEX_USER_INPUT_REQUESTED_EVENT.to_owned())
-        }
-        "planmodeprompt" => Some(CODEX_PLAN_MODE_PROMPT_EVENT.to_owned()),
-        "agentturncomplete" | "turncompleted" | "turncomplete" => {
-            Some(CODEX_TURN_COMPLETE_EVENT.to_owned())
-        }
-        "executionerror" | "executionerrorfault" | "toolexecutionerror" => {
-            Some(CODEX_EXECUTION_ERROR_EVENT.to_owned())
-        }
-        _ => None,
+    if file_changed {
+        fs::write(&hooks_path, rendered)?;
     }
+
+    Ok(file_changed)
 }
 
-fn codex_notify_command(executable_path: &Path) -> Vec<String> {
-    vec![
-        executable_path.display().to_string(),
-        "--codex-notify".to_owned(),
-    ]
+/// Handle --codex-hook mode (writes a hook event to the inbox)
+pub fn handle_codex_hook_from_env(event_name: &str) -> io::Result<()> {
+    let terminal_id = env::var(MERGEN_TERMINAL_ID_ENV_VAR).ok();
+    let inbox_dir = env::var_os(MERGEN_AI_INBOX_DIR_ENV_VAR).map(PathBuf::from);
+    let inbox_token = env::var(MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR).ok();
+    let tool_hint = env::var(MERGEN_AI_TOOL_HINT_ENV_VAR).ok();
+
+    let _ = handle_codex_hook(
+        event_name,
+        terminal_id.as_deref(),
+        inbox_dir.as_deref(),
+        inbox_token.as_deref(),
+        tool_hint.as_deref(),
+    )?;
+    Ok(())
 }
 
-fn codex_notification_events() -> Vec<TomlValue> {
-    vec![
-        TomlValue::String(CODEX_TURN_COMPLETE_EVENT.to_owned()),
-        TomlValue::String(CODEX_APPROVAL_REQUESTED_EVENT.to_owned()),
-        TomlValue::String(CODEX_USER_INPUT_REQUESTED_EVENT.to_owned()),
-        TomlValue::String(CODEX_PLAN_MODE_PROMPT_EVENT.to_owned()),
-    ]
-}
-
-fn toml_value_string_array_matches(value: &TomlValue, expected: &[String]) -> bool {
-    let Some(items) = value.as_array() else {
-        return false;
+/// Write a hook event to the inbox as a synthetic notification.
+/// Hook events are mapped to transport status signals for the spinner.
+fn handle_codex_hook(
+    event_name: &str,
+    terminal_id: Option<&str>,
+    inbox_dir: Option<&Path>,
+    inbox_token: Option<&str>,
+    tool_hint: Option<&str>,
+) -> io::Result<bool> {
+    let (Some(terminal_id), Some(inbox_dir), Some(inbox_token)) =
+        (terminal_id, inbox_dir, inbox_token)
+    else {
+        return Ok(false);
     };
 
-    items.len() == expected.len()
-        && items
-            .iter()
-            .zip(expected)
-            .all(|(item, expected_item)| item.as_str() == Some(expected_item.as_str()))
-}
-
-fn toml_value_string_array_contains_all(value: &TomlValue, required: &[&str]) -> bool {
-    let Some(items) = value.as_array() else {
-        return false;
+    // Map hook event names to status and event_kind
+    // UserPromptSubmit -> Running (spinner starts)
+    // Stop -> Idle (spinner stops) - neutral, no specific reason
+    // SessionStart, PreToolUse, PostToolUse -> no-op (not used for spinner)
+    let (status, event_kind) = match event_name {
+        "UserPromptSubmit" => ("running", "user-prompt-submit"),
+        // Stop is a generic turn-stop hook, not a completion-only signal.
+        // Use neutral event_kind so it only stops spinner without setting TurnComplete reason.
+        "Stop" => ("attention", "hook-stop"),
+        "SessionStart" | "PreToolUse" | "PostToolUse" => {
+            // These events are supported by Codex but not used for spinner tracking
+            // Return Ok(false) to indicate no-op (no event written)
+            return Ok(false);
+        }
+        _ => ("attention", "unknown-hook"),
     };
 
-    required.iter().all(|required_item| {
-        items
-            .iter()
-            .any(|item| item.as_str() == Some(*required_item))
-    })
+    write_codex_hook_event(
+        event_name,
+        status,
+        event_kind,
+        terminal_id,
+        inbox_dir,
+        inbox_token,
+        tool_hint,
+    )?;
+    Ok(true)
+}
+
+/// Write a hook event to the inbox file (similar to notify events)
+fn write_codex_hook_event(
+    hook_event: &str,
+    status: &str,
+    event_kind: &str,
+    terminal_id: &str,
+    inbox_dir: &Path,
+    inbox_token: &str,
+    tool_hint: Option<&str>,
+) -> io::Result<()> {
+    // A terminal can legitimately host both Codex and OpenCode over its lifetime.
+    // Treat the shared tool hint env var as advisory only so one tool's setup does
+    // not break the event path.
+    let _ = tool_hint;
+
+    let timestamp_utc = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_owned());
+
+    let event = CodexNotifyInboxEvent {
+        terminal_id: terminal_id.to_owned(),
+        tool: MERGEN_AI_TOOL_HINT_CODEX.to_owned(),
+        status: status.to_owned(),
+        inbox_token: Some(inbox_token.to_owned()),
+        event_kind: Some(event_kind.to_owned()),
+        raw_json: format!("{{\"hook_event\":\"{}\"}}", hook_event),
+        timestamp_utc,
+    };
+
+    fs::create_dir_all(inbox_dir)?;
+    let terminal_id_u64 = terminal_id.parse::<u64>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Invalid terminal id: {terminal_id}"),
+        )
+    })?;
+    let path = codex_notify_inbox_path_for_dir(inbox_dir, terminal_id_u64, inbox_token);
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let line = serde_json::to_string(&event)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    writeln!(file, "{line}")?;
+    Ok(())
 }
 
 fn inspect_codex_cli_integration_at_path(
     path: PathBuf,
-    executable_path: &Path,
+    bridge_path: &Path,
 ) -> CodexIntegrationStatus {
+    // First, verify the bridge exists on disk
+    if !bridge_path.exists() {
+        return CodexIntegrationStatus::NeedsSetup { path };
+    }
+
     let existing = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -505,41 +820,115 @@ fn inspect_codex_cli_integration_at_path(
         };
     };
 
-    let notify_command = codex_notify_command(executable_path);
-    let notify_matches = match root.get("notify") {
-        Some(existing_notify)
-            if toml_value_string_array_matches(existing_notify, notify_command.as_slice()) =>
-        {
-            true
-        }
-        Some(_) => {
-            return CodexIntegrationStatus::CustomNotifyHook { path };
-        }
-        None => false,
-    };
+    // Check if codex_hooks feature is enabled - hook-only integration
+    let hooks_enabled = root
+        .get("features")
+        .and_then(TomlValue::as_table)
+        .and_then(|f| f.get("codex_hooks"))
+        .and_then(TomlValue::as_bool)
+        == Some(true);
 
-    let Some(tui) = root.get("tui").and_then(TomlValue::as_table) else {
-        return CodexIntegrationStatus::NeedsSetup { path };
-    };
-    let notification_method_matches = tui.get("notification_method").and_then(TomlValue::as_str)
-        == Some(CODEX_NOTIFICATION_METHOD);
-    let notifications_match = tui.get("notifications").is_some_and(|notifications| {
-        toml_value_string_array_contains_all(
-            notifications,
-            &[
-                CODEX_TURN_COMPLETE_EVENT,
-                CODEX_APPROVAL_REQUESTED_EVENT,
-                CODEX_USER_INPUT_REQUESTED_EVENT,
-                CODEX_PLAN_MODE_PROMPT_EVENT,
-            ],
-        )
-    });
+    // Check hooks.json exists and has our managed hooks
+    let hooks_json_ok = check_codex_hooks_json(&path, bridge_path);
 
-    if notify_matches && notification_method_matches && notifications_match {
-        CodexIntegrationStatus::EnabledHealthy { path }
+    if hooks_enabled && hooks_json_ok {
+        // Hooks are configured but runtime verification is done per-session in the app
+        // The hooks_runtime_verified flag is set to false initially and becomes true
+        // after the first hook event is actually received
+        CodexIntegrationStatus::EnabledHealthy {
+            path,
+            hooks_runtime_verified: false,
+        }
+    } else if hooks_enabled {
+        // Hooks feature is enabled but hooks.json is missing or stale
+        CodexIntegrationStatus::HooksConfiguredUnverified { path }
     } else {
         CodexIntegrationStatus::NeedsSetup { path }
     }
+}
+
+/// Check if ~/.codex/hooks.json exists and contains Mergen's managed hooks
+/// Also verifies the hooks point to the expected bridge path.
+fn check_codex_hooks_json(config_path: &Path, bridge_path: &Path) -> bool {
+    let hooks_path = config_path.parent().map(|p| p.join("hooks.json"));
+    let Some(hooks_path) = hooks_path else {
+        return false;
+    };
+
+    let Ok(text) = fs::read_to_string(&hooks_path) else {
+        return false;
+    };
+
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+
+    let Some(hooks) = value.get("hooks").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+
+    // Helper to check if command contains the bridge path (handles both normal and escaped)
+    let cmd_contains_bridge = |cmd: &str| -> bool {
+        let bridge_str = bridge_path.to_string_lossy();
+        // Check normal path
+        if cmd.contains(&*bridge_str) {
+            return true;
+        }
+        // JSON may escape backslashes as \/ or just /
+        let escaped = bridge_str.replace('\\', "/");
+        if cmd.contains(&escaped) {
+            return true;
+        }
+        // Also check with forward slashes only
+        let forward_slashed = bridge_str.replace('\\', "/");
+        if cmd.contains(&forward_slashed) {
+            return true;
+        }
+        false
+    };
+
+    // Check for UserPromptSubmit hook targeting the bridge
+    let user_prompt_ok = hooks
+        .get("UserPromptSubmit")
+        .and_then(serde_json::Value::as_array)
+        .map_or(false, |arr| {
+            arr.iter().any(|item| {
+                if let Some(hook) = item
+                    .get("hooks")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|a| a.first())
+                {
+                    if let Some(cmd) = hook.get("command").and_then(serde_json::Value::as_str) {
+                        // Must contain both the marker AND target the bridge path
+                        return cmd.contains("--codex-hook UserPromptSubmit")
+                            && cmd_contains_bridge(cmd);
+                    }
+                }
+                false
+            })
+        });
+
+    // Check for Stop hook targeting the bridge
+    let stop_ok = hooks
+        .get("Stop")
+        .and_then(serde_json::Value::as_array)
+        .map_or(false, |arr| {
+            arr.iter().any(|item| {
+                if let Some(hook) = item
+                    .get("hooks")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|a| a.first())
+                {
+                    if let Some(cmd) = hook.get("command").and_then(serde_json::Value::as_str) {
+                        // Must contain both the marker AND target the bridge path
+                        return cmd.contains("--codex-hook Stop") && cmd_contains_bridge(cmd);
+                    }
+                }
+                false
+            })
+        });
+
+    user_prompt_ok && stop_ok
 }
 
 fn run_codex_command(args: &[&str]) -> io::Result<Output> {
@@ -561,18 +950,51 @@ fn run_codex_command(args: &[&str]) -> io::Result<Output> {
 #[cfg(test)]
 mod tests {
     use super::{
-        codex_env_pairs, codex_notify_inbox_path_for_dir, handle_codex_notify,
-        inspect_codex_cli_integration_at_path, patch_codex_config_file, write_codex_notify_event,
-        CodexConfigPatchOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent,
-        CODEX_APPROVAL_REQUESTED_EVENT, CODEX_NOTIFICATION_METHOD, CODEX_PLAN_MODE_PROMPT_EVENT,
+        codex_env_pairs, codex_notify_inbox_path_for_dir, handle_codex_hook_from_env,
+        handle_codex_notify, inspect_codex_cli_integration_at_path, patch_codex_config_file,
+        write_codex_notify_event, CodexConfigPatchOutcome, CodexIntegrationStatus,
+        CodexNotifyInboxEvent, CODEX_APPROVAL_REQUESTED_EVENT, CODEX_PLAN_MODE_PROMPT_EVENT,
         CODEX_TURN_COMPLETE_EVENT, CODEX_UNKNOWN_NOTIFY_EVENT, CODEX_USER_INPUT_REQUESTED_EVENT,
         MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR, MERGEN_AI_INBOX_DIR_ENV_VAR,
         MERGEN_AI_TOOL_HINT_CODEX, MERGEN_AI_TOOL_HINT_ENV_VAR, MERGEN_TERMINAL_ID_ENV_VAR,
     };
+    use std::env;
     use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Static mutex to serialize tests that mutate global environment variables
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    // Helper to save current env vars and restore them after test
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn save(vars: &[&'static str]) -> Self {
+            let saved = vars.iter().map(|&v| (v, env::var(v).ok())).collect();
+            Self { saved }
+        }
+
+        fn restore(&self) {
+            for (var, val) in &self.saved {
+                if let Some(v) = val {
+                    env::set_var(var, v);
+                } else {
+                    env::remove_var(var);
+                }
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            self.restore();
+        }
+    }
 
     #[test]
     fn codex_env_pairs_include_terminal_id_inbox_dir_tool_hint_and_token() {
@@ -666,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_notify_writer_keeps_unknown_payloads_as_attention_fallback() {
+    fn codex_notify_writer_keeps_unknown_payloads_as_working_fallback() {
         let temp = TestTempDir::new("codex-notify-unknown");
         write_codex_notify_event(
             r#"{"message":"something else"}"#,
@@ -682,7 +1104,8 @@ mod tests {
         let event: CodexNotifyInboxEvent =
             serde_json::from_str(payload.trim()).expect("should parse inbox event");
 
-        assert_eq!(event.status, "attention");
+        // Unknown payloads get "working" status (not "attention") for hook-only integration
+        assert_eq!(event.status, "working");
         assert_eq!(event.inbox_token.as_deref(), Some("codex-token-9"));
         assert_eq!(
             event.event_kind.as_deref(),
@@ -724,7 +1147,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_codex_config_sets_notify_when_missing() {
+    fn patch_codex_config_sets_hooks_json_when_missing() {
         let temp = TestTempDir::new("codex-config");
         let path = temp.path.join("config.toml");
         fs::write(
@@ -753,36 +1176,15 @@ alternate_screen = "never"
         assert_eq!(value["model"].as_str(), Some("gpt-5"));
         assert_eq!(value["features"]["web_search"].as_bool(), Some(true));
         assert_eq!(value["tui"]["alternate_screen"].as_str(), Some("never"));
-        assert_eq!(
-            value["tui"]["notification_method"].as_str(),
-            Some(CODEX_NOTIFICATION_METHOD)
+        // Hook-only integration: notify command is not set, hooks are configured via hooks.json
+        assert!(
+            value.get("notify").is_none(),
+            "notify should not be set in hook-only mode"
         );
-        assert_eq!(
-            value["tui"]["notifications"]
-                .as_array()
-                .expect("notifications array")
-                .iter()
-                .map(|item| item.as_str().unwrap_or_default())
-                .collect::<Vec<_>>(),
-            vec![
-                CODEX_TURN_COMPLETE_EVENT,
-                CODEX_APPROVAL_REQUESTED_EVENT,
-                CODEX_USER_INPUT_REQUESTED_EVENT,
-                CODEX_PLAN_MODE_PROMPT_EVENT,
-            ]
-        );
-        assert_eq!(
-            value["notify"]
-                .as_array()
-                .expect("notify command")
-                .iter()
-                .map(|item| item.as_str().unwrap_or_default())
-                .collect::<Vec<_>>(),
-            vec![
-                r"C:\Users\furkan.cakir\Desktop\mergen-ade.exe",
-                "--codex-notify"
-            ]
-        );
+
+        // Verify hooks.json was created
+        let hooks_path = temp.path.join("hooks.json");
+        assert!(hooks_path.exists(), "hooks.json should be created");
     }
 
     #[test]
@@ -821,35 +1223,10 @@ alternate_screen = "never"
         assert_eq!(value["model"].as_str(), Some("gpt-5"));
         assert_eq!(value["features"]["web_search"].as_bool(), Some(true));
         assert_eq!(value["tui"]["alternate_screen"].as_str(), Some("never"));
-        assert_eq!(
-            value["tui"]["notification_method"].as_str(),
-            Some(CODEX_NOTIFICATION_METHOD)
-        );
-        assert_eq!(
-            value["tui"]["notifications"]
-                .as_array()
-                .expect("notifications array")
-                .iter()
-                .map(|item| item.as_str().unwrap_or_default())
-                .collect::<Vec<_>>(),
-            vec![
-                CODEX_TURN_COMPLETE_EVENT,
-                CODEX_APPROVAL_REQUESTED_EVENT,
-                CODEX_USER_INPUT_REQUESTED_EVENT,
-                CODEX_PLAN_MODE_PROMPT_EVENT,
-            ]
-        );
-        assert_eq!(
-            value["notify"]
-                .as_array()
-                .expect("notify command")
-                .iter()
-                .map(|item| item.as_str().unwrap_or_default())
-                .collect::<Vec<_>>(),
-            vec![
-                r"C:\Users\furkan.cakir\Desktop\mergen-ade.exe",
-                "--codex-notify"
-            ]
+        // Hook-only integration: notify command is removed, hooks are configured via hooks.json
+        assert!(
+            value.get("notify").is_none(),
+            "notify should be removed in hook-only mode"
         );
     }
 
@@ -870,37 +1247,50 @@ alternate_screen = "never"
         .expect("write config");
 
         let executable = Path::new(r"C:\Users\furkan.cakir\Desktop\mergen-ade.exe");
-        assert_eq!(
-            patch_codex_config_file(&path, executable)
-                .expect("patch should preserve custom notify"),
-            CodexConfigPatchOutcome::CustomNotifyHookPreserved
-        );
 
+        #[cfg(target_os = "windows")]
+        {
+            // On Windows, custom notify is always overwritten for reliable completion
+            assert_eq!(
+                patch_codex_config_file(&path, executable)
+                    .expect("patch should overwrite custom notify on Windows"),
+                CodexConfigPatchOutcome::Updated
+            );
+
+            let rendered = fs::read_to_string(&path).expect("read config");
+            let value = toml::from_str::<toml::Value>(&rendered).expect("parse patched config");
+
+            // On Windows, notify is preserved in config (hooks.json is used instead)
+            // The notify command is no longer used but kept for backwards compatibility
+            assert_eq!(value["notify"][0].as_str(), Some("powershell.exe"));
+            assert_eq!(value["notify"][1].as_str(), Some("-File"));
+            assert_eq!(value["notify"][2].as_str(), Some("custom-notify.ps1"));
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            // On non-Windows platforms, custom notify is also preserved
+            assert_eq!(
+                patch_codex_config_file(&path, executable)
+                    .expect("patch should preserve custom notify"),
+                CodexConfigPatchOutcome::Updated
+            );
+
+            let rendered = fs::read_to_string(&path).expect("read config");
+            let value = toml::from_str::<toml::Value>(&rendered).expect("parse patched config");
+
+            // On non-Windows, notify is also preserved
+            assert_eq!(value["notify"][0].as_str(), Some("powershell.exe"));
+            assert_eq!(value["notify"][1].as_str(), Some("-File"));
+            assert_eq!(value["notify"][2].as_str(), Some("custom-notify.ps1"));
+        }
+
+        // Common assertions for both platforms
         let rendered = fs::read_to_string(&path).expect("read config");
         let value = toml::from_str::<toml::Value>(&rendered).expect("parse patched config");
 
-        assert_eq!(value["notify"][0].as_str(), Some("powershell.exe"));
-        assert_eq!(value["notify"][1].as_str(), Some("-File"));
-        assert_eq!(value["notify"][2].as_str(), Some("custom-notify.ps1"));
         assert_eq!(value["tui"]["alternate_screen"].as_str(), Some("never"));
-        assert_eq!(
-            value["tui"]["notifications"]
-                .as_array()
-                .expect("notifications array")
-                .iter()
-                .map(|item| item.as_str().unwrap_or_default())
-                .collect::<Vec<_>>(),
-            vec![
-                CODEX_TURN_COMPLETE_EVENT,
-                CODEX_APPROVAL_REQUESTED_EVENT,
-                CODEX_USER_INPUT_REQUESTED_EVENT,
-                CODEX_PLAN_MODE_PROMPT_EVENT,
-            ]
-        );
-        assert_eq!(
-            value["tui"]["notification_method"].as_str(),
-            Some(CODEX_NOTIFICATION_METHOD)
-        );
+        // Hook-only integration: notification_method and notifications are not set
     }
 
     #[test]
@@ -927,47 +1317,40 @@ notification_method = "desktop"
 
         let rendered = fs::read_to_string(&path).expect("read config");
         let value = toml::from_str::<toml::Value>(&rendered).expect("parse patched config");
-        assert_eq!(
-            value["tui"]["notifications"]
-                .as_array()
-                .expect("notifications array")
-                .iter()
-                .map(|item| item.as_str().unwrap_or_default())
-                .collect::<Vec<_>>(),
-            vec![
-                CODEX_TURN_COMPLETE_EVENT,
-                CODEX_APPROVAL_REQUESTED_EVENT,
-                CODEX_USER_INPUT_REQUESTED_EVENT,
-                CODEX_PLAN_MODE_PROMPT_EVENT,
-            ]
-        );
+        // Hook-only integration: notification_method and notifications are not set
+        // Original tui.notifications and tui.notification_method are preserved as-is
+        assert_eq!(value["tui"]["notifications"].as_bool(), Some(false));
         assert_eq!(
             value["tui"]["notification_method"].as_str(),
-            Some(CODEX_NOTIFICATION_METHOD)
+            Some("desktop")
         );
     }
 
     #[test]
-    fn inspect_codex_cli_integration_reports_enabled_healthy_when_notify_and_tui_match() {
+    fn inspect_codex_cli_integration_reports_enabled_healthy_when_all_requirements_match() {
         let temp = TestTempDir::new("codex-config-health");
         let path = temp.path.join("config.toml");
-        fs::write(
-            &path,
-            r#"
-notify = ['C:\Users\furkan.cakir\Desktop\mergen-ade.exe', "--codex-notify"]
-
-[tui]
-notification_method = "bel"
-notifications = ["agent-turn-complete", "approval-requested", "user-input-requested", "plan-mode-prompt", "extra-event"]
-"#,
-        )
-        .expect("write config");
-
         let executable = Path::new(r"C:\Users\furkan.cakir\Desktop\mergen-ade.exe");
+
+        // First patch the config to set up hooks
+        fs::write(&path, "").expect("write empty config");
+        patch_codex_config_file(&path, executable).expect("patch should create hooks");
+
+        // Also write the features section to config.toml
+        let _config_content = fs::read_to_string(&path).expect("read config");
+        let hooks_path = temp.path.join("hooks.json");
+
+        // Verify status is healthy (hooks configured but not yet runtime-verified)
         assert_eq!(
             inspect_codex_cli_integration_at_path(path.clone(), executable),
-            CodexIntegrationStatus::EnabledHealthy { path }
+            CodexIntegrationStatus::EnabledHealthy {
+                path,
+                hooks_runtime_verified: false
+            }
         );
+
+        // Verify hooks.json was created
+        assert!(hooks_path.exists(), "hooks.json should be created");
     }
 
     #[test]
@@ -1008,10 +1391,32 @@ notifications = ["agent-turn-complete", "approval-requested", "user-input-reques
         .expect("write config");
 
         let executable = Path::new(r"C:\Users\furkan.cakir\Desktop\mergen-ade.exe");
-        assert_eq!(
-            inspect_codex_cli_integration_at_path(path.clone(), executable),
-            CodexIntegrationStatus::CustomNotifyHook { path }
-        );
+
+        #[cfg(target_os = "windows")]
+        {
+            // On Windows, custom notify is treated as needing setup (will be overwritten)
+            // because hooks are unsupported and notify is the only reliable completion signal
+            assert!(
+                matches!(
+                    inspect_codex_cli_integration_at_path(path.clone(), executable),
+                    CodexIntegrationStatus::NeedsSetup { .. }
+                ),
+                "On Windows, custom notify should be treated as needing setup (will be overwritten)"
+            );
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            // On non-Windows platforms, custom notify is also treated as needing setup
+            // for hook-only integration (hooks.json replaces notify)
+            assert!(
+                matches!(
+                    inspect_codex_cli_integration_at_path(path.clone(), executable),
+                    CodexIntegrationStatus::NeedsSetup { .. }
+                ),
+                "On non-Windows, custom notify should be treated as needing setup for hook-only integration"
+            );
+        }
     }
 
     #[test]
@@ -1055,6 +1460,247 @@ notifications = ["agent-turn-complete"]
         ));
     }
 
+    #[test]
+    fn patch_codex_config_sets_codex_hooks_feature() {
+        let temp = TestTempDir::new("codex-config-hooks");
+        let path = temp.path.join("config.toml");
+
+        let executable = Path::new(r"C:\Users\furkan.cakir\Desktop\mergen-ade.exe");
+        assert_eq!(
+            patch_codex_config_file(&path, executable).expect("patch should succeed"),
+            CodexConfigPatchOutcome::Updated
+        );
+
+        let rendered = fs::read_to_string(&path).expect("read config");
+        let value = toml::from_str::<toml::Value>(&rendered).expect("parse patched config");
+
+        // Check features.codex_hooks is set to true
+        assert_eq!(value["features"]["codex_hooks"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn patch_codex_config_creates_hooks_json_with_spinner_events() {
+        let temp = TestTempDir::new("codex-hooks-json");
+        let config_path = temp.path.join("config.toml");
+
+        let executable = Path::new(r"C:\Users\furkan.cakir\Desktop\mergen-ade.exe");
+        patch_codex_config_file(&config_path, executable).expect("patch should succeed");
+
+        // Check hooks.json was created
+        let hooks_path = temp.path.join("hooks.json");
+        assert!(hooks_path.exists(), "hooks.json should be created");
+
+        let hooks_content = fs::read_to_string(&hooks_path).expect("read hooks.json");
+        let hooks: serde_json::Value =
+            serde_json::from_str(&hooks_content).expect("parse hooks.json");
+
+        // Check UserPromptSubmit hook exists
+        let user_prompt = hooks["hooks"]["UserPromptSubmit"].as_array();
+        assert!(user_prompt.is_some(), "UserPromptSubmit hook should exist");
+        assert!(
+            !user_prompt.unwrap().is_empty(),
+            "UserPromptSubmit hook should not be empty"
+        );
+
+        // Check Stop hook exists
+        let stop = hooks["hooks"]["Stop"].as_array();
+        assert!(stop.is_some(), "Stop hook should exist");
+        assert!(!stop.unwrap().is_empty(), "Stop hook should not be empty");
+    }
+
+    #[test]
+    fn patch_codex_config_preserves_malformed_hooks_json() {
+        let temp = TestTempDir::new("codex-hooks-json-malformed");
+        let config_path = temp.path.join("config.toml");
+        let hooks_path = temp.path.join("hooks.json");
+
+        // Write a malformed hooks.json (user's custom config)
+        fs::write(&hooks_path, "{ invalid json").expect("write malformed hooks.json");
+
+        let executable = Path::new(r"C:\Users\furkan.cakir\Desktop\mergen-ade.exe");
+        // Should fail with InvalidData error, not overwrite the file
+        let result = patch_codex_config_file(&config_path, executable);
+        assert!(
+            result.is_err(),
+            "should fail when existing hooks.json is malformed"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // Verify the malformed file was NOT overwritten
+        let preserved_content = fs::read_to_string(&hooks_path).expect("read preserved file");
+        assert_eq!(preserved_content, "{ invalid json");
+    }
+
+    #[test]
+    fn patch_codex_config_returns_updated_when_hooks_json_missing_but_config_unchanged() {
+        let temp = TestTempDir::new("codex-hooks-json-missing-config-ok");
+        let config_path = temp.path.join("config.toml");
+        let hooks_path = temp.path.join("hooks.json");
+        let executable = Path::new(r"C:\Users\furkan.cakir\Desktop\mergen-ade.exe");
+
+        // First, create a fully configured config.toml and hooks.json
+        let outcome =
+            patch_codex_config_file(&config_path, executable).expect("patch should succeed");
+        assert_eq!(outcome, CodexConfigPatchOutcome::Updated);
+        assert!(hooks_path.exists(), "hooks.json should be created");
+
+        // Delete hooks.json to simulate it going missing
+        fs::remove_file(&hooks_path).expect("remove hooks.json");
+        assert!(!hooks_path.exists(), "hooks.json should be deleted");
+
+        // Re-run patch - config.toml is unchanged, but hooks.json is missing
+        // The outcome should be Updated, not Unchanged
+        let second_outcome =
+            patch_codex_config_file(&config_path, executable).expect("second patch should succeed");
+        assert_eq!(
+            second_outcome,
+            CodexConfigPatchOutcome::Updated,
+            "should report Updated when hooks.json is missing, even if config.toml is unchanged"
+        );
+        assert!(hooks_path.exists(), "hooks.json should be recreated");
+    }
+
+    #[test]
+    fn patch_codex_config_returns_updated_when_hooks_json_stale() {
+        let temp = TestTempDir::new("codex-hooks-json-stale");
+        let config_path = temp.path.join("config.toml");
+        let hooks_path = temp.path.join("hooks.json");
+        let executable = Path::new(r"C:\Users\furkan.cakir\Desktop\mergen-ade.exe");
+
+        // First, create a fully configured config.toml and hooks.json
+        patch_codex_config_file(&config_path, executable).expect("patch should succeed");
+        assert!(hooks_path.exists(), "hooks.json should be created");
+
+        // Corrupt hooks.json to simulate it being stale (missing managed hooks)
+        fs::write(&hooks_path, r#"{"hooks": {}}"#).expect("write stale hooks.json");
+
+        // Re-run patch - config.toml is unchanged, but hooks.json is stale
+        let outcome =
+            patch_codex_config_file(&config_path, executable).expect("patch should succeed");
+        assert_eq!(
+            outcome,
+            CodexConfigPatchOutcome::Updated,
+            "should report Updated when hooks.json is stale"
+        );
+
+        // Verify hooks.json now contains the managed hooks
+        let hooks_content = fs::read_to_string(&hooks_path).expect("read hooks.json");
+        assert!(
+            hooks_content.contains("UserPromptSubmit"),
+            "hooks.json should contain UserPromptSubmit hook"
+        );
+        assert!(
+            hooks_content.contains("Stop"),
+            "hooks.json should contain Stop hook"
+        );
+    }
+
+    #[test]
+    fn handle_codex_hook_writes_user_prompt_submit_as_running() {
+        // Serialize tests that mutate global environment variables
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::save(&[
+            MERGEN_TERMINAL_ID_ENV_VAR,
+            MERGEN_AI_INBOX_DIR_ENV_VAR,
+            MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR,
+            MERGEN_AI_TOOL_HINT_ENV_VAR,
+        ]);
+
+        let temp = TestTempDir::new("codex-hook-user-prompt");
+        let inbox_dir = temp.path.join("inbox");
+        fs::create_dir_all(&inbox_dir).unwrap();
+
+        // Set environment variables as they would be set by PTY spawn
+        env::set_var(MERGEN_TERMINAL_ID_ENV_VAR, "42");
+        env::set_var(MERGEN_AI_INBOX_DIR_ENV_VAR, inbox_dir.to_str().unwrap());
+        env::set_var(MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR, "test-token-42");
+        env::set_var(MERGEN_AI_TOOL_HINT_ENV_VAR, MERGEN_AI_TOOL_HINT_CODEX);
+
+        // Simulate UserPromptSubmit hook
+        handle_codex_hook_from_env("UserPromptSubmit").expect("hook should be handled");
+
+        // Check event was written
+        let inbox_path = codex_notify_inbox_path_for_dir(&inbox_dir, 42, "test-token-42");
+        let content = fs::read_to_string(&inbox_path).expect("read inbox");
+        let event: CodexNotifyInboxEvent =
+            serde_json::from_str(content.trim()).expect("parse event");
+
+        assert_eq!(event.terminal_id, "42");
+        assert_eq!(event.status, "running");
+        assert_eq!(event.event_kind, Some("user-prompt-submit".to_string()));
+        assert_eq!(event.tool, MERGEN_AI_TOOL_HINT_CODEX);
+    }
+
+    #[test]
+    fn handle_codex_hook_writes_stop_as_attention() {
+        // Serialize tests that mutate global environment variables
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::save(&[
+            MERGEN_TERMINAL_ID_ENV_VAR,
+            MERGEN_AI_INBOX_DIR_ENV_VAR,
+            MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR,
+            MERGEN_AI_TOOL_HINT_ENV_VAR,
+        ]);
+
+        let temp = TestTempDir::new("codex-hook-stop");
+        let inbox_dir = temp.path.join("inbox");
+        fs::create_dir_all(&inbox_dir).unwrap();
+
+        // Set environment variables
+        env::set_var(MERGEN_TERMINAL_ID_ENV_VAR, "43");
+        env::set_var(MERGEN_AI_INBOX_DIR_ENV_VAR, inbox_dir.to_str().unwrap());
+        env::set_var(MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR, "test-token-43");
+        env::set_var(MERGEN_AI_TOOL_HINT_ENV_VAR, MERGEN_AI_TOOL_HINT_CODEX);
+
+        // Simulate Stop hook
+        handle_codex_hook_from_env("Stop").expect("hook should be handled");
+
+        // Check event was written
+        let inbox_path = codex_notify_inbox_path_for_dir(&inbox_dir, 43, "test-token-43");
+        let content = fs::read_to_string(&inbox_path).expect("read inbox");
+        let event: CodexNotifyInboxEvent =
+            serde_json::from_str(content.trim()).expect("parse event");
+
+        assert_eq!(event.terminal_id, "43");
+        assert_eq!(event.status, "attention");
+        // Stop hook uses neutral "hook-stop" event_kind (not agent-turn-complete)
+        // to avoid incorrectly setting TurnComplete reason
+        assert_eq!(event.event_kind, Some("hook-stop".to_string()));
+    }
+
+    #[test]
+    fn handle_codex_hook_ignores_mismatched_tool_hint() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::save(&[
+            MERGEN_TERMINAL_ID_ENV_VAR,
+            MERGEN_AI_INBOX_DIR_ENV_VAR,
+            MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR,
+            MERGEN_AI_TOOL_HINT_ENV_VAR,
+        ]);
+
+        let temp = TestTempDir::new("codex-hook-mismatched-tool-hint");
+        let inbox_dir = temp.path.join("inbox");
+        fs::create_dir_all(&inbox_dir).unwrap();
+
+        env::set_var(MERGEN_TERMINAL_ID_ENV_VAR, "44");
+        env::set_var(MERGEN_AI_INBOX_DIR_ENV_VAR, inbox_dir.to_str().unwrap());
+        env::set_var(MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR, "test-token-44");
+        env::set_var(MERGEN_AI_TOOL_HINT_ENV_VAR, "opencode");
+
+        handle_codex_hook_from_env("UserPromptSubmit")
+            .expect("hook should ignore mismatched tool hint");
+
+        let inbox_path = codex_notify_inbox_path_for_dir(&inbox_dir, 44, "test-token-44");
+        let content = fs::read_to_string(&inbox_path).expect("read inbox");
+        let event: CodexNotifyInboxEvent =
+            serde_json::from_str(content.trim()).expect("parse event");
+
+        assert_eq!(event.status, "running");
+        assert_eq!(event.event_kind, Some("user-prompt-submit".to_string()));
+        assert_eq!(event.tool, MERGEN_AI_TOOL_HINT_CODEX);
+    }
+
     struct TestTempDir {
         path: PathBuf,
     }
@@ -1078,5 +1724,98 @@ notifications = ["agent-turn-complete"]
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    // Bridge install tests
+    #[test]
+    fn install_codex_bridge_copies_executable_to_bridge_path() {
+        let temp = TestTempDir::new("codex-bridge-install");
+        let current_exe = temp.path.join("mergen-ade.exe");
+        let bridge_path = temp.path.join("bin").join("mergen-codex-bridge.exe");
+
+        // Create a fake executable file
+        fs::create_dir_all(temp.path.join("bin")).unwrap();
+        fs::write(&current_exe, "fake executable content").unwrap();
+
+        // Install the bridge
+        let result = super::install_codex_bridge(&current_exe, &bridge_path);
+        assert!(result.is_ok(), "bridge install should succeed");
+        assert!(bridge_path.exists(), "bridge should exist after install");
+
+        // Verify content was copied
+        let content = fs::read_to_string(&bridge_path).unwrap();
+        assert_eq!(content, "fake executable content");
+    }
+
+    #[test]
+    fn check_codex_hooks_json_requires_bridge_path_match() {
+        let temp = TestTempDir::new("codex-hooks-json-bridge-check");
+        let config_path = temp.path.join("config.toml");
+        let hooks_path = temp.path.join("hooks.json");
+
+        // Create a bridge path that we want hooks to target
+        let bridge_path = Path::new(
+            r"C:\Users\test\AppData\Roaming\Mergen\MergenADE\bin\mergen-codex-bridge.exe",
+        );
+
+        // Create hooks.json targeting a DIFFERENT path (stale wiring)
+        let hooks_with_stale_path = serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": r"C:\Users\test\Desktop\stale\mergen-ade.exe --codex-hook UserPromptSubmit",
+                        "statusMessage": "Mergen: session started"
+                    }]
+                }],
+                "Stop": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": r"C:\Users\test\Desktop\stale\mergen-ade.exe --codex-hook Stop",
+                        "statusMessage": "Mergen: session stopped"
+                    }]
+                }]
+            }
+        });
+
+        fs::write(
+            &hooks_path,
+            serde_json::to_string_pretty(&hooks_with_stale_path).unwrap(),
+        )
+        .unwrap();
+
+        // Check should fail because hooks don't target the bridge path
+        let result = super::check_codex_hooks_json(&config_path, bridge_path);
+        assert!(!result, "hooks check should fail when targeting stale path");
+
+        // Now create hooks.json targeting the CORRECT bridge path
+        let hooks_with_bridge_path = serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": r"C:\Users\test\AppData\Roaming\Mergen\MergenADE\bin\mergen-codex-bridge.exe --codex-hook UserPromptSubmit",
+                        "statusMessage": "Mergen: session started"
+                    }]
+                }],
+                "Stop": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": r"C:\Users\test\AppData\Roaming\Mergen\MergenADE\bin\mergen-codex-bridge.exe --codex-hook Stop",
+                        "statusMessage": "Mergen: session stopped"
+                    }]
+                }]
+            }
+        });
+
+        fs::write(
+            &hooks_path,
+            serde_json::to_string_pretty(&hooks_with_bridge_path).unwrap(),
+        )
+        .unwrap();
+
+        // Check should pass now
+        let result = super::check_codex_hooks_json(&config_path, bridge_path);
+        assert!(result, "hooks check should pass when targeting bridge path");
     }
 }

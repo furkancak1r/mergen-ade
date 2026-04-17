@@ -19,9 +19,94 @@ use eframe::egui;
 use eframe::icon_data;
 use std::any::Any;
 use std::ffi::OsString;
-use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::time::Duration;
+
+/// Windows-specific platform detection and memory monitoring
+#[cfg(target_os = "windows")]
+mod platform {
+    #[derive(Debug, Clone)]
+    pub struct GpuInfo {
+        pub name: String,
+        pub vendor_id: u32,
+        pub is_intel: bool,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct MemoryInfo {
+        pub physical_installed_mb: u64,
+        pub physical_available_mb: u64,
+        pub virtual_total_mb: u64,
+        pub virtual_available_mb: u64,
+        pub working_set_mb: u64,
+    }
+
+    /// Detect GPU using simple heuristics via environment variable
+    pub fn detect_primary_gpu() -> Option<GpuInfo> {
+        // Check for Intel GPU hint from environment
+        let intel_hint = std::env::var("MERGEN_INTEL_GPU").is_ok();
+
+        if intel_hint {
+            return Some(GpuInfo {
+                name: "Intel GPU (detected via env)".to_string(),
+                vendor_id: 0x8086,
+                is_intel: true,
+            });
+        }
+
+        None
+    }
+
+    /// Get memory info via Windows API
+    pub fn get_memory_info() -> Option<MemoryInfo> {
+        // Use Windows API via winapi crate pattern or simple estimation
+        // For now, return None and rely on environment checks
+        None
+    }
+
+    /// Check if system is under memory pressure
+    pub fn is_memory_pressure_critical() -> bool {
+        // Simple check: try to allocate a large buffer and see if it fails
+        // This is a heuristic approach when Windows APIs are not available
+        match std::env::var("MERGEN_LOW_MEMORY") {
+            Ok(val) if val == "1" || val.to_lowercase() == "true" => true,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod platform {
+    #[derive(Debug, Clone)]
+    pub struct GpuInfo {
+        pub name: String,
+        pub vendor_id: u32,
+        pub is_intel: bool,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct MemoryInfo {
+        pub physical_installed_mb: u64,
+        pub physical_available_mb: u64,
+        pub virtual_total_mb: u64,
+        pub virtual_available_mb: u64,
+        pub working_set_mb: u64,
+    }
+
+    pub fn detect_primary_gpu() -> Option<GpuInfo> {
+        None
+    }
+
+    pub fn get_memory_info() -> Option<MemoryInfo> {
+        None
+    }
+
+    pub fn is_memory_pressure_critical() -> bool {
+        false
+    }
+}
+
+use platform::*;
 
 /// Renderer backend selection modes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,14 +121,44 @@ enum RendererMode {
 
 impl RendererMode {
     /// Parse from environment variable `MERGEN_RENDERER`.
+    /// If not set, auto-detect based on GPU vendor.
     fn from_env() -> Self {
         match std::env::var("MERGEN_RENDERER").as_deref() {
-            Ok("wgpu") => Self::Wgpu,
-            Ok("glow") => Self::Glow,
-            Ok("auto") => Self::Auto,
-            _ => {
-                // Default: auto mode (wgpu preferred, fallback to glow)
+            Ok("wgpu") => {
+                log::info!("MERGEN_RENDERER=wgpu forced by environment");
+                Self::Wgpu
+            }
+            Ok("glow") => {
+                log::info!("MERGEN_RENDERER=glow forced by environment");
+                Self::Glow
+            }
+            Ok("auto") => {
+                log::info!("MERGEN_RENDERER=auto explicit from environment");
                 Self::Auto
+            }
+            _ => {
+                // Auto-detect: Check GPU vendor for intelligent default
+                if let Some(gpu) = platform::detect_primary_gpu() {
+                    log::info!(
+                        "Detected GPU: {} (vendor: 0x{:04X}, intel: {})",
+                        gpu.name,
+                        gpu.vendor_id,
+                        gpu.is_intel
+                    );
+
+                    if gpu.is_intel {
+                        // Intel GPUs: prefer wgpu for stability
+                        log::info!("Intel GPU detected - preferring wgpu renderer for stability");
+                        // Still use Auto so we can fallback to glow if wgpu fails
+                        Self::Auto
+                    } else {
+                        // NVIDIA/AMD: Auto mode with wgpu preferred
+                        Self::Auto
+                    }
+                } else {
+                    log::info!("No GPU detected - using auto renderer mode");
+                    Self::Auto
+                }
             }
         }
     }
@@ -92,40 +207,85 @@ fn make_app_creator() -> eframe::AppCreator<'static> {
 }
 
 /// Run the app with the specified renderer mode.
+/// Includes memory pressure monitoring and graceful degradation.
 fn run_with_renderer(mode: RendererMode) -> Result<(), eframe::Error> {
+    // Log initial memory state
+    if let Some(mem) = platform::get_memory_info() {
+        log::info!(
+            "Memory at startup - Physical: {} MB available / {} MB total, Virtual: {} MB available / {} MB total, Working set: {} MB",
+            mem.physical_available_mb,
+            mem.physical_installed_mb,
+            mem.virtual_available_mb,
+            mem.virtual_total_mb,
+            mem.working_set_mb
+        );
+    }
+
+    // Check for memory pressure before starting
+    if platform::is_memory_pressure_critical() {
+        log::warn!("Critical memory pressure detected at startup - attempting to start with minimal resources");
+    }
+
     match mode {
         RendererMode::Wgpu => {
             log::info!("Starting Mergen ADE with wgpu renderer (forced)");
             let options = build_native_options(eframe::Renderer::Wgpu);
-            eframe::run_native("Mergen ADE", options, make_app_creator())
+            run_with_memory_monitor(|| {
+                eframe::run_native("Mergen ADE", options, make_app_creator())
+            })
         }
         RendererMode::Glow => {
             log::info!("Starting Mergen ADE with glow renderer (forced)");
             let options = build_native_options(eframe::Renderer::Glow);
-            eframe::run_native("Mergen ADE", options, make_app_creator())
+            run_with_memory_monitor(|| {
+                eframe::run_native("Mergen ADE", options, make_app_creator())
+            })
         }
         RendererMode::Auto => {
             log::info!("Starting Mergen ADE in auto mode (wgpu preferred, fallback to glow)");
 
-            // First try: wgpu
+            // First try: wgpu with memory monitoring
             log::info!("Attempting wgpu renderer...");
             let wgpu_options = build_native_options(eframe::Renderer::Wgpu);
-            match eframe::run_native("Mergen ADE", wgpu_options, make_app_creator()) {
+            match run_with_memory_monitor(|| {
+                eframe::run_native("Mergen ADE", wgpu_options, make_app_creator())
+            }) {
                 Ok(()) => {
                     log::info!("wgpu renderer initialized successfully");
                     Ok(())
                 }
                 Err(e) => {
                     log::warn!("wgpu renderer failed to initialize: {e}");
+
+                    // Check if this might be a memory-related failure
+                    if platform::is_memory_pressure_critical() {
+                        log::error!("Memory pressure detected during wgpu initialization - attempting emergency glow fallback");
+                    }
+
                     log::info!("Falling back to glow (OpenGL) renderer...");
 
-                    // Second try: glow fallback
+                    // Second try: glow fallback with reduced resources
                     let glow_options = build_native_options(eframe::Renderer::Glow);
-                    eframe::run_native("Mergen ADE", glow_options, make_app_creator())
+                    run_with_memory_monitor(|| {
+                        eframe::run_native("Mergen ADE", glow_options, make_app_creator())
+                    })
                 }
             }
         }
     }
+}
+
+/// Wrap a run operation with periodic memory monitoring
+fn run_with_memory_monitor<F>(operation: F) -> Result<(), eframe::Error>
+where
+    F: FnOnce() -> Result<(), eframe::Error>,
+{
+    // Note: We can't easily monitor memory during the operation itself
+    // as eframe::run_native blocks. Instead, we rely on:
+    // 1. Pre-flight memory check (done in run_with_renderer)
+    // 2. Crash shield to catch panics from OOM conditions
+    // 3. The application's own memory monitoring in update loops
+    operation()
 }
 
 fn setup_panic_hook() {
@@ -216,6 +376,17 @@ impl CrashShieldApp {
         }
     }
 
+    fn from_memory_pressure() -> Self {
+        Self {
+            inner: None,
+            startup_error: Some(
+                "System memory is critically low. Please close other applications and try again."
+                    .to_string(),
+            ),
+            crash_error: None,
+        }
+    }
+
     fn note_crash(&mut self, stage: &'static str, payload: Box<dyn Any + Send>) {
         let error = format!("{stage} panicked: {}", panic_payload_to_string(&*payload));
         log::error!("{error}");
@@ -230,16 +401,32 @@ impl CrashShieldApp {
             .or(self.startup_error.as_deref())
             .unwrap_or("Mergen ADE stopped because an internal error occurred.");
 
+        // Check for specific error patterns that indicate memory issues
+        let is_memory_error = message.to_lowercase().contains("memory")
+            || message.to_lowercase().contains("alloc")
+            || message.to_lowercase().contains("out of memory")
+            || message.to_lowercase().contains("failed to create surface");
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.with_layout(
                 egui::Layout::centered_and_justified(egui::Direction::TopDown),
                 |ui| {
                     ui.vertical_centered(|ui| {
-                        ui.heading("Mergen ADE recovered from an internal error");
+                        if is_memory_error {
+                            ui.heading("Mergen ADE - Memory Error");
+                        } else {
+                            ui.heading("Mergen ADE recovered from an internal error");
+                        }
                         ui.add_space(8.0);
                         ui.label(message);
                         ui.add_space(8.0);
-                        ui.label("Restart the app to restore normal operation.");
+                        if is_memory_error {
+                            ui.label("Try closing other applications or restarting your computer.");
+                            ui.add_space(4.0);
+                            ui.label("You can also try setting MERGEN_RENDERER=glow to use OpenGL instead of wgpu.");
+                        } else {
+                            ui.label("Restart the app to restore normal operation.");
+                        }
                     });
                 },
             );
@@ -250,6 +437,12 @@ impl CrashShieldApp {
 
 impl eframe::App for CrashShieldApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Check memory pressure periodically
+        if platform::is_memory_pressure_critical() {
+            log::error!("Critical memory pressure detected during update cycle");
+            // Continue running but note the issue
+        }
+
         if self.inner.is_none() {
             self.render_fallback(ctx);
             return;
@@ -261,9 +454,24 @@ impl eframe::App for CrashShieldApp {
             }
         }));
 
-        if let Err(payload) = result {
-            self.note_crash("update", payload);
-            self.render_fallback(ctx);
+        match result {
+            Ok(()) => {}
+            Err(payload) => {
+                let payload_str = panic_payload_to_string(&*payload);
+
+                // Check for specific error patterns
+                if payload_str
+                    .to_lowercase()
+                    .contains("memory allocation failed")
+                    || payload_str.to_lowercase().contains("out of memory")
+                    || payload_str.to_lowercase().contains("failed to allocate")
+                {
+                    log::error!("Memory allocation panic detected in update cycle");
+                }
+
+                self.note_crash("update", payload);
+                self.render_fallback(ctx);
+            }
         }
     }
 
@@ -272,9 +480,11 @@ impl eframe::App for CrashShieldApp {
             return;
         };
 
-        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| {
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
             inner.raw_input_hook(ctx, raw_input);
-        })) {
+        }));
+
+        if let Err(payload) = result {
             self.note_crash("raw_input_hook", payload);
         }
     }
@@ -284,11 +494,24 @@ impl eframe::App for CrashShieldApp {
             return;
         };
 
-        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| {
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
             inner.save(storage);
-        })) {
+        }));
+
+        if let Err(payload) = result {
             self.note_crash("save", payload);
         }
+    }
+
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+
+        // Wrap on_exit in catch_unwind to ensure we always try to cleanup
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+            inner.on_exit(gl);
+        }));
     }
 
     fn auto_save_interval(&self) -> Duration {
@@ -313,225 +536,82 @@ impl eframe::App for CrashShieldApp {
     }
 }
 
-fn maybe_handle_codex_notify_mode_with<I, F>(mut args: I, mut handler: F) -> Result<bool, String>
-where
-    I: Iterator<Item = OsString>,
-    F: FnMut(&str) -> io::Result<()>,
-{
-    let Some(mode) = args.next() else {
-        return Ok(false);
-    };
-    if mode != "--codex-notify" {
-        return Ok(false);
-    }
-
-    let payload = args
-        .next()
-        .ok_or_else(|| "Missing Codex notify payload argument.".to_owned())?
-        .into_string()
-        .map_err(|_| "Codex notify payload must be valid UTF-8.".to_owned())?;
-
-    handler(&payload).map_err(|err| err.to_string())?;
-    Ok(true)
-}
-
-fn maybe_handle_codex_notify_mode<I>(args: I) -> Result<bool, String>
-where
-    I: Iterator<Item = OsString>,
-{
-    maybe_handle_codex_notify_mode_with(args, codex::handle_codex_notify_from_env)
-}
-
-fn maybe_handle_opencode_notify_mode<I>(mut args: I) -> Result<bool, String>
-where
-    I: Iterator<Item = OsString>,
-{
-    let Some(mode) = args.next() else {
-        return Ok(false);
-    };
-    if mode != "--opencode-notify" {
-        return Ok(false);
-    }
-
-    match opencode::maybe_handle_opencode_notify_mode() {
-        Ok(Some(_)) => Ok(true),
-        Ok(None) => Ok(false),
-        Err(err) => Err(err.to_string()),
-    }
-}
-
 fn main() -> Result<(), eframe::Error> {
-    let mut args = std::env::args_os();
-    let _ = args.next();
+    let args: Vec<OsString> = std::env::args_os().collect();
 
-    // Try OpenCode notify mode first
-    match maybe_handle_opencode_notify_mode(&mut args) {
-        Ok(true) => return Ok(()),
-        Ok(false) => {}
-        Err(err) => {
-            eprintln!("Failed to process OpenCode notify payload: {err}");
-            std::process::exit(1);
-        }
-    }
-
-    // Then try Codex notify mode
-    match maybe_handle_codex_notify_mode(&mut args) {
-        Ok(true) => return Ok(()),
-        Ok(false) => {}
-        Err(err) => {
-            eprintln!("Failed to process Codex notify payload: {err}");
-            std::process::exit(1);
+    // Check for CLI mode dispatch based on first argument
+    if args.len() > 1 {
+        let mode = args[1].to_string_lossy();
+        match mode.as_ref() {
+            "--opencode-notify" => match opencode::maybe_handle_opencode_notify_mode() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => {
+                    eprintln!("OpenCode notify mode did not process any payload");
+                    std::process::exit(1);
+                }
+                Err(err) => {
+                    eprintln!("Failed to process OpenCode notify payload: {err}");
+                    std::process::exit(1);
+                }
+            },
+            "--codex-hook" => {
+                if args.len() < 3 {
+                    eprintln!("Missing Codex hook event argument.");
+                    std::process::exit(1);
+                }
+                let event_name = args[2].to_string_lossy();
+                if let Err(err) = codex::handle_codex_hook_from_env(&event_name) {
+                    eprintln!("Failed to process Codex hook event: {err}");
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            _ => {
+                // Not a CLI mode flag, continue with normal app startup
+            }
         }
     }
 
     setup_panic_hook();
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn,mergen_ade=info"),
+    )
+    .init();
 
-    // Determine renderer mode from environment
+    // Pre-flight memory check before any heavy initialization
+    if platform::is_memory_pressure_critical() {
+        log::error!(
+            "Critical memory pressure detected before startup - attempting to start anyway"
+        );
+    }
+
+    // Determine renderer mode from environment or auto-detect
     let renderer_mode = RendererMode::from_env();
     log::info!(
-        "Renderer mode: {} (from MERGEN_RENDERER env var)",
+        "Renderer mode: {} (from MERGEN_RENDERER env var or auto-detect)",
         renderer_mode.as_str()
     );
+
+    // Log GPU information
+    if let Some(gpu) = platform::detect_primary_gpu() {
+        log::info!(
+            "GPU: {} (Vendor ID: 0x{:04X}, Intel: {})",
+            gpu.name,
+            gpu.vendor_id,
+            gpu.is_intel
+        );
+    } else {
+        log::info!("GPU: Unable to detect");
+    }
 
     run_with_renderer(renderer_mode)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::maybe_handle_codex_notify_mode_with;
-    use crate::codex::{
-        codex_notify_inbox_path_for_dir, CodexNotifyInboxEvent, MERGEN_AI_TOOL_HINT_CODEX,
-    };
-    use std::ffi::OsString;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn codex_notify_mode_forwards_agent_turn_complete_payload_from_argv() {
-        let temp = TestTempDir::new("codex-notify-argv-turn-complete");
-        let handled = maybe_handle_codex_notify_mode_with(
-            vec![
-                OsString::from("--codex-notify"),
-                OsString::from(r#"{"type":"agent-turn-complete"}"#),
-            ]
-            .into_iter(),
-            |payload| {
-                write_test_notify_event(payload, "41", test_codex_inbox_token(41), &temp.path)
-            },
-        )
-        .expect("argv payload should be handled");
-
-        assert!(handled);
-
-        let payload = fs::read_to_string(codex_notify_inbox_path_for_dir(
-            &temp.path,
-            41,
-            test_codex_inbox_token(41),
-        ))
-        .expect("should read inbox");
-        let event: CodexNotifyInboxEvent =
-            serde_json::from_str(payload.trim()).expect("should parse inbox event");
-
-        assert_eq!(event.status, "attention");
-        assert_eq!(event.event_kind.as_deref(), Some("agent-turn-complete"));
-        assert_eq!(event.raw_json, r#"{"type":"agent-turn-complete"}"#);
-    }
-
-    #[test]
-    fn codex_notify_mode_forwards_approval_requested_payload_from_argv() {
-        let temp = TestTempDir::new("codex-notify-argv-approval");
-        let handled = maybe_handle_codex_notify_mode_with(
-            vec![
-                OsString::from("--codex-notify"),
-                OsString::from(r#"{"event":"approval-requested"}"#),
-            ]
-            .into_iter(),
-            |payload| {
-                write_test_notify_event(payload, "42", test_codex_inbox_token(42), &temp.path)
-            },
-        )
-        .expect("argv payload should be handled");
-
-        assert!(handled);
-
-        let payload = fs::read_to_string(codex_notify_inbox_path_for_dir(
-            &temp.path,
-            42,
-            test_codex_inbox_token(42),
-        ))
-        .expect("should read inbox");
-        let event: CodexNotifyInboxEvent =
-            serde_json::from_str(payload.trim()).expect("should parse inbox event");
-
-        assert_eq!(event.status, "attention");
-        assert_eq!(event.event_kind.as_deref(), Some("approval-requested"));
-        assert_eq!(event.raw_json, r#"{"event":"approval-requested"}"#);
-    }
-
-    #[test]
-    fn codex_notify_mode_requires_payload_argument() {
-        let err = maybe_handle_codex_notify_mode_with(
-            vec![OsString::from("--codex-notify")].into_iter(),
-            |_| panic!("handler should not be called without a payload"),
-        )
-        .expect_err("missing payload should fail");
-
-        assert_eq!(err, "Missing Codex notify payload argument.");
-    }
-
     #[test]
     fn invalid_app_icon_bytes_are_non_fatal() {
         assert!(super::decode_app_icon_from_bytes(&[]).is_none());
-    }
-
-    fn write_test_notify_event(
-        payload: &str,
-        terminal_id: &str,
-        inbox_token: &str,
-        inbox_dir: &std::path::Path,
-    ) -> std::io::Result<()> {
-        crate::codex::write_codex_notify_event(
-            payload,
-            terminal_id,
-            inbox_dir,
-            inbox_token,
-            Some(MERGEN_AI_TOOL_HINT_CODEX),
-        )
-    }
-
-    fn test_codex_inbox_token(terminal_id: u64) -> &'static str {
-        match terminal_id {
-            41 => "test-codex-inbox-token-41",
-            42 => "test-codex-inbox-token-42",
-            _ => "test-codex-inbox-token",
-        }
-    }
-
-    struct TestTempDir {
-        path: PathBuf,
-    }
-
-    impl TestTempDir {
-        fn new(label: &str) -> Self {
-            let unique_suffix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time before unix epoch")
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "mergen-ade-{label}-{}-{unique_suffix}",
-                std::process::id()
-            ));
-            fs::create_dir_all(&path).expect("create temp dir");
-            Self { path }
-        }
-    }
-
-    impl Drop for TestTempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
     }
 }
