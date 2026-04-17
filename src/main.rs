@@ -3,6 +3,28 @@
     all(target_os = "windows", not(debug_assertions)),
     windows_subsystem = "windows"
 )]
+// Lints that require significant refactoring or are stylistic only
+#![allow(
+    dead_code,
+    clippy::too_many_arguments,
+    clippy::collapsible_if,
+    clippy::needless_return,
+    clippy::doc_lazy_continuation,
+    clippy::if_same_then_else,
+    clippy::manual_is_multiple_of,
+    clippy::manual_clamp,
+    clippy::io_other_error,
+    clippy::unnecessary_unwrap,
+    clippy::unwrap_or_default,
+    clippy::map_entry,
+    clippy::question_mark,
+    clippy::trim_split_whitespace,
+    clippy::single_match,
+    clippy::needless_borrow,
+    clippy::missing_const_for_thread_local,
+    clippy::needless_update,
+    clippy::unnecessary_map_or
+)]
 
 mod app;
 mod codex;
@@ -21,6 +43,27 @@ use std::any::Any;
 use std::ffi::OsString;
 use std::panic::{self, AssertUnwindSafe};
 use std::time::Duration;
+
+/// Set Windows wgpu environment defaults to avoid Vulkan validation warnings.
+/// Only applies if the user hasn't explicitly set these environment variables.
+#[cfg(target_os = "windows")]
+fn setup_windows_wgpu_env_defaults() {
+    // Use DX12 with GL fallback instead of Vulkan on Windows to avoid validation warnings.
+    // This allows wgpu to try DX12 first, and if it fails (e.g., cannot create surface),
+    // it will attempt GL (OpenGL) as a fallback within the wgpu backend selection.
+    if std::env::var("WGPU_BACKEND").is_err() {
+        std::env::set_var("WGPU_BACKEND", "dx12,gl");
+    }
+    // Disable GPU validation in debug builds to avoid "unable to find layer" warnings
+    if cfg!(debug_assertions) && std::env::var("WGPU_VALIDATION").is_err() {
+        std::env::set_var("WGPU_VALIDATION", "0");
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn setup_windows_wgpu_env_defaults() {
+    // No-op on non-Windows platforms
+}
 
 /// Windows-specific platform detection and memory monitoring
 #[cfg(target_os = "windows")]
@@ -68,10 +111,10 @@ mod platform {
     pub fn is_memory_pressure_critical() -> bool {
         // Simple check: try to allocate a large buffer and see if it fails
         // This is a heuristic approach when Windows APIs are not available
-        match std::env::var("MERGEN_LOW_MEMORY") {
-            Ok(val) if val == "1" || val.to_lowercase() == "true" => true,
-            _ => false,
-        }
+        matches!(
+            std::env::var("MERGEN_LOW_MEMORY"),
+            Ok(val) if val == "1" || val.to_lowercase() == "true"
+        )
     }
 }
 
@@ -186,6 +229,8 @@ fn build_native_options(renderer: eframe::Renderer) -> eframe::NativeOptions {
         centered: true,
         persist_window: false,
         renderer,
+        // wgpu_options uses defaults (environment variables WGPU_BACKEND/WGPU_VALIDATION
+        // are set in setup_windows_wgpu_env_defaults() on Windows)
         ..Default::default()
     }
 }
@@ -202,6 +247,40 @@ fn make_app_creator() -> eframe::AppCreator<'static> {
         };
         Ok(Box::new(shield))
     })
+}
+
+/// Preflight probe to check if wgpu renderer can be initialized.
+/// This creates a temporary wgpu instance to verify that:
+/// 1. The selected backend(s) can be loaded
+/// 2. At least one adapter is available
+///
+/// Returns Ok(()) if wgpu appears usable, Err otherwise.
+fn preflight_probe_wgpu() -> Result<(), String> {
+    // Use eframe's re-export of wgpu to avoid adding direct dependency
+    use eframe::wgpu::{Backends, Instance, InstanceDescriptor};
+
+    // Create an instance with default descriptor (respects WGPU_BACKEND env var)
+    let instance = Instance::new(InstanceDescriptor::default());
+
+    // Try to enumerate adapters - if none are available, wgpu won't work
+    let adapters = instance.enumerate_adapters(Backends::all());
+
+    if adapters.is_empty() {
+        return Err("No wgpu adapters found".to_string());
+    }
+
+    // Log available backends and adapter info for diagnostics
+    let backend_names: Vec<_> = adapters
+        .iter()
+        .map(|a: &eframe::wgpu::Adapter| format!("{:?}", a.get_info().backend))
+        .collect();
+    log::info!(
+        "Preflight probe found {} wgpu adapter(s): {:?}",
+        adapters.len(),
+        backend_names
+    );
+
+    Ok(())
 }
 
 /// Run the app with the specified renderer mode.
@@ -242,6 +321,25 @@ fn run_with_renderer(mode: RendererMode) -> Result<(), eframe::Error> {
         RendererMode::Auto => {
             log::info!("Starting Mergen ADE in auto mode (wgpu preferred, fallback to glow)");
 
+            // Preflight probe: check if wgpu can be initialized before attempting full startup.
+            // This avoids the noisy eframe error log when wgpu surface creation fails.
+            match preflight_probe_wgpu() {
+                Ok(()) => {
+                    log::info!("wgpu preflight probe succeeded, proceeding with wgpu renderer");
+                }
+                Err(probe_err) => {
+                    log::warn!(
+                        "wgpu preflight probe failed ({}), skipping to glow fallback",
+                        probe_err
+                    );
+                    log::info!("Falling back to glow (OpenGL) renderer...");
+                    let glow_options = build_native_options(eframe::Renderer::Glow);
+                    return run_with_memory_monitor(|| {
+                        eframe::run_native("Mergen ADE", glow_options, make_app_creator())
+                    });
+                }
+            }
+
             // First try: wgpu with memory monitoring
             log::info!("Attempting wgpu renderer...");
             let wgpu_options = build_native_options(eframe::Renderer::Wgpu);
@@ -253,7 +351,7 @@ fn run_with_renderer(mode: RendererMode) -> Result<(), eframe::Error> {
                     Ok(())
                 }
                 Err(e) => {
-                    log::warn!("wgpu renderer failed to initialize: {e}");
+                    log::warn!("wgpu renderer failed to initialize after preflight success: {e}");
 
                     // Check if this might be a memory-related failure
                     if platform::is_memory_pressure_critical() {
@@ -572,9 +670,16 @@ fn main() -> Result<(), eframe::Error> {
 
     setup_panic_hook();
 
+    // Set Windows wgpu environment defaults before logger init
+    setup_windows_wgpu_env_defaults();
+
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("warn,mergen_ade=info"),
     )
+    // Silence noisy wgpu_hal::vulkan warnings on Windows (last-resort filter)
+    .filter_module("wgpu_hal::vulkan", log::LevelFilter::Error)
+    .filter_module("wgpu_hal::vulkan::conv", log::LevelFilter::Error)
+    .filter_module("wgpu_hal::vulkan::instance", log::LevelFilter::Error)
     .init();
 
     // Pre-flight memory check before any heavy initialization

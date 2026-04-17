@@ -182,14 +182,13 @@ impl OpenCodeHookService {
             }
             let lower = line.to_lowercase();
             if lower.starts_with("x-mergen-token:") {
-                token_header = line.splitn(2, ':').nth(1).map(|s| s.trim());
+                token_header = line.split_once(':').map(|x| x.1.trim());
             } else if lower.starts_with("x-mergen-opencode-terminal-id:") {
-                terminal_id_header = line.splitn(2, ':').nth(1).map(|s| s.trim());
+                terminal_id_header = line.split_once(':').map(|x| x.1.trim());
             } else if lower.starts_with("content-length:") {
                 content_length = line
-                    .splitn(2, ':')
-                    .nth(1)
-                    .and_then(|s| s.trim().parse().ok())
+                    .split_once(':')
+                    .and_then(|x| x.1.trim().parse().ok())
                     .unwrap_or(0);
             }
         }

@@ -547,7 +547,7 @@ fn parse_hook_event(text: &str, config: &AiHooksConfig) -> Option<(AiCliTool, St
             if !name.is_empty() {
                 // Verify the detected tool is enabled in config
                 let config_for_tool = config.config_for(detected_tool);
-                if config_for_tool.map_or(false, |c| c.enabled) {
+                if config_for_tool.is_some_and(|c| c.enabled) {
                     return Some((detected_tool, extract_name(&name), is_notification));
                 }
             }
@@ -697,12 +697,10 @@ impl AiHookManager {
         let session = sessions.entry(terminal_id).or_default();
 
         // Step 1: Detect tool if not already detected
-        if session.tool.is_none() {
-            if !session.detect_tool(text, &self.config) {
-                return Vec::new();
-            }
-            // Tool detected - fall through to check for hook events
+        if session.tool.is_none() && !session.detect_tool(text, &self.config) {
+            return Vec::new();
         }
+        // Tool detected - fall through to check for hook events
 
         let Some(tool) = session.tool else {
             return Vec::new();
@@ -719,7 +717,7 @@ impl AiHookManager {
 
         for (line, end_offset) in complete_lines {
             if let Some((parsed_tool, event_name, is_notification)) =
-                parse_hook_event(&line, &self.config)
+                parse_hook_event(line, &self.config)
             {
                 if parsed_tool != tool {
                     continue;

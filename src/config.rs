@@ -162,7 +162,7 @@ fn atomic_replace_file(src: &Path, dst: &Path) -> io::Result<()> {
 
         let err = io::Error::last_os_error();
         let _ = fs::remove_file(src);
-        return Err(err);
+        Err(err)
     }
 
     #[cfg(not(target_os = "windows"))]

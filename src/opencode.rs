@@ -54,7 +54,7 @@ impl CodexTransportStatus {
 
     /// Map transport status to the generic status string for legacy consumers
     #[allow(dead_code)]
-    pub fn to_generic_status(&self) -> String {
+    pub fn to_generic_status(self) -> String {
         match self {
             Self::Working => "running".to_owned(),
             Self::Idle | Self::Permission => "attention".to_owned(),
@@ -91,7 +91,7 @@ impl OpenCodeTransportStatus {
     }
 
     /// Map transport status to the generic status string for legacy consumers
-    pub fn to_generic_status(&self) -> String {
+    pub fn to_generic_status(self) -> String {
         match self {
             Self::Working => "running".to_owned(),
             Self::Idle | Self::Permission => "attention".to_owned(),

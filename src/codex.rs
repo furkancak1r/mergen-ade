@@ -167,7 +167,7 @@ pub fn codex_bridge_diagnostics() -> io::Result<CodexBridgeDiagnostics> {
     };
 
     // Check if hooks.json points to bridge (hook-only integration)
-    let hooks_target_bridge = hooks_path.as_ref().map_or(false, |p| {
+    let hooks_target_bridge = hooks_path.as_ref().is_some_and(|p| {
         if p.exists() {
             let hooks_text = fs::read_to_string(p).unwrap_or_default();
             text_contains_bridge_path(&hooks_text)
@@ -299,12 +299,10 @@ pub fn enable_codex_cli_integration(_executable_path: &Path) -> io::Result<Codex
     };
 
     // Install or update the bridge
-    match ensure_codex_bridge_installed() {
-        BridgeInstallOutcome::Failed { error } => {
-            return Ok(CodexEnableOutcome::BridgeInstallFailed { error });
-        }
-        _ => {} // Continue if installed, updated, or already current
+    if let BridgeInstallOutcome::Failed { error } = ensure_codex_bridge_installed() {
+        return Ok(CodexEnableOutcome::BridgeInstallFailed { error });
     }
+    // Continue if installed, updated, or already current
 
     let install_check = run_codex_command(&["--version"]);
     let Ok(version_output) = install_check else {
@@ -714,8 +712,7 @@ pub fn maybe_handle_codex_notify_mode() -> io::Result<Option<CodexNotifyInboxEve
             let tool_hint = env::var(MERGEN_AI_TOOL_HINT_ENV_VAR).ok();
 
             if let (Some(tid), Some(dir), Some(token)) = (terminal_id, inbox_dir, inbox_token) {
-                let path = PathBuf::from(dir);
-                write_codex_notify_event(&payload, &tid, &path, &token, tool_hint.as_deref())?;
+                write_codex_notify_event(&payload, &tid, &dir, &token, tool_hint.as_deref())?;
 
                 // Re-parse to get the normalized event for the returned value
                 let event_kind = extract_notify_event_kind(&payload);
@@ -954,7 +951,7 @@ fn check_codex_hooks_json(config_path: &Path, bridge_path: &Path) -> bool {
     let user_prompt_ok = hooks
         .get("UserPromptSubmit")
         .and_then(serde_json::Value::as_array)
-        .map_or(false, |arr| {
+        .is_some_and(|arr| {
             arr.iter().any(|item| {
                 if let Some(hook) = item
                     .get("hooks")
@@ -975,7 +972,7 @@ fn check_codex_hooks_json(config_path: &Path, bridge_path: &Path) -> bool {
     let stop_ok = hooks
         .get("Stop")
         .and_then(serde_json::Value::as_array)
-        .map_or(false, |arr| {
+        .is_some_and(|arr| {
             arr.iter().any(|item| {
                 if let Some(hook) = item
                     .get("hooks")
@@ -1001,7 +998,7 @@ fn run_codex_command(args: &[&str]) -> io::Result<Output> {
         command.arg("/C").arg("codex");
         command.args(args);
         command.creation_flags(CREATE_NO_WINDOW);
-        return command.output();
+        command.output()
     }
 
     #[cfg(not(target_os = "windows"))]

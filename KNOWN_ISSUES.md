@@ -1,5 +1,44 @@
 ### Known Issues & Fix Log
 
+#### Windows wgpu renderer now supports DX12 with GL fallback and preflight probe {#windows-wgpu-dx12-gl-fallback-preflight}
+- Date: 2026-04-17
+- Context: Windows systems where wgpu DX12 backend fails to create surface (e.g., remote desktop, software rendering)
+- Error signature: `WGPU error: Failed to create surface for any enabled backend: {}` and fallback to glow taking multiple seconds with ERROR logs visible to user.
+- Symptoms/Impact: Startup showed ERROR-level log from eframe before successfully falling back to glow (OpenGL). This was visually jarring and confusing for users.
+- Root cause:
+  1. `setup_windows_wgpu_env_defaults()` was setting `WGPU_BACKEND=dx12` only, with no fallback backend.
+  2. On systems where DX12 cannot create a surface (e.g., software rendering, remote desktop), wgpu would fail completely.
+  3. eframe logs renderer initialization errors at ERROR level before returning Err to caller.
+  4. The fallback to glow only happened after the full wgpu attempt failed, producing visible ERROR logs.
+- Resolution:
+  - Changed `WGPU_BACKEND` default from `dx12` to `dx12,gl` to allow wgpu to try OpenGL backend if DX12 fails.
+  - Added `preflight_probe_wgpu()` function that creates a temporary wgpu Instance and enumerates adapters before attempting full renderer initialization.
+  - Updated `RendererMode::Auto` to run preflight probe first; if it fails (no adapters available), skip directly to glow without attempting full wgpu initialization.
+  - This prevents the ERROR log spam from eframe's `run_native` when we already know wgpu won't work.
+- Prevent recurrence:
+  - Always provide multiple backend options in `WGPU_BACKEND` when possible, or at least GL as fallback.
+  - Use preflight probes for expensive initialization paths that can fail gracefully.
+  - Log preflight failures at WARN level (not ERROR) since fallback is expected behavior.
+- Files/Commands touched: `src/main.rs`, `KNOWN_ISSUES.md`, `cargo test`, `cargo run`
+
+#### Windows wgpu renderer defaults to DX12 and disables debug validation to suppress Vulkan warnings {#windows-wgpu-dx12-default-no-validation}
+- Date: 2026-04-17
+- Context: Windows debug builds with wgpu renderer (cargo run)
+- Error signature: `wgpu_hal::vulkan::instance] InstanceFlags::VALIDATION requested, but unable to find layer: VK_LAYER_KHRONOS_validation` and `Unrecognized present mode SHARED_DEMAND_REFRESH`
+- Symptoms/Impact: Startup console spam with multiple WARN-level messages from wgpu_hal::vulkan module every time the app launched in debug mode.
+- Root cause:
+  1. `wgpu` by default selects Vulkan backend on Windows when available.
+  2. Debug builds enable `InstanceFlags::VALIDATION` by default, but the validation layer is not available on most Windows systems.
+  3. Vulkan backend logs warnings about unrecognized present modes (SHARED_DEMAND_REFRESH, SHARED_CONTINUOUS_REFRESH).
+- Resolution:
+  - Added `setup_windows_wgpu_env_defaults()` that sets `WGPU_BACKEND=dx12` on Windows when not already set by user.
+  - For debug builds, also sets `WGPU_VALIDATION=0` to suppress validation layer warnings.
+  - Added log module filters for `wgpu_hal::vulkan`, `wgpu_hal::vulkan::conv`, `wgpu_hal::vulkan::instance` at Error level as last-resort suppression.
+- Prevent recurrence:
+  - User can still override with explicit `WGPU_BACKEND` or `WGPU_VALIDATION` environment variables.
+  - Log filters only suppress WARN-level noise; actual errors will still be logged.
+- Files/Commands touched: `src/main.rs`, `KNOWN_ISSUES.md`, `cargo test`, `cargo run`
+
 #### Codex CLI integration is now strictly hook-only (notify/visible/title methods removed) {#codex-cli-hook-only-integration}
 - Date: 2026-04-17
 - Context: Windows and cross-platform Codex CLI integration
