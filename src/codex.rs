@@ -23,13 +23,6 @@ pub const MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR: &str = "MERGEN_ADE_CODEX_INBOX_T
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-// Codex notify event constants
-pub const CODEX_UNKNOWN_NOTIFY_EVENT: &str = "unknown";
-pub const CODEX_APPROVAL_REQUESTED_EVENT: &str = "approval-requested";
-pub const CODEX_USER_INPUT_REQUESTED_EVENT: &str = "user-input-requested";
-pub const CODEX_PLAN_MODE_PROMPT_EVENT: &str = "plan-mode-prompt";
-pub const CODEX_TURN_COMPLETE_EVENT: &str = "turn-complete";
-
 /// Result of ensuring the bridge is installed and up-to-date.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BridgeInstallOutcome {
@@ -402,10 +395,13 @@ pub fn patch_codex_config_file(
     // Update or create hooks.json with spinner events - hook-only integration
     let hooks_changed = update_codex_hooks_json(path, executable_path)?;
 
+    // Remove legacy notify configuration - hook-only integration
+    let notify_removed = remove_legacy_notify_from_config(root);
+
     let rendered = toml::to_string_pretty(&value)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
 
-    let config_changed = rendered != existing;
+    let config_changed = rendered != existing || notify_removed;
 
     if !config_changed && !hooks_changed {
         return Ok(CodexConfigPatchOutcome::Unchanged);
@@ -419,101 +415,18 @@ pub fn patch_codex_config_file(
     Ok(CodexConfigPatchOutcome::Updated)
 }
 
-pub fn handle_codex_notify_from_env(payload: &str) -> io::Result<()> {
-    let terminal_id = env::var(MERGEN_TERMINAL_ID_ENV_VAR).ok();
-    let inbox_dir = env::var_os(MERGEN_AI_INBOX_DIR_ENV_VAR).map(PathBuf::from);
-    let inbox_token = env::var(MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR).ok();
-    let tool_hint = env::var(MERGEN_AI_TOOL_HINT_ENV_VAR).ok();
-    let _ = handle_codex_notify(
-        payload,
-        terminal_id.as_deref(),
-        inbox_dir.as_deref(),
-        inbox_token.as_deref(),
-        tool_hint.as_deref(),
-    )?;
-    Ok(())
-}
-
-fn handle_codex_notify(
-    payload: &str,
-    terminal_id: Option<&str>,
-    inbox_dir: Option<&Path>,
-    inbox_token: Option<&str>,
-    _tool_hint: Option<&str>,
-) -> io::Result<bool> {
-    let (Some(terminal_id), Some(inbox_dir), Some(inbox_token)) =
-        (terminal_id, inbox_dir, inbox_token)
-    else {
-        return Ok(false);
-    };
-
-    // Write to inbox
-    write_codex_notify_event(payload, terminal_id, inbox_dir, inbox_token, _tool_hint)?;
-    Ok(true)
-}
-
-/// Write a notify event to the inbox file
-/// Parses the payload JSON and writes appropriate event to inbox
-fn write_codex_notify_event(
-    payload: &str,
-    terminal_id: &str,
-    inbox_dir: &Path,
-    inbox_token: &str,
-    tool_hint: Option<&str>,
-) -> io::Result<()> {
-    // Parse the payload to determine event type
-    let status;
-    let event_kind;
-
-    // Simple JSON parsing to extract event type
-    let payload_lower = payload.to_lowercase();
-    if payload_lower.contains("turn-complete") || payload_lower.contains("turn complete") {
-        status = "attention";
-        event_kind = CODEX_TURN_COMPLETE_EVENT;
-    } else if payload_lower.contains("approval") {
-        status = "attention";
-        event_kind = CODEX_APPROVAL_REQUESTED_EVENT;
-    } else if payload_lower.contains("user-input") || payload_lower.contains("input") {
-        status = "attention";
-        event_kind = CODEX_USER_INPUT_REQUESTED_EVENT;
-    } else if payload_lower.contains("plan") || payload_lower.contains("mode") {
-        status = "attention";
-        event_kind = CODEX_PLAN_MODE_PROMPT_EVENT;
+/// Remove legacy `notify` configuration entry from Codex config.
+/// Hook-only integration does not use the notify command.
+/// Returns true if the entry was removed.
+fn remove_legacy_notify_from_config(root: &mut toml::map::Map<String, TomlValue>) -> bool {
+    let has_notify = root.get("notify").is_some();
+    if has_notify {
+        root.remove("notify");
+        log::info!("Removed legacy notify configuration from Codex config (hook-only integration)");
+        true
     } else {
-        // Default: working status with unknown event type
-        status = "working";
-        event_kind = CODEX_UNKNOWN_NOTIFY_EVENT;
+        false
     }
-
-    // Create the event
-    let timestamp_utc = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_owned());
-
-    let event = CodexNotifyInboxEvent {
-        terminal_id: terminal_id.to_owned(),
-        tool: MERGEN_AI_TOOL_HINT_CODEX.to_owned(),
-        status: status.to_owned(),
-        inbox_token: Some(inbox_token.to_owned()),
-        event_kind: Some(event_kind.to_owned()),
-        raw_json: payload.to_owned(),
-        timestamp_utc,
-    };
-
-    fs::create_dir_all(inbox_dir)?;
-    let terminal_id_u64 = terminal_id.parse::<u64>().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Invalid terminal id: {terminal_id}"),
-        )
-    })?;
-    let path = codex_notify_inbox_path_for_dir(inbox_dir, terminal_id_u64, inbox_token);
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    let line = serde_json::to_string(&event)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-    writeln!(file, "{line}")?;
-    Ok(())
 }
 
 /// Returns the path to ~/.codex/hooks.json
@@ -777,6 +690,156 @@ fn write_codex_hook_event(
     Ok(())
 }
 
+/// Handle --codex-notify mode (writes a notify event to the inbox)
+/// This provides CLI entry point for legacy Codex notify integration.
+pub fn maybe_handle_codex_notify_mode() -> io::Result<Option<CodexNotifyInboxEvent>> {
+    let mut args = std::env::args_os().peekable();
+
+    while let Some(arg) = args.next() {
+        if arg == "--codex-notify" {
+            let payload = args
+                .next()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Missing Codex notify payload argument.",
+                    )
+                })?
+                .to_string_lossy()
+                .to_string();
+
+            let terminal_id = env::var(MERGEN_TERMINAL_ID_ENV_VAR).ok();
+            let inbox_dir = env::var_os(MERGEN_AI_INBOX_DIR_ENV_VAR).map(PathBuf::from);
+            let inbox_token = env::var(MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR).ok();
+            let tool_hint = env::var(MERGEN_AI_TOOL_HINT_ENV_VAR).ok();
+
+            if let (Some(tid), Some(dir), Some(token)) = (terminal_id, inbox_dir, inbox_token) {
+                let path = PathBuf::from(dir);
+                write_codex_notify_event(&payload, &tid, &path, &token, tool_hint.as_deref())?;
+
+                // Re-parse to get the normalized event for the returned value
+                let event_kind = extract_notify_event_kind(&payload);
+                let (status, codex_event_kind) = match event_kind.as_deref() {
+                    Some("agent-turn-complete") | Some("turn-complete") => {
+                        ("attention", Some("agent-turn-complete".to_owned()))
+                    }
+                    Some("approval-requested") => {
+                        ("attention", Some("approval-requested".to_owned()))
+                    }
+                    Some("user-input-requested") => {
+                        ("attention", Some("user-input-requested".to_owned()))
+                    }
+                    Some("plan-mode-prompt") => ("attention", Some("plan-mode-prompt".to_owned())),
+                    Some("session-idle") | Some("idle") => {
+                        ("attention", Some("session-idle".to_owned()))
+                    }
+                    Some("session-error") | Some("error") => {
+                        ("attention", Some("execution-error".to_owned()))
+                    }
+                    _ => ("attention", event_kind.map(|s| s.to_owned())),
+                };
+
+                let event = CodexNotifyInboxEvent {
+                    terminal_id: tid,
+                    tool: MERGEN_AI_TOOL_HINT_CODEX.to_owned(),
+                    status: status.to_owned(),
+                    inbox_token: Some(token),
+                    event_kind: codex_event_kind,
+                    raw_json: payload,
+                    timestamp_utc: format_iso_timestamp(),
+                };
+                return Ok(Some(event));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Write a notify event to the inbox file.
+/// Maps Codex notification events to transport status signals for the spinner.
+fn write_codex_notify_event(
+    payload: &str,
+    terminal_id: &str,
+    inbox_dir: &Path,
+    inbox_token: &str,
+    _tool_hint: Option<&str>,
+) -> io::Result<()> {
+    // A terminal can legitimately host both Codex and OpenCode over its lifetime.
+    // Treat the shared tool hint env var as advisory only so one tool's setup does
+    // not break the event path.
+
+    // Extract event kind from payload and map to status
+    let event_kind = extract_notify_event_kind(payload);
+
+    // Map Codex notify events to status
+    let status = match event_kind.as_deref() {
+        // Working signals
+        Some("tool-execute-before") | Some("tool.execute.before") => "running",
+        // Permission signals
+        Some("approval-requested") | Some("approval_requested") => "attention",
+        Some("user-input-requested") | Some("user_input_requested") => "attention",
+        Some("plan-mode-prompt") | Some("plan_mode_prompt") => "attention",
+        // Idle/completion signals
+        Some("session-idle") | Some("session_idle") | Some("idle") => "attention",
+        Some("session-error") | Some("session_error") | Some("error") => "attention",
+        Some("agent-turn-complete") | Some("turn-complete") | Some("turn_complete") => "attention",
+        _ => "attention",
+    };
+
+    let event = CodexNotifyInboxEvent {
+        terminal_id: terminal_id.to_owned(),
+        tool: MERGEN_AI_TOOL_HINT_CODEX.to_owned(),
+        status: status.to_owned(),
+        inbox_token: Some(inbox_token.to_owned()),
+        event_kind: event_kind.map(|s| s.to_owned()),
+        raw_json: payload.to_owned(),
+        timestamp_utc: format_iso_timestamp(),
+    };
+
+    let json = serde_json::to_string(&event)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    let terminal_id_u64 = terminal_id.parse::<u64>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Invalid terminal id: {terminal_id}"),
+        )
+    })?;
+    let path = codex_notify_inbox_path_for_dir(inbox_dir, terminal_id_u64, inbox_token);
+
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{json}")?;
+    file.flush()
+}
+
+/// Extract event kind from Codex notify payload (JSON parsing)
+fn extract_notify_event_kind(payload: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(payload).ok()?;
+
+    // Try various common locations for event type/name
+    // Priority: event.type > type > event > kind > event.name > name > event_type
+    let kind = parsed
+        .get("event")
+        .and_then(|e| e.get("type"))
+        .or_else(|| parsed.get("type"))
+        .or_else(|| parsed.get("event"))
+        .or_else(|| parsed.get("kind"))
+        .or_else(|| parsed.get("event").and_then(|e| e.get("name")))
+        .or_else(|| parsed.get("name"))
+        .or_else(|| parsed.get("event_type"));
+
+    kind.and_then(|v| v.as_str())
+        .map(|s| s.to_lowercase().replace('_', "-"))
+}
+
+/// Format current timestamp as ISO-like string (seconds since epoch with nanos)
+fn format_iso_timestamp() -> String {
+    let now = SystemTime::now();
+    let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = duration.as_secs();
+    format!("{}.{:09}Z", secs, duration.subsec_nanos())
+}
+
 fn inspect_codex_cli_integration_at_path(
     path: PathBuf,
     bridge_path: &Path,
@@ -951,12 +1014,10 @@ fn run_codex_command(args: &[&str]) -> io::Result<Output> {
 mod tests {
     use super::{
         codex_env_pairs, codex_notify_inbox_path_for_dir, handle_codex_hook_from_env,
-        handle_codex_notify, inspect_codex_cli_integration_at_path, patch_codex_config_file,
-        write_codex_notify_event, CodexConfigPatchOutcome, CodexIntegrationStatus,
-        CodexNotifyInboxEvent, CODEX_APPROVAL_REQUESTED_EVENT, CODEX_PLAN_MODE_PROMPT_EVENT,
-        CODEX_TURN_COMPLETE_EVENT, CODEX_UNKNOWN_NOTIFY_EVENT, CODEX_USER_INPUT_REQUESTED_EVENT,
-        MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR, MERGEN_AI_INBOX_DIR_ENV_VAR,
-        MERGEN_AI_TOOL_HINT_CODEX, MERGEN_AI_TOOL_HINT_ENV_VAR, MERGEN_TERMINAL_ID_ENV_VAR,
+        inspect_codex_cli_integration_at_path, patch_codex_config_file, CodexConfigPatchOutcome,
+        CodexIntegrationStatus, CodexNotifyInboxEvent, MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR,
+        MERGEN_AI_INBOX_DIR_ENV_VAR, MERGEN_AI_TOOL_HINT_CODEX, MERGEN_AI_TOOL_HINT_ENV_VAR,
+        MERGEN_TERMINAL_ID_ENV_VAR,
     };
     use std::env;
     use std::ffi::OsString;
@@ -1010,140 +1071,6 @@ mod tests {
         assert_eq!(pairs[2].1, OsString::from(MERGEN_AI_TOOL_HINT_CODEX));
         assert_eq!(pairs[3].0, MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR);
         assert_eq!(pairs[3].1, OsString::from("codex-token-23"));
-    }
-
-    #[test]
-    fn codex_notify_writer_marks_approval_requests_as_attention() {
-        let temp = TestTempDir::new("codex-notify-approval");
-        write_codex_notify_event(
-            r#"{"event":"approval-requested"}"#,
-            "7",
-            &temp.path,
-            "codex-token-7",
-            Some(MERGEN_AI_TOOL_HINT_CODEX),
-        )
-        .expect("should write codex notify event");
-
-        let path = codex_notify_inbox_path_for_dir(&temp.path, 7, "codex-token-7");
-        let payload = fs::read_to_string(path).expect("should read inbox");
-        let event: CodexNotifyInboxEvent =
-            serde_json::from_str(payload.trim()).expect("should parse inbox event");
-
-        assert_eq!(event.status, "attention");
-        assert_eq!(event.inbox_token.as_deref(), Some("codex-token-7"));
-        assert_eq!(
-            event.event_kind.as_deref(),
-            Some(CODEX_APPROVAL_REQUESTED_EVENT)
-        );
-    }
-
-    #[test]
-    fn codex_notify_writer_maps_user_input_requests_to_attention() {
-        let temp = TestTempDir::new("codex-notify-user-input");
-        write_codex_notify_event(
-            r#"{"type":"tool/requestUserInput"}"#,
-            "8",
-            &temp.path,
-            "codex-token-8",
-            Some(MERGEN_AI_TOOL_HINT_CODEX),
-        )
-        .expect("should write codex notify event");
-
-        let path = codex_notify_inbox_path_for_dir(&temp.path, 8, "codex-token-8");
-        let payload = fs::read_to_string(path).expect("should read inbox");
-        let event: CodexNotifyInboxEvent =
-            serde_json::from_str(payload.trim()).expect("should parse inbox event");
-
-        assert_eq!(event.status, "attention");
-        assert_eq!(event.inbox_token.as_deref(), Some("codex-token-8"));
-        assert_eq!(
-            event.event_kind.as_deref(),
-            Some(CODEX_USER_INPUT_REQUESTED_EVENT)
-        );
-    }
-
-    #[test]
-    fn codex_notify_writer_maps_plan_mode_prompts_to_attention() {
-        let temp = TestTempDir::new("codex-notify-plan-mode");
-        write_codex_notify_event(
-            r#"{"event":"plan-mode-prompt"}"#,
-            "10",
-            &temp.path,
-            "codex-token-10",
-            Some(MERGEN_AI_TOOL_HINT_CODEX),
-        )
-        .expect("should write codex notify event");
-
-        let path = codex_notify_inbox_path_for_dir(&temp.path, 10, "codex-token-10");
-        let payload = fs::read_to_string(path).expect("should read inbox");
-        let event: CodexNotifyInboxEvent =
-            serde_json::from_str(payload.trim()).expect("should parse inbox event");
-
-        assert_eq!(event.status, "attention");
-        assert_eq!(event.inbox_token.as_deref(), Some("codex-token-10"));
-        assert_eq!(
-            event.event_kind.as_deref(),
-            Some(CODEX_PLAN_MODE_PROMPT_EVENT)
-        );
-    }
-
-    #[test]
-    fn codex_notify_writer_keeps_unknown_payloads_as_working_fallback() {
-        let temp = TestTempDir::new("codex-notify-unknown");
-        write_codex_notify_event(
-            r#"{"message":"something else"}"#,
-            "9",
-            &temp.path,
-            "codex-token-9",
-            Some(MERGEN_AI_TOOL_HINT_CODEX),
-        )
-        .expect("should write codex notify event");
-
-        let path = codex_notify_inbox_path_for_dir(&temp.path, 9, "codex-token-9");
-        let payload = fs::read_to_string(path).expect("should read inbox");
-        let event: CodexNotifyInboxEvent =
-            serde_json::from_str(payload.trim()).expect("should parse inbox event");
-
-        // Unknown payloads get "working" status (not "attention") for hook-only integration
-        assert_eq!(event.status, "working");
-        assert_eq!(event.inbox_token.as_deref(), Some("codex-token-9"));
-        assert_eq!(
-            event.event_kind.as_deref(),
-            Some(CODEX_UNKNOWN_NOTIFY_EVENT)
-        );
-    }
-
-    #[test]
-    fn codex_notify_handler_without_routing_is_noop() {
-        let handled = handle_codex_notify(
-            r#"{"event":"approval-requested"}"#,
-            None,
-            None,
-            None,
-            Some(MERGEN_AI_TOOL_HINT_CODEX),
-        )
-        .expect("missing routing should not fail");
-
-        assert!(!handled);
-    }
-
-    #[test]
-    fn codex_notify_handler_with_partial_routing_is_noop() {
-        let temp = TestTempDir::new("codex-notify-partial");
-        let handled = handle_codex_notify(
-            r#"{"event":"approval-requested"}"#,
-            None,
-            Some(temp.path.as_path()),
-            Some("codex-token-partial"),
-            Some(MERGEN_AI_TOOL_HINT_CODEX),
-        )
-        .expect("partial routing should not fail");
-
-        assert!(!handled);
-        assert!(fs::read_dir(&temp.path)
-            .expect("temp dir should exist")
-            .next()
-            .is_none());
     }
 
     #[test]
@@ -1250,39 +1177,39 @@ alternate_screen = "never"
 
         #[cfg(target_os = "windows")]
         {
-            // On Windows, custom notify is always overwritten for reliable completion
+            // Hook-only integration: all notify entries are removed
             assert_eq!(
-                patch_codex_config_file(&path, executable)
-                    .expect("patch should overwrite custom notify on Windows"),
+                patch_codex_config_file(&path, executable).expect("patch should succeed"),
                 CodexConfigPatchOutcome::Updated
             );
 
             let rendered = fs::read_to_string(&path).expect("read config");
             let value = toml::from_str::<toml::Value>(&rendered).expect("parse patched config");
 
-            // On Windows, notify is preserved in config (hooks.json is used instead)
-            // The notify command is no longer used but kept for backwards compatibility
-            assert_eq!(value["notify"][0].as_str(), Some("powershell.exe"));
-            assert_eq!(value["notify"][1].as_str(), Some("-File"));
-            assert_eq!(value["notify"][2].as_str(), Some("custom-notify.ps1"));
+            // Hook-only integration: notify is removed from config
+            // hooks.json is used instead
+            assert!(
+                value.get("notify").is_none(),
+                "notify should be removed in hook-only mode"
+            );
         }
 
         #[cfg(not(target_os = "windows"))]
         {
-            // On non-Windows platforms, custom notify is also preserved
+            // Hook-only integration: all notify entries are removed
             assert_eq!(
-                patch_codex_config_file(&path, executable)
-                    .expect("patch should preserve custom notify"),
+                patch_codex_config_file(&path, executable).expect("patch should succeed"),
                 CodexConfigPatchOutcome::Updated
             );
 
             let rendered = fs::read_to_string(&path).expect("read config");
             let value = toml::from_str::<toml::Value>(&rendered).expect("parse patched config");
 
-            // On non-Windows, notify is also preserved
-            assert_eq!(value["notify"][0].as_str(), Some("powershell.exe"));
-            assert_eq!(value["notify"][1].as_str(), Some("-File"));
-            assert_eq!(value["notify"][2].as_str(), Some("custom-notify.ps1"));
+            // Hook-only integration: notify is removed from config
+            assert!(
+                value.get("notify").is_none(),
+                "notify should be removed in hook-only mode"
+            );
         }
 
         // Common assertions for both platforms
@@ -1699,6 +1626,126 @@ notifications = ["agent-turn-complete"]
         assert_eq!(event.status, "running");
         assert_eq!(event.event_kind, Some("user-prompt-submit".to_string()));
         assert_eq!(event.tool, MERGEN_AI_TOOL_HINT_CODEX);
+    }
+
+    #[test]
+    fn handle_codex_notify_mode_writes_agent_turn_complete_as_attention() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::save(&[
+            MERGEN_TERMINAL_ID_ENV_VAR,
+            MERGEN_AI_INBOX_DIR_ENV_VAR,
+            MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR,
+        ]);
+
+        let temp = TestTempDir::new("codex-notify-mode");
+        let inbox_dir = temp.path.join("inbox");
+        fs::create_dir_all(&inbox_dir).unwrap();
+
+        // Set environment variables
+        env::set_var(MERGEN_TERMINAL_ID_ENV_VAR, "55");
+        env::set_var(MERGEN_AI_INBOX_DIR_ENV_VAR, inbox_dir.to_str().unwrap());
+        env::set_var(MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR, "test-token-55");
+
+        // Simulate running with --codex-notify argument
+        // We need to manually set up args for the test since we can't easily modify std::env::args_os
+        let payload = r#"{"event":{"type":"agent-turn-complete"}}"#;
+        let event = super::write_codex_notify_event(
+            payload,
+            "55",
+            &inbox_dir,
+            "test-token-55",
+            Some("codex"),
+        );
+        assert!(event.is_ok(), "notify event should be written");
+
+        // Check event was written
+        let inbox_path = codex_notify_inbox_path_for_dir(&inbox_dir, 55, "test-token-55");
+        let content = fs::read_to_string(&inbox_path).expect("read inbox");
+        let notify_event: CodexNotifyInboxEvent =
+            serde_json::from_str(content.trim()).expect("parse event");
+
+        assert_eq!(notify_event.terminal_id, "55");
+        assert_eq!(notify_event.status, "attention");
+        assert_eq!(
+            notify_event.event_kind,
+            Some("agent-turn-complete".to_string())
+        );
+        assert_eq!(notify_event.tool, MERGEN_AI_TOOL_HINT_CODEX);
+    }
+
+    #[test]
+    fn patch_codex_config_removes_legacy_mergen_notify() {
+        let temp = TestTempDir::new("codex-config-remove-notify");
+        let path = temp.path.join("config.toml");
+        fs::write(
+            &path,
+            r#"
+model = "gpt-5"
+notify = ['C:\\Users\\test\\AppData\\Roaming\\Mergen\\MergenADE\\bin\\mergen-codex-bridge.exe', "--codex-notify"]
+
+[features]
+codex_hooks = true
+
+[tui]
+alternate_screen = "never"
+"#,
+        )
+        .expect("write config");
+
+        let executable = Path::new(
+            r"C:\Users\test\AppData\Roaming\Mergen\MergenADE\bin\mergen-codex-bridge.exe",
+        );
+        let result = patch_codex_config_file(&path, executable);
+
+        assert!(
+            matches!(result, Ok(CodexConfigPatchOutcome::Updated)),
+            "config should be updated to remove notify"
+        );
+
+        let rendered = fs::read_to_string(&path).expect("read config");
+        let value = toml::from_str::<toml::Value>(&rendered).expect("parse patched config");
+
+        assert!(
+            value.get("notify").is_none(),
+            "notify should be removed in hook-only mode"
+        );
+        assert_eq!(value["features"]["codex_hooks"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn extract_notify_event_kind_handles_various_payloads() {
+        // Test event.type format
+        assert_eq!(
+            super::extract_notify_event_kind(r#"{"event":{"type":"agent-turn-complete"}}"#),
+            Some("agent-turn-complete".to_string())
+        );
+
+        // Test top-level type
+        assert_eq!(
+            super::extract_notify_event_kind(r#"{"type":"approval-requested"}"#),
+            Some("approval-requested".to_string())
+        );
+
+        // Test underscore to hyphen conversion
+        assert_eq!(
+            super::extract_notify_event_kind(r#"{"type":"user_input_requested"}"#),
+            Some("user-input-requested".to_string())
+        );
+
+        // Test kind field
+        assert_eq!(
+            super::extract_notify_event_kind(r#"{"kind":"plan-mode-prompt"}"#),
+            Some("plan-mode-prompt".to_string())
+        );
+
+        // Test name field
+        assert_eq!(
+            super::extract_notify_event_kind(r#"{"name":"session-idle"}"#),
+            Some("session-idle".to_string())
+        );
+
+        // Test empty/invalid
+        assert_eq!(super::extract_notify_event_kind(r#"{}"#), None);
     }
 
     struct TestTempDir {

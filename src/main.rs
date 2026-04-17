@@ -106,8 +106,6 @@ mod platform {
     }
 }
 
-use platform::*;
-
 /// Renderer backend selection modes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RendererMode {
@@ -376,17 +374,6 @@ impl CrashShieldApp {
         }
     }
 
-    fn from_memory_pressure() -> Self {
-        Self {
-            inner: None,
-            startup_error: Some(
-                "System memory is critically low. Please close other applications and try again."
-                    .to_string(),
-            ),
-            crash_error: None,
-        }
-    }
-
     fn note_crash(&mut self, stage: &'static str, payload: Box<dyn Any + Send>) {
         let error = format!("{stage} panicked: {}", panic_payload_to_string(&*payload));
         log::error!("{error}");
@@ -551,6 +538,17 @@ fn main() -> Result<(), eframe::Error> {
                 }
                 Err(err) => {
                     eprintln!("Failed to process OpenCode notify payload: {err}");
+                    std::process::exit(1);
+                }
+            },
+            "--codex-notify" => match codex::maybe_handle_codex_notify_mode() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => {
+                    eprintln!("Codex notify mode did not process any payload");
+                    std::process::exit(1);
+                }
+                Err(err) => {
+                    eprintln!("Failed to process Codex notify payload: {err}");
                     std::process::exit(1);
                 }
             },

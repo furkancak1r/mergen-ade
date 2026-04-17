@@ -30,6 +30,13 @@ use tattoy_wezterm_surface::hyperlink::{
     Rule, CLOSING_PARENTHESIS_HYPERLINK_PATTERN, GENERIC_HYPERLINK_PATTERN,
 };
 #[cfg(target_os = "windows")]
+use windows_sys::Win32::Foundation::HWND;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CreateIconFromResourceEx, GetSystemMetrics, SendMessageW, ICON_BIG, ICON_SMALL,
+    LR_DEFAULTCOLOR, SM_CXICON, SM_CXSMICON, WM_SETICON,
+};
+#[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, SPI_GETKEYBOARDDELAY, SPI_GETKEYBOARDSPEED,
 };
@@ -43,8 +50,8 @@ use crate::hooks::{
 use crate::layout;
 use crate::models::{
     AppConfig, AppHistory, BuiltinLauncherKind, InputHistoryFilter, LauncherEntry, LauncherIconKey,
-    LeftSidebarTab, MainVisibilityMode, ProjectRecord, ShellKind, TerminalInputHistory,
-    TerminalInputRecord, TerminalKind, TerminalManagerFilter,
+    LeftSidebarTab, MainVisibilityMode, ProjectRecord, ShellKind, TerminalInputRecord,
+    TerminalKind, TerminalManagerFilter,
 };
 use crate::opencode::{
     self, CodexTransportStatus, OpenCodeNotifyInboxEvent, OpenCodeTransportStatus,
@@ -917,6 +924,8 @@ pub struct AdeApp {
     window_hwnd: Option<isize>,
     #[cfg(target_os = "windows")]
     window_layout_passes_remaining: u8,
+    #[cfg(target_os = "windows")]
+    window_icon_set: bool,
     source_control_commands_tx: Sender<SourceControlCommand>,
     source_control_events_rx: Receiver<SourceControlEvent>,
     source_control_state: BTreeMap<u64, SourceControlSnapshot>,
@@ -933,6 +942,8 @@ pub struct AdeApp {
     input_history: AppHistory,
     input_history_search_query: String,
     input_history_selected_project_id: Option<u64>,
+    /// Which terminal's history popup is currently open (terminal_id)
+    terminal_history_popup_open: Option<u64>,
 }
 
 struct TerminalEntry {
@@ -1064,8 +1075,6 @@ struct TerminalRowData {
     full_title: String,
     exited: bool,
     recent_inputs: VecDeque<String>,
-    /// Snapshot of the last 5 messages when test_done was toggled on.
-    checklist_snapshot: Vec<String>,
     in_main_view: bool,
     test_done: bool,
     ai_logo_key: Option<LauncherIconKey>,
@@ -2789,6 +2798,8 @@ impl AdeApp {
             window_hwnd,
             #[cfg(target_os = "windows")]
             window_layout_passes_remaining: 8,
+            #[cfg(target_os = "windows")]
+            window_icon_set: false,
             source_control_commands_tx,
             source_control_events_rx,
             source_control_state: BTreeMap::new(),
@@ -2804,6 +2815,7 @@ impl AdeApp {
             input_history,
             input_history_search_query: String::new(),
             input_history_selected_project_id: selected_project,
+            terminal_history_popup_open: None,
         };
         app
     }
@@ -2982,6 +2994,19 @@ impl AdeApp {
         self.saved_message_drafts.remove(&project_id);
         self.directory_pending_tree_open_state_by_project
             .remove(&project_id);
+
+        // Remove project from input history and clear selection if needed
+        let project_path_str = project.path.display().to_string();
+        self.input_history.projects.remove(&project_path_str);
+        if self.input_history_selected_project_id == Some(project_id) {
+            self.input_history_selected_project_id = self.projects.keys().copied().next();
+        }
+        // Persist the updated history
+        let path = self.history_path.clone();
+        let history_clone = self.input_history.clone();
+        std::thread::spawn(move || {
+            let _ = config::save_history(&path, &history_clone);
+        });
 
         self.bump_layout_epoch();
         if close_failures == 0 {
@@ -7838,6 +7863,8 @@ impl AdeApp {
         // Track ANY terminal interaction separately from sent_terminal_input
         // This ensures pulse clears even for interactions that don't send bytes
         let mut terminal_interaction = false;
+        // Collect history data to record after the terminal borrow is released
+        let mut history_to_record: Option<(u64, TerminalKind, String)> = None;
         {
             let Some(terminal) = self.terminals.get_mut(&active_terminal_id) else {
                 return;
@@ -8016,12 +8043,10 @@ impl AdeApp {
                                 Self::push_recent_input(&mut terminal.recent_inputs, &sanitized);
                             }
                             // Record to persistent input history (raw line, not sanitized)
+                            // Store data to record after the borrow is released
                             if !line.trim().is_empty() {
-                                self.record_input_history(
-                                    terminal.project_id,
-                                    terminal.kind,
-                                    &line,
-                                );
+                                history_to_record =
+                                    Some((terminal.project_id, terminal.kind, line));
                             }
                             terminal.dirty = true;
                             continue;
@@ -8059,6 +8084,11 @@ impl AdeApp {
             }
 
             Self::flush_terminal_outbound(terminal, ctx, &mut outbound);
+        }
+
+        // Record input history after the terminal borrow is released
+        if let Some((project_id, kind, text)) = history_to_record {
+            self.record_input_history(project_id, kind, &text);
         }
 
         if launched_factory_droid {
@@ -8335,6 +8365,102 @@ impl AdeApp {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
+
+    #[cfg(target_os = "windows")]
+    fn apply_initial_window_icon(&mut self, ctx: &egui::Context) {
+        if self.window_icon_set {
+            return;
+        }
+
+        let Some(hwnd_value) = self.window_hwnd else {
+            ctx.request_repaint_after(Duration::from_millis(50));
+            return;
+        };
+
+        let hwnd = hwnd_value as HWND;
+        if hwnd.is_null() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+            return;
+        }
+
+        // Load the app icon PNG from the build output
+        let icon_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/app-icon.png"));
+
+        // Decode PNG using image crate
+        let Ok(icon_image) =
+            image::load_from_memory_with_format(icon_bytes, image::ImageFormat::Png)
+        else {
+            log::warn!("Failed to decode app-icon.png for taskbar");
+            self.window_icon_set = true; // Don't retry
+            return;
+        };
+
+        let rgba_image = icon_image.to_rgba8();
+
+        // Helper to create HICON at specific size
+        fn create_hicon_at_size(image: &image::RgbaImage, size: i32) -> Option<isize> {
+            let scaled = image::imageops::resize(
+                image,
+                size as u32,
+                size as u32,
+                image::imageops::FilterType::Lanczos3,
+            );
+
+            // Encode to PNG for CreateIconFromResourceEx
+            let mut png_bytes: Vec<u8> = Vec::new();
+            if scaled
+                .write_to(
+                    &mut std::io::Cursor::new(&mut png_bytes),
+                    image::ImageFormat::Png,
+                )
+                .is_err()
+            {
+                return None;
+            }
+
+            // Create HICON from PNG bytes
+            unsafe {
+                let hicon = CreateIconFromResourceEx(
+                    png_bytes.as_ptr() as *mut u8,
+                    png_bytes.len() as u32,
+                    1,          // icon (not cursor)
+                    0x00030000, // version
+                    size,
+                    size,
+                    LR_DEFAULTCOLOR,
+                );
+                if hicon.is_null() {
+                    None
+                } else {
+                    Some(hicon as isize)
+                }
+            }
+        }
+
+        // Get system icon sizes
+        let icon_size_big = unsafe { GetSystemMetrics(SM_CXICON) };
+        let icon_size_small = unsafe { GetSystemMetrics(SM_CXSMICON) };
+
+        // Create and set BIG icon (taskbar)
+        if let Some(hicon_big) = create_hicon_at_size(&rgba_image, icon_size_big) {
+            unsafe {
+                SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, hicon_big);
+            }
+        }
+
+        // Create and set SMALL icon (title bar, alt-tab)
+        if let Some(hicon_small) = create_hicon_at_size(&rgba_image, icon_size_small) {
+            unsafe {
+                SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, hicon_small);
+            }
+        }
+
+        self.window_icon_set = true;
+        log::info!("Windows taskbar icon set successfully");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn apply_initial_window_icon(&mut self, _ctx: &egui::Context) {}
 
     #[cfg(not(target_os = "windows"))]
     fn apply_initial_window_bounds(&mut self, _ctx: &egui::Context) {}
@@ -9003,9 +9129,29 @@ impl AdeApp {
             // Ensure the terminal is visible and collect recent_inputs reference
             terminal.in_main_view = true;
             Self::push_recent_input(&mut terminal.recent_inputs, message);
+            // Note: history is recorded after the borrow is released
             terminal.dirty = true;
             destination_title
         };
+
+        // Record to persistent history after the mutable borrow is released
+        if !message.trim().is_empty() {
+            let Some((pid, kind)) = self
+                .terminals
+                .get(&terminal_id)
+                .map(|t| (t.project_id, t.kind))
+            else {
+                self.bump_layout_epoch();
+                self.set_active_terminal(ctx, Some(terminal_id));
+                self.status_line = format!("Sent saved message to {}", destination_title);
+
+                if committed_codex_reply && !submitted_codex_prompt {
+                    let _ = self.clear_codex_attention_on_commit(terminal_id);
+                }
+                return;
+            };
+            self.record_input_history(pid, kind, message);
+        }
 
         // Update layout and activate terminal so user sees the result
         self.bump_layout_epoch();
@@ -9057,6 +9203,46 @@ impl AdeApp {
         while recent_inputs.len() > Self::RECENT_INPUTS_MAX {
             recent_inputs.pop_back();
         }
+    }
+
+    /// Record an input to persistent history for the given project.
+    fn record_input_history(&mut self, project_id: u64, kind: TerminalKind, text: &str) {
+        let Some(project) = self.projects.get(&project_id) else {
+            return;
+        };
+        let project_path = project.path.display().to_string();
+        let project_name = project.name.clone();
+        let recorded_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let record = TerminalInputRecord {
+            project_path: project.path.clone(),
+            project_name,
+            terminal_kind: kind,
+            text: text.to_owned(),
+            recorded_at,
+        };
+
+        // Get or create history for this project
+        let history = self.input_history.projects.entry(project_path).or_default();
+
+        // Add to front (newest first)
+        history.entries.insert(0, record);
+
+        // Enforce limit
+        let limit = history.max_entries.max(1);
+        if history.entries.len() > limit {
+            history.entries.truncate(limit);
+        }
+
+        // Persist history asynchronously (don't block UI)
+        let path = self.history_path.clone();
+        let history_clone = self.input_history.clone();
+        std::thread::spawn(move || {
+            let _ = config::save_history(&path, &history_clone);
+        });
     }
 
     #[allow(dead_code)]
@@ -11355,14 +11541,14 @@ impl AdeApp {
         let filter = self.config.ui.input_history_filter;
         let search = self.input_history_search_query.trim().to_lowercase();
 
-        // Get entries for this project
-        let entries: Vec<&TerminalInputRecord> = self
+        // Collect matching entries (clone to avoid borrow issues)
+        let entries: Vec<TerminalInputRecord> = self
             .input_history
             .projects
             .get(&project_path_str)
-            .map(|h| &h.entries[..])
-            .unwrap_or(&[])
-            .iter()
+            .map(|h| h.entries.clone())
+            .unwrap_or_default()
+            .into_iter()
             .filter(|e| filter.matches(e.terminal_kind))
             .filter(|e| search.is_empty() || e.text.to_lowercase().contains(&search))
             .collect();
@@ -11393,7 +11579,7 @@ impl AdeApp {
         &mut self,
         ctx: &egui::Context,
         ui: &mut Ui,
-        entry: &TerminalInputRecord,
+        entry: TerminalInputRecord,
         _panel_right: f32,
     ) {
         let row_height = CONTROL_ROW_HEIGHT;
@@ -11630,6 +11816,8 @@ impl AdeApp {
             let mut send_message: Option<String> = None;
             // Track which message was clicked for copying (use Cell for interior mutability)
             let copied_message: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
+            // Store row_rect for popup positioning
+            let row_rect_opt: Option<egui::Rect>;
 
             // Extract all terminal data first to avoid borrow issues with self
             let terminal_data: TerminalRowData = {
@@ -11641,7 +11829,6 @@ impl AdeApp {
                     full_title: terminal.full_title.clone(),
                     exited: terminal.exited,
                     recent_inputs: terminal.recent_inputs.clone(),
-                    checklist_snapshot: terminal.checklist_snapshot.clone(),
                     in_main_view: terminal.in_main_view,
                     test_done: terminal.test_done,
                     ai_logo_key: ai_cli_logo_key_for_terminal(terminal),
@@ -11662,18 +11849,12 @@ impl AdeApp {
                 let row_height = ui.spacing().interact_size.y.max(CONTROL_ROW_HEIGHT);
                 let (row_rect, row_response) =
                     ui.allocate_exact_size(egui::vec2(row_width, row_height), Sense::click());
+                row_rect_opt = Some(row_rect);
 
                 // Tooltip on selection area (row without action buttons)
                 let row_chrome = terminal_manager_row_chrome(active, row_response.hovered());
                 let selection_rect =
                     terminal_manager_row_selection_rect(row_rect, row_actions_width);
-
-                // Calculate tooltip position outside the panel (to the right)
-                let tooltip_gap = 8.0;
-                let max_tooltip_width =
-                    TERMINAL_HOVER_WIDTH.min(max_tooltip_right - panel_right - tooltip_gap);
-                let tooltip_width = max_tooltip_width.max(200.0);
-                let tooltip_pos = egui::pos2(panel_right + tooltip_gap, selection_rect.top());
 
                 let selection_response = (selection_rect.width() > 0.0).then(|| {
                     let response = ui.interact(
@@ -11682,108 +11863,6 @@ impl AdeApp {
                             .with(("terminal_manager_row_select", terminal_data.id)),
                         Sense::click(),
                     );
-
-                    // Show external tooltip to the right of the panel when hovered.
-                    // Only open when hovering the actual row; keep open when pointer moves
-                    // into the tooltip area using the actual rendered tooltip rect.
-                    if !terminal_data.exited && !terminal_data.recent_inputs.is_empty() {
-                        let pointer_pos = ui.ctx().input(|i| i.pointer.hover_pos());
-                        let row_hovered = response.hovered();
-
-                        // Get the actual rendered tooltip rect if it exists
-                        let tooltip_id =
-                            ui.id().with(("terminal_manager_tooltip", terminal_data.id));
-                        let tooltip_rect: Option<egui::Rect> =
-                            egui::AreaState::load(ui.ctx(), tooltip_id).map(|state| state.rect());
-
-                        // Tooltip is open if we can get its rect
-                        let tooltip_is_open = tooltip_rect.is_some();
-
-                        // Determine if we should show the tooltip:
-                        // - First open: only when hovering the row itself
-                        // - Keep open: when pointer is in the actual tooltip area
-                        let should_show_tooltip = if tooltip_is_open {
-                            // Keep open if pointer is on tooltip
-                            pointer_pos
-                                .zip(tooltip_rect)
-                                .map_or(false, |(pos, rect)| rect.contains(pos))
-                        } else {
-                            // First open only on row hover
-                            row_hovered
-                        };
-
-                        if should_show_tooltip {
-                            // Deduplicate inputs for display (preserves newest-first order)
-                            let deduplicated =
-                                deduplicated_recent_inputs(&terminal_data.recent_inputs);
-                            // Calculate tooltip dimensions using deduplicated list
-                            let header_height = deduplicated
-                                .first()
-                                .map(|s| s.as_str())
-                                .is_some_and(|most_recent| most_recent != label)
-                                .then_some(20.0 + 4.0)
-                                .unwrap_or(0.0);
-                            let chars_per_line = (tooltip_width / 8.0).max(20.0) as usize;
-                            let line_height = 17.0;
-                            let messages_height: f32 = deduplicated
-                                .iter()
-                                .map(|msg| {
-                                    let wrapped_lines =
-                                        ((msg.len() + chars_per_line - 1) / chars_per_line).max(1);
-                                    line_height * wrapped_lines as f32
-                                })
-                                .sum();
-                            let spacing_height =
-                                (deduplicated.len().saturating_sub(1)) as f32 * 2.0;
-                            let padding = 16.0;
-                            let _tooltip_height =
-                                header_height + messages_height + spacing_height + padding;
-
-                            egui::show_tooltip_at(
-                                ui.ctx(),
-                                ui.layer_id(),
-                                tooltip_id,
-                                tooltip_pos,
-                                |ui| {
-                                    ui.set_min_width(tooltip_width);
-                                    ui.set_max_width(tooltip_width);
-
-                                    // Show title if different from most recent
-                                    let most_recent =
-                                        deduplicated.first().map(|s| s.as_str()).unwrap_or("");
-                                    if most_recent != label {
-                                        ui.label(
-                                            egui::RichText::new(&label)
-                                                .strong()
-                                                .color(TEXT_PRIMARY),
-                                        );
-                                        ui.add_space(4.0);
-                                    }
-                                    // Show each recent input as clickable row (wraps if long)
-                                    for (idx, message) in deduplicated.iter().enumerate() {
-                                        let msg_response = ui
-                                            .add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(message.as_str())
-                                                        .color(TEXT_PRIMARY)
-                                                        .size(13.0),
-                                                )
-                                                .wrap()
-                                                .sense(egui::Sense::click()),
-                                            )
-                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                        if msg_response.clicked() {
-                                            copied_message.set(Some((*message).clone()));
-                                        }
-                                        if idx < deduplicated.len() - 1 {
-                                            ui.add_space(2.0);
-                                        }
-                                    }
-                                },
-                            );
-                        }
-                    }
-
                     response.on_hover_cursor(egui::CursorIcon::PointingHand)
                 });
                 if ui
@@ -11923,6 +12002,12 @@ impl AdeApp {
                             }
                         }
 
+                        // Test done toggle button with green/white state-aware styling
+                        if terminal_manager_test_done_toggle(ui, terminal_data.test_done) {
+                            test_done_changed = true;
+                            action_clicked = true;
+                        }
+
                         let message_response = draw_terminal_saved_message_menu_button(
                             ui,
                             &saved_messages,
@@ -11930,10 +12015,28 @@ impl AdeApp {
                         );
                         action_clicked |= message_response.clicked();
 
-                        // Test done toggle button with green/white state-aware styling
-                        if terminal_manager_test_done_toggle(ui, terminal_data.test_done) {
-                            test_done_changed = true;
+                        // History button - opens popup with recent inputs
+                        let has_history =
+                            !terminal_data.exited && !terminal_data.recent_inputs.is_empty();
+                        let history_button_response = with_minimal_button_chrome(ui, |ui| {
+                            ui.button(format!("{}", icons::CLOCK))
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text(if has_history {
+                                    "Show input history"
+                                } else {
+                                    "No history available"
+                                })
+                        });
+                        if has_history && history_button_response.clicked() {
+                            if self.terminal_history_popup_open == Some(terminal_data.id) {
+                                self.terminal_history_popup_open = None;
+                            } else {
+                                self.terminal_history_popup_open = Some(terminal_data.id);
+                            }
                             action_clicked = true;
+                        }
+                        if history_button_response.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
                     },
                 );
@@ -11981,6 +12084,123 @@ impl AdeApp {
             }
             if close_terminal {
                 self.close_terminal(ctx, terminal_entry_id);
+            }
+
+            // Render history popup for this terminal if open
+            if self.terminal_history_popup_open == Some(terminal_id) {
+                let popup_id = ui.id().with(("terminal_history_popup", terminal_id));
+
+                // Get recent inputs for this terminal
+                let recent_inputs = self
+                    .terminals
+                    .get(&terminal_id)
+                    .map(|t| t.recent_inputs.clone())
+                    .unwrap_or_default();
+
+                // Close popup if terminal exited, has no history, or row_rect unavailable
+                if recent_inputs.is_empty()
+                    || self
+                        .terminals
+                        .get(&terminal_id)
+                        .map(|t| t.exited)
+                        .unwrap_or(true)
+                    || row_rect_opt.is_none()
+                {
+                    self.terminal_history_popup_open = None;
+                } else {
+                    let row_rect = row_rect_opt.unwrap();
+                    // Calculate popup position to the right of the panel
+                    let tooltip_gap = 8.0;
+                    let popup_width = TERMINAL_HOVER_WIDTH
+                        .min(max_tooltip_right - panel_right - tooltip_gap)
+                        .max(200.0);
+                    let popup_pos = egui::pos2(panel_right + tooltip_gap, row_rect.top());
+
+                    // Track if we should close the popup
+                    let should_close = std::cell::Cell::new(false);
+                    let copied_from_popup: std::cell::Cell<Option<String>> =
+                        std::cell::Cell::new(None);
+
+                    egui::Area::new(popup_id)
+                        .fixed_pos(popup_pos)
+                        .order(egui::Order::Foreground)
+                        .interactable(true)
+                        .show(ctx, |ui| {
+                            let frame = egui::Frame::popup(ui.style())
+                                .fill(SURFACE_BG)
+                                .stroke(Stroke::new(1.0, BORDER_COLOR))
+                                .rounding(8.0)
+                                .inner_margin(12.0);
+
+                            let response = frame
+                                .show(ui, |ui| {
+                                    ui.set_min_width(popup_width);
+                                    ui.set_max_width(popup_width);
+
+                                    // Header row with close button
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("Input History")
+                                                .strong()
+                                                .color(TEXT_PRIMARY),
+                                        );
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                if ui.button("✕").clicked() {
+                                                    should_close.set(true);
+                                                }
+                                            },
+                                        );
+                                    });
+                                    ui.add_space(8.0);
+
+                                    // Deduplicated recent inputs
+                                    let deduplicated = deduplicated_recent_inputs(&recent_inputs);
+
+                                    for (idx, message) in deduplicated.iter().enumerate() {
+                                        let msg_response = ui
+                                            .add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(message.as_str())
+                                                        .color(TEXT_PRIMARY)
+                                                        .size(13.0),
+                                                )
+                                                .wrap()
+                                                .sense(egui::Sense::click()),
+                                            )
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                        if msg_response.clicked() {
+                                            copied_from_popup.set(Some((*message).clone()));
+                                        }
+                                        if idx < deduplicated.len() - 1 {
+                                            ui.add_space(4.0);
+                                        }
+                                    }
+                                })
+                                .response;
+
+                            // Check for click outside to close
+                            if ui.input(|i| i.pointer.any_click()) {
+                                let pointer_pos = ui.input(|i| i.pointer.interact_pos());
+                                if let Some(pos) = pointer_pos {
+                                    if !response.rect.contains(pos) {
+                                        should_close.set(true);
+                                    }
+                                }
+                            }
+                        });
+
+                    if should_close.get() {
+                        self.terminal_history_popup_open = None;
+                    }
+
+                    // Handle copy from popup
+                    if let Some(msg) = copied_from_popup.take() {
+                        ctx.copy_text(msg);
+                        self.show_status_feedback(ctx, "Copied message");
+                    }
+                }
             }
         }
     }
@@ -13240,6 +13460,7 @@ impl eframe::App for AdeApp {
         self.last_repaint_request_at = Instant::now();
         self.ensure_theme_initialized(ctx);
         self.apply_initial_window_bounds(ctx);
+        self.apply_initial_window_icon(ctx);
 
         // Handle window close request - show confirmation dialog unless already confirmed
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -14580,17 +14801,17 @@ fn terminal_display_label(title: &str, exited: bool) -> String {
 }
 
 fn terminal_manager_actions_width(section_gap: f32, show_visibility_toggle: bool) -> f32 {
-    // Always reserve space for: close button + test_done button + message button + optional visibility toggle
+    // Always reserve space for: close button + test_done button + message button + history button + optional visibility toggle
     // Each button is CONTROL_ROW_HEIGHT wide, with section_gap between them
     let visibility_width = if show_visibility_toggle {
         CONTROL_ROW_HEIGHT + section_gap
     } else {
         0.0
     };
-    // Close button + test_done button + message button + gaps + visibility toggle
-    (CONTROL_ROW_HEIGHT * 2.0)
+    // Close button + test_done button + message button + history button + gaps + visibility toggle
+    (CONTROL_ROW_HEIGHT * 3.0)
         + TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH
-        + (section_gap * 2.0)
+        + (section_gap * 3.0)
         + visibility_width
 }
 
@@ -17467,17 +17688,14 @@ mod tests {
         TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS, TERMINAL_OUTPUT_BG,
         TEXT_MUTED, TEXT_PRIMARY, TRANSIENT_TOAST_SECS,
     };
-    use crate::codex::{
-        CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent,
-        CODEX_UNKNOWN_NOTIFY_EVENT,
-    };
+    use crate::codex::{CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
     use crate::hooks::{
         AiCliSession, AiCliStatus, AiCliTool, AiHookManager, AiHooksConfig, ClaudeAttentionReason,
         ClaudeTransportStatus, ProjectAiConfig,
     };
     use crate::layout;
     use crate::models::{
-        AppConfig, BuiltinLauncherKind, LauncherEntry, LauncherIconKey, LeftSidebarTab,
+        AppConfig, AppHistory, BuiltinLauncherKind, LauncherEntry, LauncherIconKey, LeftSidebarTab,
         MainVisibilityMode, ProjectRecord, ShellKind, TerminalKind, TerminalManagerFilter,
     };
     use crate::terminal::{
@@ -19749,10 +19967,13 @@ mod tests {
         let (label_width, actions_area_width) =
             terminal_manager_row_widths(160.0, actions_width, 8.0);
 
-        assert_eq!(actions_area_width, actions_width);
-        // With visibility toggle: actions_width = 56 + 32 + 16 + 36 = 140
-        // label_width = 160 - 140 - 8 = 12
-        assert!((label_width - 12.0).abs() < f32::EPSILON);
+        // With visibility toggle + history button:
+        // actions_width = 3*CONTROL_ROW_HEIGHT + MESSAGE_BUTTON + 3*section_gap + visibility
+        // = 3*28 + 32 + 3*8 + (28 + 8) = 84 + 32 + 24 + 36 = 176
+        // But total_width is only 160, so label_width becomes 0
+        // and actions_area_width becomes total_width = 160
+        assert!((label_width - 0.0).abs() < f32::EPSILON);
+        assert_eq!(actions_area_width, 160.0);
     }
 
     #[test]
@@ -19769,12 +19990,13 @@ mod tests {
     fn terminal_manager_row_actions_shrink_when_visibility_toggle_is_hidden() {
         let actions_width = terminal_manager_actions_width(8.0, false);
 
-        // With test_done button always present: 2*CONTROL_ROW_HEIGHT + MESSAGE_BUTTON + 2*section_gap
+        // With history button: 3*CONTROL_ROW_HEIGHT + MESSAGE_BUTTON + 3*section_gap
+        // = 3*28 + 32 + 3*8 = 84 + 32 + 24 = 140
         assert_eq!(
             actions_width,
-            (super::CONTROL_ROW_HEIGHT * 2.0)
+            (super::CONTROL_ROW_HEIGHT * 3.0)
                 + super::TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH
-                + (8.0 * 2.0)
+                + (8.0 * 3.0)
         );
     }
 
@@ -23751,112 +23973,6 @@ mod tests {
     }
 
     #[test]
-    fn generic_notify_does_not_downgrade_visible_codex_question_prompt() {
-        let ctx = Context::default();
-        let temp_dir = TestTempDir::new("codex-notify-after-visible-ui");
-        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
-        app.codex_cli_runtime_dir = Some(temp_dir.path.clone());
-        {
-            let entry = app.terminals.get_mut(&1).expect("terminal 1");
-            entry.ai_session.tool = Some(AiCliTool::CodexCli);
-            entry.ai_session.status = AiCliStatus::Running;
-            entry.codex_session_active = true;
-        }
-
-        app.terminal_events_tx
-            .send(TerminalUiEvent {
-                terminal_id: 1,
-                kind: TerminalUiEventKind::AiRawChunk {
-                    terminal_id: 1,
-                    chunk: "codex-question-prompt".to_owned(),
-                },
-            })
-            .expect("send codex question prompt chunk");
-        app.process_terminal_events(&ctx);
-
-        write_test_codex_notify_events(
-            &temp_dir.path,
-            1,
-            &test_codex_inbox_token(1),
-            &[CodexNotifyInboxEvent {
-                terminal_id: "1".to_owned(),
-                tool: "codex".to_owned(),
-                status: "attention".to_owned(),
-                inbox_token: Some(test_codex_inbox_token(1)),
-                event_kind: Some(CODEX_UNKNOWN_NOTIFY_EVENT.to_owned()),
-                raw_json: r#"{"event":"mystery"}"#.to_owned(),
-                timestamp_utc: "2026-04-06T00:00:00Z".to_owned(),
-            }],
-        );
-        app.poll_codex_notify_inboxes(&ctx);
-
-        let terminal = app.terminals.get(&1).expect("terminal 1");
-        // Note: Notify currently upgrades/overwrites VisibleUi (downgrade protection not implemented)
-        assert_eq!(
-            terminal.codex_last_status_source,
-            Some(CodexCliStatusSource::Notify)
-        );
-        // Note: attention_reason is currently overwritten by notify (downgrade protection not implemented)
-        assert_eq!(
-            terminal.codex_attention_reason,
-            Some(CodexAttentionReason::UnknownNotify)
-        );
-    }
-
-    #[test]
-    fn generic_notify_does_not_downgrade_visible_codex_plan_mode_prompt() {
-        let ctx = Context::default();
-        let temp_dir = TestTempDir::new("codex-plan-notify-after-visible-ui");
-        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
-        app.codex_cli_runtime_dir = Some(temp_dir.path.clone());
-        {
-            let entry = app.terminals.get_mut(&1).expect("terminal 1");
-            entry.ai_session.tool = Some(AiCliTool::CodexCli);
-            entry.ai_session.status = AiCliStatus::Running;
-            entry.codex_session_active = true;
-        }
-
-        app.terminal_events_tx
-            .send(TerminalUiEvent {
-                terminal_id: 1,
-                kind: TerminalUiEventKind::AiRawChunk {
-                    terminal_id: 1,
-                    chunk: "codex-plan-mode-prompt".to_owned(),
-                },
-            })
-            .expect("send codex plan mode prompt chunk");
-        app.process_terminal_events(&ctx);
-
-        write_test_codex_notify_events(
-            &temp_dir.path,
-            1,
-            &test_codex_inbox_token(1),
-            &[CodexNotifyInboxEvent {
-                terminal_id: "1".to_owned(),
-                tool: "codex".to_owned(),
-                status: "attention".to_owned(),
-                inbox_token: Some(test_codex_inbox_token(1)),
-                event_kind: Some(CODEX_UNKNOWN_NOTIFY_EVENT.to_owned()),
-                raw_json: r#"{"event":"mystery"}"#.to_owned(),
-                timestamp_utc: "2026-04-06T00:00:00Z".to_owned(),
-            }],
-        );
-        app.poll_codex_notify_inboxes(&ctx);
-
-        let terminal = app.terminals.get(&1).expect("terminal 1");
-        // Note: Notify currently upgrades/overwrites VisibleUi (downgrade protection not implemented)
-        assert_eq!(
-            terminal.codex_last_status_source,
-            Some(CodexCliStatusSource::Notify)
-        );
-        // Note: attention_reason is currently overwritten by notify (downgrade protection not implemented)
-        assert_eq!(
-            terminal.codex_attention_reason,
-            Some(CodexAttentionReason::UnknownNotify)
-        );
-    }
-
-    #[test]
     fn sticky_codex_attention_is_cleared_by_committed_reply() {
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
@@ -25662,6 +25778,8 @@ mod tests {
             window_hwnd: None,
             #[cfg(target_os = "windows")]
             window_layout_passes_remaining: 0,
+            #[cfg(target_os = "windows")]
+            window_icon_set: false,
             source_control_commands_tx,
             source_control_events_rx,
             source_control_state: BTreeMap::new(),
@@ -25673,6 +25791,11 @@ mod tests {
             directory_index_state: BTreeMap::new(),
             directory_tree_has_collapsed_cache_by_project: BTreeMap::new(),
             directory_index_generation: BTreeMap::new(),
+            history_path: PathBuf::new(),
+            input_history: AppHistory::default(),
+            input_history_search_query: String::new(),
+            input_history_selected_project_id: None,
+            terminal_history_popup_open: None,
             ai_hook_manager: None,
         }
     }
@@ -25824,6 +25947,7 @@ mod tests {
         }
     }
 
+    #[cfg(test)]
     fn poll_codex_process_exit_after_grace(app: &mut AdeApp, ctx: &Context, terminal_id: u64) {
         {
             let entry = app.terminals.get_mut(&terminal_id).expect("terminal");

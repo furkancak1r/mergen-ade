@@ -302,15 +302,6 @@ impl ClaudeAttentionReason {
 // disabled for Codex to ensure strict hook-authoritative behavior.
 // Only Claude Code uses title-based detection as a fallback.
 
-/// Normalized Codex CLI status values (kept for compatibility with existing code)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CodexTransportStatus {
-    Working,
-    Idle,
-    Permission,
-}
-
 const CLAUDE_IDLE_PREFIX: char = '\u{2733}'; // ✳ eight-spoked asterisk
 
 /// Returns true if the character is a Braille pattern (U+2800–U+28FF)

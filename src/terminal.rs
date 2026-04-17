@@ -2841,12 +2841,6 @@ pub fn try_terminal_snapshots(
     Some((render, selection))
 }
 
-/// Single snapshot without selection - cheaper for normal rendering
-pub fn try_terminal_snapshot(runtime: &TerminalRuntime) -> Option<TerminalSnapshot> {
-    let terminal = runtime.term.lock().ok()?;
-    Some(snapshot_from_terminal(&terminal))
-}
-
 pub fn try_terminal_selection_snapshot(
     runtime: &TerminalRuntime,
 ) -> Option<TerminalSelectionSnapshot> {
@@ -3182,6 +3176,7 @@ fn selection_snapshot_from_terminal(terminal: &Terminal) -> TerminalSelectionSna
     TerminalSelectionSnapshot { lines }
 }
 
+#[cfg(test)]
 fn snapshots_from_terminal(terminal: &Terminal) -> (TerminalSnapshot, TerminalSelectionSnapshot) {
     (
         snapshot_from_terminal(terminal),
