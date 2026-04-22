@@ -63,8 +63,14 @@ pub fn load_history(path: &Path) -> io::Result<AppHistory> {
         return Ok(AppHistory::default());
     }
     let text = fs::read_to_string(path)?;
-    let history: AppHistory = serde_json::from_str(&text)
+    let mut history: AppHistory = serde_json::from_str(&text)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    // Migrate legacy data: normalize max_entries == 0 to default (500)
+    for project_history in history.projects.values_mut() {
+        if project_history.max_entries == 0 {
+            project_history.max_entries = 500;
+        }
+    }
     Ok(history)
 }
 
@@ -551,5 +557,71 @@ default_shell = "powershell"
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_history_migrates_zero_max_entries_to_default() {
+        use crate::models::{AppHistory, TerminalInputHistory, TerminalInputRecord, TerminalKind};
+        use std::path::PathBuf;
+
+        let path = unique_temp_path("history-migration").with_extension("json");
+
+        // Create history with max_entries = 0 (legacy bug state)
+        let mut history = AppHistory::default();
+        let project_history = TerminalInputHistory {
+            max_entries: 0,
+            entries: vec![
+                TerminalInputRecord {
+                    project_path: PathBuf::from("C:/test"),
+                    project_name: "Test".to_owned(),
+                    terminal_kind: TerminalKind::Foreground,
+                    text: "cmd1".to_owned(),
+                    recorded_at: 1000,
+                },
+                TerminalInputRecord {
+                    project_path: PathBuf::from("C:/test"),
+                    project_name: "Test".to_owned(),
+                    terminal_kind: TerminalKind::Foreground,
+                    text: "cmd2".to_owned(),
+                    recorded_at: 1001,
+                },
+            ],
+        };
+        history
+            .projects
+            .insert("C:/test".to_owned(), project_history);
+
+        // Save legacy state
+        save_history(&path, &history).expect("should save history");
+
+        // Load should migrate max_entries to 500
+        let loaded = load_history(&path).expect("should load history");
+        let loaded_project = loaded
+            .projects
+            .get("C:/test")
+            .expect("project should exist");
+        assert_eq!(
+            loaded_project.max_entries, 500,
+            "max_entries should be migrated from 0 to 500"
+        );
+        assert_eq!(
+            loaded_project.entries.len(),
+            2,
+            "both entries should be preserved after migration"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn terminal_input_history_default_has_500_limit() {
+        use crate::models::TerminalInputHistory;
+
+        let history = TerminalInputHistory::default();
+        assert_eq!(
+            history.max_entries, 500,
+            "default max_entries should be 500"
+        );
+        assert!(history.entries.is_empty());
     }
 }

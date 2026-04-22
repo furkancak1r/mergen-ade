@@ -9419,13 +9419,17 @@ impl AdeApp {
         // Get or create history for this project
         let history = self.input_history.projects.entry(project_path).or_default();
 
+        // Migrate legacy data: if max_entries is 0, set it to default (500)
+        if history.max_entries == 0 {
+            history.max_entries = 500;
+        }
+
         // Add to front (newest first)
         history.entries.insert(0, record);
 
         // Enforce limit
-        let limit = history.max_entries.max(1);
-        if history.entries.len() > limit {
-            history.entries.truncate(limit);
+        if history.entries.len() > history.max_entries {
+            history.entries.truncate(history.max_entries);
         }
 
         // Persist history asynchronously (don't block UI)
@@ -29110,5 +29114,98 @@ mod tests {
 
         // Cleanup
         let _ = fs::remove_file(&temp_path);
+    }
+
+    #[test]
+    fn record_input_history_migrates_zero_max_entries() {
+        use crate::models::{TerminalInputHistory, TerminalInputRecord, TerminalKind};
+        use std::path::PathBuf;
+
+        let mut app = test_app([(1, test_terminal_entry(1, 1))], Some(1));
+
+        // Add a project
+        app.projects.insert(
+            1,
+            test_project(1, "Test", "C:/test", &["msg1"], &["check1"]),
+        );
+
+        // Pre-populate with legacy state: max_entries = 0
+        let legacy_history = TerminalInputHistory {
+            max_entries: 0,
+            entries: vec![TerminalInputRecord {
+                project_path: PathBuf::from("C:/test"),
+                project_name: "Test".to_owned(),
+                terminal_kind: TerminalKind::Foreground,
+                text: "existing".to_owned(),
+                recorded_at: 1000,
+            }],
+        };
+        app.input_history
+            .projects
+            .insert("C:/test".to_owned(), legacy_history);
+
+        // Record a new input - this should migrate max_entries
+        app.record_input_history(1, TerminalKind::Foreground, "new command");
+
+        // Verify migration happened
+        let history = app
+            .input_history
+            .projects
+            .get("C:/test")
+            .expect("history should exist");
+        assert_eq!(
+            history.max_entries, 500,
+            "max_entries should be migrated to 500"
+        );
+        assert_eq!(
+            history.entries.len(),
+            2,
+            "both entries should be preserved (existing + new)"
+        );
+        assert_eq!(history.entries[0].text, "new command");
+        assert_eq!(history.entries[1].text, "existing");
+    }
+
+    #[test]
+    fn record_input_history_keeps_multiple_entries_with_proper_limit() {
+        use crate::models::{TerminalInputHistory, TerminalInputRecord, TerminalKind};
+        use std::path::PathBuf;
+
+        let mut app = test_app([(1, test_terminal_entry(1, 1))], Some(1));
+
+        // Add a project
+        app.projects.insert(
+            1,
+            test_project(1, "Test", "C:/test", &["msg1"], &["check1"]),
+        );
+
+        // Pre-populate with proper max_entries
+        let proper_history = TerminalInputHistory {
+            max_entries: 500,
+            entries: vec![],
+        };
+        app.input_history
+            .projects
+            .insert("C:/test".to_owned(), proper_history);
+
+        // Record multiple inputs
+        for i in 0..10 {
+            app.record_input_history(1, TerminalKind::Foreground, &format!("cmd{}", i));
+        }
+
+        // Verify all entries preserved (under limit)
+        let history = app
+            .input_history
+            .projects
+            .get("C:/test")
+            .expect("history should exist");
+        assert_eq!(
+            history.entries.len(),
+            10,
+            "should keep all 10 entries (under 500 limit)"
+        );
+        // Newest first
+        assert_eq!(history.entries[0].text, "cmd9");
+        assert_eq!(history.entries[9].text, "cmd0");
     }
 }

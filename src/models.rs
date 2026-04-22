@@ -415,7 +415,7 @@ pub struct TerminalInputRecord {
 }
 
 /// Per-project terminal input history.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalInputHistory {
     /// Maximum entries to keep per project.
     #[serde(default = "default_history_limit")]
@@ -423,6 +423,15 @@ pub struct TerminalInputHistory {
     /// Recorded inputs (newest first).
     #[serde(default)]
     pub entries: Vec<TerminalInputRecord>,
+}
+
+impl Default for TerminalInputHistory {
+    fn default() -> Self {
+        Self {
+            max_entries: default_history_limit(),
+            entries: Vec::new(),
+        }
+    }
 }
 
 const fn default_history_limit() -> usize {
