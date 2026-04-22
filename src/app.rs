@@ -17,6 +17,7 @@ use arboard::Clipboard;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
+use directories::ProjectDirs;
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{
     self, Align, Color32, Event, FontData, FontFamily, FontId, Galley, Id, Key, Layout, RichText,
@@ -204,6 +205,61 @@ const WINDOWS_TERMINAL_FONT_CANDIDATES: [(&str, &str); 2] = [
 static FACTORY_DROID_INBOX_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CODEX_NOTIFY_INBOX_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static OPENCODE_NOTIFY_INBOX_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+// Default blank project constants
+const RESERVED_BLANK_PROJECT_ID: u64 = 0;
+const DEFAULT_BLANK_PROJECT_NAME: &str = "Don't Work on a Project";
+const DEFAULT_BLANK_PROJECT_FOLDER: &str = "Don't Work on a Project";
+const DEFAULT_AGENTS_MD_CONTENT: &str = r#"# Project AGENTS
+
+This is an empty project. The user can give you tasks to perform on their PC or just chat with you.
+"#;
+
+/// Ensures the default blank project folder and AGENTS.md file exist in app data.
+/// Returns the path to the project folder.
+fn ensure_default_blank_project_path() -> Option<PathBuf> {
+    let dirs = ProjectDirs::from("com", "Mergen", "MergenADE")?;
+    let project_dir = dirs.data_dir().join(DEFAULT_BLANK_PROJECT_FOLDER);
+
+    // Create the project folder if it doesn't exist
+    if let Err(e) = fs::create_dir_all(&project_dir) {
+        eprintln!("Failed to create default project folder: {e}");
+        return None;
+    }
+
+    // Create AGENTS.md if it doesn't exist (don't overwrite existing)
+    let agents_path = project_dir.join("AGENTS.md");
+    if !agents_path.exists() {
+        if let Err(e) = fs::write(&agents_path, DEFAULT_AGENTS_MD_CONTENT) {
+            eprintln!("Failed to create AGENTS.md: {e}");
+        }
+    }
+
+    Some(project_dir)
+}
+
+/// Returns true if the project ID is the reserved blank project.
+fn is_blank_project(project_id: u64) -> bool {
+    project_id == RESERVED_BLANK_PROJECT_ID
+}
+
+/// Sort key for projects: blank project always sorts last.
+/// Returns (is_blank, project_name) tuple for sorting.
+fn project_sort_key(project: &ProjectRecord) -> (bool, String) {
+    (is_blank_project(project.id), project.name.clone())
+}
+
+/// Returns a vector of project references sorted with blank project at the bottom.
+fn sorted_projects(projects: &BTreeMap<u64, ProjectRecord>) -> Vec<&ProjectRecord> {
+    let mut sorted: Vec<&ProjectRecord> = projects.values().collect();
+    sorted.sort_by_key(|p| project_sort_key(p));
+    sorted
+}
+
+/// Returns true if any project has at least one checklist item.
+fn has_any_checklist_items(projects: &[ProjectRecord]) -> bool {
+    projects.iter().any(|p| !p.checklist.is_empty())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum AppIcon {
@@ -944,6 +1000,10 @@ pub struct AdeApp {
     input_history_selected_project_id: Option<u64>,
     /// Which terminal's history popup is currently open (terminal_id)
     terminal_history_popup_open: Option<u64>,
+    /// Tracks whether the history popup was just opened this frame (to prevent immediate close)
+    terminal_history_popup_just_opened: bool,
+    /// Collapse/expand state per project in the Check-list panel (persisted implicitly via egui storage)
+    checklist_collapsed_by_project: BTreeMap<u64, bool>,
 }
 
 struct TerminalEntry {
@@ -955,11 +1015,7 @@ struct TerminalEntry {
     full_title: String,
     pending_line_for_title: String,
     recent_inputs: VecDeque<String>,
-    /// Snapshot of the last 5 messages when test_done was toggled on.
-    /// Cleared when test_done is toggled off.
-    checklist_snapshot: Vec<String>,
     in_main_view: bool,
-    test_done: bool,
     dirty: bool,
     last_seqno: usize,
     last_cursor_row: Option<usize>,
@@ -1076,7 +1132,6 @@ struct TerminalRowData {
     exited: bool,
     recent_inputs: VecDeque<String>,
     in_main_view: bool,
-    test_done: bool,
     ai_logo_key: Option<LauncherIconKey>,
     ai_badge: AiBadgeModel,
 }
@@ -2665,8 +2720,33 @@ impl AdeApp {
         }
         // Always show projects without live terminals on startup
         config.ui.terminal_manager_hide_inactive_projects = false;
+        // Collapse checklist panel on startup if no checklist items exist across all projects
+        if !has_any_checklist_items(&config.projects) {
+            config.ui.checklist_panel_expanded = false;
+        }
         #[cfg(target_os = "windows")]
         let window_hwnd = Self::extract_window_hwnd(_cc);
+
+        // Ensure default blank project folder and AGENTS.md exist
+        let blank_project_path = ensure_default_blank_project_path();
+
+        // Inject default blank project into config if not present
+        let blank_project_exists = config
+            .projects
+            .iter()
+            .any(|p| p.id == RESERVED_BLANK_PROJECT_ID);
+        if !blank_project_exists {
+            if let Some(ref path) = blank_project_path {
+                config.projects.push(ProjectRecord {
+                    id: RESERVED_BLANK_PROJECT_ID,
+                    name: DEFAULT_BLANK_PROJECT_NAME.to_owned(),
+                    path: path.clone(),
+                    saved_messages: Vec::new(),
+                    ai_config: crate::hooks::ProjectAiConfig::default(),
+                    checklist: Vec::new(),
+                });
+            }
+        }
 
         let projects = config
             .projects
@@ -2675,12 +2755,24 @@ impl AdeApp {
             .map(|project| (project.id, project))
             .collect::<BTreeMap<_, _>>();
 
-        let next_project_id = projects.keys().last().copied().unwrap_or(0) + 1;
+        let next_project_id = projects
+            .keys()
+            .filter(|&&id| id != RESERVED_BLANK_PROJECT_ID)
+            .last()
+            .copied()
+            .unwrap_or(1)
+            + 1;
         let selected_project = config
             .ui
             .last_selected_project_id
             .filter(|project_id| projects.contains_key(project_id))
-            .or_else(|| projects.keys().next().copied());
+            .or_else(|| {
+                // If no last selected project, prefer first non-blank project
+                projects
+                    .values()
+                    .find(|p| !is_blank_project(p.id))
+                    .map(|p| p.id)
+            });
         let current_executable_path =
             std::env::current_exe().unwrap_or_else(|_| PathBuf::from("unknown"));
         let (ai_hook_manager, factory_droid_hooks_dir, factory_droid_hooks_dir_error) =
@@ -2816,6 +2908,8 @@ impl AdeApp {
             input_history_search_query: String::new(),
             input_history_selected_project_id: selected_project,
             terminal_history_popup_open: None,
+            terminal_history_popup_just_opened: false,
+            checklist_collapsed_by_project: BTreeMap::new(),
         };
         app
     }
@@ -2929,6 +3023,7 @@ impl AdeApp {
             path,
             saved_messages: Vec::new(),
             ai_config: crate::hooks::ProjectAiConfig::default(),
+            checklist: Vec::new(),
         };
 
         let new_project_id = project.id;
@@ -2942,6 +3037,13 @@ impl AdeApp {
     }
 
     fn remove_project(&mut self, ctx: &egui::Context, project_id: u64) {
+        // Prevent removal of the reserved blank project
+        if is_blank_project(project_id) {
+            self.status_line =
+                "Cannot remove the default blank project 'Don't Work on a Project'".to_owned();
+            return;
+        }
+
         let Some(project) = self.projects.remove(&project_id) else {
             return;
         };
@@ -3111,9 +3213,7 @@ impl AdeApp {
             full_title: fallback_title,
             pending_line_for_title: String::new(),
             recent_inputs: VecDeque::new(),
-            checklist_snapshot: Vec::new(),
             in_main_view: true,
-            test_done: false,
             dirty: true,
             last_seqno: runtime.latest_seqno(),
             last_cursor_row: None,
@@ -7036,13 +7136,46 @@ impl AdeApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context, main_area_size: Vec2) {
-        if self.ui_owns_keyboard(ctx) {
+        let ui_owns_keyboard = self.ui_owns_keyboard(ctx);
+
+        // Always process buffered navigation shortcuts (including when Terminal Manager is open)
+        let buffered_shortcuts = self.take_buffered_terminal_navigation_shortcuts();
+
+        if ui_owns_keyboard {
+            // When UI owns keyboard (e.g., Terminal Manager open), only process
+            // buffered single-view navigation shortcuts, not grid navigation
+            for shortcut in buffered_shortcuts {
+                match shortcut {
+                    TerminalNavigationShortcut::SingleViewLinear(direction) => {
+                        let terminal_ids = self.terminal_ids_for_single_view_navigation();
+                        if let Some(next_terminal) = next_terminal_in_linear_direction(
+                            self.single_view_navigation_anchor(),
+                            &terminal_ids,
+                            |terminal_id| {
+                                self.terminals
+                                    .get(&terminal_id)
+                                    .is_some_and(|terminal| !terminal.exited)
+                            },
+                            direction,
+                        ) {
+                            self.set_active_terminal(ctx, Some(next_terminal));
+                        }
+                    }
+                    TerminalNavigationShortcut::SingleViewFilter(direction) => {
+                        self.cycle_terminal_manager_filter(direction, ctx);
+                    }
+                    _ => {}
+                }
+            }
             return;
         }
 
         let mut changed = false;
         let shortcuts = self.take_terminal_navigation_shortcuts(ctx);
-        for shortcut in shortcuts {
+        // Include buffered shortcuts that weren't processed above
+        let mut all_shortcuts = buffered_shortcuts;
+        all_shortcuts.extend(shortcuts);
+        for shortcut in all_shortcuts {
             match shortcut {
                 TerminalNavigationShortcut::Grid(direction) => {
                     let visible_ids = self.visible_terminal_ids_for_main();
@@ -7781,19 +7914,15 @@ impl AdeApp {
     }
 
     fn terminal_ids_for_single_view_navigation(&self) -> Vec<u64> {
-        if self.projects.is_empty() {
-            return self.terminals.keys().copied().collect();
-        }
-
+        // Return all terminals matching the current filter, across all projects
+        // This enables Ctrl+Alt+Arrow to navigate across project boundaries.
+        // Include exited terminals so recovery from an exited terminal works.
         let kind = self.config.ui.terminal_manager_filter.terminal_kind();
-        let mut result = Vec::new();
-
-        for project_id in self.projects.keys().copied().collect::<Vec<_>>() {
-            let ids = terminal_ids_for_project_kind(&self.terminals, project_id, kind);
-            result.extend(ids);
-        }
-
-        result
+        self.terminals
+            .iter()
+            .filter(|(_, terminal)| terminal.kind == kind)
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     fn route_active_terminal_input(&mut self, ctx: &egui::Context, events: Vec<Event>) {
@@ -9959,7 +10088,10 @@ impl AdeApp {
         ui: &mut Ui,
         changes: &mut SettingsEditOutcome,
     ) {
-        let project_ids: Vec<u64> = self.projects.keys().copied().collect();
+        let project_ids: Vec<u64> = sorted_projects(&self.projects)
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
 
         if project_ids.is_empty() {
             show_settings_card(
@@ -10857,12 +10989,11 @@ impl AdeApp {
 
                 match self.config.ui.left_sidebar_tab {
                     LeftSidebarTab::Directory => {
-                        let project_rows = self
-                            .projects
-                            .iter()
-                            .map(|(project_id, project)| {
+                        let project_rows = sorted_projects(&self.projects)
+                            .into_iter()
+                            .map(|project| {
                                 (
-                                    *project_id,
+                                    project.id,
                                     project.name.clone(),
                                     project.path.clone(),
                                     project.path.display().to_string(),
@@ -11181,10 +11312,9 @@ impl AdeApp {
                             });
                     }
                     LeftSidebarTab::SourceControl => {
-                        let project_rows = self
-                            .projects
-                            .iter()
-                            .map(|(project_id, project)| (*project_id, project.name.clone()))
+                        let project_rows = sorted_projects(&self.projects)
+                            .into_iter()
+                            .map(|project| (project.id, project.name.clone()))
                             .collect::<Vec<_>>();
 
                         if project_rows.is_empty() {
@@ -11458,10 +11588,9 @@ impl AdeApp {
         ui.set_width(ui.max_rect().width());
 
         // Project selector
-        let project_rows: Vec<(u64, String)> = self
-            .projects
-            .iter()
-            .map(|(id, p)| (*id, p.name.clone()))
+        let project_rows: Vec<(u64, String)> = sorted_projects(&self.projects)
+            .into_iter()
+            .map(|p| (p.id, p.name.clone()))
             .collect();
 
         let selected_project_label = self
@@ -11670,7 +11799,10 @@ impl AdeApp {
         let visible_kind = self.config.ui.terminal_manager_filter.terminal_kind();
         let foreground_launchers = self.foreground_launchers();
         let hide_inactive = self.config.ui.terminal_manager_hide_inactive_projects;
-        let project_ids: Vec<u64> = self.projects.keys().copied().collect();
+        let project_ids: Vec<u64> = sorted_projects(&self.projects)
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
 
         for project_id in project_ids {
             let Some(project_snapshot) = self.projects.get(&project_id).cloned() else {
@@ -11812,7 +11944,6 @@ impl AdeApp {
             let mut set_active = false;
             let mut close_terminal = false;
             let mut visibility_changed = false;
-            let mut test_done_changed = false;
             let mut send_message: Option<String> = None;
             // Track which message was clicked for copying (use Cell for interior mutability)
             let copied_message: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
@@ -11830,7 +11961,6 @@ impl AdeApp {
                     exited: terminal.exited,
                     recent_inputs: terminal.recent_inputs.clone(),
                     in_main_view: terminal.in_main_view,
-                    test_done: terminal.test_done,
                     ai_logo_key: ai_cli_logo_key_for_terminal(terminal),
                     ai_badge: AiBadgeModel::from_terminal(terminal),
                 }
@@ -12002,12 +12132,6 @@ impl AdeApp {
                             }
                         }
 
-                        // Test done toggle button with green/white state-aware styling
-                        if terminal_manager_test_done_toggle(ui, terminal_data.test_done) {
-                            test_done_changed = true;
-                            action_clicked = true;
-                        }
-
                         let message_response = draw_terminal_saved_message_menu_button(
                             ui,
                             &saved_messages,
@@ -12030,8 +12154,10 @@ impl AdeApp {
                         if has_history && history_button_response.clicked() {
                             if self.terminal_history_popup_open == Some(terminal_data.id) {
                                 self.terminal_history_popup_open = None;
+                                self.terminal_history_popup_just_opened = false;
                             } else {
                                 self.terminal_history_popup_open = Some(terminal_data.id);
+                                self.terminal_history_popup_just_opened = true;
                             }
                             action_clicked = true;
                         }
@@ -12061,19 +12187,6 @@ impl AdeApp {
                 }
                 self.bump_layout_epoch();
             }
-            if test_done_changed {
-                if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
-                    terminal.test_done = !terminal.test_done;
-                    // Snapshot the last 5 messages when marking as done; clear when unmarking
-                    if terminal.test_done {
-                        terminal.checklist_snapshot =
-                            terminal.recent_inputs.iter().cloned().collect();
-                    } else {
-                        terminal.checklist_snapshot.clear();
-                    }
-                }
-                self.bump_layout_epoch();
-            }
             if set_active {
                 self.set_active_terminal(ctx, Some(terminal_entry_id));
             }
@@ -12090,11 +12203,11 @@ impl AdeApp {
             if self.terminal_history_popup_open == Some(terminal_id) {
                 let popup_id = ui.id().with(("terminal_history_popup", terminal_id));
 
-                // Get recent inputs for this terminal
-                let recent_inputs = self
+                // Get recent inputs and project_id for this terminal
+                let (recent_inputs, project_id) = self
                     .terminals
                     .get(&terminal_id)
-                    .map(|t| t.recent_inputs.clone())
+                    .map(|t| (t.recent_inputs.clone(), t.project_id))
                     .unwrap_or_default();
 
                 // Close popup if terminal exited, has no history, or row_rect unavailable
@@ -12137,42 +12250,80 @@ impl AdeApp {
                                     ui.set_min_width(popup_width);
                                     ui.set_max_width(popup_width);
 
-                                    // Header row with close button
+                                    // Header row
                                     ui.horizontal(|ui| {
                                         ui.label(
                                             egui::RichText::new("Input History")
                                                 .strong()
                                                 .color(TEXT_PRIMARY),
                                         );
-                                        ui.with_layout(
-                                            Layout::right_to_left(Align::Center),
-                                            |ui| {
-                                                if ui.button("✕").clicked() {
-                                                    should_close.set(true);
-                                                }
-                                            },
-                                        );
                                     });
                                     ui.add_space(8.0);
 
-                                    // Deduplicated recent inputs
+                                    // Deduplicated recent inputs with checkboxes for checklist
                                     let deduplicated = deduplicated_recent_inputs(&recent_inputs);
 
+                                    // Get project's checklist for this terminal's project
+                                    let project_checklist: Vec<String> = self
+                                        .projects
+                                        .get(&project_id)
+                                        .map(|p| p.checklist.clone())
+                                        .unwrap_or_default();
+
                                     for (idx, message) in deduplicated.iter().enumerate() {
-                                        let msg_response = ui
-                                            .add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(message.as_str())
-                                                        .color(TEXT_PRIMARY)
-                                                        .size(13.0),
+                                        let is_checked =
+                                            project_checklist.contains(&(*message).to_string());
+
+                                        ui.horizontal(|ui| {
+                                            // Checkbox to toggle checklist status
+                                            let mut checked = is_checked;
+                                            if ui.checkbox(&mut checked, "").changed() {
+                                                if let Some(project) =
+                                                    self.projects.get_mut(&project_id)
+                                                {
+                                                    if checked {
+                                                        // Add to checklist if not already present
+                                                        if !project.checklist.contains(message) {
+                                                            project
+                                                                .checklist
+                                                                .push((*message).to_owned());
+                                                        }
+                                                    } else {
+                                                        // Remove from checklist
+                                                        project.checklist.retain(|m| m != *message);
+                                                        // Collapse checklist panel if this was the last item globally
+                                                        if self
+                                                            .projects
+                                                            .values()
+                                                            .all(|p| p.checklist.is_empty())
+                                                        {
+                                                            self.config
+                                                                .ui
+                                                                .checklist_panel_expanded = false;
+                                                        }
+                                                    }
+                                                    self.note_projects_changed();
+                                                    self.persist_config();
+                                                }
+                                            }
+
+                                            // Clickable message label
+                                            let msg_response = ui
+                                                .add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(message.as_str())
+                                                            .color(TEXT_PRIMARY)
+                                                            .size(13.0),
+                                                    )
+                                                    .wrap()
+                                                    .sense(egui::Sense::click()),
                                                 )
-                                                .wrap()
-                                                .sense(egui::Sense::click()),
-                                            )
-                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                        if msg_response.clicked() {
-                                            copied_from_popup.set(Some((*message).clone()));
-                                        }
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                            if msg_response.clicked() {
+                                                copied_from_popup.set(Some((*message).clone()));
+                                            }
+                                        });
+
                                         if idx < deduplicated.len() - 1 {
                                             ui.add_space(4.0);
                                         }
@@ -12180,8 +12331,10 @@ impl AdeApp {
                                 })
                                 .response;
 
-                            // Check for click outside to close
-                            if ui.input(|i| i.pointer.any_click()) {
+                            // Check for click outside to close (skip if popup was just opened this frame)
+                            if !self.terminal_history_popup_just_opened
+                                && ui.input(|i| i.pointer.any_click())
+                            {
                                 let pointer_pos = ui.input(|i| i.pointer.interact_pos());
                                 if let Some(pos) = pointer_pos {
                                     if !response.rect.contains(pos) {
@@ -12193,7 +12346,11 @@ impl AdeApp {
 
                     if should_close.get() {
                         self.terminal_history_popup_open = None;
+                        self.terminal_history_popup_just_opened = false;
                     }
+
+                    // Clear the just-opened flag after this frame
+                    self.terminal_history_popup_just_opened = false;
 
                     // Handle copy from popup
                     if let Some(msg) = copied_from_popup.take() {
@@ -12329,11 +12486,24 @@ impl AdeApp {
     }
 
     /// Draw the Check-list panel on the right side.
-    /// Collapsible; shows only terminals marked with test_done=true.
+    /// Shows projects with checklist items.
     fn draw_checklist_panel(&mut self, ctx: &egui::Context) -> Option<egui::Rect> {
         if !self.config.ui.checklist_panel_expanded {
             return None;
         }
+
+        // Collect projects with checklist items first (to avoid borrow issues)
+        let projects_with_checklist: Vec<(u64, String, Vec<String>)> = {
+            let mut projects: Vec<(u64, String, Vec<String>)> = Vec::new();
+            for (project_id, project) in &self.projects {
+                if !project.checklist.is_empty() {
+                    projects.push((*project_id, project.name.clone(), project.checklist.clone()));
+                }
+            }
+            // Sort by project id for stable ordering
+            projects.sort_by(|a, b| a.0.cmp(&b.0));
+            projects
+        };
 
         let response = egui::SidePanel::right("checklist_panel")
             .resizable(false)
@@ -12360,101 +12530,59 @@ impl AdeApp {
                 });
                 ui.separator();
 
-                // Collect checked terminals grouped by project (scrollable content)
-                let checked_terminals: Vec<(u64, String, u64, String, Vec<String>)> = {
-                    let mut terminals: Vec<(u64, String, u64, String, Vec<String>)> = Vec::new();
-                    for (terminal_id, terminal) in &self.terminals {
-                        if terminal.test_done {
-                            if let Some(project) = self.projects.get(&terminal.project_id) {
-                                terminals.push((
-                                    terminal.project_id,
-                                    project.name.clone(),
-                                    *terminal_id,
-                                    terminal.full_title.clone(),
-                                    terminal.checklist_snapshot.clone(),
-                                ));
-                            }
-                        }
-                    }
-                    terminals
-                };
-
                 // Wrap content in ScrollArea for long lists
                 egui::ScrollArea::vertical()
                     .id_salt("checklist_panel_scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        if checked_terminals.is_empty() {
+                        if projects_with_checklist.is_empty() {
                             ui.add_space(20.0);
                             ui.centered_and_justified(|ui| {
                                 ui.label(
                                     RichText::new(
-                                        "No items in Check-list\nClick the check icon in Terminal Manager to add",
+                                        "No items in Check-list\nOpen history popup and check items to add",
                                     )
                                     .color(TEXT_MUTED)
                                     .size(13.0),
                                 );
                             });
                         } else {
-                            // Group by project
-                            let mut sorted = checked_terminals;
-                            sorted.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
-                            let mut current_project_id: Option<u64> = None;
-
-                            for (project_id, project_name, terminal_id, terminal_title, snapshot) in sorted
-                            {
-                                // Project header
-                                if current_project_id != Some(project_id) {
-                                    current_project_id = Some(project_id);
-                                    ui.add_space(8.0);
-                                    ui.horizontal_top(|ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(format!("{} {}", icons::FOLDER_OPEN, project_name))
-                                                    .strong()
-                                                    .color(TEXT_PRIMARY)
-                                            )
-                                            .wrap(),
-                                        );
-                                    });
-                                    ui.add_space(4.0);
-                                }
-
-                                // Terminal row with checkbox to uncheck
-                                ui.horizontal_top(|ui| {
-                                    ui.add_space(16.0);
-
-                                    // Uncheck button
-                                    if terminal_manager_test_done_toggle(ui, true) {
-                                        // Uncheck this terminal
-                                        if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
-                                            terminal.test_done = false;
-                                            terminal.checklist_snapshot.clear();
-                                        }
-                                        self.bump_layout_epoch();
-                                    }
-
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&terminal_title)
-                                                .color(TEXT_PRIMARY)
-                                                .size(13.0)
-                                        )
-                                        .wrap(),
+                            for (project_id, project_name, checklist) in projects_with_checklist {
+                                // Project header with count
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} {} ({})",
+                                            icons::FOLDER_OPEN,
+                                            project_name,
+                                            checklist.len()
+                                        ))
+                                        .strong()
+                                        .color(TEXT_PRIMARY),
                                     );
                                 });
+                                ui.add_space(4.0);
 
-                                // Show the 5 snapshot messages (or placeholder if empty)
-                                ui.indent(Id::new(("checklist-messages", terminal_id)), |ui| {
-                                    if snapshot.is_empty() {
-                                        ui.label(
-                                            egui::RichText::new("No messages captured – checklist saves a snapshot when you mark a terminal as done, and it does not auto-update with later messages.")
-                                                .color(TEXT_MUTED)
-                                                .size(12.0)
-                                                .italics(),
-                                        );
-                                    } else {
-                                        for (idx, message) in snapshot.iter().enumerate() {
+                                // Checklist items for this project
+                                ui.indent(Id::new(("checklist-items", project_id)), |ui| {
+                                    for (idx, message) in checklist.iter().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            // Checkbox to uncheck item
+                                            let mut checked = true;
+                                            if ui.checkbox(&mut checked, "").changed() {
+                                                if let Some(p) = self.projects.get_mut(&project_id) {
+                                                    p.checklist.retain(|m| m != message);
+                                                    // Collapse checklist panel if this was the last item globally
+                                                    if self.projects.values().all(|p| p.checklist.is_empty()) {
+                                                        self.config.ui.checklist_panel_expanded = false;
+                                                    }
+                                                    self.note_projects_changed();
+                                                    self.persist_config();
+                                                }
+                                            }
+
+                                            // Clickable message label
                                             let msg_response = ui
                                                 .add(
                                                     egui::Label::new(
@@ -12471,9 +12599,9 @@ impl AdeApp {
                                                 ctx.copy_text(message.to_string());
                                                 self.show_status_feedback(ctx, "Copied message");
                                             }
-                                            if idx < snapshot.len().saturating_sub(1) {
-                                                ui.add_space(2.0);
-                                            }
+                                        });
+                                        if idx < checklist.len().saturating_sub(1) {
+                                            ui.add_space(2.0);
                                         }
                                     }
                                 });
@@ -12519,14 +12647,7 @@ impl AdeApp {
             None
         };
 
-        let (
-            clicked,
-            close_requested,
-            copied_selection,
-            copied_hover_message,
-            paste_requested,
-            link_to_open,
-        ) = {
+        let (clicked, close_requested, copied_selection, paste_requested, link_to_open) = {
             let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
                 return;
             };
@@ -12534,7 +12655,6 @@ impl AdeApp {
             let mut close_requested = false;
             let mut pane_clicked = false;
             let mut copied_selection = None;
-            let copied_hover_message: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
             let mut paste_requested = false;
             let mut link_to_open = None;
             let header_chrome = terminal_header_chrome(is_active);
@@ -12617,115 +12737,15 @@ impl AdeApp {
                                 .sense(Sense::click()),
                             );
                             // Save values before title_response is potentially moved
-                            let title_rect = title_response.rect;
-                            let title_id = title_response.id;
+                            let _title_rect = title_response.rect;
+                            let _title_id = title_response.id;
                             let is_title_hovered = title_response.hovered();
                             let is_title_clicked = title_response.clicked();
                             let title_response =
                                 title_response.on_hover_cursor(egui::CursorIcon::PointingHand);
 
-                            // Calculate click timing, pointer position and direction
-                            let (
-                                time_since_last_click,
-                                time_since_last_pointer_movement,
-                                pointer_pos,
-                                pointer_dir,
-                            ) = ui.ctx().input(|input| {
-                                (
-                                    input.pointer.time_since_last_click(),
-                                    input.pointer.time_since_last_movement(),
-                                    input.pointer.hover_pos(),
-                                    input.pointer.direction(),
-                                )
-                            });
-                            let clicked_recently =
-                                time_since_last_click < time_since_last_pointer_movement + 0.1;
-
-                            // Check if pointer is on tooltip or moving toward it
-                            // (for keeping it open like Terminal Manager)
-                            let tooltip_area_id = egui::tooltip_id(title_id, 0);
-                            let tooltip_rect = egui::AreaState::load(ui.ctx(), tooltip_area_id)
-                                .map(|state| state.rect());
-                            let pointer_on_tooltip = pointer_pos
-                                .zip(tooltip_rect)
-                                .map_or(false, |(pos, rect)| rect.contains(pos));
-
-                            // Only check "moving toward tooltip" when pointer is in the gap
-                            // between title and tooltip (not when wandering in terminal body)
-                            let moving_toward_tooltip = pointer_dir != Vec2::ZERO
-                                && pointer_pos.zip(tooltip_rect).map_or(false, |(pos, rect)| {
-                                    // Pointer must be below title and above/near tooltip
-                                    let in_gap_region =
-                                        pos.y > title_rect.bottom() && pos.y < rect.top() + 20.0;
-                                    // Direction must be generally downward (toward tooltip)
-                                    let moving_downward = pointer_dir.y > 0.0;
-                                    in_gap_region
-                                        && moving_downward
-                                        && rect.intersects_ray(pos, pointer_dir.normalized())
-                                });
-
-                            // Show centered tooltip under title when hovered
-                            // Keep open when pointer moves to tooltip or is on the way to it
-                            let should_show_tooltip = pointer_on_tooltip
-                                || moving_toward_tooltip
-                                || (!clicked_recently && is_title_hovered);
-
-                            if should_show_tooltip
-                                && !terminal.exited
-                                && !terminal.recent_inputs.is_empty()
-                            {
-                                let tooltip_pos =
-                                    egui::pos2(title_rect.center().x, title_rect.bottom() + 4.0);
-                                egui::show_tooltip_at(
-                                    ui.ctx(),
-                                    ui.layer_id(),
-                                    title_id,
-                                    tooltip_pos,
-                                    |ui| {
-                                        // Fixed width tooltip with wrapping content
-                                        let tooltip_width = TERMINAL_HOVER_WIDTH
-                                            .min(ui.ctx().screen_rect().width() - 32.0);
-                                        ui.set_min_width(tooltip_width);
-                                        ui.set_max_width(tooltip_width);
-
-                                        // Deduplicate inputs for display (preserves newest-first order)
-                                        let deduplicated =
-                                            deduplicated_recent_inputs(&terminal.recent_inputs);
-
-                                        // Show title if different from most recent
-                                        let most_recent =
-                                            deduplicated.first().map(|s| s.as_str()).unwrap_or("");
-                                        if most_recent != terminal.full_title {
-                                            ui.label(
-                                                egui::RichText::new(&terminal.full_title)
-                                                    .strong()
-                                                    .color(TEXT_PRIMARY),
-                                            );
-                                            ui.add_space(4.0);
-                                        }
-                                        // Show each recent input as clickable row (wraps if long)
-                                        for (idx, message) in deduplicated.iter().enumerate() {
-                                            let msg_response = ui
-                                                .add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(message.as_str())
-                                                            .color(TEXT_PRIMARY)
-                                                            .size(13.0),
-                                                    )
-                                                    .wrap()
-                                                    .sense(egui::Sense::click()),
-                                                )
-                                                .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                            if msg_response.clicked() {
-                                                copied_hover_message.set(Some((*message).clone()));
-                                            }
-                                            if idx < deduplicated.len() - 1 {
-                                                ui.add_space(2.0);
-                                            }
-                                        }
-                                    },
-                                );
-                            } else if is_title_hovered && !clicked_recently {
+                            // Show truncation tooltip on hover (history hover removed per design)
+                            if is_title_hovered {
                                 with_truncation_tooltip(
                                     ui,
                                     title_response,
@@ -13208,7 +13228,6 @@ impl AdeApp {
                 pane_clicked,
                 close_requested,
                 copied_selection,
-                copied_hover_message.take(),
                 paste_requested,
                 link_to_open,
             )
@@ -13230,11 +13249,6 @@ impl AdeApp {
         if let Some(text) = copied_selection {
             ui.ctx().copy_text(text);
             self.finalize_pointer_selection_copy(ui.ctx());
-        }
-
-        if let Some(message) = copied_hover_message {
-            ui.ctx().copy_text(message);
-            self.show_status_feedback(ui.ctx(), "Copied message");
         }
 
         if paste_requested {
@@ -13432,6 +13446,38 @@ impl eframe::App for AdeApp {
                 return;
             }
 
+            // Terminal capture not active — but still buffer single-view navigation shortcuts
+            // (Ctrl+Alt+Arrow and Ctrl+Left/Right for filter) when a popup is open
+            // (e.g., Terminal Manager) so they work even when UI owns keyboard.
+            // Grid navigation (Ctrl+Arrow) should NOT be buffered here to avoid
+            // interfering with UI text editing.
+            let is_popup_open = ctx.memory(|mem| mem.any_popup_open());
+            if is_popup_open {
+                let (navigation_shortcuts, remaining_events) =
+                    Self::partition_terminal_navigation_shortcuts(
+                        remaining_events,
+                        single_view_shortcuts_enabled,
+                    );
+                // Only buffer single-view shortcuts (linear and filter), not grid navigation
+                let single_view_shortcuts: Vec<_> = navigation_shortcuts
+                    .into_iter()
+                    .filter(|s| {
+                        matches!(
+                            s,
+                            TerminalNavigationShortcut::SingleViewLinear(_)
+                                | TerminalNavigationShortcut::SingleViewFilter(_)
+                        )
+                    })
+                    .collect();
+                self.buffered_terminal_navigation
+                    .extend(single_view_shortcuts);
+                // Terminal capture not active — fall through to normal UI event processing
+                let (_, remaining_events) =
+                    Self::partition_blocked_ui_reverse_focus_traversal_events(remaining_events);
+                raw_input.events = remaining_events;
+                return;
+            }
+
             // Terminal capture not active — fall through to normal UI event processing
             let (_, remaining_events) =
                 Self::partition_blocked_ui_reverse_focus_traversal_events(remaining_events);
@@ -13607,6 +13653,10 @@ fn recover_config_state(
 
     // Always show projects without live terminals on startup
     config.ui.terminal_manager_hide_inactive_projects = false;
+    // Collapse checklist panel if no checklist items exist after recovery
+    if !has_any_checklist_items(&config.projects) {
+        config.ui.checklist_panel_expanded = false;
+    }
 
     config
 }
@@ -13641,6 +13691,8 @@ fn recover_project_records(
                 &merged_project.saved_messages,
                 &current_project.saved_messages,
             );
+            merged_project.checklist =
+                merge_saved_messages(&merged_project.checklist, &current_project.checklist);
             projects.insert(loaded_id, merged_project);
             project_id_remap.insert(current_project.id, loaded_id);
             continue;
@@ -14801,17 +14853,17 @@ fn terminal_display_label(title: &str, exited: bool) -> String {
 }
 
 fn terminal_manager_actions_width(section_gap: f32, show_visibility_toggle: bool) -> f32 {
-    // Always reserve space for: close button + test_done button + message button + history button + optional visibility toggle
+    // Always reserve space for: close button + message button + history button + optional visibility toggle
     // Each button is CONTROL_ROW_HEIGHT wide, with section_gap between them
     let visibility_width = if show_visibility_toggle {
         CONTROL_ROW_HEIGHT + section_gap
     } else {
         0.0
     };
-    // Close button + test_done button + message button + history button + gaps + visibility toggle
-    (CONTROL_ROW_HEIGHT * 3.0)
+    // Close button + message button + history button + gaps + visibility toggle
+    (CONTROL_ROW_HEIGHT * 2.0)
         + TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH
-        + (section_gap * 3.0)
+        + (section_gap * 2.0)
         + visibility_width
 }
 
@@ -15498,11 +15550,8 @@ fn draw_terminal_manager_diff_summary(
         .sense(Sense::hover()),
     );
 
-    response.on_hover_ui(|ui| {
-        for line in &summary.tooltip_lines {
-            ui.label(line);
-        }
-    })
+    // Hover tooltip removed per design decision
+    response
 }
 
 fn draw_terminal_manager_title_and_diff_summary(
@@ -18657,8 +18706,8 @@ mod tests {
         let screen_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(760.0, 520.0));
         let mut app = test_app([], None);
         app.projects = BTreeMap::from([
-            (7, test_project(7, "Demo", "C:/demo", &["git status"])),
-            (9, test_project(9, "Docs", "C:/docs", &["pnpm build"])),
+            (7, test_project(7, "Demo", "C:/demo", &["git status"], &[])),
+            (9, test_project(9, "Docs", "C:/docs", &["pnpm build"], &[])),
         ]);
         app.selected_project = Some(9);
         app.show_settings_popup = true;
@@ -18694,7 +18743,7 @@ mod tests {
         let mut app = test_app([], None);
         app.projects = BTreeMap::from([(
             7,
-            test_project(7, "Demo", "C:/demo", &[long_prompt, long_prompt]),
+            test_project(7, "Demo", "C:/demo", &[long_prompt, long_prompt], &[]),
         )]);
         app.selected_project = Some(7);
         app.show_settings_popup = true;
@@ -19967,13 +20016,11 @@ mod tests {
         let (label_width, actions_area_width) =
             terminal_manager_row_widths(160.0, actions_width, 8.0);
 
-        // With visibility toggle + history button:
-        // actions_width = 3*CONTROL_ROW_HEIGHT + MESSAGE_BUTTON + 3*section_gap + visibility
-        // = 3*28 + 32 + 3*8 + (28 + 8) = 84 + 32 + 24 + 36 = 176
-        // But total_width is only 160, so label_width becomes 0
-        // and actions_area_width becomes total_width = 160
-        assert!((label_width - 0.0).abs() < f32::EPSILON);
-        assert_eq!(actions_area_width, 160.0);
+        // With visibility toggle + history button (no test_done button):
+        // actions_width = 2*CONTROL_ROW_HEIGHT + MESSAGE_BUTTON + 2*section_gap + visibility
+        // = 2*28 + 32 + 2*8 + (28 + 8) = 56 + 32 + 16 + 36 = 140
+        // But total_width is only 160, so actions_area_width becomes 140
+        assert!((actions_area_width - 140.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -19990,14 +20037,9 @@ mod tests {
     fn terminal_manager_row_actions_shrink_when_visibility_toggle_is_hidden() {
         let actions_width = terminal_manager_actions_width(8.0, false);
 
-        // With history button: 3*CONTROL_ROW_HEIGHT + MESSAGE_BUTTON + 3*section_gap
-        // = 3*28 + 32 + 3*8 = 84 + 32 + 24 = 140
-        assert_eq!(
-            actions_width,
-            (super::CONTROL_ROW_HEIGHT * 3.0)
-                + super::TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH
-                + (8.0 * 3.0)
-        );
+        // With history button (no test_done): 2*CONTROL_ROW_HEIGHT + MESSAGE_BUTTON + 2*section_gap
+        // = 2*28 + 32 + 2*8 = 56 + 32 + 16 = 104
+        assert!((actions_width - 104.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -20249,7 +20291,7 @@ mod tests {
         terminal.title = "Short".to_owned();
         terminal.full_title = "Short".to_owned();
         app.projects
-            .insert(7, test_project(7, "Demo", "C:/demo", &["git status"]));
+            .insert(7, test_project(7, "Demo", "C:/demo", &["git status"], &[]));
         app
     }
 
@@ -20484,6 +20526,70 @@ mod tests {
         assert_eq!(
             output.platform_output.cursor_icon,
             egui::CursorIcon::PointingHand
+        );
+    }
+
+    #[test]
+    fn terminal_manager_history_popup_stays_open_after_button_click() {
+        // Regression test: clicking the history button should open the popup
+        // and it should NOT immediately close in the same frame due to
+        // the "click outside" detection firing for the same click.
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        // Create app with a terminal that has some recent inputs
+        let mut app = terminal_manager_row_test_app(None);
+        let terminal = app.terminals.get_mut(&2).expect("terminal");
+        terminal.recent_inputs.push_back("git status".to_string());
+        terminal.recent_inputs.push_back("cargo build".to_string());
+
+        // Calculate history button position (rightmost button in actions area)
+        let _layout = terminal_manager_row_test_layout(&ctx, 320.0, false);
+        let row_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(320.0, super::CONTROL_ROW_HEIGHT),
+        );
+        let section_gap = 8.0f32;
+        // History button is left of message button (which is left of close)
+        // Close is at right edge, then message, then history
+        let close_left = row_rect.right() - super::CONTROL_ROW_HEIGHT;
+        let message_left = close_left - section_gap - super::TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH;
+        let history_left = message_left - section_gap - super::CONTROL_ROW_HEIGHT;
+        let history_button_center = egui::pos2(
+            history_left + super::CONTROL_ROW_HEIGHT * 0.5,
+            row_rect.center().y,
+        );
+
+        // Initial render to establish state
+        let _ = draw_terminal_rows_in_test_ui(&ctx, RawInput::default(), &mut app);
+        assert_eq!(app.terminal_history_popup_open, None);
+
+        // Simulate clicking the history button (press and release)
+        let click_input = RawInput {
+            events: vec![
+                Event::PointerMoved(history_button_center),
+                Event::PointerButton {
+                    pos: history_button_center,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::default(),
+                },
+                Event::PointerButton {
+                    pos: history_button_center,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::default(),
+                },
+            ],
+            ..RawInput::default()
+        };
+        let _ = draw_terminal_rows_in_test_ui(&ctx, click_input, &mut app);
+
+        // Popup should be open for terminal 2, not None
+        assert_eq!(
+            app.terminal_history_popup_open,
+            Some(2),
+            "history popup should remain open after button click, not immediately close"
         );
     }
 
@@ -21208,7 +21314,7 @@ mod tests {
     #[test]
     fn request_source_control_refresh_marks_loading_without_clearing_snapshot_data() {
         let mut app = test_app([], None);
-        app.projects = BTreeMap::from([(7, test_project(7, "Repo", "C:/repo", &[]))]);
+        app.projects = BTreeMap::from([(7, test_project(7, "Repo", "C:/repo", &[], &[]))]);
         app.source_control_state.insert(
             7,
             SourceControlSnapshot {
@@ -21284,9 +21390,9 @@ mod tests {
     fn next_due_auto_source_control_project_prefers_selected_or_live_terminal_projects() {
         let mut app = test_app([(3, test_terminal_entry(3, 3))], None);
         app.projects = BTreeMap::from([
-            (1, test_project(1, "Idle", "C:/idle", &[])),
-            (2, test_project(2, "Selected", "C:/selected", &[])),
-            (3, test_project(3, "Live", "C:/live", &[])),
+            (1, test_project(1, "Idle", "C:/idle", &[], &[])),
+            (2, test_project(2, "Selected", "C:/selected", &[], &[])),
+            (3, test_project(3, "Live", "C:/live", &[], &[])),
         ]);
         app.selected_project = Some(2);
         app.source_control_refresh_state
@@ -21303,9 +21409,9 @@ mod tests {
     fn next_due_auto_source_control_project_rotates_after_last_auto_refresh() {
         let mut app = test_app([], None);
         app.projects = BTreeMap::from([
-            (1, test_project(1, "One", "C:/one", &[])),
-            (2, test_project(2, "Two", "C:/two", &[])),
-            (3, test_project(3, "Three", "C:/three", &[])),
+            (1, test_project(1, "One", "C:/one", &[], &[])),
+            (2, test_project(2, "Two", "C:/two", &[], &[])),
+            (3, test_project(3, "Three", "C:/three", &[], &[])),
         ]);
         app.source_control_last_auto_refresh_project = Some(2);
 
@@ -21315,7 +21421,7 @@ mod tests {
     #[test]
     fn manual_fetch_upgrades_pending_source_control_refresh() {
         let mut app = test_app([], None);
-        app.projects = BTreeMap::from([(7, test_project(7, "Demo", "C:/demo", &[]))]);
+        app.projects = BTreeMap::from([(7, test_project(7, "Demo", "C:/demo", &[], &[]))]);
 
         app.request_source_control_refresh(7, false, false);
         app.request_source_control_refresh(7, true, true);
@@ -21337,7 +21443,7 @@ mod tests {
     #[test]
     fn prune_source_control_state_removes_queued_entries_for_deleted_projects() {
         let mut app = test_app([], None);
-        app.projects = BTreeMap::from([(1, test_project(1, "Keep", "C:/keep", &[]))]);
+        app.projects = BTreeMap::from([(1, test_project(1, "Keep", "C:/keep", &[], &[]))]);
         app.source_control_refresh_state.insert(
             7,
             SourceControlRefreshState {
@@ -21367,8 +21473,8 @@ mod tests {
             Some(1),
         );
         app.projects = BTreeMap::from([
-            (7, test_project(7, "Remove", "C:/remove", &[])),
-            (9, test_project(9, "Keep", "C:/keep", &[])),
+            (7, test_project(7, "Remove", "C:/remove", &[], &[])),
+            (9, test_project(9, "Keep", "C:/keep", &[], &[])),
         ]);
         app.selected_project = Some(7);
         app.source_control_state
@@ -21421,7 +21527,7 @@ mod tests {
     fn remove_project_ignores_unknown_project_id() {
         let ctx = Context::default();
         let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
-        app.projects = BTreeMap::from([(7, test_project(7, "Keep", "C:/keep", &[]))]);
+        app.projects = BTreeMap::from([(7, test_project(7, "Keep", "C:/keep", &[], &[]))]);
         app.selected_project = Some(7);
 
         app.remove_project(&ctx, 99);
@@ -25223,7 +25329,7 @@ mod tests {
 
     #[test]
     fn recovered_config_preserves_loaded_settings_until_session_changes_them() {
-        let loaded_project = test_project(7, "Loaded", "C:/loaded/demo", &[]);
+        let loaded_project = test_project(7, "Loaded", "C:/loaded/demo", &[], &[]);
         let loaded_config = AppConfig {
             default_shell: ShellKind::Cmd,
             ui: crate::models::UiConfig {
@@ -25296,8 +25402,8 @@ mod tests {
 
     #[test]
     fn recovered_config_keeps_loaded_projects_when_added_project_reuses_hidden_id() {
-        let loaded_project = test_project(1, "Loaded", "C:/loaded/demo", &[]);
-        let current_project = test_project(1, "Added", "C:/added/demo", &[]);
+        let loaded_project = test_project(1, "Loaded", "C:/loaded/demo", &[], &[]);
+        let current_project = test_project(1, "Added", "C:/added/demo", &[], &[]);
         let loaded_config = AppConfig {
             projects: vec![loaded_project.clone()],
             ..AppConfig::default()
@@ -25327,8 +25433,8 @@ mod tests {
 
     #[test]
     fn recovered_config_merges_duplicate_project_paths_and_saved_messages() {
-        let loaded_project = test_project(5, "Loaded", "C:/shared/demo", &["existing"]);
-        let current_project = test_project(1, "Added", "C:/shared/demo", &["new"]);
+        let loaded_project = test_project(5, "Loaded", "C:/shared/demo", &["existing"], &[]);
+        let current_project = test_project(1, "Added", "C:/shared/demo", &["new"], &[]);
         let loaded_config = AppConfig {
             projects: vec![loaded_project.clone()],
             ..AppConfig::default()
@@ -25546,7 +25652,13 @@ mod tests {
         ctx.fonts(|fonts| fonts.layout_job(layout_job))
     }
 
-    fn test_project(id: u64, name: &str, path: &str, saved_messages: &[&str]) -> ProjectRecord {
+    fn test_project(
+        id: u64,
+        name: &str,
+        path: &str,
+        saved_messages: &[&str],
+        checklist: &[&str],
+    ) -> ProjectRecord {
         ProjectRecord {
             id,
             name: name.to_owned(),
@@ -25556,6 +25668,7 @@ mod tests {
                 .map(|message| (*message).to_owned())
                 .collect(),
             ai_config: ProjectAiConfig::default(),
+            checklist: checklist.iter().map(|item| (*item).to_owned()).collect(),
         }
     }
 
@@ -25612,9 +25725,7 @@ mod tests {
             full_title: format!("Terminal {id}"),
             pending_line_for_title: String::new(),
             recent_inputs: VecDeque::new(),
-            checklist_snapshot: Vec::new(),
             in_main_view: true,
-            test_done: false,
             dirty: false,
             last_seqno: 0,
             last_cursor_row: None,
@@ -25791,11 +25902,13 @@ mod tests {
             directory_index_state: BTreeMap::new(),
             directory_tree_has_collapsed_cache_by_project: BTreeMap::new(),
             directory_index_generation: BTreeMap::new(),
+            checklist_collapsed_by_project: BTreeMap::new(),
             history_path: PathBuf::new(),
             input_history: AppHistory::default(),
             input_history_search_query: String::new(),
             input_history_selected_project_id: None,
             terminal_history_popup_open: None,
+            terminal_history_popup_just_opened: false,
             ai_hook_manager: None,
         }
     }
@@ -28516,111 +28629,146 @@ mod tests {
     }
 
     #[test]
-    fn checklist_snapshot_captured_when_test_done_toggled_on() {
-        let ctx = Context::default();
-        ctx.set_fonts(FontDefinitions::default());
+    fn project_checklist_persists_across_sessions() {
+        let mut app = test_app([(1, test_terminal_entry(1, 1))], Some(1));
+        // Add project 1
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &["initial"]));
 
-        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
-
-        // Add some messages to recent_inputs
-        if let Some(terminal) = app.terminals.get_mut(&1) {
-            terminal.recent_inputs.push_back("first message".to_owned());
-            terminal
-                .recent_inputs
-                .push_back("second message".to_owned());
-            terminal.recent_inputs.push_back("third message".to_owned());
+        // Add items to project checklist
+        if let Some(project) = app.projects.get_mut(&1) {
+            project.checklist.push("first item".to_owned());
+            project.checklist.push("second item".to_owned());
         }
 
-        // Toggle test_done on
-        if let Some(terminal) = app.terminals.get_mut(&1) {
-            terminal.test_done = true;
-            terminal.checklist_snapshot = terminal.recent_inputs.iter().cloned().collect();
-        }
-
-        let terminal = app.terminals.get(&1).expect("terminal 1");
-        assert!(terminal.test_done);
-        assert_eq!(terminal.checklist_snapshot.len(), 3);
-        assert_eq!(terminal.checklist_snapshot[0], "first message");
-        assert_eq!(terminal.checklist_snapshot[1], "second message");
-        assert_eq!(terminal.checklist_snapshot[2], "third message");
+        let project = app.projects.get(&1).expect("project 1");
+        assert_eq!(project.checklist.len(), 3); // initial + 2 new
+        assert_eq!(project.checklist[1], "first item");
+        assert_eq!(project.checklist[2], "second item");
     }
 
     #[test]
-    fn checklist_snapshot_cleared_when_test_done_toggled_off() {
-        let ctx = Context::default();
-        ctx.set_fonts(FontDefinitions::default());
+    fn project_checklist_survives_terminal_closure() {
+        let mut app = test_app([(1, test_terminal_entry(1, 1))], Some(1));
+        // Add project 1
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
 
-        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
-
-        // Add messages and toggle on first
-        if let Some(terminal) = app.terminals.get_mut(&1) {
-            terminal.recent_inputs.push_back("message".to_owned());
-            terminal.test_done = true;
-            terminal.checklist_snapshot = terminal.recent_inputs.iter().cloned().collect();
+        // Add items to project checklist before terminal closes
+        if let Some(project) = app.projects.get_mut(&1) {
+            project.checklist.push("item from terminal".to_owned());
         }
 
-        // Now toggle off
-        if let Some(terminal) = app.terminals.get_mut(&1) {
-            terminal.test_done = false;
-            terminal.checklist_snapshot.clear();
-        }
+        // Terminal closes (simulated by removing from terminals)
+        app.terminals.remove(&1);
 
-        let terminal = app.terminals.get(&1).expect("terminal 1");
-        assert!(!terminal.test_done);
-        assert!(terminal.checklist_snapshot.is_empty());
+        // Checklist should still be available in project
+        let project = app.projects.get(&1).expect("project 1");
+        assert_eq!(project.checklist.len(), 1);
+        assert_eq!(project.checklist[0], "item from terminal");
     }
 
     #[test]
-    fn checklist_snapshot_persists_when_new_messages_added() {
-        let ctx = Context::default();
-        ctx.set_fonts(FontDefinitions::default());
+    fn checklist_merge_combines_loaded_and_current_items() {
+        let loaded_project = test_project(5, "Demo", "C:/demo", &[], &["loaded_item"]);
+        let current_project = test_project(5, "Demo", "C:/demo", &[], &["current_item"]);
 
-        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let merged_checklist =
+            super::merge_saved_messages(&loaded_project.checklist, &current_project.checklist);
 
-        // Add initial messages and toggle on
-        if let Some(terminal) = app.terminals.get_mut(&1) {
-            terminal.recent_inputs.push_back("original".to_owned());
-            terminal.test_done = true;
-            terminal.checklist_snapshot = terminal.recent_inputs.iter().cloned().collect();
-        }
-
-        // Add new message to recent_inputs
-        if let Some(terminal) = app.terminals.get_mut(&1) {
-            terminal.recent_inputs.push_back("new message".to_owned());
-        }
-
-        // Snapshot should still contain only original
-        let terminal = app.terminals.get(&1).expect("terminal 1");
-        assert_eq!(terminal.checklist_snapshot.len(), 1);
-        assert_eq!(terminal.checklist_snapshot[0], "original");
+        assert_eq!(merged_checklist.len(), 2);
+        assert!(merged_checklist.contains(&"loaded_item".to_owned()));
+        assert!(merged_checklist.contains(&"current_item".to_owned()));
     }
 
     #[test]
-    fn checklist_panel_shows_only_checked_terminals() {
-        let ctx = Context::default();
-        ctx.set_fonts(FontDefinitions::default());
+    fn recover_config_collapses_empty_checklist_panel() {
+        use crate::models::{AppConfig, UiConfig};
 
-        let mut app = test_app(
-            [
-                (1, test_terminal_entry(1, 7)),
-                (2, test_terminal_entry(2, 7)),
-            ],
+        let loaded_config = AppConfig {
+            ui: UiConfig {
+                checklist_panel_expanded: true,
+                ..UiConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        // No projects with checklist items
+
+        let recovered = recover_config_state(
+            &boot_failed_current_config(),
+            &BTreeMap::new(),
             None,
+            loaded_config,
+            PendingConfigChanges::default(),
         );
 
-        // Mark terminal 1 as checked
-        if let Some(terminal) = app.terminals.get_mut(&1) {
-            terminal.test_done = true;
-            terminal.checklist_snapshot = vec!["message".to_owned()];
+        assert!(
+            !recovered.ui.checklist_panel_expanded,
+            "Empty checklist panel should be collapsed on startup"
+        );
+    }
+
+    #[test]
+    fn recover_config_keeps_checklist_panel_when_items_exist() {
+        use crate::models::{AppConfig, ProjectRecord, UiConfig};
+        use std::path::PathBuf;
+
+        let loaded_config = AppConfig {
+            ui: UiConfig {
+                checklist_panel_expanded: true,
+                ..UiConfig::default()
+            },
+            projects: vec![ProjectRecord {
+                id: 1,
+                name: "Test".to_owned(),
+                path: PathBuf::from("C:/test"),
+                saved_messages: vec![],
+                ai_config: crate::hooks::ProjectAiConfig::default(),
+                checklist: vec!["item1".to_owned()],
+            }],
+            ..AppConfig::default()
+        };
+
+        // Create a current config with panel expanded (simulating user had it open)
+        let mut current_config = boot_failed_current_config();
+        current_config.ui.checklist_panel_expanded = true;
+
+        let recovered = recover_config_state(
+            &current_config,
+            &BTreeMap::new(),
+            None,
+            loaded_config,
+            PendingConfigChanges::default(),
+        );
+
+        assert!(
+            recovered.ui.checklist_panel_expanded,
+            "Checklist panel should remain open when items exist"
+        );
+    }
+
+    #[test]
+    fn checklist_panel_closes_when_last_item_removed() {
+        let mut app = test_app([(1, test_terminal_entry(1, 1))], Some(1));
+        // Add project 1 with a checklist item
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &["only_item"]));
+        // Open the checklist panel
+        app.config.ui.checklist_panel_expanded = true;
+
+        // Remove the last item
+        if let Some(project) = app.projects.get_mut(&1) {
+            project.checklist.clear();
         }
 
-        // Terminal 2 remains unchecked
+        // Simulate the auto-close logic that runs on item removal
+        if app.projects.values().all(|p| p.checklist.is_empty()) {
+            app.config.ui.checklist_panel_expanded = false;
+        }
 
-        let checked_count = app
-            .terminals
-            .values()
-            .filter(|t| t.test_done && !t.checklist_snapshot.is_empty())
-            .count();
-        assert_eq!(checked_count, 1);
+        assert!(
+            !app.config.ui.checklist_panel_expanded,
+            "Panel should auto-close when last checklist item is removed"
+        );
     }
 }

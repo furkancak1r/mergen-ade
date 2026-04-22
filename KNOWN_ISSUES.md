@@ -1863,3 +1863,23 @@
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: 2026-04-13 user-reported paste issue; regression tests `normalize_terminal_clipboard_events_*` (7 tests)
 
+#### Check-list panel empty-state behavior fixed to avoid unnecessary open-on-startup {#check-list-panel-empty-state-behavior-fixed-to-avoid-unnecessary-open-on-startup}
+- Date: 2026-04-22T00:00:00Z
+- Context: main/Windows startup UX and checklist panel auto-collapse
+- Error signature: `Check-list sagdaki panel icerisinde veri yoksa otomatik olarak acik gelmesin ve mergen ade kapanip acilsa bile icindeki verilerin korunmasi lazim`
+- Symptoms/Impact: Checklist panel was opening automatically on every startup even when empty, creating visual noise. However, checklist data was already persisted correctly across restarts.
+- Root cause: The `checklist_panel_expanded` UI flag was persisted and restored without checking whether any checklist items actually existed. The data persistence (checklist items per project) was already working correctly.
+- Resolution: 
+  1. Added `has_any_checklist_items()` helper to detect if any project has checklist items.
+  2. On startup (`bootstrap()`), collapse the panel if no checklist items exist.
+  3. In config recovery (`recover_config_state()`), also collapse if empty after merge.
+  4. When the last checklist item is removed (both from history popup and side panel), auto-collapse the panel immediately.
+  5. Adding items does NOT auto-open the panel; user must explicitly toggle it.
+- Prevent recurrence:
+  - Always validate persisted UI state against actual data before applying on startup.
+  - Keep data persistence (checklist items) separate from view state (panel open/closed).
+  - Add regression tests for both startup collapse and runtime auto-close behaviors.
+- Files/Commands touched: `src/app.rs`, `src/config.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-22 user request; regression tests `recover_config_collapses_empty_checklist_panel`, `recover_config_keeps_checklist_panel_when_items_exist`, `checklist_panel_closes_when_last_item_removed`, `save_and_load_preserves_project_checklist`
+
+

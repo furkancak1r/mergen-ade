@@ -212,6 +212,7 @@ impl From<LegacyAppConfig> for AppConfig {
                     path: project.path,
                     saved_messages: project.saved_messages,
                     ai_config: crate::hooks::ProjectAiConfig::default(),
+                    checklist: Vec::new(),
                 }
             })
             .collect();
@@ -456,6 +457,33 @@ default_shell = "powershell"
             .expect("claude launcher");
 
         assert_eq!(claude.launch_command, "cc");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_and_load_preserves_project_checklist() {
+        use crate::models::ProjectRecord;
+        use std::path::PathBuf;
+
+        let path = unique_temp_path("preserve-project-checklist");
+        let mut config = AppConfig::default();
+        config.projects.push(ProjectRecord {
+            id: 1,
+            name: "Test Project".to_owned(),
+            path: PathBuf::from("C:/test"),
+            saved_messages: vec!["msg1".to_owned()],
+            ai_config: crate::hooks::ProjectAiConfig::default(),
+            checklist: vec!["item1".to_owned(), "item2".to_owned()],
+        });
+
+        save_config(&path, &config).expect("should save config");
+
+        let loaded = load_config(&path).expect("should load config");
+        assert_eq!(loaded.projects.len(), 1);
+        assert_eq!(loaded.projects[0].checklist.len(), 2);
+        assert!(loaded.projects[0].checklist.contains(&"item1".to_owned()));
+        assert!(loaded.projects[0].checklist.contains(&"item2".to_owned()));
 
         let _ = fs::remove_file(path);
     }

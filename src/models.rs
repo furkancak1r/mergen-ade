@@ -393,6 +393,10 @@ pub struct ProjectRecord {
     pub saved_messages: Vec<String>,
     #[serde(default)]
     pub ai_config: ProjectAiConfig,
+    /// Checklist items (prompts marked by user from history popup).
+    /// Persisted across sessions; survives terminal closure.
+    #[serde(default)]
+    pub checklist: Vec<String>,
 }
 
 /// A single recorded terminal input.
