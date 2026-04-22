@@ -1128,6 +1128,7 @@ struct TerminalHeldKeyRepeatTiming {
 #[derive(Debug, Clone)]
 struct TerminalRowData {
     id: u64,
+    project_id: u64,
     full_title: String,
     exited: bool,
     recent_inputs: VecDeque<String>,
@@ -2809,7 +2810,10 @@ impl AdeApp {
 
         // Load input history
         let history_path = config::history_path().unwrap_or_else(|_| PathBuf::from("history.json"));
-        let input_history = config::load_history(&history_path).unwrap_or_default();
+        let (input_history, history_load_error) = match config::load_history(&history_path) {
+            Ok(history) => (history, None),
+            Err(err) => (AppHistory::default(), Some(err.to_string())),
+        };
 
         let app = Self {
             config_path,
@@ -2868,6 +2872,11 @@ impl AdeApp {
             directory_pending_tree_open_state_by_project: BTreeMap::new(),
             status_line: config_load_error
                 .map(|err| format!("Config load error: {err}. Existing config preserved."))
+                .or_else(|| {
+                    history_load_error.map(|err| {
+                        format!("History load error: {err}. Started with empty history.")
+                    })
+                })
                 .or_else(|| {
                     factory_droid_hooks_dir_error
                         .as_ref()
@@ -2955,6 +2964,33 @@ impl AdeApp {
         if recovered_from_disk {
             self.status_line = "Config recovered and changes saved.".to_owned();
         }
+    }
+
+    /// Persist input history to disk (synchronous).
+    fn persist_history(&mut self) {
+        if let Err(err) = config::save_history(&self.history_path, &self.input_history) {
+            self.status_line = format!("History save error: {err}");
+        }
+    }
+
+    /// Returns the most recent input texts for a project (from persistent history),
+    /// in display order (newest first), up to RECENT_INPUTS_MAX items.
+    fn recent_inputs_from_history(&self, project_id: u64) -> VecDeque<String> {
+        let Some(project) = self.projects.get(&project_id) else {
+            return VecDeque::new();
+        };
+        let project_path = project.path.display().to_string();
+        self.input_history
+            .projects
+            .get(&project_path)
+            .map(|h| {
+                h.entries
+                    .iter()
+                    .take(Self::RECENT_INPUTS_MAX)
+                    .map(|e| e.text.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn note_ui_config_changed(&mut self) {
@@ -3204,6 +3240,9 @@ impl AdeApp {
         };
 
         let fallback_title = format!("Terminal {terminal_id}");
+        // Hydrate recent_inputs from persisted project history so the history popup
+        // survives restarts and binary updates.
+        let hydrated_recent_inputs = self.recent_inputs_from_history(project_id);
         let entry = TerminalEntry {
             id: terminal_id,
             project_id,
@@ -3212,7 +3251,7 @@ impl AdeApp {
             title: fallback_title.clone(),
             full_title: fallback_title,
             pending_line_for_title: String::new(),
-            recent_inputs: VecDeque::new(),
+            recent_inputs: hydrated_recent_inputs,
             in_main_view: true,
             dirty: true,
             last_seqno: runtime.latest_seqno(),
@@ -7914,15 +7953,38 @@ impl AdeApp {
     }
 
     fn terminal_ids_for_single_view_navigation(&self) -> Vec<u64> {
-        // Return all terminals matching the current filter, across all projects
-        // This enables Ctrl+Alt+Arrow to navigate across project boundaries.
+        // Return all terminals matching the current filter, across all projects,
+        // in visual order (sorted projects, then terminals within each project).
+        // This enables Ctrl+Alt+Arrow to navigate across project boundaries
+        // following the same order as the Terminal Manager UI.
         // Include exited terminals so recovery from an exited terminal works.
         let kind = self.config.ui.terminal_manager_filter.terminal_kind();
-        self.terminals
-            .iter()
-            .filter(|(_, terminal)| terminal.kind == kind)
-            .map(|(id, _)| *id)
-            .collect()
+
+        // Fallback: if no projects exist but terminals do (e.g., some test cases),
+        // return terminals in ID order for backward compatibility.
+        if self.projects.is_empty() {
+            return self
+                .terminals
+                .iter()
+                .filter(|(_, terminal)| terminal.kind == kind)
+                .map(|(id, _)| *id)
+                .collect();
+        }
+
+        let mut result = Vec::new();
+        for project in sorted_projects(&self.projects) {
+            // Collect terminals for this project in their natural BTreeMap order
+            let mut project_terminals: Vec<u64> = self
+                .terminals
+                .iter()
+                .filter(|(_, terminal)| terminal.project_id == project.id && terminal.kind == kind)
+                .map(|(id, _)| *id)
+                .collect();
+            // Sort by terminal ID to ensure stable ordering within project
+            project_terminals.sort_unstable();
+            result.extend(project_terminals);
+        }
+        result
     }
 
     fn route_active_terminal_input(&mut self, ctx: &egui::Context, events: Vec<Event>) {
@@ -11957,6 +12019,7 @@ impl AdeApp {
                 };
                 TerminalRowData {
                     id: terminal.id,
+                    project_id: terminal.project_id,
                     full_title: terminal.full_title.clone(),
                     exited: terminal.exited,
                     recent_inputs: terminal.recent_inputs.clone(),
@@ -12140,8 +12203,15 @@ impl AdeApp {
                         action_clicked |= message_response.clicked();
 
                         // History button - opens popup with recent inputs
+                        // Consider persisted history as well so the button is available
+                        // after restarts and binary updates.
+                        let has_runtime_history = !terminal_data.recent_inputs.is_empty();
+                        let has_persisted_history = !terminal_data.exited
+                            && !self
+                                .recent_inputs_from_history(terminal_data.project_id)
+                                .is_empty();
                         let has_history =
-                            !terminal_data.exited && !terminal_data.recent_inputs.is_empty();
+                            !terminal_data.exited && (has_runtime_history || has_persisted_history);
                         let history_button_response = with_minimal_button_chrome(ui, |ui| {
                             ui.button(format!("{}", icons::CLOCK))
                                 .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -12204,11 +12274,18 @@ impl AdeApp {
                 let popup_id = ui.id().with(("terminal_history_popup", terminal_id));
 
                 // Get recent inputs and project_id for this terminal
-                let (recent_inputs, project_id) = self
+                let (runtime_recent_inputs, project_id) = self
                     .terminals
                     .get(&terminal_id)
                     .map(|t| (t.recent_inputs.clone(), t.project_id))
                     .unwrap_or_default();
+
+                // Fallback to persisted history if runtime recent_inputs is empty
+                let recent_inputs = if runtime_recent_inputs.is_empty() {
+                    self.recent_inputs_from_history(project_id)
+                } else {
+                    runtime_recent_inputs
+                };
 
                 // Close popup if terminal exited, has no history, or row_rect unavailable
                 if recent_inputs.is_empty()
@@ -13593,6 +13670,7 @@ impl eframe::App for AdeApp {
         }
 
         self.persist_config();
+        self.persist_history();
     }
 }
 
@@ -22402,6 +22480,123 @@ mod tests {
     }
 
     #[test]
+    fn handle_shortcuts_follows_project_order_not_terminal_id_order() {
+        // Regression test: navigation should follow visual order (sorted projects),
+        // not raw terminal ID order.
+        let ctx = Context::default();
+
+        // Create terminals with IDs: 1, 2, 3 in projects 9, 7, 5
+        // Project names determine sort order: "Alpha" (5) < "Beta" (7) < "Gamma" (9)
+        // So visual order is: terminal 3 (proj 5), terminal 2 (proj 7), terminal 1 (proj 9)
+        let mut terminal1 = test_terminal_entry(1, 9);
+        terminal1.kind = TerminalKind::Foreground;
+        let mut terminal2 = test_terminal_entry(2, 7);
+        terminal2.kind = TerminalKind::Foreground;
+        let mut terminal3 = test_terminal_entry(3, 5);
+        terminal3.kind = TerminalKind::Foreground;
+
+        let mut app = test_app(
+            [(1, terminal1), (2, terminal2), (3, terminal3)],
+            Some(3), // Active terminal is in project 5 (first in visual order)
+        );
+
+        // Setup projects in different order than terminal IDs
+        // "Alpha" sorts first alphabetically
+        app.projects
+            .insert(5, test_project(5, "Alpha", "C:/alpha", &[], &[]));
+        app.projects
+            .insert(7, test_project(7, "Beta", "C:/beta", &[], &[]));
+        app.projects
+            .insert(9, test_project(9, "Gamma", "C:/gamma", &[], &[]));
+
+        // Verify navigation order follows project order, not terminal ID order
+        // Visual order: [3 (Alpha), 2 (Beta), 1 (Gamma)]
+
+        // Ctrl+Alt+Down from terminal 3 (index 0) should go to terminal 2 (index 1)
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowDown,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        // Should go from terminal 3 to terminal 2 (next in visual order, not ID order)
+        assert_eq!(app.active_terminal, Some(2));
+
+        // Now Ctrl+Alt+Down from terminal 2 (index 1) should go to terminal 1 (index 2)
+        app.set_active_terminal(&ctx, Some(2));
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowDown,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        // Should go from terminal 2 to terminal 1 (next in visual order)
+        assert_eq!(app.active_terminal, Some(1));
+
+        // Now at last terminal (index 2), Ctrl+Alt+Down should wrap to terminal 3 (index 0)
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowDown,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        // Should wrap from terminal 1 to terminal 3
+        assert_eq!(app.active_terminal, Some(3));
+
+        // Verify Up direction follows visual order too
+        // From terminal 3 (index 0), Up should wrap to terminal 1 (index 2, last)
+        app.set_active_terminal(&ctx, Some(3));
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowUp,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        // Up from first should wrap to last (terminal 1)
+        assert_eq!(app.active_terminal, Some(1));
+    }
+
+    #[test]
     fn handle_shortcuts_cycles_filter_with_ctrl_right_in_single_view() {
         let ctx = Context::default();
         ctx.input_mut(|input| {
@@ -28770,5 +28965,150 @@ mod tests {
             !app.config.ui.checklist_panel_expanded,
             "Panel should auto-close when last checklist item is removed"
         );
+    }
+
+    #[test]
+    fn recent_inputs_from_history_returns_persisted_entries() {
+        use crate::models::{TerminalInputHistory, TerminalInputRecord, TerminalKind};
+        use std::path::PathBuf;
+
+        let mut app = test_app([(1, test_terminal_entry(1, 1))], Some(1));
+
+        // Add a project
+        app.projects.insert(
+            1,
+            test_project(1, "Test", "C:/test", &["msg1"], &["check1"]),
+        );
+
+        // Populate persisted history
+        let project_history = TerminalInputHistory {
+            max_entries: 500,
+            entries: vec![
+                TerminalInputRecord {
+                    project_path: PathBuf::from("C:/test"),
+                    project_name: "Test".to_owned(),
+                    terminal_kind: TerminalKind::Foreground,
+                    text: "cargo build".to_owned(),
+                    recorded_at: 1000,
+                },
+                TerminalInputRecord {
+                    project_path: PathBuf::from("C:/test"),
+                    project_name: "Test".to_owned(),
+                    terminal_kind: TerminalKind::Background,
+                    text: "git status".to_owned(),
+                    recorded_at: 1001,
+                },
+            ],
+        };
+        app.input_history
+            .projects
+            .insert("C:/test".to_owned(), project_history);
+
+        // Verify recent_inputs_from_history returns the texts in correct order
+        let recent = app.recent_inputs_from_history(1);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0], "cargo build");
+        assert_eq!(recent[1], "git status");
+    }
+
+    #[test]
+    fn recent_inputs_from_history_returns_empty_for_unknown_project() {
+        let app = test_app([(1, test_terminal_entry(1, 1))], Some(1));
+
+        // No project with id 999 exists
+        let recent = app.recent_inputs_from_history(999);
+        assert!(recent.is_empty());
+    }
+
+    #[test]
+    fn recent_inputs_from_history_limits_to_max() {
+        use crate::models::{TerminalInputHistory, TerminalInputRecord, TerminalKind};
+        use std::path::PathBuf;
+
+        let mut app = test_app([(1, test_terminal_entry(1, 1))], Some(1));
+        app.projects.insert(
+            1,
+            test_project(1, "Test", "C:/test", &["msg1"], &["check1"]),
+        );
+
+        // Create more entries than RECENT_INPUTS_MAX (which is 5)
+        let entries: Vec<TerminalInputRecord> = (0..10)
+            .map(|i| TerminalInputRecord {
+                project_path: PathBuf::from("C:/test"),
+                project_name: "Test".to_owned(),
+                terminal_kind: TerminalKind::Foreground,
+                text: format!("cmd{}", i),
+                recorded_at: i as u64,
+            })
+            .collect();
+
+        let project_history = TerminalInputHistory {
+            max_entries: 500,
+            entries,
+        };
+        app.input_history
+            .projects
+            .insert("C:/test".to_owned(), project_history);
+
+        // Should be limited to RECENT_INPUTS_MAX (5)
+        let recent = app.recent_inputs_from_history(1);
+        assert_eq!(recent.len(), 5);
+        // Newest first
+        assert_eq!(recent[0], "cmd0");
+        assert_eq!(recent[4], "cmd4");
+    }
+
+    #[test]
+    fn persist_history_writes_to_disk() {
+        use crate::models::{TerminalInputHistory, TerminalInputRecord, TerminalKind};
+        use std::fs;
+        use std::path::PathBuf;
+
+        let mut app = test_app([(1, test_terminal_entry(1, 1))], Some(1));
+
+        // Add a project (required for history recording)
+        app.projects.insert(
+            1,
+            test_project(1, "Test", "C:/test", &["msg1"], &["check1"]),
+        );
+
+        // Set up a temp history file
+        let temp_path = std::env::temp_dir().join(format!(
+            "mergen-ade-test-history-{}.json",
+            std::process::id()
+        ));
+        app.history_path = temp_path.clone();
+
+        // Populate history directly (bypassing the async record_input_history)
+        let project_history = TerminalInputHistory {
+            max_entries: 500,
+            entries: vec![TerminalInputRecord {
+                project_path: PathBuf::from("C:/test"),
+                project_name: "Test".to_owned(),
+                terminal_kind: TerminalKind::Foreground,
+                text: "test command".to_owned(),
+                recorded_at: 1000,
+            }],
+        };
+        app.input_history
+            .projects
+            .insert("C:/test".to_owned(), project_history);
+
+        // Persist synchronously
+        app.persist_history();
+
+        // Verify file exists and has content
+        assert!(
+            temp_path.exists(),
+            "history file should exist after persist"
+        );
+        let content = fs::read_to_string(&temp_path).expect("should read history file");
+        assert!(
+            content.contains("test command"),
+            "history should contain the recorded command"
+        );
+
+        // Cleanup
+        let _ = fs::remove_file(&temp_path);
     }
 }

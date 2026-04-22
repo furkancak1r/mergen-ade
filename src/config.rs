@@ -239,7 +239,7 @@ fn normalize_config_for_current_platform(config: &mut AppConfig) {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_config, save_config};
+    use super::{load_config, load_history, save_config, save_history};
     use crate::models::{AppConfig, BuiltinLauncherKind, ShellKind, TerminalManagerFilter};
     use std::fs;
     use std::path::PathBuf;
@@ -494,5 +494,62 @@ default_shell = "powershell"
             .expect("time should move forward")
             .as_nanos();
         std::env::temp_dir().join(format!("mergen-ade-{label}-{unique}.toml"))
+    }
+
+    #[test]
+    fn save_and_load_history_roundtrip() {
+        use crate::models::{AppHistory, TerminalInputHistory, TerminalInputRecord, TerminalKind};
+        use std::path::PathBuf;
+
+        let path = unique_temp_path("history-roundtrip").with_extension("json");
+        let mut history = AppHistory::default();
+
+        // Add some entries
+        let project_history = TerminalInputHistory {
+            max_entries: 500,
+            entries: vec![
+                TerminalInputRecord {
+                    project_path: PathBuf::from("C:/test"),
+                    project_name: "Test Project".to_owned(),
+                    terminal_kind: TerminalKind::Foreground,
+                    text: "cargo build".to_owned(),
+                    recorded_at: 1234567890,
+                },
+                TerminalInputRecord {
+                    project_path: PathBuf::from("C:/test"),
+                    project_name: "Test Project".to_owned(),
+                    terminal_kind: TerminalKind::Background,
+                    text: "git status".to_owned(),
+                    recorded_at: 1234567891,
+                },
+            ],
+        };
+        history
+            .projects
+            .insert("C:/test".to_owned(), project_history);
+
+        // Save and reload
+        save_history(&path, &history).expect("should save history");
+        let loaded = load_history(&path).expect("should load history");
+
+        // Verify
+        assert_eq!(loaded.projects.len(), 1);
+        let loaded_project = loaded
+            .projects
+            .get("C:/test")
+            .expect("project should exist");
+        assert_eq!(loaded_project.entries.len(), 2);
+        assert_eq!(loaded_project.entries[0].text, "cargo build");
+        assert_eq!(loaded_project.entries[1].text, "git status");
+        assert_eq!(
+            loaded_project.entries[0].terminal_kind,
+            TerminalKind::Foreground
+        );
+        assert_eq!(
+            loaded_project.entries[1].terminal_kind,
+            TerminalKind::Background
+        );
+
+        let _ = fs::remove_file(path);
     }
 }

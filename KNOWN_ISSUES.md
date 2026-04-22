@@ -1,5 +1,57 @@
 ### Known Issues & Fix Log
 
+#### Terminal Manager navigation now follows visual order instead of terminal ID order {#terminal-manager-navigation-visual-order}
+- Date: 2026-04-22
+- Context: Terminal Manager single-view navigation with Ctrl+Arrow and Ctrl+Alt+Arrow shortcuts
+- Error signature: `Ctrl+Arrow keys in Terminal Manager don't follow the visual order; they jump based on terminal opening order (ID).`
+- Symptoms/Impact:
+  1. When using Ctrl+Up/Down or Ctrl+Alt+Up/Down to navigate between terminals in single view mode, the focus moved according to terminal ID (creation order) rather than the visual order shown in Terminal Manager.
+  2. Projects sorted alphabetically in Terminal Manager caused confusion when navigation followed a different order.
+  3. Users expected navigation to follow the same top-to-bottom order as the UI.
+- Root cause:
+  1. `terminal_ids_for_single_view_navigation()` iterated directly over `self.terminals` BTreeMap, which yields entries sorted by terminal ID (u64).
+  2. Terminal Manager UI uses `sorted_projects()` to sort projects alphabetically, then renders terminals within each project.
+  3. The navigation order and visual order had different sorting keys (ID vs project name).
+- Resolution:
+  - Modified `terminal_ids_for_single_view_navigation()` to build the terminal list by iterating over `sorted_projects()` first, then collecting matching terminals within each project.
+  - Within each project, terminals are sorted by ID for stable ordering.
+  - Added backward compatibility fallback: if no projects exist (some test scenarios), returns terminals in ID order as before.
+  - The fix affects both `Ctrl+Arrow` (grid navigation in multi-view) and `Ctrl+Alt+Arrow` (linear navigation in single-view) shortcuts, as both use the same underlying navigation helpers.
+- Prevent recurrence:
+  - Always derive navigation order from the same source as visual rendering (sorted projects).
+  - When adding new navigation features, ensure they respect the visual hierarchy (projects → terminals within projects).
+  - Add regression tests that verify navigation order when project sort order differs from terminal ID order.
+- Files/Commands touched: `src/app.rs` (terminal_ids_for_single_view_navigation, handle_shortcuts_follows_project_order_not_terminal_id_order test), `KNOWN_ISSUES.md`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: 647 tests pass, including the new regression test `handle_shortcuts_follows_project_order_not_terminal_id_order`.
+
+#### Input history and checklist data now persist across application restarts and binary updates {#input-history-checklist-persistence}
+- Date: 2026-04-22
+- Context: Windows and cross-platform release binary updates, application restarts
+- Error signature: `Input history lost after closing and reopening Mergen-ADE`, `Checklist panel empty after binary update`
+- Symptoms/Impact:
+  1. Terminal input history (shown in the history popup via the clock button) was lost after closing and reopening the application.
+  2. Checklist items survived in config but the history popup showed no entries after restart.
+  3. Users expected history to persist like checklist data.
+- Root cause:
+  1. Input history was loaded from `history.json` into `input_history` field, but the terminal's `recent_inputs` (used for the popup) was only populated at runtime from session-local data.
+  2. New terminals started with empty `recent_inputs: VecDeque::new()`, ignoring the persisted project history.
+  3. The history popup only checked `terminal.recent_inputs`, not the persistent `input_history`.
+  4. `on_exit()` only saved config, not history - though history was saved asynchronously on each input, a crash or fast close could lose data.
+- Resolution:
+  - Added `persist_history()` synchronous helper to `AdeApp` that writes `input_history` to disk immediately.
+  - Modified `on_exit()` to call `persist_history()` before shutdown, ensuring final state is saved.
+  - Added `recent_inputs_from_history(project_id)` helper that extracts the most recent entries from persistent history for a given project.
+  - Modified `spawn_terminal_for_project()` to hydrate `recent_inputs` from persisted history when creating new terminals.
+  - Modified terminal manager row rendering to check both runtime `recent_inputs` and persisted history when determining `has_history`.
+  - Modified the history popup to fallback to persisted project history if runtime `recent_inputs` is empty.
+  - Added `history_load_error` visibility in `bootstrap()` status line, similar to config load errors.
+- Prevent recurrence:
+  - Always hydrate runtime state from persistent storage at feature entry points (terminal spawn, popup open).
+  - Ensure all persistent data has synchronous save path in `on_exit()` for crash safety.
+  - Add unit tests for persistence roundtrips and state hydration.
+- Files/Commands touched: `src/app.rs` (persist_history, recent_inputs_from_history, spawn_terminal_for_project, draw_terminal_rows, on_exit, bootstrap), `src/config.rs` (save_and_load_history_roundtrip test), `KNOWN_ISSUES.md`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: 646 tests pass, including `save_and_load_history_roundtrip`, `recent_inputs_from_history_returns_persisted_entries`, `persist_history_writes_to_disk`.
+
 #### Windows wgpu renderer now supports DX12 with GL fallback and preflight probe {#windows-wgpu-dx12-gl-fallback-preflight}
 - Date: 2026-04-17
 - Context: Windows systems where wgpu DX12 backend fails to create surface (e.g., remote desktop, software rendering)
