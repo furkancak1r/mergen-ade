@@ -1,5 +1,30 @@
 ### Known Issues & Fix Log
 
+#### Semgrep UnicodeEncodeError on Windows — environment variable fix required {#semgrep-windows-unicode}
+- Date: 2026-04-22
+- Context: Windows PowerShell, Semgrep security scanning
+- Error signature: `UnicodeEncodeError: 'charmap' codec can't encode character '\u202a'`
+- Symptoms/Impact:
+  1. `semgrep scan --config=auto` fails when downloading community rules with Unicode characters.
+  2. Error occurs in `semgrep.config_resolver.parse_config_string` when writing temp file.
+  3. Blocking git commit/push workflows that require semgrep validation.
+- Root cause:
+  1. Python 3.12 on Windows defaults to `cp1254` locale encoding instead of UTF-8.
+  2. Semgrep writes downloaded config to temp file without explicit encoding: `os.fdopen(tmp_fd, "w")`.
+  3. Community rules contain Unicode character U+202A (Left-to-Right Embedding) which `cp1254` cannot encode.
+- Resolution:
+  - Set user environment variable `PYTHONUTF8=1` to force Python UTF-8 mode globally.
+  - PowerShell command: `[System.Environment]::SetEnvironmentVariable("PYTHONUTF8", "1", "User")`
+  - Alternative: Use `python -X utf8 -m semgrep` for one-off scans.
+- Action Required:
+  - **Restart all PowerShell/terminal windows** after setting the environment variable.
+  - Verify fix: Run `semgrep scan --config=auto --error src/` — should complete with 0 findings.
+- Prevent recurrence:
+  - This is a machine-level environment configuration; document for new Windows dev environments.
+  - Consider adding `PYTHONUTF8=1` to CI/CD pipelines or dev container configs.
+- Files/Commands touched: Windows User Environment Variables, `KNOWN_ISSUES.md`
+- References: `sys.flags.utf8_mode`, `PYTHONUTF8`, https://docs.python.org/3/using/cmdline.html#envvar-PYTHONUTF8
+
 #### Terminal Manager navigation now follows visual order instead of terminal ID order {#terminal-manager-navigation-visual-order}
 - Date: 2026-04-22
 - Context: Terminal Manager single-view navigation with Ctrl+Arrow and Ctrl+Alt+Arrow shortcuts
@@ -1933,5 +1958,50 @@
   - Add regression tests for both startup collapse and runtime auto-close behaviors.
 - Files/Commands touched: `src/app.rs`, `src/config.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: 2026-04-22 user request; regression tests `recover_config_collapses_empty_checklist_panel`, `recover_config_keeps_checklist_panel_when_items_exist`, `checklist_panel_closes_when_last_item_removed`, `save_and_load_preserves_project_checklist`
+
+#### OpenCode can appear stuck at Loading plugins when too many DBHub MCPs start together {#opencode-loading-plugins-dbhub-mcp-startup}
+- Date: 2026-04-27T00:00:00Z
+- Context: main/Windows Mergen terminal launching OpenCode from a project after global OpenCode config and model settings were already valid
+- Error signature: `OpenCode stayed on Loading plugins only inside Mergen; terminal OpenCode worked normally.`
+- Symptoms/Impact: OpenCode could not reach the interactive input screen from Mergen when all DBHub MCP servers were enabled. The UI label remained `Loading plugins`, but logs showed startup time was dominated by `/mcp` and `/command`.
+- Root cause: Four local DBHub MCP servers launched together via `npx -y @bytebase/dbhub`, pushing OpenCode startup beyond Mergen's practical UI tolerance. Each DBHub instance initialized successfully but returned non-fatal `MCP error -32601` for resources/prompts, adding startup noise. The Mergen-owned `mergen-opencode-status.js` plugin was initially suspected, but isolation later showed it was not the active blocker.
+- Resolution: Keep the Mergen OpenCode status plugin and local HTTP status bridge enabled. Limit active DBHub MCP servers to a stable set of three when launching OpenCode inside Mergen, or optimize DBHub startup before enabling all four together.
+- Prevent recurrence:
+  - When debugging `Loading plugins`, check OpenCode logs for slow `/mcp` and `/command` requests before disabling Mergen's status plugin.
+  - Validate MCP combinations one at a time and then in groups; all individual MCPs may pass while the combined startup load still blocks the UI.
+  - Keep `mergen-opencode-status.js` available unless current logs directly implicate the plugin.
+- Files/Commands touched: `src/app.rs`, `src/terminal.rs`, `src/main.rs`, `src/hooks.rs`, `src/opencode.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: 2026-04-27 user-reported Mergen-only OpenCode `Loading plugins` hang; MCP isolation showed `openaiDeveloperDocs + 3 DBHub` opened while `openaiDeveloperDocs + 4 DBHub` and four DBHub together hung around 13-14 seconds of startup.
+
+#### Codex CLI terminal scroll instability (viewport jumping) {#codex-cli-scroll-instability}
+- Date: 2026-04-27
+- Context: Codex CLI (v0.121.0+) running inside Mergen terminal on Windows
+- Error signature: `Terminal content continuously slides upward/jumps compared to stable OpenCode behavior.`
+- Symptoms/Impact:
+  - Codex TUI redraws caused the terminal viewport to scroll unpredictably
+  - Content would slide up during agent responses, making it hard to follow the conversation
+  - OpenCode (same Mergen terminal infrastructure) remained stable, indicating Codex-specific behavior
+- Root cause:
+  1. Codex CLI sends aggressive synchronized output blocks (DECSET 2026) containing ED2 (`ESC[2J` - erase display) and ED3 (`ESC[3J` - erase scrollback) sequences
+  2. These clear sequences are intended for the TUI's internal buffer management during atomic updates, not for actual terminal clearing in the context of a scrollback-enabled terminal
+  3. wezterm-term (underlying terminal emulation) processes these sequences, causing visible viewport jumps when scrollback exists
+  4. Mergen's ScrollArea stickiness alone could not prevent the jumps because the sequences modify the terminal state before rendering
+- Resolution:
+  - Implemented stateful `CodexRedrawFilter` in `terminal.rs` that:
+    - Tracks synchronized output mode state (ESC[?2026h / ESC[?2026l)
+    - Suppresses ED2 (CSI 2J) and ED3 (CSI 3J) sequences only when inside a synchronized block
+    - Passes through all other sequences and normal text unchanged
+  - Added `active_ai_tool: Arc<Mutex<Option<AiCliTool>>>` to `TerminalRuntime` to enable tool-specific filtering
+  - Integrated filter into `spawn_reader_thread` - only activates when current tool is `CodexCli`
+  - AI signal parsing uses original (unfiltered) bytes to maintain hook compatibility
+  - Updated all AI tool state management (`mark_*_launch_pending`, `clear_*_state`) to sync `active_ai_tool`
+- Prevent recurrence:
+  - Keep terminal filtering minimal and tool-specific - only Codex triggers this filter
+  - Test split-chunk scenarios where escape sequences span IO buffer boundaries
+  - Document that synchronized output clear sequences are often TUI-internal, not user-facing
+  - Maintain separation between terminal display filtering and AI signal parsing paths
+- Files/Commands touched: `src/terminal.rs` (CodexRedrawFilter struct, spawn_reader_thread, TerminalRuntime), `src/app.rs` (active_ai_tool sync in all AI tool handlers), `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: AGENTS.md AI CLI Integration section; wezterm-term CSI sequence handling; Codex CLI TUI redraw behavior analysis
+
 
 

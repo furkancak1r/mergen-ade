@@ -61,6 +61,213 @@ const IO_BUFFER_SIZE: usize = 16 * 1024;
 #[cfg(target_os = "windows")]
 const GRACEFUL_TERMINATION_TIMEOUT_MS: u32 = 300;
 
+/// Filters Codex CLI's aggressive redraw sequences during synchronized output.
+/// When active, suppresses ED2 (erase display) and ED3 (erase scrollback)
+/// sequences that cause viewport jumping in the Mergen terminal view.
+///
+/// Codex sends `ESC[?2026h` (begin sync), then `ESC[2J` / `ESC[3J` clears,
+/// then `ESC[?2026l` (end sync). These clears are for the TUI's internal
+/// buffer management, not for actual terminal clearing in our context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CodexRedrawFilter {
+    /// True when inside a synchronized update block (ESC[?2026h ... ESC[?2026l)
+    sync_active: bool,
+    /// Partial escape sequence buffer for sequences split across chunks
+    pending: [u8; 16],
+    pending_len: usize,
+}
+
+/// Action to take for a processed escape sequence
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterAction {
+    /// Emit the sequence to output (for sync start/end and pass-through CSI)
+    Emit(usize),
+    /// Suppress the sequence (for ED2/ED3 during sync)
+    Suppress(usize),
+    /// Incomplete sequence, need more bytes
+    Incomplete,
+    /// Not a sequence we handle, pass through byte-by-byte
+    Unknown,
+}
+
+impl CodexRedrawFilter {
+    pub const fn new() -> Self {
+        Self {
+            sync_active: false,
+            pending: [0; 16],
+            pending_len: 0,
+        }
+    }
+
+    /// Process bytes and return filtered output.
+    /// Clears sequences ED2 (ESC[2J) and ED3 (ESC[3J) are suppressed
+    /// when sync_active is true. Sync state is tracked via 2026 mode.
+    pub fn filter(&mut self, input: &[u8], output: &mut Vec<u8>) {
+        output.clear();
+
+        // Pre-allocate roughly the input size (we usually don't remove much)
+        output.reserve(input.len());
+
+        let mut i = 0;
+        let len = input.len();
+
+        // First, handle any pending bytes from previous chunk
+        if self.pending_len > 0 {
+            // Combine pending + new input to process the sequence
+            let combined_len = self.pending_len + len;
+            let mut combined = vec![0u8; combined_len];
+            combined[..self.pending_len].copy_from_slice(&self.pending[..self.pending_len]);
+            combined[self.pending_len..].copy_from_slice(input);
+
+            match self.process_sequence(&combined) {
+                FilterAction::Emit(consumed) => {
+                    // Emit the complete sequence
+                    output.extend_from_slice(&combined[..consumed]);
+                    self.pending_len = 0;
+                    i = consumed.saturating_sub(self.pending_len);
+                    // Clamp i to not exceed len
+                    if i > len {
+                        i = len;
+                    }
+                }
+                FilterAction::Suppress(consumed) => {
+                    // Just consume, don't emit
+                    self.pending_len = 0;
+                    i = consumed.saturating_sub(self.pending_len);
+                    if i > len {
+                        i = len;
+                    }
+                }
+                FilterAction::Incomplete => {
+                    // Still incomplete - buffer all input and return
+                    if combined_len <= self.pending.len() {
+                        self.pending[..combined_len].copy_from_slice(&combined);
+                        self.pending_len = combined_len;
+                    } else {
+                        // Too long, just pass through what we have
+                        output.extend_from_slice(&self.pending[..self.pending_len]);
+                        output.extend_from_slice(input);
+                        self.pending_len = 0;
+                    }
+                    return;
+                }
+                FilterAction::Unknown => {
+                    // Not a sequence we handle - output pending bytes and continue
+                    output.extend_from_slice(&self.pending[..self.pending_len]);
+                    self.pending_len = 0;
+                    // i stays 0, process input normally
+                }
+            }
+        }
+
+        while i < len {
+            if input[i] == 0x1b {
+                // Start of escape sequence - look ahead
+                let remaining = &input[i..];
+                match self.process_sequence(remaining) {
+                    FilterAction::Emit(consumed) => {
+                        output.extend_from_slice(&remaining[..consumed]);
+                        i += consumed;
+                    }
+                    FilterAction::Suppress(consumed) => {
+                        // Just advance, don't emit
+                        i += consumed;
+                    }
+                    FilterAction::Incomplete => {
+                        // Buffer for next chunk
+                        if remaining.len() <= self.pending.len() {
+                            self.pending[..remaining.len()].copy_from_slice(remaining);
+                            self.pending_len = remaining.len();
+                        } else {
+                            // Too long for buffer, pass through byte-by-byte
+                            output.push(input[i]);
+                        }
+                        break;
+                    }
+                    FilterAction::Unknown => {
+                        // Not a sequence we handle, pass through byte-by-byte
+                        output.push(input[i]);
+                        i += 1;
+                    }
+                }
+            } else {
+                output.push(input[i]);
+                i += 1;
+            }
+        }
+    }
+
+    /// Process an escape sequence, updating state and returning action to take.
+    fn process_sequence(&mut self, seq: &[u8]) -> FilterAction {
+        if seq.is_empty() || seq[0] != 0x1b {
+            return FilterAction::Unknown;
+        }
+
+        // Check for CSI sequences: ESC [ ...
+        if seq.len() >= 2 && seq[1] == b'[' {
+            // Look for the command character (uppercase letter, lowercase letter, or @/\/~)
+            let mut param_end = 0;
+            for (idx, &b) in seq.iter().enumerate().skip(2) {
+                if (b >= b'A' && b <= b'Z')
+                    || (b >= b'a' && b <= b'z')
+                    || b == b'@'
+                    || b == b'\\'
+                    || b == b'~'
+                {
+                    param_end = idx;
+                    break;
+                }
+                // Only allow valid parameter bytes (digits, ;, ?, :)
+                if !b.is_ascii_digit() && b != b';' && b != b'?' && b != b':' {
+                    // Invalid sequence, abort
+                    break;
+                }
+            }
+
+            if param_end == 0 {
+                // No command character found yet - check if we might get more bytes
+                if seq.len() < 16 {
+                    return FilterAction::Incomplete;
+                }
+                // Too long, treat as unknown
+                return FilterAction::Unknown;
+            }
+
+            if param_end >= seq.len() {
+                // Incomplete sequence
+                return FilterAction::Incomplete;
+            }
+
+            let cmd = seq[param_end];
+            let params = &seq[2..param_end];
+            let full_len = param_end + 1;
+
+            // Check for synchronized update mode (2026)
+            if cmd == b'h' || cmd == b'l' {
+                if params == b"?2026" {
+                    self.sync_active = cmd == b'h';
+                    return FilterAction::Emit(full_len);
+                }
+            }
+
+            // Check for erase sequences when sync is active
+            if self.sync_active && cmd == b'J' {
+                // ED2 (2J) = erase display, ED3 (3J) = erase scrollback
+                if params == b"2" || params == b"3" || params == b"?2" || params == b"?3" {
+                    // Suppress these sequences during sync
+                    return FilterAction::Suppress(full_len);
+                }
+            }
+
+            // Other CSI sequence - pass through
+            return FilterAction::Emit(full_len);
+        }
+
+        // Not a CSI sequence we handle
+        FilterAction::Unknown
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalColor {
     pub r: u8,
@@ -285,6 +492,8 @@ pub struct TerminalRuntime {
     forced_codex_process_probe: Mutex<Option<TestCodexProcessProbe>>,
     #[cfg(test)]
     queued_codex_process_probe_after_next_input: Mutex<Option<TestCodexProcessProbe>>,
+    /// Current active AI CLI tool for this terminal, used to enable Codex-specific filtering.
+    active_ai_tool: Arc<Mutex<Option<AiCliTool>>>,
 }
 
 enum RuntimeCommand {
@@ -491,8 +700,6 @@ impl TerminalRuntime {
                 command.env(name, value);
             }
         }
-        // Inject Orca-style hook service env vars if available
-        // This enables the OpenCode plugin to send direct status updates via HTTP
         if let Some(hook_service) = opencode_hook_service {
             if let Some(opencode_dir) = opencode_runtime_dir.as_deref() {
                 let config_dir = crate::opencode_hook_service::write_terminal_plugin_config(
@@ -558,6 +765,7 @@ impl TerminalRuntime {
         let latest_seqno = Arc::new(AtomicUsize::new(terminal.current_seqno()));
         let term = Arc::new(Mutex::new(terminal));
         let (command_tx, command_rx) = crossbeam_channel::unbounded();
+        let active_ai_tool = Arc::new(Mutex::new(None));
 
         spawn_reader_thread(
             terminal_id,
@@ -567,6 +775,7 @@ impl TerminalRuntime {
             ui_event_tx.clone(),
             repaint_ctx.clone(),
             ai_hook_manager,
+            active_ai_tool.clone(),
         );
         spawn_io_thread(
             terminal_id,
@@ -599,6 +808,7 @@ impl TerminalRuntime {
             forced_codex_process_probe: Mutex::new(None),
             #[cfg(test)]
             queued_codex_process_probe_after_next_input: Mutex::new(None),
+            active_ai_tool,
         })
     }
 
@@ -697,6 +907,14 @@ impl TerminalRuntime {
 
     pub fn latest_seqno(&self) -> usize {
         self.latest_seqno.load(Ordering::Relaxed)
+    }
+
+    /// Sets the active AI CLI tool for this terminal.
+    /// This enables Codex-specific filtering (e.g., suppressing ED2/ED3 during sync).
+    pub fn set_active_ai_tool(&self, tool: Option<AiCliTool>) {
+        if let Ok(mut guard) = self.active_ai_tool.lock() {
+            *guard = tool;
+        }
     }
 
     pub fn has_factory_droid_descendant_process(&self) -> Option<bool> {
@@ -1014,6 +1232,7 @@ pub(crate) fn test_terminal_runtime() -> TerminalRuntime {
         child_process_handle: Mutex::new(None),
         #[cfg(target_os = "windows")]
         job_handle: Mutex::new(None),
+        active_ai_tool: Arc::new(Mutex::new(None)),
         #[cfg(test)]
         forced_factory_droid_process_active: None,
         #[cfg(test)]
@@ -1081,6 +1300,7 @@ pub(crate) fn test_terminal_runtime_with_capture() -> (TerminalRuntime, TestTerm
             child_process_handle: Mutex::new(None),
             #[cfg(target_os = "windows")]
             job_handle: Mutex::new(None),
+            active_ai_tool: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             forced_factory_droid_process_active: None,
             #[cfg(test)]
@@ -2625,9 +2845,12 @@ fn spawn_reader_thread(
     tx: Sender<TerminalUiEvent>,
     repaint_ctx: eframe::egui::Context,
     ai_hook_manager: Option<Arc<AiHookManager>>,
+    active_ai_tool: Arc<Mutex<Option<AiCliTool>>>,
 ) {
     thread::spawn(move || {
         let mut buffer = vec![0u8; IO_BUFFER_SIZE];
+        let mut filtered_buffer: Vec<u8> = Vec::with_capacity(IO_BUFFER_SIZE);
+        let mut codex_filter = CodexRedrawFilter::new();
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
         // NOTE: pending_visible_codex_status removed - Codex uses hook-only integration
@@ -2638,12 +2861,27 @@ fn spawn_reader_thread(
                 Ok(0) => break,
                 Ok(read_bytes) => {
                     let bytes = &buffer[..read_bytes];
+
+                    // Check if we should apply Codex filtering
+                    let should_filter = active_ai_tool.lock().ok().and_then(|guard| *guard)
+                        == Some(AiCliTool::CodexCli);
+
+                    // Determine which bytes to pass to terminal
+                    let terminal_bytes: &[u8] = if should_filter {
+                        codex_filter.filter(bytes, &mut filtered_buffer);
+                        &filtered_buffer
+                    } else {
+                        bytes
+                    };
+
                     if let Ok(mut terminal) = term.lock() {
-                        terminal.advance_bytes(bytes);
+                        terminal.advance_bytes(terminal_bytes);
                         latest_seqno.store(terminal.current_seqno(), Ordering::Relaxed);
                     }
                     send_ui_event(terminal_id, TerminalUiEventKind::Wakeup, &tx, &repaint_ctx);
 
+                    // AI signal parsing uses ORIGINAL bytes (before filtering)
+                    // to ensure hook-delimited signals are not corrupted
                     if let Some(manager) = &ai_hook_manager {
                         for signal in collect_ai_read_signals(
                             terminal_id,
@@ -3504,12 +3742,13 @@ mod tests {
         selection_snapshot_from_terminal, send_ui_event, snapshot_from_terminal,
         snapshots_from_terminal, test_terminal_runtime, trim_trailing_default_cells,
         verified_process_entry, verified_process_tree_descendants, verified_snapshot_root_process,
-        AdeTerminalConfig, PendingAiReadSignalKind, PendingOscTitle, PendingVisibleFactoryStatus,
-        PendingVisibleOpenCodeStatus, ProcessSnapshotEntry, RootProcessTerminationPlan,
-        RuntimeCommand, SharedWriter, SharedWriterHandle, TerminalColor, TerminalCursor,
-        TerminalCursorLine, TerminalCursorShape, TerminalDimensions, TerminalRuntime,
-        TerminalSelectionHyperlink, TerminalStyle, TerminalStyledCell, TerminalUiEventKind,
-        TrackedProcessIdentity, VerifiedProcessLookup, MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS,
+        AdeTerminalConfig, CodexRedrawFilter, PendingAiReadSignalKind, PendingOscTitle,
+        PendingVisibleFactoryStatus, PendingVisibleOpenCodeStatus, ProcessSnapshotEntry,
+        RootProcessTerminationPlan, RuntimeCommand, SharedWriter, SharedWriterHandle,
+        TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape, TerminalDimensions,
+        TerminalRuntime, TerminalSelectionHyperlink, TerminalStyle, TerminalStyledCell,
+        TerminalUiEventKind, TrackedProcessIdentity, VerifiedProcessLookup,
+        MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS,
     };
     use crate::codex::{
         codex_env_pairs, MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR, MERGEN_AI_INBOX_DIR_ENV_VAR,
@@ -4486,6 +4725,7 @@ mod tests {
                 child_process_handle: Mutex::new(None),
                 #[cfg(target_os = "windows")]
                 job_handle: Mutex::new(None),
+                active_ai_tool: Arc::new(Mutex::new(None)),
                 #[cfg(test)]
                 forced_factory_droid_process_active: None,
                 #[cfg(test)]
@@ -5473,5 +5713,167 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_owned()
+    }
+
+    // =========================================================================
+    // CodexRedrawFilter tests
+    // =========================================================================
+
+    #[test]
+    fn codex_filter_passes_through_normal_bytes() {
+        let mut filter = CodexRedrawFilter::new();
+        let mut output = Vec::new();
+        let input = b"Hello, World!\nThis is normal text.";
+
+        filter.filter(input, &mut output);
+
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn codex_filter_suppresses_ed2_during_sync() {
+        let mut filter = CodexRedrawFilter::new();
+        let mut output = Vec::new();
+
+        // Start sync
+        filter.filter(b"\x1b[?2026h", &mut output);
+        assert_eq!(output, b"\x1b[?2026h");
+
+        // ED2 should be suppressed during sync
+        filter.filter(b"\x1b[2J", &mut output);
+        assert!(output.is_empty());
+
+        // ED3 should also be suppressed
+        filter.filter(b"\x1b[3J", &mut output);
+        assert!(output.is_empty());
+
+        // End sync
+        filter.filter(b"\x1b[?2026l", &mut output);
+        assert_eq!(output, b"\x1b[?2026l");
+    }
+
+    #[test]
+    fn codex_filter_passes_ed2_when_not_in_sync() {
+        let mut filter = CodexRedrawFilter::new();
+        let mut output = Vec::new();
+
+        // ED2 should pass through when not in sync
+        filter.filter(b"\x1b[2J", &mut output);
+        assert_eq!(output, b"\x1b[2J");
+    }
+
+    #[test]
+    fn codex_filter_handles_split_sync_start_across_chunks() {
+        let mut filter = CodexRedrawFilter::new();
+        let mut output = Vec::new();
+
+        // Split "\x1b[?2026h" across chunks: first "\x1b[?" then "2026h"
+        filter.filter(b"\x1b[?", &mut output);
+        assert!(output.is_empty()); // Incomplete sequence, buffered
+
+        filter.filter(b"2026h", &mut output);
+        assert_eq!(output, b"\x1b[?2026h");
+
+        // Now in sync mode, ED2 should be suppressed
+        filter.filter(b"\x1b[2J", &mut output);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn codex_filter_handles_split_ed2_across_chunks() {
+        let mut filter = CodexRedrawFilter::new();
+        let mut output = Vec::new();
+
+        // Enter sync mode first
+        filter.filter(b"\x1b[?2026h", &mut output);
+        assert_eq!(output, b"\x1b[?2026h");
+
+        // Split ED2: "\x1b[" and "2J"
+        filter.filter(b"\x1b[", &mut output);
+        assert!(output.is_empty()); // Incomplete, buffered
+
+        filter.filter(b"2J", &mut output);
+        // ED2 should be suppressed during sync
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn codex_filter_handles_split_sync_end_across_chunks() {
+        let mut filter = CodexRedrawFilter::new();
+        let mut accumulated = Vec::new();
+        let mut output = Vec::new();
+
+        // Enter sync mode
+        filter.filter(b"\x1b[?2026h\x1b[2J", &mut output);
+        // Only sync start passes, ED2 is suppressed
+        assert_eq!(output, b"\x1b[?2026h");
+        accumulated.extend_from_slice(&output);
+
+        // Split end sync: "\x1b[?" and "2026l"
+        output.clear();
+        filter.filter(b"\x1b[?", &mut output);
+        assert!(output.is_empty()); // Incomplete, buffered
+        accumulated.extend_from_slice(&output);
+        assert_eq!(accumulated, b"\x1b[?2026h"); // No new output
+
+        output.clear();
+        filter.filter(b"2026l", &mut output);
+        assert_eq!(output, b"\x1b[?2026l");
+        accumulated.extend_from_slice(&output);
+        assert_eq!(accumulated, b"\x1b[?2026h\x1b[?2026l");
+
+        // Now out of sync, ED2 should pass through
+        output.clear();
+        filter.filter(b"\x1b[2J", &mut output);
+        assert_eq!(output, b"\x1b[2J");
+        accumulated.extend_from_slice(&output);
+        assert_eq!(accumulated, b"\x1b[?2026h\x1b[?2026l\x1b[2J");
+    }
+
+    #[test]
+    fn codex_filter_mixed_content_with_sync_blocks() {
+        let mut filter = CodexRedrawFilter::new();
+        let mut output = Vec::new();
+
+        // Mixed: text, sync start, clear, text, sync end, clear
+        let input = b"Text\x1b[?2026h\x1b[2JMore\x1b[?2026l\x1b[3J";
+        filter.filter(input, &mut output);
+
+        // Should have: text, sync start, "More", sync end, clear (last clear passes)
+        assert_eq!(output, b"Text\x1b[?2026hMore\x1b[?2026l\x1b[3J");
+    }
+
+    #[test]
+    fn codex_filter_preserves_other_csi_sequences() {
+        let mut filter = CodexRedrawFilter::new();
+        let mut accumulated = Vec::new();
+        let mut output = Vec::new();
+
+        // Enter sync mode
+        filter.filter(b"\x1b[?2026h", &mut output);
+        assert_eq!(output, b"\x1b[?2026h");
+        accumulated.extend_from_slice(&output);
+
+        // Other CSI sequences should pass through even in sync
+        output.clear();
+        filter.filter(b"\x1b[31m\x1b[1;1H\x1b[0m", &mut output);
+        assert_eq!(output, b"\x1b[31m\x1b[1;1H\x1b[0m");
+        accumulated.extend_from_slice(&output);
+        assert_eq!(accumulated, b"\x1b[?2026h\x1b[31m\x1b[1;1H\x1b[0m");
+    }
+
+    #[test]
+    fn codex_filter_state_resets_on_sync_end() {
+        let mut filter = CodexRedrawFilter::new();
+        let mut output = Vec::new();
+
+        // Enter and exit sync
+        filter.filter(b"\x1b[?2026h\x1b[?2026l", &mut output);
+        assert_eq!(output, b"\x1b[?2026h\x1b[?2026l");
+
+        // Now ED2 should pass through again
+        output.clear();
+        filter.filter(b"\x1b[2J", &mut output);
+        assert_eq!(output, b"\x1b[2J");
     }
 }

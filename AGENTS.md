@@ -70,7 +70,7 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Supported AI tools:** `Factory Droid`, `Codex CLI`, `OpenCode`, and `Claude Code` are supported. Codex CLI uses hook-only integration.
 - **Factory Droid hook format:** Only `droid-hook:*` and `factory-droid-hook:*` format patterns are recognized for Factory Droid. The `claude-hook:*` format is not supported.
 - **Factory Droid detection commands:** Only `droid` and `factory` trigger Factory Droid session detection. Do not add `cc`, `claude`, or other AI CLI commands.
-- **OpenCode detection commands:** `opencode` triggers OpenCode session detection. OpenCode is tracked through explicit launch detection and process-based status, similar to Codex CLI. OpenCode does not use PTY hook events.
+- **OpenCode detection commands:** `opencode` triggers OpenCode session detection. OpenCode is tracked through explicit launch detection, process-based status, visible UI/title parsing, notify/inbox status paths, and the Mergen-owned `mergen-opencode-status.js` plugin. If OpenCode hangs at `Loading plugins`, inspect MCP startup load before disabling the plugin path.
 - **Codex CLI integration:** Codex uses strict hook-only integration. Mergen configures `hooks.json` with `UserPromptSubmit` and `Stop` events that route to the Mergen bridge. The status transitions are:
   - `UserPromptSubmit` hook → Running (spinner)
   - `Stop` hook → Attention/Pulse (waiting for user)

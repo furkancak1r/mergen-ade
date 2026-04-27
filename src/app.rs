@@ -3433,6 +3433,20 @@ impl AdeApp {
             .map(|dir| Self::opencode_notify_inbox_path_for_dir(dir, terminal_id, inbox_token))
     }
 
+    /// Returns true if the terminal is already owned by any AI CLI (including pending launch).
+    /// This prevents accidentally switching AI tool ownership when the user types a command
+    /// that looks like another AI CLI launch command while inside an active session.
+    fn is_terminal_owned_by_any_ai(entry: &TerminalEntry) -> bool {
+        entry.ai_session.tool.is_some()
+            || entry.factory_droid_launch_pending_since.is_some()
+            || entry.codex_launch_pending_since.is_some()
+            || entry.opencode_launch_pending_since.is_some()
+            || entry.claude_launch_pending_since.is_some()
+            || entry.factory_droid_session_active
+            || entry.codex_session_active
+            || entry.opencode_session_active
+    }
+
     fn launch_command_stem(line: &str) -> Option<&str> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -3601,6 +3615,9 @@ impl AdeApp {
         if let Some(manager) = &self.ai_hook_manager {
             manager.set_tool(terminal_id, AiCliTool::FactoryDroid);
         }
+        entry
+            .runtime
+            .set_active_ai_tool(Some(AiCliTool::FactoryDroid));
 
         let mut changed = false;
         if entry.ai_session.tool != Some(AiCliTool::FactoryDroid) {
@@ -3638,6 +3655,7 @@ impl AdeApp {
             || entry.factory_droid_session_active;
 
         entry.ai_session = AiCliSession::default();
+        entry.runtime.set_active_ai_tool(None);
         entry.factory_droid_launch_pending_since = None;
         entry.factory_droid_session_active = false;
         entry.factory_droid_last_process_seen_at = None;
@@ -4208,6 +4226,7 @@ impl AdeApp {
         if let Some(manager) = &self.ai_hook_manager {
             manager.set_tool(terminal_id, AiCliTool::CodexCli);
         }
+        entry.runtime.set_active_ai_tool(Some(AiCliTool::CodexCli));
 
         let mut changed = false;
         if entry.ai_session.tool != Some(AiCliTool::CodexCli) {
@@ -4257,6 +4276,7 @@ impl AdeApp {
         if entry.ai_session.tool == Some(AiCliTool::CodexCli) {
             entry.ai_session = AiCliSession::default();
         }
+        entry.runtime.set_active_ai_tool(None);
         entry.codex_launch_pending_since = None;
         entry.codex_launch_process_baseline = None;
         entry.codex_session_active = false;
@@ -4610,6 +4630,7 @@ impl AdeApp {
         if let Some(manager) = &self.ai_hook_manager {
             manager.set_tool(terminal_id, AiCliTool::OpenCode);
         }
+        entry.runtime.set_active_ai_tool(Some(AiCliTool::OpenCode));
 
         let mut changed = false;
         if entry.ai_session.tool != Some(AiCliTool::OpenCode) {
@@ -4660,6 +4681,7 @@ impl AdeApp {
         if entry.ai_session.tool == Some(AiCliTool::OpenCode) {
             entry.ai_session = AiCliSession::default();
         }
+        entry.runtime.set_active_ai_tool(None);
         entry.opencode_launch_pending_since = None;
         entry.opencode_launch_process_baseline = None;
         entry.opencode_session_active = false;
@@ -4691,6 +4713,7 @@ impl AdeApp {
         if entry.ai_session.tool == Some(AiCliTool::Claude) {
             entry.ai_session = AiCliSession::default();
         }
+        entry.runtime.set_active_ai_tool(None);
         entry.claude_launch_pending_since = None;
         entry.claude_session_active = false;
         entry.claude_normalized_status = None;
@@ -4717,6 +4740,7 @@ impl AdeApp {
         if let Some(manager) = &self.ai_hook_manager {
             manager.set_tool(terminal_id, AiCliTool::Claude);
         }
+        entry.runtime.set_active_ai_tool(Some(AiCliTool::Claude));
 
         let mut changed = false;
         if entry.ai_session.tool != Some(AiCliTool::Claude) {
@@ -5281,7 +5305,7 @@ impl AdeApp {
         Option<OpenCodeAttentionReason>,
     )> {
         // Priority 0: Normalized transport status (Orca-compatible)
-        // This is the most authoritative signal from the OpenCode plugin/notify mode
+        // This is the most authoritative signal from OpenCode plugin/notify mode.
         if let Some(normalized) = entry.opencode_normalized_status {
             match normalized {
                 OpenCodeTransportStatus::Working => {
@@ -5658,7 +5682,6 @@ impl AdeApp {
 
         for event in events {
             if let Ok(terminal_id) = event.terminal_id.parse::<u64>() {
-                // Map the hook event_kind to transport status (Orca-compatible)
                 let (transport_status, reason_hint) = match event.event_kind.as_deref() {
                     Some("working") => (OpenCodeTransportStatus::Working, None),
                     Some("idle") => (
@@ -5676,7 +5699,6 @@ impl AdeApp {
                     _ => continue,
                 };
 
-                // Use the unified transport status helper for consistent behavior
                 changed |= self.apply_opencode_transport_status(
                     terminal_id,
                     transport_status,
@@ -8125,32 +8147,45 @@ impl AdeApp {
                             let line = std::mem::take(&mut terminal.pending_line_for_title);
                             let line_stem = Self::launch_command_stem(&line)
                                 .map(|stem| stem.to_ascii_lowercase());
-                            if line_stem.as_ref().is_some_and(|stem| {
-                                factory_droid_launcher_stems.contains(stem)
-                                    || stem == "droid"
-                                    || stem == "factory"
-                            }) {
+                            // Only detect AI launch commands if terminal is not already owned by any AI.
+                            // This prevents switching to another AI tool when typing commands like
+                            // "codex" inside an OpenCode session.
+                            let can_claim_ai_ownership =
+                                !Self::is_terminal_owned_by_any_ai(terminal);
+                            if can_claim_ai_ownership
+                                && line_stem.as_ref().is_some_and(|stem| {
+                                    factory_droid_launcher_stems.contains(stem)
+                                        || stem == "droid"
+                                        || stem == "factory"
+                                })
+                            {
                                 launched_factory_droid = true;
                             }
-                            if line_stem.as_ref().is_some_and(|stem| {
-                                codex_launcher_stems.contains(stem) || stem == "codex"
-                            }) {
+                            if can_claim_ai_ownership
+                                && line_stem.as_ref().is_some_and(|stem| {
+                                    codex_launcher_stems.contains(stem) || stem == "codex"
+                                })
+                            {
                                 launched_codex_cli = true;
                                 codex_launch_baseline =
                                     terminal.runtime.snapshot_codex_descendant_processes();
                             }
-                            if line_stem.as_ref().is_some_and(|stem| {
-                                opencode_launcher_stems.contains(stem) || stem == "opencode"
-                            }) {
+                            if can_claim_ai_ownership
+                                && line_stem.as_ref().is_some_and(|stem| {
+                                    opencode_launcher_stems.contains(stem) || stem == "opencode"
+                                })
+                            {
                                 launched_opencode = true;
                                 opencode_launch_baseline =
                                     terminal.runtime.snapshot_opencode_descendant_processes();
                             }
-                            if line_stem.as_ref().is_some_and(|stem| {
-                                claude_launcher_stems.contains(stem)
-                                    || stem == "claude"
-                                    || stem == "cc"
-                            }) {
+                            if can_claim_ai_ownership
+                                && line_stem.as_ref().is_some_and(|stem| {
+                                    claude_launcher_stems.contains(stem)
+                                        || stem == "claude"
+                                        || stem == "cc"
+                                })
+                            {
                                 launched_claude = true;
                             }
                             let sanitized_line = terminal_title_candidate(&line);
@@ -13621,7 +13656,6 @@ impl eframe::App for AdeApp {
         self.poll_factory_droid_hook_inboxes(ctx);
         self.poll_codex_notify_inboxes(ctx);
         self.poll_opencode_notify_inboxes(ctx);
-        // Poll the Orca-style HTTP hook service for direct OpenCode status
         self.poll_opencode_hook_service(ctx);
         if input_gate_elapsed == 0 || self.factory_droid_process_last_poll_at.is_none() {
             self.poll_factory_droid_processes(ctx);
@@ -25259,6 +25293,100 @@ mod tests {
     }
 
     #[test]
+    fn typing_codex_inside_opencode_session_does_not_switch_ownership() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        // Simulate an active OpenCode session
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::OpenCode);
+            entry.ai_session.status = AiCliStatus::Attention;
+            entry.opencode_session_active = true;
+            entry.opencode_process_identity = Some(TrackedProcessIdentity {
+                pid: 9001,
+                creation_time: Some(10001),
+            });
+            entry.opencode_attention_reason = Some(OpenCodeAttentionReason::TurnComplete);
+            entry.opencode_normalized_status = Some(OpenCodeTransportStatus::Idle);
+            entry.opencode_attention_pending = true;
+        }
+
+        // Type "codex" and press Enter (as if the user is prompting the AI)
+        app.route_active_terminal_input(
+            &ctx,
+            vec![
+                Event::Text("codex".to_owned()),
+                Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::default(),
+                },
+            ],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        // Terminal should remain owned by OpenCode, not switch to Codex
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::OpenCode));
+        // Launch pending should NOT be set for Codex
+        assert!(
+            terminal.codex_launch_pending_since.is_none(),
+            "codex_launch_pending_since should be None when typing 'codex' inside OpenCode session"
+        );
+        // OpenCode state should remain intact
+        assert!(terminal.opencode_session_active);
+        assert_eq!(
+            terminal.opencode_attention_reason,
+            Some(OpenCodeAttentionReason::TurnComplete)
+        );
+    }
+
+    #[test]
+    fn typing_opencode_inside_codex_session_does_not_switch_ownership() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        // Simulate an active Codex session
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Attention;
+            entry.codex_session_active = true;
+            entry.codex_process_identity = Some(TrackedProcessIdentity {
+                pid: 7001,
+                creation_time: Some(8001),
+            });
+            entry.codex_attention_reason = Some(CodexAttentionReason::TurnComplete);
+            entry.codex_normalized_status = Some(CodexTransportStatus::Idle);
+            entry.codex_attention_pending = true;
+        }
+
+        // Type "opencode" and press Enter (as if the user is prompting the AI)
+        app.route_active_terminal_input(
+            &ctx,
+            vec![
+                Event::Text("opencode".to_owned()),
+                Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::default(),
+                },
+            ],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        // Terminal should remain owned by Codex, not switch to OpenCode
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        // Launch pending should NOT be set for OpenCode
+        assert!(
+            terminal.opencode_launch_pending_since.is_none(),
+            "opencode_launch_pending_since should be None when typing 'opencode' inside Codex session"
+        );
+        // Codex session should remain active
+        assert!(terminal.codex_session_active);
+    }
+
+    #[test]
     fn event_terminal_navigation_shortcut_accepts_egui_command_alias_for_ctrl() {
         let shortcut = AdeApp::event_terminal_navigation_shortcut(&Event::Key {
             key: Key::ArrowDown,
@@ -26042,11 +26170,11 @@ mod tests {
             codex_notify_last_poll_at: None,
             codex_process_last_poll_at: None,
             opencode_cli_runtime_dir: None,
+            opencode_hook_last_poll_at: None,
+            opencode_hook_service: None,
             opencode_notify_inboxes: BTreeMap::new(),
             opencode_notify_last_poll_at: None,
             opencode_process_last_poll_at: None,
-            opencode_hook_service: None,
-            opencode_hook_last_poll_at: None,
             config: AppConfig::default(),
             config_load_error: None,
             config_save_requires_reload: false,
