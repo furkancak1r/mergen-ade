@@ -1,5 +1,37 @@
 ### Known Issues & Fix Log
 
+#### Codex prompt follow no longer sticks to trailing blank terminal rows {#codex-prompt-follow-no-longer-sticks-to-trailing-blank-terminal-rows}
+- Date: 2026-04-27
+- Context: main terminal pane scroll behavior while Codex CLI is active
+- Error signature: `Codex terminal sometimes scrolls down by itself and shows a black screen until the user scrolls back up.`
+- Symptoms/Impact: During a live Codex session, Mergen could follow the rendered terminal buffer to its physical bottom even when Codex left blank rows below the prompt/cursor. The viewport then showed mostly empty black space and the user had to scroll upward to find the prompt again.
+- Root cause: Normal terminal auto-follow used `ScrollArea::stick_to_bottom(true)`, which anchors to the rendered transcript's bottom. Codex TUI redraws can include trailing blank terminal rows below the live input/cursor row, so the transcript bottom is not always the useful prompt location.
+- Resolution:
+  - Added Codex-specific prompt scroll anchoring in `src/app.rs` so auto-follow targets the stable input cursor row, falling back to the live cursor or last non-empty row.
+  - Kept non-Codex terminals on the existing bottom-stick behavior.
+  - Added a manual detach flag so user scrollback is not forced back to the prompt until terminal input or terminal switching re-enables auto-follow.
+- Prevent recurrence:
+  - Treat Codex auto-follow as prompt/cursor following, not transcript-bottom following.
+  - Keep tests covering trailing blank rows, non-Codex bottom stickiness, manual detach, and terminal-switch/input reattachment.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-27 user report that Codex sometimes jumps to a black lower area and requires scrolling up.
+
+#### Codex input line now bottom-aligns after terminal switches {#codex-input-line-bottom-aligns-after-terminal-switches}
+- Date: 2026-04-27
+- Context: main terminal pane scroll behavior when switching back to an active Codex CLI terminal
+- Error signature: `After switching terminals, the Codex input area appears near the top of the terminal instead of at the bottom.`
+- Symptoms/Impact: Returning to a Codex terminal could show the live input/cursor row high in the viewport, with unused terminal rows below it. The session was still usable, but the terminal looked scrolled to the wrong place.
+- Root cause: The activation-only scroll alignment targeted the cursor row with a fixed top padding (`target_row - 2`). That kept the prompt visible, but it intentionally placed the input line near the top of the viewport instead of aligning it with the bottom where terminal prompts normally sit.
+- Resolution:
+  - Changed activation scroll offset calculation in `src/app.rs` to bottom-align the stable input cursor row within the visible viewport.
+  - Preserved clamping against snapshot bounds so stale/out-of-range cursor coordinates cannot reopen the transcript at an invalid bottom offset.
+  - Added a regression test for cursor/input rows followed by trailing blank terminal rows.
+- Prevent recurrence:
+  - Treat terminal activation alignment as prompt/input positioning, not transcript browsing.
+  - Keep helper-level tests for cursor row, trailing blank rows, and out-of-bounds cursor coordinates.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-27 user report that Codex input appears at the top after switching terminals.
+
 #### Codex documentation and release validation now match the hook-color fix {#codex-docs-release-validation-match-hook-color-fix}
 - Date: 2026-04-27
 - Context: Post-fix validation for Windows native Codex CLI hook/color behavior and release executable update

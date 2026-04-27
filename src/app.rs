@@ -1029,6 +1029,7 @@ struct TerminalEntry {
     selection_drag_active: bool,
     snapshot_refresh_deferred: bool,
     activation_scroll_align_pending: bool,
+    prompt_scroll_anchor_detached: bool,
     exited: bool,
     runtime: TerminalRuntime,
     ai_session: AiCliSession,
@@ -3275,6 +3276,7 @@ impl AdeApp {
             selection_drag_active: false,
             snapshot_refresh_deferred: false,
             activation_scroll_align_pending: false,
+            prompt_scroll_anchor_detached: false,
             exited: false,
             runtime,
             ai_session: AiCliSession::default(),
@@ -8832,6 +8834,7 @@ impl AdeApp {
             return;
         }
 
+        reset_terminal_prompt_scroll_anchor(terminal);
         terminal.runtime.send_bytes(std::mem::take(outbound));
         terminal.dirty = true;
         ctx.request_repaint();
@@ -8844,6 +8847,7 @@ impl AdeApp {
         ctx: &egui::Context,
     ) {
         Self::clear_terminal_selection(terminal);
+        reset_terminal_prompt_scroll_anchor(terminal);
         terminal.runtime.send_paste_bytes(paste_bytes);
         Self::append_pending_line(&mut terminal.pending_line_for_title, text);
         terminal.dirty = true;
@@ -9024,6 +9028,7 @@ impl AdeApp {
             if let Some(entry) = self.terminals.get_mut(&terminal_id) {
                 entry.snapshot_refresh_deferred = false;
                 entry.activation_scroll_align_pending = true;
+                reset_terminal_prompt_scroll_anchor(entry);
                 entry.dirty = true;
             }
         }
@@ -9448,6 +9453,7 @@ impl AdeApp {
             let destination_title = terminal.title.clone();
             let mut outbound = message.as_bytes().to_vec();
             outbound.push(b'\r');
+            reset_terminal_prompt_scroll_anchor(terminal);
             terminal.runtime.send_bytes(outbound);
             Self::clear_terminal_selection(terminal);
             Self::append_pending_line(&mut terminal.pending_line_for_title, message);
@@ -9624,6 +9630,7 @@ impl AdeApp {
 
         let mut outbound = command.as_bytes().to_vec();
         outbound.push(b'\r');
+        reset_terminal_prompt_scroll_anchor(terminal);
         terminal.runtime.send_bytes(outbound);
         Self::clear_terminal_selection(terminal);
         Self::append_pending_line(&mut terminal.pending_line_for_title, command);
@@ -9649,6 +9656,7 @@ impl AdeApp {
 
         let mut outbound = trimmed.as_bytes().to_vec();
         outbound.push(b'\r');
+        reset_terminal_prompt_scroll_anchor(terminal);
         terminal.runtime.send_bytes(outbound);
         Self::clear_terminal_selection(terminal);
         terminal.pending_line_for_title.clear();
@@ -13427,33 +13435,40 @@ impl AdeApp {
                             if let Some(pointer_pos) =
                                 ui.ctx().input(|input| input.pointer.interact_pos())
                             {
-                                if rect.contains(pointer_pos)
-                                    && terminal.runtime.is_mouse_reporting_active()
-                                {
-                                    let direction = if wheel_delta.y > 0.0 {
-                                        WheelDirection::Up
-                                    } else if wheel_delta.y < 0.0 {
-                                        WheelDirection::Down
-                                    } else if wheel_delta.x > 0.0 {
-                                        WheelDirection::Right
+                                if rect.contains(pointer_pos) {
+                                    let mouse_reporting_active =
+                                        terminal.runtime.is_mouse_reporting_active();
+                                    if mouse_reporting_active {
+                                        let direction = if wheel_delta.y > 0.0 {
+                                            WheelDirection::Up
+                                        } else if wheel_delta.y < 0.0 {
+                                            WheelDirection::Down
+                                        } else if wheel_delta.x > 0.0 {
+                                            WheelDirection::Right
+                                        } else {
+                                            WheelDirection::Left
+                                        };
+                                        let cell_x = ((pointer_pos.x - rect.min.x) / char_width)
+                                            .floor()
+                                            as usize;
+                                        let cell_y = ((pointer_pos.y - rect.min.y) / line_height)
+                                            .floor()
+                                            as usize;
+                                        terminal.runtime.send_mouse_wheel(TerminalWheelEvent {
+                                            direction,
+                                            x: cell_x,
+                                            y: cell_y,
+                                            x_pixel_offset: 0,
+                                            y_pixel_offset: 0,
+                                        });
+                                        ui.ctx().input_mut(|input| {
+                                            input.smooth_scroll_delta = Vec2::ZERO;
+                                        });
                                     } else {
-                                        WheelDirection::Left
-                                    };
-                                    let cell_x = ((pointer_pos.x - rect.min.x) / char_width).floor()
-                                        as usize;
-                                    let cell_y = ((pointer_pos.y - rect.min.y) / line_height)
-                                        .floor()
-                                        as usize;
-                                    terminal.runtime.send_mouse_wheel(TerminalWheelEvent {
-                                        direction,
-                                        x: cell_x,
-                                        y: cell_y,
-                                        x_pixel_offset: 0,
-                                        y_pixel_offset: 0,
-                                    });
-                                    ui.ctx().input_mut(|input| {
-                                        input.smooth_scroll_delta = Vec2::ZERO;
-                                    });
+                                        detach_terminal_prompt_scroll_anchor_on_manual_scroll(
+                                            terminal,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -17483,11 +17498,41 @@ fn terminal_output_scroll_behavior(
             )
         })
         .flatten();
+    let prompt_anchor_offset = activation_offset.or_else(|| {
+        terminal_prompt_scroll_anchor_enabled(terminal)
+            .then(|| {
+                terminal_activation_scroll_offset(
+                    &terminal.render_cache,
+                    terminal.stable_input_cursor_row,
+                    line_height,
+                    viewport_height,
+                )
+            })
+            .flatten()
+    });
 
     TerminalOutputScrollBehavior {
-        vertical_offset: activation_offset,
-        stick_to_bottom: has_content && activation_offset.is_none(),
+        vertical_offset: prompt_anchor_offset,
+        stick_to_bottom: has_content && prompt_anchor_offset.is_none(),
         keep_activation_alignment_pending: terminal.activation_scroll_align_pending && !has_content,
+    }
+}
+
+fn terminal_prompt_scroll_anchor_enabled(terminal: &TerminalEntry) -> bool {
+    terminal.ai_session.tool == Some(AiCliTool::CodexCli)
+        && !terminal.prompt_scroll_anchor_detached
+        && (terminal.codex_session_active
+            || terminal.codex_launch_pending_since.is_some()
+            || terminal.ai_session.status != AiCliStatus::Inactive)
+}
+
+fn reset_terminal_prompt_scroll_anchor(terminal: &mut TerminalEntry) {
+    terminal.prompt_scroll_anchor_detached = false;
+}
+
+fn detach_terminal_prompt_scroll_anchor_on_manual_scroll(terminal: &mut TerminalEntry) {
+    if terminal_prompt_scroll_anchor_enabled(terminal) {
+        terminal.prompt_scroll_anchor_detached = true;
     }
 }
 
@@ -17509,9 +17554,16 @@ fn terminal_activation_scroll_offset(
     // terminal opens too far scrolled).
     let max_row = snapshot.lines.len().saturating_sub(1);
     let clamped_target_row = target_row.min(max_row);
-    let preferred_top_row = clamped_target_row.saturating_sub(2);
     let content_height = snapshot.lines.len() as f32 * line_height.max(0.0);
     let max_offset = (content_height - viewport_height.max(0.0)).max(0.0);
+    let visible_rows = if line_height > 0.0 {
+        (viewport_height.max(0.0) / line_height).floor().max(1.0) as usize
+    } else {
+        1
+    };
+    let preferred_top_row = clamped_target_row
+        .saturating_add(1)
+        .saturating_sub(visible_rows);
     Some((preferred_top_row as f32 * line_height.max(0.0)).clamp(0.0, max_offset))
 }
 
@@ -17931,7 +17983,8 @@ mod tests {
         average_terminal_cell_width, build_terminal_cursor_overlay, build_terminal_render,
         collect_source_control_line_totals, collect_source_control_snapshot,
         configure_terminal_font_family, count_text_line_bytes, cursor_hidden_by_row_filter,
-        deduplicated_recent_inputs, default_app_open_command, draw_ai_badge,
+        deduplicated_recent_inputs, default_app_open_command,
+        detach_terminal_prompt_scroll_anchor_on_manual_scroll, draw_ai_badge,
         draw_terminal_manager_title_and_diff_summary, draw_terminal_status_badges,
         force_terminal_pane_width, install_terminal_font_family, launcher_icon_for_ai_tool,
         merge_source_control_refresh_result, next_active_terminal_after_close,
@@ -21808,7 +21861,25 @@ mod tests {
 
         let offset = terminal_activation_scroll_offset(&snapshot, Some(6), 10.0, 40.0);
 
-        assert_eq!(offset, Some(40.0));
+        assert_eq!(offset, Some(30.0));
+    }
+
+    #[test]
+    fn terminal_activation_scroll_offset_bottom_aligns_cursor_with_trailing_blank_rows() {
+        let snapshot = TerminalSnapshot {
+            lines: vec![TerminalStyledLine::default(); 20],
+            cursor: Some(TerminalCursor {
+                x: 0,
+                y: 12,
+                shape: TerminalCursorShape::Block,
+                blinking: false,
+            }),
+            cursor_line: None,
+        };
+
+        let offset = terminal_activation_scroll_offset(&snapshot, None, 10.0, 50.0);
+
+        assert_eq!(offset, Some(80.0));
     }
 
     #[test]
@@ -21936,10 +22007,9 @@ mod tests {
 
         let offset = terminal_activation_scroll_offset(&snapshot, None, 10.0, 60.0);
 
-        // Without clamping, this would try to scroll to row 98 (100 - 2 padding).
+        // Without clamping, this would try to scroll toward the out-of-bounds row.
         // With clamping, target_row (100) is clamped to max_row (9),
-        // then preferred_top_row = 9 - 2 = 7,
-        // Expected offset: 7 * 10.0 = 70.0 (clamped to max_offset which is 100 - 60 = 40)
+        // then preferred_top_row = 9 + 1 - 6 visible rows = 4.
         assert_eq!(offset, Some(40.0));
     }
 
@@ -21978,9 +22048,95 @@ mod tests {
 
         let behavior = terminal_output_scroll_behavior(&terminal, 10.0, 50.0);
 
-        assert_eq!(behavior.vertical_offset, Some(60.0));
+        assert_eq!(behavior.vertical_offset, Some(40.0));
         assert!(!behavior.stick_to_bottom);
         assert!(!behavior.keep_activation_alignment_pending);
+    }
+
+    #[test]
+    fn codex_output_scroll_behavior_anchors_to_prompt_before_trailing_blank_rows() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.ai_session.tool = Some(AiCliTool::CodexCli);
+        terminal.ai_session.status = AiCliStatus::Running;
+        terminal.codex_session_active = true;
+        terminal.render_cache = TerminalSnapshot {
+            lines: vec![TerminalStyledLine::default(); 20],
+            cursor: Some(TerminalCursor {
+                x: 0,
+                y: 12,
+                shape: TerminalCursorShape::Block,
+                blinking: false,
+            }),
+            cursor_line: None,
+        };
+
+        let behavior = terminal_output_scroll_behavior(&terminal, 10.0, 50.0);
+
+        assert_eq!(behavior.vertical_offset, Some(80.0));
+        assert!(!behavior.stick_to_bottom);
+        assert!(!behavior.keep_activation_alignment_pending);
+    }
+
+    #[test]
+    fn non_codex_output_scroll_behavior_keeps_bottom_stickiness() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.render_cache = TerminalSnapshot {
+            lines: vec![TerminalStyledLine::default(); 20],
+            cursor: Some(TerminalCursor {
+                x: 0,
+                y: 12,
+                shape: TerminalCursorShape::Block,
+                blinking: false,
+            }),
+            cursor_line: None,
+        };
+
+        let behavior = terminal_output_scroll_behavior(&terminal, 10.0, 50.0);
+
+        assert_eq!(behavior.vertical_offset, None);
+        assert!(behavior.stick_to_bottom);
+        assert!(!behavior.keep_activation_alignment_pending);
+    }
+
+    #[test]
+    fn codex_output_scroll_behavior_respects_manual_detach() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.ai_session.tool = Some(AiCliTool::CodexCli);
+        terminal.ai_session.status = AiCliStatus::Running;
+        terminal.codex_session_active = true;
+        terminal.prompt_scroll_anchor_detached = true;
+        terminal.render_cache = TerminalSnapshot {
+            lines: vec![TerminalStyledLine::default(); 20],
+            cursor: Some(TerminalCursor {
+                x: 0,
+                y: 12,
+                shape: TerminalCursorShape::Block,
+                blinking: false,
+            }),
+            cursor_line: None,
+        };
+
+        let behavior = terminal_output_scroll_behavior(&terminal, 10.0, 50.0);
+
+        assert_eq!(behavior.vertical_offset, None);
+        assert!(behavior.stick_to_bottom);
+    }
+
+    #[test]
+    fn codex_manual_scroll_detaches_until_terminal_input_resets_anchor() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.ai_session.tool = Some(AiCliTool::CodexCli);
+        terminal.ai_session.status = AiCliStatus::Running;
+        terminal.codex_session_active = true;
+
+        detach_terminal_prompt_scroll_anchor_on_manual_scroll(&mut terminal);
+        assert!(terminal.prompt_scroll_anchor_detached);
+
+        let ctx = Context::default();
+        let mut outbound = b"continue".to_vec();
+        AdeApp::flush_terminal_outbound(&mut terminal, &ctx, &mut outbound);
+
+        assert!(!terminal.prompt_scroll_anchor_detached);
     }
 
     #[test]
@@ -26545,6 +26701,7 @@ mod tests {
             selection_drag_active: false,
             snapshot_refresh_deferred: false,
             activation_scroll_align_pending: false,
+            prompt_scroll_anchor_detached: false,
             exited: false,
             runtime,
             ai_session: AiCliSession::default(),
@@ -29057,6 +29214,7 @@ mod tests {
         let mut entry2 = test_terminal_entry_with_runtime(2, 7, test_terminal_runtime());
         entry2.dirty = false;
         entry2.snapshot_refresh_deferred = true; // deferred from prior state
+        entry2.prompt_scroll_anchor_detached = true;
 
         let mut app = test_app([(1, entry1), (2, entry2)], Some(1));
 
@@ -29076,6 +29234,10 @@ mod tests {
         assert!(
             entry.activation_scroll_align_pending,
             "newly active terminal should request a prompt-aligned scroll on first render"
+        );
+        assert!(
+            !entry.prompt_scroll_anchor_detached,
+            "newly active terminal should re-enable prompt scroll anchoring"
         );
     }
 
