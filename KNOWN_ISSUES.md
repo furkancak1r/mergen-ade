@@ -1,5 +1,201 @@
 ### Known Issues & Fix Log
 
+#### Codex documentation and release validation now match the hook-color fix {#codex-docs-release-validation-match-hook-color-fix}
+- Date: 2026-04-27
+- Context: Post-fix validation for Windows native Codex CLI hook/color behavior and release executable update
+- Error signature: `Documentation did not fully describe the current Codex visible exceptions, and final release validation should remain warning-free.`
+- Symptoms/Impact:
+  1. `AGENTS.md` described Codex as hook-only with a question-prompt visible exception, but did not mention the strict interrupt-banner exception that hides the spinner after `Esc`.
+  2. The latest validation pass fixed Rust warnings in tests before rebuilding the supported Windows release executable.
+- Root cause:
+  1. Codex visible exceptions were added incrementally across the spinner, question prompt, and interrupt flows.
+  2. The final warning cleanup happened after the Codex hook-color entry was first written.
+- Resolution:
+  - Updated `AGENTS.md` to document the `conversation interrupted` plus `/feedback` exception and clarify that it clears the spinner while preserving session/process tracking.
+  - Removed the warning-producing test import and unused tuple binding in `src/app.rs`.
+  - Rebuilt the supported Windows release executable at `target/x86_64-pc-windows-msvc/release/mergen-ade.exe`.
+- Prevent recurrence:
+  - Keep Codex visible exceptions listed together in `AGENTS.md` whenever terminal-layer detection changes.
+  - Treat release executable updates as requiring a warning-free `cargo test` and MSVC release build.
+- Files/Commands touched: `AGENTS.md`, `KNOWN_ISSUES.md`, `src/app.rs`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: 2026-04-27 user request to refresh `AGENTS.md` and `KNOWN_ISSUES.md` after warning cleanup, release build, and Codex hook/color fixes.
+
+#### Codex managed hooks now cover tool events and debounce Stop pulse {#codex-managed-hooks-tool-events-stop-debounce}
+- Date: 2026-04-27
+- Context: Windows native Codex CLI with official Codex hooks and Mergen badge tracking
+- Error signature: `Codex turns yellow/pulse while the agent is still continuing work; expected gray spinner like OpenCode.`
+- Symptoms/Impact:
+  1. Mergen only configured `UserPromptSubmit` and `Stop`, so tool-level continuation evidence was missing.
+  2. `Stop` immediately transitioned Codex from spinner to attention/pulse even when Codex continued into another tool/action path.
+  3. Codex badge semantics were not fully aligned with OpenCode's normalized colors.
+- Root cause:
+  1. The managed `hooks.json` did not install `PreToolUse`, `PermissionRequest`, or `PostToolUse` even though official Codex hooks support them.
+  2. `src/app.rs` treated every `hook-stop` as an immediate `TurnComplete` signal.
+  3. The badge visual helper did not use Codex attention reason when deciding whether acknowledged idle should hide or remain solid.
+- Resolution:
+  - Added managed Codex hook entries for `PreToolUse`, `PermissionRequest`, and `PostToolUse` with the official Bash/apply_patch/MCP matcher and short timeout.
+  - Mapped `PreToolUse` and `PostToolUse` to Working so active continuation restores the gray spinner.
+  - Mapped `PermissionRequest` to approval/permission attention, matching OpenCode amber behavior.
+  - Debounced `Stop` for a short settle window; follow-up work cancels the pending stop, otherwise it becomes a green turn-complete pulse.
+  - Updated Codex badge rendering to match OpenCode's working/permission/idle color semantics.
+- Prevent recurrence:
+  - Keep `check_codex_hooks_json()` aligned with every Mergen-managed Codex hook event so stale two-hook installs are detected.
+  - Test `Stop` alone, `Stop` followed by tool work, and permission-request color behavior.
+- Files/Commands touched: `src/codex.rs`, `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test codex`
+- References: 2026-04-27 user-reported Codex yellow pulse while work should still show spinner; official Codex hook docs (`developers.openai.com/codex/hooks`).
+
+#### Codex Esc interrupt banner now hides the running spinner {#codex-esc-interrupt-banner-hides-spinner}
+- Date: 2026-04-27
+- Context: Windows native Codex CLI during an in-flight turn interrupted from the TUI with `Esc`
+- Error signature: `Codex stops after Esc and shows the interrupted banner, but Mergen keeps the spinner visible.`
+- Symptoms/Impact:
+  1. The active Codex turn stopped, but Mergen still showed a running spinner.
+  2. Follow-up input could be accepted by Codex while the badge still implied active work.
+  3. Queue pressure could drop Codex visible-state chunks because they were not marked as reliable delivery signals.
+- Root cause:
+  1. `src/app.rs` already knew how to map `codex-interrupted-banner` to `Inactive`, but `src/terminal.rs` no longer emitted that chunk.
+  2. The Codex visible detector only handled question prompt footers, not the `conversation interrupted ... /feedback` banner.
+  3. The interrupted idle path left stale pending-attention evidence behind.
+- Resolution:
+  - Extended the Codex visible status detector to recognize the interrupt banner with a strict `conversation interrupted` plus `/feedback` match.
+  - Kept the spinner hidden only after the banner is observed, not immediately on keydown.
+  - Marked Codex question and interrupt chunks as reliably delivered.
+  - Cleared stale Codex pending-attention flags and timestamps on interrupted idle while preserving session/process tracking.
+- Prevent recurrence:
+  - Keep the interrupt detector stricter than generic `interrupt` text because normal Codex prompts include `esc to interrupt`.
+  - Cover Running and Attention interruption paths, plus follow-up prompt reuse, with regressions.
+- Files/Commands touched: `src/terminal.rs`, `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test codex`, `cargo test`
+- References: 2026-04-27 user-reported Codex `Esc` interrupt spinner persistence.
+
+#### Codex CLI Windows hook-only spinner/pulse now works correctly with official hooks {#codex-cli-windows-hook-only-fix}
+- Date: 2026-04-27
+- Context: Windows native Codex CLI with official hooks (`UserPromptSubmit`, `Stop`)
+- Error signature: `Codex CLI on Windows shows gray spinner but never transitions to green pulse; terminal click doesn't clear the badge.`
+- Symptoms/Impact:
+  1. Codex CLI showed gray spinner when work started but never turned green when completed.
+  2. The badge stayed in "unknown" state (gray) instead of "turn complete" (green pulse).
+  3. Clicking the terminal or pressing Esc didn't acknowledge/clear the pulse.
+  4. Hook events from official Codex hooks weren't reaching Mergen's UI state machine.
+- Root cause:
+  1. **Env var collision**: Codex and OpenCode shared `MERGEN_AI_INBOX_DIR`. OpenCode env setup ran after Codex in `terminal.rs`, overwriting the inbox directory. Codex hook events were being written to `runtime/opencode/codex-*.jsonl` instead of `runtime/codex-cli/`.
+  2. **Wrong attention reason**: `hook-stop` event was mapped to `UnknownNotify` (gray pulse) instead of `TurnComplete` (green pulse).
+  3. **Stale working cleanup**: The 2-second stale working timeout (`clear_codex_stale_working_if_needed`) was interrupting long Codex operations even when hooks were actively providing updates.
+  4. **Wrong acknowledge path**: Codex was only using `sent_terminal_input` to acknowledge attention, but OpenCode uses `terminal_interaction` (covers clicks, focus, Esc, etc.).
+- Resolution:
+  - Added `MERGEN_ADE_CODEX_INBOX_DIR` env var in `src/codex.rs` for Codex-specific inbox directory, avoiding collision with OpenCode.
+  - Updated `codex_env_pairs()` to return 5 elements including the new env var.
+  - Changed `hook-stop` mapping in `src/app.rs` to use `TurnComplete` instead of `UnknownNotify` for proper green pulse semantics.
+  - Disabled stale working cleanup when `codex_hooks_runtime_verified` is true (hook-only mode).
+  - Fixed acknowledge behavior: Codex now uses `terminal_interaction` (like OpenCode) instead of only `sent_terminal_input`.
+  - Updated tests to expect `TurnComplete` reason for hook-stop events.
+- Prevent recurrence:
+  - Always use tool-specific env vars for shared resources (inbox directories, tokens) when multiple AI CLIs can coexist.
+  - Map hook events to semantically correct attention reasons (`TurnComplete` for completion, not generic `UnknownNotify`).
+  - Disable timeout-based fallbacks when explicit signal paths (hooks) are verified working.
+  - Align acknowledge behavior across AI CLI integrations for consistent UX.
+- Files/Commands touched: `src/codex.rs`, `src/app.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User-reported Codex CLI spinner/pulse issue on Windows; hook events found in wrong runtime directory (`runtime/opencode/`).
+
+#### Codex CLI question prompt now shows pulse while waiting for user answer {#codex-cli-question-prompt-pulse}
+- Date: 2026-04-27
+- Context: Windows native Codex CLI with hook-only integration when asking interactive questions
+- Error signature: `Codex spinner keeps spinning during question prompts; should show pulse while waiting for user answer.`
+- Symptoms/Impact:
+  1. When Codex showed a question UI ("Question 1/1", "enter to submit answer"), the spinner continued spinning instead of transitioning to pulse.
+  2. The `Stop` hook doesn't fire during question prompts because the turn hasn't technically completed - Codex is waiting for the user's answer.
+  3. Users expected a pulse (not spinner) to indicate "waiting for your input" state.
+- Root cause:
+  1. Strict hook-only integration assumed `Stop` hook would fire for all attention states.
+  2. Codex question prompts are intermediate states where the agent is idle but waiting for user input, not a completed turn.
+  3. No visible UI detection was in place to catch this specific case.
+- Resolution:
+  - Added narrow `PendingVisibleCodexStatus` detector in `src/terminal.rs` specifically for question prompts.
+  - Detector matches the pattern: "Question" + number + "enter to submit answer".
+  - Emits `codex-question-prompt` raw chunk which transitions spinner → pulse with `UserInputRequested` reason.
+  - Detector is intentionally narrow to avoid false positives on normal Codex output.
+  - This is the only visible UI detection for Codex; all other states remain hook-only.
+- Prevent recurrence:
+  - Document the question prompt exception in AGENTS.md as the sole visible UI detection for Codex.
+  - Keep the detector pattern extremely specific (requires both "Question" and "enter to submit answer").
+  - Test with actual Codex question flows to ensure no regression in hook-only behavior for non-question states.
+- Files/Commands touched: `src/terminal.rs`, `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User-reported spinner behavior during Codex question prompts; screenshot showing "Question 1/1 (1 unanswered)" UI.
+
+#### Codex CLI question prompt Escape key now routes to terminal like OpenCode {#codex-cli-question-prompt-escape}
+- Date: 2026-04-27
+- Context: Windows native Codex CLI with hook-only integration during interactive question prompts
+- Error signature: `Codex question prompt doesn't respond to Escape key; Esc should cancel/acknowledge like in OpenCode.`
+- Symptoms/Impact:
+  1. When Codex showed a question prompt UI, pressing Escape key had no effect in the terminal.
+  2. The Escape key was consumed by the Mergen UI instead of being routed to the Codex terminal.
+  3. Users expected Escape to work like in OpenCode question prompts (clear pulse, allow cancellation).
+- Root cause:
+  1. Codex question prompt detection was added, but the raw input routing logic didn't have a Codex-specific branch.
+  2. The `should_steal_attention_terminal_input()` function only had branches for Factory Droid and OpenCode interactive attention states.
+  3. Codex question prompt (UserInputRequested) fell through to the generic `event_is_terminal_text_entry()` check, which doesn't include Escape.
+- Resolution:
+  - Added `terminal_has_codex_interactive_attention()` helper function in `src/app.rs` using `CodexAttentionReason::allows_empty_submit()`.
+  - Updated `should_steal_attention_terminal_input()` to check for Codex interactive attention and route events using `event_is_factory_droid_interactive_entry()` (which includes Escape).
+  - This ensures Escape, arrow keys, Tab, and other interactive keys are properly routed to the terminal during Codex question prompts.
+  - Added test `codex_question_prompt_escape_clears_pulse_but_keeps_attention` to verify the behavior.
+- Prevent recurrence:
+  - Any new interactive attention states must be explicitly added to `should_steal_attention_terminal_input()` with proper event routing.
+  - Match the pattern used by OpenCode and Factory Droid for consistent keyboard handling.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User-reported Escape key not working in Codex question prompts; comparison with OpenCode behavior.
+
+#### Codex CLI question prompt detector improved for "Questions" plural form {#codex-question-detector-plural}
+- Date: 2026-04-27
+- Context: Windows native Codex CLI with hook-only integration when asking interactive questions
+- Error signature: `Codex question prompt not detected when text shows "Questions 1/1 answered" or similar variations.`
+- Symptoms/Impact:
+  1. The question prompt detector was looking for "Question" (singular) but Codex sometimes shows "Questions" (plural).
+  2. The detector was also not handling variations like "(1 unanswered)" or "answered" suffixes.
+  3. This caused the spinner to keep spinning instead of transitioning to pulse when questions were displayed.
+- Root cause:
+  1. The detector pattern `question` + number didn't account for the plural form `questions`.
+  2. The pattern was too rigid about whitespace and didn't use the same projection/collapsing as other detectors.
+- Resolution:
+  - Updated `detect_visible_codex_question_with_end()` in `src/terminal.rs` to use `build_visible_status_projection()` and `collapse_projection_whitespace()` like other detectors.
+  - Modified the pattern to accept both "question" and "questions" (handling the optional 's').
+  - Made the number pattern detection more robust: skip whitespace, require digit(s), require '/', require digit(s).
+  - The detector now properly ignores suffix text like "(1 unanswered)" or "answered" after the number pattern.
+- Prevent recurrence:
+  - Use the same text projection/collapsing utilities as other detectors for consistent behavior.
+  - Test detector against actual Codex output variations including plural forms and status suffixes.
+- Files/Commands touched: `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User-reported question prompt not being detected; screenshot showing "Questions 1/1 answered" text.
+
+#### Codex CLI terminal rendering fixed after hook-only integration caused diagonal/stair-step output {#codex-cli-terminal-rendering-fixed}
+- Date: 2026-04-27
+- Context: Windows native Codex CLI with hook-only integration
+- Error signature: `Codex terminal shows diagonal/stair-step text rendering after hook fix; lines start where previous line ended instead of at column 1.`
+- Symptoms/Impact:
+  1. After the hook-only fix, Codex CLI terminal showed corrupted rendering where each line of text started at the column where the previous line ended.
+  2. This created a diagonal/stair-step visual effect making the terminal unreadable.
+  3. Additionally, hook status messages like "Running Stop hook: Mergen: session stopped" appeared in the terminal.
+- Root cause:
+  1. **Over-aggressive filtering**: The `CodexRedrawFilter` was suppressing cursor-positioning sequences (`ESC[H`, `ESC[1;1H`, `ESC[f`) during synchronized update blocks.
+  2. Codex TUI relies on these sequences to reposition the cursor to column 1 when redrawing the input area. Without them, each write continued from the previous cursor position.
+  3. **Hook status messages**: The `statusMessage` field in `hooks.json` caused Codex to display hook execution status in the terminal.
+- Resolution:
+  - Modified `CodexRedrawFilter` in `src/terminal.rs` to only suppress ED3 (erase scrollback) during sync blocks, preserving cursor positioning and ED2 (erase display).
+  - Updated filter comments to document that cursor positioning must be preserved for proper TUI redraw semantics.
+  - Removed `statusMessage` field from managed hook entries in `src/codex.rs` to prevent terminal noise.
+  - Updated all affected tests to reflect the new filtering behavior:
+    - `codex_filter_suppresses_ed3_during_sync` (renamed from ED2 test)
+    - `codex_filter_handles_split_ed3_across_chunks` (renamed from ED2 test)
+    - `codex_filter_preserves_cursor_positioning_during_sync` (updated to verify pass-through)
+    - `codex_filter_full_redraw_sequence_preserves_cursor_and_ed2` (updated expectations)
+    - `codex_filter_preserves_other_csi_sequences` (updated to verify cursor positioning passes)
+    - `codex_filter_suppresses_ed3_scrollback_erase_during_sync` (new test)
+- Prevent recurrence:
+  - Do not suppress cursor-positioning sequences independently from erase commands in TUI redraw filtering.
+  - When filtering terminal output for specific applications, test with actual TUI sessions to verify rendering integrity.
+  - Omit `statusMessage` from managed hooks to prevent unwanted terminal output.
+- Files/Commands touched: `src/terminal.rs`, `src/codex.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User-reported diagonal rendering issue after Codex hook-only fix.
+
 #### Codex CLI terminal opens at top of viewport instead of bottom {#codex-terminal-opens-at-top}
 - Date: 2026-04-27
 - Context: main/Windows terminal manager with Codex CLI sessions

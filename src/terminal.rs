@@ -62,14 +62,14 @@ const IO_BUFFER_SIZE: usize = 16 * 1024;
 const GRACEFUL_TERMINATION_TIMEOUT_MS: u32 = 300;
 
 /// Filters Codex CLI's aggressive redraw sequences during synchronized output.
-/// When active, suppresses ED2 (erase display), ED3 (erase scrollback), and
-/// cursor repositioning sequences that cause viewport jumping in the Mergen
-/// terminal view.
+/// When active, suppresses ED3 (erase scrollback) which causes content loss in
+/// the Mergen terminal view. Other sequences like cursor repositioning and
+/// ED2 (erase display) are preserved to maintain proper TUI redraw semantics.
 ///
 /// Codex sends `ESC[?2026h` (begin sync), then `ESC[2J` / `ESC[3J` clears,
-/// and `ESC[H` / `ESC[1;1H` cursor-home, then `ESC[?2026l` (end sync). These
-/// are for the TUI's internal buffer management, not for actual terminal
-/// behavior in our context.
+/// and `ESC[H` / `ESC[1;1H` cursor-home, then `ESC[?2026l` (end sync).
+/// Only ED3 is suppressed to prevent scrollback loss while allowing the TUI
+/// to manage its own viewport correctly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CodexRedrawFilter {
     /// True when inside a synchronized update block (ESC[?2026h ... ESC[?2026l)
@@ -258,21 +258,21 @@ impl CodexRedrawFilter {
             }
 
             // Check for erase sequences when sync is active
+            // Only suppress ED3 (erase scrollback) which causes content loss in Mergen.
+            // ED2 (erase display) is preserved to maintain proper TUI redraw semantics.
             if self.sync_active && cmd == b'J' {
-                // ED2 (2J) = erase display, ED3 (3J) = erase scrollback
-                if params == b"2" || params == b"3" || params == b"?2" || params == b"?3" {
-                    // Suppress these sequences during sync
+                // ED3 (3J) = erase scrollback - suppress to prevent content loss
+                if params == b"3" || params == b"?3" {
                     return FilterAction::Suppress(full_len);
                 }
+                // ED2 (2J) = erase display - pass through to allow proper TUI redraws
             }
 
-            // Check for cursor repositioning sequences when sync is active
-            // H (CUP) and f (HVP) both move cursor - suppress during sync
-            if self.sync_active && (cmd == b'H' || cmd == b'f') {
-                // Cursor Home (no params) or Cursor Position (row;col)
-                // Suppress these during sync to prevent viewport jumping
-                return FilterAction::Suppress(full_len);
-            }
+            // Cursor positioning sequences (H/f) are intentionally NOT suppressed.
+            // Codex TUI relies on cursor-home (ESC[H, ESC[1;1H) and position (ESC[row;colH)
+            // to correctly redraw the input area. Suppressing these causes diagonal/stair-step
+            // rendering artifacts where each line starts where the previous ended.
+            // See: CodexRedrawFilter cursor positioning preservation fix
 
             // Other CSI sequence - pass through
             return FilterAction::Emit(full_len);
@@ -2242,8 +2242,204 @@ impl PendingVisibleFactoryStatus {
     }
 }
 
-// NOTE: PendingVisibleCodexStatus removed - Codex uses hook-only integration.
-// Visible UI detection is disabled for Codex to ensure strict hook-authoritative behavior.
+/// Pending visible Codex status detector.
+/// This is a narrow exception to hook-only integration for specific TUI states
+/// where Codex does not emit a Stop hook: question prompts and Esc interrupts.
+#[derive(Debug, Default)]
+struct PendingVisibleCodexStatus {
+    buffer: String,
+}
+
+impl PendingVisibleCodexStatus {
+    #[cfg(test)]
+    fn extract_from_text(&mut self, text: &str) -> Option<String> {
+        self.extract_from_text_with_end_offset(text)
+            .map(|(status, _)| status)
+    }
+
+    fn extract_from_text_with_end_offset(&mut self, text: &str) -> Option<(String, usize)> {
+        if text.is_empty() {
+            return None;
+        }
+
+        let previous_buffer_len = self.buffer.len();
+        self.buffer.push_str(text);
+
+        if let Some((detected, end_offset)) = detect_visible_codex_status_with_end(&self.buffer) {
+            self.buffer.clear();
+            return Some((
+                detected.to_string(),
+                end_offset
+                    .saturating_sub(previous_buffer_len)
+                    .min(text.len()),
+            ));
+        }
+
+        self.truncate_to_limit();
+        None
+    }
+
+    fn truncate_to_limit(&mut self) {
+        let overflow = self
+            .buffer
+            .chars()
+            .count()
+            .saturating_sub(MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS);
+        if overflow == 0 {
+            return;
+        }
+
+        let mut char_indices = self.buffer.char_indices();
+        let split_at = char_indices
+            .nth(overflow - 1)
+            .map(|(index, ch)| index + ch.len_utf8())
+            .unwrap_or(0);
+        self.buffer.drain(..split_at);
+    }
+}
+
+fn detect_visible_codex_status_with_end(text: &str) -> Option<(&'static str, usize)> {
+    let (projection, projection_offsets) = build_visible_status_projection(text);
+    let (collapsed, collapsed_offsets) =
+        collapse_projection_whitespace(&projection, &projection_offsets);
+
+    // Normalize for case-insensitive matching
+    let collapsed_lower = collapsed.to_lowercase();
+
+    if let Some(end_offset) =
+        detect_visible_codex_interrupted_banner_with_end(&collapsed_lower, &collapsed_offsets)
+    {
+        return Some(("codex-interrupted-banner", end_offset));
+    }
+
+    // FIRST: Try header+footer pattern: "Question(s) X/Y" + "enter to submit answer"
+    if let Some(result) = detect_codex_question_header_pattern(&collapsed_lower, &collapsed_offsets)
+    {
+        return Some(result);
+    }
+
+    // SECOND: Fallback to footer-only pattern for real TUI chunks
+    // Detect: "enter to submit answer" + "esc to interrupt"
+    // This handles cases where only the footer arrives in the buffer
+    detect_codex_question_footer_pattern(&collapsed_lower, &collapsed_offsets)
+}
+
+fn detect_visible_codex_interrupted_banner_with_end(
+    collapsed_lower: &str,
+    collapsed_offsets: &[usize],
+) -> Option<usize> {
+    let interrupted_start = collapsed_lower.find("conversation interrupted")?;
+    let interrupted_end = interrupted_start + "conversation interrupted".len();
+    let feedback_end = collapsed_lower[interrupted_end..]
+        .find("/feedback")
+        .map(|offset| interrupted_end + offset + "/feedback".len())?;
+    let end_char_index = collapsed_lower[..feedback_end]
+        .chars()
+        .count()
+        .saturating_sub(1);
+    collapsed_offsets.get(end_char_index).copied()
+}
+
+/// Detects header pattern: "Question(s) X/Y" + "enter to submit answer"
+fn detect_codex_question_header_pattern(
+    collapsed_lower: &str,
+    collapsed_offsets: &[usize],
+) -> Option<(&'static str, usize)> {
+    // Look for question pattern: "question" or "questions" (plural)
+    let question_start = collapsed_lower.find("question")?;
+
+    // After "question", check if it's followed by 's' (plural) - skip it
+    let after_question_word = question_start + "question".len();
+    let after_plural =
+        if collapsed_lower.get(after_question_word..after_question_word + 1) == Some("s") {
+            after_question_word + 1
+        } else {
+            after_question_word
+        };
+
+    // Must have a question number pattern like "1/1" or "1/3" after "question(s)"
+    // Allow whitespace between "question(s)" and the number
+    let mut pos = after_plural;
+    while pos < collapsed_lower.len() && collapsed_lower.as_bytes()[pos].is_ascii_whitespace() {
+        pos += 1;
+    }
+
+    // Check for number/number pattern (e.g., "1/1", "1/3")
+    let number_start = pos;
+    if number_start >= collapsed_lower.len() {
+        return None;
+    }
+
+    // Must start with a digit
+    if !collapsed_lower.as_bytes()[number_start].is_ascii_digit() {
+        return None;
+    }
+
+    // Read digits
+    pos = number_start;
+    while pos < collapsed_lower.len() && collapsed_lower.as_bytes()[pos].is_ascii_digit() {
+        pos += 1;
+    }
+
+    // Must have '/'
+    if pos >= collapsed_lower.len() || collapsed_lower.as_bytes()[pos] != b'/' {
+        return None;
+    }
+    pos += 1; // skip '/'
+
+    // Must have more digits
+    if pos >= collapsed_lower.len() || !collapsed_lower.as_bytes()[pos].is_ascii_digit() {
+        return None;
+    }
+    while pos < collapsed_lower.len() && collapsed_lower.as_bytes()[pos].is_ascii_digit() {
+        pos += 1;
+    }
+
+    // Skip any trailing content like "(1 unanswered)" or "answered"
+    // Look for "enter to submit answer" after the number pattern
+    let after_number = pos;
+    let enter_pos = collapsed_lower[after_number..].find("enter to submit answer")?;
+    let enter_end = after_number + enter_pos + "enter to submit answer".len();
+
+    // Calculate end offset at the end of "enter to submit answer"
+    let end_char_index = collapsed_lower[..enter_end]
+        .chars()
+        .count()
+        .saturating_sub(1);
+    collapsed_offsets
+        .get(end_char_index)
+        .copied()
+        .map(|o| ("codex-question-prompt", o))
+}
+
+/// Detects footer-only pattern: "enter to submit answer" + "esc to interrupt"
+/// This is a narrow pattern that specifically matches the Codex question UI footer
+fn detect_codex_question_footer_pattern(
+    collapsed_lower: &str,
+    collapsed_offsets: &[usize],
+) -> Option<(&'static str, usize)> {
+    // Must have "enter to submit answer"
+    let enter_pos = collapsed_lower.find("enter to submit answer")?;
+    let enter_end = enter_pos + "enter to submit answer".len();
+
+    // Must also have "esc to interrupt" somewhere in the text
+    // This creates a narrow pattern that only matches the specific UI footer
+    let esc_pos = collapsed_lower.find("esc to interrupt")?;
+
+    // Ensure both markers are present and "esc to interrupt" comes after or near "enter"
+    // We don't require strict ordering because TUI may render them in chunks
+    // But we do require both to be present to avoid false positives
+
+    // Use the later of the two end positions for the offset
+    let esc_end = esc_pos + "esc to interrupt".len();
+    let end_pos = enter_end.max(esc_end);
+
+    let end_char_index = collapsed_lower[..end_pos].chars().count().saturating_sub(1);
+    collapsed_offsets
+        .get(end_char_index)
+        .copied()
+        .map(|o| ("codex-question-prompt", o))
+}
 
 #[derive(Debug, Default)]
 struct PendingVisibleOpenCodeStatus {
@@ -2767,6 +2963,7 @@ fn collect_ai_read_signals(
     manager: &AiHookManager,
     pending_osc_title: &mut PendingOscTitle,
     pending_visible_factory_status: &mut PendingVisibleFactoryStatus,
+    pending_visible_codex_status: &mut PendingVisibleCodexStatus,
     pending_visible_opencode_status: &mut PendingVisibleOpenCodeStatus,
 ) -> Vec<PendingAiReadSignal> {
     let text = String::from_utf8_lossy(bytes);
@@ -2835,7 +3032,17 @@ fn collect_ai_read_signals(
         });
     }
 
-    // NOTE: Codex visible status detection removed - hook-only integration.
+    // Codex visible status detection - narrow exceptions to hook-only integration.
+    // Question prompts switch spinner -> pulse; interrupt banners hide stopped work.
+    if let Some((chunk, end_offset)) =
+        pending_visible_codex_status.extract_from_text_with_end_offset(&text)
+    {
+        signals.push(PendingAiReadSignal {
+            text_offset: end_offset.min(text.len()),
+            kind: PendingAiReadSignalKind::RawChunk { chunk },
+        });
+    }
+
     // OpenCode visible status detection is preserved for manual launch scenarios.
     // even before the tool is explicitly detected (e.g., manual launch scenarios).
     // The patterns are OpenCode-specific and won't false-positive on other output.
@@ -2868,7 +3075,8 @@ fn spawn_reader_thread(
         let mut codex_filter = CodexRedrawFilter::new();
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
-        // NOTE: pending_visible_codex_status removed - Codex uses hook-only integration
+        // Codex visible status detection - narrow exception for specific TUI states.
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         loop {
@@ -2904,6 +3112,7 @@ fn spawn_reader_thread(
                             manager,
                             &mut pending_osc_title,
                             &mut pending_visible_factory_status,
+                            &mut pending_visible_codex_status,
                             &mut pending_visible_opencode_status,
                         ) {
                             match signal.kind {
@@ -3066,7 +3275,8 @@ fn ai_raw_chunk_requires_reliable_delivery(chunk: &str) -> bool {
             | "droid-ask-user-prompt"
             | "droid-spec-approval-prompt"
             | "droid-interrupted-banner"
-            // NOTE: Codex visible UI chunks removed - hook-only integration
+            | "codex-question-prompt"
+            | "codex-interrupted-banner"
             | "opencode-question-prompt"
             | "opencode-approval-prompt"
             | "opencode-plan-mode"
@@ -3758,16 +3968,17 @@ mod tests {
         snapshots_from_terminal, test_terminal_runtime, trim_trailing_default_cells,
         verified_process_entry, verified_process_tree_descendants, verified_snapshot_root_process,
         AdeTerminalConfig, CodexRedrawFilter, PendingAiReadSignalKind, PendingOscTitle,
-        PendingVisibleFactoryStatus, PendingVisibleOpenCodeStatus, ProcessSnapshotEntry,
-        RootProcessTerminationPlan, RuntimeCommand, SharedWriter, SharedWriterHandle,
-        TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape, TerminalDimensions,
-        TerminalRuntime, TerminalSelectionHyperlink, TerminalStyle, TerminalStyledCell,
-        TerminalUiEventKind, TrackedProcessIdentity, VerifiedProcessLookup,
+        PendingVisibleCodexStatus, PendingVisibleFactoryStatus, PendingVisibleOpenCodeStatus,
+        ProcessSnapshotEntry, RootProcessTerminationPlan, RuntimeCommand, SharedWriter,
+        SharedWriterHandle, TerminalColor, TerminalCursor, TerminalCursorLine, TerminalCursorShape,
+        TerminalDimensions, TerminalRuntime, TerminalSelectionHyperlink, TerminalStyle,
+        TerminalStyledCell, TerminalUiEventKind, TrackedProcessIdentity, VerifiedProcessLookup,
         MAX_PENDING_VISIBLE_FACTORY_STATUS_CHARS,
     };
     use crate::codex::{
-        codex_env_pairs, MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR, MERGEN_AI_INBOX_DIR_ENV_VAR,
-        MERGEN_AI_TOOL_HINT_CODEX, MERGEN_AI_TOOL_HINT_ENV_VAR, MERGEN_TERMINAL_ID_ENV_VAR,
+        codex_env_pairs, MERGEN_ADE_CODEX_INBOX_DIR_ENV_VAR, MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR,
+        MERGEN_AI_INBOX_DIR_ENV_VAR, MERGEN_AI_TOOL_HINT_CODEX, MERGEN_AI_TOOL_HINT_ENV_VAR,
+        MERGEN_TERMINAL_ID_ENV_VAR,
     };
     use crate::hooks::{
         AiCliStatus, AiCliTool, AiHooksConfig, FACTORY_DROID_HOOKS_DIR_ENV_VAR,
@@ -4209,6 +4420,7 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
         let bytes = b"[droid-hook:event=UserPromptSubmit]\x1b]0;[Idle]\x07";
 
@@ -4218,6 +4430,7 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
             &mut pending_visible_opencode_status,
         );
 
@@ -4246,6 +4459,7 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
         let bytes = b"[droid-hook:event=UserPromptSubmit]HOOKS  Stop";
 
@@ -4255,6 +4469,7 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
             &mut pending_visible_opencode_status,
         );
 
@@ -4284,6 +4499,7 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
         let hook = "[droid-hook:event=UserPromptSubmit]";
         let bytes = b"[droid-hook:event=UserPromptSubmit]\xF0\x9F\x94\x94";
@@ -4294,6 +4510,7 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
             &mut pending_visible_opencode_status,
         );
 
@@ -4327,10 +4544,12 @@ mod tests {
         assert_eq!(pairs[0].1, OsString::from("29"));
         assert_eq!(pairs[1].0, MERGEN_AI_INBOX_DIR_ENV_VAR);
         assert_eq!(pairs[1].1, inbox_dir.as_os_str());
-        assert_eq!(pairs[2].0, MERGEN_AI_TOOL_HINT_ENV_VAR);
-        assert_eq!(pairs[2].1, OsString::from(MERGEN_AI_TOOL_HINT_CODEX));
-        assert_eq!(pairs[3].0, MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR);
-        assert_eq!(pairs[3].1, OsString::from("codex-token-29"));
+        assert_eq!(pairs[2].0, MERGEN_ADE_CODEX_INBOX_DIR_ENV_VAR);
+        assert_eq!(pairs[2].1, inbox_dir.as_os_str());
+        assert_eq!(pairs[3].0, MERGEN_AI_TOOL_HINT_ENV_VAR);
+        assert_eq!(pairs[3].1, OsString::from(MERGEN_AI_TOOL_HINT_CODEX));
+        assert_eq!(pairs[4].0, MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR);
+        assert_eq!(pairs[4].1, OsString::from("codex-token-29"));
     }
 
     #[test]
@@ -4339,6 +4558,7 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
@@ -4347,6 +4567,7 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
             &mut pending_visible_opencode_status,
         );
 
@@ -4365,6 +4586,7 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
@@ -4373,6 +4595,7 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
             &mut pending_visible_opencode_status,
         );
 
@@ -4395,6 +4618,7 @@ mod tests {
         manager.set_tool(1, AiCliTool::FactoryDroid);
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
@@ -4403,6 +4627,7 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
             &mut pending_visible_opencode_status,
         );
 
@@ -4426,6 +4651,7 @@ mod tests {
         manager.set_tool(1, AiCliTool::FactoryDroid);
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
@@ -4434,6 +4660,7 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
             &mut pending_visible_opencode_status,
         );
 
@@ -4471,6 +4698,7 @@ mod tests {
         manager.set_tool(1, AiCliTool::FactoryDroid);
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
@@ -4479,6 +4707,7 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
             &mut pending_visible_opencode_status,
         );
 
@@ -4507,6 +4736,7 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
@@ -4515,6 +4745,7 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
             &mut pending_visible_opencode_status,
         );
 
@@ -4530,6 +4761,7 @@ mod tests {
             crate::hooks::AiHookManager::new(AiHooksConfig::with_factory_droid_defaults());
         let mut pending_osc_title = PendingOscTitle::default();
         let mut pending_visible_factory_status = PendingVisibleFactoryStatus::default();
+        let mut pending_visible_codex_status = PendingVisibleCodexStatus::default();
         let mut pending_visible_opencode_status = PendingVisibleOpenCodeStatus::default();
 
         let signals = collect_ai_read_signals(
@@ -4538,6 +4770,7 @@ mod tests {
             &manager,
             &mut pending_osc_title,
             &mut pending_visible_factory_status,
+            &mut pending_visible_codex_status,
             &mut pending_visible_opencode_status,
         );
 
@@ -5746,7 +5979,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_filter_suppresses_ed2_during_sync() {
+    fn codex_filter_suppresses_ed3_during_sync() {
         let mut filter = CodexRedrawFilter::new();
         let mut output = Vec::new();
 
@@ -5754,15 +5987,18 @@ mod tests {
         filter.filter(b"\x1b[?2026h", &mut output);
         assert_eq!(output, b"\x1b[?2026h");
 
-        // ED2 should be suppressed during sync
+        // ED2 (erase display) should PASS THROUGH during sync
+        output.clear();
         filter.filter(b"\x1b[2J", &mut output);
-        assert!(output.is_empty());
+        assert_eq!(output, b"\x1b[2J");
 
-        // ED3 should also be suppressed
+        // ED3 (erase scrollback) should be suppressed during sync
+        output.clear();
         filter.filter(b"\x1b[3J", &mut output);
         assert!(output.is_empty());
 
         // End sync
+        output.clear();
         filter.filter(b"\x1b[?2026l", &mut output);
         assert_eq!(output, b"\x1b[?2026l");
     }
@@ -5789,13 +6025,14 @@ mod tests {
         filter.filter(b"2026h", &mut output);
         assert_eq!(output, b"\x1b[?2026h");
 
-        // Now in sync mode, ED2 should be suppressed
+        // Now in sync mode, ED2 should PASS THROUGH (only ED3 is suppressed)
+        output.clear();
         filter.filter(b"\x1b[2J", &mut output);
-        assert!(output.is_empty());
+        assert_eq!(output, b"\x1b[2J");
     }
 
     #[test]
-    fn codex_filter_handles_split_ed2_across_chunks() {
+    fn codex_filter_handles_split_ed3_across_chunks() {
         let mut filter = CodexRedrawFilter::new();
         let mut output = Vec::new();
 
@@ -5803,12 +6040,12 @@ mod tests {
         filter.filter(b"\x1b[?2026h", &mut output);
         assert_eq!(output, b"\x1b[?2026h");
 
-        // Split ED2: "\x1b[" and "2J"
+        // Split ED3: "\x1b[" and "3J"
         filter.filter(b"\x1b[", &mut output);
         assert!(output.is_empty()); // Incomplete, buffered
 
-        filter.filter(b"2J", &mut output);
-        // ED2 should be suppressed during sync
+        filter.filter(b"3J", &mut output);
+        // ED3 (erase scrollback) should be suppressed during sync
         assert!(output.is_empty());
     }
 
@@ -5818,10 +6055,10 @@ mod tests {
         let mut accumulated = Vec::new();
         let mut output = Vec::new();
 
-        // Enter sync mode
+        // Enter sync mode with ED2 (now passes through during sync)
         filter.filter(b"\x1b[?2026h\x1b[2J", &mut output);
-        // Only sync start passes, ED2 is suppressed
-        assert_eq!(output, b"\x1b[?2026h");
+        // Both sync start and ED2 pass through (only ED3 is suppressed)
+        assert_eq!(output, b"\x1b[?2026h\x1b[2J");
         accumulated.extend_from_slice(&output);
 
         // Split end sync: "\x1b[?" and "2026l"
@@ -5829,20 +6066,20 @@ mod tests {
         filter.filter(b"\x1b[?", &mut output);
         assert!(output.is_empty()); // Incomplete, buffered
         accumulated.extend_from_slice(&output);
-        assert_eq!(accumulated, b"\x1b[?2026h"); // No new output
+        assert_eq!(accumulated, b"\x1b[?2026h\x1b[2J"); // No new output from split sequence
 
         output.clear();
         filter.filter(b"2026l", &mut output);
         assert_eq!(output, b"\x1b[?2026l");
         accumulated.extend_from_slice(&output);
-        assert_eq!(accumulated, b"\x1b[?2026h\x1b[?2026l");
+        assert_eq!(accumulated, b"\x1b[?2026h\x1b[2J\x1b[?2026l");
 
-        // Now out of sync, ED2 should pass through
+        // Now out of sync, ED2 should pass through (it already did during sync)
         output.clear();
         filter.filter(b"\x1b[2J", &mut output);
         assert_eq!(output, b"\x1b[2J");
         accumulated.extend_from_slice(&output);
-        assert_eq!(accumulated, b"\x1b[?2026h\x1b[?2026l\x1b[2J");
+        assert_eq!(accumulated, b"\x1b[?2026h\x1b[2J\x1b[?2026l\x1b[2J");
     }
 
     #[test]
@@ -5850,12 +6087,13 @@ mod tests {
         let mut filter = CodexRedrawFilter::new();
         let mut output = Vec::new();
 
-        // Mixed: text, sync start, clear, text, sync end, clear
-        let input = b"Text\x1b[?2026h\x1b[2JMore\x1b[?2026l\x1b[3J";
+        // Mixed: text, sync start, ED2 clear, ED3 scrollback erase, text, sync end, ED3 clear
+        let input = b"Text\x1b[?2026h\x1b[2J\x1b[3JMore\x1b[?2026l\x1b[3J";
         filter.filter(input, &mut output);
 
-        // Should have: text, sync start, "More", sync end, clear (last clear passes)
-        assert_eq!(output, b"Text\x1b[?2026hMore\x1b[?2026l\x1b[3J");
+        // Should have: text, sync start, ED2 (preserved), "More", sync end, ED3 (after sync passes)
+        // Only ED3 (3J) during sync is suppressed; ED2 and post-sync ED3 pass through
+        assert_eq!(output, b"Text\x1b[?2026h\x1b[2JMore\x1b[?2026l\x1b[3J");
     }
 
     #[test]
@@ -5869,13 +6107,14 @@ mod tests {
         assert_eq!(output, b"\x1b[?2026h");
         accumulated.extend_from_slice(&output);
 
-        // SGR (color) sequences pass through, but cursor repositioning is suppressed
+        // SGR (color) sequences pass through, and cursor repositioning is also preserved
+        // This is required for proper Codex TUI redraw semantics
         output.clear();
         filter.filter(b"\x1b[31m\x1b[1;1H\x1b[0m", &mut output);
-        // Only color sequences pass, cursor-home (1;1H) is suppressed during sync
-        assert_eq!(output, b"\x1b[31m\x1b[0m");
+        // Both color sequences and cursor positioning pass through during sync
+        assert_eq!(output, b"\x1b[31m\x1b[1;1H\x1b[0m");
         accumulated.extend_from_slice(&output);
-        assert_eq!(accumulated, b"\x1b[?2026h\x1b[31m\x1b[0m");
+        assert_eq!(accumulated, b"\x1b[?2026h\x1b[31m\x1b[1;1H\x1b[0m");
     }
 
     #[test]
@@ -5894,7 +6133,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_filter_suppresses_cursor_home_during_sync() {
+    fn codex_filter_preserves_cursor_positioning_during_sync() {
         let mut filter = CodexRedrawFilter::new();
         let mut output = Vec::new();
 
@@ -5902,19 +6141,60 @@ mod tests {
         filter.filter(b"\x1b[?2026h", &mut output);
         assert_eq!(output, b"\x1b[?2026h");
 
-        // Cursor home without params (ESC[H) should be suppressed
+        // Cursor home without params (ESC[H) should PASS THROUGH during sync
+        // This is required for proper Codex TUI redraw semantics
         output.clear();
         filter.filter(b"\x1b[H", &mut output);
-        assert!(output.is_empty());
+        assert_eq!(output, b"\x1b[H");
 
-        // Cursor position (ESC[1;1H) should be suppressed
+        // Cursor position (ESC[1;1H) should also PASS THROUGH during sync
         output.clear();
         filter.filter(b"\x1b[1;1H", &mut output);
-        assert!(output.is_empty());
+        assert_eq!(output, b"\x1b[1;1H");
 
-        // HVP (ESC[f) should be suppressed - same as H
+        // HVP (ESC[f) should also PASS THROUGH during sync
         output.clear();
         filter.filter(b"\x1b[f", &mut output);
+        assert_eq!(output, b"\x1b[f");
+
+        // End sync
+        output.clear();
+        filter.filter(b"\x1b[?2026l", &mut output);
+        assert_eq!(output, b"\x1b[?2026l");
+    }
+
+    #[test]
+    fn codex_filter_full_redraw_sequence_preserves_cursor_and_ed2() {
+        let mut filter = CodexRedrawFilter::new();
+        let mut output = Vec::new();
+
+        // Full Codex redraw sequence: sync, cursor-home, ED2 clear, text, end-sync
+        // Only ED3 (scrollback erase) should be suppressed, not ED2 or cursor positioning
+        let input = b"\x1b[?2026h\x1b[1;1H\x1b[2Jprompt text\x1b[?2026l";
+        filter.filter(input, &mut output);
+
+        // Should have: sync start, cursor position, ED2 (preserved), "prompt text", sync end
+        // Only ED3 would be suppressed if present
+        assert_eq!(output, b"\x1b[?2026h\x1b[1;1H\x1b[2Jprompt text\x1b[?2026l");
+    }
+
+    #[test]
+    fn codex_filter_suppresses_ed3_scrollback_erase_during_sync() {
+        let mut filter = CodexRedrawFilter::new();
+        let mut output = Vec::new();
+
+        // Enter sync mode
+        filter.filter(b"\x1b[?2026h", &mut output);
+        assert_eq!(output, b"\x1b[?2026h");
+
+        // ED3 (erase scrollback) should be suppressed during sync
+        output.clear();
+        filter.filter(b"\x1b[3J", &mut output);
+        assert!(output.is_empty());
+
+        // Also test parameterized form
+        output.clear();
+        filter.filter(b"\x1b[?3J", &mut output);
         assert!(output.is_empty());
 
         // End sync
@@ -5922,23 +6202,301 @@ mod tests {
         filter.filter(b"\x1b[?2026l", &mut output);
         assert_eq!(output, b"\x1b[?2026l");
 
-        // Now cursor home should pass through
+        // Now ED3 should pass through
         output.clear();
-        filter.filter(b"\x1b[H", &mut output);
-        assert_eq!(output, b"\x1b[H");
+        filter.filter(b"\x1b[3J", &mut output);
+        assert_eq!(output, b"\x1b[3J");
+    }
+
+    // Codex visible status detector tests
+    // =========================================================================
+
+    #[test]
+    fn codex_interrupted_banner_detects_full_banner() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        let text =
+            "Conversation interrupted. You can continue by typing a new message, or run /feedback.";
+        let result = detector.extract_from_text(text);
+
+        assert_eq!(result, Some("codex-interrupted-banner".to_string()));
     }
 
     #[test]
-    fn codex_filter_full_redraw_sequence_suppressed() {
-        let mut filter = CodexRedrawFilter::new();
-        let mut output = Vec::new();
+    fn codex_interrupted_banner_handles_split_across_chunks() {
+        let mut detector = PendingVisibleCodexStatus::default();
 
-        // Full Codex redraw sequence: sync, cursor-home, clear, text, end-sync
-        let input = b"\x1b[?2026h\x1b[1;1H\x1b[2Jprompt text\x1b[?2026l";
-        filter.filter(input, &mut output);
+        let result1 = detector.extract_from_text("Conversation interrupted. You can continue");
+        assert_eq!(result1, None);
 
-        // Should only have: sync start, "prompt text", sync end
-        // cursor-home and clear are suppressed
-        assert_eq!(output, b"\x1b[?2026hprompt text\x1b[?2026l");
+        let result2 = detector.extract_from_text(" with a new message or run /feedback.");
+        assert_eq!(result2, Some("codex-interrupted-banner".to_string()));
+    }
+
+    #[test]
+    fn codex_interrupted_banner_handles_ansi_and_cursor_sequences() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        let text = "\x1b[H\x1b[2J\x1b[31mConversation interrupted\x1b[0m\r\nRun \x1b[1m/feedback\x1b[0m to report this.";
+        let result = detector.extract_from_text(text);
+
+        assert_eq!(result, Some("codex-interrupted-banner".to_string()));
+    }
+
+    #[test]
+    fn codex_interrupted_banner_no_false_positive_on_working_esc_only() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        let text = "Working (1 tool use) • esc to interrupt";
+        let result = detector.extract_from_text(text);
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn codex_interrupted_banner_requires_feedback_marker() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        let text = "The transcript mentioned conversation interrupted in quoted output.";
+        let result = detector.extract_from_text(text);
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn codex_question_prompt_can_return_after_interrupt_banner() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        let interrupt =
+            detector.extract_from_text("Conversation interrupted. Continue or run /feedback.");
+        assert_eq!(interrupt, Some("codex-interrupted-banner".to_string()));
+
+        let question =
+            detector.extract_from_text("Questions 1/1\nenter to submit answer | esc to interrupt");
+        assert_eq!(question, Some("codex-question-prompt".to_string()));
+    }
+
+    #[test]
+    fn codex_question_prompt_detects_question_pattern() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        // Standard question prompt pattern
+        let text = "Question 1/1\nenter to submit answer\nesc to interrupt";
+        let result = detector.extract_from_text(text);
+
+        assert_eq!(result, Some("codex-question-prompt".to_string()));
+    }
+
+    #[test]
+    fn codex_question_prompt_detects_multi_question() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        // Multiple questions (e.g., 2 of 5)
+        let text = "Some context before\nQuestion 2/5\nenter to submit answer";
+        let result = detector.extract_from_text(text);
+
+        assert_eq!(result, Some("codex-question-prompt".to_string()));
+    }
+
+    #[test]
+    fn codex_question_prompt_no_false_positive_without_enter() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        // Just "Question" without "enter to submit answer" should not match
+        let text = "Question about something\nsome other text";
+        let result = detector.extract_from_text(text);
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn codex_question_prompt_no_false_positive_without_question_number() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        // "enter to submit answer" without "Question X/Y" pattern should not match
+        let text = "Please enter to submit answer\nsome other text";
+        let result = detector.extract_from_text(text);
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn codex_question_prompt_handles_split_across_chunks() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        // Split "Question 1/1\nenter to submit" across chunks
+        let result1 = detector.extract_from_text("Question 1/1\nenter to ");
+        assert_eq!(result1, None); // Incomplete, buffered
+
+        let result2 = detector.extract_from_text("submit answer");
+        assert_eq!(result2, Some("codex-question-prompt".to_string()));
+    }
+
+    #[test]
+    fn codex_question_prompt_no_false_positive_on_normal_codex_output() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        // Normal Codex output should not trigger false positive
+        let text =
+            "I'll help you with that. Let me analyze the code...\n\nAnalyzing file structure...";
+        let result = detector.extract_from_text(text);
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn codex_question_prompt_footer_only_detects_tab_enter_esc_pattern() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        // Footer-only pattern: tab to add notes | enter to submit answer | esc to interrupt
+        // This matches real Codex TUI output when header has scrolled away
+        let text = "tab to add notes | enter to submit answer | esc to interrupt";
+        let result = detector.extract_from_text(text);
+
+        assert_eq!(result, Some("codex-question-prompt".to_string()));
+    }
+
+    #[test]
+    fn codex_question_prompt_footer_only_detects_just_enter_esc() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        // Minimal footer pattern: enter to submit answer | esc to interrupt
+        let text = "enter to submit answer | esc to interrupt";
+        let result = detector.extract_from_text(text);
+
+        assert_eq!(result, Some("codex-question-prompt".to_string()));
+    }
+
+    #[test]
+    fn codex_question_prompt_footer_only_handles_reversed_order() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        // Footer pattern with reversed order (may happen in chunked output)
+        let text = "esc to interrupt | enter to submit answer";
+        let result = detector.extract_from_text(text);
+
+        assert_eq!(result, Some("codex-question-prompt".to_string()));
+    }
+
+    #[test]
+    fn codex_question_prompt_no_false_positive_without_esc_interrupt() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        // Just "enter to submit answer" without "esc to interrupt" should not match footer pattern
+        // (header pattern would still match if Question X/Y is present)
+        let text = "Please enter to submit answer\nSome other text";
+        let result = detector.extract_from_text(text);
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn codex_question_prompt_no_false_positive_esc_without_enter() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        // Just "esc to interrupt" without "enter to submit answer" should not match
+        let text = "Press esc to interrupt the current operation";
+        let result = detector.extract_from_text(text);
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn codex_question_prompt_detects_upstream_snapshot_format() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        // Based on actual Codex upstream snapshot format
+        // "Questions 1/1 (1 unanswered)" with footer
+        let text = "Questions 1/1 (1 unanswered)\ntab to add notes | enter to submit answer | esc to interrupt";
+        let result = detector.extract_from_text(text);
+
+        assert_eq!(result, Some("codex-question-prompt".to_string()));
+    }
+
+    #[test]
+    fn codex_question_prompt_handles_long_content_between_header_and_footer() {
+        let mut detector = PendingVisibleCodexStatus::default();
+        let mut long_text = String::new();
+
+        // Build text with Question header, long content, then footer
+        long_text.push_str("Question 3/10\n\n");
+        // Add enough filler to exceed typical chunk size
+        for i in 0..100 {
+            long_text.push_str(&format!("Line {} of the question content...\n", i));
+        }
+        long_text.push_str("\nenter to submit answer | esc to interrupt");
+
+        let result = detector.extract_from_text(&long_text);
+        assert_eq!(result, Some("codex-question-prompt".to_string()));
+    }
+
+    #[test]
+    fn codex_question_prompt_handles_ansi_sequences() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        // ANSI sequences embedded in the prompt (as appears in real TUI)
+        let text = "\x1b[1mQuestion 1/1\x1b[0m\n\x1b[90menter to submit answer\x1b[0m | \x1b[90mesc to interrupt\x1b[0m";
+        let result = detector.extract_from_text(text);
+
+        assert_eq!(result, Some("codex-question-prompt".to_string()));
+    }
+
+    #[test]
+    fn codex_question_prompt_handles_cursor_positioning_sequences() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        // Cursor positioning sequences that appear in real TUI redraw
+        let text = "\x1b[H\x1b[2JQuestion 1/1\nenter to submit answer | esc to interrupt";
+        let result = detector.extract_from_text(text);
+
+        assert_eq!(result, Some("codex-question-prompt".to_string()));
+    }
+
+    #[test]
+    fn codex_question_prompt_no_false_positive_on_working_esc_only() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        // Normal "Working... esc to interrupt" status line without "enter to submit answer"
+        // This should NOT match as a question prompt
+        let text = "Working (1 tool use) • esc to interrupt";
+        let result = detector.extract_from_text(text);
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn codex_question_prompt_detects_plural_questions_with_parenthetical() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        // "Questions 2/5 (2 unanswered)" format
+        let text = "Questions 2/5 (2 unanswered)\nenter to submit answer | esc to interrupt";
+        let result = detector.extract_from_text(text);
+
+        assert_eq!(result, Some("codex-question-prompt".to_string()));
+    }
+
+    #[test]
+    fn codex_question_prompt_handles_split_header_footer_across_chunks() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        // First chunk has header but no footer yet
+        let result1 = detector.extract_from_text("Question 1/1\n\nSome question content here\n");
+        assert_eq!(result1, None); // No footer yet, buffered
+
+        // Second chunk adds footer
+        let result2 =
+            detector.extract_from_text("More content\n\nenter to submit answer | esc to interrupt");
+        assert_eq!(result2, Some("codex-question-prompt".to_string()));
+    }
+
+    #[test]
+    fn codex_question_prompt_handles_footer_only_chunk() {
+        let mut detector = PendingVisibleCodexStatus::default();
+
+        // Only footer arrives (header scrolled away or in different chunk)
+        let result = detector
+            .extract_from_text("tab to add notes | enter to submit answer | esc to interrupt");
+
+        assert_eq!(result, Some("codex-question-prompt".to_string()));
     }
 }

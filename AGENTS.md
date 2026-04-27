@@ -71,13 +71,20 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Factory Droid hook format:** Only `droid-hook:*` and `factory-droid-hook:*` format patterns are recognized for Factory Droid. The `claude-hook:*` format is not supported.
 - **Factory Droid detection commands:** Only `droid` and `factory` trigger Factory Droid session detection. Do not add `cc`, `claude`, or other AI CLI commands.
 - **OpenCode detection commands:** `opencode` triggers OpenCode session detection. OpenCode is tracked through explicit launch detection, process-based status, visible UI/title parsing, notify/inbox status paths, and the Mergen-owned `mergen-opencode-status.js` plugin. If OpenCode hangs at `Loading plugins`, inspect MCP startup load before disabling the plugin path.
-- **Codex CLI integration:** Codex uses strict hook-only integration. Mergen configures `hooks.json` with `UserPromptSubmit` and `Stop` events that route to the Mergen bridge. The status transitions are:
-  - `UserPromptSubmit` hook → Running (spinner)
-  - `Stop` hook → Attention/Pulse (waiting for user)
-  - No notify, BEL, title, or visible UI fallback is used for Codex.
+- **Codex CLI integration:** Codex uses strict hook-only integration with narrow visible-state exceptions. Mergen configures `hooks.json` with `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, and `Stop` events that route to the Mergen bridge. The status transitions are:
+  - `UserPromptSubmit`, `PreToolUse`, and `PostToolUse` hooks → Running (gray spinner)
+  - `PermissionRequest` hook → `ApprovalRequested` / amber pulse (waiting for user)
+  - `Stop` hook → short debounce, then `TurnComplete` / green pulse unless follow-up work arrives first
+  - **Question prompt exception:** When Codex shows a question UI ("Question X/Y" with "enter to submit answer"), a narrow visible detection triggers `UserInputRequested` attention with amber pulse. This handles the case where the turn is waiting for user input but the Stop hook hasn't fired yet.
+  - **Interrupt banner exception:** When Codex renders the strict interrupted-turn banner (`conversation interrupted` plus `/feedback`), narrow visible detection clears the running spinner without clearing the live Codex session/process tracking.
+  - No notify, BEL, or title fallback is used for Codex.
+  - **Routing:** Uses tool-specific `MERGEN_ADE_CODEX_INBOX_DIR` env var to avoid collisions with OpenCode's shared `MERGEN_AI_INBOX_DIR`.
+  - **Hook configuration:** Managed hooks intentionally omit `statusMessage` to prevent Codex from displaying status text (e.g., "Running Stop hook: Mergen: session stopped") in the terminal.
+  - **Redraw filtering:** The `CodexRedrawFilter` only suppresses `ED3` (scrollback erase) during synchronized update blocks. Cursor positioning sequences (`ESC[H`, `ESC[1;1H`, `ESC[f`) and `ED2` (erase display) are preserved to prevent diagonal/stair-step rendering artifacts.
+  - **Keyboard routing:** During question prompts (`UserInputRequested` attention), raw keyboard events (including Escape, arrow keys, Tab) are routed to the terminal using the same mechanism as OpenCode/Factory Droid interactive attention states.
 - **Claude Code integration:** Claude uses title-based detection (Orca-compatible). Title patterns are detected via OSC title updates.
 - **UI labels:** Use "Droid", "Factory Droid", "Codex CLI", "OpenCode", and "Claude" terminology. Do not use "claude" lowercase references in user-facing text.
-- **Event triggers:** Factory Droid uses `UserPromptSubmit` → Running (green pulse) and `Stop`/notification → Attention (yellow pulse). Codex CLI uses hook-only: `UserPromptSubmit` → Running and `Stop` → Attention. OpenCode uses explicit launch detection plus process-based tracking for spinner/pulse status. Claude uses title-based detection.
+- **Event triggers:** Factory Droid uses `UserPromptSubmit` → Running (green pulse) and `Stop`/notification → Attention (yellow pulse). Codex CLI uses hook-only: prompt/tool hooks → Running, `PermissionRequest` → amber attention, debounced `Stop` → turn-complete attention, and the strict interrupt banner → clear running spinner. OpenCode uses explicit launch detection plus process-based tracking for spinner/pulse status. Claude uses title-based detection.
 - **Plan mode skill restriction:** If you are Codex, OpenCode, or Droid, do not use the plan mode skill from Claude Code's configuration. The plan mode skill is exclusively for `cc` (Claude Code) sessions only.
 
 ## Concurrent AI Sessions

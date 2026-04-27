@@ -17,9 +17,21 @@ use std::os::windows::process::CommandExt;
 pub const CODEX_SETUP_URL: &str = "https://developers.openai.com/codex/cli/#cli-setup";
 pub const MERGEN_TERMINAL_ID_ENV_VAR: &str = "MERGEN_TERMINAL_ID";
 pub const MERGEN_AI_INBOX_DIR_ENV_VAR: &str = "MERGEN_AI_INBOX_DIR";
+/// Codex-specific inbox dir env var to avoid env var collisions with OpenCode
+/// OpenCode also uses MERGEN_AI_INBOX_DIR, so Codex has its own dedicated env var
+pub const MERGEN_ADE_CODEX_INBOX_DIR_ENV_VAR: &str = "MERGEN_ADE_CODEX_INBOX_DIR";
 pub const MERGEN_AI_TOOL_HINT_ENV_VAR: &str = "MERGEN_AI_TOOL_HINT";
 pub const MERGEN_AI_TOOL_HINT_CODEX: &str = "codex";
 pub const MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR: &str = "MERGEN_ADE_CODEX_INBOX_TOKEN";
+const CODEX_MANAGED_HOOK_TIMEOUT_SECONDS: u64 = 10;
+const CODEX_TOOL_HOOK_MATCHER: &str = "^(Bash|apply_patch|Edit|Write|mcp__.*)$";
+const CODEX_MANAGED_HOOK_EVENTS: [(&str, Option<&str>); 5] = [
+    ("UserPromptSubmit", None),
+    ("PreToolUse", Some(CODEX_TOOL_HOOK_MATCHER)),
+    ("PermissionRequest", Some(CODEX_TOOL_HOOK_MATCHER)),
+    ("PostToolUse", Some(CODEX_TOOL_HOOK_MATCHER)),
+    ("Stop", None),
+];
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -256,14 +268,20 @@ pub fn codex_env_pairs(
     terminal_id: u64,
     inbox_dir: &Path,
     inbox_token: &str,
-) -> [(String, OsString); 4] {
+) -> [(String, OsString); 5] {
     [
         (
             MERGEN_TERMINAL_ID_ENV_VAR.to_owned(),
             OsString::from(terminal_id.to_string()),
         ),
+        // Set both the common inbox dir and the Codex-specific one
+        // The Codex-specific env var takes precedence in the hook handler
         (
             MERGEN_AI_INBOX_DIR_ENV_VAR.to_owned(),
+            inbox_dir.as_os_str().to_owned(),
+        ),
+        (
+            MERGEN_ADE_CODEX_INBOX_DIR_ENV_VAR.to_owned(),
             inbox_dir.as_os_str().to_owned(),
         ),
         (
@@ -492,43 +510,23 @@ fn update_codex_hooks_json(config_path: &Path, executable_path: &Path) -> io::Re
         .cloned()
         .unwrap_or_default();
 
-    // Hook definitions for spinner tracking
-    // UserPromptSubmit -> starts spinner (Running)
-    // Stop -> stops spinner (Idle/Attention)
-    let user_prompt_cmd = codex_hook_command(executable_path, "UserPromptSubmit");
-    let stop_cmd = codex_hook_command(executable_path, "Stop");
-
-    // Build the UserPromptSubmit hook entry
-    let user_prompt_entry = json!({
-        "hooks": [
-            {
-                "type": "command",
-                "command": user_prompt_cmd,
-                "statusMessage": "Mergen: session started"
-            }
-        ]
-    });
-
-    // Build the Stop hook entry
-    let stop_entry = json!({
-        "hooks": [
-            {
-                "type": "command",
-                "command": stop_cmd,
-                "statusMessage": "Mergen: session stopped"
-            }
-        ]
-    });
-
-    // Update hooks (preserving any existing hooks not managed by us)
-    let mergen_managed = [
-        ("UserPromptSubmit", user_prompt_entry),
-        ("Stop", stop_entry),
-    ];
-
     let mut hooks_changed = false;
 
-    for (event_name, entry) in mergen_managed {
+    for (event_name, matcher) in CODEX_MANAGED_HOOK_EVENTS {
+        // statusMessage intentionally omitted to prevent Codex from displaying
+        // hook status text in the terminal.
+        let hook_entry = json!({
+            "type": "command",
+            "command": codex_hook_command(executable_path, event_name),
+            "timeout": CODEX_MANAGED_HOOK_TIMEOUT_SECONDS
+        });
+        let mut entry = json!({
+            "hooks": [hook_entry]
+        });
+        if let Some(matcher) = matcher {
+            entry["matcher"] = Value::String(matcher.to_owned());
+        }
+
         let event_array = hooks
             .entry(event_name)
             .or_insert_with(|| Value::Array(vec![]));
@@ -585,7 +583,10 @@ fn update_codex_hooks_json(config_path: &Path, executable_path: &Path) -> io::Re
 /// Handle --codex-hook mode (writes a hook event to the inbox)
 pub fn handle_codex_hook_from_env(event_name: &str) -> io::Result<()> {
     let terminal_id = env::var(MERGEN_TERMINAL_ID_ENV_VAR).ok();
-    let inbox_dir = env::var_os(MERGEN_AI_INBOX_DIR_ENV_VAR).map(PathBuf::from);
+    // Use Codex-specific inbox dir first, fallback to common one for backward compatibility
+    let inbox_dir = env::var_os(MERGEN_ADE_CODEX_INBOX_DIR_ENV_VAR)
+        .or_else(|| env::var_os(MERGEN_AI_INBOX_DIR_ENV_VAR))
+        .map(PathBuf::from);
     let inbox_token = env::var(MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR).ok();
     let tool_hint = env::var(MERGEN_AI_TOOL_HINT_ENV_VAR).ok();
 
@@ -614,20 +615,13 @@ fn handle_codex_hook(
         return Ok(false);
     };
 
-    // Map hook event names to status and event_kind
-    // UserPromptSubmit -> Running (spinner starts)
-    // Stop -> Idle (spinner stops) - neutral, no specific reason
-    // SessionStart, PreToolUse, PostToolUse -> no-op (not used for spinner)
     let (status, event_kind) = match event_name {
         "UserPromptSubmit" => ("running", "user-prompt-submit"),
-        // Stop is a generic turn-stop hook, not a completion-only signal.
-        // Use neutral event_kind so it only stops spinner without setting TurnComplete reason.
+        "PreToolUse" => ("running", "pre-tool-use"),
+        "PostToolUse" => ("running", "post-tool-use"),
+        "PermissionRequest" => ("attention", "permission-request"),
         "Stop" => ("attention", "hook-stop"),
-        "SessionStart" | "PreToolUse" | "PostToolUse" => {
-            // These events are supported by Codex but not used for spinner tracking
-            // Return Ok(false) to indicate no-op (no event written)
-            return Ok(false);
-        }
+        "SessionStart" => return Ok(false),
         _ => ("attention", "unknown-hook"),
     };
 
@@ -707,7 +701,10 @@ pub fn maybe_handle_codex_notify_mode() -> io::Result<Option<CodexNotifyInboxEve
                 .to_string();
 
             let terminal_id = env::var(MERGEN_TERMINAL_ID_ENV_VAR).ok();
-            let inbox_dir = env::var_os(MERGEN_AI_INBOX_DIR_ENV_VAR).map(PathBuf::from);
+            // Use Codex-specific inbox dir first, fallback to common one for backward compatibility
+            let inbox_dir = env::var_os(MERGEN_ADE_CODEX_INBOX_DIR_ENV_VAR)
+                .or_else(|| env::var_os(MERGEN_AI_INBOX_DIR_ENV_VAR))
+                .map(PathBuf::from);
             let inbox_token = env::var(MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR).ok();
             let tool_hint = env::var(MERGEN_AI_TOOL_HINT_ENV_VAR).ok();
 
@@ -947,48 +944,31 @@ fn check_codex_hooks_json(config_path: &Path, bridge_path: &Path) -> bool {
         false
     };
 
-    // Check for UserPromptSubmit hook targeting the bridge
-    let user_prompt_ok = hooks
-        .get("UserPromptSubmit")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|arr| {
-            arr.iter().any(|item| {
-                if let Some(hook) = item
-                    .get("hooks")
-                    .and_then(serde_json::Value::as_array)
-                    .and_then(|a| a.first())
-                {
-                    if let Some(cmd) = hook.get("command").and_then(serde_json::Value::as_str) {
-                        // Must contain both the marker AND target the bridge path
-                        return cmd.contains("--codex-hook UserPromptSubmit")
-                            && cmd_contains_bridge(cmd);
+    let managed_hook_ok = |event_name: &str| {
+        hooks
+            .get(event_name)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|arr| {
+                arr.iter().any(|item| {
+                    if let Some(hook) = item
+                        .get("hooks")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|a| a.first())
+                    {
+                        if let Some(cmd) = hook.get("command").and_then(serde_json::Value::as_str) {
+                            // Must contain both the marker AND target the bridge path
+                            return cmd.contains(&format!("--codex-hook {event_name}"))
+                                && cmd_contains_bridge(cmd);
+                        }
                     }
-                }
-                false
+                    false
+                })
             })
-        });
+    };
 
-    // Check for Stop hook targeting the bridge
-    let stop_ok = hooks
-        .get("Stop")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|arr| {
-            arr.iter().any(|item| {
-                if let Some(hook) = item
-                    .get("hooks")
-                    .and_then(serde_json::Value::as_array)
-                    .and_then(|a| a.first())
-                {
-                    if let Some(cmd) = hook.get("command").and_then(serde_json::Value::as_str) {
-                        // Must contain both the marker AND target the bridge path
-                        return cmd.contains("--codex-hook Stop") && cmd_contains_bridge(cmd);
-                    }
-                }
-                false
-            })
-        });
-
-    user_prompt_ok && stop_ok
+    CODEX_MANAGED_HOOK_EVENTS
+        .iter()
+        .all(|(event_name, _)| managed_hook_ok(event_name))
 }
 
 fn run_codex_command(args: &[&str]) -> io::Result<Output> {
@@ -1012,9 +992,9 @@ mod tests {
     use super::{
         codex_env_pairs, codex_notify_inbox_path_for_dir, handle_codex_hook_from_env,
         inspect_codex_cli_integration_at_path, patch_codex_config_file, CodexConfigPatchOutcome,
-        CodexIntegrationStatus, CodexNotifyInboxEvent, MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR,
-        MERGEN_AI_INBOX_DIR_ENV_VAR, MERGEN_AI_TOOL_HINT_CODEX, MERGEN_AI_TOOL_HINT_ENV_VAR,
-        MERGEN_TERMINAL_ID_ENV_VAR,
+        CodexIntegrationStatus, CodexNotifyInboxEvent, MERGEN_ADE_CODEX_INBOX_DIR_ENV_VAR,
+        MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR, MERGEN_AI_INBOX_DIR_ENV_VAR,
+        MERGEN_AI_TOOL_HINT_CODEX, MERGEN_AI_TOOL_HINT_ENV_VAR, MERGEN_TERMINAL_ID_ENV_VAR,
     };
     use std::env;
     use std::ffi::OsString;
@@ -1064,10 +1044,13 @@ mod tests {
         assert_eq!(pairs[0].1, OsString::from("23"));
         assert_eq!(pairs[1].0, MERGEN_AI_INBOX_DIR_ENV_VAR);
         assert_eq!(pairs[1].1, inbox_dir.as_os_str());
-        assert_eq!(pairs[2].0, MERGEN_AI_TOOL_HINT_ENV_VAR);
-        assert_eq!(pairs[2].1, OsString::from(MERGEN_AI_TOOL_HINT_CODEX));
-        assert_eq!(pairs[3].0, MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR);
-        assert_eq!(pairs[3].1, OsString::from("codex-token-23"));
+        // Codex-specific inbox dir is also set to avoid env var collisions with OpenCode
+        assert_eq!(pairs[2].0, MERGEN_ADE_CODEX_INBOX_DIR_ENV_VAR);
+        assert_eq!(pairs[2].1, inbox_dir.as_os_str());
+        assert_eq!(pairs[3].0, MERGEN_AI_TOOL_HINT_ENV_VAR);
+        assert_eq!(pairs[3].1, OsString::from(MERGEN_AI_TOOL_HINT_CODEX));
+        assert_eq!(pairs[4].0, MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR);
+        assert_eq!(pairs[4].1, OsString::from("codex-token-23"));
     }
 
     #[test]
@@ -1418,18 +1401,45 @@ notifications = ["agent-turn-complete"]
         let hooks: serde_json::Value =
             serde_json::from_str(&hooks_content).expect("parse hooks.json");
 
-        // Check UserPromptSubmit hook exists
-        let user_prompt = hooks["hooks"]["UserPromptSubmit"].as_array();
-        assert!(user_prompt.is_some(), "UserPromptSubmit hook should exist");
-        assert!(
-            !user_prompt.unwrap().is_empty(),
-            "UserPromptSubmit hook should not be empty"
-        );
+        for event_name in [
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PermissionRequest",
+            "PostToolUse",
+            "Stop",
+        ] {
+            let entries = hooks["hooks"][event_name]
+                .as_array()
+                .unwrap_or_else(|| panic!("{event_name} hook should exist"));
+            assert!(!entries.is_empty(), "{event_name} hook should not be empty");
+            let entry = &entries[0];
+            let hook = entry["hooks"][0]
+                .as_object()
+                .unwrap_or_else(|| panic!("{event_name} command hook should exist"));
+            assert_eq!(hook["type"].as_str(), Some("command"));
+            assert_eq!(hook["timeout"].as_u64(), Some(10));
+            assert!(
+                hook.get("statusMessage").is_none(),
+                "{event_name} should not set statusMessage"
+            );
+            assert!(
+                hook["command"]
+                    .as_str()
+                    .is_some_and(|cmd| cmd.contains(&format!("--codex-hook {event_name}"))),
+                "{event_name} command should route through --codex-hook"
+            );
+        }
 
-        // Check Stop hook exists
-        let stop = hooks["hooks"]["Stop"].as_array();
-        assert!(stop.is_some(), "Stop hook should exist");
-        assert!(!stop.unwrap().is_empty(), "Stop hook should not be empty");
+        for event_name in ["PreToolUse", "PermissionRequest", "PostToolUse"] {
+            assert_eq!(
+                hooks["hooks"][event_name][0]["matcher"].as_str(),
+                Some(r"^(Bash|apply_patch|Edit|Write|mcp__.*)$")
+            );
+        }
+        assert!(hooks["hooks"]["UserPromptSubmit"][0]
+            .get("matcher")
+            .is_none());
+        assert!(hooks["hooks"]["Stop"][0].get("matcher").is_none());
     }
 
     #[test]
@@ -1518,6 +1528,18 @@ notifications = ["agent-turn-complete"]
             hooks_content.contains("Stop"),
             "hooks.json should contain Stop hook"
         );
+        assert!(
+            hooks_content.contains("PreToolUse"),
+            "hooks.json should contain PreToolUse hook"
+        );
+        assert!(
+            hooks_content.contains("PermissionRequest"),
+            "hooks.json should contain PermissionRequest hook"
+        );
+        assert!(
+            hooks_content.contains("PostToolUse"),
+            "hooks.json should contain PostToolUse hook"
+        );
     }
 
     #[test]
@@ -1527,6 +1549,7 @@ notifications = ["agent-turn-complete"]
         let _guard = EnvGuard::save(&[
             MERGEN_TERMINAL_ID_ENV_VAR,
             MERGEN_AI_INBOX_DIR_ENV_VAR,
+            MERGEN_ADE_CODEX_INBOX_DIR_ENV_VAR,
             MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR,
             MERGEN_AI_TOOL_HINT_ENV_VAR,
         ]);
@@ -1538,6 +1561,10 @@ notifications = ["agent-turn-complete"]
         // Set environment variables as they would be set by PTY spawn
         env::set_var(MERGEN_TERMINAL_ID_ENV_VAR, "42");
         env::set_var(MERGEN_AI_INBOX_DIR_ENV_VAR, inbox_dir.to_str().unwrap());
+        env::set_var(
+            MERGEN_ADE_CODEX_INBOX_DIR_ENV_VAR,
+            inbox_dir.to_str().unwrap(),
+        );
         env::set_var(MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR, "test-token-42");
         env::set_var(MERGEN_AI_TOOL_HINT_ENV_VAR, MERGEN_AI_TOOL_HINT_CODEX);
 
@@ -1563,6 +1590,7 @@ notifications = ["agent-turn-complete"]
         let _guard = EnvGuard::save(&[
             MERGEN_TERMINAL_ID_ENV_VAR,
             MERGEN_AI_INBOX_DIR_ENV_VAR,
+            MERGEN_ADE_CODEX_INBOX_DIR_ENV_VAR,
             MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR,
             MERGEN_AI_TOOL_HINT_ENV_VAR,
         ]);
@@ -1574,6 +1602,10 @@ notifications = ["agent-turn-complete"]
         // Set environment variables
         env::set_var(MERGEN_TERMINAL_ID_ENV_VAR, "43");
         env::set_var(MERGEN_AI_INBOX_DIR_ENV_VAR, inbox_dir.to_str().unwrap());
+        env::set_var(
+            MERGEN_ADE_CODEX_INBOX_DIR_ENV_VAR,
+            inbox_dir.to_str().unwrap(),
+        );
         env::set_var(MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR, "test-token-43");
         env::set_var(MERGEN_AI_TOOL_HINT_ENV_VAR, MERGEN_AI_TOOL_HINT_CODEX);
 
@@ -1594,11 +1626,56 @@ notifications = ["agent-turn-complete"]
     }
 
     #[test]
+    fn handle_codex_hook_writes_tool_events_with_opencode_style_statuses() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::save(&[
+            MERGEN_TERMINAL_ID_ENV_VAR,
+            MERGEN_AI_INBOX_DIR_ENV_VAR,
+            MERGEN_ADE_CODEX_INBOX_DIR_ENV_VAR,
+            MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR,
+            MERGEN_AI_TOOL_HINT_ENV_VAR,
+        ]);
+
+        let temp = TestTempDir::new("codex-hook-tool-events");
+        let inbox_dir = temp.path.join("inbox");
+        fs::create_dir_all(&inbox_dir).unwrap();
+
+        env::set_var(MERGEN_TERMINAL_ID_ENV_VAR, "45");
+        env::set_var(MERGEN_AI_INBOX_DIR_ENV_VAR, inbox_dir.to_str().unwrap());
+        env::set_var(
+            MERGEN_ADE_CODEX_INBOX_DIR_ENV_VAR,
+            inbox_dir.to_str().unwrap(),
+        );
+        env::set_var(MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR, "test-token-45");
+        env::set_var(MERGEN_AI_TOOL_HINT_ENV_VAR, MERGEN_AI_TOOL_HINT_CODEX);
+
+        for event_name in ["PreToolUse", "PermissionRequest", "PostToolUse"] {
+            handle_codex_hook_from_env(event_name).expect("hook should be handled");
+        }
+
+        let inbox_path = codex_notify_inbox_path_for_dir(&inbox_dir, 45, "test-token-45");
+        let content = fs::read_to_string(&inbox_path).expect("read inbox");
+        let events = content
+            .lines()
+            .map(|line| serde_json::from_str::<CodexNotifyInboxEvent>(line).expect("parse event"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].status, "running");
+        assert_eq!(events[0].event_kind, Some("pre-tool-use".to_owned()));
+        assert_eq!(events[1].status, "attention");
+        assert_eq!(events[1].event_kind, Some("permission-request".to_owned()));
+        assert_eq!(events[2].status, "running");
+        assert_eq!(events[2].event_kind, Some("post-tool-use".to_owned()));
+    }
+
+    #[test]
     fn handle_codex_hook_ignores_mismatched_tool_hint() {
         let _lock = ENV_MUTEX.lock().unwrap();
         let _guard = EnvGuard::save(&[
             MERGEN_TERMINAL_ID_ENV_VAR,
             MERGEN_AI_INBOX_DIR_ENV_VAR,
+            MERGEN_ADE_CODEX_INBOX_DIR_ENV_VAR,
             MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR,
             MERGEN_AI_TOOL_HINT_ENV_VAR,
         ]);
@@ -1609,6 +1686,10 @@ notifications = ["agent-turn-complete"]
 
         env::set_var(MERGEN_TERMINAL_ID_ENV_VAR, "44");
         env::set_var(MERGEN_AI_INBOX_DIR_ENV_VAR, inbox_dir.to_str().unwrap());
+        env::set_var(
+            MERGEN_ADE_CODEX_INBOX_DIR_ENV_VAR,
+            inbox_dir.to_str().unwrap(),
+        );
         env::set_var(MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR, "test-token-44");
         env::set_var(MERGEN_AI_TOOL_HINT_ENV_VAR, "opencode");
 
@@ -1631,6 +1712,7 @@ notifications = ["agent-turn-complete"]
         let _guard = EnvGuard::save(&[
             MERGEN_TERMINAL_ID_ENV_VAR,
             MERGEN_AI_INBOX_DIR_ENV_VAR,
+            MERGEN_ADE_CODEX_INBOX_DIR_ENV_VAR,
             MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR,
         ]);
 
@@ -1641,6 +1723,10 @@ notifications = ["agent-turn-complete"]
         // Set environment variables
         env::set_var(MERGEN_TERMINAL_ID_ENV_VAR, "55");
         env::set_var(MERGEN_AI_INBOX_DIR_ENV_VAR, inbox_dir.to_str().unwrap());
+        env::set_var(
+            MERGEN_ADE_CODEX_INBOX_DIR_ENV_VAR,
+            inbox_dir.to_str().unwrap(),
+        );
         env::set_var(MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR, "test-token-55");
 
         // Simulate running with --codex-notify argument
@@ -1803,20 +1889,40 @@ alternate_screen = "never"
         );
 
         // Create hooks.json targeting a DIFFERENT path (stale wiring)
+        // Note: statusMessage intentionally omitted to prevent terminal noise
         let hooks_with_stale_path = serde_json::json!({
             "hooks": {
                 "UserPromptSubmit": [{
                     "hooks": [{
                         "type": "command",
-                        "command": r"C:\Users\test\Desktop\stale\mergen-ade.exe --codex-hook UserPromptSubmit",
-                        "statusMessage": "Mergen: session started"
+                        "command": r"C:\Users\test\Desktop\stale\mergen-ade.exe --codex-hook UserPromptSubmit"
+                    }]
+                }],
+                "PreToolUse": [{
+                    "matcher": r"^(Bash|apply_patch|Edit|Write|mcp__.*)$",
+                    "hooks": [{
+                        "type": "command",
+                        "command": r"C:\Users\test\Desktop\stale\mergen-ade.exe --codex-hook PreToolUse"
+                    }]
+                }],
+                "PermissionRequest": [{
+                    "matcher": r"^(Bash|apply_patch|Edit|Write|mcp__.*)$",
+                    "hooks": [{
+                        "type": "command",
+                        "command": r"C:\Users\test\Desktop\stale\mergen-ade.exe --codex-hook PermissionRequest"
+                    }]
+                }],
+                "PostToolUse": [{
+                    "matcher": r"^(Bash|apply_patch|Edit|Write|mcp__.*)$",
+                    "hooks": [{
+                        "type": "command",
+                        "command": r"C:\Users\test\Desktop\stale\mergen-ade.exe --codex-hook PostToolUse"
                     }]
                 }],
                 "Stop": [{
                     "hooks": [{
                         "type": "command",
-                        "command": r"C:\Users\test\Desktop\stale\mergen-ade.exe --codex-hook Stop",
-                        "statusMessage": "Mergen: session stopped"
+                        "command": r"C:\Users\test\Desktop\stale\mergen-ade.exe --codex-hook Stop"
                     }]
                 }]
             }
@@ -1833,20 +1939,40 @@ alternate_screen = "never"
         assert!(!result, "hooks check should fail when targeting stale path");
 
         // Now create hooks.json targeting the CORRECT bridge path
+        // Note: statusMessage intentionally omitted to prevent terminal noise
         let hooks_with_bridge_path = serde_json::json!({
             "hooks": {
                 "UserPromptSubmit": [{
                     "hooks": [{
                         "type": "command",
-                        "command": r"C:\Users\test\AppData\Roaming\Mergen\MergenADE\bin\mergen-codex-bridge.exe --codex-hook UserPromptSubmit",
-                        "statusMessage": "Mergen: session started"
+                        "command": r"C:\Users\test\AppData\Roaming\Mergen\MergenADE\bin\mergen-codex-bridge.exe --codex-hook UserPromptSubmit"
+                    }]
+                }],
+                "PreToolUse": [{
+                    "matcher": r"^(Bash|apply_patch|Edit|Write|mcp__.*)$",
+                    "hooks": [{
+                        "type": "command",
+                        "command": r"C:\Users\test\AppData\Roaming\Mergen\MergenADE\bin\mergen-codex-bridge.exe --codex-hook PreToolUse"
+                    }]
+                }],
+                "PermissionRequest": [{
+                    "matcher": r"^(Bash|apply_patch|Edit|Write|mcp__.*)$",
+                    "hooks": [{
+                        "type": "command",
+                        "command": r"C:\Users\test\AppData\Roaming\Mergen\MergenADE\bin\mergen-codex-bridge.exe --codex-hook PermissionRequest"
+                    }]
+                }],
+                "PostToolUse": [{
+                    "matcher": r"^(Bash|apply_patch|Edit|Write|mcp__.*)$",
+                    "hooks": [{
+                        "type": "command",
+                        "command": r"C:\Users\test\AppData\Roaming\Mergen\MergenADE\bin\mergen-codex-bridge.exe --codex-hook PostToolUse"
                     }]
                 }],
                 "Stop": [{
                     "hooks": [{
                         "type": "command",
-                        "command": r"C:\Users\test\AppData\Roaming\Mergen\MergenADE\bin\mergen-codex-bridge.exe --codex-hook Stop",
-                        "statusMessage": "Mergen: session stopped"
+                        "command": r"C:\Users\test\AppData\Roaming\Mergen\MergenADE\bin\mergen-codex-bridge.exe --codex-hook Stop"
                     }]
                 }]
             }

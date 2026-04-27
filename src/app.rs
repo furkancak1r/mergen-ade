@@ -90,6 +90,7 @@ const CODEX_PROCESS_POLL_MS: u64 = 150;
 const CODEX_LAUNCH_GRACE_MS: u64 = 5_000;
 const CODEX_TRAILING_OUTPUT_GRACE_MS: u64 = 750;
 const CODEX_RUNNING_GRACE_MS: u64 = 2_000;
+const CODEX_STOP_SETTLE_MS: u64 = 350;
 const OPENCODE_PROCESS_POLL_MS: u64 = 150;
 const OPENCODE_LAUNCH_GRACE_MS: u64 = 5_000;
 const OPENCODE_TRAILING_OUTPUT_GRACE_MS: u64 = 750;
@@ -1058,6 +1059,7 @@ struct TerminalEntry {
     codex_last_notify_attention_at: Option<Instant>,
     codex_last_visible_attention_at: Option<Instant>,
     codex_last_turn_complete_at: Option<Instant>,
+    codex_pending_stop_since: Option<Instant>,
     /// Pending attention flag for pulse/unread semantics (Orca-compatible)
     /// True when user needs to acknowledge attention (idle/permission after working)
     /// Cleared on terminal focus or keyboard input
@@ -1343,6 +1345,8 @@ struct AiBadgeModel {
     /// Pending attention flag for pulse/unread semantics (Orca-compatible)
     /// True when user needs to acknowledge attention (shown as pulse)
     codex_attention_pending: bool,
+    /// Codex attention reason for badge visibility decisions
+    codex_attention_reason: Option<CodexAttentionReason>,
     /// Pending attention flag for pulse/unread semantics (Orca-compatible)
     /// True when user needs to acknowledge attention (shown as pulse)
     opencode_attention_pending: bool,
@@ -1371,6 +1375,7 @@ impl AiBadgeModel {
             opencode_normalized_status: terminal.opencode_normalized_status,
             claude_normalized_status: terminal.claude_normalized_status,
             codex_attention_pending: terminal.codex_attention_pending,
+            codex_attention_reason: terminal.codex_attention_reason,
             opencode_attention_pending: terminal.opencode_attention_pending,
             opencode_attention_reason: terminal.opencode_attention_reason,
             tooltip_lines,
@@ -1435,6 +1440,7 @@ fn ai_badge_visual(
     opencode_normalized_status: Option<OpenCodeTransportStatus>,
     claude_normalized_status: Option<ClaudeTransportStatus>,
     codex_attention_pending: bool,
+    codex_attention_reason: Option<CodexAttentionReason>,
     opencode_attention_pending: bool,
     opencode_attention_reason: Option<OpenCodeAttentionReason>,
 ) -> Option<AiBadgeVisual> {
@@ -1460,8 +1466,11 @@ fn ai_badge_visual(
                         // Idle: pulse if pending, hidden if acknowledged
                         if codex_attention_pending {
                             Some(AiBadgeVisual::Pulse(Color32::from_rgb(100, 200, 100)))
+                        } else if codex_attention_reason == Some(CodexAttentionReason::TurnComplete)
+                        {
+                            None
                         } else {
-                            None // Turn complete acknowledged - badge hidden
+                            Some(AiBadgeVisual::Solid(Color32::from_rgb(100, 200, 100)))
                         }
                     }
                 };
@@ -1620,6 +1629,7 @@ fn draw_ai_badge(ui: &mut Ui, badge: &AiBadgeModel) -> egui::Response {
         badge.opencode_normalized_status,
         badge.claude_normalized_status,
         badge.codex_attention_pending,
+        badge.codex_attention_reason,
         badge.opencode_attention_pending,
         badge.opencode_attention_reason,
     ) else {
@@ -1709,6 +1719,7 @@ fn draw_terminal_status_badges(ui: &mut Ui, ai_badge: &AiBadgeModel) -> Terminal
         ai_badge.opencode_normalized_status,
         ai_badge.claude_normalized_status,
         ai_badge.codex_attention_pending,
+        ai_badge.codex_attention_reason,
         ai_badge.opencode_attention_pending,
         ai_badge.opencode_attention_reason,
     );
@@ -2373,10 +2384,9 @@ impl AdeApp {
                     .to_owned()
             }
             CodexEnableOutcome::ConfigUpdated { path, updated } => {
-                // Hook-only integration: UserPromptSubmit -> Running, Stop -> Attention/Pulse
                 if *updated {
                     format!(
-                        "Codex CLI hook-only integration enabled. UserPromptSubmit starts spinner, Stop triggers pulse: {}",
+                        "Codex CLI hook-only integration enabled. Prompt/tool hooks drive spinner; Stop is debounced before pulse: {}",
                         path.display()
                     )
                 } else {
@@ -2458,7 +2468,7 @@ impl AdeApp {
                 hooks_runtime_verified: true,
                 ..
             } => {
-                "Codex CLI hook-only integration is enabled and working. UserPromptSubmit starts spinner, Stop triggers pulse."
+                "Codex CLI hook-only integration is enabled and working. Prompt/tool hooks drive spinner; Stop is debounced before pulse."
                     .to_owned()
             }
             CodexIntegrationStatus::EnabledHealthy {
@@ -2473,7 +2483,7 @@ impl AdeApp {
                     .to_owned()
             }
             CodexIntegrationStatus::NeedsSetup { .. } => {
-                "Codex CLI hook-only integration can be enabled here. Hooks will be configured for spinner/pulse tracking."
+                "Codex CLI hook-only integration can be enabled here. Hooks will be configured for spinner, permission, and turn-complete tracking."
                     .to_owned()
             }
             CodexIntegrationStatus::ConfigReadError { error, .. } => {
@@ -2527,7 +2537,7 @@ impl AdeApp {
         match codex::patch_codex_config_file(&path, &bridge_path) {
             Ok(codex::CodexConfigPatchOutcome::Updated) => {
                 self.status_line = format!(
-                    "Codex CLI hook-only integration enabled in {}: UserPromptSubmit starts spinner, Stop triggers pulse",
+                    "Codex CLI hook-only integration enabled in {}: prompt/tool hooks drive spinner; Stop is debounced before pulse",
                     path.display()
                 );
             }
@@ -3293,6 +3303,7 @@ impl AdeApp {
             codex_last_notify_attention_at: None,
             codex_last_visible_attention_at: None,
             codex_last_turn_complete_at: None,
+            codex_pending_stop_since: None,
             codex_attention_pending: false,
             codex_hooks_runtime_verified: false,
             opencode_launch_pending_since: None,
@@ -4250,6 +4261,7 @@ impl AdeApp {
         entry.codex_last_process_seen_at = None;
         entry.codex_process_missing_since = None;
         entry.codex_attention_reason = None;
+        entry.codex_pending_stop_since = None;
         entry.dirty = true;
         changed
     }
@@ -4271,7 +4283,8 @@ impl AdeApp {
             || entry.codex_process_missing_since.is_some()
             || entry.codex_last_status_source.is_some()
             || entry.codex_attention_reason.is_some()
-            || entry.codex_prompt_submit_since.is_some();
+            || entry.codex_prompt_submit_since.is_some()
+            || entry.codex_pending_stop_since.is_some();
 
         if entry.ai_session.tool == Some(AiCliTool::CodexCli) {
             entry.ai_session = AiCliSession::default();
@@ -4286,6 +4299,7 @@ impl AdeApp {
         entry.codex_last_status_source = None;
         entry.codex_attention_reason = None;
         entry.codex_prompt_submit_since = None;
+        entry.codex_pending_stop_since = None;
         entry.dirty = true;
         changed
     }
@@ -4376,6 +4390,50 @@ impl AdeApp {
             })
     }
 
+    fn note_codex_pending_stop(&mut self, terminal_id: u64) -> bool {
+        let Some(manager) = self.ai_hook_manager.as_ref().cloned() else {
+            return false;
+        };
+        manager.set_tool(terminal_id, AiCliTool::CodexCli);
+
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        let now = Instant::now();
+        let mut changed = false;
+        if entry.codex_pending_stop_since.is_none() {
+            entry.codex_pending_stop_since = Some(now);
+            changed = true;
+        }
+        if !entry.codex_session_active {
+            entry.codex_session_active = true;
+            changed = true;
+        }
+        entry.codex_last_process_seen_at = Some(now);
+        entry.dirty = true;
+        changed
+    }
+
+    fn settle_codex_pending_stop_if_needed(&mut self, terminal_id: u64) -> bool {
+        let should_settle = self
+            .terminals
+            .get(&terminal_id)
+            .and_then(|entry| entry.codex_pending_stop_since)
+            .is_some_and(|since| since.elapsed() >= Duration::from_millis(CODEX_STOP_SETTLE_MS));
+
+        if !should_settle {
+            return false;
+        }
+
+        self.apply_codex_transport_status(
+            terminal_id,
+            CodexTransportStatus::Idle,
+            CodexCliStatusSource::Hook,
+            Some(CodexAttentionReason::TurnComplete),
+        )
+    }
+
     /// Apply semantic Codex transport status to a terminal entry (Orca-compatible).
     /// This properly handles working -> idle/permission transitions with pending attention.
     fn apply_codex_transport_status(
@@ -4399,6 +4457,10 @@ impl AdeApp {
         let previous_transport_status = entry.codex_normalized_status;
         let mut changed = false;
 
+        if entry.codex_pending_stop_since.take().is_some() {
+            changed = true;
+        }
+
         // Update normalized status
         if entry.codex_normalized_status != Some(transport_status) {
             entry.codex_normalized_status = Some(transport_status);
@@ -4416,14 +4478,36 @@ impl AdeApp {
                 if entry.codex_attention_reason.take().is_some() {
                     changed = true;
                 }
+                if entry.codex_last_notify_attention_at.take().is_some() {
+                    changed = true;
+                }
+                if entry.codex_last_visible_attention_at.take().is_some() {
+                    changed = true;
+                }
+                if entry.codex_last_turn_complete_at.take().is_some() {
+                    changed = true;
+                }
                 (AiCliStatus::Running, None)
             }
             CodexTransportStatus::Idle => {
                 // If no reason hint, go to Inactive (e.g., interrupted banner)
                 // while preserving session metadata
                 if reason_hint.is_none() {
-                    // Clear attention reason but keep session metadata
+                    // Clear attention visuals/evidence but keep session metadata.
                     if entry.codex_attention_reason.take().is_some() {
+                        changed = true;
+                    }
+                    if entry.codex_attention_pending {
+                        entry.codex_attention_pending = false;
+                        changed = true;
+                    }
+                    if entry.codex_last_notify_attention_at.take().is_some() {
+                        changed = true;
+                    }
+                    if entry.codex_last_visible_attention_at.take().is_some() {
+                        changed = true;
+                    }
+                    if entry.codex_last_turn_complete_at.take().is_some() {
                         changed = true;
                     }
                     entry.codex_last_title_idle_at = Some(now);
@@ -4451,16 +4535,23 @@ impl AdeApp {
                     }
 
                     // Update attention reason for UI tooltip
-                    // Special case: hook-stop (Hook source + UnknownNotify reason) should preserve
-                    // existing attention reasons from Notify/VisibleUi to avoid overwriting
-                    // interactive attention states (ApprovalRequested, UserInputRequested, PlanModePrompt)
+                    // Special case: hook-stop (Hook source + TurnComplete reason) should preserve
+                    // existing interactive attention reasons from Notify/VisibleUi to avoid overwriting
+                    // interactive attention states (ApprovalRequested, UserInputRequested, PlanModePrompt).
+                    // TurnComplete from hook is the generic "work done" signal, not a specific interactive prompt.
                     let should_preserve_existing_reason = source == CodexCliStatusSource::Hook
-                        && reason == Some(CodexAttentionReason::UnknownNotify)
+                        && reason == Some(CodexAttentionReason::TurnComplete)
                         && entry.codex_attention_reason.is_some()
                         && matches!(
                             entry.codex_last_status_source,
                             Some(CodexCliStatusSource::Notify)
                                 | Some(CodexCliStatusSource::VisibleUi)
+                        )
+                        && matches!(
+                            entry.codex_attention_reason,
+                            Some(CodexAttentionReason::ApprovalRequested)
+                                | Some(CodexAttentionReason::UserInputRequested)
+                                | Some(CodexAttentionReason::PlanModePrompt)
                         );
 
                     if let Some(r) = reason {
@@ -4607,7 +4698,8 @@ impl AdeApp {
         if matches!(
             source,
             CodexCliStatusSource::Hook | CodexCliStatusSource::Notify
-        ) {
+        ) && transport_status != CodexTransportStatus::Working
+        {
             entry.codex_last_notify_attention_at = Some(now);
         }
 
@@ -5944,6 +6036,7 @@ impl AdeApp {
         let mut changed = false;
         for terminal_id in terminal_ids {
             changed |= self.process_codex_notify_inbox(terminal_id);
+            changed |= self.settle_codex_pending_stop_if_needed(terminal_id);
             // Also check for stale working titles (Orca-compatible behavior)
             changed |= self.clear_codex_stale_working_if_needed(terminal_id);
         }
@@ -5954,8 +6047,8 @@ impl AdeApp {
     }
 
     /// Clear stale Codex working state if the last working title is older than the grace period.
-    /// This is the Orca-compatible behavior: if no fresh working evidence arrives,
-    /// the spinner should stop.
+    /// Hook-only mode: If hooks are runtime-verified, stale working cleanup is disabled
+    /// because the spinner should only stop via the Stop hook event.
     fn clear_codex_stale_working_if_needed(&mut self, terminal_id: u64) -> bool {
         let Some(entry) = self.terminals.get(&terminal_id) else {
             return false;
@@ -5963,6 +6056,12 @@ impl AdeApp {
 
         // Only check if currently in Working state via title
         if entry.codex_normalized_status != Some(CodexTransportStatus::Working) {
+            return false;
+        }
+
+        // Hook-only mode: If hooks are runtime-verified, don't clear stale working
+        // The spinner should only stop via the official Stop hook event
+        if entry.codex_hooks_runtime_verified {
             return false;
         }
 
@@ -6112,24 +6211,28 @@ impl AdeApp {
             }
         }
 
+        if event.event_kind.as_deref() == Some("hook-stop")
+            && event.status == "attention"
+            && is_hook_event
+        {
+            let state_changed = self.note_codex_pending_stop(terminal_id);
+            return state_changed || verified_hooks;
+        }
+
         // Map Codex event kinds to semantic transport status and reason hints
         // This preserves Orca-compatible semantics through the state machine
         let (transport_status, reason_hint, source) = match event.event_kind.as_deref() {
             // Hook events for spinner tracking (UserPromptSubmit hooks)
             // This proves hooks are working at runtime and starts the spinner
-            Some(kind) if kind == "user-prompt-submit" || kind == "session-start" => (
-                CodexTransportStatus::Working,
-                None,
-                CodexCliStatusSource::Hook,
-            ),
-            // Stop hook (hook-stop) signals the end of agent work.
-            // This transitions from Working to Idle/Attention state.
-            Some(kind) if kind == "hook-stop" && event.status == "attention" && is_hook_event => {
-                // Use UnknownNotify as the reason - the preservation logic in
-                // apply_codex_transport_status will preserve existing interactive reasons
+            Some(kind)
+                if kind == "user-prompt-submit"
+                    || kind == "session-start"
+                    || kind == "pre-tool-use"
+                    || kind == "post-tool-use" =>
+            {
                 (
-                    CodexTransportStatus::Idle,
-                    Some(CodexAttentionReason::UnknownNotify),
+                    CodexTransportStatus::Working,
+                    None,
                     CodexCliStatusSource::Hook,
                 )
             }
@@ -6152,8 +6255,11 @@ impl AdeApp {
             ),
             // Permission-related events map to Permission status
             Some(kind)
-                if kind == "approval-requested"
+                if kind == "permission-request"
+                    || kind == "permission_request"
+                    || kind == "approval-requested"
                     || kind == "approval_requested"
+                    || kind.contains("permission")
                     || kind.contains("approval") =>
             {
                 (
@@ -7504,6 +7610,14 @@ impl AdeApp {
                 .is_some_and(CodexAttentionReason::clears_on_terminal_acknowledge)
     }
 
+    fn terminal_has_codex_interactive_attention(terminal: &TerminalEntry) -> bool {
+        terminal.ai_session.tool == Some(AiCliTool::CodexCli)
+            && terminal.ai_session.status == AiCliStatus::Attention
+            && terminal
+                .codex_attention_reason
+                .is_some_and(CodexAttentionReason::allows_empty_submit)
+    }
+
     fn terminal_has_opencode_interactive_attention(terminal: &TerminalEntry) -> bool {
         terminal.ai_session.tool == Some(AiCliTool::OpenCode)
             && terminal.ai_session.status == AiCliStatus::Attention
@@ -7539,6 +7653,11 @@ impl AdeApp {
 
         terminal.ai_session.status == AiCliStatus::Attention
             && if Self::terminal_has_factory_droid_interactive_attention(terminal) {
+                events
+                    .iter()
+                    .any(Self::event_is_factory_droid_interactive_entry)
+            } else if Self::terminal_has_codex_interactive_attention(terminal) {
+                // Codex interactive attention (question prompts) - same as OpenCode/Factory
                 events
                     .iter()
                     .any(Self::event_is_factory_droid_interactive_entry)
@@ -8353,7 +8472,9 @@ impl AdeApp {
         {
             ctx.request_repaint();
         }
-        if sent_terminal_input && self.clear_codex_attention_on_interaction(active_terminal_id) {
+        // Codex pulse also clears on any terminal interaction (click, keyboard, etc.)
+        // This matches OpenCode behavior: green pulse acknowledges on any interaction
+        if terminal_interaction && self.clear_codex_attention_on_interaction(active_terminal_id) {
             ctx.request_repaint();
         }
         if sent_terminal_input && self.clear_claude_attention_on_interaction(active_terminal_id) {
@@ -10805,7 +10926,7 @@ impl AdeApp {
             );
             ui.label(
                 RichText::new(
-                    "Codex CLI integration uses multiple fallback paths on Windows: hook-based spinner tracking, process tracking, title-based detection, and notify events. Hooks are disabled upstream on Windows; WSL bridging stays out of scope in this release.",
+                    "Codex CLI integration uses official hooks on Windows: prompt/tool hooks keep the gray spinner active, permission requests use amber attention, and Stop settles into a green turn-complete pulse unless follow-up work arrives first. WSL bridging stays out of scope in this release.",
                 )
                 .small()
                 .color(TEXT_MUTED),
@@ -12135,6 +12256,7 @@ impl AdeApp {
                                     terminal_data.ai_badge.opencode_normalized_status,
                                     terminal_data.ai_badge.claude_normalized_status,
                                     terminal_data.ai_badge.codex_attention_pending,
+                                    terminal_data.ai_badge.codex_attention_reason,
                                     terminal_data.ai_badge.opencode_attention_pending,
                                     terminal_data.ai_badge.opencode_attention_reason,
                                 )
@@ -17845,8 +17967,8 @@ mod tests {
         SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
         TerminalOutputScrollBehavior, TerminalSecondaryClickAction, TerminalSelection,
-        TerminalSelectionPoint, TransientToast, CODEX_PROCESS_POLL_MS,
-        CODEX_TRAILING_OUTPUT_GRACE_MS, DIRECTORY_INDEX_CHANNEL_CAPACITY,
+        TerminalSelectionPoint, TransientToast, CODEX_NOTIFY_POLL_MS, CODEX_PROCESS_POLL_MS,
+        CODEX_STOP_SETTLE_MS, CODEX_TRAILING_OUTPUT_GRACE_MS, DIRECTORY_INDEX_CHANNEL_CAPACITY,
         FACTORY_DROID_HOOK_POLL_MS, OPENCODE_PROCESS_POLL_MS, OPENCODE_RUNNING_GRACE_MS,
         OPENCODE_TRAILING_OUTPUT_GRACE_MS, SOURCE_CONTROL_CHANNEL_CAPACITY,
         SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG, TERMINAL_COPY_FEEDBACK_TEXT,
@@ -20129,7 +20251,7 @@ mod tests {
     #[test]
     fn terminal_manager_row_reserves_gap_and_actions_width() {
         let actions_width = terminal_manager_actions_width(8.0, true);
-        let (label_width, actions_area_width) =
+        let (_label_width, actions_area_width) =
             terminal_manager_row_widths(160.0, actions_width, 8.0);
 
         // With visibility toggle + history button (no test_done button):
@@ -24212,6 +24334,206 @@ mod tests {
     }
 
     #[test]
+    fn codex_question_prompt_escape_clears_pulse_but_keeps_attention() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        // Setup: Codex in question prompt state (UserInputRequested)
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Attention;
+            entry.codex_session_active = true;
+            entry.codex_attention_reason = Some(CodexAttentionReason::UserInputRequested);
+            entry.codex_attention_pending = true;
+            entry.codex_normalized_status = Some(CodexTransportStatus::Permission);
+        }
+
+        // Send Escape key - this should be routed to terminal and clear pulse
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        // After Escape: pulse cleared but attention state persists (like OpenCode)
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert!(!terminal.codex_attention_pending);
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::UserInputRequested)
+        );
+    }
+
+    #[test]
+    fn running_codex_interrupt_banner_sets_inactive_without_clearing_session() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let expected_identity = TrackedProcessIdentity {
+            pid: 7001,
+            creation_time: Some(8001),
+        };
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+            entry.codex_process_identity = Some(expected_identity);
+            entry.codex_normalized_status = Some(CodexTransportStatus::Working);
+            entry.codex_attention_reason = Some(CodexAttentionReason::TurnComplete);
+            entry.codex_attention_pending = true;
+            entry.codex_last_notify_attention_at = Some(Instant::now());
+            entry.codex_last_visible_attention_at = Some(Instant::now());
+            entry.codex_last_turn_complete_at = Some(Instant::now());
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "codex-interrupted-banner".to_owned(),
+                },
+            })
+            .expect("send codex interrupt chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert_eq!(
+            terminal.codex_normalized_status,
+            Some(CodexTransportStatus::Idle)
+        );
+        assert_eq!(terminal.codex_attention_reason, None);
+        assert!(!terminal.codex_attention_pending);
+        assert_eq!(terminal.codex_process_identity, Some(expected_identity));
+        assert!(terminal.codex_session_active);
+        assert_eq!(terminal.codex_last_notify_attention_at, None);
+        assert_eq!(terminal.codex_last_visible_attention_at, None);
+        assert_eq!(terminal.codex_last_turn_complete_at, None);
+
+        let badge = AiBadgeModel::from_terminal(terminal);
+        let visual = ai_badge_visual(
+            badge.status,
+            badge.codex_normalized_status,
+            badge.opencode_normalized_status,
+            badge.claude_normalized_status,
+            badge.codex_attention_pending,
+            badge.codex_attention_reason,
+            badge.opencode_attention_pending,
+            badge.opencode_attention_reason,
+        );
+        assert_eq!(visual, None);
+    }
+
+    #[test]
+    fn attention_codex_interrupt_banner_sets_inactive_without_clearing_session() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let expected_identity = TrackedProcessIdentity {
+            pid: 7002,
+            creation_time: Some(8002),
+        };
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Attention;
+            entry.codex_session_active = true;
+            entry.codex_process_identity = Some(expected_identity);
+            entry.codex_normalized_status = Some(CodexTransportStatus::Permission);
+            entry.codex_attention_reason = Some(CodexAttentionReason::UserInputRequested);
+            entry.codex_attention_pending = true;
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "codex-interrupted-banner".to_owned(),
+                },
+            })
+            .expect("send codex interrupt chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
+        assert_eq!(
+            terminal.codex_normalized_status,
+            Some(CodexTransportStatus::Idle)
+        );
+        assert_eq!(terminal.codex_attention_reason, None);
+        assert!(!terminal.codex_attention_pending);
+        assert_eq!(terminal.codex_process_identity, Some(expected_identity));
+        assert!(terminal.codex_session_active);
+    }
+
+    #[test]
+    fn codex_prompt_can_continue_after_interrupt_banner_without_relaunch() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let expected_identity = TrackedProcessIdentity {
+            pid: 7003,
+            creation_time: Some(8003),
+        };
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+            entry.codex_process_identity = Some(expected_identity);
+            entry.codex_normalized_status = Some(CodexTransportStatus::Working);
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "codex-interrupted-banner".to_owned(),
+                },
+            })
+            .expect("send codex interrupt chunk");
+        app.process_terminal_events(&ctx);
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![
+                Event::Text("continue".to_owned()),
+                Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::default(),
+                },
+            ],
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::CodexCli));
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+        assert_eq!(
+            terminal.codex_normalized_status,
+            Some(CodexTransportStatus::Working)
+        );
+        assert_eq!(
+            terminal.codex_last_status_source,
+            Some(CodexCliStatusSource::PromptSubmit)
+        );
+        assert_eq!(terminal.codex_process_identity, Some(expected_identity));
+        assert!(terminal.codex_session_active);
+    }
+
+    #[test]
     fn visible_codex_question_prompt_sets_attention_reason() {
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
@@ -24548,7 +24870,7 @@ mod tests {
         }
 
         // Simulate hook-stop event (Stop hook with hook-stop event_kind)
-        // hook-stop SHOULD transition from Working to Idle/Attention
+        // hook-stop SHOULD transition from Working to Idle/Attention with TurnComplete
         write_test_codex_notify_events(
             &temp_dir.path,
             1,
@@ -24566,19 +24888,36 @@ mod tests {
         app.poll_codex_notify_inboxes(&ctx);
 
         let terminal = app.terminals.get(&1).expect("terminal 1");
-        // Working state should transition to Attention via Idle
+        // Stop is debounced so immediate follow-up work can keep the spinner active.
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+        assert_eq!(
+            terminal.codex_normalized_status,
+            Some(CodexTransportStatus::Working)
+        );
+        assert!(terminal.codex_pending_stop_since.is_some());
+        assert!(!terminal.codex_attention_pending);
+        assert!(terminal.codex_hooks_runtime_verified);
+
+        app.codex_notify_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_NOTIFY_POLL_MS + 1));
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.codex_pending_stop_since =
+                Some(Instant::now() - Duration::from_millis(CODEX_STOP_SETTLE_MS + 1));
+        }
+        app.poll_codex_notify_inboxes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
         assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
         assert_eq!(
             terminal.codex_normalized_status,
             Some(CodexTransportStatus::Idle)
         );
-        // Pulse should be active (unknown notify reason = pulse)
+        assert!(terminal.codex_pending_stop_since.is_none());
         assert!(terminal.codex_attention_pending);
         assert_eq!(
             terminal.codex_attention_reason,
-            Some(CodexAttentionReason::UnknownNotify)
+            Some(CodexAttentionReason::TurnComplete)
         );
-        // Hooks should be marked as runtime-verified
         assert!(terminal.codex_hooks_runtime_verified);
     }
 
@@ -24617,6 +24956,14 @@ mod tests {
         );
         app.poll_codex_notify_inboxes(&ctx);
 
+        app.codex_notify_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_NOTIFY_POLL_MS + 1));
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.codex_pending_stop_since =
+                Some(Instant::now() - Duration::from_millis(CODEX_STOP_SETTLE_MS + 1));
+        }
+        app.poll_codex_notify_inboxes(&ctx);
+
         let terminal = app.terminals.get(&1).expect("terminal 1");
         // State should transition to Attention
         assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
@@ -24651,7 +24998,7 @@ mod tests {
             entry.codex_last_status_source = Some(CodexCliStatusSource::Hook);
         }
 
-        // First: hook-stop event transitions to Attention with UnknownNotify reason
+        // First: hook-stop event starts a short debounce while spinner remains active.
         write_test_codex_notify_events(
             &temp_dir.path,
             1,
@@ -24668,13 +25015,10 @@ mod tests {
         );
         app.poll_codex_notify_inboxes(&ctx);
 
-        // Verify state is Attention with UnknownNotify
+        // Verify spinner is still active during the Stop settle window.
         let terminal = app.terminals.get(&1).expect("terminal 1");
-        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
-        assert_eq!(
-            terminal.codex_attention_reason,
-            Some(CodexAttentionReason::UnknownNotify)
-        );
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+        assert!(terminal.codex_pending_stop_since.is_some());
 
         // Second: visible question prompt should upgrade the reason
         app.terminal_events_tx
@@ -24691,6 +25035,7 @@ mod tests {
         let terminal = app.terminals.get(&1).expect("terminal 1");
         // Reason should be upgraded to UserInputRequested
         assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert!(terminal.codex_pending_stop_since.is_none());
         assert_eq!(
             terminal.codex_attention_reason,
             Some(CodexAttentionReason::UserInputRequested)
@@ -24699,6 +25044,135 @@ mod tests {
         assert_eq!(
             terminal.codex_last_status_source,
             Some(CodexCliStatusSource::VisibleUi)
+        );
+    }
+
+    #[test]
+    fn hook_stop_followed_by_tool_work_keeps_spinner() {
+        let ctx = Context::default();
+        let temp_dir = TestTempDir::new("codex-hook-stop-then-tool-work");
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.codex_cli_runtime_dir = Some(temp_dir.path.clone());
+
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+            entry.codex_normalized_status = Some(CodexTransportStatus::Working);
+            entry.codex_last_status_source = Some(CodexCliStatusSource::Hook);
+        }
+
+        write_test_codex_notify_events(
+            &temp_dir.path,
+            1,
+            &test_codex_inbox_token(1),
+            &[
+                CodexNotifyInboxEvent {
+                    terminal_id: "1".to_owned(),
+                    tool: "codex".to_owned(),
+                    status: "attention".to_owned(),
+                    inbox_token: Some(test_codex_inbox_token(1)),
+                    event_kind: Some("hook-stop".to_owned()),
+                    raw_json: r#"{"hook_event":"Stop"}"#.to_owned(),
+                    timestamp_utc: "2026-04-06T00:00:00Z".to_owned(),
+                },
+                CodexNotifyInboxEvent {
+                    terminal_id: "1".to_owned(),
+                    tool: "codex".to_owned(),
+                    status: "running".to_owned(),
+                    inbox_token: Some(test_codex_inbox_token(1)),
+                    event_kind: Some("pre-tool-use".to_owned()),
+                    raw_json: r#"{"hook_event":"PreToolUse"}"#.to_owned(),
+                    timestamp_utc: "2026-04-06T00:00:01Z".to_owned(),
+                },
+            ],
+        );
+        app.poll_codex_notify_inboxes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+        assert_eq!(
+            terminal.codex_normalized_status,
+            Some(CodexTransportStatus::Working)
+        );
+        assert!(terminal.codex_pending_stop_since.is_none());
+        assert!(!terminal.codex_attention_pending);
+        assert_eq!(terminal.codex_attention_reason, None);
+
+        let badge = AiBadgeModel::from_terminal(terminal);
+        let visual = ai_badge_visual(
+            badge.status,
+            badge.codex_normalized_status,
+            badge.opencode_normalized_status,
+            badge.claude_normalized_status,
+            badge.codex_attention_pending,
+            badge.codex_attention_reason,
+            badge.opencode_attention_pending,
+            badge.opencode_attention_reason,
+        );
+        assert_eq!(
+            visual,
+            Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180)))
+        );
+    }
+
+    #[test]
+    fn permission_request_hook_sets_codex_amber_attention_like_opencode() {
+        let ctx = Context::default();
+        let temp_dir = TestTempDir::new("codex-permission-request-hook");
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.codex_cli_runtime_dir = Some(temp_dir.path.clone());
+
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+            entry.codex_normalized_status = Some(CodexTransportStatus::Working);
+            entry.codex_last_status_source = Some(CodexCliStatusSource::Hook);
+        }
+
+        write_test_codex_notify_events(
+            &temp_dir.path,
+            1,
+            &test_codex_inbox_token(1),
+            &[CodexNotifyInboxEvent {
+                terminal_id: "1".to_owned(),
+                tool: "codex".to_owned(),
+                status: "attention".to_owned(),
+                inbox_token: Some(test_codex_inbox_token(1)),
+                event_kind: Some("permission-request".to_owned()),
+                raw_json: r#"{"hook_event":"PermissionRequest"}"#.to_owned(),
+                timestamp_utc: "2026-04-06T00:00:00Z".to_owned(),
+            }],
+        );
+        app.poll_codex_notify_inboxes(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.codex_normalized_status,
+            Some(CodexTransportStatus::Permission)
+        );
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::ApprovalRequested)
+        );
+        assert!(terminal.codex_attention_pending);
+
+        let badge = AiBadgeModel::from_terminal(terminal);
+        let visual = ai_badge_visual(
+            badge.status,
+            badge.codex_normalized_status,
+            badge.opencode_normalized_status,
+            badge.claude_normalized_status,
+            badge.codex_attention_pending,
+            badge.codex_attention_reason,
+            badge.opencode_attention_pending,
+            badge.opencode_attention_reason,
+        );
+        assert_eq!(
+            visual,
+            Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 180, 100)))
         );
     }
 
@@ -24962,6 +25436,7 @@ mod tests {
             badge.opencode_normalized_status,
             badge.claude_normalized_status,
             badge.codex_attention_pending,
+            badge.codex_attention_reason,
             badge.opencode_attention_pending,
             badge.opencode_attention_reason,
         );
@@ -24999,6 +25474,7 @@ mod tests {
             badge.opencode_normalized_status,
             badge.claude_normalized_status,
             badge.codex_attention_pending,
+            badge.codex_attention_reason,
             badge.opencode_attention_pending,
             badge.opencode_attention_reason,
         );
@@ -25037,6 +25513,7 @@ mod tests {
             badge.opencode_normalized_status,
             badge.claude_normalized_status,
             badge.codex_attention_pending,
+            badge.codex_attention_reason,
             badge.opencode_attention_pending,
             badge.opencode_attention_reason,
         );
@@ -25185,6 +25662,7 @@ mod tests {
             initial_badge.opencode_normalized_status,
             initial_badge.claude_normalized_status,
             initial_badge.codex_attention_pending,
+            initial_badge.codex_attention_reason,
             initial_badge.opencode_attention_pending,
             initial_badge.opencode_attention_reason,
         );
@@ -25213,6 +25691,7 @@ mod tests {
             badge.opencode_normalized_status,
             badge.claude_normalized_status,
             badge.codex_attention_pending,
+            badge.codex_attention_reason,
             badge.opencode_attention_pending,
             badge.opencode_attention_reason,
         );
@@ -25251,6 +25730,7 @@ mod tests {
             badge.opencode_normalized_status,
             badge.claude_normalized_status,
             badge.codex_attention_pending,
+            badge.codex_attention_reason,
             badge.opencode_attention_pending,
             badge.opencode_attention_reason,
         );
@@ -26093,6 +26573,7 @@ mod tests {
             codex_last_notify_attention_at: None,
             codex_last_visible_attention_at: None,
             codex_last_turn_complete_at: None,
+            codex_pending_stop_since: None,
             codex_attention_pending: false,
             codex_hooks_runtime_verified: false,
             opencode_launch_pending_since: None,
@@ -27476,21 +27957,98 @@ mod tests {
 
         // Without normalized status - pending=true shows pulse
         assert_eq!(
-            ai_badge_visual(AiCliStatus::Running, None, None, None, false, false, None),
+            ai_badge_visual(
+                AiCliStatus::Running,
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+                None
+            ),
             Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180)))
         );
         assert_eq!(
-            ai_badge_visual(AiCliStatus::Attention, None, None, None, false, true, None),
+            ai_badge_visual(
+                AiCliStatus::Attention,
+                None,
+                None,
+                None,
+                false,
+                None,
+                true,
+                None
+            ),
             Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 220, 220)))
         );
         // Without normalized status - pending=false shows solid
         assert_eq!(
-            ai_badge_visual(AiCliStatus::Attention, None, None, None, false, false, None),
+            ai_badge_visual(
+                AiCliStatus::Attention,
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+                None
+            ),
             Some(AiBadgeVisual::Solid(Color32::from_rgb(180, 180, 180)))
         );
         assert_eq!(
-            ai_badge_visual(AiCliStatus::Inactive, None, None, None, false, false, None),
+            ai_badge_visual(
+                AiCliStatus::Inactive,
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+                None
+            ),
             None
+        );
+
+        // Codex uses the same colors as OpenCode: working gray, permission amber, idle green.
+        assert_eq!(
+            ai_badge_visual(
+                AiCliStatus::Attention,
+                Some(CodexTransportStatus::Permission),
+                None,
+                None,
+                true,
+                Some(CodexAttentionReason::UserInputRequested),
+                false,
+                None
+            ),
+            Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 180, 100)))
+        );
+        assert_eq!(
+            ai_badge_visual(
+                AiCliStatus::Attention,
+                Some(CodexTransportStatus::Idle),
+                None,
+                None,
+                false,
+                Some(CodexAttentionReason::TurnComplete),
+                false,
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            ai_badge_visual(
+                AiCliStatus::Attention,
+                Some(CodexTransportStatus::Idle),
+                None,
+                None,
+                false,
+                Some(CodexAttentionReason::ExecutionError),
+                false,
+                None
+            ),
+            Some(AiBadgeVisual::Solid(Color32::from_rgb(100, 200, 100)))
         );
 
         // With OpenCode normalized status for semantic differentiation
@@ -27503,6 +28061,7 @@ mod tests {
                 Some(OpenCodeTransportStatus::Permission),
                 None,
                 false,
+                None,
                 true,
                 None
             ),
@@ -27516,6 +28075,7 @@ mod tests {
                 Some(OpenCodeTransportStatus::Permission),
                 None,
                 false,
+                None,
                 false,
                 None
             ),
@@ -27529,6 +28089,7 @@ mod tests {
                 Some(OpenCodeTransportStatus::Idle),
                 None,
                 false,
+                None,
                 true,
                 Some(OpenCodeAttentionReason::TurnComplete)
             ),
@@ -27542,6 +28103,7 @@ mod tests {
                 Some(OpenCodeTransportStatus::Idle),
                 None,
                 false,
+                None,
                 false,
                 Some(OpenCodeAttentionReason::TurnComplete)
             ),
@@ -27555,6 +28117,7 @@ mod tests {
                 Some(OpenCodeTransportStatus::Permission),
                 None,
                 false,
+                None,
                 false,
                 Some(OpenCodeAttentionReason::PermissionAsked)
             ),
@@ -27568,6 +28131,7 @@ mod tests {
                 Some(OpenCodeTransportStatus::Permission),
                 None,
                 false,
+                None,
                 false,
                 Some(OpenCodeAttentionReason::QuestionAsked)
             ),
@@ -27581,6 +28145,7 @@ mod tests {
                 Some(OpenCodeTransportStatus::Working),
                 None,
                 false,
+                None,
                 false,
                 None
             ),
@@ -27596,6 +28161,7 @@ mod tests {
                 Some(OpenCodeTransportStatus::Idle),
                 Some(ClaudeTransportStatus::Permission),
                 true, // codex_attention_pending used for Claude
+                None,
                 false,
                 None
             ),
@@ -27608,6 +28174,7 @@ mod tests {
                 None,
                 Some(ClaudeTransportStatus::Idle),
                 false,
+                None,
                 false,
                 None
             ),
@@ -27657,6 +28224,7 @@ mod tests {
             opencode_normalized_status: None,
             claude_normalized_status: None,
             codex_attention_pending: false,
+            codex_attention_reason: None,
             opencode_attention_pending: false,
             opencode_attention_reason: None,
             tooltip_lines: vec!["Factory Droid - Working...".to_string()],
@@ -27668,6 +28236,7 @@ mod tests {
             opencode_normalized_status: None,
             claude_normalized_status: None,
             codex_attention_pending: false,
+            codex_attention_reason: None,
             opencode_attention_pending: true,
             opencode_attention_reason: None,
             tooltip_lines: vec!["Factory Droid - Waiting for you...".to_string()],
@@ -27679,6 +28248,7 @@ mod tests {
             opencode_normalized_status: None,
             claude_normalized_status: None,
             codex_attention_pending: false,
+            codex_attention_reason: None,
             opencode_attention_pending: false,
             opencode_attention_reason: None,
             tooltip_lines: vec!["Factory Droid - Idle".to_string()],
@@ -27712,6 +28282,7 @@ mod tests {
             opencode_normalized_status: None,
             claude_normalized_status: None,
             codex_attention_pending: false,
+            codex_attention_reason: None,
             opencode_attention_pending: false,
             opencode_attention_reason: None,
             tooltip_lines: vec!["Factory Droid - Working...".to_string()],
@@ -28059,6 +28630,7 @@ mod tests {
             opencode_normalized_status: None,
             claude_normalized_status: None,
             codex_attention_pending: false,
+            codex_attention_reason: None,
             opencode_attention_pending: false,
             opencode_attention_reason: None,
             tooltip_lines: vec!["Factory Droid - Idle".to_string()],
@@ -29296,8 +29868,7 @@ mod tests {
 
     #[test]
     fn record_input_history_keeps_multiple_entries_with_proper_limit() {
-        use crate::models::{TerminalInputHistory, TerminalInputRecord, TerminalKind};
-        use std::path::PathBuf;
+        use crate::models::{TerminalInputHistory, TerminalKind};
 
         let mut app = test_app([(1, test_terminal_entry(1, 1))], Some(1));
 
