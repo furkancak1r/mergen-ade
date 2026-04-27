@@ -62,12 +62,14 @@ const IO_BUFFER_SIZE: usize = 16 * 1024;
 const GRACEFUL_TERMINATION_TIMEOUT_MS: u32 = 300;
 
 /// Filters Codex CLI's aggressive redraw sequences during synchronized output.
-/// When active, suppresses ED2 (erase display) and ED3 (erase scrollback)
-/// sequences that cause viewport jumping in the Mergen terminal view.
+/// When active, suppresses ED2 (erase display), ED3 (erase scrollback), and
+/// cursor repositioning sequences that cause viewport jumping in the Mergen
+/// terminal view.
 ///
 /// Codex sends `ESC[?2026h` (begin sync), then `ESC[2J` / `ESC[3J` clears,
-/// then `ESC[?2026l` (end sync). These clears are for the TUI's internal
-/// buffer management, not for actual terminal clearing in our context.
+/// and `ESC[H` / `ESC[1;1H` cursor-home, then `ESC[?2026l` (end sync). These
+/// are for the TUI's internal buffer management, not for actual terminal
+/// behavior in our context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CodexRedrawFilter {
     /// True when inside a synchronized update block (ESC[?2026h ... ESC[?2026l)
@@ -82,7 +84,7 @@ pub struct CodexRedrawFilter {
 enum FilterAction {
     /// Emit the sequence to output (for sync start/end and pass-through CSI)
     Emit(usize),
-    /// Suppress the sequence (for ED2/ED3 during sync)
+    /// Suppress the sequence (for ED2/ED3 and cursor repositioning during sync)
     Suppress(usize),
     /// Incomplete sequence, need more bytes
     Incomplete,
@@ -100,7 +102,7 @@ impl CodexRedrawFilter {
     }
 
     /// Process bytes and return filtered output.
-    /// Clears sequences ED2 (ESC[2J) and ED3 (ESC[3J) are suppressed
+    /// Erase sequences (ED2/ED3) and cursor repositioning (H/f) are suppressed
     /// when sync_active is true. Sync state is tracked via 2026 mode.
     pub fn filter(&mut self, input: &[u8], output: &mut Vec<u8>) {
         output.clear();
@@ -113,18 +115,22 @@ impl CodexRedrawFilter {
 
         // First, handle any pending bytes from previous chunk
         if self.pending_len > 0 {
+            // Save the old pending length before we potentially clear it
+            let old_pending_len = self.pending_len;
+
             // Combine pending + new input to process the sequence
-            let combined_len = self.pending_len + len;
+            let combined_len = old_pending_len + len;
             let mut combined = vec![0u8; combined_len];
-            combined[..self.pending_len].copy_from_slice(&self.pending[..self.pending_len]);
-            combined[self.pending_len..].copy_from_slice(input);
+            combined[..old_pending_len].copy_from_slice(&self.pending[..old_pending_len]);
+            combined[old_pending_len..].copy_from_slice(input);
 
             match self.process_sequence(&combined) {
                 FilterAction::Emit(consumed) => {
                     // Emit the complete sequence
                     output.extend_from_slice(&combined[..consumed]);
                     self.pending_len = 0;
-                    i = consumed.saturating_sub(self.pending_len);
+                    // Calculate how many bytes from the new input were consumed
+                    i = consumed.saturating_sub(old_pending_len);
                     // Clamp i to not exceed len
                     if i > len {
                         i = len;
@@ -133,7 +139,8 @@ impl CodexRedrawFilter {
                 FilterAction::Suppress(consumed) => {
                     // Just consume, don't emit
                     self.pending_len = 0;
-                    i = consumed.saturating_sub(self.pending_len);
+                    // Calculate how many bytes from the new input were consumed
+                    i = consumed.saturating_sub(old_pending_len);
                     if i > len {
                         i = len;
                     }
@@ -145,7 +152,7 @@ impl CodexRedrawFilter {
                         self.pending_len = combined_len;
                     } else {
                         // Too long, just pass through what we have
-                        output.extend_from_slice(&self.pending[..self.pending_len]);
+                        output.extend_from_slice(&self.pending[..old_pending_len]);
                         output.extend_from_slice(input);
                         self.pending_len = 0;
                     }
@@ -153,7 +160,7 @@ impl CodexRedrawFilter {
                 }
                 FilterAction::Unknown => {
                     // Not a sequence we handle - output pending bytes and continue
-                    output.extend_from_slice(&self.pending[..self.pending_len]);
+                    output.extend_from_slice(&self.pending[..old_pending_len]);
                     self.pending_len = 0;
                     // i stays 0, process input normally
                 }
@@ -257,6 +264,14 @@ impl CodexRedrawFilter {
                     // Suppress these sequences during sync
                     return FilterAction::Suppress(full_len);
                 }
+            }
+
+            // Check for cursor repositioning sequences when sync is active
+            // H (CUP) and f (HVP) both move cursor - suppress during sync
+            if self.sync_active && (cmd == b'H' || cmd == b'f') {
+                // Cursor Home (no params) or Cursor Position (row;col)
+                // Suppress these during sync to prevent viewport jumping
+                return FilterAction::Suppress(full_len);
             }
 
             // Other CSI sequence - pass through
@@ -5854,12 +5869,13 @@ mod tests {
         assert_eq!(output, b"\x1b[?2026h");
         accumulated.extend_from_slice(&output);
 
-        // Other CSI sequences should pass through even in sync
+        // SGR (color) sequences pass through, but cursor repositioning is suppressed
         output.clear();
         filter.filter(b"\x1b[31m\x1b[1;1H\x1b[0m", &mut output);
-        assert_eq!(output, b"\x1b[31m\x1b[1;1H\x1b[0m");
+        // Only color sequences pass, cursor-home (1;1H) is suppressed during sync
+        assert_eq!(output, b"\x1b[31m\x1b[0m");
         accumulated.extend_from_slice(&output);
-        assert_eq!(accumulated, b"\x1b[?2026h\x1b[31m\x1b[1;1H\x1b[0m");
+        assert_eq!(accumulated, b"\x1b[?2026h\x1b[31m\x1b[0m");
     }
 
     #[test]
@@ -5875,5 +5891,54 @@ mod tests {
         output.clear();
         filter.filter(b"\x1b[2J", &mut output);
         assert_eq!(output, b"\x1b[2J");
+    }
+
+    #[test]
+    fn codex_filter_suppresses_cursor_home_during_sync() {
+        let mut filter = CodexRedrawFilter::new();
+        let mut output = Vec::new();
+
+        // Enter sync mode
+        filter.filter(b"\x1b[?2026h", &mut output);
+        assert_eq!(output, b"\x1b[?2026h");
+
+        // Cursor home without params (ESC[H) should be suppressed
+        output.clear();
+        filter.filter(b"\x1b[H", &mut output);
+        assert!(output.is_empty());
+
+        // Cursor position (ESC[1;1H) should be suppressed
+        output.clear();
+        filter.filter(b"\x1b[1;1H", &mut output);
+        assert!(output.is_empty());
+
+        // HVP (ESC[f) should be suppressed - same as H
+        output.clear();
+        filter.filter(b"\x1b[f", &mut output);
+        assert!(output.is_empty());
+
+        // End sync
+        output.clear();
+        filter.filter(b"\x1b[?2026l", &mut output);
+        assert_eq!(output, b"\x1b[?2026l");
+
+        // Now cursor home should pass through
+        output.clear();
+        filter.filter(b"\x1b[H", &mut output);
+        assert_eq!(output, b"\x1b[H");
+    }
+
+    #[test]
+    fn codex_filter_full_redraw_sequence_suppressed() {
+        let mut filter = CodexRedrawFilter::new();
+        let mut output = Vec::new();
+
+        // Full Codex redraw sequence: sync, cursor-home, clear, text, end-sync
+        let input = b"\x1b[?2026h\x1b[1;1H\x1b[2Jprompt text\x1b[?2026l";
+        filter.filter(input, &mut output);
+
+        // Should only have: sync start, "prompt text", sync end
+        // cursor-home and clear are suppressed
+        assert_eq!(output, b"\x1b[?2026hprompt text\x1b[?2026l");
     }
 }

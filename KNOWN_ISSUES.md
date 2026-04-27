@@ -1,5 +1,29 @@
 ### Known Issues & Fix Log
 
+#### Codex CLI terminal opens at top of viewport instead of bottom {#codex-terminal-opens-at-top}
+- Date: 2026-04-27
+- Context: main/Windows terminal manager with Codex CLI sessions
+- Error signature: `Codex terminal prompt appears at the top of the viewport instead of the bottom; content looks scrolled up.`
+- Symptoms/Impact: When opening a Codex CLI session, the prompt and initial content appeared at the top of the terminal pane instead of the expected bottom-aligned position. This made the terminal look like it had been scrolled up, even on first open.
+- Root cause: The `CodexRedrawFilter` was suppressing erase sequences (`ESC[2J`, `ESC[3J`) during synchronized output blocks, but it was still allowing cursor repositioning sequences (`ESC[H`, `ESC[1;1H`, `ESC[f`) to pass through. Codex sends these sequences together in a sync block:
+  1. `ESC[?2026h` - Begin synchronized update
+  2. `ESC[1;1H` or `ESC[H` - Move cursor to top-left (cursor home)
+  3. `ESC[2J` - Erase display (suppressed)
+  4. Content is then written starting from the top
+  5. `ESC[?2026l` - End synchronized update
+
+  Since the erase was suppressed but cursor-home was not, the content was written starting at row 1 instead of continuing from the current cursor position.
+- Resolution:
+  - Extended `CodexRedrawFilter` in `src/terminal.rs` to also suppress cursor repositioning sequences (`H` and `f` CSI commands) during synchronized update blocks.
+  - The filter now treats cursor-home the same as erase sequences - both are suppressed during sync, allowing the terminal to naturally scroll and show content at the bottom.
+  - Fixed a pending buffer calculation bug where split sequence handling could skip bytes after completing a sequence.
+- Prevent recurrence:
+  - When adding redraw filtering for TUI applications, consider all sequences that affect viewport positioning (not just erase commands).
+  - Test with actual Codex CLI sessions to verify prompt appears at the expected location.
+  - Add regression tests that verify complete Codex redraw sequences are handled correctly.
+- Files/Commands touched: `src/terminal.rs` (CodexRedrawFilter), `KNOWN_ISSUES.md`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User-reported issue with screenshots showing Codex prompt at top vs expected bottom alignment.
+
 #### Semgrep UnicodeEncodeError on Windows — environment variable fix required {#semgrep-windows-unicode}
 - Date: 2026-04-22
 - Context: Windows PowerShell, Semgrep security scanning
