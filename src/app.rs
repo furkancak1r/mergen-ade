@@ -17546,14 +17546,9 @@ fn terminal_activation_scroll_offset(
         return None;
     }
 
-    let target_row = stable_input_cursor_row
-        .or_else(|| snapshot.cursor.map(|cursor| cursor.y))
-        .or_else(|| terminal_last_non_empty_row(snapshot))?;
-    // Defensive clamp: ensure target row is within snapshot bounds to avoid
-    // scrolling too far down when cursor coordinate is stale/absolute (issue: Codex
-    // terminal opens too far scrolled).
     let max_row = snapshot.lines.len().saturating_sub(1);
-    let clamped_target_row = target_row.min(max_row);
+    let clamped_target_row =
+        terminal_scroll_anchor_row(snapshot, stable_input_cursor_row)?.min(max_row);
     let content_height = snapshot.lines.len() as f32 * line_height.max(0.0);
     let max_offset = (content_height - viewport_height.max(0.0)).max(0.0);
     let visible_rows = if line_height > 0.0 {
@@ -17565,6 +17560,35 @@ fn terminal_activation_scroll_offset(
         .saturating_add(1)
         .saturating_sub(visible_rows);
     Some((preferred_top_row as f32 * line_height.max(0.0)).clamp(0.0, max_offset))
+}
+
+fn terminal_scroll_anchor_row(
+    snapshot: &TerminalSnapshot,
+    stable_input_cursor_row: Option<usize>,
+) -> Option<usize> {
+    if snapshot.lines.is_empty() {
+        return None;
+    }
+
+    let max_row = snapshot.lines.len().saturating_sub(1);
+    let prompt_row = stable_input_cursor_row
+        .filter(|row| *row <= max_row)
+        .or_else(|| {
+            snapshot
+                .cursor
+                .map(|cursor| cursor.y)
+                .filter(|row| *row <= max_row)
+        });
+    let last_non_empty_row = terminal_last_non_empty_row(snapshot);
+
+    match (prompt_row, last_non_empty_row) {
+        (Some(prompt_row), Some(last_non_empty_row)) => Some(prompt_row.max(last_non_empty_row)),
+        (Some(prompt_row), None) => Some(prompt_row),
+        (None, Some(last_non_empty_row)) => Some(last_non_empty_row),
+        (None, None) => stable_input_cursor_row
+            .or_else(|| snapshot.cursor.map(|cursor| cursor.y))
+            .map(|row| row.min(max_row)),
+    }
 }
 
 fn terminal_last_non_empty_row(snapshot: &TerminalSnapshot) -> Option<usize> {
@@ -21883,6 +21907,33 @@ mod tests {
     }
 
     #[test]
+    fn terminal_activation_scroll_offset_keeps_footer_rows_below_input_visible() {
+        let mut lines = vec![TerminalStyledLine::default(); 20];
+        lines[15] = TerminalStyledLine {
+            runs: vec![TerminalStyledRun {
+                text: "gpt-5.5 xhigh fast".to_owned(),
+                style: test_terminal_style(),
+                column: 0,
+                display_width: 18,
+            }],
+        };
+        let snapshot = TerminalSnapshot {
+            lines,
+            cursor: Some(TerminalCursor {
+                x: 0,
+                y: 12,
+                shape: TerminalCursorShape::Block,
+                blinking: false,
+            }),
+            cursor_line: None,
+        };
+
+        let offset = terminal_activation_scroll_offset(&snapshot, Some(12), 10.0, 50.0);
+
+        assert_eq!(offset, Some(110.0));
+    }
+
+    #[test]
     fn terminal_activation_scroll_offset_falls_back_to_last_non_empty_row_and_clamps() {
         let snapshot = TerminalSnapshot {
             lines: vec![
@@ -22073,6 +22124,40 @@ mod tests {
         let behavior = terminal_output_scroll_behavior(&terminal, 10.0, 50.0);
 
         assert_eq!(behavior.vertical_offset, Some(80.0));
+        assert!(!behavior.stick_to_bottom);
+        assert!(!behavior.keep_activation_alignment_pending);
+    }
+
+    #[test]
+    fn codex_output_scroll_behavior_keeps_footer_rows_below_prompt_visible() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.ai_session.tool = Some(AiCliTool::CodexCli);
+        terminal.ai_session.status = AiCliStatus::Running;
+        terminal.codex_session_active = true;
+
+        let mut lines = vec![TerminalStyledLine::default(); 20];
+        lines[15] = TerminalStyledLine {
+            runs: vec![TerminalStyledRun {
+                text: "gpt-5.5 xhigh fast".to_owned(),
+                style: test_terminal_style(),
+                column: 0,
+                display_width: 18,
+            }],
+        };
+        terminal.render_cache = TerminalSnapshot {
+            lines,
+            cursor: Some(TerminalCursor {
+                x: 0,
+                y: 12,
+                shape: TerminalCursorShape::Block,
+                blinking: false,
+            }),
+            cursor_line: None,
+        };
+
+        let behavior = terminal_output_scroll_behavior(&terminal, 10.0, 50.0);
+
+        assert_eq!(behavior.vertical_offset, Some(110.0));
         assert!(!behavior.stick_to_bottom);
         assert!(!behavior.keep_activation_alignment_pending);
     }

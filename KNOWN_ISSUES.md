@@ -1,5 +1,21 @@
 ### Known Issues & Fix Log
 
+#### Codex prompt anchor now keeps footer/status rows visible below the input {#codex-prompt-anchor-keeps-footer-status-rows-visible}
+- Date: 2026-04-27
+- Context: main terminal pane scroll behavior while Codex CLI is active
+- Error signature: `Codex input moved to the bottom, but footer/status lines below it were hidden under the visible terminal area.`
+- Symptoms/Impact: After the prompt-follow fix, Codex no longer opened on a blank lower region, but the viewport could still align the input/cursor row as the last visible row. Codex footer/status text below the input, such as model/path lines, could then sit just below the pane and require manual scrolling to see.
+- Root cause: `terminal_activation_scroll_offset()` prioritized the stable input cursor row over all other useful rows. It only fell back to the last non-empty row when no stable/live cursor row existed, so meaningful rows below the prompt were treated like trailing terminal space.
+- Resolution:
+  - Added a prompt anchor row selector that considers both the stable/live cursor row and the last non-empty row in the current snapshot.
+  - The viewport now targets whichever useful row is lower, preserving Codex footer/status rows below the input while still ignoring trailing blank rows.
+  - Preserved non-Codex bottom stickiness and Codex manual-scroll detach behavior.
+- Prevent recurrence:
+  - Treat Codex prompt following as following the useful live block, not only the input cursor row.
+  - Keep regression coverage for useful footer rows below the prompt and for trailing blank rows below the footer.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-27 user screenshots comparing hidden Codex footer rows against the expected visible model/path footer.
+
 #### Codex prompt follow no longer sticks to trailing blank terminal rows {#codex-prompt-follow-no-longer-sticks-to-trailing-blank-terminal-rows}
 - Date: 2026-04-27
 - Context: main terminal pane scroll behavior while Codex CLI is active
