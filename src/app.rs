@@ -11156,15 +11156,19 @@ impl AdeApp {
                 let panel_right = ui.max_rect().right();
                 ui.set_width(ui.max_rect().width());
 
-                let (panel_icon, panel_title) = match self.config.ui.left_sidebar_tab {
-                    LeftSidebarTab::Directory => (icons::TREE_VIEW, "Directory"),
-                    LeftSidebarTab::SourceControl => (icons::GIT_BRANCH, "Source Control"),
-                    LeftSidebarTab::TerminalManager => (icons::TERMINAL_WINDOW, "Terminal Manager"),
-                    LeftSidebarTab::InputHistory => (icons::CLOCK, "Input History"),
+                let (panel_icon_opt, panel_title) = match self.config.ui.left_sidebar_tab {
+                    LeftSidebarTab::Directory => (Some(icons::TREE_VIEW), "Directory"),
+                    LeftSidebarTab::SourceControl => (Some(icons::GIT_BRANCH), "Source Control"),
+                    LeftSidebarTab::TerminalManager => (None, "Terminal Manager"),
+                    LeftSidebarTab::InputHistory => (Some(icons::CLOCK), "Input History"),
                 };
                 ui.horizontal(|ui| {
+                    let panel_label = match panel_icon_opt {
+                        Some(icon) => format!("{icon} {panel_title}"),
+                        None => panel_title.to_string(),
+                    };
                     ui.label(
-                        RichText::new(format!("{panel_icon} {panel_title}"))
+                        RichText::new(panel_label)
                             .strong()
                             .size(15.0)
                             .color(TEXT_PRIMARY),
@@ -16352,7 +16356,7 @@ fn draw_project_group_header(
                 .max_rect(label_rect)
                 .layout(Layout::left_to_right(Align::Center)),
             |ui| {
-                let label = format!("{} {}", icons::FOLDER_OPEN, project_name);
+                let label = project_name.to_string();
                 let _ = draw_terminal_manager_title_and_diff_summary(
                     ui,
                     &label,
