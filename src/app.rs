@@ -1015,6 +1015,9 @@ struct TerminalEntry {
     title: String,
     full_title: String,
     pending_line_for_title: String,
+    /// Raw input buffer for history (preserves multi-line and Unicode content).
+    /// Unlike pending_line_for_title, this is NOT cleared on newlines.
+    pending_input_for_history: String,
     recent_inputs: VecDeque<String>,
     in_main_view: bool,
     dirty: bool,
@@ -3251,9 +3254,13 @@ impl AdeApp {
         };
 
         let fallback_title = format!("Terminal {terminal_id}");
-        // Hydrate recent_inputs from persisted project history so the history popup
-        // survives restarts and binary updates.
-        let hydrated_recent_inputs = self.recent_inputs_from_history(project_id);
+        // Hydrate recent_inputs from persisted project history for foreground terminals only.
+        // Background terminals use runtime-only history for rerun functionality.
+        let hydrated_recent_inputs = if kind == TerminalKind::Foreground {
+            self.recent_inputs_from_history(project_id)
+        } else {
+            VecDeque::new()
+        };
         let entry = TerminalEntry {
             id: terminal_id,
             project_id,
@@ -3262,6 +3269,7 @@ impl AdeApp {
             title: fallback_title.clone(),
             full_title: fallback_title,
             pending_line_for_title: String::new(),
+            pending_input_for_history: String::new(),
             recent_inputs: hydrated_recent_inputs,
             in_main_view: true,
             dirty: true,
@@ -8241,6 +8249,10 @@ impl AdeApp {
                         outbound.extend_from_slice(text.as_bytes());
                         sent_terminal_input = true;
                         Self::append_pending_line(&mut terminal.pending_line_for_title, &text);
+                        Self::append_pending_input_for_history(
+                            &mut terminal.pending_input_for_history,
+                            &text,
+                        );
                     }
                     Event::Paste(text) => {
                         terminal_interaction = true;
@@ -8379,6 +8391,18 @@ impl AdeApp {
                             {
                                 submitted_opencode_prompt = true;
                             }
+                            // Record to persistent input history from the raw history buffer.
+                            // This preserves multi-line and Unicode content unlike the title buffer.
+                            // Store data to record after the borrow is released.
+                            let history_line =
+                                std::mem::take(&mut terminal.pending_input_for_history);
+                            if !history_line.trim().is_empty() {
+                                // Track recent inputs for tooltip/rerun history from RAW input
+                                // (not sanitized title) so multi-line prompts are preserved
+                                Self::push_recent_input(&mut terminal.recent_inputs, &history_line);
+                                history_to_record =
+                                    Some((terminal.project_id, terminal.kind, history_line));
+                            }
                             if let Some(sanitized) = sanitized_line {
                                 terminal.full_title = sanitized.clone();
                                 terminal.title = update_terminal_title(
@@ -8386,14 +8410,6 @@ impl AdeApp {
                                     terminal.id as usize,
                                     TITLE_MAX_LEN,
                                 );
-                                // Track recent inputs for tooltip history (filters "/" commands)
-                                Self::push_recent_input(&mut terminal.recent_inputs, &sanitized);
-                            }
-                            // Record to persistent input history (raw line, not sanitized)
-                            // Store data to record after the borrow is released
-                            if !line.trim().is_empty() {
-                                history_to_record =
-                                    Some((terminal.project_id, terminal.kind, line));
                             }
                             terminal.dirty = true;
                             continue;
@@ -8402,6 +8418,7 @@ impl AdeApp {
                         if key == Key::Backspace {
                             Self::clear_terminal_selection(terminal);
                             terminal.pending_line_for_title.pop();
+                            terminal.pending_input_for_history.pop();
                         }
 
                         if key == Key::Escape
@@ -8814,6 +8831,9 @@ impl AdeApp {
     #[cfg(not(target_os = "windows"))]
     fn apply_initial_window_bounds(&mut self, _ctx: &egui::Context) {}
 
+    /// Appends text to the pending line buffer for title detection.
+    /// Clears the buffer on newlines (\r or \n) since titles should only
+    /// reflect the current logical line.
     fn append_pending_line(pending: &mut String, text: &str) {
         for ch in text.chars() {
             if ch == '\r' || ch == '\n' {
@@ -8823,6 +8843,32 @@ impl AdeApp {
             pending.push(ch);
         }
         trim_pending_line_suffix(pending, TERMINAL_PENDING_LINE_MAX_CHARS);
+    }
+
+    /// Appends text to the pending input buffer for history recording.
+    /// Unlike append_pending_line, this preserves newlines and Unicode content
+    /// so multi-line prompts are recorded correctly in input history.
+    /// Note: This buffer is NOT capped like the title buffer, so full long
+    /// prompts are preserved for history and rerun functionality.
+    fn append_pending_input_for_history(pending: &mut String, text: &str) {
+        // Normalize \r\n to \n for consistent history storage
+        let mut prev_was_cr = false;
+        for ch in text.chars() {
+            if ch == '\r' {
+                pending.push('\n');
+                prev_was_cr = true;
+            } else if ch == '\n' {
+                if !prev_was_cr {
+                    // Standalone \n (not part of \r\n)
+                    pending.push('\n');
+                }
+                prev_was_cr = false;
+            } else {
+                pending.push(ch);
+                prev_was_cr = false;
+            }
+        }
+        // Intentionally NOT trimming - full input must be preserved for history/rerun
     }
 
     fn flush_terminal_outbound(
@@ -8850,6 +8896,7 @@ impl AdeApp {
         reset_terminal_prompt_scroll_anchor(terminal);
         terminal.runtime.send_paste_bytes(paste_bytes);
         Self::append_pending_line(&mut terminal.pending_line_for_title, text);
+        Self::append_pending_input_for_history(&mut terminal.pending_input_for_history, text);
         terminal.dirty = true;
         ctx.request_repaint();
     }
@@ -9457,6 +9504,8 @@ impl AdeApp {
             terminal.runtime.send_bytes(outbound);
             Self::clear_terminal_selection(terminal);
             Self::append_pending_line(&mut terminal.pending_line_for_title, message);
+            // Clear history buffer since we're sending a saved message (direct command)
+            terminal.pending_input_for_history.clear();
             let line = std::mem::take(&mut terminal.pending_line_for_title);
             if let Some(sanitized) = terminal_title_candidate(&line) {
                 terminal.full_title = sanitized;
@@ -9559,7 +9608,13 @@ impl AdeApp {
     }
 
     /// Record an input to persistent history for the given project.
+    /// Background terminal inputs are not persisted (runtime-only for rerun).
     fn record_input_history(&mut self, project_id: u64, kind: TerminalKind, text: &str) {
+        // Skip background terminals - they use runtime-only history for rerun
+        if kind == TerminalKind::Background {
+            return;
+        }
+
         let Some(project) = self.projects.get(&project_id) else {
             return;
         };
@@ -9634,6 +9689,8 @@ impl AdeApp {
         terminal.runtime.send_bytes(outbound);
         Self::clear_terminal_selection(terminal);
         Self::append_pending_line(&mut terminal.pending_line_for_title, command);
+        // Clear history buffer since we're sending a direct command
+        terminal.pending_input_for_history.clear();
         let line = std::mem::take(&mut terminal.pending_line_for_title);
         if let Some(sanitized) = terminal_title_candidate(&line) {
             terminal.full_title = sanitized;
@@ -9660,6 +9717,7 @@ impl AdeApp {
         terminal.runtime.send_bytes(outbound);
         Self::clear_terminal_selection(terminal);
         terminal.pending_line_for_title.clear();
+        terminal.pending_input_for_history.clear();
         Self::append_pending_line(&mut terminal.pending_line_for_title, trimmed);
         let line = std::mem::take(&mut terminal.pending_line_for_title);
         if let Some(sanitized) = terminal_title_candidate(&line) {
@@ -9670,6 +9728,62 @@ impl AdeApp {
         terminal.dirty = true;
         ctx.request_repaint();
         true
+    }
+
+    /// Send an interrupt signal (Ctrl+C, 0x03) to a terminal.
+    /// Used by background terminal rerun/interrupt button to stop running commands.
+    fn send_interrupt_to_terminal(&mut self, ctx: &egui::Context, terminal_id: u64) {
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        if terminal.exited {
+            return;
+        }
+
+        // Send Ctrl+C (0x03) to interrupt running process
+        terminal.runtime.send_bytes(vec![0x03]);
+        terminal.dirty = true;
+        self.show_status_feedback(ctx, "Sent interrupt (Ctrl+C)");
+    }
+
+    /// Rerun a command in a terminal (used by background terminal rerun button).
+    /// Does not record to persistent history (background is runtime-only).
+    /// Sends the full stored command including multi-line content and Unicode.
+    fn rerun_command_in_terminal(&mut self, ctx: &egui::Context, terminal_id: u64, command: &str) {
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+
+        if terminal.exited {
+            return;
+        }
+
+        let trimmed = command.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        // Send the FULL command (not trimmed) to preserve multi-line content
+        // The stored command may contain newlines and Unicode that must be replayed exactly
+        let mut outbound = command.as_bytes().to_vec();
+        outbound.push(b'\r');
+        reset_terminal_prompt_scroll_anchor(terminal);
+        terminal.runtime.send_bytes(outbound);
+        Self::clear_terminal_selection(terminal);
+        terminal.pending_line_for_title.clear();
+        terminal.pending_input_for_history.clear();
+        Self::append_pending_line(&mut terminal.pending_line_for_title, trimmed);
+        let line = std::mem::take(&mut terminal.pending_line_for_title);
+        if let Some(sanitized) = terminal_title_candidate(&line) {
+            terminal.full_title = sanitized.clone();
+            terminal.title = update_terminal_title(&sanitized, terminal.id as usize, TITLE_MAX_LEN);
+        }
+        // Note: We intentionally do NOT call record_input_history here because
+        // background terminals use runtime-only history (not persisted).
+        // The command is already in recent_inputs from the first run.
+        terminal.dirty = true;
+        ctx.request_repaint();
+        self.show_status_feedback(ctx, &format!("Rerunning: {}", trimmed));
     }
 
     fn next_custom_launcher_id(&self) -> String {
@@ -11972,12 +12086,8 @@ impl AdeApp {
                 );
                 ui.add_space(6.0);
 
-                // Text (truncated)
-                let text = if entry.text.len() > 60 {
-                    format!("{}...", &entry.text[..60])
-                } else {
-                    entry.text.clone()
-                };
+                // Text (truncated using char-safe truncation to avoid panics on Unicode)
+                let text = capped_hover_text(&entry.text, 60);
                 ui.label(RichText::new(text).color(TEXT_PRIMARY).size(13.0));
 
                 // Push remaining space to the right
@@ -12367,37 +12477,81 @@ impl AdeApp {
                         );
                         action_clicked |= message_response.clicked();
 
-                        // History button - opens popup with recent inputs
-                        // Consider persisted history as well so the button is available
-                        // after restarts and binary updates.
-                        let has_runtime_history = !terminal_data.recent_inputs.is_empty();
-                        let has_persisted_history = !terminal_data.exited
-                            && !self
-                                .recent_inputs_from_history(terminal_data.project_id)
-                                .is_empty();
-                        let has_history =
-                            !terminal_data.exited && (has_runtime_history || has_persisted_history);
-                        let history_button_response = with_minimal_button_chrome(ui, |ui| {
-                            ui.button(format!("{}", icons::CLOCK))
-                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                .on_hover_text(if has_history {
-                                    "Show input history"
+                        // For background terminals: show rerun/interrupt button (runtime-only)
+                        // For foreground terminals: show history button (persisted + runtime)
+                        if kind == TerminalKind::Background {
+                            // Background terminals use runtime-only history for rerun/interrupt
+                            let has_runtime_history = !terminal_data.recent_inputs.is_empty();
+                            let has_runnable_command = has_runtime_history && !terminal_data.exited;
+
+                            // Check if terminal has active work (AI Running status)
+                            let is_running = terminal_data.ai_badge.status == AiCliStatus::Running;
+
+                            let rerun_button_response = with_minimal_button_chrome(ui, |ui| {
+                                let icon = if is_running {
+                                    icons::X // Show X (interrupt) when running
                                 } else {
-                                    "No history available"
-                                })
-                        });
-                        if has_history && history_button_response.clicked() {
-                            if self.terminal_history_popup_open == Some(terminal_data.id) {
-                                self.terminal_history_popup_open = None;
-                                self.terminal_history_popup_just_opened = false;
-                            } else {
-                                self.terminal_history_popup_open = Some(terminal_data.id);
-                                self.terminal_history_popup_just_opened = true;
+                                    icons::ARROW_CLOCKWISE // Show refresh when idle
+                                };
+                                let tooltip = if is_running {
+                                    "Stop running command (Ctrl+C)"
+                                } else if has_runnable_command {
+                                    "Rerun last command"
+                                } else {
+                                    "No command to rerun"
+                                };
+                                ui.button(format!("{}", icon))
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .on_hover_text(tooltip)
+                            });
+
+                            if rerun_button_response.clicked() && !terminal_data.exited {
+                                if is_running {
+                                    // Send Ctrl+C to interrupt running work
+                                    self.send_interrupt_to_terminal(ctx, terminal_data.id);
+                                    action_clicked = true;
+                                } else if has_runnable_command {
+                                    // Rerun the most recent command
+                                    if let Some(cmd) = terminal_data.recent_inputs.front() {
+                                        self.rerun_command_in_terminal(ctx, terminal_data.id, cmd);
+                                        action_clicked = true;
+                                    }
+                                }
                             }
-                            action_clicked = true;
-                        }
-                        if history_button_response.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            if rerun_button_response.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                        } else {
+                            // Foreground terminals: history button with persisted + runtime
+                            let has_runtime_history = !terminal_data.recent_inputs.is_empty();
+                            let has_persisted_history = !terminal_data.exited
+                                && !self
+                                    .recent_inputs_from_history(terminal_data.project_id)
+                                    .is_empty();
+                            let has_history = !terminal_data.exited
+                                && (has_runtime_history || has_persisted_history);
+                            let history_button_response = with_minimal_button_chrome(ui, |ui| {
+                                ui.button(format!("{}", icons::CLOCK))
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .on_hover_text(if has_history {
+                                        "Show input history"
+                                    } else {
+                                        "No history available"
+                                    })
+                            });
+                            if has_history && history_button_response.clicked() {
+                                if self.terminal_history_popup_open == Some(terminal_data.id) {
+                                    self.terminal_history_popup_open = None;
+                                    self.terminal_history_popup_just_opened = false;
+                                } else {
+                                    self.terminal_history_popup_open = Some(terminal_data.id);
+                                    self.terminal_history_popup_just_opened = true;
+                                }
+                                action_clicked = true;
+                            }
+                            if history_button_response.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
                         }
                     },
                 );
@@ -19344,6 +19498,78 @@ mod tests {
         let terminal = app.terminals.get(&1).expect("terminal 1");
         // Slash commands should NOT be added to recent_inputs
         assert!(terminal.recent_inputs.is_empty());
+    }
+
+    #[test]
+    fn multiline_unicode_input_recorded_in_history() {
+        let ctx = Context::default();
+        // Use project_id 1 for both terminal and project
+        let mut app = test_app([(1, test_terminal_entry(1, 1))], Some(1));
+
+        // Add project for history recording (project_id 1 with path C:/test)
+        app.projects
+            .insert(1, test_project(1, "Test", "C:/test", &[], &[]));
+
+        // Simulate multi-line paste with Unicode box drawing character
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Text("line1\nline2\n┃ final line".to_owned())],
+        );
+
+        // Press Enter to submit
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        // Verify the terminal's pending_input_for_history was cleared
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(terminal.pending_input_for_history.is_empty());
+
+        // Verify the input was recorded to persistent history (not just recent_inputs)
+        let history = app.input_history.projects.get("C:/test").expect("history");
+        assert_eq!(history.entries.len(), 1);
+        // The full multi-line content should be in persistent history
+        assert_eq!(history.entries[0].text, "line1\nline2\n┃ final line");
+    }
+
+    #[test]
+    fn multiline_input_title_uses_last_line_only() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+
+        // Add project for history recording
+        app.projects
+            .insert(1, test_project(1, "Test", "C:/test", &[], &[]));
+
+        // Simulate multi-line paste with Unicode box drawing character
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Text("line1\nline2\n┃ final line".to_owned())],
+        );
+
+        // Press Enter to submit
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        // Verify title uses only the last line (pending_line_for_title behavior)
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.pending_line_for_title, ""); // Cleared after Enter
+        assert_eq!(terminal.full_title, "┃ final line"); // Only last line
     }
 
     #[test]
@@ -26763,6 +26989,7 @@ mod tests {
             title: format!("Terminal {id}"),
             full_title: format!("Terminal {id}"),
             pending_line_for_title: String::new(),
+            pending_input_for_history: String::new(),
             recent_inputs: VecDeque::new(),
             in_main_view: true,
             dirty: false,
@@ -27304,6 +27531,35 @@ mod tests {
     }
 
     #[test]
+    fn append_pending_input_for_history_preserves_multiline() {
+        let mut pending = String::new();
+
+        AdeApp::append_pending_input_for_history(&mut pending, "line1\r\nline2\nline3");
+
+        assert_eq!(pending, "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn append_pending_input_for_history_preserves_unicode() {
+        let mut pending = String::new();
+
+        AdeApp::append_pending_input_for_history(&mut pending, "┃ box drawing char");
+
+        assert_eq!(pending, "┃ box drawing char");
+    }
+
+    #[test]
+    fn append_pending_input_for_history_normalizes_cr_lf() {
+        let mut pending = String::new();
+
+        // Mixed line endings should normalize to \n
+        AdeApp::append_pending_input_for_history(&mut pending, "a\r\nb\nc\rd");
+
+        // \r\n becomes \n, standalone \r becomes \n, standalone \n stays \n
+        assert_eq!(pending, "a\nb\nc\nd");
+    }
+
+    #[test]
     fn push_recent_input_keeps_last_5() {
         let mut recent_inputs = VecDeque::new();
 
@@ -27434,6 +27690,28 @@ mod tests {
         assert_eq!(deduplicated[0].as_str(), "first");
         assert_eq!(deduplicated[1].as_str(), "second");
         assert_eq!(deduplicated[2].as_str(), "third");
+    }
+
+    #[test]
+    fn capped_hover_text_truncates_at_char_boundary() {
+        use super::capped_hover_text;
+
+        // Test with ASCII
+        let ascii = capped_hover_text("hello world", 5);
+        assert_eq!(ascii, "hello…");
+
+        // Test with Unicode (┃ is 3 bytes in UTF-8 but 1 char)
+        // First 5 chars: ┃ + space + d + r + a = "┃ dra"
+        let unicode = capped_hover_text("┃ drawing", 5);
+        assert_eq!(unicode, "┃ dra…");
+
+        // Test exact length
+        let exact = capped_hover_text("exact", 5);
+        assert_eq!(exact, "exact");
+
+        // Test empty
+        let empty = capped_hover_text("", 5);
+        assert_eq!(empty, "");
     }
 
     #[test]
@@ -30144,5 +30422,280 @@ mod tests {
         // Newest first
         assert_eq!(history.entries[0].text, "cmd9");
         assert_eq!(history.entries[9].text, "cmd0");
+    }
+
+    #[test]
+    fn record_input_history_skips_background_terminals() {
+        use crate::models::{TerminalInputHistory, TerminalInputRecord, TerminalKind};
+        use std::path::PathBuf;
+
+        let mut app = test_app([(1, test_terminal_entry(1, 1))], Some(1));
+
+        // Add a project
+        app.projects.insert(
+            1,
+            test_project(1, "Test", "C:/test", &["msg1"], &["check1"]),
+        );
+
+        // Pre-populate with some foreground history
+        let initial_history = TerminalInputHistory {
+            max_entries: 500,
+            entries: vec![TerminalInputRecord {
+                project_path: PathBuf::from("C:/test"),
+                project_name: "Test".to_owned(),
+                terminal_kind: TerminalKind::Foreground,
+                text: "existing fg".to_owned(),
+                recorded_at: 1000,
+            }],
+        };
+        app.input_history
+            .projects
+            .insert("C:/test".to_owned(), initial_history);
+
+        // Record foreground input - should be added
+        app.record_input_history(1, TerminalKind::Foreground, "new foreground");
+
+        // Record background input - should NOT be added
+        app.record_input_history(1, TerminalKind::Background, "new background");
+
+        // Verify only foreground entries were added
+        let history = app
+            .input_history
+            .projects
+            .get("C:/test")
+            .expect("history should exist");
+        assert_eq!(history.entries.len(), 2, "should have 2 foreground entries");
+        assert_eq!(history.entries[0].text, "new foreground");
+        assert_eq!(history.entries[1].text, "existing fg");
+
+        // Verify no background entry exists
+        assert!(
+            !history.entries.iter().any(|e| e.text == "new background"),
+            "background input should not be persisted"
+        );
+    }
+
+    #[test]
+    fn background_terminal_spawn_does_not_hydrate_from_history() {
+        use crate::models::{TerminalInputHistory, TerminalInputRecord, TerminalKind};
+        use std::path::PathBuf;
+
+        let mut app = test_app([], None);
+
+        // Add a project
+        app.projects.insert(
+            1,
+            test_project(1, "Test", "C:/test", &["msg1"], &["check1"]),
+        );
+
+        // Populate persisted history with entries
+        let project_history = TerminalInputHistory {
+            max_entries: 500,
+            entries: vec![
+                TerminalInputRecord {
+                    project_path: PathBuf::from("C:/test"),
+                    project_name: "Test".to_owned(),
+                    terminal_kind: TerminalKind::Foreground,
+                    text: "fg cmd".to_owned(),
+                    recorded_at: 1000,
+                },
+                TerminalInputRecord {
+                    project_path: PathBuf::from("C:/test"),
+                    project_name: "Test".to_owned(),
+                    terminal_kind: TerminalKind::Background,
+                    text: "bg cmd".to_owned(),
+                    recorded_at: 1001,
+                },
+            ],
+        };
+        app.input_history
+            .projects
+            .insert("C:/test".to_owned(), project_history);
+
+        // Test recent_inputs_from_history returns entries (for foreground hydration)
+        let history_for_hydration = app.recent_inputs_from_history(1);
+        assert_eq!(
+            history_for_hydration.len(),
+            2,
+            "recent_inputs_from_history should return both entries for foreground hydration"
+        );
+
+        // Test that a background terminal entry manually created with empty recent_inputs
+        // stays empty (simulating the spawn behavior)
+        let runtime = test_terminal_runtime();
+        let bg_terminal = test_terminal_entry_with_runtime(2, 1, runtime);
+        // Background terminals should start with empty recent_inputs
+        // (spawn_terminal_for_project now only hydrates for foreground)
+        assert_eq!(
+            bg_terminal.recent_inputs.len(),
+            0,
+            "background terminal should start with empty recent_inputs"
+        );
+    }
+
+    #[test]
+    fn append_pending_input_for_history_preserves_more_than_title_limit() {
+        // Regression: pending_input_for_history was capped to 512 chars like the title buffer,
+        // causing long prompts to lose their prefix in history/rerun.
+        let mut pending = String::new();
+        let long_input = "a".repeat(1000);
+
+        AdeApp::append_pending_input_for_history(&mut pending, &long_input);
+
+        // History buffer should preserve full 1000 chars, not truncate to 512
+        assert_eq!(
+            pending.len(),
+            1000,
+            "history buffer should preserve full long input, not truncate to title limit"
+        );
+        assert_eq!(pending, long_input);
+    }
+
+    #[test]
+    fn foreground_history_preserves_long_multiline_unicode_input() {
+        // Regression: recent_inputs was populated from sanitized title (last line only),
+        // causing multi-line prompts to lose content. Now uses raw history_line.
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 1))], Some(1));
+
+        // Add project for history recording
+        app.projects
+            .insert(1, test_project(1, "Test", "C:/test", &[], &[]));
+
+        // Long multi-line input with Unicode that exceeds title limit
+        let line1 = "┃ ".repeat(300); // 600 chars with Unicode
+        let line2 = "cargo test --workspace".to_owned();
+        let full_input = format!("{}\n{}", line1, line2);
+
+        // Simulate typing the multi-line input
+        app.route_active_terminal_input(&ctx, vec![Event::Text(full_input.clone())]);
+
+        // Press Enter to submit
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        // Verify recent_inputs contains the FULL raw input, not just last line
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.recent_inputs.len(),
+            1,
+            "should have one recent input"
+        );
+        // The full multi-line content should be in recent_inputs
+        assert_eq!(
+            terminal.recent_inputs[0], full_input,
+            "recent_inputs should contain full multi-line Unicode input, not truncated"
+        );
+
+        // Title should use only the last line
+        assert_eq!(
+            terminal.full_title, line2,
+            "title should use last line only"
+        );
+    }
+
+    #[test]
+    fn background_recent_inputs_use_raw_multiline_history_input() {
+        // Regression: background recent_inputs was populated from sanitized title,
+        // causing rerun to replay only the last line. Now uses raw history_line.
+        let ctx = Context::default();
+        let mut app = test_app(
+            [(
+                1,
+                test_terminal_entry_with_kind(1, 1, TerminalKind::Background),
+            )],
+            Some(1),
+        );
+
+        // Multi-line input with Unicode
+        let full_input = "line1\nline2\n┃ final".to_owned();
+
+        // Simulate typing the multi-line input
+        app.route_active_terminal_input(&ctx, vec![Event::Text(full_input.clone())]);
+
+        // Press Enter to submit
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }],
+        );
+
+        // Verify recent_inputs contains the FULL raw input for background terminal
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.recent_inputs.len(),
+            1,
+            "background should have one recent input"
+        );
+        assert_eq!(
+            terminal.recent_inputs[0], full_input,
+            "background recent_inputs should contain full multi-line Unicode input"
+        );
+    }
+
+    #[test]
+    fn background_rerun_sends_full_multiline_command() {
+        // Regression: rerun used trimmed command, losing multi-line content.
+        // Now sends full stored command with newlines preserved.
+        let ctx = Context::default();
+        let mut app = test_app(
+            [(
+                1,
+                test_terminal_entry_with_kind(1, 1, TerminalKind::Background),
+            )],
+            Some(1),
+        );
+
+        // Set up a terminal runtime with capture to verify what gets sent
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        app.terminals.insert(
+            1,
+            test_terminal_entry_with_runtime_and_kind(1, 1, runtime, TerminalKind::Background),
+        );
+
+        // Store a multi-line command in recent_inputs (simulating previous run)
+        let full_command = "line1\nline2\n┃ final".to_owned();
+        if let Some(terminal) = app.terminals.get_mut(&1) {
+            terminal.recent_inputs.push_front(full_command.clone());
+        }
+
+        // Rerun the command
+        app.rerun_command_in_terminal(&ctx, 1, &full_command);
+
+        // Drain runtime commands to process the sent bytes
+        capture.drain();
+
+        // Verify the FULL command was sent (including newlines), plus \r
+        let sent = capture.bytes();
+        let expected = format!("{}\r", full_command);
+        assert_eq!(
+            String::from_utf8(sent).unwrap(),
+            expected,
+            "rerun should send full multi-line command with newlines preserved"
+        );
+    }
+
+    fn test_terminal_entry_with_runtime_and_kind(
+        id: u64,
+        project_id: u64,
+        runtime: TerminalRuntime,
+        kind: TerminalKind,
+    ) -> TerminalEntry {
+        let mut terminal = test_terminal_entry_with_runtime(id, project_id, runtime);
+        terminal.kind = kind;
+        terminal
     }
 }

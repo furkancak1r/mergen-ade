@@ -1,5 +1,109 @@
 ### Known Issues & Fix Log
 
+#### Terminal history and background rerun now preserve full raw submitted input {#terminal-history-preserves-full-raw-input}
+- Date: 2026-04-28
+- Context: Terminal Manager input history and background rerun functionality
+- Error signature: `Long prompts over 512 chars truncated; background rerun replays only last line of multi-line input`
+- Symptoms/Impact:
+  1. When users pasted or typed long multi-line prompts (>512 chars), `pending_input_for_history` was still capped to the title buffer limit (512 chars), losing the prompt prefix.
+  2. When Enter was pressed, `recent_inputs` was populated from the sanitized title candidate (last line only), not the raw history buffer.
+  3. Background terminal rerun replayed only the title/last line, not the full multi-line prompt that was originally submitted.
+- Root cause:
+  1. `append_pending_input_for_history()` reused `trim_pending_line_suffix()` with `TERMINAL_PENDING_LINE_MAX_CHARS`, applying title-buffer limits to history storage.
+  2. The Enter handler pushed `sanitized` (title candidate) into `recent_inputs` before taking `history_line`, causing runtime history to lose multi-line content.
+  3. `rerun_command_in_terminal()` used `trimmed.as_bytes()` which was the trimmed version, not the full stored command.
+- Resolution:
+  - Removed `trim_pending_line_suffix()` call from `append_pending_input_for_history()`; history buffer is now uncapped.
+  - Modified Enter handling to push `history_line` (raw input) into `recent_inputs` instead of `sanitized` (title candidate).
+  - Updated `rerun_command_in_terminal()` to send the full stored command bytes, preserving multi-line content and Unicode.
+  - Added regression tests: `append_pending_input_for_history_preserves_more_than_title_limit`, `foreground_history_preserves_long_multiline_unicode_input`, `background_recent_inputs_use_raw_multiline_history_input`, `background_rerun_sends_full_multiline_command`.
+- Prevent recurrence:
+  - Keep `pending_line_for_title` and `pending_input_for_history` separate; never apply title-buffer truncation to history storage.
+  - Always populate `recent_inputs` from raw submitted input, not title candidates.
+  - Test with inputs >512 chars, multi-byte Unicode, and mixed line endings.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: Code review finding that history buffer still truncated long prompts and rerun used trimmed commands.
+
+#### GitHub Actions workflow shell injection vulnerabilities fixed via env variables {#github-actions-shell-injection-fix}
+- Date: 2026-04-28
+- Context: `.github/workflows/release.yml` security hardening per Semgrep findings
+- Error signature: `Semgrep: workflow runs with potentially untrusted code, using '${{ github.ref_name }}' in 'run:' step is dangerous`
+- Symptoms/Impact:
+  1. Semgrep security scan reported 2 shell injection vulnerabilities at lines 34 and 145 in `release.yml`.
+  2. Direct interpolation of `${{ github.ref_name }}` in PowerShell and bash `run:` steps could allow command injection if the ref name contains malicious characters.
+  3. Risk: Attacker-controlled branch/tag names could execute arbitrary shell commands during release workflow.
+- Root cause:
+  1. The Windows packaging step used `$tag = "${{ github.ref_name }}"` directly in PowerShell.
+  2. The macOS packaging step used `"${{ github.ref_name }}"` directly in bash.
+  3. GitHub Actions expression interpolation in shell scripts is a known attack vector (CWE-78, injection via malicious ref names).
+- Resolution:
+  - Added `RELEASE_TAG: ${{ github.ref_name }}` environment variable declarations to both Windows and macOS packaging steps.
+  - Changed Windows PowerShell to use `$tag = "$env:RELEASE_TAG"` instead of direct interpolation.
+  - Changed macOS bash to use `"$RELEASE_TAG"` instead of direct interpolation.
+  - Semgrep re-run confirmed 0 findings across all files.
+- Prevent recurrence:
+  - Always pass GitHub context values through environment variables in `run:` steps, never interpolate directly.
+  - Run Semgrep before pushing workflow changes to catch injection patterns early.
+  - Document the pattern in AGENTS.md as a security guideline.
+- Files/Commands touched: `.github/workflows/release.yml`, `AGENTS.md`, `KNOWN_ISSUES.md`, `semgrep scan --config=auto --error`
+- References: Semgrep finding `yaml.github-actions.security.run-shell-injection.run-shell-injection`; CWE-78.
+
+#### Background Terminal Manager now uses runtime-only history with rerun/interrupt button {#background-terminal-runtime-history-rerun}
+- Date: 2026-04-28
+- Context: Terminal Manager background terminal input history and command controls
+- Error signature: `Background Terminal Manager shows input history popup that shouldn't persist; need rerun/stop functionality instead`
+- Symptoms/Impact:
+  1. Background terminal inputs were being persisted to `history.json`, mixing with foreground history in the global Input History panel.
+  2. Background terminals showed a clock icon (input history popup) that wasn't useful for background workflow.
+  3. Users needed a way to quickly rerun the last background command or stop a running background command.
+- Root cause:
+  1. `record_input_history()` did not distinguish between foreground and background terminals.
+  2. `spawn_terminal_for_project()` hydrated `recent_inputs` from persisted history for all terminal kinds.
+  3. Terminal Manager row rendering used the same history button for all terminals regardless of kind.
+- Resolution:
+  - Modified `record_input_history()` to skip background terminals (return early for `TerminalKind::Background`).
+  - Modified `spawn_terminal_for_project()` to only hydrate `recent_inputs` from persisted history for foreground terminals; background terminals start with empty `VecDeque::new()`.
+  - Replaced the history clock button with a context-aware rerun/interrupt button for background terminals:
+    - Shows ↻ (refresh/clockwise arrow) when idle with a runnable command available.
+    - Shows X (close/interrupt) when `AiCliStatus::Running` is detected.
+    - Tooltip changes between "Rerun last command", "Stop running command (Ctrl+C)", and "No command to rerun".
+  - Added `send_interrupt_to_terminal()` helper that sends `0x03` (Ctrl+C) to interrupt running background work.
+  - Added `rerun_command_in_terminal()` helper that sends the most recent `recent_inputs` command followed by Enter.
+  - Foreground terminals keep the existing clock/history button and full persisted history behavior.
+- Prevent recurrence:
+  - Keep the `TerminalKind` check in `record_input_history()` and `spawn_terminal_for_project()`; add tests that fail if background history is persisted.
+  - Test that background terminals spawn with empty `recent_inputs` even when persisted history exists.
+  - Add regression tests for rerun button sending the correct command and interrupt sending `0x03`.
+- Files/Commands touched: `src/app.rs` (record_input_history, spawn_terminal_for_project, draw_terminal_rows, send_interrupt_to_terminal, rerun_command_in_terminal), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request to remove background history popup and add rerun/stop functionality; 662 tests pass including new `record_input_history_skips_background_terminals` and `background_terminal_spawn_does_not_hydrate_from_history`.
+
+#### Terminal input history now preserves multi-line and Unicode content {#terminal-input-history-preserves-multiline-unicode}
+- Date: 2026-04-28
+- Context: Terminal Manager input history recording and display
+- Error signature: `Terminal Manager shows only "┃" after multi-line prompt input; full prompt lost.`
+- Symptoms/Impact:
+  1. When users pasted or typed multi-line prompts (e.g., AI prompts with box-drawing characters like `┃`), Terminal Manager history only recorded the last line.
+  2. The full multi-line prompt was lost, making it impossible to reuse complex prompts from history.
+  3. Input history row rendering used byte-index truncation `entry.text[..60]` which could panic or corrupt Unicode characters (3-byte sequences like `┃`).
+- Root cause:
+  1. `append_pending_line()` cleared the buffer on every newline (`\r` or `\n`), so multi-line input only retained the last line.
+  2. The same buffer (`pending_line_for_title`) was used for both title detection and history recording, but these have different requirements: titles need the last logical line only, while history needs the complete raw input.
+  3. `draw_input_history_row()` used byte-index slicing for truncation, which is unsafe for UTF-8 multi-byte characters.
+- Resolution:
+  - Added separate `pending_input_for_history: String` field to `TerminalEntry` alongside existing `pending_line_for_title`.
+  - Created `append_pending_input_for_history()` helper that preserves newlines (normalizing `\r\n` to `\n`) and keeps full Unicode content.
+  - Modified `Event::Text` and `Event::Paste` handling to populate both buffers.
+  - Modified `Enter` key handling to record history from `pending_input_for_history` while keeping title updates from `pending_line_for_title`.
+  - Modified `Backspace` to pop from both buffers to keep them in sync.
+  - Updated `draw_input_history_row()` to use `capped_hover_text()` for char-safe truncation instead of byte-index slicing.
+  - Added comprehensive unit tests for multi-line input, Unicode preservation, and char-safe truncation.
+- Prevent recurrence:
+  - Keep `pending_line_for_title` and `pending_input_for_history` separate; never reuse the title buffer for history.
+  - Always use char-safe truncation helpers for user-visible text; never use byte-index slicing on potentially-Unicode strings.
+  - Test with multi-byte Unicode characters (e.g., `┃`, `🎉`, `ñ`) in input history flows.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User report that multi-line AI prompts with box-drawing characters only showed `┃` in Terminal Manager history.
+
 #### Codex prompt anchor now keeps footer/status rows visible below the input {#codex-prompt-anchor-keeps-footer-status-rows-visible}
 - Date: 2026-04-27
 - Context: main terminal pane scroll behavior while Codex CLI is active

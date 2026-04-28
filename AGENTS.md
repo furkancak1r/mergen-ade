@@ -87,8 +87,23 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Event triggers:** Factory Droid uses `UserPromptSubmit` → Running (green pulse) and `Stop`/notification → Attention (yellow pulse). Codex CLI uses hook-only: prompt/tool hooks → Running, `PermissionRequest` → amber attention, debounced `Stop` → turn-complete attention, and the strict interrupt banner → clear running spinner. OpenCode uses explicit launch detection plus process-based tracking for spinner/pulse status. Claude uses title-based detection.
 - **Plan mode skill restriction:** If you are Codex, OpenCode, or Droid, do not use the plan mode skill from Claude Code's configuration. The plan mode skill is exclusively for `cc` (Claude Code) sessions only.
 
+## Terminal Input & History Invariants
+- `pending_line_for_title` is for title/AI command detection only; it clears on newlines (\r or \n) since titles should reflect only the current logical line. This buffer is capped to `TERMINAL_PENDING_LINE_MAX_CHARS` (512) to prevent unbounded growth.
+- `pending_input_for_history` preserves the complete raw input including multi-line content and Unicode characters (e.g., box-drawing characters like `┃`). This buffer is **NOT** capped—full prompts of any length must be preserved for history and rerun functionality.
+- When Enter is pressed, history is recorded from `pending_input_for_history` (taking the full raw text), while title updates use `pending_line_for_title` (taking only the last logical line).
+- Runtime `recent_inputs` (for tooltips and rerun) must be populated from the raw `history_line`, not the sanitized title candidate. This ensures multi-line prompts appear correctly in Terminal Manager and background rerun replays the full command.
+- Backspace pops from both buffers to keep them in sync for single-character deletion.
+- Always use char-safe truncation helpers (e.g., `capped_hover_text()`) for UI display of user text; never use byte-index slicing like `text[..60]` which can panic on multi-byte UTF-8 sequences or split Unicode code points.
+
 ## Concurrent AI Sessions
 - Sen (AI agent) çalışırken başka bir AI agent'ı da aynı anda çalışıyor olabilir.
 - Eğer dosyalarda veya kodda başka birinin yaptığı değişiklikleri fark edersen, bu değişikliklere müdahale etme.
 - Kendi işlemlerine devam et; başkasının yaptığı değişiklikleri değiştirme, silme veya üzerine yazma.
 - Çakışma olursa kullanıcıya danış; tek başına karar verip başkasının işini bozma.
+
+## Terminal Manager & Input History Guidelines
+- **Background terminals use runtime-only input history**: Do not persist background terminal inputs to `history.json`. They use `recent_inputs` (runtime-only) for the rerun/interrupt button.
+- **Foreground terminals persist input history**: Foreground terminal inputs are recorded to persistent history and shown in the global Input History panel.
+- **Background rerun/interrupt behavior**: The background Terminal Manager row shows a refresh (rerun) button that becomes an X (interrupt) button when `AiCliStatus::Running` is detected. When clicked while running, it sends `0x03` (Ctrl+C) to the terminal; when idle, it reruns the most recent command from `recent_inputs`.
+- **Rerun must replay the full stored command**: Background rerun sends the complete `recent_inputs[0]` content (including multi-line content and Unicode), not a trimmed or title-only version. The full raw input is preserved specifically for this purpose.
+- **Do not interpolate GitHub contexts directly**: In workflow `run:` steps, use environment variables instead of direct `${{ github.ref_name }}` interpolation to avoid shell injection risks (per Semgrep findings).
