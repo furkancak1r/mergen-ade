@@ -30,8 +30,10 @@ jobs:
       - name: Package release zip
         id: package
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = "$env:RELEASE_TAG"
           $assetName = "mergen-ade-$tag-windows-x64-portable.zip"
           $staging = "release-staging"
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
@@ -136,13 +138,14 @@ jobs:
       - name: Package signed and notarized DMG
         id: package
         env:
+          RELEASE_TAG: ${{ github.ref_name }}
           MACOS_SIGN_AND_NOTARIZE: "1"
           MACOS_BUNDLE_ID: com.mergen.MergenADE
           MACOS_CODESIGN_IDENTITY: ${{ secrets.APPLE_DEVELOPER_IDENTITY }}
           MACOS_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_API_KEY_ID }}
           MACOS_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_API_ISSUER_ID }}
           MACOS_NOTARY_KEY_PATH: ${{ steps.apple-credentials.outputs.notary_key_path }}
-        run: bash ./scripts/package-macos-release.sh "${{ github.ref_name }}"
+        run: bash ./scripts/package-macos-release.sh "$RELEASE_TAG"
 
       - name: Upload macOS notarization diagnostics
         if: failure()
