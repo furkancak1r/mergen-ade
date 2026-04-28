@@ -11156,19 +11156,15 @@ impl AdeApp {
                 let panel_right = ui.max_rect().right();
                 ui.set_width(ui.max_rect().width());
 
-                let (panel_icon_opt, panel_title) = match self.config.ui.left_sidebar_tab {
-                    LeftSidebarTab::Directory => (Some(icons::TREE_VIEW), "Directory"),
-                    LeftSidebarTab::SourceControl => (Some(icons::GIT_BRANCH), "Source Control"),
-                    LeftSidebarTab::TerminalManager => (None, "Terminal Manager"),
-                    LeftSidebarTab::InputHistory => (Some(icons::CLOCK), "Input History"),
+                let panel_title = match self.config.ui.left_sidebar_tab {
+                    LeftSidebarTab::Directory => "Directory",
+                    LeftSidebarTab::SourceControl => "Source Control",
+                    LeftSidebarTab::TerminalManager => "Terminal Manager",
+                    LeftSidebarTab::InputHistory => "Input History",
                 };
                 ui.horizontal(|ui| {
-                    let panel_label = match panel_icon_opt {
-                        Some(icon) => format!("{icon} {panel_title}"),
-                        None => panel_title.to_string(),
-                    };
                     ui.label(
-                        RichText::new(panel_label)
+                        RichText::new(panel_title)
                             .strong()
                             .size(15.0)
                             .color(TEXT_PRIMARY),
@@ -11241,9 +11237,7 @@ impl AdeApp {
                                 project_rows
                                     .iter()
                                     .find(|(project_id, _, _, _)| *project_id == selected_id)
-                                    .map(|(_, project_name, _, _)| {
-                                        format!("{} {}", icons::FOLDER_OPEN, project_name)
-                                    })
+                                    .map(|(_, project_name, _, _)| project_name.to_string())
                             })
                             .unwrap_or_else(|| "No project selected".to_owned());
 
@@ -11275,7 +11269,7 @@ impl AdeApp {
                                                 ui.selectable_value(
                                                     &mut self.selected_project,
                                                     Some(*project_id),
-                                                    format!("{} {}", icons::FOLDER, project_name),
+                                                    project_name.clone(),
                                                 );
                                             }
                                         });
@@ -11572,9 +11566,7 @@ impl AdeApp {
                                 project_rows
                                     .iter()
                                     .find(|(project_id, _)| *project_id == selected_id)
-                                    .map(|(_, project_name)| {
-                                        format!("{} {}", icons::FOLDER_OPEN, project_name)
-                                    })
+                                    .map(|(_, project_name)| project_name.to_string())
                             })
                             .unwrap_or_else(|| "No project selected".to_owned());
 
@@ -11607,7 +11599,7 @@ impl AdeApp {
                                                 ui.selectable_value(
                                                     &mut self.selected_project,
                                                     Some(*project_id),
-                                                    format!("{} {}", icons::FOLDER, project_name),
+                                                    project_name.clone(),
                                                 );
                                             }
                                         });
@@ -11830,7 +11822,7 @@ impl AdeApp {
         let selected_project_label = self
             .input_history_selected_project_id
             .and_then(|id| self.projects.get(&id))
-            .map(|p| format!("{} {}", icons::FOLDER_OPEN, p.name))
+            .map(|p| p.name.clone())
             .unwrap_or_else(|| "No project selected".to_owned());
 
         ui.label(RichText::new("Project").color(TEXT_MUTED));
@@ -11850,7 +11842,7 @@ impl AdeApp {
                                     ui.selectable_value(
                                         &mut self.input_history_selected_project_id,
                                         Some(*project_id),
-                                        format!("{} {}", icons::FOLDER, project_name),
+                                        project_name.clone(),
                                     );
                                 }
                             });
@@ -12772,7 +12764,7 @@ impl AdeApp {
                 // Header
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(format!("{} Check-list", icons::CHECK_CIRCLE))
+                        RichText::new("Check-list")
                             .strong()
                             .size(15.0)
                             .color(TEXT_PRIMARY),
@@ -12802,14 +12794,9 @@ impl AdeApp {
                                 ui.add_space(8.0);
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        RichText::new(format!(
-                                            "{} {} ({})",
-                                            icons::FOLDER_OPEN,
-                                            project_name,
-                                            checklist.len()
-                                        ))
-                                        .strong()
-                                        .color(TEXT_PRIMARY),
+                                        RichText::new(format!("{} ({})", project_name, checklist.len()))
+                                            .strong()
+                                            .color(TEXT_PRIMARY),
                                     );
                                 });
                                 ui.add_space(4.0);
