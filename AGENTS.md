@@ -1,5 +1,14 @@
 # Repository Guidelines
 
+## Critical Rules - DO NOT BREAK
+
+### Never Kill Running Mergen ADE Processes
+- **ABSOLUTE RULE**: Never terminate, stop, or kill any running `mergen-ade` process, especially if it's running on the desktop.
+- This applies to ALL automation, scripts, builds, and agent actions.
+- If a new binary needs testing, ask the user to manually restart the application.
+- The user explicitly owns the lifecycle of the desktop application instance.
+- Violation of this rule can cause data loss, interrupted workflows, and broken user trust.
+
 ## Project Structure & Module Organization
 - `src/main.rs`: app entrypoint and native window startup.
 - `src/app.rs`: UI composition (top bar, activity rail, collapsible side panels, terminal manager, main tiled panes) and app state flow.
@@ -71,6 +80,10 @@ If `cargo` is not on PATH in PowerShell, use:
 - `partial_warning` should remain internal state only; do not display it in the Directory panel UI.
 - Preserve symlink safeguards: never recursively descend into symlinked directories.
 - The worker thread should drain stale commands and prefer the latest `Full` command per project to avoid processing outdated requests.
+- **Deferred directories must use `DirectoryNode::is_deferred` as metadata**; do not add visible placeholder children for normal lazy-load state. Placeholder nodes (`directory_placeholder_node`) are only for exceptional/truncated states such as load failure, outside-project paths, or omitted items after hard limits.
+- **Directory worker command draining must never silently drop distinct `Subtree` commands**. Use batch draining (`Vec<DirectoryIndexCommand>`) to preserve all subtree load requests. Only deduplicate Full commands per project (keep latest generation).
+- **When the UI queues a subtree load, request a repaint** (`request_repaint_after`) to process worker events promptly without waiting for unrelated input.
+- **`request_directory_subtree_load()` must report whether work was queued** (`bool`) and must clean up loading state (`directory_index_subtree_loading_by_project`) if command send fails, to prevent stuck loading indicators.
 - Add regression tests whenever directory indexing, deferred loading, or tree rendering behavior changes.
 
 ## Subagent Usage Policy
@@ -100,6 +113,13 @@ If `cargo` is not on PATH in PowerShell, use:
 - **UI labels:** Use "Droid", "Factory Droid", "Codex CLI", "OpenCode", and "Claude" terminology. Do not use "claude" lowercase references in user-facing text.
 - **Event triggers:** Factory Droid uses `UserPromptSubmit` → Running (green pulse) and `Stop`/notification → Attention (yellow pulse). Codex CLI uses hook-only: prompt/tool hooks → Running, `PermissionRequest` → amber attention, debounced `Stop` → turn-complete attention, and the strict interrupt banner → clear running spinner. OpenCode uses explicit launch detection plus process-based tracking for spinner/pulse status. Claude uses title-based detection.
 - **Plan mode skill restriction:** If you are Codex, OpenCode, or Droid, do not use the plan mode skill from Claude Code's configuration. The plan mode skill is exclusively for `cc` (Claude Code) sessions only.
+
+## File Editor Guidelines
+- Long editor content must be wrapped in a stable-id `ScrollArea` (e.g., `FILE_EDITOR_SCROLL_ID`).
+- `TextEdit::multiline` must allocate enough rows for the full line count (`max(visible_rows, line_count)`), not only the visible viewport.
+- Preserve `FILE_EDITOR_INPUT_ID` focus isolation so editor input never routes to terminal capture.
+- Dirty detection must compare against `saved_text` (taking snapshots before mutable borrow to avoid borrow issues).
+- Add regression tests for scroll behavior with files longer than screen height.
 
 ## Terminal Input & History Invariants
 - `pending_line_for_title` is for title/AI command detection only; it clears on newlines (\r or \n) since titles should reflect only the current logical line. This buffer is capped to `TERMINAL_PENDING_LINE_MAX_CHARS` (512) to prevent unbounded growth.

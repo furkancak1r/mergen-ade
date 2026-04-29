@@ -1,5 +1,87 @@
 ### Known Issues & Fix Log
 
+#### Deferred directory folders could stay as ellipsis after opening {#deferred-directory-ellipsis-stuck}
+- Date: 2026-04-29 (follow-up)
+- Context: Directory sidebar lazy subtree loading after shallow indexing
+- Error signature: `Opening a folder in Directory panel shows "…" and files never appear`
+- Symptoms/Impact:
+  1. Expanding a deferred folder could show only a placeholder/ellipsis row.
+  2. File rows did not appear even though the folder was open.
+  3. Multiple expanded deferred folders could leave some subtree loads permanently unprocessed.
+  4. Placeholder children were shown for normal deferred directories (not just exceptional states).
+- Root cause:
+  1. Normal deferred directories were represented with visible placeholder child nodes ("…").
+  2. `drain_stale_directory_commands()` drained all queued commands but returned only one command, silently dropping additional `Subtree` requests.
+  3. `request_directory_subtree_load()` did not report send success and could leave paths stuck in `directory_index_subtree_loading_by_project`.
+  4. UI did not guarantee repaint while subtree worker results were pending.
+- Resolution:
+  - Removed placeholder children from normal deferred directory nodes (kept only for truncation/error states).
+  - Changed command draining to return a batch (`Vec<DirectoryIndexCommand>`) that preserves all distinct `Subtree` commands.
+  - Made `request_directory_subtree_load()` return `bool` and clean up loading state on send failure.
+  - Added repaint scheduling when subtree loads are queued and while in-flight loads exist.
+  - Added regression tests: `deferred_directory_nodes_do_not_create_visible_placeholder_children`, `drain_stale_commands_preserves_multiple_subtrees`, `drain_stale_commands_keeps_latest_full_per_project`, `request_directory_subtree_load_returns_false_when_already_loading`.
+- Prevent recurrence:
+  - Treat `is_deferred` as the source of truth for normal lazy-load state; never add visible placeholder children.
+  - Never drop distinct subtree commands during worker drain; use batch draining.
+  - Never leave loading-set entries without a corresponding queued command or cleanup path.
+  - Test expanding more than one deferred folder in the same frame.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report that opening a folder in Directory panel shows only ellipsis and files do not appear; follow-up to search-deferred-lazy-load.
+
+#### File editor scroll did not work for long files {#file-editor-scroll-long-files}
+- Date: 2026-04-29
+- Context: Built-in file editor scroll behavior for files longer than viewport
+- Error signature: `Mouse wheel scroll doesn't work in file editor for long files`
+- Symptoms/Impact:
+  1. Scrolling with mouse wheel did not move through long files in the editor.
+  2. Files longer than screen height could not be fully viewed.
+  3. No scrollbar appeared because TextEdit height was fixed to viewport only.
+- Root cause:
+  1. `TextEdit::multiline` used `desired_rows` based only on visible height `(editor_height / 14.0)`.
+  2. The editor body was not wrapped in a `ScrollArea`.
+  3. TextEdit only allocated enough vertical space for visible rows, not total lines.
+- Resolution:
+  - Added `FILE_EDITOR_SCROLL_ID` constant for stable scroll area identity.
+  - Wrapped text editor in `egui::ScrollArea::vertical()` with `FILE_EDITOR_SCROLL_ID`.
+  - Changed `desired_rows` calculation to use `max(visible_rows, line_count)` so TextEdit expands for long files.
+  - Dirty tracking and focus protection preserved in the new structure.
+  - Added regression tests: `file_editor_text_edit_desired_rows_expands_for_long_files`, `file_editor_scroll_id_is_constant`.
+- Prevent recurrence:
+  - Any editor with potentially long content must use ScrollArea and size TextEdit appropriately.
+  - Test scroll behavior with files longer than screen height.
+  - Ensure scroll ID is stable across frames for scroll position persistence.
+- Files/Commands touched: `src/app.rs` (FILE_EDITOR_SCROLL_ID, draw_file_editor), `KNOWN_ISSUES.md`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report that scroll did not work in file editor for long files.
+
+#### Search did not trigger lazy loading for deferred directories {#search-deferred-lazy-load}
+- Date: 2026-04-29 (updated)
+- Context: Directory sidebar search with deferred indexing
+- Error signature: `Searching "mig" shows "migrations" folder expanded but with placeholder instead of contents`
+- Symptoms/Impact:
+  1. When searching, folders matching the query were shown expanded but deferred directories were not loaded.
+  2. Users saw placeholder text instead of actual folder contents during search.
+  3. The `!search_active` condition in lazy-load check prevented loading when search was active.
+  4. Subtree commands could be dropped by `drain_stale_directory_commands()` when Full commands existed.
+  5. Loading set entries could get stuck on generation mismatch, blocking future loads.
+- Root cause:
+  1. `draw_folder_tree()` checked `!search_active` before queueing deferred directories for loading.
+  2. `drain_stale_directory_commands()` prioritized Full commands over Subtree, dropping deferred load requests.
+  3. `process_directory_index_events()` didn't clean up `loading_set` on generation mismatch, leaving stale entries.
+  4. Placeholder text was misleading when folder was already expanded and loading.
+- Resolution:
+  - Changed lazy-load condition from `is_expanded && !search_active` to `is_expanded || search_active`.
+  - Fixed `drain_stale_directory_commands()` to prioritize Subtree commands over Full commands.
+  - Fixed `process_directory_index_events()` to always clean up `loading_set` even on generation mismatch.
+  - Updated placeholder text to minimal ellipsis "…" for cleaner UI.
+  - Added regression tests: `search_shows_expanded_deferred_directories_for_lazy_loading`, `drain_stale_commands_prioritizes_subtree_over_full`, `subtree_event_cleans_up_loading_set_on_generation_mismatch`.
+- Prevent recurrence:
+  - When a folder is rendered expanded (either by user action or by search), it should be eligible for lazy loading.
+  - Subtree commands must not be dropped by command draining logic.
+  - Loading state must always be cleaned up to prevent stuck loading indicators.
+  - Test search interaction with deferred directories after any changes to tree rendering or lazy-load logic.
+- Files/Commands touched: `src/app.rs` (draw_folder_tree, drain_stale_directory_commands, process_directory_index_events, build_directory_node_from_entry, build_directory_node), `KNOWN_ISSUES.md`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report during file editor feature verification; search "mig" showed migrations folder with placeholder instead of loading.
+
 #### Directory index time budget was advisory instead of a hard stop {#directory-index-time-budget-hard-stop}
 - Date: 2026-04-29 (follow-up)
 - Context: Directory sidebar indexing still blocking for 20+ seconds despite 150ms time budget

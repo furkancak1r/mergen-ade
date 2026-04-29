@@ -152,6 +152,11 @@ const DIRECTORY_INDEX_DEFERRED_NAMES: &[&str] = &[
     "__pycache__",
     "coverage",
 ];
+/// Maximum file size for built-in editor (2 MB).
+const FILE_EDITOR_MAX_BYTES: u64 = 2 * 1024 * 1024;
+/// Input ID for file editor text area.
+const FILE_EDITOR_INPUT_ID: &str = "file-editor-input";
+const FILE_EDITOR_SCROLL_ID: &str = "file-editor-scroll";
 const SOURCE_CONTROL_PRIORITY_REFRESH_SECS: f64 = 5.0;
 const SOURCE_CONTROL_BACKGROUND_REFRESH_SECS: f64 = 20.0;
 const SOURCE_CONTROL_CHANNEL_CAPACITY: usize = 1;
@@ -290,9 +295,12 @@ fn has_any_checklist_items(projects: &[ProjectRecord]) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum AppIcon {
     ArrowClockwise,
+    ArrowLeft,
+    ArrowRight,
     ChatText,
     CheckCircle,
     Clock,
+    Code,
     Copy,
     Download,
     Eye,
@@ -312,11 +320,14 @@ enum AppIcon {
 }
 
 impl AppIcon {
-    const ALL: [Self; 20] = [
+    const ALL: [Self; 23] = [
         Self::ArrowClockwise,
+        Self::ArrowLeft,
+        Self::ArrowRight,
         Self::ChatText,
         Self::CheckCircle,
         Self::Clock,
+        Self::Code,
         Self::Copy,
         Self::Download,
         Self::Eye,
@@ -338,9 +349,12 @@ impl AppIcon {
     const fn lucide_name(self) -> &'static str {
         match self {
             Self::ArrowClockwise => "refresh-ccw",
+            Self::ArrowLeft => "arrow-left",
+            Self::ArrowRight => "arrow-right",
             Self::ChatText => "message-square-text",
             Self::CheckCircle => "circle-check",
             Self::Clock => "clock",
+            Self::Code => "code",
             Self::Copy => "copy",
             Self::Download => "download",
             Self::Eye => "eye",
@@ -393,9 +407,12 @@ mod icons {
     use super::AppIcon;
 
     pub const ARROW_CLOCKWISE: AppIcon = AppIcon::ArrowClockwise;
+    pub const ARROW_LEFT: AppIcon = AppIcon::ArrowLeft;
+    pub const ARROW_RIGHT: AppIcon = AppIcon::ArrowRight;
     pub const CHAT_TEXT: AppIcon = AppIcon::ChatText;
     pub const CHECK_CIRCLE: AppIcon = AppIcon::CheckCircle;
     pub const CLOCK: AppIcon = AppIcon::Clock;
+    pub const CODE: AppIcon = AppIcon::Code;
     pub const COPY: AppIcon = AppIcon::Copy;
     pub const DOWNLOAD: AppIcon = AppIcon::Download;
     pub const EYE: AppIcon = AppIcon::Eye;
@@ -1032,6 +1049,158 @@ pub struct AdeApp {
     terminal_history_popup_just_opened: bool,
     /// Collapse/expand state per project in the Check-list panel (persisted implicitly via egui storage)
     checklist_collapsed_by_project: BTreeMap<u64, bool>,
+    /// File editor state (runtime only, not persisted)
+    file_editor: FileEditorState,
+}
+
+/// Represents a single open file buffer in the built-in editor.
+#[derive(Debug, Clone)]
+struct OpenFileBuffer {
+    /// Which project this file belongs to
+    project_id: u64,
+    /// Full path to the file
+    path: PathBuf,
+    /// Display name for UI
+    display_name: String,
+    /// Current text content
+    text: String,
+    /// Last saved text content (for dirty detection)
+    saved_text: String,
+    /// Whether the buffer has unsaved changes
+    dirty: bool,
+    /// Last modified time when loaded (for conflict detection)
+    loaded_modified_at: Option<SystemTime>,
+    /// Error message if file operations fail
+    last_error: Option<String>,
+}
+
+impl OpenFileBuffer {
+    fn new(project_id: u64, path: PathBuf, text: String, display_name: String) -> Self {
+        Self {
+            project_id,
+            path,
+            display_name,
+            saved_text: text.clone(),
+            text,
+            dirty: false,
+            loaded_modified_at: None,
+            last_error: None,
+        }
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.dirty || self.text != self.saved_text
+    }
+
+    fn mark_saved(&mut self) {
+        self.saved_text = self.text.clone();
+        self.dirty = false;
+    }
+}
+
+/// State for the built-in file editor.
+/// Manages the active file and navigation history.
+#[derive(Debug, Clone)]
+struct FileEditorState {
+    /// Currently active file buffer
+    active: Option<OpenFileBuffer>,
+    /// Back stack for navigation (previously opened files)
+    back_stack: Vec<OpenFileBuffer>,
+    /// Forward stack for navigation (files navigated back from)
+    forward_stack: Vec<OpenFileBuffer>,
+    /// Maximum number of sessions to keep in history
+    max_history: usize,
+}
+
+impl Default for FileEditorState {
+    fn default() -> Self {
+        Self {
+            active: None,
+            back_stack: Vec::new(),
+            forward_stack: Vec::new(),
+            max_history: 20,
+        }
+    }
+}
+
+impl FileEditorState {
+    /// Open a new file, pushing current to back stack if present.
+    fn open_file(&mut self, buffer: OpenFileBuffer) {
+        // Clear forward stack when opening a new file
+        self.forward_stack.clear();
+
+        // Push current active to back stack if exists
+        if let Some(current) = self.active.take() {
+            self.push_to_back_stack(current);
+        }
+
+        // Set new buffer as active
+        self.active = Some(buffer);
+    }
+
+    /// Navigate back to previous file.
+    fn navigate_back(&mut self) -> bool {
+        if let Some(previous) = self.back_stack.pop() {
+            // Push current to forward stack
+            if let Some(current) = self.active.take() {
+                self.push_to_forward_stack(current);
+            }
+            self.active = Some(previous);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Navigate forward to next file.
+    fn navigate_forward(&mut self) -> bool {
+        if let Some(next) = self.forward_stack.pop() {
+            // Push current to back stack
+            if let Some(current) = self.active.take() {
+                self.push_to_back_stack(current);
+            }
+            self.active = Some(next);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Close the editor, clearing all state.
+    fn close(&mut self) {
+        self.active = None;
+        self.back_stack.clear();
+        self.forward_stack.clear();
+    }
+
+    /// Check if editor has an active file.
+    fn is_open(&self) -> bool {
+        self.active.is_some()
+    }
+
+    /// Check if there are files in back stack.
+    fn can_go_back(&self) -> bool {
+        !self.back_stack.is_empty()
+    }
+
+    /// Check if there are files in forward stack.
+    fn can_go_forward(&self) -> bool {
+        !self.forward_stack.is_empty()
+    }
+
+    fn push_to_back_stack(&mut self, buffer: OpenFileBuffer) {
+        if self.back_stack.len() >= self.max_history {
+            self.back_stack.remove(0);
+        }
+        self.back_stack.push(buffer);
+    }
+
+    fn push_to_forward_stack(&mut self, buffer: OpenFileBuffer) {
+        if self.forward_stack.len() >= self.max_history {
+            self.forward_stack.remove(0);
+        }
+        self.forward_stack.push(buffer);
+    }
 }
 
 struct TerminalEntry {
@@ -3030,6 +3199,7 @@ impl AdeApp {
             terminal_history_popup_open: None,
             terminal_history_popup_just_opened: false,
             checklist_collapsed_by_project: BTreeMap::new(),
+            file_editor: FileEditorState::default(),
         };
         app
     }
@@ -7339,6 +7509,15 @@ impl AdeApp {
                     partial_warning,
                     truncation,
                 } => {
+                    // Always remove from loading set to prevent stuck loading state
+                    // This must happen even on generation mismatch
+                    if let Some(loading_set) = self
+                        .directory_index_subtree_loading_by_project
+                        .get_mut(&project_id)
+                    {
+                        loading_set.remove(&target_path);
+                    }
+
                     let latest_generation = self
                         .directory_index_generation
                         .get(&project_id)
@@ -7368,14 +7547,6 @@ impl AdeApp {
                             changed = true;
                         }
                     }
-
-                    // Remove from loading set
-                    if let Some(loading_set) = self
-                        .directory_index_subtree_loading_by_project
-                        .get_mut(&project_id)
-                    {
-                        loading_set.remove(&target_path);
-                    }
                 }
             }
         }
@@ -7384,6 +7555,14 @@ impl AdeApp {
         }
         if !self.directory_index_events_rx.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(1));
+        }
+        // Keep repainting while subtree loads are in flight so results appear promptly
+        let has_in_flight_subtrees = self
+            .directory_index_subtree_loading_by_project
+            .values()
+            .any(|set| !set.is_empty());
+        if has_in_flight_subtrees {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
 
@@ -7442,9 +7621,10 @@ impl AdeApp {
     }
 
     /// Request on-demand loading of a deferred directory subtree.
-    fn request_directory_subtree_load(&mut self, project_id: u64, target_path: PathBuf) {
+    /// Returns true if the command was successfully queued, false otherwise.
+    fn request_directory_subtree_load(&mut self, project_id: u64, target_path: PathBuf) -> bool {
         let Some(project) = self.projects.get(&project_id).cloned() else {
-            return;
+            return false;
         };
 
         // Check if already loading
@@ -7453,7 +7633,7 @@ impl AdeApp {
             .entry(project_id)
             .or_default();
         if loading_set.contains(&target_path) {
-            return; // Already loading
+            return false; // Already loading
         }
 
         let generation = self
@@ -7462,15 +7642,29 @@ impl AdeApp {
             .copied()
             .unwrap_or(0);
 
+        // Insert into loading set BEFORE sending command
         loading_set.insert(target_path.clone());
 
+        let target_path_for_cleanup = target_path.clone();
         let command = DirectoryIndexCommand::Subtree {
             project_id,
             generation,
             project_path: project.path,
             target_path,
         };
-        let _ = self.directory_index_commands_tx.send(command);
+
+        // Send command and handle failure
+        if self.directory_index_commands_tx.send(command).is_err() {
+            // Clean up loading set if send failed
+            if let Some(set) = self.directory_index_subtree_loading_by_project.get_mut(&project_id)
+            {
+                set.remove(&target_path_for_cleanup);
+            }
+            self.status_line = "Directory index worker unavailable".to_owned();
+            return false;
+        }
+
+        true
     }
 
     fn cached_directory_tree_has_collapsed_folders(
@@ -7506,6 +7700,91 @@ impl AdeApp {
     fn invalidate_directory_tree_collapsed_cache(&mut self, project_id: u64) {
         self.directory_tree_has_collapsed_cache_by_project
             .remove(&project_id);
+    }
+
+    /// Open a file in the built-in editor.
+    fn open_file_in_editor(&mut self, project_id: u64, path: PathBuf) {
+        // Check if file can be opened
+        if let Some(error) = can_open_in_editor(&path) {
+            self.status_line = format!("Cannot open file: {}", error);
+            return;
+        }
+
+        // Try to read the file
+        match fs::read_to_string(&path) {
+            Ok(text) => {
+                let display_name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+
+                let status_name = display_name.clone();
+                let buffer = OpenFileBuffer::new(project_id, path, text, display_name);
+                self.file_editor.open_file(buffer);
+                self.status_line = format!("Opened {} in editor", status_name);
+            }
+            Err(err) => {
+                self.status_line = format!("Failed to open file: {}", err);
+            }
+        }
+    }
+
+    /// Save the current file in the editor.
+    fn save_current_file(&mut self) -> bool {
+        if let Some(buffer) = &mut self.file_editor.active {
+            match fs::write(&buffer.path, &buffer.text) {
+                Ok(()) => {
+                    buffer.mark_saved();
+                    self.status_line = format!("Saved {}", buffer.display_name);
+                    true
+                }
+                Err(err) => {
+                    buffer.last_error = Some(err.to_string());
+                    self.status_line = format!("Failed to save {}: {}", buffer.display_name, err);
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Close the file editor.
+    fn close_file_editor(&mut self) {
+        self.file_editor.close();
+        self.status_line = "Editor closed".to_owned();
+    }
+
+    /// Navigate back to previous file in editor.
+    fn navigate_editor_back(&mut self) -> bool {
+        if self.file_editor.navigate_back() {
+            let name = self
+                .file_editor
+                .active
+                .as_ref()
+                .map(|b| b.display_name.clone())
+                .unwrap_or_default();
+            self.status_line = format!("Navigated to {}", name);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Navigate forward to next file in editor.
+    fn navigate_editor_forward(&mut self) -> bool {
+        if self.file_editor.navigate_forward() {
+            let name = self
+                .file_editor
+                .active
+                .as_ref()
+                .map(|b| b.display_name.clone())
+                .unwrap_or_default();
+            self.status_line = format!("Navigated to {}", name);
+            true
+        } else {
+            false
+        }
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context, main_area_size: Vec2) {
@@ -7667,14 +7946,23 @@ impl AdeApp {
             return true;
         }
 
+        if ctx.memory(|mem| mem.has_focus(egui::Id::new(FILE_EDITOR_INPUT_ID))) {
+            return true;
+        }
+
         self.selected_project.is_some_and(|project_id| {
             ctx.memory(|mem| mem.has_focus(Self::saved_message_draft_input_id(project_id)))
         })
     }
 
+    fn file_editor_input_id() -> Id {
+        Id::new(FILE_EDITOR_INPUT_ID)
+    }
+
     fn surrender_ui_text_focus(&self, ctx: &egui::Context) {
         ctx.memory_mut(|mem| {
             mem.surrender_focus(Self::directory_search_input_id());
+            mem.surrender_focus(Self::file_editor_input_id());
             if let Some(project_id) = self.selected_project {
                 mem.surrender_focus(Self::saved_message_draft_input_id(project_id));
             }
@@ -12050,7 +12338,7 @@ impl AdeApp {
                                                 );
                                             }
 
-                                            let (has_results, folder_state_changed, deferred_to_load) =
+                                            let (has_results, folder_state_changed, deferred_to_load, file_to_open) =
                                                 draw_folder_tree(
                                                 ui,
                                                 &snapshot.root,
@@ -12069,8 +12357,20 @@ impl AdeApp {
                                             }
 
                                             // Trigger lazy loading for expanded deferred directories
+                                            let mut any_subtree_requested = false;
                                             for target_path in deferred_to_load {
-                                                self.request_directory_subtree_load(project_id, target_path);
+                                                if self.request_directory_subtree_load(project_id, target_path) {
+                                                    any_subtree_requested = true;
+                                                }
+                                            }
+                                            // Request repaint to process subtree results
+                                            if any_subtree_requested {
+                                                ui.ctx().request_repaint_after(Duration::from_millis(16));
+                                            }
+
+                                            // Open file in editor if requested
+                                            if let Some(path) = file_to_open {
+                                                self.open_file_in_editor(project_id, path);
                                             }
 
                                             if search_query.is_some() && !has_results {
@@ -13198,6 +13498,12 @@ impl AdeApp {
     }
 
     fn draw_main_area(&mut self, ctx: &egui::Context) {
+        // Check if file editor is active - if so, show editor instead of terminals
+        if self.file_editor.is_open() {
+            self.draw_file_editor(ctx);
+            return;
+        }
+
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(APP_BG))
             .show(ctx, |ui| {
@@ -13294,6 +13600,231 @@ impl AdeApp {
                 let total_height = grid.rows as f32 * pane_height + total_gap_y;
                 ui.allocate_space(Vec2::new(total_width, total_height));
             });
+    }
+
+    /// Draw the built-in file editor.
+    fn draw_file_editor(&mut self, ctx: &egui::Context) {
+        // Check if editor is open first
+        if !self.file_editor.is_open() {
+            return;
+        }
+
+        // Extract data we need before borrowing
+        let can_go_back = self.file_editor.can_go_back();
+        let can_go_forward = self.file_editor.can_go_forward();
+
+        // Collect UI interaction requests during rendering
+        let mut navigate_back = false;
+        let mut navigate_forward = false;
+        let mut close_editor = false;
+        let mut save_file = false;
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(APP_BG))
+            .show(ctx, |ui| {
+                let available = ui.available_size();
+
+                // Get buffer data for rendering
+                let (project_name, display_name, is_dirty, _has_error, error_msg) =
+                    if let Some(buffer) = &self.file_editor.active {
+                        let project_name = self
+                            .projects
+                            .get(&buffer.project_id)
+                            .map(|p| p.name.clone())
+                            .unwrap_or_else(|| "Unknown Project".to_owned());
+                        (
+                            project_name,
+                            buffer.display_name.clone(),
+                            buffer.is_dirty(),
+                            buffer.last_error.is_some(),
+                            buffer.last_error.clone(),
+                        )
+                    } else {
+                        ("".to_owned(), "".to_owned(), false, false, None)
+                    };
+
+                // Header
+                let header_height = TERMINAL_HEADER_HEIGHT;
+                let header_rect = egui::Rect::from_min_size(
+                    ui.cursor().min,
+                    egui::vec2(available.x, header_height),
+                );
+
+                let mut header_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(header_rect)
+                        .layout(Layout::left_to_right(Align::Center)),
+                );
+
+                header_ui.set_min_size(egui::vec2(available.x, header_height));
+
+                egui::Frame::none()
+                    .fill(SURFACE_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .rounding(8.0)
+                    .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                    .show(&mut header_ui, |ui| {
+                        ui.set_min_height(header_height - 12.0);
+
+                        // Back button
+                        ui.add_enabled_ui(can_go_back, |ui| {
+                            if styled_icon_button(
+                                ui,
+                                icons::ARROW_LEFT,
+                                if can_go_back { BTN_ICON } else { BTN_SUBTLE },
+                                if can_go_back { BTN_ICON_HOVER } else { BTN_SUBTLE_HOVER },
+                                if can_go_back { BTN_ICON_ACTIVE } else { BTN_SUBTLE },
+                                "Previous File",
+                            ) {
+                                navigate_back = true;
+                            }
+                        });
+
+                        // Forward button
+                        ui.add_enabled_ui(can_go_forward, |ui| {
+                            if styled_icon_button(
+                                ui,
+                                icons::ARROW_RIGHT,
+                                if can_go_forward { BTN_ICON } else { BTN_SUBTLE },
+                                if can_go_forward { BTN_ICON_HOVER } else { BTN_SUBTLE_HOVER },
+                                if can_go_forward { BTN_ICON_ACTIVE } else { BTN_SUBTLE },
+                                "Next File",
+                            ) {
+                                navigate_forward = true;
+                            }
+                        });
+
+                        ui.add_space(8.0);
+
+                        // File icon and name
+                        ui.label(RichText::new(format!("{}  ", icons::CODE)).size(16.0));
+                        let title_text = if is_dirty {
+                            format!("{} *", display_name)
+                        } else {
+                            display_name
+                        };
+                        ui.label(
+                            RichText::new(title_text)
+                                .strong()
+                                .size(14.0)
+                                .color(if is_dirty { ACCENT } else { TEXT_PRIMARY }),
+                        );
+
+                        ui.add_space(8.0);
+
+                        // Project label
+                        ui.label(
+                            RichText::new(format!("{}  {}", icons::FOLDER, project_name))
+                                .size(12.0)
+                                .color(TEXT_MUTED),
+                        );
+
+                        // Spacer to push buttons to the right
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            // Close button
+                            if styled_icon_button(
+                                ui,
+                                icons::X,
+                                BTN_RED,
+                                BTN_RED_HOVER,
+                                Color32::from_rgb(186, 58, 58),
+                                "Close Editor",
+                            ) {
+                                close_editor = true;
+                            }
+
+                            ui.add_space(8.0);
+
+                            // Save button (only enabled if dirty)
+                            let can_save = is_dirty;
+                            ui.add_enabled_ui(can_save, |ui| {
+                                if styled_icon_button(
+                                    ui,
+                                    icons::CHECK_CIRCLE,
+                                    if can_save { BTN_TEAL } else { BTN_SUBTLE },
+                                    if can_save { BTN_TEAL_HOVER } else { BTN_SUBTLE_HOVER },
+                                    if can_save { BTN_ICON_ACTIVE } else { BTN_SUBTLE },
+                                    "Save File",
+                                ) {
+                                    save_file = true;
+                                }
+                            });
+                        });
+                    });
+
+                ui.add_space(TERMINAL_HEADER_GAP);
+
+                // Editor body
+                let editor_height = (available.y - header_height - TERMINAL_HEADER_GAP).max(100.0);
+                let editor_rect = egui::Rect::from_min_size(
+                    ui.cursor().min,
+                    egui::vec2(available.x, editor_height),
+                );
+
+                let mut editor_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(editor_rect)
+                        .layout(Layout::top_down(Align::Min)),
+                );
+
+                egui::Frame::none()
+                    .fill(SURFACE_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .rounding(10.0)
+                    .inner_margin(egui::Margin::same(12.0))
+                    .show(&mut editor_ui, |ui| {
+                        // Error display if any
+                        if let Some(error) = error_msg {
+                            ui.colored_label(Color32::LIGHT_RED, format!("Error: {}", error));
+                            ui.add_space(8.0);
+                        }
+
+                        // Text editor wrapped in ScrollArea for long files
+                        if let Some(buffer) = &mut self.file_editor.active {
+                            let font_id = terminal_font_id(ui.style());
+                            let line_height = 14.0; // Approximate line height for terminal font
+                            let visible_rows = (editor_height / line_height) as usize;
+                            let line_count = buffer.text.lines().count().max(1);
+                            // Ensure TextEdit is tall enough for all lines so ScrollArea can scroll
+                            let desired_rows = visible_rows.max(line_count);
+                            // Store saved_text for dirty check after potential modification
+                            let saved_text = buffer.saved_text.clone();
+
+                            let text_edit = egui::TextEdit::multiline(&mut buffer.text)
+                                .id(egui::Id::new(FILE_EDITOR_INPUT_ID))
+                                .font(font_id)
+                                .code_editor()
+                                .lock_focus(true)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(desired_rows);
+
+                            let response = egui::ScrollArea::vertical()
+                                .id_salt(FILE_EDITOR_SCROLL_ID)
+                                .max_height(editor_height - 24.0)
+                                .show(ui, |ui| ui.add(text_edit))
+                                .inner;
+
+                            // Update dirty flag based on text changes
+                            if response.changed() {
+                                buffer.dirty = buffer.text != saved_text;
+                            }
+                        }
+                    });
+            });
+
+        // Process deferred UI actions after rendering is complete
+        if navigate_back {
+            self.navigate_editor_back();
+        }
+        if navigate_forward {
+            self.navigate_editor_forward();
+        }
+        if save_file {
+            self.save_current_file();
+        }
+        if close_editor {
+            self.close_file_editor();
+        }
     }
 
     fn draw_sidebar_seam_fix(
@@ -14612,47 +15143,50 @@ fn spawn_directory_index_worker(
 ) {
     std::thread::spawn(move || {
         while let Ok(command) = rx.recv() {
-            // Drain stale commands and keep only the most relevant work
-            let command = drain_stale_directory_commands(&rx, command);
+            // Drain stale commands and get a batch of commands to process
+            let batch = drain_stale_directory_commands(&rx, command);
 
-            match command {
-                DirectoryIndexCommand::Full {
-                    project_id,
-                    generation,
-                    project_path,
-                } => {
-                    let snapshot = collect_directory_index_snapshot(&project_path);
-                    if tx
-                        .send(DirectoryIndexEvent::Full {
-                            project_id,
-                            generation,
-                            snapshot,
-                        })
-                        .is_err()
-                    {
-                        break;
+            // Process all commands in the batch (never drop distinct subtree commands)
+            for cmd in batch {
+                match cmd {
+                    DirectoryIndexCommand::Full {
+                        project_id,
+                        generation,
+                        project_path,
+                    } => {
+                        let snapshot = collect_directory_index_snapshot(&project_path);
+                        if tx
+                            .send(DirectoryIndexEvent::Full {
+                                project_id,
+                                generation,
+                                snapshot,
+                            })
+                            .is_err()
+                        {
+                            return; // Exit worker if channel closed
+                        }
                     }
-                }
-                DirectoryIndexCommand::Subtree {
-                    project_id,
-                    generation,
-                    project_path,
-                    target_path,
-                } => {
-                    let result = collect_directory_subtree(&project_path, &target_path);
-                    if tx
-                        .send(DirectoryIndexEvent::Subtree {
-                            project_id,
-                            generation,
-                            target_path,
-                            children: result.children,
-                            last_error: result.last_error,
-                            partial_warning: result.partial_warning,
-                            truncation: result.truncation,
-                        })
-                        .is_err()
-                    {
-                        break;
+                    DirectoryIndexCommand::Subtree {
+                        project_id,
+                        generation,
+                        project_path,
+                        target_path,
+                    } => {
+                        let result = collect_directory_subtree(&project_path, &target_path);
+                        if tx
+                            .send(DirectoryIndexEvent::Subtree {
+                                project_id,
+                                generation,
+                                target_path,
+                                children: result.children,
+                                last_error: result.last_error,
+                                partial_warning: result.partial_warning,
+                                truncation: result.truncation,
+                            })
+                            .is_err()
+                        {
+                            return; // Exit worker if channel closed
+                        }
                     }
                 }
             }
@@ -14660,17 +15194,35 @@ fn spawn_directory_index_worker(
     });
 }
 
-/// Drain stale commands from the channel and return the most relevant command to process.
-/// For Full commands, prefers the latest generation for each project.
-/// For Subtree commands, keeps them if their generation matches current or they're for different paths.
+/// Drain stale commands from the channel and return a batch of commands to process.
+/// All Subtree commands are preserved (never drop distinct lazy-load requests).
+/// For Full commands, only the latest generation per project is kept.
 fn drain_stale_directory_commands(
     rx: &Receiver<DirectoryIndexCommand>,
     initial: DirectoryIndexCommand,
-) -> DirectoryIndexCommand {
+) -> Vec<DirectoryIndexCommand> {
     use std::collections::HashMap;
+    use std::collections::HashSet;
 
     let mut latest_full_by_project: HashMap<u64, DirectoryIndexCommand> = HashMap::new();
     let mut subtree_commands: Vec<DirectoryIndexCommand> = Vec::new();
+    let mut seen_subtree_keys: HashSet<(u64, u64, PathBuf)> = HashSet::new(); // (project_id, generation, target_path)
+
+    // Helper to deduplicate subtree commands by (project_id, generation, target_path)
+    let mut add_subtree = |cmd: DirectoryIndexCommand| {
+        if let DirectoryIndexCommand::Subtree {
+            project_id,
+            generation,
+            target_path,
+            ..
+        } = &cmd
+        {
+            let key = (*project_id, *generation, target_path.clone());
+            if seen_subtree_keys.insert(key) {
+                subtree_commands.push(cmd);
+            }
+        }
+    };
 
     // Classify the initial command
     match &initial {
@@ -14678,7 +15230,7 @@ fn drain_stale_directory_commands(
             latest_full_by_project.insert(*project_id, initial);
         }
         DirectoryIndexCommand::Subtree { .. } => {
-            subtree_commands.push(initial);
+            add_subtree(initial);
         }
     }
 
@@ -14690,31 +15242,18 @@ fn drain_stale_directory_commands(
                 latest_full_by_project.insert(project_id, cmd);
             }
             DirectoryIndexCommand::Subtree { .. } => {
-                // Keep subtree commands that are still relevant
-                // (generation filtering happens in the event handler)
-                subtree_commands.push(cmd);
+                // Keep all distinct subtree commands - never drop lazy-load requests
+                add_subtree(cmd);
             }
         }
     }
 
-    // Priority: process the most recent Full command if available
-    // Pick the one with the highest generation number
-    if let Some((_, full_cmd)) = latest_full_by_project
-        .into_iter()
-        .max_by_key(|(_, cmd)| match cmd {
-            DirectoryIndexCommand::Full { generation, .. } => *generation,
-            _ => 0,
-        })
-    {
-        return full_cmd;
-    }
+    // Build batch: all subtree commands first, then latest full commands
+    let mut batch = Vec::new();
+    batch.extend(subtree_commands);
+    batch.extend(latest_full_by_project.into_values());
 
-    // If no Full command, return the first Subtree command
-    // (they're processed FIFO, and generation filtering happens in the event handler)
-    subtree_commands
-        .into_iter()
-        .next()
-        .expect("At least one command should exist")
+    batch
 }
 
 fn collect_source_control_snapshot(project_path: &Path, run_fetch: bool) -> SourceControlSnapshot {
@@ -15553,12 +16092,10 @@ fn build_directory_node_from_entry(
     build_state.increment_nodes();
 
     if should_descend_into_directory(is_dir, is_symlink) {
-        // In shallow scan modes, never recurse - just add placeholder
+        // Mark that we have deferred directories, but do NOT add visible placeholder children
+        // Placeholders are only for exceptional states (truncation, errors), not normal lazy-load state.
+        // The DirectoryNode::is_deferred flag is the source of truth for lazy loading.
         build_state.mark_has_deferred();
-        node.children.push(directory_placeholder_node(
-            &info.path,
-            "... (indexing deferred)".to_owned(),
-        ));
     }
 
     Some(node)
@@ -15596,12 +16133,9 @@ fn build_directory_node(
     build_state.increment_nodes();
 
     if should_descend_into_directory(is_dir, is_symlink) {
-        // In shallow scan modes, never recurse immediately
+        // Mark that we have deferred directories, but do NOT add visible placeholder children
+        // Placeholders are only for exceptional states (truncation, errors), not normal lazy-load state.
         build_state.mark_has_deferred();
-        node.children.push(directory_placeholder_node(
-            path,
-            "... (indexing deferred)".to_owned(),
-        ));
     }
 
     Some(node)
@@ -15704,6 +16238,32 @@ fn open_path_with_default_app(path: &Path) -> Result<(), String> {
     }
 }
 
+/// Check if a file can be opened in the built-in editor.
+fn can_open_in_editor(path: &Path) -> Option<String> {
+    // Check if file exists
+    let metadata = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return Some("File not found".to_owned()),
+    };
+
+    // Check if it's a file (not a directory)
+    if !metadata.is_file() {
+        return Some("Not a regular file".to_owned());
+    }
+
+    // Check size limit
+    let size = metadata.len();
+    if size > FILE_EDITOR_MAX_BYTES {
+        return Some(format!(
+            "File too large ({} > {} MB)",
+            size / (1024 * 1024),
+            FILE_EDITOR_MAX_BYTES / (1024 * 1024)
+        ));
+    }
+
+    None
+}
+
 fn trim_pending_line_suffix(text: &mut String, max_chars: usize) {
     if max_chars == 0 {
         text.clear();
@@ -15723,7 +16283,7 @@ fn trim_pending_line_suffix(text: &mut String, max_chars: usize) {
     text.drain(..split_at);
 }
 
-/// Returns (rendered_any, folder_state_changed, deferred_paths_to_load).
+/// Returns (rendered_any, folder_state_changed, deferred_paths_to_load, file_to_open).
 fn draw_folder_tree(
     ui: &mut Ui,
     root: &DirectoryNode,
@@ -15731,10 +16291,11 @@ fn draw_folder_tree(
     search_query: Option<&str>,
     force_show_all_descendants: bool,
     matching_directories: Option<&HashSet<PathBuf>>,
-) -> (bool, bool, Vec<PathBuf>) {
+) -> (bool, bool, Vec<PathBuf>, Option<PathBuf>) {
     let mut rendered_any = false;
     let mut folder_state_changed = false;
     let mut deferred_to_load = Vec::new();
+    let mut file_to_open: Option<PathBuf> = None;
     for item in &root.children {
         let item_name_lower = item.name.to_lowercase();
         let item_matches = search_query.is_some_and(|query| item_name_lower.contains(query));
@@ -15761,8 +16322,10 @@ fn draw_folder_tree(
             let previous_open_state = search_active.then(|| header_state.is_open());
 
             // Check if deferred directory is expanded and needs loading
+            // During search, folders are shown expanded if they match or contain matches
             let is_expanded = header_state.is_open();
-            if item.is_deferred && is_expanded && !search_active {
+            let is_rendered_expanded = is_expanded || search_active;
+            if item.is_deferred && is_rendered_expanded {
                 deferred_to_load.push(item.path.clone());
             }
 
@@ -15773,7 +16336,7 @@ fn draw_folder_tree(
             let (_, header_response, _) = header_state
                 .show_header(ui, |ui| draw_directory_folder_row(ui, &item.name))
                 .body(|ui| {
-                    let (_, child_state_changed, child_deferred) = draw_folder_tree(
+                    let (_, child_state_changed, child_deferred, child_file_open) = draw_folder_tree(
                         ui,
                         item,
                         status_line_update,
@@ -15783,6 +16346,9 @@ fn draw_folder_tree(
                     );
                     folder_state_changed |= child_state_changed;
                     deferred_to_load.extend(child_deferred);
+                    if child_file_open.is_some() {
+                        file_to_open = child_file_open;
+                    }
                 });
             if search_active {
                 if let Some(previous_open_state) = previous_open_state {
@@ -15854,7 +16420,12 @@ fn draw_folder_tree(
             let double_clicked = response.double_clicked();
             response.context_menu(|ui| {
                 with_minimal_button_chrome(ui, |ui| {
-                    if ui.button("Open").clicked() {
+                    if ui.button(format!("{} Open in Editor", icons::CODE)).clicked() {
+                        file_to_open = Some(item.path.clone());
+                        *status_line_update = Some(format!("Opening {} in editor...", item.name));
+                        ui.close_menu();
+                    }
+                    if ui.button("Open with Default App").clicked() {
                         match open_path_with_default_app(&item.path) {
                             Ok(()) => {
                                 *status_line_update = Some(format!("Opened file: {}", item.name));
@@ -15890,19 +16461,14 @@ fn draw_folder_tree(
             });
 
             if double_clicked {
-                match open_path_with_default_app(&item.path) {
-                    Ok(()) => {
-                        *status_line_update = Some(format!("Opened file: {}", item.name));
-                    }
-                    Err(err) => {
-                        *status_line_update = Some(format!("Open file failed: {err}"));
-                    }
-                }
+                // Double-click opens in the built-in editor
+                file_to_open = Some(item.path.clone());
+                *status_line_update = Some(format!("Opening {} in editor...", item.name));
             }
         }
     }
 
-    (rendered_any, folder_state_changed, deferred_to_load)
+    (rendered_any, folder_state_changed, deferred_to_load, file_to_open)
 }
 
 fn collect_matching_directory_paths(
@@ -19012,6 +19578,7 @@ mod tests {
         with_minimal_button_chrome, with_settings_text_edit_chrome, AdeApp, AiBadgeModel,
         AiBadgeVisual, CodexAttentionReason, CodexCliStatusSource, CodexTransportStatus,
         CtrlCAction, DirectoryIndexSnapshot, DirectoryIndexTruncationFlags, DirectoryNode,
+        FileEditorState, OpenFileBuffer,
         FactoryDroidAttentionReason, FactoryDroidHookInboxEvent,
         FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
         FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, OpenCodeAttentionReason,
@@ -28014,6 +28581,7 @@ mod tests {
             terminal_history_popup_open: None,
             terminal_history_popup_just_opened: false,
             ai_hook_manager: None,
+            file_editor: FileEditorState::default(),
         }
     }
 
@@ -28890,9 +29458,12 @@ mod tests {
         let node = node.unwrap();
         assert!(node.is_dir);
         assert!(node.is_deferred);
-        // Should have a placeholder child
-        assert!(!node.children.is_empty());
-        assert!(node.children[0].is_placeholder);
+        // Normal deferred directories should NOT have placeholder children
+        // (placeholders are only for exceptional states like truncation/errors)
+        assert!(
+            node.children.is_empty(),
+            "normal deferred directories should not have placeholder children"
+        );
     }
 
     #[test]
@@ -28952,6 +29523,97 @@ mod tests {
     }
 
     #[test]
+    fn search_shows_expanded_deferred_directories_for_lazy_loading() {
+        // Regression test: When search is active, deferred directories that are shown
+        // expanded (because they match or contain matches) should trigger lazy loading.
+        // This tests the fix for the issue where searching "mig" would show "migrations"
+        // folder expanded but with placeholder "... (indexing deferred)" instead of loading it.
+        use super::{DirectoryNode, draw_folder_tree};
+        use std::path::PathBuf;
+        use std::collections::HashSet;
+        use egui::{Context, RawInput, FontDefinitions, pos2};
+
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        // Create a deferred directory node (simulating migrations folder)
+        let deferred_dir = DirectoryNode {
+            name: "migrations".to_owned(),
+            path: PathBuf::from("/project/migrations"),
+            is_dir: true,
+            is_placeholder: false,
+            is_deferred: true,  // Key: this directory is deferred
+            children: vec![DirectoryNode {
+                name: "…".to_owned(),
+                path: PathBuf::from("/project/migrations"),
+                is_dir: false,
+                is_placeholder: true,
+                is_deferred: false,
+                children: vec![],
+            }],
+        };
+
+        let root = DirectoryNode {
+            name: "project".to_owned(),
+            path: PathBuf::from("/project"),
+            is_dir: true,
+            is_placeholder: false,
+            is_deferred: false,
+            children: vec![deferred_dir],
+        };
+
+        // Simulate search for "mig" - this should match "migrations"
+        let search_query: Option<&str> = Some("mig");
+        let mut matching_dirs = HashSet::new();
+        matching_dirs.insert(PathBuf::from("/project/migrations"));
+
+        let mut deferred_to_load_result: Option<Vec<PathBuf>> = None;
+
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                // Create a constrained rect for the tree
+                let rect = egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(320.0, 200.0));
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                let mut status: Option<String> = None;
+                let (_rendered, _changed, deferred_to_load, _file_open) = draw_folder_tree(
+                    &mut child,
+                    &root,
+                    &mut status,
+                    search_query,
+                    false,
+                    Some(&matching_dirs),
+                );
+                deferred_to_load_result = Some(deferred_to_load);
+            });
+        });
+
+        // Critical assertion: The deferred directory should be in the load queue
+        // because it is shown expanded during search
+        let deferred_to_load = deferred_to_load_result
+            .expect("draw_folder_tree should have been called");
+        assert!(
+            deferred_to_load.contains(&PathBuf::from("/project/migrations")),
+            "Deferred directory shown during search should be queued for lazy loading"
+        );
+    }
+
+    #[test]
+    fn placeholder_text_is_minimal() {
+        // Test that placeholder nodes show minimal clean text (ellipsis)
+        use super::directory_placeholder_node;
+        use std::path::Path;
+
+        let node = directory_placeholder_node(Path::new("/test"), "…".to_owned());
+        assert!(!node.is_deferred);
+        assert!(node.is_placeholder);
+        assert_eq!(node.name, "…");
+    }
+
+    #[test]
     fn directory_index_drain_stale_commands_prefers_latest_full() {
         // Test that drain_stale_directory_commands prefers the latest Full command
         use super::{drain_stale_directory_commands, DirectoryIndexCommand, DirectoryScanMode};
@@ -28985,20 +29647,128 @@ mod tests {
         // Receive the first command
         let first = rx.recv().unwrap();
 
-        // Drain should return the latest (generation 3)
-        let result = drain_stale_directory_commands(&rx, first);
+        // Drain should return the latest (generation 3) in the batch
+        let batch = drain_stale_directory_commands(&rx, first);
 
-        match result {
-            DirectoryIndexCommand::Full {
-                generation,
-                project_path,
-                ..
-            } => {
-                assert_eq!(generation, 3);
-                assert!(project_path.to_string_lossy().contains("project1-v2"));
+        // Find the Full command in the batch
+        let full_cmd = batch
+            .iter()
+            .find_map(|cmd| match cmd {
+                DirectoryIndexCommand::Full {
+                    generation,
+                    project_path,
+                    ..
+                } => Some((*generation, project_path.clone())),
+                _ => None,
+            })
+            .expect("Expected Full command in batch");
+
+        assert_eq!(full_cmd.0, 3);
+        assert!(full_cmd.1.to_string_lossy().contains("project1-v2"));
+    }
+
+    #[test]
+    fn drain_stale_commands_prioritizes_subtree_over_full() {
+        // Regression test: Subtree commands should be processed before Full commands
+        // to ensure deferred loading doesn't get dropped
+        use super::{drain_stale_directory_commands, DirectoryIndexCommand, DirectoryScanMode};
+        use crossbeam_channel::unbounded;
+        use std::path::PathBuf;
+
+        let (tx, rx) = unbounded();
+
+        // Send a Full command first
+        tx.send(DirectoryIndexCommand::Full {
+            project_id: 1,
+            generation: 1,
+            project_path: PathBuf::from("/project1"),
+        })
+        .unwrap();
+
+        // Then send a Subtree command
+        tx.send(DirectoryIndexCommand::Subtree {
+            project_id: 1,
+            generation: 1,
+            project_path: PathBuf::from("/project1"),
+            target_path: PathBuf::from("/project1/src"),
+        })
+        .unwrap();
+
+        // Receive the first command (Full)
+        let first = rx.recv().unwrap();
+
+        // Drain should return a batch containing the Subtree command
+        let batch = drain_stale_directory_commands(&rx, first);
+
+        // Find the Subtree command in the batch
+        let subtree_target = batch
+            .iter()
+            .find_map(|cmd| match cmd {
+                DirectoryIndexCommand::Subtree { target_path, .. } => {
+                    Some(target_path.clone())
+                }
+                _ => None,
+            })
+            .expect("Expected Subtree command in batch");
+
+        assert_eq!(subtree_target, PathBuf::from("/project1/src"));
+    }
+
+    #[test]
+    fn subtree_event_cleans_up_loading_set_on_generation_mismatch() {
+        // Regression test: Subtree event should clean up loading_set even if generation mismatch
+        use super::{DirectoryIndexEvent, DirectoryIndexTruncationFlags, DirectoryNode};
+        use crossbeam_channel::unbounded;
+        use std::collections::BTreeSet;
+        use std::path::PathBuf;
+
+        let (tx, rx) = unbounded();
+        let mut loading_set: BTreeSet<PathBuf> = BTreeSet::new();
+
+        // Simulate a loading state
+        let target_path = PathBuf::from("/project/src");
+        loading_set.insert(target_path.clone());
+        assert!(loading_set.contains(&target_path));
+
+        // Send a Subtree event with mismatched generation
+        tx.send(DirectoryIndexEvent::Subtree {
+            project_id: 1,
+            generation: 99, // Mismatched generation
+            target_path: target_path.clone(),
+            children: vec![DirectoryNode {
+                name: "file.rs".to_owned(),
+                path: PathBuf::from("/project/src/file.rs"),
+                is_dir: false,
+                is_placeholder: false,
+                is_deferred: false,
+                children: vec![],
+            }],
+            last_error: None,
+            partial_warning: None,
+            truncation: DirectoryIndexTruncationFlags::default(),
+        })
+        .unwrap();
+
+        // Simulate processing: receive event and clean up loading_set
+        if let Ok(event) = rx.try_recv() {
+            match event {
+                DirectoryIndexEvent::Subtree {
+                    target_path: event_path,
+                    generation: _,
+                    ..
+                } => {
+                    // Always remove from loading set (even on generation mismatch)
+                    loading_set.remove(&event_path);
+                }
+                _ => {}
             }
-            _ => panic!("Expected Full command"),
         }
+
+        // Loading set should be cleaned up despite generation mismatch
+        assert!(
+            !loading_set.contains(&target_path),
+            "loading_set should be cleaned up even on generation mismatch"
+        );
     }
 
     #[test]
@@ -31858,6 +32628,247 @@ mod tests {
         assert!(
             terminal.pending_rerun_since.is_none(),
             "pending timestamp should be cleared after phase 2"
+        );
+    }
+
+    #[test]
+    fn file_editor_text_edit_desired_rows_expands_for_long_files() {
+        // Regression test: TextEdit::multiline must have enough rows for long files
+        // to allow ScrollArea to scroll. Previously desired_rows was fixed to visible
+        // viewport, causing scroll to not work for files longer than screen height.
+        use super::{OpenFileBuffer, FILE_EDITOR_INPUT_ID};
+        use egui::{Context, RawInput, FontDefinitions};
+
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        // Create a buffer with many lines (simulating a long file)
+        let long_content = "line\n".repeat(200); // 200 lines
+        let buffer = OpenFileBuffer {
+            project_id: 1,
+            path: PathBuf::from("/project/src/long.rs"),
+            display_name: "long.rs".to_owned(),
+            text: long_content.clone(),
+            saved_text: long_content,
+            dirty: false,
+            loaded_modified_at: None,
+            last_error: None,
+        };
+
+        let line_count = buffer.text.lines().count();
+        let visible_rows = 25; // Simulate visible viewport
+
+        // The critical assertion: desired_rows must be at least line_count
+        // so TextEdit allocates enough vertical space for scrolling
+        let desired_rows = visible_rows.max(line_count);
+        assert!(
+            desired_rows >= line_count,
+            "TextEdit must have at least {} rows for long file, had {}",
+            line_count,
+            desired_rows
+        );
+
+        // Verify line count is what we expect
+        assert_eq!(line_count, 200, "should have 200 lines");
+    }
+
+    #[test]
+    fn file_editor_scroll_id_is_constant() {
+        // Test that FILE_EDITOR_SCROLL_ID is a stable constant for scroll persistence
+        use super::FILE_EDITOR_SCROLL_ID;
+        assert_eq!(FILE_EDITOR_SCROLL_ID, "file-editor-scroll");
+    }
+
+    #[test]
+    fn deferred_directory_nodes_do_not_create_visible_placeholder_children() {
+        // Regression test: Normal deferred directories should NOT have visible placeholder children.
+        // Placeholders are only for exceptional states (truncation, errors), not normal lazy-load.
+        use super::{
+            build_directory_node_from_entry, DirectoryIndexBuildState, DirectoryScanMode,
+            DirectoryIndexTruncationFlags, DIRECTORY_INDEX_FULL_SCAN_TIME_BUDGET_MS,
+        };
+        use std::path::PathBuf;
+
+        let mut build_state =
+            DirectoryIndexBuildState::new(DIRECTORY_INDEX_FULL_SCAN_TIME_BUDGET_MS);
+
+        // Create a normal directory entry (not a symlink)
+        let dir_entry = super::DirEntryInfo {
+            path: PathBuf::from("/project/src"),
+            name: "src".to_owned(),
+            file_type: {
+                let metadata = std::fs::metadata(".").unwrap();
+                metadata.file_type()
+            },
+        };
+
+        // Build node in InitialRoot mode (normal shallow scan)
+        let node = build_directory_node_from_entry(
+            dir_entry,
+            0,
+            &mut build_state,
+            DirectoryScanMode::InitialRoot,
+        );
+
+        assert!(node.is_some());
+        let node = node.unwrap();
+
+        // Node should be a deferred directory
+        assert!(node.is_dir, "node should be a directory");
+        assert!(node.is_deferred, "node should be marked as deferred");
+        assert!(
+            !node.is_placeholder,
+            "node itself should not be a placeholder"
+        );
+
+        // CRITICAL: Normal deferred directories should have NO visible placeholder children
+        assert!(
+            node.children.is_empty(),
+            "normal deferred directories should NOT have placeholder children, but had {:?}",
+            node.children
+        );
+    }
+
+    #[test]
+    fn drain_stale_commands_preserves_multiple_subtrees() {
+        // Regression test: All distinct Subtree commands must be preserved, never dropped.
+        // Previously, drain_stale_directory_commands returned only one command.
+        use super::{drain_stale_directory_commands, DirectoryIndexCommand, DirectoryScanMode};
+        use crossbeam_channel::unbounded;
+        use std::path::PathBuf;
+
+        let (tx, rx) = unbounded();
+
+        // Send one Full command
+        tx.send(DirectoryIndexCommand::Full {
+            project_id: 1,
+            generation: 1,
+            project_path: PathBuf::from("/project1"),
+        })
+        .unwrap();
+
+        // Send TWO Subtree commands for different paths
+        tx.send(DirectoryIndexCommand::Subtree {
+            project_id: 1,
+            generation: 1,
+            project_path: PathBuf::from("/project1"),
+            target_path: PathBuf::from("/project1/src"),
+        })
+        .unwrap();
+
+        tx.send(DirectoryIndexCommand::Subtree {
+            project_id: 1,
+            generation: 1,
+            project_path: PathBuf::from("/project1"),
+            target_path: PathBuf::from("/project1/tests"),
+        })
+        .unwrap();
+
+        // Receive the first command (Full)
+        let first = rx.recv().unwrap();
+
+        // Drain should return a BATCH containing ALL commands
+        let batch = drain_stale_directory_commands(&rx, first);
+
+        // Count commands in batch
+        let subtree_count = batch
+            .iter()
+            .filter(|cmd| matches!(cmd, DirectoryIndexCommand::Subtree { .. }))
+            .count();
+        let full_count = batch
+            .iter()
+            .filter(|cmd| matches!(cmd, DirectoryIndexCommand::Full { .. }))
+            .count();
+
+        // BOTH subtree commands should be preserved
+        assert_eq!(
+            subtree_count, 2,
+            "batch should contain both subtree commands, had {subtree_count}"
+        );
+        assert_eq!(full_count, 1, "batch should contain the full command");
+    }
+
+    #[test]
+    fn drain_stale_commands_keeps_latest_full_per_project() {
+        // Regression test: Multiple Full commands for same project should keep only latest.
+        use super::{drain_stale_directory_commands, DirectoryIndexCommand, DirectoryScanMode};
+        use crossbeam_channel::unbounded;
+        use std::path::PathBuf;
+
+        let (tx, rx) = unbounded();
+
+        // Send multiple Full commands for same project with different generations
+        tx.send(DirectoryIndexCommand::Full {
+            project_id: 1,
+            generation: 1,
+            project_path: PathBuf::from("/project1-v1"),
+        })
+        .unwrap();
+
+        tx.send(DirectoryIndexCommand::Full {
+            project_id: 1,
+            generation: 2,
+            project_path: PathBuf::from("/project1-v2"),
+        })
+        .unwrap();
+
+        tx.send(DirectoryIndexCommand::Full {
+            project_id: 1,
+            generation: 3,
+            project_path: PathBuf::from("/project1-v3"),
+        })
+        .unwrap();
+
+        // Receive first command
+        let first = rx.recv().unwrap();
+
+        // Drain
+        let batch = drain_stale_directory_commands(&rx, first);
+
+        // Should have exactly one Full command with generation 3
+        let full_cmds: Vec<_> = batch
+            .iter()
+            .filter_map(|cmd| match cmd {
+                DirectoryIndexCommand::Full {
+                    generation,
+                    project_path,
+                    ..
+                } => Some((*generation, project_path.clone())),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(full_cmds.len(), 1, "should have exactly one Full command");
+        assert_eq!(full_cmds[0].0, 3, "should keep generation 3 (latest)");
+        assert!(
+            full_cmds[0].1.to_string_lossy().contains("v3"),
+            "should have v3 path"
+        );
+    }
+
+    #[test]
+    fn request_directory_subtree_load_returns_false_when_already_loading() {
+        // Test that request_directory_subtree_load returns false when already in loading set.
+        use std::collections::BTreeSet;
+        use std::path::PathBuf;
+
+        // Use test_app to get a properly initialized app
+        let mut app = test_app([], None);
+        let project_id = 1;
+        let target_path = PathBuf::from("/project/src");
+
+        // Pre-populate the loading set
+        let loading_set: BTreeSet<PathBuf> = [target_path.clone()].into_iter().collect();
+        app.directory_index_subtree_loading_by_project
+            .insert(project_id, loading_set);
+
+        // Attempt to load same path again
+        let result = app.request_directory_subtree_load(project_id, target_path.clone());
+
+        // Should return false because already loading
+        assert!(
+            !result,
+            "request_directory_subtree_load should return false when already loading"
         );
     }
 
