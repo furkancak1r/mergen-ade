@@ -1,5 +1,28 @@
 ### Known Issues & Fix Log
 
+#### Background rerun now interrupts non-AI long-running commands before replay {#background-rerun-interrupts-non-ai-commands}
+- Date: 2026-04-29
+- Context: Terminal Manager background terminal rerun/interrupt control
+- Error signature: `Rerun sends npm run dev:client into a running Vite process instead of stopping it first`
+- Symptoms/Impact:
+  1. Background terminal rerun showed the refresh icon for non-AI commands because no `AiCliStatus::Running` state was present.
+  2. Clicking rerun while `npm run dev:client` / Vite was still running wrote the command into the active process instead of cancelling it.
+  3. Users expected rerun to replace the previous background command, not append input to it.
+- Root cause:
+  1. The interrupt path was gated only on AI CLI running state.
+  2. Generic shell/PTY sessions do not expose a reliable foreground-command-running signal, so long-running dev servers were treated as idle by the Terminal Manager row.
+  3. `rerun_command_in_terminal()` replayed the stored command directly without sending Ctrl+C first.
+- Resolution:
+  - Updated background rerun to send `0x03` (Ctrl+C) before replaying the stored command.
+  - Kept replaying the full stored command bytes, preserving multi-line content and Unicode.
+  - Updated the idle rerun tooltip to say `Interrupt and rerun last command`.
+  - Updated regression coverage so background rerun verifies Ctrl+C is sent before the full stored command.
+- Prevent recurrence:
+  - Treat background rerun as replace-current-work semantics unless a separate stop-only AI running state is explicitly shown.
+  - Keep rerun tests checking both the Ctrl+C prefix and full raw command preservation.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test background_rerun_interrupts_then_sends_full_multiline_command`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: 2026-04-29 user report that rerun did not cancel a running `npm run dev:client` / Vite process.
+
 #### Terminal history and background rerun now preserve full raw submitted input {#terminal-history-preserves-full-raw-input}
 - Date: 2026-04-28
 - Context: Terminal Manager input history and background rerun functionality

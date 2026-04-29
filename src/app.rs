@@ -9763,9 +9763,11 @@ impl AdeApp {
             return;
         }
 
-        // Send the FULL command (not trimmed) to preserve multi-line content
-        // The stored command may contain newlines and Unicode that must be replayed exactly
-        let mut outbound = command.as_bytes().to_vec();
+        // Interrupt first so rerun replaces long-running commands like dev servers.
+        // Send the FULL command (not trimmed) to preserve multi-line content.
+        let mut outbound = Vec::with_capacity(command.len() + 2);
+        outbound.push(0x03);
+        outbound.extend_from_slice(command.as_bytes());
         outbound.push(b'\r');
         reset_terminal_prompt_scroll_anchor(terminal);
         terminal.runtime.send_bytes(outbound);
@@ -9783,7 +9785,7 @@ impl AdeApp {
         // The command is already in recent_inputs from the first run.
         terminal.dirty = true;
         ctx.request_repaint();
-        self.show_status_feedback(ctx, &format!("Rerunning: {}", trimmed));
+        self.show_status_feedback(ctx, &format!("Interrupting and rerunning: {}", trimmed));
     }
 
     fn next_custom_launcher_id(&self) -> String {
@@ -12496,7 +12498,7 @@ impl AdeApp {
                                 let tooltip = if is_running {
                                     "Stop running command (Ctrl+C)"
                                 } else if has_runnable_command {
-                                    "Rerun last command"
+                                    "Interrupt and rerun last command"
                                 } else {
                                     "No command to rerun"
                                 };
@@ -12511,7 +12513,7 @@ impl AdeApp {
                                     self.send_interrupt_to_terminal(ctx, terminal_data.id);
                                     action_clicked = true;
                                 } else if has_runnable_command {
-                                    // Rerun the most recent command
+                                    // Interrupt any current process, then rerun the most recent command.
                                     if let Some(cmd) = terminal_data.recent_inputs.front() {
                                         self.rerun_command_in_terminal(ctx, terminal_data.id, cmd);
                                         action_clicked = true;
@@ -30647,9 +30649,9 @@ mod tests {
     }
 
     #[test]
-    fn background_rerun_sends_full_multiline_command() {
-        // Regression: rerun used trimmed command, losing multi-line content.
-        // Now sends full stored command with newlines preserved.
+    fn background_rerun_interrupts_then_sends_full_multiline_command() {
+        // Regression: rerun sent the command into long-running processes.
+        // Now it sends Ctrl+C first while preserving the full stored command.
         let ctx = Context::default();
         let mut app = test_app(
             [(
@@ -30678,13 +30680,15 @@ mod tests {
         // Drain runtime commands to process the sent bytes
         capture.drain();
 
-        // Verify the FULL command was sent (including newlines), plus \r
+        // Verify Ctrl+C is sent first, then the FULL command (including newlines), plus \r.
         let sent = capture.bytes();
-        let expected = format!("{}\r", full_command);
+        let mut expected = vec![0x03];
+        expected.extend_from_slice(full_command.as_bytes());
+        expected.push(b'\r');
         assert_eq!(
-            String::from_utf8(sent).unwrap(),
+            sent,
             expected,
-            "rerun should send full multi-line command with newlines preserved"
+            "rerun should interrupt first, then send full multi-line command with newlines preserved"
         );
     }
 
