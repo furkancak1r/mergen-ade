@@ -1,5 +1,31 @@
 ### Known Issues & Fix Log
 
+#### OpenCode AI model configuration with switchable slots {#opencode-model-configuration-slots}
+- Date: 2026-04-29
+- Context: Settings UI / OpenCode integration
+- Error signature: `User requested ability to switch between Firepass K2.5 Turbo and GPT-5.5 Fast models with one click`
+- Symptoms/Impact:
+  1. Users wanted to quickly switch between different OpenCode build models without manually editing config files.
+  2. OpenCode's global config (~/.config/opencode/opencode.json) and runtime configs needed to be kept in sync.
+  3. Previously there was no UI in Mergen to manage OpenCode model settings.
+- Resolution:
+  - Added `OpenCodeModelConfig` struct to `models.rs` with two configurable slots (A and B) and an active slot selector.
+  - Created new `opencode_config.rs` module with:
+    - `patch_global_opencode_config()` to safely update global OpenCode config while preserving all other settings (JSONC-compatible parsing).
+    - `write_terminal_runtime_config()` to write per-terminal runtime configs with build model override.
+  - Added new `SettingsSection::OpenCode` to the Settings UI with:
+    - Two model input fields for Slot A and Slot B.
+    - "Use Slot A" / "Use Slot B" buttons that immediately switch the active model.
+    - Status display showing current active slot and model.
+  - Updated `TerminalRuntime::spawn()` to accept the active build model and write it to the runtime config.
+  - Slot A defaults to `fireworks-ai/accounts/fireworks/routers/kimi-k2p5-turbo`, Slot B defaults to `openai/gpt-5.5-fast`.
+- Prevent recurrence:
+  - JSONC comment stripping ensures we can parse OpenCode's JSONC config without errors.
+  - The patch function only modifies `mode.build.model`, preserving provider, tools, modes, and all other user settings.
+  - Runtime configs are written per-terminal so each new terminal gets the current active model.
+- Files/Commands touched: `src/models.rs`, `src/opencode_config.rs`, `src/app.rs` (SettingsSection, draw_settings_opencode_section, switch_opencode_build_model_slot), `src/terminal.rs`, `src/main.rs`, `src/config.rs` (legacy migration), `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request for one-click OpenCode model switching.
+
 #### Background rerun now interrupts non-AI long-running commands before replay {#background-rerun-interrupts-non-ai-commands}
 - Date: 2026-04-29
 - Context: Terminal Manager background terminal rerun/interrupt control

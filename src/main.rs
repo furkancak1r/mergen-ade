@@ -33,6 +33,7 @@ mod hooks;
 mod layout;
 mod models;
 mod opencode;
+mod opencode_config;
 mod opencode_hook_service;
 mod terminal;
 mod title;

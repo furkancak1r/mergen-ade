@@ -230,6 +230,7 @@ impl From<LegacyAppConfig> for AppConfig {
             launchers: default_launchers(),
             projects,
             ai_hooks: crate::hooks::AiHooksConfig::default(),
+            opencode: crate::models::OpenCodeModelConfig::default(),
         }
     }
 }

@@ -1793,6 +1793,7 @@ struct DirectoryIndexEvent {
 struct PendingConfigChanges {
     default_shell: bool,
     launchers: bool,
+    opencode: bool,
     ui: bool,
     projects: bool,
     selection: bool,
@@ -1803,14 +1804,16 @@ enum SettingsSection {
     #[default]
     General,
     Launchers,
+    OpenCode,
     SavedMessages,
     Diagnostics,
 }
 
 impl SettingsSection {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::General,
         Self::Launchers,
+        Self::OpenCode,
         Self::SavedMessages,
         Self::Diagnostics,
     ];
@@ -1819,6 +1822,7 @@ impl SettingsSection {
         match self {
             Self::General => "General",
             Self::Launchers => "Launchers",
+            Self::OpenCode => "OpenCode",
             Self::SavedMessages => "Saved Messages",
             Self::Diagnostics => "Diagnostics",
         }
@@ -1828,6 +1832,7 @@ impl SettingsSection {
         match self {
             Self::General => "General",
             Self::Launchers => "Launchers",
+            Self::OpenCode => "OpenCode",
             Self::SavedMessages => "Saved Messages",
             Self::Diagnostics => "Diagnostics",
         }
@@ -1838,6 +1843,9 @@ impl SettingsSection {
             Self::General => "Adjust terminal defaults and layout behavior for the workspace.",
             Self::Launchers => {
                 "Choose which foreground launchers appear and how each command is submitted."
+            }
+            Self::OpenCode => {
+                "Configure OpenCode AI model slots and switch between them instantly."
             }
             Self::SavedMessages => {
                 "Manage saved messages per project and send them to active terminals."
@@ -1852,6 +1860,7 @@ impl SettingsSection {
         match self {
             Self::General => AppIcon::Gear,
             Self::Launchers => AppIcon::TerminalWindow,
+            Self::OpenCode => AppIcon::ChatText,
             Self::SavedMessages => AppIcon::ChatText,
             Self::Diagnostics => AppIcon::Eye,
         }
@@ -1861,6 +1870,7 @@ impl SettingsSection {
         match self {
             Self::General => "settings-general-scroll",
             Self::Launchers => "settings-launchers-scroll",
+            Self::OpenCode => "settings-opencode-scroll",
             Self::SavedMessages => "settings-saved-messages-scroll",
             Self::Diagnostics => "settings-diagnostics-scroll",
         }
@@ -1890,6 +1900,7 @@ struct SettingsEditOutcome {
     ui_config_changed: bool,
     default_shell_changed: bool,
     launchers_changed: bool,
+    opencode_changed: bool,
     projects_changed: bool,
 }
 
@@ -1907,6 +1918,11 @@ impl SettingsEditOutcome {
     fn note_launchers_change(&mut self) {
         self.should_persist = true;
         self.launchers_changed = true;
+    }
+
+    fn note_opencode_change(&mut self) {
+        self.should_persist = true;
+        self.opencode_changed = true;
     }
 
     fn note_projects_change(&mut self) {
@@ -3027,6 +3043,10 @@ impl AdeApp {
         self.pending_config_changes.launchers = true;
     }
 
+    fn note_opencode_changed(&mut self) {
+        self.pending_config_changes.opencode = true;
+    }
+
     fn note_projects_changed(&mut self) {
         self.pending_config_changes.projects = true;
     }
@@ -3238,6 +3258,7 @@ impl AdeApp {
             .map(|_| Self::next_opencode_notify_inbox_token(terminal_id));
 
         let dimensions = TerminalDimensions::default();
+        let opencode_build_model = Some(self.config.opencode.active_build_model());
         let runtime = match TerminalRuntime::spawn(
             terminal_id,
             shell,
@@ -3253,6 +3274,7 @@ impl AdeApp {
             self.opencode_cli_runtime_dir.clone(),
             opencode_notify_inbox_token.clone(),
             self.opencode_hook_service.as_ref(),
+            opencode_build_model,
         ) {
             Ok(runtime) => runtime,
             Err(err) => {
@@ -10048,6 +10070,9 @@ impl AdeApp {
                             SettingsSection::Launchers => {
                                 self.draw_settings_launchers_section(ui, changes);
                             }
+                            SettingsSection::OpenCode => {
+                                self.draw_settings_opencode_section(ctx, ui, changes);
+                            }
                             SettingsSection::SavedMessages => {
                                 self.draw_settings_saved_messages_section(ctx, ui, changes);
                             }
@@ -10471,6 +10496,201 @@ impl AdeApp {
                 }
             },
         );
+    }
+
+    fn draw_settings_opencode_section(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut Ui,
+        changes: &mut SettingsEditOutcome,
+    ) {
+        let healthy_color = Color32::from_rgb(114, 209, 152);
+        let _warning_color = Color32::from_rgb(232, 184, 76);
+
+        ui.label(
+            RichText::new(
+                "Switch between two configured build models with a single click. Both global and runtime configs are updated.",
+            )
+            .small()
+            .color(TEXT_MUTED),
+        );
+        ui.add_space(12.0);
+
+        // Model Slot A Card
+        let is_slot_a_active = self.config.opencode.active_build_model_slot == "a";
+        show_settings_card(
+            ui,
+            AppIcon::Terminal,
+            "Build Model Slot A",
+            "First model configuration for build mode.",
+            |ui| {
+                ui.label(RichText::new("Model identifier").small().color(TEXT_MUTED));
+                let slot_a_response = with_settings_text_edit_chrome(ui, |ui| {
+                    ui.add_sized(
+                        [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
+                        egui::TextEdit::singleline(&mut self.config.opencode.build_model_slot_a)
+                            .hint_text(
+                                "e.g., fireworks-ai/accounts/fireworks/routers/kimi-k2p5-turbo",
+                            )
+                            .desired_width(ui.available_width().max(0.0)),
+                    )
+                });
+                if slot_a_response.changed() {
+                    changes.note_opencode_change();
+                }
+
+                ui.add_space(8.0);
+                let use_slot_a_label = if is_slot_a_active {
+                    "Currently Active (Slot A)"
+                } else {
+                    "Use Slot A"
+                };
+                let use_slot_a_color = if is_slot_a_active {
+                    healthy_color
+                } else {
+                    TEXT_PRIMARY
+                };
+
+                let use_slot_a_text = if is_slot_a_active {
+                    RichText::new(use_slot_a_label)
+                        .color(use_slot_a_color)
+                        .strong()
+                } else {
+                    RichText::new(use_slot_a_label).color(use_slot_a_color)
+                };
+
+                let use_slot_a_response = ui.add_sized(
+                    [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
+                    egui::Button::new(use_slot_a_text),
+                );
+                if use_slot_a_response.clicked() && !is_slot_a_active {
+                    self.switch_opencode_build_model_slot(ctx, "a");
+                    changes.note_opencode_change();
+                }
+            },
+        );
+        ui.add_space(12.0);
+
+        // Model Slot B Card
+        show_settings_card(
+            ui,
+            AppIcon::TerminalWindow,
+            "Build Model Slot B",
+            "Second model configuration for build mode.",
+            |ui| {
+                ui.label(RichText::new("Model identifier").small().color(TEXT_MUTED));
+                let slot_b_response = with_settings_text_edit_chrome(ui, |ui| {
+                    ui.add_sized(
+                        [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
+                        egui::TextEdit::singleline(&mut self.config.opencode.build_model_slot_b)
+                            .hint_text("e.g., openai/gpt-5.5-fast")
+                            .desired_width(ui.available_width().max(0.0)),
+                    )
+                });
+                if slot_b_response.changed() {
+                    changes.note_opencode_change();
+                }
+
+                ui.add_space(8.0);
+                let use_slot_b_label = if !is_slot_a_active {
+                    "Currently Active (Slot B)"
+                } else {
+                    "Use Slot B"
+                };
+                let use_slot_b_color = if !is_slot_a_active {
+                    healthy_color
+                } else {
+                    TEXT_PRIMARY
+                };
+                let is_slot_b_active = !is_slot_a_active;
+
+                let use_slot_b_text = if is_slot_b_active {
+                    RichText::new(use_slot_b_label)
+                        .color(use_slot_b_color)
+                        .strong()
+                } else {
+                    RichText::new(use_slot_b_label).color(use_slot_b_color)
+                };
+
+                let use_slot_b_response = ui.add_sized(
+                    [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
+                    egui::Button::new(use_slot_b_text),
+                );
+                if use_slot_b_response.clicked() && is_slot_a_active {
+                    self.switch_opencode_build_model_slot(ctx, "b");
+                    changes.note_opencode_change();
+                }
+            },
+        );
+        ui.add_space(12.0);
+
+        // Status card
+        show_settings_card(
+            ui,
+            AppIcon::Eye,
+            "Configuration Status",
+            "Current active model and last update status.",
+            |ui| {
+                let active_model = self.config.opencode.active_build_model();
+                let slot_label = if is_slot_a_active { "A" } else { "B" };
+                Self::draw_settings_diagnostic_row(ui, "Active Slot", slot_label, healthy_color);
+                Self::draw_settings_diagnostic_row(ui, "Active Model", active_model, TEXT_PRIMARY);
+            },
+        );
+    }
+
+    fn switch_opencode_build_model_slot(&mut self, ctx: &egui::Context, slot: &str) {
+        let opencode = &mut self.config.opencode;
+        let previous_slot = opencode.active_build_model_slot.clone();
+        opencode.set_active_slot(slot);
+
+        if previous_slot == opencode.active_build_model_slot {
+            return; // No change
+        }
+
+        let new_model = opencode.active_build_model().to_owned();
+
+        // Patch global OpenCode config
+        match crate::opencode_config::patch_global_opencode_config(&new_model) {
+            Ok(crate::opencode_config::OpenCodePatchOutcome::Updated) => {
+                self.show_status_feedback(
+                    ctx,
+                    format!("OpenCode build model set to: {}", new_model),
+                );
+            }
+            Ok(crate::opencode_config::OpenCodePatchOutcome::Unchanged) => {
+                self.show_status_feedback(
+                    ctx,
+                    format!("OpenCode build model already set to: {}", new_model),
+                );
+            }
+            Err(err) => {
+                self.status_line = format!("Failed to update global OpenCode config: {}", err);
+            }
+        }
+
+        // Update all active terminal runtime configs
+        self.update_opencode_runtime_configs_for_all_terminals(&new_model);
+    }
+
+    fn update_opencode_runtime_configs_for_all_terminals(&mut self, build_model: &str) {
+        let Some(ref opencode_runtime_dir) = self.opencode_cli_runtime_dir else {
+            return;
+        };
+
+        for (terminal_id, _terminal) in &self.terminals {
+            if let Err(err) = crate::opencode_config::write_terminal_runtime_config(
+                opencode_runtime_dir,
+                *terminal_id,
+                build_model,
+            ) {
+                log::warn!(
+                    "Failed to update OpenCode runtime config for terminal {}: {}",
+                    terminal_id,
+                    err
+                );
+            }
+        }
     }
 
     fn draw_settings_saved_messages_section(
@@ -13846,6 +14066,12 @@ impl AdeApp {
             if changes.launchers_changed {
                 self.note_launchers_changed();
             }
+            if changes.opencode_changed {
+                // OpenCode config changes are persisted via Mergen config
+                // The actual OpenCode config files are written immediately
+                // when switching slots, but we still need to save Mergen's config
+                self.note_opencode_changed();
+            }
             if changes.projects_changed {
                 self.note_projects_changed();
             }
@@ -14059,6 +14285,10 @@ fn recover_config_state(
 
     if pending_config_changes.launchers {
         config.launchers = current_config.launchers.clone();
+    }
+
+    if pending_config_changes.opencode {
+        config.opencode = current_config.opencode.clone();
     }
 
     config.ui.show_project_explorer = current_config.ui.show_project_explorer;

@@ -449,6 +449,46 @@ pub struct AppHistory {
     pub projects: std::collections::BTreeMap<String, TerminalInputHistory>,
 }
 
+/// OpenCode model configuration with two switchable slots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OpenCodeModelConfig {
+    /// Model name for build mode slot A.
+    pub build_model_slot_a: String,
+    /// Model name for build mode slot B.
+    pub build_model_slot_b: String,
+    /// Which slot is currently active ("a" or "b").
+    pub active_build_model_slot: String,
+}
+
+impl Default for OpenCodeModelConfig {
+    fn default() -> Self {
+        Self {
+            build_model_slot_a: "fireworks-ai/accounts/fireworks/routers/kimi-k2p5-turbo"
+                .to_owned(),
+            build_model_slot_b: "openai/gpt-5.5-fast".to_owned(),
+            active_build_model_slot: "a".to_owned(),
+        }
+    }
+}
+
+impl OpenCodeModelConfig {
+    /// Returns the currently active build model name.
+    pub fn active_build_model(&self) -> &str {
+        match self.active_build_model_slot.as_str() {
+            "b" => &self.build_model_slot_b,
+            _ => &self.build_model_slot_a,
+        }
+    }
+
+    /// Sets the active slot ("a" or "b").
+    pub fn set_active_slot(&mut self, slot: &str) {
+        if slot.eq_ignore_ascii_case("a") || slot.eq_ignore_ascii_case("b") {
+            self.active_build_model_slot = slot.to_ascii_lowercase();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -459,6 +499,8 @@ pub struct AppConfig {
     pub launchers: Vec<LauncherEntry>,
     pub projects: Vec<ProjectRecord>,
     pub ai_hooks: AiHooksConfig,
+    #[serde(default)]
+    pub opencode: OpenCodeModelConfig,
 }
 
 impl Default for AppConfig {
@@ -470,6 +512,7 @@ impl Default for AppConfig {
             launchers: default_launchers(),
             projects: Vec::new(),
             ai_hooks: AiHooksConfig::default(),
+            opencode: OpenCodeModelConfig::default(),
         }
     }
 }
@@ -478,7 +521,7 @@ impl Default for AppConfig {
 mod tests {
     use super::{
         default_launchers, normalize_launcher_entries, BuiltinLauncherKind, LauncherEntry,
-        LauncherIconKey, ShellKind,
+        LauncherIconKey, OpenCodeModelConfig, ShellKind,
     };
 
     #[test]
@@ -545,5 +588,60 @@ mod tests {
         assert_eq!(launchers[0].builtin, Some(BuiltinLauncherKind::OpenCode));
         assert_eq!(launchers[4].builtin, None);
         assert_eq!(launchers[4].display_name, "Custom");
+    }
+
+    #[test]
+    fn opencode_model_config_default_slot_a_is_kimi_k2p5_turbo() {
+        let config = OpenCodeModelConfig::default();
+        assert!(config.build_model_slot_a.contains("kimi-k2p5-turbo"));
+        assert!(config.build_model_slot_b.contains("gpt-5.5-fast"));
+        assert_eq!(config.active_build_model_slot, "a");
+    }
+
+    #[test]
+    fn opencode_model_config_active_build_model_returns_correct_slot() {
+        let mut config = OpenCodeModelConfig::default();
+        config.build_model_slot_a = "model-a".to_owned();
+        config.build_model_slot_b = "model-b".to_owned();
+
+        config.active_build_model_slot = "a".to_owned();
+        assert_eq!(config.active_build_model(), "model-a");
+
+        config.active_build_model_slot = "b".to_owned();
+        assert_eq!(config.active_build_model(), "model-b");
+
+        // Invalid slot defaults to a
+        config.active_build_model_slot = "invalid".to_owned();
+        assert_eq!(config.active_build_model(), "model-a");
+    }
+
+    #[test]
+    fn opencode_model_config_set_active_slot_validates_input() {
+        let mut config = OpenCodeModelConfig::default();
+
+        config.set_active_slot("a");
+        assert_eq!(config.active_build_model_slot, "a");
+
+        config.set_active_slot("B"); // uppercase should work
+        assert_eq!(config.active_build_model_slot, "b");
+
+        config.set_active_slot("invalid"); // should not change
+        assert_eq!(config.active_build_model_slot, "b");
+    }
+
+    #[test]
+    fn opencode_model_config_roundtrips_through_serde() {
+        let original = OpenCodeModelConfig {
+            build_model_slot_a: "custom/model-a".to_owned(),
+            build_model_slot_b: "custom/model-b".to_owned(),
+            active_build_model_slot: "b".to_owned(),
+        };
+
+        let serialized = serde_json::to_string(&original).unwrap();
+        let deserialized: OpenCodeModelConfig = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized.build_model_slot_a, "custom/model-a");
+        assert_eq!(deserialized.build_model_slot_b, "custom/model-b");
+        assert_eq!(deserialized.active_build_model_slot, "b");
     }
 }

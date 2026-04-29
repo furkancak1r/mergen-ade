@@ -20,6 +20,7 @@ use crate::hooks::{
     FACTORY_DROID_TERMINAL_ID_ENV_VAR,
 };
 use crate::opencode::opencode_env_pairs;
+use crate::opencode_config;
 use crate::opencode_hook_service::OpenCodeHookService;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -670,6 +671,7 @@ impl TerminalRuntime {
         opencode_runtime_dir: Option<PathBuf>,
         opencode_notify_inbox_token: Option<String>,
         opencode_hook_service: Option<&OpenCodeHookService>,
+        opencode_build_model: Option<&str>,
     ) -> io::Result<Self> {
         let pty_system = native_pty_system();
         let pty_pair = pty_system
@@ -723,6 +725,20 @@ impl TerminalRuntime {
                 )?;
                 for (name, value) in hook_service.build_pty_env(terminal_id, &config_dir) {
                     command.env(name, value);
+                }
+                // Also write the runtime config with the build model override
+                if let Some(build_model) = opencode_build_model {
+                    if let Err(err) = opencode_config::write_terminal_runtime_config(
+                        opencode_dir,
+                        terminal_id,
+                        build_model,
+                    ) {
+                        log::warn!(
+                            "Failed to write OpenCode runtime config for terminal {}: {}",
+                            terminal_id,
+                            err
+                        );
+                    }
                 }
             }
         }
