@@ -1,5 +1,63 @@
 ### Known Issues & Fix Log
 
+#### Terminal drag selection did not autoscroll near viewport edges {#terminal-selection-edge-autoscroll}
+- Date: 2026-04-29
+- Context: Terminal text selection and scroll behavior
+- Error signature: `Selecting terminal text and dragging mouse above/below viewport does not scroll`
+- Symptoms/Impact:
+  1. Selecting terminal text and dragging mouse outside the viewport did not scroll the content.
+  2. Selection could not extend beyond visible rows when dragging up or down.
+  3. User had to use mouse wheel to manually scroll while keeping selection active.
+- Root cause:
+  1. Terminal selection was manually implemented but did not apply ScrollArea autoscroll.
+  2. Pointer tracking only used `response.hover_pos()` which returns `None` when pointer leaves viewport.
+  3. `stick_to_bottom` behavior was active during selection and could override manual scroll.
+  4. No `request_repaint_after` was issued to continue scrolling while mouse was held.
+- Resolution:
+  - Added `terminal_selection_autoscroll_delta()` helper to calculate scroll delta based on pointer proximity to viewport edges.
+  - Added `terminal_selection_autoscroll_speed()` helper with min/max speed bounds (1-8 lines per frame).
+  - Modified pointer tracking to use global `input.pointer.interact_pos()` as fallback when selection drag is active.
+  - Added `selection_drag_in_progress` detection to continue tracking pointer outside viewport rect.
+  - Applied autoscroll via `ui.scroll_with_delta()` when dragging near viewport edges.
+  - Disabled `stick_to_bottom` while `selection_drag_active` is true.
+  - Added `request_repaint_after(Duration::from_millis(16))` to continue autoscrolling while mouse is held.
+  - Detaches prompt scroll anchor when autoscrolling (manual scroll behavior).
+  - Added regression tests: `terminal_selection_autoscroll_delta_returns_zero_inside_safe_zone`, `terminal_selection_autoscroll_delta_scrolls_up_near_top`, `terminal_selection_autoscroll_delta_scrolls_down_near_bottom`, `terminal_selection_autoscroll_delta_increases_with_distance`, `terminal_selection_autoscroll_speed_has_min_and_max_bounds`, `terminal_output_scroll_behavior_disables_stick_to_bottom_while_selecting`.
+- Prevent recurrence:
+  - Always provide global pointer position fallback when tracking selection outside viewport.
+  - Never let `stick_to_bottom` override manual/autoscroll operations.
+  - Request continuous repaint while autoscroll delta is non-zero.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report that selecting terminal text and dragging outside viewport does not scroll.
+
+#### File editor drag selection did not autoscroll near viewport edges {#file-editor-selection-edge-autoscroll}
+- Date: 2026-04-29
+- Context: Built-in file editor text selection inside long files
+- Error signature: `Selecting text in the editor and dragging above/below the viewport does not scroll`
+- Symptoms/Impact:
+  1. Text selection was limited to the currently visible editor rows.
+  2. Dragging the mouse above or below the editor viewport did not scroll the file.
+  3. Selection appeared frozen while the pointer was outside the visible text area.
+- Root cause:
+  1. The file editor used `TextEdit::multiline` inside a parent `ScrollArea`, but did not implement drag-selection autoscroll for that parent scroll area.
+  2. No runtime file-editor selection drag state was stored across frames.
+  3. Pointer tracking did not use global `input.pointer.interact_pos()` while dragging outside the viewport.
+  4. No repaint was requested while the pointer stayed near the viewport edge.
+- Resolution:
+  - Refactored autoscroll helpers to be generic: `selection_edge_autoscroll_delta()` and `selection_edge_autoscroll_speed()` for shared use between terminal and file editor.
+  - Added runtime file editor selection drag state (`FileEditorState.selection_drag_active`).
+  - Reset drag state on file open, close, and editor navigation (`open_file()`, `close()`, `navigate_back()`, `navigate_forward()`).
+  - Added `file_editor_selection_drag_active_after_input()` helper to compute drag state from input events.
+  - Updated `draw_file_editor()` to detect drag state, use global pointer position during drag, and apply `ui.scroll_with_delta()` when pointer is near viewport edges.
+  - Request repaint every 16ms while autoscrolling to ensure continuous scroll while mouse is held.
+  - Added regression tests: `file_editor_selection_drag_starts_on_drag_started`, `file_editor_selection_drag_stays_active_while_primary_down`, `file_editor_selection_drag_stops_on_mouse_release`, `file_editor_selection_drag_stops_on_drag_stopped`, `file_editor_open_file_resets_selection_drag_state`, `file_editor_close_resets_selection_drag_state`, `file_editor_navigate_back_resets_selection_drag_state`, `file_editor_navigate_forward_resets_selection_drag_state`, plus shared edge autoscroll tests.
+- Prevent recurrence:
+  - Any custom selection UI inside a `ScrollArea` must explicitly handle edge autoscroll.
+  - Do not rely on hover-only pointer state for drag workflows that can leave the viewport.
+  - Test drag-selection beyond visible bounds for long editor content.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User screenshot/report showing selection starting near the bottom of a long SQL file and failing to scroll upward while dragging.
+
 #### Deferred directory folders could stay as ellipsis after opening {#deferred-directory-ellipsis-stuck}
 - Date: 2026-04-29 (follow-up)
 - Context: Directory sidebar lazy subtree loading after shallow indexing

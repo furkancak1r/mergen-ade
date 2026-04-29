@@ -120,6 +120,12 @@ If `cargo` is not on PATH in PowerShell, use:
 - Preserve `FILE_EDITOR_INPUT_ID` focus isolation so editor input never routes to terminal capture.
 - Dirty detection must compare against `saved_text` (taking snapshots before mutable borrow to avoid borrow issues).
 - Add regression tests for scroll behavior with files longer than screen height.
+- Drag-selecting text in the file editor must continue tracking pointer position when the pointer leaves the editor viewport.
+- While file editor text selection drag is active near viewport edges, the editor `ScrollArea` must autoscroll with `ui.scroll_with_delta` and request repaint.
+- File editor selection drag state must be runtime-only (`FileEditorState.selection_drag_active`) and reset when opening, closing, or navigating between files.
+- Use `input.pointer.interact_pos()` as the pointer fallback for file editor drag autoscroll; do not rely only on `TextEdit` hover state.
+- Use shared `selection_edge_autoscroll_delta()` helper for consistent edge autoscroll behavior across terminal and file editor.
+- Add regression tests for file editor selection drag state transitions and edge autoscroll delta behavior.
 
 ## Terminal Input & History Invariants
 - `pending_line_for_title` is for title/AI command detection only; it clears on newlines (\r or \n) since titles should reflect only the current logical line. This buffer is capped to `TERMINAL_PENDING_LINE_MAX_CHARS` (512) to prevent unbounded growth.
@@ -128,6 +134,14 @@ If `cargo` is not on PATH in PowerShell, use:
 - Runtime `recent_inputs` (for tooltips and rerun) must be populated from the raw `history_line`, not the sanitized title candidate. This ensures multi-line prompts appear correctly in Terminal Manager and background rerun replays the full command.
 - Backspace pops from both buffers to keep them in sync for single-character deletion.
 - Always use char-safe truncation helpers (e.g., `capped_hover_text()`) for UI display of user text; never use byte-index slicing like `text[..60]` which can panic on multi-byte UTF-8 sequences or split Unicode code points.
+
+## Terminal Selection Guidelines
+- Drag selection must continue tracking pointer position even when the pointer leaves the terminal viewport.
+- While selection drag is active near the viewport edges, terminal output must autoscroll with `ui.scroll_with_delta` and request repaint.
+- Selection autoscroll must detach prompt scroll anchoring (`detach_terminal_prompt_scroll_anchor_on_manual_scroll`) and must not be overridden by `stick_to_bottom`.
+- Use `input.pointer.interact_pos()` as a fallback when `response.hover_pos()` returns `None` during selection drag.
+- Autoscroll speed must vary based on pointer distance from viewport edge (slower near edge, faster when farther away, clamped to 1-8 lines per frame).
+- Add regression tests for edge autoscroll direction, speed, and zero delta inside the safe zone.
 
 ## Concurrent AI Sessions
 - Sen (AI agent) çalışırken başka bir AI agent'ı da aynı anda çalışıyor olabilir.

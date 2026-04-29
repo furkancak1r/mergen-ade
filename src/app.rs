@@ -1110,6 +1110,9 @@ struct FileEditorState {
     forward_stack: Vec<OpenFileBuffer>,
     /// Maximum number of sessions to keep in history
     max_history: usize,
+    /// Whether text selection drag is currently active (for edge autoscroll).
+    /// Runtime-only state; not persisted across sessions.
+    selection_drag_active: bool,
 }
 
 impl Default for FileEditorState {
@@ -1119,6 +1122,7 @@ impl Default for FileEditorState {
             back_stack: Vec::new(),
             forward_stack: Vec::new(),
             max_history: 20,
+            selection_drag_active: false,
         }
     }
 }
@@ -1136,6 +1140,9 @@ impl FileEditorState {
 
         // Set new buffer as active
         self.active = Some(buffer);
+
+        // Reset selection drag state when opening a new file
+        self.selection_drag_active = false;
     }
 
     /// Navigate back to previous file.
@@ -1146,6 +1153,9 @@ impl FileEditorState {
                 self.push_to_forward_stack(current);
             }
             self.active = Some(previous);
+
+            // Reset selection drag state when navigating
+            self.selection_drag_active = false;
             true
         } else {
             false
@@ -1160,6 +1170,9 @@ impl FileEditorState {
                 self.push_to_back_stack(current);
             }
             self.active = Some(next);
+
+            // Reset selection drag state when navigating
+            self.selection_drag_active = false;
             true
         } else {
             false
@@ -1171,6 +1184,7 @@ impl FileEditorState {
         self.active = None;
         self.back_stack.clear();
         self.forward_stack.clear();
+        self.selection_drag_active = false;
     }
 
     /// Check if editor has an active file.
@@ -1200,6 +1214,22 @@ impl FileEditorState {
             self.forward_stack.remove(0);
         }
         self.forward_stack.push(buffer);
+    }
+}
+
+/// Pure helper to compute file editor selection drag state after handling input events.
+/// Returns the new drag active state based on current state and input events.
+fn file_editor_selection_drag_active_after_input(
+    was_active: bool,
+    primary_down: bool,
+    drag_started: bool,
+    dragged: bool,
+    drag_stopped: bool,
+) -> bool {
+    if drag_stopped || !primary_down {
+        false
+    } else {
+        was_active || drag_started || dragged
     }
 }
 
@@ -13798,14 +13828,69 @@ impl AdeApp {
                                 .desired_width(f32::INFINITY)
                                 .desired_rows(desired_rows);
 
-                            let response = egui::ScrollArea::vertical()
+                            // Get pointer input state before ScrollArea for drag detection
+                            let (primary_down, drag_started, dragged, drag_stopped) =
+                                ui.ctx().input(|input| {
+                                    (
+                                        input.pointer.primary_down(),
+                                        input.pointer.primary_pressed(),
+                                        input.pointer.is_moving(),
+                                        input.pointer.primary_released(),
+                                    )
+                                });
+
+                            // Update selection drag state
+                            let was_drag_active = self.file_editor.selection_drag_active;
+                            let is_drag_active = file_editor_selection_drag_active_after_input(
+                                was_drag_active,
+                                primary_down,
+                                drag_started,
+                                dragged,
+                                drag_stopped,
+                            );
+
+                            let scroll_area_output = egui::ScrollArea::vertical()
                                 .id_salt(FILE_EDITOR_SCROLL_ID)
                                 .max_height(editor_height - 24.0)
-                                .show(ui, |ui| ui.add(text_edit))
-                                .inner;
+                                .show(ui, |ui| {
+                                    let text_response = ui.add(text_edit);
+
+                                    // Apply edge autoscroll when selection drag is active
+                                    if is_drag_active {
+                                        let pointer_pos = ui
+                                            .ctx()
+                                            .input(|input| input.pointer.interact_pos());
+                                        let viewport_rect = ui.clip_rect();
+                                        let autoscroll_delta = selection_edge_autoscroll_delta(
+                                            pointer_pos,
+                                            viewport_rect,
+                                            line_height,
+                                        );
+
+                                        if autoscroll_delta != 0.0 {
+                                            // Apply scroll delta to the ScrollArea
+                                            // Positive delta = scroll up (content moves up)
+                                            // Negative delta = scroll down (content moves down)
+                                            ui.scroll_with_delta(egui::vec2(
+                                                0.0,
+                                                autoscroll_delta,
+                                            ));
+                                            // Request repaint to continue autoscrolling
+                                            // while mouse is held near the edge
+                                            ui.ctx().request_repaint_after(
+                                                Duration::from_millis(16),
+                                            );
+                                        }
+                                    }
+
+                                    text_response
+                                });
+
+                            // Update selection drag state for next frame
+                            self.file_editor.selection_drag_active = is_drag_active;
 
                             // Update dirty flag based on text changes
-                            if response.changed() {
+                            if scroll_area_output.inner.changed() {
                                 buffer.dirty = buffer.text != saved_text;
                             }
                         }
@@ -14392,12 +14477,25 @@ impl AdeApp {
                             primary_pressed_on_terminal,
                             terminal.pending_link_click.is_some(),
                         );
-                        let should_track_pointer =
-                            primary_drag_started || primary_dragged || should_resolve_link;
+                        // Selection drag tracks pointer even outside the viewport rect
+                        let selection_drag_in_progress =
+                            terminal.selection_drag_active && primary_down;
+                        let should_track_pointer = primary_drag_started
+                            || primary_dragged
+                            || selection_drag_in_progress
+                            || should_resolve_link;
                         if should_track_pointer || terminal.selection.is_some() {
                             Self::ensure_terminal_selection_snapshot(terminal);
                         }
-                        let pointer_pos = response.hover_pos().or(response.interact_pointer_pos());
+                        // Use global input position when selection drag is active to track outside viewport
+                        let pointer_pos = if selection_drag_in_progress {
+                            response
+                                .hover_pos()
+                                .or(response.interact_pointer_pos())
+                                .or_else(|| ui.ctx().input(|input| input.pointer.interact_pos()))
+                        } else {
+                            response.hover_pos().or(response.interact_pointer_pos())
+                        };
                         let pointer_point = should_track_pointer
                             .then(|| {
                                 terminal.selection_snapshot.as_ref().and_then(
@@ -14449,9 +14547,27 @@ impl AdeApp {
                                 Self::update_terminal_primary_drag(terminal, point);
                             }
                         }
-                        if primary_dragged {
+                        if primary_dragged || selection_drag_in_progress {
                             if let Some(point) = pointer_point {
                                 Self::update_terminal_primary_drag(terminal, point);
+                            }
+                        }
+                        // Apply autoscroll when dragging selection near viewport edges
+                        if selection_drag_in_progress {
+                            let autoscroll_delta = terminal_selection_autoscroll_delta(
+                                pointer_pos,
+                                viewport_rect,
+                                line_height,
+                            );
+                            if autoscroll_delta != 0.0 {
+                                // Detach prompt anchor when autoscrolling (manual scroll behavior)
+                                detach_terminal_prompt_scroll_anchor_on_manual_scroll(terminal);
+                                // Apply scroll delta to the ScrollArea
+                                // Positive delta = scroll up (content moves up)
+                                // Negative delta = scroll down (content moves down)
+                                ui.scroll_with_delta(egui::vec2(0.0, autoscroll_delta));
+                                // Request repaint to continue autoscrolling while mouse is held
+                                ui.ctx().request_repaint_after(Duration::from_millis(16));
                             }
                         }
                         if !primary_down {
@@ -19053,9 +19169,12 @@ fn terminal_output_scroll_behavior(
             .flatten()
     });
 
+    // Disable stick_to_bottom while selection drag is active to allow autoscroll
+    let selection_drag_active = terminal.selection_drag_active;
+
     TerminalOutputScrollBehavior {
         vertical_offset: prompt_anchor_offset,
-        stick_to_bottom: has_content && prompt_anchor_offset.is_none(),
+        stick_to_bottom: has_content && prompt_anchor_offset.is_none() && !selection_drag_active,
         keep_activation_alignment_pending: terminal.activation_scroll_align_pending && !has_content,
     }
 }
@@ -19131,6 +19250,98 @@ fn terminal_scroll_anchor_row(
             .or_else(|| snapshot.cursor.map(|cursor| cursor.y))
             .map(|row| row.min(max_row)),
     }
+}
+
+/// Calculates autoscroll delta for selection drag when pointer is near viewport edges.
+/// This is a generic helper used by both terminal and file editor selection workflows.
+///
+/// Returns positive value to scroll up (content moves up, revealing content above)
+/// or negative value to scroll down (content moves down, revealing content below).
+/// Returns 0.0 when pointer is in the safe zone.
+fn selection_edge_autoscroll_delta(
+    pointer_pos: Option<egui::Pos2>,
+    viewport_rect: egui::Rect,
+    line_height: f32,
+) -> f32 {
+    let Some(pos) = pointer_pos else {
+        return 0.0;
+    };
+
+    if !line_height.is_finite() || line_height <= 0.0 {
+        return 0.0;
+    }
+
+    // Safety zone margin from viewport edges
+    const SAFETY_ZONE_LINES: f32 = 1.5;
+    let safety_margin = line_height * SAFETY_ZONE_LINES;
+
+    // Check if pointer is above the top edge (outside viewport)
+    let distance_above = viewport_rect.min.y - pos.y;
+    if distance_above > 0.0 {
+        // Pointer is above the viewport - scroll up (positive delta)
+        let proximity = safety_margin + distance_above;
+        return selection_edge_autoscroll_speed(proximity, line_height);
+    }
+
+    // Check if pointer is near the top edge (within safety margin inside viewport)
+    let distance_from_top = pos.y - viewport_rect.min.y;
+    if distance_from_top < safety_margin {
+        // Pointer is near the top edge inside viewport - scroll up (positive delta)
+        let proximity = safety_margin - distance_from_top;
+        return selection_edge_autoscroll_speed(proximity, line_height);
+    }
+
+    // Check if pointer is below the bottom edge (outside viewport)
+    let distance_below = pos.y - viewport_rect.max.y;
+    if distance_below > 0.0 {
+        // Pointer is below the viewport - scroll down (negative delta)
+        let proximity = safety_margin + distance_below;
+        return -selection_edge_autoscroll_speed(proximity, line_height);
+    }
+
+    // Check if pointer is near the bottom edge (within safety margin inside viewport)
+    let distance_from_bottom = viewport_rect.max.y - pos.y;
+    if distance_from_bottom < safety_margin {
+        // Pointer is near the bottom edge inside viewport - scroll down (negative delta)
+        let proximity = safety_margin - distance_from_bottom;
+        return -selection_edge_autoscroll_speed(proximity, line_height);
+    }
+
+    // Pointer is in the safe zone (neither near top nor bottom)
+    0.0
+}
+
+/// Calculates autoscroll speed based on pointer proximity to viewport edge.
+/// Returns speed in pixels per frame (to be applied via scroll_with_delta).
+/// Distance is measured from the edge of the safety zone outward.
+fn selection_edge_autoscroll_speed(proximity: f32, line_height: f32) -> f32 {
+    // Minimum speed: 1 line per frame
+    let min_speed = line_height;
+    // Maximum speed: 8 lines per frame
+    let max_speed = line_height * 8.0;
+
+    // Calculate speed factor based on proximity (pixels beyond safety zone)
+    // Starts slow at the edge, gets faster as pointer moves further away
+    let speed_factor = (proximity / line_height).clamp(0.0, 6.0);
+
+    // Interpolate between min and max speed
+    let speed = min_speed + (max_speed - min_speed) * (speed_factor / 6.0);
+
+    speed.clamp(min_speed, max_speed)
+}
+
+/// Helper to calculate terminal selection autoscroll delta (wrapper for generic helper).
+fn terminal_selection_autoscroll_delta(
+    pointer_pos: Option<egui::Pos2>,
+    viewport_rect: egui::Rect,
+    line_height: f32,
+) -> f32 {
+    selection_edge_autoscroll_delta(pointer_pos, viewport_rect, line_height)
+}
+
+/// Helper to calculate terminal selection autoscroll speed (wrapper for generic helper).
+fn terminal_selection_autoscroll_speed(proximity: f32, line_height: f32) -> f32 {
+    selection_edge_autoscroll_speed(proximity, line_height)
 }
 
 fn terminal_last_non_empty_row(snapshot: &TerminalSnapshot) -> Option<usize> {
@@ -19551,6 +19762,7 @@ mod tests {
         configure_terminal_font_family, count_text_line_bytes, cursor_hidden_by_row_filter,
         deduplicated_recent_inputs, default_app_open_command,
         detach_terminal_prompt_scroll_anchor_on_manual_scroll, draw_ai_badge,
+        file_editor_selection_drag_active_after_input,
         draw_terminal_manager_title_and_diff_summary, draw_terminal_status_badges,
         force_terminal_pane_width, install_terminal_font_family, launcher_icon_for_ai_tool,
         merge_source_control_refresh_result, next_active_terminal_after_close,
@@ -19573,7 +19785,9 @@ mod tests {
         terminal_manager_diff_summary_model, terminal_manager_diff_summary_visual,
         terminal_manager_row_chrome, terminal_manager_row_widths, terminal_output_scroll_behavior,
         terminal_output_surface_size, terminal_output_viewport_size,
-        terminal_secondary_click_action, terminal_selection_point_from_pointer,
+        selection_edge_autoscroll_delta, selection_edge_autoscroll_speed,
+        terminal_secondary_click_action, terminal_selection_autoscroll_delta,
+        terminal_selection_autoscroll_speed, terminal_selection_point_from_pointer,
         terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
         with_minimal_button_chrome, with_settings_text_edit_chrome, AdeApp, AiBadgeModel,
         AiBadgeVisual, CodexAttentionReason, CodexCliStatusSource, CodexTransportStatus,
@@ -23719,6 +23933,154 @@ mod tests {
         assert_eq!(behavior.vertical_offset, Some(40.0));
         assert!(!behavior.stick_to_bottom);
         assert!(!behavior.keep_activation_alignment_pending);
+    }
+
+    #[test]
+    fn terminal_output_scroll_behavior_disables_stick_to_bottom_while_selecting() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.render_cache = TerminalSnapshot {
+            lines: vec![TerminalStyledLine::default(); 20],
+            cursor: Some(TerminalCursor {
+                x: 0,
+                y: 10,
+                shape: TerminalCursorShape::Block,
+                blinking: false,
+            }),
+            cursor_line: None,
+        };
+        terminal.selection_drag_active = true;
+
+        let behavior = terminal_output_scroll_behavior(&terminal, 10.0, 50.0);
+
+        assert!(!behavior.stick_to_bottom);
+        assert!(!behavior.keep_activation_alignment_pending);
+    }
+
+    #[test]
+    fn terminal_selection_autoscroll_delta_returns_zero_inside_safe_zone() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(200.0, 150.0));
+        let line_height = 10.0;
+        let safety_margin = line_height * 1.5; // 15.0
+
+        // Pointer well inside the viewport, past the top safety zone
+        // y = 116 is 16 pixels from top edge, which is > 15 (safety_margin)
+        let delta = terminal_selection_autoscroll_delta(
+            Some(egui::pos2(50.0, 100.0 + safety_margin + 1.0)),
+            viewport,
+            line_height,
+        );
+        assert_eq!(delta, 0.0);
+
+        // Pointer at center
+        let delta = terminal_selection_autoscroll_delta(
+            Some(egui::pos2(50.0, 175.0)),
+            viewport,
+            line_height,
+        );
+        assert_eq!(delta, 0.0);
+
+        // Pointer well inside the viewport, past the bottom safety zone
+        // viewport.max.y = 250, safety_margin = 15, so y = 234 is 16 pixels from bottom
+        let delta = terminal_selection_autoscroll_delta(
+            Some(egui::pos2(50.0, 250.0 - safety_margin - 1.0)),
+            viewport,
+            line_height,
+        );
+        assert_eq!(delta, 0.0);
+    }
+
+    #[test]
+    fn terminal_selection_autoscroll_delta_scrolls_up_near_top() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(200.0, 150.0));
+        let line_height = 10.0;
+
+        // Pointer just above the viewport
+        let delta = terminal_selection_autoscroll_delta(
+            Some(egui::pos2(50.0, 95.0)),
+            viewport,
+            line_height,
+        );
+        assert!(delta > 0.0, "Expected positive delta to scroll up");
+    }
+
+    #[test]
+    fn terminal_selection_autoscroll_delta_scrolls_down_near_bottom() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(200.0, 150.0));
+        let line_height = 10.0;
+
+        // Pointer just below the viewport
+        let delta = terminal_selection_autoscroll_delta(
+            Some(egui::pos2(50.0, 260.0)),
+            viewport,
+            line_height,
+        );
+        assert!(delta < 0.0, "Expected negative delta to scroll down");
+    }
+
+    #[test]
+    fn terminal_selection_autoscroll_delta_increases_with_distance() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(200.0, 150.0));
+        let line_height = 10.0;
+
+        // Pointer far above the viewport
+        let far_delta = terminal_selection_autoscroll_delta(
+            Some(egui::pos2(50.0, 50.0)),
+            viewport,
+            line_height,
+        );
+
+        // Pointer near the viewport edge
+        let near_delta = terminal_selection_autoscroll_delta(
+            Some(egui::pos2(50.0, 95.0)),
+            viewport,
+            line_height,
+        );
+
+        assert!(
+            far_delta > near_delta,
+            "Far pointer should produce larger scroll speed"
+        );
+    }
+
+    #[test]
+    fn terminal_selection_autoscroll_delta_returns_zero_for_none_pointer() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(200.0, 150.0));
+        let line_height = 10.0;
+
+        let delta = terminal_selection_autoscroll_delta(None, viewport, line_height);
+        assert_eq!(delta, 0.0);
+    }
+
+    #[test]
+    fn terminal_selection_autoscroll_delta_returns_zero_for_invalid_line_height() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(200.0, 150.0));
+
+        let delta = terminal_selection_autoscroll_delta(
+            Some(egui::pos2(50.0, 50.0)),
+            viewport,
+            -1.0,
+        );
+        assert_eq!(delta, 0.0);
+
+        let delta = terminal_selection_autoscroll_delta(
+            Some(egui::pos2(50.0, 50.0)),
+            viewport,
+            0.0,
+        );
+        assert_eq!(delta, 0.0);
+    }
+
+    #[test]
+    fn terminal_selection_autoscroll_speed_has_min_and_max_bounds() {
+        let line_height = 10.0;
+
+        // Very close to edge (within safety margin)
+        let slow = terminal_selection_autoscroll_speed(5.0, line_height);
+        assert!(slow >= line_height, "Minimum speed should be line_height");
+
+        // Far from edge
+        let fast = terminal_selection_autoscroll_speed(100.0, line_height);
+        assert!(fast <= line_height * 8.0, "Maximum speed should be 8x line_height");
     }
 
     #[test]
@@ -32677,6 +33039,354 @@ mod tests {
         // Test that FILE_EDITOR_SCROLL_ID is a stable constant for scroll persistence
         use super::FILE_EDITOR_SCROLL_ID;
         assert_eq!(FILE_EDITOR_SCROLL_ID, "file-editor-scroll");
+    }
+
+    #[test]
+    fn file_editor_selection_drag_starts_on_drag_started() {
+        // Regression test: selection drag should start when drag begins
+        let was_active = false;
+        let primary_down = true;
+        let drag_started = true;
+        let dragged = false;
+        let drag_stopped = false;
+
+        let result = file_editor_selection_drag_active_after_input(
+            was_active,
+            primary_down,
+            drag_started,
+            dragged,
+            drag_stopped,
+        );
+
+        assert!(result, "Selection drag should start when drag_started is true");
+    }
+
+    #[test]
+    fn file_editor_selection_drag_stays_active_while_primary_down() {
+        // Regression test: selection drag should stay active while mouse is held
+        let was_active = true;
+        let primary_down = true;
+        let drag_started = false;
+        let dragged = true;
+        let drag_stopped = false;
+
+        let result = file_editor_selection_drag_active_after_input(
+            was_active,
+            primary_down,
+            drag_started,
+            dragged,
+            drag_stopped,
+        );
+
+        assert!(result, "Selection drag should stay active while primary_down is true");
+    }
+
+    #[test]
+    fn file_editor_selection_drag_stops_on_mouse_release() {
+        // Regression test: selection drag should stop when mouse is released
+        let was_active = true;
+        let primary_down = false; // Mouse released
+        let drag_started = false;
+        let dragged = false;
+        let drag_stopped = false;
+
+        let result = file_editor_selection_drag_active_after_input(
+            was_active,
+            primary_down,
+            drag_started,
+            dragged,
+            drag_stopped,
+        );
+
+        assert!(
+            !result,
+            "Selection drag should stop when primary_down is false"
+        );
+    }
+
+    #[test]
+    fn file_editor_selection_drag_stops_on_drag_stopped() {
+        // Regression test: selection drag should stop when drag_stopped event fires
+        let was_active = true;
+        let primary_down = true;
+        let drag_started = false;
+        let dragged = false;
+        let drag_stopped = true;
+
+        let result = file_editor_selection_drag_active_after_input(
+            was_active,
+            primary_down,
+            drag_started,
+            dragged,
+            drag_stopped,
+        );
+
+        assert!(
+            !result,
+            "Selection drag should stop when drag_stopped is true"
+        );
+    }
+
+    #[test]
+    fn file_editor_open_file_resets_selection_drag_state() {
+        // Regression test: opening a new file should reset drag state
+        use super::OpenFileBuffer;
+        use std::path::PathBuf;
+
+        let mut editor_state = super::FileEditorState::default();
+        // Simulate an active drag
+        editor_state.selection_drag_active = true;
+
+        // Open a new file
+        let buffer = OpenFileBuffer::new(
+            1,
+            PathBuf::from("/test/file.rs"),
+            "content".to_owned(),
+            "file.rs".to_owned(),
+        );
+        editor_state.open_file(buffer);
+
+        assert!(
+            !editor_state.selection_drag_active,
+            "Selection drag should be reset when opening a new file"
+        );
+    }
+
+    #[test]
+    fn file_editor_close_resets_selection_drag_state() {
+        // Regression test: closing editor should reset drag state
+        use super::OpenFileBuffer;
+        use std::path::PathBuf;
+
+        let mut editor_state = super::FileEditorState::default();
+
+        // Open a file first
+        let buffer = OpenFileBuffer::new(
+            1,
+            PathBuf::from("/test/file.rs"),
+            "content".to_owned(),
+            "file.rs".to_owned(),
+        );
+        editor_state.open_file(buffer);
+
+        // Simulate an active drag
+        editor_state.selection_drag_active = true;
+
+        // Close the editor
+        editor_state.close();
+
+        assert!(
+            !editor_state.selection_drag_active,
+            "Selection drag should be reset when closing editor"
+        );
+    }
+
+    #[test]
+    fn file_editor_navigate_back_resets_selection_drag_state() {
+        // Regression test: navigating back should reset drag state
+        use super::OpenFileBuffer;
+        use std::path::PathBuf;
+
+        let mut editor_state = super::FileEditorState::default();
+
+        // Open two files to have something in back stack
+        let buffer1 = OpenFileBuffer::new(
+            1,
+            PathBuf::from("/test/file1.rs"),
+            "content1".to_owned(),
+            "file1.rs".to_owned(),
+        );
+        editor_state.open_file(buffer1);
+
+        let buffer2 = OpenFileBuffer::new(
+            1,
+            PathBuf::from("/test/file2.rs"),
+            "content2".to_owned(),
+            "file2.rs".to_owned(),
+        );
+        editor_state.open_file(buffer2);
+
+        // Simulate an active drag
+        editor_state.selection_drag_active = true;
+
+        // Navigate back
+        editor_state.navigate_back();
+
+        assert!(
+            !editor_state.selection_drag_active,
+            "Selection drag should be reset when navigating back"
+        );
+    }
+
+    #[test]
+    fn file_editor_navigate_forward_resets_selection_drag_state() {
+        // Regression test: navigating forward should reset drag state
+        use super::OpenFileBuffer;
+        use std::path::PathBuf;
+
+        let mut editor_state = super::FileEditorState::default();
+
+        // Open two files and navigate back to have something in forward stack
+        let buffer1 = OpenFileBuffer::new(
+            1,
+            PathBuf::from("/test/file1.rs"),
+            "content1".to_owned(),
+            "file1.rs".to_owned(),
+        );
+        editor_state.open_file(buffer1);
+
+        let buffer2 = OpenFileBuffer::new(
+            1,
+            PathBuf::from("/test/file2.rs"),
+            "content2".to_owned(),
+            "file2.rs".to_owned(),
+        );
+        editor_state.open_file(buffer2);
+
+        editor_state.navigate_back(); // Now buffer2 is in forward stack
+
+        // Simulate an active drag
+        editor_state.selection_drag_active = true;
+
+        // Navigate forward
+        editor_state.navigate_forward();
+
+        assert!(
+            !editor_state.selection_drag_active,
+            "Selection drag should be reset when navigating forward"
+        );
+    }
+
+    #[test]
+    fn selection_edge_autoscroll_delta_returns_zero_inside_safe_zone() {
+        // Regression test: selection edge autoscroll should return zero when pointer is in safe zone
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(200.0, 150.0));
+        let line_height = 10.0;
+        let safety_margin = line_height * 1.5; // 15.0
+
+        // Pointer well inside the viewport, past the top safety zone
+        let delta = selection_edge_autoscroll_delta(
+            Some(egui::pos2(50.0, 100.0 + safety_margin + 1.0)),
+            viewport,
+            line_height,
+        );
+        assert_eq!(delta, 0.0);
+
+        // Pointer at center
+        let delta = selection_edge_autoscroll_delta(
+            Some(egui::pos2(50.0, 175.0)),
+            viewport,
+            line_height,
+        );
+        assert_eq!(delta, 0.0);
+
+        // Pointer well inside the viewport, past the bottom safety zone
+        let delta = selection_edge_autoscroll_delta(
+            Some(egui::pos2(50.0, 250.0 - safety_margin - 1.0)),
+            viewport,
+            line_height,
+        );
+        assert_eq!(delta, 0.0);
+    }
+
+    #[test]
+    fn selection_edge_autoscroll_delta_scrolls_to_previous_content_near_top() {
+        // Regression test: near top edge should scroll to previous content (positive delta)
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(200.0, 150.0));
+        let line_height = 10.0;
+
+        // Pointer just above the viewport
+        let delta = selection_edge_autoscroll_delta(
+            Some(egui::pos2(50.0, 95.0)),
+            viewport,
+            line_height,
+        );
+        assert!(delta > 0.0, "Expected positive delta to scroll to previous content");
+    }
+
+    #[test]
+    fn selection_edge_autoscroll_delta_scrolls_to_next_content_near_bottom() {
+        // Regression test: near bottom edge should scroll to next content (negative delta)
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(200.0, 150.0));
+        let line_height = 10.0;
+
+        // Pointer just below the viewport
+        let delta = selection_edge_autoscroll_delta(
+            Some(egui::pos2(50.0, 260.0)),
+            viewport,
+            line_height,
+        );
+        assert!(delta < 0.0, "Expected negative delta to scroll to next content");
+    }
+
+    #[test]
+    fn selection_edge_autoscroll_delta_increases_with_distance() {
+        // Regression test: autoscroll speed should increase with pointer distance from edge
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(200.0, 150.0));
+        let line_height = 10.0;
+
+        // Pointer far above the viewport
+        let far_delta = selection_edge_autoscroll_delta(
+            Some(egui::pos2(50.0, 50.0)),
+            viewport,
+            line_height,
+        );
+
+        // Pointer near the viewport edge
+        let near_delta = selection_edge_autoscroll_delta(
+            Some(egui::pos2(50.0, 95.0)),
+            viewport,
+            line_height,
+        );
+
+        assert!(
+            far_delta > near_delta,
+            "Far pointer should produce larger scroll speed"
+        );
+    }
+
+    #[test]
+    fn selection_edge_autoscroll_delta_returns_zero_for_none_pointer() {
+        // Regression test: should return zero when pointer is None
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(200.0, 150.0));
+        let line_height = 10.0;
+
+        let delta = selection_edge_autoscroll_delta(None, viewport, line_height);
+        assert_eq!(delta, 0.0);
+    }
+
+    #[test]
+    fn selection_edge_autoscroll_delta_returns_zero_for_invalid_line_height() {
+        // Regression test: should return zero for invalid line height
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(200.0, 150.0));
+
+        let delta = selection_edge_autoscroll_delta(
+            Some(egui::pos2(50.0, 50.0)),
+            viewport,
+            -1.0,
+        );
+        assert_eq!(delta, 0.0);
+
+        let delta = selection_edge_autoscroll_delta(
+            Some(egui::pos2(50.0, 50.0)),
+            viewport,
+            0.0,
+        );
+        assert_eq!(delta, 0.0);
+    }
+
+    #[test]
+    fn selection_edge_autoscroll_speed_has_min_and_max_bounds() {
+        // Regression test: speed should be clamped between min and max
+        let line_height = 10.0;
+
+        // Very close to edge (within safety margin)
+        let slow = selection_edge_autoscroll_speed(5.0, line_height);
+        assert!(slow >= line_height, "Minimum speed should be line_height");
+
+        // Far from edge
+        let fast = selection_edge_autoscroll_speed(100.0, line_height);
+        assert!(fast <= line_height * 8.0, "Maximum speed should be 8x line_height");
     }
 
     #[test]
