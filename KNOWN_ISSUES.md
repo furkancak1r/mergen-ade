@@ -13,14 +13,18 @@
   2. Generic shell/PTY sessions do not expose a reliable foreground-command-running signal, so long-running dev servers were treated as idle by the Terminal Manager row.
   3. `rerun_command_in_terminal()` replayed the stored command directly without sending Ctrl+C first.
 - Resolution:
-  - Updated background rerun to send `0x03` (Ctrl+C) before replaying the stored command.
+  - Changed background rerun to a two-phase process:
+    1. **Phase 1 (immediate):** Send `0x03` (Ctrl+C) and store command in `pending_rerun_command` with timestamp.
+    2. **Phase 2 (after settle):** After `PENDING_RERUN_SETTLE_MS` (150ms), send the full stored command followed by Enter.
+  - Added `process_pending_reruns()` helper in `update()` loop to handle phase 2 after settle duration.
   - Kept replaying the full stored command bytes, preserving multi-line content and Unicode.
   - Updated the idle rerun tooltip to say `Interrupt and rerun last command`.
-  - Updated regression coverage so background rerun verifies Ctrl+C is sent before the full stored command.
+  - Updated regression test `background_rerun_two_phase_interrupt_then_command` to verify both phases separately.
 - Prevent recurrence:
   - Treat background rerun as replace-current-work semantics unless a separate stop-only AI running state is explicitly shown.
-  - Keep rerun tests checking both the Ctrl+C prefix and full raw command preservation.
-- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test background_rerun_interrupts_then_sends_full_multiline_command`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+  - Keep rerun tests checking both phases: Ctrl+C first, then full command after settle.
+  - Ensure single-buffer writes are never used for Ctrl+C+command; always use two-phase with pending state.
+- Files/Commands touched: `src/app.rs` (TerminalEntry, rerun_command_in_terminal, process_pending_reruns, update, PENDING_RERUN_SETTLE_MS), `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test background_rerun_two_phase_interrupt_then_command`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: 2026-04-29 user report that rerun did not cancel a running `npm run dev:client` / Vite process.
 
 #### Terminal history and background rerun now preserve full raw submitted input {#terminal-history-preserves-full-raw-input}

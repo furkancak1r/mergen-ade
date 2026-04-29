@@ -108,6 +108,9 @@ const CURSOR_UNDERLINE_HEIGHT_PX: f32 = 2.0;
 const TERMINAL_HELD_KEY_REPEAT_FALLBACK_INITIAL_DELAY_SECS: f64 = 0.5;
 const TERMINAL_HELD_KEY_REPEAT_FALLBACK_INTERVAL_SECS: f64 = 1.0 / 30.0;
 const TERMINAL_HELD_KEY_REPEAT_MAX_SYNTHETIC_EVENTS_PER_FRAME: usize = 16;
+/// Settle duration before sending the command phase of a background rerun.
+/// Ensures Ctrl+C has been processed by the shell/PTY before the command is typed.
+const PENDING_RERUN_SETTLE_MS: u64 = 150;
 
 // Embedded Nerd Font for terminal icon support (Windows-only)
 #[cfg(target_os = "windows")]
@@ -1097,6 +1100,11 @@ struct TerminalEntry {
     /// True when user needs to acknowledge attention (idle/permission after working)
     /// Cleared on terminal focus or keyboard input
     opencode_attention_pending: bool,
+    /// Pending background rerun: command to replay after Ctrl+C settle.
+    /// Stores the full raw command (including multi-line) to be sent in a second phase.
+    pending_rerun_command: Option<String>,
+    /// When the pending rerun was queued; used for settle timing before sending command.
+    pending_rerun_since: Option<Instant>,
     /// When we launched Claude (explicit claim of ownership)
     /// Cleared when Claude session is confirmed active via title/hook
     claude_launch_pending_since: Option<Instant>,
@@ -3334,6 +3342,8 @@ impl AdeApp {
             opencode_last_hook_attention_at: None,
             opencode_last_turn_complete_at: None,
             opencode_attention_pending: false,
+            pending_rerun_command: None,
+            pending_rerun_since: None,
             // Claude Code state (Orca-compatible title-based detection)
             claude_launch_pending_since: None,
             claude_session_active: false,
@@ -9748,7 +9758,7 @@ impl AdeApp {
 
     /// Rerun a command in a terminal (used by background terminal rerun button).
     /// Does not record to persistent history (background is runtime-only).
-    /// Sends the full stored command including multi-line content and Unicode.
+    /// Two-phase send: Ctrl+C now, command after settle via pending_rerun_command.
     fn rerun_command_in_terminal(&mut self, ctx: &egui::Context, terminal_id: u64, command: &str) {
         let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
             return;
@@ -9763,29 +9773,64 @@ impl AdeApp {
             return;
         }
 
-        // Interrupt first so rerun replaces long-running commands like dev servers.
-        // Send the FULL command (not trimmed) to preserve multi-line content.
-        let mut outbound = Vec::with_capacity(command.len() + 2);
-        outbound.push(0x03);
-        outbound.extend_from_slice(command.as_bytes());
-        outbound.push(b'\r');
-        reset_terminal_prompt_scroll_anchor(terminal);
-        terminal.runtime.send_bytes(outbound);
-        Self::clear_terminal_selection(terminal);
-        terminal.pending_line_for_title.clear();
-        terminal.pending_input_for_history.clear();
-        Self::append_pending_line(&mut terminal.pending_line_for_title, trimmed);
-        let line = std::mem::take(&mut terminal.pending_line_for_title);
-        if let Some(sanitized) = terminal_title_candidate(&line) {
-            terminal.full_title = sanitized.clone();
-            terminal.title = update_terminal_title(&sanitized, terminal.id as usize, TITLE_MAX_LEN);
-        }
-        // Note: We intentionally do NOT call record_input_history here because
-        // background terminals use runtime-only history (not persisted).
-        // The command is already in recent_inputs from the first run.
+        // Phase 1: send interrupt (Ctrl+C) immediately.
+        // Phase 2: command will be sent after settle in process_pending_reruns().
+        terminal.runtime.send_bytes(vec![0x03]);
+        terminal.pending_rerun_command = Some(command.to_owned());
+        terminal.pending_rerun_since = Some(Instant::now());
         terminal.dirty = true;
         ctx.request_repaint();
-        self.show_status_feedback(ctx, &format!("Interrupting and rerunning: {}", trimmed));
+        self.show_status_feedback(ctx, &format!("Interrupting, will rerun: {}", trimmed));
+    }
+
+    /// Process pending reruns: after settle duration, send the stored command.
+    fn process_pending_reruns(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let settle_duration = Duration::from_millis(PENDING_RERUN_SETTLE_MS);
+
+        // Collect pending reruns to process (avoid borrow issues with self.show_status_feedback).
+        let mut to_process: Vec<(u64, String)> = Vec::new();
+        for terminal in self.terminals.values_mut() {
+            if let Some(ref command) = terminal.pending_rerun_command {
+                let should_send = terminal
+                    .pending_rerun_since
+                    .is_some_and(|since| now.duration_since(since) >= settle_duration);
+
+                if should_send {
+                    let trimmed = command.trim();
+                    if !trimmed.is_empty() && !terminal.exited {
+                        to_process.push((terminal.id, command.clone()));
+                    }
+                    // Clear pending state regardless of whether we sent (to avoid retries).
+                    terminal.pending_rerun_command = None;
+                    terminal.pending_rerun_since = None;
+                }
+            }
+        }
+
+        // Process collected reruns (self is no longer borrowed by terminals loop).
+        for (terminal_id, command) in to_process {
+            let trimmed = command.trim();
+            if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                let mut outbound = command.as_bytes().to_vec();
+                outbound.push(b'\r');
+                reset_terminal_prompt_scroll_anchor(terminal);
+                terminal.runtime.send_bytes(outbound);
+                Self::clear_terminal_selection(terminal);
+                terminal.pending_line_for_title.clear();
+                terminal.pending_input_for_history.clear();
+                Self::append_pending_line(&mut terminal.pending_line_for_title, trimmed);
+                let line = std::mem::take(&mut terminal.pending_line_for_title);
+                if let Some(sanitized) = terminal_title_candidate(&line) {
+                    terminal.full_title = sanitized.clone();
+                    terminal.title =
+                        update_terminal_title(&sanitized, terminal.id as usize, TITLE_MAX_LEN);
+                }
+                terminal.dirty = true;
+                ctx.request_repaint();
+                self.show_status_feedback(ctx, &format!("Rerunning: {}", trimmed));
+            }
+        }
     }
 
     fn next_custom_launcher_id(&self) -> String {
@@ -13950,6 +13995,9 @@ impl eframe::App for AdeApp {
         if input_gate_elapsed == 0 || self.opencode_process_last_poll_at.is_none() {
             self.poll_opencode_processes(ctx);
         }
+
+        // Phase 3b: Process pending background reruns after settle duration.
+        self.process_pending_reruns(ctx);
 
         self.process_source_control_events(ctx);
         self.process_directory_index_events(ctx);
@@ -18194,10 +18242,10 @@ mod tests {
         TerminalSelectionPoint, TransientToast, CODEX_NOTIFY_POLL_MS, CODEX_PROCESS_POLL_MS,
         CODEX_STOP_SETTLE_MS, CODEX_TRAILING_OUTPUT_GRACE_MS, DIRECTORY_INDEX_CHANNEL_CAPACITY,
         FACTORY_DROID_HOOK_POLL_MS, OPENCODE_PROCESS_POLL_MS, OPENCODE_RUNNING_GRACE_MS,
-        OPENCODE_TRAILING_OUTPUT_GRACE_MS, SOURCE_CONTROL_CHANNEL_CAPACITY,
-        SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG, TERMINAL_COPY_FEEDBACK_TEXT,
-        TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS, TERMINAL_OUTPUT_BG,
-        TEXT_MUTED, TEXT_PRIMARY, TRANSIENT_TOAST_SECS,
+        OPENCODE_TRAILING_OUTPUT_GRACE_MS, PENDING_RERUN_SETTLE_MS,
+        SOURCE_CONTROL_CHANNEL_CAPACITY, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG,
+        TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS,
+        TERMINAL_OUTPUT_BG, TEXT_MUTED, TEXT_PRIMARY, TRANSIENT_TOAST_SECS,
     };
     use crate::codex::{CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
     use crate::hooks::{
@@ -27056,6 +27104,8 @@ mod tests {
             opencode_last_hook_attention_at: None,
             opencode_last_turn_complete_at: None,
             opencode_attention_pending: false,
+            pending_rerun_command: None,
+            pending_rerun_since: None,
             // Claude Code state (Orca-compatible title-based detection)
             claude_launch_pending_since: None,
             claude_session_active: false,
@@ -30649,9 +30699,9 @@ mod tests {
     }
 
     #[test]
-    fn background_rerun_interrupts_then_sends_full_multiline_command() {
+    fn background_rerun_two_phase_interrupt_then_command() {
         // Regression: rerun sent the command into long-running processes.
-        // Now it sends Ctrl+C first while preserving the full stored command.
+        // Now two-phase: 1) Ctrl+C immediately, 2) command after settle.
         let ctx = Context::default();
         let mut app = test_app(
             [(
@@ -30674,21 +30724,59 @@ mod tests {
             terminal.recent_inputs.push_front(full_command.clone());
         }
 
-        // Rerun the command
+        // Phase 1: rerun_command_in_terminal sends only Ctrl+C and queues the command.
         app.rerun_command_in_terminal(&ctx, 1, &full_command);
-
-        // Drain runtime commands to process the sent bytes
         capture.drain();
 
-        // Verify Ctrl+C is sent first, then the FULL command (including newlines), plus \r.
-        let sent = capture.bytes();
-        let mut expected = vec![0x03];
-        expected.extend_from_slice(full_command.as_bytes());
-        expected.push(b'\r');
+        // Verify only Ctrl+C was sent (phase 1), command is pending.
+        let sent_after_phase1 = capture.bytes();
         assert_eq!(
-            sent,
-            expected,
-            "rerun should interrupt first, then send full multi-line command with newlines preserved"
+            sent_after_phase1,
+            vec![0x03],
+            "phase 1 should send only Ctrl+C"
+        );
+
+        // Verify pending state is set correctly.
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.pending_rerun_command,
+            Some(full_command.clone()),
+            "command should be pending after phase 1"
+        );
+        assert!(
+            terminal.pending_rerun_since.is_some(),
+            "pending timestamp should be set"
+        );
+
+        // Phase 2: manually advance pending_rerun_since so settle is satisfied.
+        if let Some(terminal) = app.terminals.get_mut(&1) {
+            terminal.pending_rerun_since =
+                Some(Instant::now() - Duration::from_millis(PENDING_RERUN_SETTLE_MS + 10));
+        }
+
+        // Process pending reruns (this sends the actual command).
+        app.process_pending_reruns(&ctx);
+        capture.drain();
+
+        // Verify total sent bytes: Ctrl+C (phase 1) + full command + \r (phase 2).
+        let total_sent = capture.bytes();
+        let mut expected_total = vec![0x03];
+        expected_total.extend_from_slice(full_command.as_bytes());
+        expected_total.push(b'\r');
+        assert_eq!(
+            total_sent, expected_total,
+            "total should be Ctrl+C then full multi-line command with newlines preserved"
+        );
+
+        // Verify pending state is cleared after sending.
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(
+            terminal.pending_rerun_command.is_none(),
+            "pending command should be cleared after phase 2"
+        );
+        assert!(
+            terminal.pending_rerun_since.is_none(),
+            "pending timestamp should be cleared after phase 2"
         );
     }
 
