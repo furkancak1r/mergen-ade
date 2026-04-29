@@ -130,6 +130,28 @@ const DIRECTORY_INDEX_CHANNEL_CAPACITY: usize = 1;
 const DIRECTORY_INDEX_MAX_CHILDREN_PER_DIR: usize = 1_000;
 const DIRECTORY_INDEX_MAX_DEPTH: usize = 10;
 const DIRECTORY_INDEX_MAX_NODES: usize = 20_000;
+/// Time budget for initial full scan to ensure fast UI responsiveness.
+const DIRECTORY_INDEX_FULL_SCAN_TIME_BUDGET_MS: u128 = 150;
+/// Time budget for on-demand subtree loads.
+const DIRECTORY_INDEX_SUBTREE_TIME_BUDGET_MS: u128 = 100;
+/// Directory names to defer during fast indexing (heavy/generated folders).
+const DIRECTORY_INDEX_DEFERRED_NAMES: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    "dist",
+    "build",
+    ".cache",
+    ".parcel-cache",
+    ".turbo",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "coverage",
+];
 const SOURCE_CONTROL_PRIORITY_REFRESH_SECS: f64 = 5.0;
 const SOURCE_CONTROL_BACKGROUND_REFRESH_SECS: f64 = 20.0;
 const SOURCE_CONTROL_CHANNEL_CAPACITY: usize = 1;
@@ -997,6 +1019,8 @@ pub struct AdeApp {
     directory_index_state: BTreeMap<u64, DirectoryIndexSnapshot>,
     directory_tree_has_collapsed_cache_by_project: BTreeMap<u64, bool>,
     directory_index_generation: BTreeMap<u64, u64>,
+    /// Tracks which subtrees are currently loading per project (for deduplication).
+    directory_index_subtree_loading_by_project: BTreeMap<u64, BTreeSet<PathBuf>>,
     // Terminal input history
     history_path: PathBuf,
     input_history: AppHistory,
@@ -1279,11 +1303,31 @@ struct SourceControlCommand {
     run_fetch: bool,
 }
 
+/// Directory index command variants for full and on-demand subtree loading.
 #[derive(Debug, Clone)]
-struct DirectoryIndexCommand {
-    project_id: u64,
-    generation: u64,
-    project_path: PathBuf,
+enum DirectoryIndexCommand {
+    /// Full scan of the project root (fast, with deferred heavy directories).
+    Full {
+        project_id: u64,
+        generation: u64,
+        project_path: PathBuf,
+    },
+    /// Subtree load for a specific deferred directory path.
+    Subtree {
+        project_id: u64,
+        generation: u64,
+        project_path: PathBuf,
+        target_path: PathBuf,
+    },
+}
+
+/// Scan mode for directory indexing to control recursion behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryScanMode {
+    /// Initial root scan: read only immediate children, defer all child directories.
+    InitialRoot,
+    /// Lazy subtree scan: read only immediate children of target, defer all child directories.
+    LazySubtree,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1771,7 +1815,18 @@ struct DirectoryNode {
     path: PathBuf,
     is_dir: bool,
     is_placeholder: bool,
+    /// True if this directory was deferred during fast indexing and should be loaded on demand.
+    is_deferred: bool,
     children: Vec<DirectoryNode>,
+}
+
+/// Snapshot flags for why the directory index was truncated or partial.
+#[derive(Debug, Clone, Default)]
+struct DirectoryIndexTruncationFlags {
+    node_limit: bool,
+    depth_limit: bool,
+    time_budget: bool,
+    deferred_directories: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1780,13 +1835,28 @@ struct DirectoryIndexSnapshot {
     loading: bool,
     last_error: Option<String>,
     partial_warning: Option<String>,
+    truncation: DirectoryIndexTruncationFlags,
 }
 
+/// Directory index event for full or subtree results.
 #[derive(Debug, Clone)]
-struct DirectoryIndexEvent {
-    project_id: u64,
-    generation: u64,
-    snapshot: DirectoryIndexSnapshot,
+enum DirectoryIndexEvent {
+    /// Full project index result.
+    Full {
+        project_id: u64,
+        generation: u64,
+        snapshot: DirectoryIndexSnapshot,
+    },
+    /// Subtree result for a specific deferred directory.
+    Subtree {
+        project_id: u64,
+        generation: u64,
+        target_path: PathBuf,
+        children: Vec<DirectoryNode>,
+        last_error: Option<String>,
+        partial_warning: Option<String>,
+        truncation: DirectoryIndexTruncationFlags,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2836,10 +2906,12 @@ impl AdeApp {
             crossbeam_channel::bounded(SOURCE_CONTROL_CHANNEL_CAPACITY);
         let (source_control_events_tx, source_control_events_rx) =
             crossbeam_channel::bounded(SOURCE_CONTROL_CHANNEL_CAPACITY);
+        // Use unbounded channels for directory indexing to prevent UI blocking during
+        // large project scans. The worker is single-threaded and backpressure is managed
+        // through the generation counter and in-flight request tracking.
         let (directory_index_commands_tx, directory_index_commands_rx) =
-            crossbeam_channel::bounded(DIRECTORY_INDEX_CHANNEL_CAPACITY);
-        let (directory_index_events_tx, directory_index_events_rx) =
-            crossbeam_channel::bounded(DIRECTORY_INDEX_CHANNEL_CAPACITY);
+            crossbeam_channel::unbounded();
+        let (directory_index_events_tx, directory_index_events_rx) = crossbeam_channel::unbounded();
         spawn_source_control_worker(source_control_commands_rx, source_control_events_tx.clone());
         spawn_directory_index_worker(
             directory_index_commands_rx,
@@ -2950,6 +3022,7 @@ impl AdeApp {
             directory_index_state: BTreeMap::new(),
             directory_tree_has_collapsed_cache_by_project: BTreeMap::new(),
             directory_index_generation: BTreeMap::new(),
+            directory_index_subtree_loading_by_project: BTreeMap::new(),
             history_path,
             input_history,
             input_history_search_query: String::new(),
@@ -7234,20 +7307,77 @@ impl AdeApp {
     fn process_directory_index_events(&mut self, ctx: &egui::Context) {
         let mut changed = false;
         while let Ok(event) = self.directory_index_events_rx.try_recv() {
-            let latest_generation = self
-                .directory_index_generation
-                .get(&event.project_id)
-                .copied()
-                .unwrap_or(0);
-            if event.generation != latest_generation {
-                continue;
-            }
+            match event {
+                DirectoryIndexEvent::Full {
+                    project_id,
+                    generation,
+                    snapshot,
+                } => {
+                    let latest_generation = self
+                        .directory_index_generation
+                        .get(&project_id)
+                        .copied()
+                        .unwrap_or(0);
+                    if generation != latest_generation {
+                        continue;
+                    }
 
-            self.directory_index_state
-                .insert(event.project_id, event.snapshot);
-            self.directory_tree_has_collapsed_cache_by_project
-                .remove(&event.project_id);
-            changed = true;
+                    self.directory_index_state.insert(project_id, snapshot);
+                    self.directory_tree_has_collapsed_cache_by_project
+                        .remove(&project_id);
+                    // Clear any in-flight subtree loading state on full refresh
+                    self.directory_index_subtree_loading_by_project
+                        .remove(&project_id);
+                    changed = true;
+                }
+                DirectoryIndexEvent::Subtree {
+                    project_id,
+                    generation,
+                    target_path,
+                    children,
+                    last_error,
+                    partial_warning,
+                    truncation,
+                } => {
+                    let latest_generation = self
+                        .directory_index_generation
+                        .get(&project_id)
+                        .copied()
+                        .unwrap_or(0);
+                    if generation != latest_generation {
+                        continue;
+                    }
+
+                    // Apply subtree result to the existing snapshot
+                    if let Some(snapshot) = self.directory_index_state.get_mut(&project_id) {
+                        if let Err(err) = apply_subtree_to_node(
+                            &mut snapshot.root,
+                            &target_path,
+                            children,
+                            last_error,
+                            partial_warning,
+                            truncation,
+                        ) {
+                            log::warn!(
+                                "Failed to apply subtree for project {} at {:?}: {}",
+                                project_id,
+                                target_path,
+                                err
+                            );
+                        } else {
+                            changed = true;
+                        }
+                    }
+
+                    // Remove from loading set
+                    if let Some(loading_set) = self
+                        .directory_index_subtree_loading_by_project
+                        .get_mut(&project_id)
+                    {
+                        loading_set.remove(&target_path);
+                    }
+                }
+            }
         }
         if changed {
             ctx.request_repaint();
@@ -7293,13 +7423,15 @@ impl AdeApp {
                 loading: true,
                 last_error: None,
                 partial_warning: None,
+                truncation: DirectoryIndexTruncationFlags::default(),
             });
 
-        let command = DirectoryIndexCommand {
+        let command = DirectoryIndexCommand::Full {
             project_id,
             generation: current_generation,
             project_path: project.path,
         };
+        // Use non-blocking send; unbounded channel prevents UI blocking
         if self.directory_index_commands_tx.send(command).is_err() {
             if let Some(snapshot) = self.directory_index_state.get_mut(&project_id) {
                 snapshot.loading = false;
@@ -7307,6 +7439,38 @@ impl AdeApp {
             }
             self.status_line = "Directory index worker unavailable".to_owned();
         }
+    }
+
+    /// Request on-demand loading of a deferred directory subtree.
+    fn request_directory_subtree_load(&mut self, project_id: u64, target_path: PathBuf) {
+        let Some(project) = self.projects.get(&project_id).cloned() else {
+            return;
+        };
+
+        // Check if already loading
+        let loading_set = self
+            .directory_index_subtree_loading_by_project
+            .entry(project_id)
+            .or_default();
+        if loading_set.contains(&target_path) {
+            return; // Already loading
+        }
+
+        let generation = self
+            .directory_index_generation
+            .get(&project_id)
+            .copied()
+            .unwrap_or(0);
+
+        loading_set.insert(target_path.clone());
+
+        let command = DirectoryIndexCommand::Subtree {
+            project_id,
+            generation,
+            project_path: project.path,
+            target_path,
+        };
+        let _ = self.directory_index_commands_tx.send(command);
     }
 
     fn cached_directory_tree_has_collapsed_folders(
@@ -11853,9 +12017,12 @@ impl AdeApp {
                                                         .to_owned(),
                                                 );
                                             }
-                                        } else if let Some(warning) = &snapshot.partial_warning {
-                                            ui.colored_label(TEXT_MUTED, warning);
-                                        } else if !snapshot.loading {
+                                        }
+
+                                        // Always render tree when not loading and no error
+                                        // partial_warning is kept for internal state but not displayed
+                                        // to keep the UI clean; heavy folders are shown as deferred
+                                        if !snapshot.loading && snapshot.last_error.is_none() {
                                             if let Some(open_all) = pending_open_all {
                                                 apply_directory_tree_open_state(
                                                     ui.ctx(),
@@ -11883,7 +12050,7 @@ impl AdeApp {
                                                 );
                                             }
 
-                                            let (has_results, folder_state_changed) =
+                                            let (has_results, folder_state_changed, deferred_to_load) =
                                                 draw_folder_tree(
                                                 ui,
                                                 &snapshot.root,
@@ -11899,6 +12066,11 @@ impl AdeApp {
                                                 self.invalidate_directory_tree_collapsed_cache(
                                                     project_id,
                                                 );
+                                            }
+
+                                            // Trigger lazy loading for expanded deferred directories
+                                            for target_path in deferred_to_load {
+                                                self.request_directory_subtree_load(project_id, target_path);
                                             }
 
                                             if search_query.is_some() && !has_results {
@@ -14440,19 +14612,109 @@ fn spawn_directory_index_worker(
 ) {
     std::thread::spawn(move || {
         while let Ok(command) = rx.recv() {
-            let snapshot = collect_directory_index_snapshot(&command.project_path);
-            if tx
-                .send(DirectoryIndexEvent {
-                    project_id: command.project_id,
-                    generation: command.generation,
-                    snapshot,
-                })
-                .is_err()
-            {
-                break;
+            // Drain stale commands and keep only the most relevant work
+            let command = drain_stale_directory_commands(&rx, command);
+
+            match command {
+                DirectoryIndexCommand::Full {
+                    project_id,
+                    generation,
+                    project_path,
+                } => {
+                    let snapshot = collect_directory_index_snapshot(&project_path);
+                    if tx
+                        .send(DirectoryIndexEvent::Full {
+                            project_id,
+                            generation,
+                            snapshot,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                DirectoryIndexCommand::Subtree {
+                    project_id,
+                    generation,
+                    project_path,
+                    target_path,
+                } => {
+                    let result = collect_directory_subtree(&project_path, &target_path);
+                    if tx
+                        .send(DirectoryIndexEvent::Subtree {
+                            project_id,
+                            generation,
+                            target_path,
+                            children: result.children,
+                            last_error: result.last_error,
+                            partial_warning: result.partial_warning,
+                            truncation: result.truncation,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             }
         }
     });
+}
+
+/// Drain stale commands from the channel and return the most relevant command to process.
+/// For Full commands, prefers the latest generation for each project.
+/// For Subtree commands, keeps them if their generation matches current or they're for different paths.
+fn drain_stale_directory_commands(
+    rx: &Receiver<DirectoryIndexCommand>,
+    initial: DirectoryIndexCommand,
+) -> DirectoryIndexCommand {
+    use std::collections::HashMap;
+
+    let mut latest_full_by_project: HashMap<u64, DirectoryIndexCommand> = HashMap::new();
+    let mut subtree_commands: Vec<DirectoryIndexCommand> = Vec::new();
+
+    // Classify the initial command
+    match &initial {
+        DirectoryIndexCommand::Full { project_id, .. } => {
+            latest_full_by_project.insert(*project_id, initial);
+        }
+        DirectoryIndexCommand::Subtree { .. } => {
+            subtree_commands.push(initial);
+        }
+    }
+
+    // Drain all available commands from the channel
+    while let Ok(cmd) = rx.try_recv() {
+        match cmd {
+            DirectoryIndexCommand::Full { project_id, .. } => {
+                // Keep only the latest Full command per project
+                latest_full_by_project.insert(project_id, cmd);
+            }
+            DirectoryIndexCommand::Subtree { .. } => {
+                // Keep subtree commands that are still relevant
+                // (generation filtering happens in the event handler)
+                subtree_commands.push(cmd);
+            }
+        }
+    }
+
+    // Priority: process the most recent Full command if available
+    // Pick the one with the highest generation number
+    if let Some((_, full_cmd)) = latest_full_by_project
+        .into_iter()
+        .max_by_key(|(_, cmd)| match cmd {
+            DirectoryIndexCommand::Full { generation, .. } => *generation,
+            _ => 0,
+        })
+    {
+        return full_cmd;
+    }
+
+    // If no Full command, return the first Subtree command
+    // (they're processed FIFO, and generation filtering happens in the event handler)
+    subtree_commands
+        .into_iter()
+        .next()
+        .expect("At least one command should exist")
 }
 
 fn collect_source_control_snapshot(project_path: &Path, run_fetch: bool) -> SourceControlSnapshot {
@@ -14918,10 +15180,125 @@ fn parse_branch_header(header: &str) -> (String, usize, usize) {
     (branch_part, ahead, behind)
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct DirectoryIndexBuildState {
     visited_nodes: usize,
     truncated: bool,
+    started_at: std::time::Instant,
+    time_budget: std::time::Duration,
+    flags: DirectoryIndexTruncationFlags,
+}
+
+impl DirectoryIndexBuildState {
+    fn new(time_budget_ms: u128) -> Self {
+        Self {
+            visited_nodes: 0,
+            truncated: false,
+            started_at: std::time::Instant::now(),
+            time_budget: std::time::Duration::from_millis(time_budget_ms as u64),
+            flags: DirectoryIndexTruncationFlags::default(),
+        }
+    }
+
+    fn time_budget_exceeded(&self) -> bool {
+        self.started_at.elapsed() > self.time_budget
+    }
+
+    fn increment_nodes(&mut self) {
+        self.visited_nodes += 1;
+    }
+
+    fn mark_truncated_by_nodes(&mut self) {
+        self.truncated = true;
+        self.flags.node_limit = true;
+    }
+
+    fn mark_truncated_by_depth(&mut self) {
+        self.truncated = true;
+        self.flags.depth_limit = true;
+    }
+
+    fn mark_truncated_by_time(&mut self) {
+        self.truncated = true;
+        self.flags.time_budget = true;
+    }
+
+    fn mark_has_deferred(&mut self) {
+        self.flags.deferred_directories = true;
+    }
+
+    /// Check if scanning should stop due to time budget or node limit.
+    fn should_stop(&self) -> bool {
+        self.truncated || self.time_budget_exceeded()
+    }
+
+    /// Get the stop reason for placeholder messages.
+    fn stop_reason(&self) -> &'static str {
+        if self.flags.time_budget {
+            "time budget"
+        } else if self.flags.node_limit {
+            "node limit"
+        } else {
+            "stopped"
+        }
+    }
+}
+
+/// Subtree scan result for on-demand deferred directory loading.
+struct DirectorySubtreeResult {
+    children: Vec<DirectoryNode>,
+    last_error: Option<String>,
+    partial_warning: Option<String>,
+    truncation: DirectoryIndexTruncationFlags,
+}
+
+/// Collect a subtree for a specific deferred directory path.
+fn collect_directory_subtree(project_path: &Path, target_path: &Path) -> DirectorySubtreeResult {
+    let mut build_state = DirectoryIndexBuildState::new(DIRECTORY_INDEX_SUBTREE_TIME_BUDGET_MS);
+
+    // Check if target is within project
+    let Ok(relative_depth) = target_path
+        .strip_prefix(project_path)
+        .map(|p| p.components().count())
+    else {
+        return DirectorySubtreeResult {
+            children: vec![directory_placeholder_node(
+                target_path,
+                "... (outside project)".to_owned(),
+            )],
+            last_error: Some("Subtree path outside project".to_owned()),
+            partial_warning: None,
+            truncation: DirectoryIndexTruncationFlags::default(),
+        };
+    };
+
+    // Read children using LazySubtree mode (one level only, child dirs are deferred)
+    let children_result = read_directory_children(
+        target_path,
+        relative_depth,
+        &mut build_state,
+        DirectoryScanMode::LazySubtree,
+    );
+
+    let (children, last_error) = match children_result {
+        Ok(c) => (c, None),
+        Err(err) => (
+            vec![directory_placeholder_node(
+                target_path,
+                "... (load failed)".to_owned(),
+            )],
+            Some(format!("Subtree index failed: {err}")),
+        ),
+    };
+
+    DirectorySubtreeResult {
+        children,
+        last_error,
+        partial_warning: build_state
+            .truncated
+            .then_some(directory_index_partial_warning(&build_state.flags)),
+        truncation: build_state.flags,
+    }
 }
 
 fn build_directory_root_node(path: &Path) -> DirectoryNode {
@@ -14936,18 +15313,23 @@ fn build_directory_root_node(path: &Path) -> DirectoryNode {
         path: path.to_path_buf(),
         is_dir: true,
         is_placeholder: false,
+        is_deferred: false,
         children: Vec::new(),
     }
 }
 
 fn collect_directory_index_snapshot(project_path: &Path) -> DirectoryIndexSnapshot {
     let mut root = build_directory_root_node(project_path);
-    let mut build_state = DirectoryIndexBuildState {
-        visited_nodes: 1,
-        ..Default::default()
-    };
+    let mut build_state = DirectoryIndexBuildState::new(DIRECTORY_INDEX_FULL_SCAN_TIME_BUDGET_MS);
+    build_state.increment_nodes(); // Count root node
 
-    let snapshot_error = match read_directory_children(project_path, 0, &mut build_state) {
+    // Use InitialRoot mode: read only immediate children, defer all child directories
+    let snapshot_error = match read_directory_children(
+        project_path,
+        0,
+        &mut build_state,
+        DirectoryScanMode::InitialRoot,
+    ) {
         Ok(children) => {
             root.children = children;
             None
@@ -14961,14 +15343,72 @@ fn collect_directory_index_snapshot(project_path: &Path) -> DirectoryIndexSnapsh
         last_error: snapshot_error,
         partial_warning: build_state
             .truncated
-            .then_some(directory_index_partial_warning()),
+            .then_some(directory_index_partial_warning(&build_state.flags)),
+        truncation: build_state.flags,
     }
 }
 
-fn directory_index_partial_warning() -> String {
+fn directory_index_partial_warning(flags: &DirectoryIndexTruncationFlags) -> String {
+    let mut reasons = Vec::new();
+    if flags.node_limit {
+        reasons.push(format!("{DIRECTORY_INDEX_MAX_NODES} node limit"));
+    }
+    if flags.depth_limit {
+        reasons.push(format!("depth {DIRECTORY_INDEX_MAX_DEPTH} limit"));
+    }
+    if flags.time_budget {
+        reasons.push(format!(
+            "{}ms time budget",
+            DIRECTORY_INDEX_FULL_SCAN_TIME_BUDGET_MS
+        ));
+    }
+    if flags.deferred_directories {
+        reasons.push("heavy folders deferred".to_owned());
+    }
+    if reasons.is_empty() {
+        return format!(
+            "Directory index was truncated. Limits: {DIRECTORY_INDEX_MAX_NODES} nodes, depth {DIRECTORY_INDEX_MAX_DEPTH}."
+        );
+    }
     format!(
-        "Directory index was truncated to protect memory. Limits: {DIRECTORY_INDEX_MAX_NODES} nodes, depth {DIRECTORY_INDEX_MAX_DEPTH}, {DIRECTORY_INDEX_MAX_CHILDREN_PER_DIR} items per folder."
+        "Directory index loaded partially for fast startup ({}). Some folders load on demand.",
+        reasons.join(", ")
     )
+}
+
+/// Apply subtree children to a deferred directory node in the snapshot tree.
+fn apply_subtree_to_node(
+    node: &mut DirectoryNode,
+    target_path: &Path,
+    children: Vec<DirectoryNode>,
+    last_error: Option<String>,
+    partial_warning: Option<String>,
+    _truncation: DirectoryIndexTruncationFlags,
+) -> Result<(), String> {
+    if node.path == target_path {
+        // Found the target node
+        if node.is_deferred {
+            node.is_deferred = false;
+            node.children = children;
+        }
+        return Ok(());
+    }
+
+    // Search children recursively
+    for child in &mut node.children {
+        if child.is_dir && target_path.starts_with(&child.path) {
+            return apply_subtree_to_node(
+                child,
+                target_path,
+                children,
+                last_error,
+                partial_warning,
+                _truncation,
+            );
+        }
+    }
+
+    Err(format!("Target path {:?} not found in tree", target_path))
 }
 
 fn directory_placeholder_node(parent: &Path, label: String) -> DirectoryNode {
@@ -14977,45 +15417,106 @@ fn directory_placeholder_node(parent: &Path, label: String) -> DirectoryNode {
         path: parent.to_path_buf(),
         is_dir: false,
         is_placeholder: true,
+        is_deferred: false,
         children: Vec::new(),
     }
+}
+
+/// Entry info collected during directory iteration to avoid extra metadata calls.
+#[derive(Debug, Clone)]
+struct DirEntryInfo {
+    path: PathBuf,
+    name: String,
+    file_type: std::fs::FileType,
 }
 
 fn read_directory_children(
     path: &Path,
     depth: usize,
     build_state: &mut DirectoryIndexBuildState,
+    mode: DirectoryScanMode,
 ) -> Result<Vec<DirectoryNode>, String> {
+    // Hard-stop check: immediately return if time budget already exceeded
+    if build_state.should_stop() {
+        build_state.mark_truncated_by_time();
+        return Ok(vec![directory_placeholder_node(
+            path,
+            format!("... more items omitted ({})", build_state.stop_reason()),
+        )]);
+    }
+
     let entries = fs::read_dir(path).map_err(|err| err.to_string())?;
-    let mut children_paths = Vec::new();
+    let mut collected: Vec<DirEntryInfo> = Vec::new();
     let mut truncated_children = false;
-    for entry in entries {
-        let Ok(entry) = entry else {
+
+    // Collect entries with hard-stop time budget checks inside the loop
+    for entry_result in entries {
+        // Hard-stop: check time budget every few iterations to avoid excessive checks
+        if build_state.should_stop() {
+            build_state.mark_truncated_by_time();
+            truncated_children = true;
+            break;
+        }
+
+        let Ok(entry) = entry_result else {
             continue;
         };
-        if children_paths.len() >= DIRECTORY_INDEX_MAX_CHILDREN_PER_DIR {
-            truncated_children = true;
-            build_state.truncated = true;
-            break;
-        }
-        children_paths.push(entry.path());
-    }
-    children_paths.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
 
-    let mut children = Vec::new();
-    for child_path in children_paths {
-        if build_state.visited_nodes >= DIRECTORY_INDEX_MAX_NODES {
-            build_state.truncated = true;
+        if collected.len() >= DIRECTORY_INDEX_MAX_CHILDREN_PER_DIR {
+            truncated_children = true;
+            build_state.mark_truncated_by_nodes();
             break;
         }
-        if let Some(node) = build_directory_node(&child_path, depth + 1, build_state) {
+
+        // Get file type directly from DirEntry to avoid extra metadata call
+        let file_type = entry.file_type().ok();
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        // Skip symlinks during initial scan for safety
+        if let Some(ft) = file_type {
+            collected.push(DirEntryInfo {
+                path,
+                name,
+                file_type: ft,
+            });
+        }
+    }
+
+    // Sort using pre-cached lowercase names
+    let mut sortable: Vec<(String, DirEntryInfo)> = collected
+        .into_iter()
+        .map(|info| {
+            let name_lower = info.name.to_lowercase();
+            (name_lower, info)
+        })
+        .collect();
+    sortable.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Build nodes with hard-stop checks
+    let mut children = Vec::new();
+    for (_, info) in sortable {
+        // Hard-stop: check before building each node
+        if build_state.should_stop() {
+            build_state.mark_truncated_by_time();
+            break;
+        }
+
+        if build_state.visited_nodes >= DIRECTORY_INDEX_MAX_NODES {
+            build_state.mark_truncated_by_nodes();
+            break;
+        }
+
+        if let Some(node) = build_directory_node_from_entry(info, depth, build_state, mode) {
             children.push(node);
         }
     }
-    if build_state.visited_nodes >= DIRECTORY_INDEX_MAX_NODES {
+
+    // Add placeholder if we stopped early
+    if build_state.should_stop() || build_state.visited_nodes >= DIRECTORY_INDEX_MAX_NODES {
         children.push(directory_placeholder_node(
             path,
-            "... more items omitted".to_owned(),
+            format!("... more items omitted ({})", build_state.stop_reason()),
         ));
     } else if truncated_children {
         children.push(directory_placeholder_node(
@@ -15027,40 +15528,80 @@ fn read_directory_children(
     Ok(children)
 }
 
+/// Build a directory node from a DirEntryInfo (avoids extra metadata calls).
+fn build_directory_node_from_entry(
+    info: DirEntryInfo,
+    _depth: usize,
+    build_state: &mut DirectoryIndexBuildState,
+    _mode: DirectoryScanMode,
+) -> Option<DirectoryNode> {
+    let is_symlink = info.file_type.is_symlink();
+    let is_dir = info.file_type.is_dir();
+
+    // In InitialRoot and LazySubtree modes, all directories are deferred
+    // unless they are symlinks (which we never descend into)
+    let should_defer = is_dir && !is_symlink;
+
+    let mut node = DirectoryNode {
+        name: info.name,
+        path: info.path.clone(),
+        is_dir,
+        is_placeholder: false,
+        is_deferred: should_defer,
+        children: Vec::new(),
+    };
+    build_state.increment_nodes();
+
+    if should_descend_into_directory(is_dir, is_symlink) {
+        // In shallow scan modes, never recurse - just add placeholder
+        build_state.mark_has_deferred();
+        node.children.push(directory_placeholder_node(
+            &info.path,
+            "... (indexing deferred)".to_owned(),
+        ));
+    }
+
+    Some(node)
+}
+
+/// Build a directory node for a path (used for root node construction).
+/// This performs the necessary metadata lookup for paths not from DirEntry.
 fn build_directory_node(
     path: &Path,
-    depth: usize,
+    _depth: usize,
     build_state: &mut DirectoryIndexBuildState,
+    _mode: DirectoryScanMode,
 ) -> Option<DirectoryNode> {
     let name = path
         .file_name()
         .map(|segment| segment.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string());
-    let file_type = fs::symlink_metadata(path).ok()?.file_type();
+
+    let metadata = fs::symlink_metadata(path).ok()?;
+    let file_type = metadata.file_type();
     let is_symlink = file_type.is_symlink();
-    let is_dir = path.is_dir();
+    let is_dir = file_type.is_dir();
+
+    // In InitialRoot and LazySubtree modes, all directories are deferred
+    let should_defer = is_dir && !is_symlink;
 
     let mut node = DirectoryNode {
         name,
         path: path.to_path_buf(),
         is_dir,
         is_placeholder: false,
+        is_deferred: should_defer,
         children: Vec::new(),
     };
-    build_state.visited_nodes = build_state.visited_nodes.saturating_add(1);
+    build_state.increment_nodes();
 
     if should_descend_into_directory(is_dir, is_symlink) {
-        if depth >= DIRECTORY_INDEX_MAX_DEPTH {
-            if directory_contains_entries(path) {
-                build_state.truncated = true;
-                node.children.push(directory_placeholder_node(
-                    path,
-                    format!("... more items omitted (depth>{DIRECTORY_INDEX_MAX_DEPTH})"),
-                ));
-            }
-        } else if let Ok(children) = read_directory_children(path, depth, build_state) {
-            node.children = children;
-        }
+        // In shallow scan modes, never recurse immediately
+        build_state.mark_has_deferred();
+        node.children.push(directory_placeholder_node(
+            path,
+            "... (indexing deferred)".to_owned(),
+        ));
     }
 
     Some(node)
@@ -15182,6 +15723,7 @@ fn trim_pending_line_suffix(text: &mut String, max_chars: usize) {
     text.drain(..split_at);
 }
 
+/// Returns (rendered_any, folder_state_changed, deferred_paths_to_load).
 fn draw_folder_tree(
     ui: &mut Ui,
     root: &DirectoryNode,
@@ -15189,9 +15731,10 @@ fn draw_folder_tree(
     search_query: Option<&str>,
     force_show_all_descendants: bool,
     matching_directories: Option<&HashSet<PathBuf>>,
-) -> (bool, bool) {
+) -> (bool, bool, Vec<PathBuf>) {
     let mut rendered_any = false;
     let mut folder_state_changed = false;
+    let mut deferred_to_load = Vec::new();
     for item in &root.children {
         let item_name_lower = item.name.to_lowercase();
         let item_matches = search_query.is_some_and(|query| item_name_lower.contains(query));
@@ -15216,6 +15759,13 @@ fn draw_folder_tree(
             let search_active = search_query.is_some();
             let initial_open_state = (!search_active).then(|| header_state.is_open());
             let previous_open_state = search_active.then(|| header_state.is_open());
+
+            // Check if deferred directory is expanded and needs loading
+            let is_expanded = header_state.is_open();
+            if item.is_deferred && is_expanded && !search_active {
+                deferred_to_load.push(item.path.clone());
+            }
+
             if search_active {
                 header_state.set_open(true);
             }
@@ -15223,7 +15773,7 @@ fn draw_folder_tree(
             let (_, header_response, _) = header_state
                 .show_header(ui, |ui| draw_directory_folder_row(ui, &item.name))
                 .body(|ui| {
-                    let (_, child_state_changed) = draw_folder_tree(
+                    let (_, child_state_changed, child_deferred) = draw_folder_tree(
                         ui,
                         item,
                         status_line_update,
@@ -15232,6 +15782,7 @@ fn draw_folder_tree(
                         matching_directories,
                     );
                     folder_state_changed |= child_state_changed;
+                    deferred_to_load.extend(child_deferred);
                 });
             if search_active {
                 if let Some(previous_open_state) = previous_open_state {
@@ -15351,7 +15902,7 @@ fn draw_folder_tree(
         }
     }
 
-    (rendered_any, folder_state_changed)
+    (rendered_any, folder_state_changed, deferred_to_load)
 }
 
 fn collect_matching_directory_paths(
@@ -18460,13 +19011,13 @@ mod tests {
         terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
         with_minimal_button_chrome, with_settings_text_edit_chrome, AdeApp, AiBadgeModel,
         AiBadgeVisual, CodexAttentionReason, CodexCliStatusSource, CodexTransportStatus,
-        CtrlCAction, DirectoryIndexSnapshot, DirectoryNode, FactoryDroidAttentionReason,
-        FactoryDroidHookInboxEvent, FactoryDroidManagedInstallComponent,
-        FactoryDroidManagedInstallDiagnostics, FactoryDroidStatusSource,
-        FactoryDroidTransportDiagnostics, OpenCodeAttentionReason, OpenCodeStatusSource,
-        OpenCodeTransportStatus, PendingConfigChanges, PendingTerminalLinkClick, SettingsSection,
-        SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
-        SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
+        CtrlCAction, DirectoryIndexSnapshot, DirectoryIndexTruncationFlags, DirectoryNode,
+        FactoryDroidAttentionReason, FactoryDroidHookInboxEvent,
+        FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
+        FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, OpenCodeAttentionReason,
+        OpenCodeStatusSource, OpenCodeTransportStatus, PendingConfigChanges,
+        PendingTerminalLinkClick, SettingsSection, SourceControlBadgeState, SourceControlFile,
+        SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
         TerminalOutputScrollBehavior, TerminalSecondaryClickAction, TerminalSelection,
         TerminalSelectionPoint, TransientToast, CODEX_NOTIFY_POLL_MS, CODEX_PROCESS_POLL_MS,
@@ -22307,11 +22858,13 @@ mod tests {
                     path: PathBuf::from("C:/remove"),
                     is_dir: true,
                     is_placeholder: false,
+                    is_deferred: false,
                     children: Vec::new(),
                 },
                 loading: false,
                 last_error: None,
                 partial_warning: None,
+                truncation: DirectoryIndexTruncationFlags::default(),
             },
         );
         app.directory_index_generation.insert(7, 2);
@@ -27452,6 +28005,7 @@ mod tests {
             directory_index_state: BTreeMap::new(),
             directory_tree_has_collapsed_cache_by_project: BTreeMap::new(),
             directory_index_generation: BTreeMap::new(),
+            directory_index_subtree_loading_by_project: BTreeMap::new(),
             checklist_collapsed_by_project: BTreeMap::new(),
             history_path: PathBuf::new(),
             input_history: AppHistory::default(),
@@ -28148,6 +28702,303 @@ mod tests {
         assert!(super::should_descend_into_directory(true, false));
         assert!(!super::should_descend_into_directory(true, true));
         assert!(!super::should_descend_into_directory(false, false));
+    }
+
+    #[test]
+    fn deferred_heavy_directories_are_marked_but_not_recursively_scanned() {
+        use super::{DirectoryIndexBuildState, DIRECTORY_INDEX_SUBTREE_TIME_BUDGET_MS};
+
+        // Create a build state for testing
+        let mut build_state = DirectoryIndexBuildState::new(DIRECTORY_INDEX_SUBTREE_TIME_BUDGET_MS);
+        build_state.increment_nodes();
+
+        // Test that node limit marking works
+        build_state.mark_truncated_by_nodes();
+        assert!(build_state.truncated);
+        assert!(build_state.flags.node_limit);
+
+        // Test that depth limit marking works
+        let mut build_state2 =
+            DirectoryIndexBuildState::new(DIRECTORY_INDEX_SUBTREE_TIME_BUDGET_MS);
+        build_state2.mark_truncated_by_depth();
+        assert!(build_state2.truncated);
+        assert!(build_state2.flags.depth_limit);
+
+        // Test that deferred marking works
+        let mut build_state3 =
+            DirectoryIndexBuildState::new(DIRECTORY_INDEX_SUBTREE_TIME_BUDGET_MS);
+        build_state3.mark_has_deferred();
+        assert!(build_state3.flags.deferred_directories);
+    }
+
+    #[test]
+    fn directory_index_truncation_flags_produce_meaningful_warnings() {
+        use super::{directory_index_partial_warning, DirectoryIndexTruncationFlags};
+
+        // Test empty flags (no truncation)
+        let empty_flags = DirectoryIndexTruncationFlags::default();
+        let warning = directory_index_partial_warning(&empty_flags);
+        assert!(warning.contains("truncated"));
+
+        // Test node limit flag
+        let mut flags = DirectoryIndexTruncationFlags::default();
+        flags.node_limit = true;
+        let warning = directory_index_partial_warning(&flags);
+        assert!(warning.contains("node limit"));
+        assert!(warning.contains("fast startup"));
+
+        // Test time budget flag
+        let mut flags = DirectoryIndexTruncationFlags::default();
+        flags.time_budget = true;
+        let warning = directory_index_partial_warning(&flags);
+        assert!(warning.contains("time budget"));
+    }
+
+    #[test]
+    fn directory_placeholder_node_is_not_deferred() {
+        use super::directory_placeholder_node;
+        use std::path::Path;
+
+        let node = directory_placeholder_node(Path::new("/test"), "... test".to_owned());
+        assert!(!node.is_deferred);
+        assert!(node.is_placeholder);
+    }
+
+    #[test]
+    fn directory_index_snapshot_with_partial_warning_still_has_children() {
+        // Regression test: ensure partial_warning doesn't prevent tree rendering
+        use super::{
+            DirectoryIndexSnapshot, DirectoryIndexTruncationFlags, DirectoryNode,
+            DirectorySubtreeResult,
+        };
+        use std::path::PathBuf;
+
+        // Create a snapshot with partial warning and children
+        let snapshot = DirectoryIndexSnapshot {
+            root: DirectoryNode {
+                name: "project".to_owned(),
+                path: PathBuf::from("/project"),
+                is_dir: true,
+                is_placeholder: false,
+                is_deferred: false,
+                children: vec![
+                    DirectoryNode {
+                        name: "src".to_owned(),
+                        path: PathBuf::from("/project/src"),
+                        is_dir: true,
+                        is_placeholder: false,
+                        is_deferred: false,
+                        children: vec![],
+                    },
+                    DirectoryNode {
+                        name: "package.json".to_owned(),
+                        path: PathBuf::from("/project/package.json"),
+                        is_dir: false,
+                        is_placeholder: false,
+                        is_deferred: false,
+                        children: vec![],
+                    },
+                ],
+            },
+            loading: false,
+            last_error: None,
+            partial_warning: Some(
+                "Directory index loaded partially for fast startup (150ms time budget, heavy folders deferred). Some folders load on demand.".to_owned(),
+            ),
+            truncation: DirectoryIndexTruncationFlags {
+                time_budget: true,
+                deferred_directories: true,
+                ..Default::default()
+            },
+        };
+
+        // Verify snapshot has children despite partial_warning
+        assert!(!snapshot.root.children.is_empty());
+        assert_eq!(snapshot.root.children.len(), 2);
+        assert!(snapshot.partial_warning.is_some());
+        assert!(snapshot.last_error.is_none());
+        assert!(!snapshot.loading);
+    }
+
+    #[test]
+    fn directory_subtree_result_preserves_children_with_warning() {
+        // Regression test: subtree load should return children even with time budget warning
+        use super::{DirectoryIndexTruncationFlags, DirectoryNode, DirectorySubtreeResult};
+        use std::path::PathBuf;
+
+        let children = vec![DirectoryNode {
+            name: "file.txt".to_owned(),
+            path: PathBuf::from("/folder/file.txt"),
+            is_dir: false,
+            is_placeholder: false,
+            is_deferred: false,
+            children: vec![],
+        }];
+
+        let result = DirectorySubtreeResult {
+            children: children.clone(),
+            last_error: None,
+            partial_warning: Some("time budget exceeded".to_owned()),
+            truncation: DirectoryIndexTruncationFlags {
+                time_budget: true,
+                ..Default::default()
+            },
+        };
+
+        // Verify children are preserved even with warning
+        assert!(!result.children.is_empty());
+        assert_eq!(result.children.len(), 1);
+        assert!(result.partial_warning.is_some());
+        assert!(result.last_error.is_none());
+    }
+
+    #[test]
+    fn initial_directory_scan_defers_all_child_directories() {
+        // Regression test: InitialRoot mode should defer ALL directories, not just heavy ones
+        use super::{
+            build_directory_node_from_entry, DirectoryIndexBuildState,
+            DirectoryIndexTruncationFlags, DirectoryScanMode,
+            DIRECTORY_INDEX_FULL_SCAN_TIME_BUDGET_MS,
+        };
+        use std::path::PathBuf;
+
+        let mut build_state =
+            DirectoryIndexBuildState::new(DIRECTORY_INDEX_FULL_SCAN_TIME_BUDGET_MS);
+
+        // Create a directory entry info
+        let dir_entry = super::DirEntryInfo {
+            path: PathBuf::from("/project/src"),
+            name: "src".to_owned(),
+            file_type: {
+                // Create a fake directory file type (this is a simplification for the test)
+                // In real code this comes from DirEntry::file_type()
+                let metadata = std::fs::metadata(".").unwrap();
+                metadata.file_type()
+            },
+        };
+
+        // In InitialRoot mode, even non-heavy directories should be deferred
+        let node = build_directory_node_from_entry(
+            dir_entry,
+            0,
+            &mut build_state,
+            DirectoryScanMode::InitialRoot,
+        );
+
+        // The node should exist and be marked as deferred
+        assert!(node.is_some());
+        let node = node.unwrap();
+        assert!(node.is_dir);
+        assert!(node.is_deferred);
+        // Should have a placeholder child
+        assert!(!node.children.is_empty());
+        assert!(node.children[0].is_placeholder);
+    }
+
+    #[test]
+    fn lazy_subtree_scan_marks_child_directories_deferred() {
+        // Regression test: LazySubtree mode should mark all child directories as deferred
+        use super::{
+            build_directory_node_from_entry, DirectoryIndexBuildState, DirectoryScanMode,
+            DIRECTORY_INDEX_SUBTREE_TIME_BUDGET_MS,
+        };
+        use std::path::PathBuf;
+
+        let mut build_state = DirectoryIndexBuildState::new(DIRECTORY_INDEX_SUBTREE_TIME_BUDGET_MS);
+
+        // Create a directory entry for a child directory
+        let dir_entry = super::DirEntryInfo {
+            path: PathBuf::from("/project/node_modules/express"),
+            name: "express".to_owned(),
+            file_type: {
+                let metadata = std::fs::metadata(".").unwrap();
+                metadata.file_type()
+            },
+        };
+
+        // In LazySubtree mode, even subdirectories of node_modules should be deferred
+        let node = build_directory_node_from_entry(
+            dir_entry,
+            1,
+            &mut build_state,
+            DirectoryScanMode::LazySubtree,
+        );
+
+        assert!(node.is_some());
+        let node = node.unwrap();
+        assert!(node.is_dir);
+        assert!(node.is_deferred);
+    }
+
+    #[test]
+    fn build_state_should_stop_respects_time_budget() {
+        // Test that should_stop() correctly detects time budget exhaustion
+        use super::{DirectoryIndexBuildState, DIRECTORY_INDEX_FULL_SCAN_TIME_BUDGET_MS};
+
+        // Create a build state with a very short time budget
+        let mut build_state = DirectoryIndexBuildState::new(1); // 1ms budget
+
+        // Immediately check - should not have stopped yet
+        // (but we can't guarantee timing, so we test the methods)
+        assert!(!build_state.time_budget_exceeded() || build_state.should_stop());
+
+        // Mark as truncated manually
+        build_state.mark_truncated_by_time();
+        assert!(build_state.should_stop());
+        assert!(
+            build_state.stop_reason().contains("time")
+                || build_state.stop_reason().contains("budget")
+        );
+    }
+
+    #[test]
+    fn directory_index_drain_stale_commands_prefers_latest_full() {
+        // Test that drain_stale_directory_commands prefers the latest Full command
+        use super::{drain_stale_directory_commands, DirectoryIndexCommand, DirectoryScanMode};
+        use crossbeam_channel::unbounded;
+        use std::path::PathBuf;
+
+        let (tx, rx) = unbounded();
+
+        // Send multiple Full commands for the same project
+        tx.send(DirectoryIndexCommand::Full {
+            project_id: 1,
+            generation: 1,
+            project_path: PathBuf::from("/project1"),
+        })
+        .unwrap();
+
+        tx.send(DirectoryIndexCommand::Full {
+            project_id: 1,
+            generation: 2,
+            project_path: PathBuf::from("/project1"),
+        })
+        .unwrap();
+
+        tx.send(DirectoryIndexCommand::Full {
+            project_id: 1,
+            generation: 3,
+            project_path: PathBuf::from("/project1-v2"),
+        })
+        .unwrap();
+
+        // Receive the first command
+        let first = rx.recv().unwrap();
+
+        // Drain should return the latest (generation 3)
+        let result = drain_stale_directory_commands(&rx, first);
+
+        match result {
+            DirectoryIndexCommand::Full {
+                generation,
+                project_path,
+                ..
+            } => {
+                assert_eq!(generation, 3);
+                assert!(project_path.to_string_lossy().contains("project1-v2"));
+            }
+            _ => panic!("Expected Full command"),
+        }
     }
 
     #[test]

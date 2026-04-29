@@ -1,0 +1,620 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e2]:
+    - region
+    - generic [ref=e3]:
+      - link "Skip to content" [ref=e4] [cursor=pointer]:
+        - /url: "#start-of-content"
+      - banner [ref=e6]:
+        - heading "Navigation Menu" [level=2] [ref=e7]
+        - generic [ref=e9]:
+          - button "Toggle navigation" [ref=e11] [cursor=pointer]
+          - link "Homepage" [ref=e17] [cursor=pointer]:
+            - /url: /
+            - img [ref=e18]
+          - generic [ref=e20]:
+            - link "Sign in" [ref=e21] [cursor=pointer]:
+              - /url: /login?return_to=https%3A%2F%2Fgithub.com%2Ffurkancak1r%2Fmergen-ade%2Fblob%2Fmain%2FAGENTS.md
+            - button "Appearance settings" [ref=e24] [cursor=pointer]:
+              - img
+    - main [ref=e28]:
+      - generic [ref=e29]:
+        - generic [ref=e30]:
+          - generic [ref=e32]:
+            - img [ref=e33]
+            - link "furkancak1r" [ref=e36] [cursor=pointer]:
+              - /url: /furkancak1r
+            - generic [ref=e37]: /
+            - strong [ref=e38]:
+              - link "mergen-ade" [ref=e39] [cursor=pointer]:
+                - /url: /furkancak1r/mergen-ade
+            - generic [ref=e40]: Public
+          - generic [ref=e41]:
+            - list:
+              - listitem [ref=e42]:
+                - link "You must be signed in to change notification settings" [ref=e43] [cursor=pointer]:
+                  - /url: /login?return_to=%2Ffurkancak1r%2Fmergen-ade
+                  - img [ref=e44]
+                  - text: Notifications
+              - listitem [ref=e46]:
+                - link "Fork 0" [ref=e47] [cursor=pointer]:
+                  - /url: /login?return_to=%2Ffurkancak1r%2Fmergen-ade
+                  - img [ref=e48]
+                  - text: Fork
+                  - generic "0" [ref=e50]
+              - listitem [ref=e51]:
+                - link "You must be signed in to star a repository" [ref=e53] [cursor=pointer]:
+                  - /url: /login?return_to=%2Ffurkancak1r%2Fmergen-ade
+                  - img [ref=e54]
+                  - text: Star
+                  - generic "6 users starred this repository" [ref=e56]: "6"
+        - navigation "Repository" [ref=e57]:
+          - list [ref=e58]:
+            - listitem [ref=e59]:
+              - link "Code" [ref=e60] [cursor=pointer]:
+                - /url: /furkancak1r/mergen-ade
+                - img [ref=e61]
+                - generic [ref=e63]: Code
+            - listitem [ref=e64]:
+              - link "Issues" [ref=e65] [cursor=pointer]:
+                - /url: /furkancak1r/mergen-ade/issues
+                - img [ref=e66]
+                - generic [ref=e69]: Issues
+            - listitem [ref=e70]:
+              - link "Pull requests" [ref=e71] [cursor=pointer]:
+                - /url: /furkancak1r/mergen-ade/pulls
+                - img [ref=e72]
+                - generic [ref=e74]: Pull requests
+            - listitem [ref=e75]:
+              - link "Actions" [ref=e76] [cursor=pointer]:
+                - /url: /furkancak1r/mergen-ade/actions
+                - img [ref=e77]
+                - generic [ref=e79]: Actions
+            - listitem [ref=e80]:
+              - link "Projects" [ref=e81] [cursor=pointer]:
+                - /url: /furkancak1r/mergen-ade/projects
+                - img [ref=e82]
+                - generic [ref=e84]: Projects
+            - listitem [ref=e85]:
+              - link "Security and quality" [ref=e86] [cursor=pointer]:
+                - /url: /furkancak1r/mergen-ade/security
+                - img [ref=e87]
+                - generic [ref=e89]: Security and quality
+            - listitem [ref=e90]:
+              - link "Insights" [ref=e91] [cursor=pointer]:
+                - /url: /furkancak1r/mergen-ade/pulse
+                - img [ref=e92]
+                - generic [ref=e94]: Insights
+      - generic [ref=e105]:
+        - generic [ref=e109]:
+          - generic [ref=e110]:
+            - heading "Expand file tree" [level=2] [ref=e112]:
+              - button "Expand file tree" [ref=e113] [cursor=pointer]:
+                - img [ref=e114]
+            - button "main branch" [ref=e118] [cursor=pointer]:
+              - generic [ref=e119]:
+                - generic [ref=e121]:
+                  - img [ref=e123]
+                  - generic [ref=e126]: main
+                - generic:
+                  - img
+            - generic [ref=e128]:
+              - navigation "Breadcrumbs" [ref=e129]:
+                - heading "Breadcrumbs" [level=2] [ref=e130]
+                - list [ref=e131]:
+                  - listitem [ref=e132]:
+                    - link "mergen-ade" [ref=e133] [cursor=pointer]:
+                      - /url: /furkancak1r/mergen-ade/tree/main
+              - generic [ref=e134]:
+                - text: /
+                - heading "AGENTS.md" [level=1] [ref=e135]
+              - button "Copy path" [ref=e136] [cursor=pointer]:
+                - img [ref=e137]
+          - generic [ref=e142]:
+            - generic [ref=e145]:
+              - img [ref=e147]
+              - combobox "Go to file" [ref=e149]
+            - button "More file actions" [ref=e150] [cursor=pointer]:
+              - img [ref=e151]
+        - generic [ref=e153]:
+          - generic [ref=e155]:
+            - heading "Latest commit" [level=2] [ref=e156]
+            - generic [ref=e157]:
+              - generic [ref=e158]:
+                - generic [ref=e160]:
+                  - img "Furkan Çakır" [ref=e161]
+                  - img "Furkan Çakır" [ref=e162]
+                - generic "Furkan Çakır" [ref=e164]
+                - generic [ref=e165]: and
+                - generic "Furkan Çakır" [ref=e167]
+              - generic [ref=e168]:
+                - link "Arka plan terminal geçmişini çalışma zamanına özgü yap ve yeniden çal…" [ref=e171] [cursor=pointer]:
+                  - /url: /furkancak1r/mergen-ade/commit/4ec6670dea0722fab66327467a8b169c151e43be
+                - button "Open commit details" [ref=e172] [cursor=pointer]:
+                  - img [ref=e173]
+            - generic [ref=e175]:
+              - generic [ref=e177]:
+                - link "Commit 4ec6670" [ref=e178] [cursor=pointer]:
+                  - /url: /furkancak1r/mergen-ade/commit/4ec6670dea0722fab66327467a8b169c151e43be
+                  - text: 4ec6670
+                - text: ·
+                - generic "Apr 28, 2026, 12:35 PM GMT+3" [ref=e179]: Apr 28, 2026yesterday
+              - generic [ref=e180]:
+                - heading "History" [level=2] [ref=e181]
+                - link "View commit history for this file." [ref=e183] [cursor=pointer]:
+                  - /url: /furkancak1r/mergen-ade/commits/main/AGENTS.md
+                  - generic [ref=e184]:
+                    - generic:
+                      - img
+          - generic [ref=e186]:
+            - generic "11.7 KB" [ref=e190]: 109 lines (96 loc) · 11.7 KB
+            - generic [ref=e192]:
+              - heading "File metadata and controls" [level=2] [ref=e193]
+              - list "File view" [ref=e195]:
+                - listitem [ref=e196]:
+                  - button "Preview" [ref=e197] [cursor=pointer]:
+                    - generic [ref=e199]: Preview
+                - listitem [ref=e200]:
+                  - button "Code" [ref=e201] [cursor=pointer]:
+                    - generic [ref=e203]: Code
+                - listitem [ref=e204]:
+                  - button "Blame" [ref=e205] [cursor=pointer]:
+                    - generic [ref=e207]: Blame
+              - generic [ref=e208]:
+                - generic [ref=e209]:
+                  - generic [ref=e210]:
+                    - link "Raw" [ref=e212] [cursor=pointer]:
+                      - /url: https://github.com/furkancak1r/mergen-ade/raw/refs/heads/main/AGENTS.md
+                      - generic [ref=e214]: Raw
+                    - button "Copy raw file" [ref=e216] [cursor=pointer]:
+                      - img [ref=e217]
+                    - button "Download raw file" [ref=e221] [cursor=pointer]:
+                      - img [ref=e222]
+                  - generic [ref=e225]:
+                    - button "You must be signed in to make or propose changes" [disabled] [ref=e227]:
+                      - img [ref=e228]
+                    - button "More edit options" [ref=e231] [cursor=pointer]:
+                      - img [ref=e232]
+                - button "Outline" [ref=e234] [cursor=pointer]:
+                  - img [ref=e235]
+            - region [ref=e238]:
+              - article [ref=e240]:
+                - generic [ref=e241]:
+                  - heading "Repository Guidelines" [level=1] [ref=e242]
+                  - 'link "Permalink: Repository Guidelines" [ref=e243] [cursor=pointer]':
+                    - /url: "#repository-guidelines"
+                    - img [ref=e244]
+                - generic [ref=e246]:
+                  - heading "Project Structure & Module Organization" [level=2] [ref=e247]
+                  - 'link "Permalink: Project Structure & Module Organization" [ref=e248] [cursor=pointer]':
+                    - /url: "#project-structure--module-organization"
+                    - img [ref=e249]
+                - list [ref=e251]:
+                  - listitem [ref=e252]:
+                    - code [ref=e253]: src/main.rs
+                    - text: ": app entrypoint and native window startup."
+                  - listitem [ref=e254]:
+                    - code [ref=e255]: src/app.rs
+                    - text: ": UI composition (top bar, activity rail, collapsible side panels, terminal manager, main tiled panes) and app state flow."
+                  - listitem [ref=e256]:
+                    - code [ref=e257]: src/terminal.rs
+                    - text: ": terminal runtime, PTY integration, event forwarding, snapshot rendering data."
+                  - listitem [ref=e258]:
+                    - code [ref=e259]: src/layout.rs
+                    - text: ": auto-tiling grid math and related unit tests."
+                  - listitem [ref=e260]:
+                    - code [ref=e261]: src/title.rs
+                    - text: ": terminal title update/truncation logic and unit tests."
+                  - listitem [ref=e262]:
+                    - code [ref=e263]: src/config.rs
+                    - text: +
+                    - code [ref=e264]: src/models.rs
+                    - text: ": persisted TOML config schema and load/save behavior."
+                  - listitem [ref=e265]:
+                    - code [ref=e266]: .github/workflows/release.yml
+                    - text: ": GitHub release pipeline for Windows ZIP and signed/notarized macOS ARM64 DMG assets."
+                  - listitem [ref=e267]:
+                    - text: Build artifacts are in
+                    - code [ref=e268]: target/
+                    - text: (do not commit).
+                - generic [ref=e269]:
+                  - heading "Build, Test, and Development Commands" [level=2] [ref=e270]
+                  - 'link "Permalink: Build, Test, and Development Commands" [ref=e271] [cursor=pointer]':
+                    - /url: "#build-test-and-development-commands"
+                    - img [ref=e272]
+                - list [ref=e274]:
+                  - listitem [ref=e275]:
+                    - code [ref=e276]: cargo build --release
+                    - text: ": default local production build using the repo MSVC target configuration."
+                  - listitem [ref=e277]:
+                    - code [ref=e278]: cargo build --release --target x86_64-pc-windows-msvc
+                    - text: ":"
+                    - strong [ref=e279]: supported Windows release binary
+                    - text: (
+                    - code [ref=e280]: target/x86_64-pc-windows-msvc/release/mergen-ade.exe
+                    - text: ). Use this command to update the release executable.
+                  - listitem [ref=e281]:
+                    - strong [ref=e282]: To update the release executable
+                    - text: ": Always use"
+                    - code [ref=e283]: cargo build --release --target x86_64-pc-windows-msvc
+                    - text: (not the default target) to ensure the binary is placed at the correct path.
+                  - listitem [ref=e284]:
+                    - code [ref=e285]: cargo build --release --target x86_64-pc-windows-gnullvm
+                    - text: ": optional local build via repo-local LLVM-MinGW linker."
+                  - listitem [ref=e286]:
+                    - code [ref=e287]: cargo build --release --target aarch64-apple-darwin
+                    - text: ": native macOS build used by the release workflow before signing/notarization packaging."
+                  - listitem [ref=e288]:
+                    - code [ref=e289]: cargo run --release
+                    - text: ": run optimized build locally using the same default target."
+                  - listitem [ref=e290]:
+                    - code [ref=e291]: cargo test
+                    - text: ": run unit tests (layout, title, terminal helpers)."
+                  - listitem [ref=e292]:
+                    - code [ref=e293]: cargo fmt
+                    - text: ": format Rust sources before commit."
+                - paragraph [ref=e294]:
+                  - text: If
+                  - code [ref=e295]: cargo
+                  - text: "is not on PATH in PowerShell, use:"
+                  - code [ref=e296]: $env:USERPROFILE\.cargo\bin\cargo.exe <command>
+                  - text: .
+                - generic [ref=e297]:
+                  - heading "Coding Style & Naming Conventions" [level=2] [ref=e298]
+                  - 'link "Permalink: Coding Style & Naming Conventions" [ref=e299] [cursor=pointer]':
+                    - /url: "#coding-style--naming-conventions"
+                    - img [ref=e300]
+                - list [ref=e302]:
+                  - listitem [ref=e303]: Rust 2021, 4-space indentation, UTF-8, LF/CRLF handled by Git.
+                  - listitem [ref=e304]: Keep modules focused; prefer small functions over large mixed-responsibility blocks.
+                  - listitem [ref=e305]:
+                    - text: "Naming:"
+                    - code [ref=e306]: snake_case
+                    - text: for functions/modules,
+                    - code [ref=e307]: PascalCase
+                    - text: for types,
+                    - code [ref=e308]: SCREAMING_SNAKE_CASE
+                    - text: for constants.
+                  - listitem [ref=e309]: Avoid heavy dependencies; preserve the low-memory, native-first design.
+                  - listitem [ref=e310]: Keep UI controls visually lightweight; prefer minimal icon-first interactions over heavy bordered button chrome unless emphasis is required.
+                  - listitem [ref=e311]:
+                    - text: Run
+                    - code [ref=e312]: cargo fmt
+                    - text: after edits; keep warnings minimal and intentional.
+                - generic [ref=e313]:
+                  - heading "Testing Guidelines" [level=2] [ref=e314]
+                  - 'link "Permalink: Testing Guidelines" [ref=e315] [cursor=pointer]':
+                    - /url: "#testing-guidelines"
+                    - img [ref=e316]
+                - list [ref=e318]:
+                  - listitem [ref=e319]:
+                    - text: Use inline unit tests (
+                    - code [ref=e320]: "#[cfg(test)]"
+                    - text: ) in the same module where logic lives.
+                  - listitem [ref=e321]: Test behavior, not implementation details.
+                  - listitem [ref=e322]:
+                    - text: Prefer descriptive test names like
+                    - code [ref=e323]: wide_viewport_prefers_more_columns
+                    - text: .
+                  - listitem [ref=e324]:
+                    - text: "Minimum expectation for feature changes:"
+                    - list [ref=e325]:
+                      - listitem [ref=e326]: Update/add tests in affected modules.
+                      - listitem [ref=e327]:
+                        - text: Ensure
+                        - code [ref=e328]: cargo test
+                        - text: passes locally.
+                - generic [ref=e329]:
+                  - heading "Commit & Pull Request Guidelines" [level=2] [ref=e330]
+                  - 'link "Permalink: Commit & Pull Request Guidelines" [ref=e331] [cursor=pointer]':
+                    - /url: "#commit--pull-request-guidelines"
+                    - img [ref=e332]
+                - list [ref=e334]:
+                  - listitem [ref=e335]:
+                    - text: "Follow existing history style: short, imperative subject lines (examples:"
+                    - code [ref=e336]: Fix terminal input focus
+                    - text: ","
+                    - code [ref=e337]: Add release workflow
+                    - text: ).
+                  - listitem [ref=e338]: Keep commits scoped to one concern when possible.
+                  - listitem [ref=e339]:
+                    - text: "PRs should include:"
+                    - list [ref=e340]:
+                      - listitem [ref=e341]: What changed and why.
+                      - listitem [ref=e342]:
+                        - text: Validation steps (
+                        - code [ref=e343]: cargo test
+                        - text: ", manual run notes)."
+                      - listitem [ref=e344]: UI screenshots/GIFs for visible behavior changes.
+                      - listitem [ref=e345]: Any platform-specific assumptions or limitations, especially Windows-first runtime behavior and macOS signing/notarization requirements.
+                - generic [ref=e346]:
+                  - heading "Security & Configuration Notes" [level=2] [ref=e347]
+                  - 'link "Permalink: Security & Configuration Notes" [ref=e348] [cursor=pointer]':
+                    - /url: "#security--configuration-notes"
+                    - img [ref=e349]
+                - list [ref=e351]:
+                  - listitem [ref=e352]: Do not commit local paths, secrets, or generated executables.
+                  - listitem [ref=e353]:
+                    - text: Config is user-local via
+                    - code [ref=e354]: ProjectDirs
+                    - text: ; on Windows this maps under
+                    - code [ref=e355]: "%APPDATA%"
+                    - text: . Treat it as runtime data, not source-controlled state.
+                  - listitem [ref=e356]:
+                    - text: "Official macOS releases require GitHub secrets for Apple signing and notarization:"
+                    - code [ref=e357]: APPLE_DEVELOPER_ID_APP_CERT_BASE64
+                    - text: ","
+                    - code [ref=e358]: APPLE_DEVELOPER_ID_APP_CERT_PASSWORD
+                    - text: ","
+                    - code [ref=e359]: APPLE_DEVELOPER_IDENTITY
+                    - text: ","
+                    - code [ref=e360]: APPLE_NOTARY_API_KEY_ID
+                    - text: ","
+                    - code [ref=e361]: APPLE_NOTARY_API_ISSUER_ID
+                    - text: ","
+                    - code [ref=e362]: APPLE_NOTARY_API_PRIVATE_KEY_BASE64
+                    - text: .
+                  - listitem [ref=e363]: Public repository status is acceptable for this flow because signing material stays in GitHub Actions secrets and the release workflow is tag-push based; do not write signing material into tracked files or logs.
+                - generic [ref=e364]:
+                  - heading "Known Issues Maintenance" [level=2] [ref=e365]
+                  - 'link "Permalink: Known Issues Maintenance" [ref=e366] [cursor=pointer]':
+                    - /url: "#known-issues-maintenance"
+                    - img [ref=e367]
+                - list [ref=e369]:
+                  - listitem [ref=e370]:
+                    - text: Keep
+                    - code [ref=e371]: KNOWN_ISSUES.md
+                    - text: up to date whenever a bug is diagnosed and fixed or a recurring failure mode is identified.
+                  - listitem [ref=e372]:
+                    - text: Treat
+                    - code [ref=e373]: KNOWN_ISSUES.md
+                    - text: as append-only unless the user explicitly asks for a cleanup or rewrite; prefer adding a new dated entry over rewriting history.
+                  - listitem [ref=e374]: Record the symptom, root cause, resolution summary, and concrete references (commit/PR/issue) so later regressions can be traced quickly.
+                - generic [ref=e375]:
+                  - heading "Subagent Usage Policy" [level=2] [ref=e376]
+                  - 'link "Permalink: Subagent Usage Policy" [ref=e377] [cursor=pointer]':
+                    - /url: "#subagent-usage-policy"
+                    - img [ref=e378]
+                - list [ref=e380]:
+                  - listitem [ref=e381]: For any non-trivial implementation, debugging, or review task, use subagents instead of running everything in a single agent.
+                  - listitem [ref=e382]:
+                    - text: "When work can be split safely, delegate independent parts in parallel (for example:"
+                    - code [ref=e383]: explorer
+                    - text: for discovery,
+                    - code [ref=e384]: fast_code
+                    - text: for implementation,
+                    - code [ref=e385]: test
+                    - text: for verification,
+                    - code [ref=e386]: reviewer
+                    - text: for risk checks).
+                  - listitem [ref=e387]: Respect the configured concurrency limit and do not exceed 4 parallel subagent threads.
+                  - listitem [ref=e388]: Keep urgent critical-path edits local only when delegation would block progress; otherwise prefer delegation first.
+                  - listitem [ref=e389]: In handoff/final notes, summarize which subagents were used and what each one produced.
+                - generic [ref=e390]:
+                  - heading "AI CLI Integration" [level=2] [ref=e391]
+                  - 'link "Permalink: AI CLI Integration" [ref=e392] [cursor=pointer]':
+                    - /url: "#ai-cli-integration"
+                    - img [ref=e393]
+                - list [ref=e395]:
+                  - listitem [ref=e396]:
+                    - strong [ref=e397]: "Supported AI tools:"
+                    - code [ref=e398]: Factory Droid
+                    - text: ","
+                    - code [ref=e399]: Codex CLI
+                    - text: ","
+                    - code [ref=e400]: OpenCode
+                    - text: ", and"
+                    - code [ref=e401]: Claude Code
+                    - text: are supported. Codex CLI uses hook-only integration.
+                  - listitem [ref=e402]:
+                    - strong [ref=e403]: "Factory Droid hook format:"
+                    - text: Only
+                    - code [ref=e404]: droid-hook:*
+                    - text: and
+                    - code [ref=e405]: factory-droid-hook:*
+                    - text: format patterns are recognized for Factory Droid. The
+                    - code [ref=e406]: claude-hook:*
+                    - text: format is not supported.
+                  - listitem [ref=e407]:
+                    - strong [ref=e408]: "Factory Droid detection commands:"
+                    - text: Only
+                    - code [ref=e409]: droid
+                    - text: and
+                    - code [ref=e410]: factory
+                    - text: trigger Factory Droid session detection. Do not add
+                    - code [ref=e411]: cc
+                    - text: ","
+                    - code [ref=e412]: claude
+                    - text: ", or other AI CLI commands."
+                  - listitem [ref=e413]:
+                    - strong [ref=e414]: "OpenCode detection commands:"
+                    - code [ref=e415]: opencode
+                    - text: triggers OpenCode session detection. OpenCode is tracked through explicit launch detection, process-based status, visible UI/title parsing, notify/inbox status paths, and the Mergen-owned
+                    - code [ref=e416]: mergen-opencode-status.js
+                    - text: plugin. If OpenCode hangs at
+                    - code [ref=e417]: Loading plugins
+                    - text: ", inspect MCP startup load before disabling the plugin path."
+                  - listitem [ref=e418]:
+                    - strong [ref=e419]: "Codex CLI integration:"
+                    - text: Codex uses strict hook-only integration with narrow visible-state exceptions. Mergen configures
+                    - code [ref=e420]: hooks.json
+                    - text: with
+                    - code [ref=e421]: UserPromptSubmit
+                    - text: ","
+                    - code [ref=e422]: PreToolUse
+                    - text: ","
+                    - code [ref=e423]: PermissionRequest
+                    - text: ","
+                    - code [ref=e424]: PostToolUse
+                    - text: ", and"
+                    - code [ref=e425]: Stop
+                    - text: "events that route to the Mergen bridge. The status transitions are:"
+                    - list [ref=e426]:
+                      - listitem [ref=e427]:
+                        - code [ref=e428]: UserPromptSubmit
+                        - text: ","
+                        - code [ref=e429]: PreToolUse
+                        - text: ", and"
+                        - code [ref=e430]: PostToolUse
+                        - text: hooks → Running (gray spinner)
+                      - listitem [ref=e431]:
+                        - code [ref=e432]: PermissionRequest
+                        - text: hook →
+                        - code [ref=e433]: ApprovalRequested
+                        - text: / amber pulse (waiting for user)
+                      - listitem [ref=e434]:
+                        - code [ref=e435]: Stop
+                        - text: hook → short debounce, then
+                        - code [ref=e436]: TurnComplete
+                        - text: / green pulse unless follow-up work arrives first
+                      - listitem [ref=e437]:
+                        - strong [ref=e438]: "Question prompt exception:"
+                        - text: When Codex shows a question UI ("Question X/Y" with "enter to submit answer"), a narrow visible detection triggers
+                        - code [ref=e439]: UserInputRequested
+                        - text: attention with amber pulse. This handles the case where the turn is waiting for user input but the Stop hook hasn't fired yet.
+                      - listitem [ref=e440]:
+                        - strong [ref=e441]: "Interrupt banner exception:"
+                        - text: When Codex renders the strict interrupted-turn banner (
+                        - code [ref=e442]: conversation interrupted
+                        - text: plus
+                        - code [ref=e443]: /feedback
+                        - text: ), narrow visible detection clears the running spinner without clearing the live Codex session/process tracking.
+                      - listitem [ref=e444]: No notify, BEL, or title fallback is used for Codex.
+                      - listitem [ref=e445]:
+                        - strong [ref=e446]: "Routing:"
+                        - text: Uses tool-specific
+                        - code [ref=e447]: MERGEN_ADE_CODEX_INBOX_DIR
+                        - text: env var to avoid collisions with OpenCode's shared
+                        - code [ref=e448]: MERGEN_AI_INBOX_DIR
+                        - text: .
+                      - listitem [ref=e449]:
+                        - strong [ref=e450]: "Hook configuration:"
+                        - text: Managed hooks intentionally omit
+                        - code [ref=e451]: statusMessage
+                        - text: "to prevent Codex from displaying status text (e.g., \"Running Stop hook: Mergen: session stopped\") in the terminal."
+                      - listitem [ref=e452]:
+                        - strong [ref=e453]: "Redraw filtering:"
+                        - text: The
+                        - code [ref=e454]: CodexRedrawFilter
+                        - text: only suppresses
+                        - code [ref=e455]: ED3
+                        - text: (scrollback erase) during synchronized update blocks. Cursor positioning sequences (
+                        - code [ref=e456]: ESC[H
+                        - text: ","
+                        - code [ref=e457]: ESC[1;1H
+                        - text: ","
+                        - code [ref=e458]: ESC[f
+                        - text: ) and
+                        - code [ref=e459]: ED2
+                        - text: (erase display) are preserved to prevent diagonal/stair-step rendering artifacts.
+                      - listitem [ref=e460]:
+                        - strong [ref=e461]: "Keyboard routing:"
+                        - text: During question prompts (
+                        - code [ref=e462]: UserInputRequested
+                        - text: attention), raw keyboard events (including Escape, arrow keys, Tab) are routed to the terminal using the same mechanism as OpenCode/Factory Droid interactive attention states.
+                  - listitem [ref=e463]:
+                    - strong [ref=e464]: "Claude Code integration:"
+                    - text: Claude uses title-based detection (Orca-compatible). Title patterns are detected via OSC title updates.
+                  - listitem [ref=e465]:
+                    - strong [ref=e466]: "UI labels:"
+                    - text: Use "Droid", "Factory Droid", "Codex CLI", "OpenCode", and "Claude" terminology. Do not use "claude" lowercase references in user-facing text.
+                  - listitem [ref=e467]:
+                    - strong [ref=e468]: "Event triggers:"
+                    - text: Factory Droid uses
+                    - code [ref=e469]: UserPromptSubmit
+                    - text: → Running (green pulse) and
+                    - code [ref=e470]: Stop
+                    - text: "/notification → Attention (yellow pulse). Codex CLI uses hook-only: prompt/tool hooks → Running,"
+                    - code [ref=e471]: PermissionRequest
+                    - text: → amber attention, debounced
+                    - code [ref=e472]: Stop
+                    - text: → turn-complete attention, and the strict interrupt banner → clear running spinner. OpenCode uses explicit launch detection plus process-based tracking for spinner/pulse status. Claude uses title-based detection.
+                  - listitem [ref=e473]:
+                    - strong [ref=e474]: "Plan mode skill restriction:"
+                    - text: If you are Codex, OpenCode, or Droid, do not use the plan mode skill from Claude Code's configuration. The plan mode skill is exclusively for
+                    - code [ref=e475]: cc
+                    - text: (Claude Code) sessions only.
+                - generic [ref=e476]:
+                  - heading "Terminal Input & History Invariants" [level=2] [ref=e477]
+                  - 'link "Permalink: Terminal Input & History Invariants" [ref=e478] [cursor=pointer]':
+                    - /url: "#terminal-input--history-invariants"
+                    - img [ref=e479]
+                - list [ref=e481]:
+                  - listitem [ref=e482]:
+                    - code [ref=e483]: pending_line_for_title
+                    - text: is for title/AI command detection only; it clears on newlines (\r or \n) since titles should reflect only the current logical line. This buffer is capped to
+                    - code [ref=e484]: TERMINAL_PENDING_LINE_MAX_CHARS
+                    - text: (512) to prevent unbounded growth.
+                  - listitem [ref=e485]:
+                    - code [ref=e486]: pending_input_for_history
+                    - text: preserves the complete raw input including multi-line content and Unicode characters (e.g., box-drawing characters like
+                    - code [ref=e487]: ┃
+                    - text: ). This buffer is
+                    - strong [ref=e488]: NOT
+                    - text: capped—full prompts of any length must be preserved for history and rerun functionality.
+                  - listitem [ref=e489]:
+                    - text: When Enter is pressed, history is recorded from
+                    - code [ref=e490]: pending_input_for_history
+                    - text: (taking the full raw text), while title updates use
+                    - code [ref=e491]: pending_line_for_title
+                    - text: (taking only the last logical line).
+                  - listitem [ref=e492]:
+                    - text: Runtime
+                    - code [ref=e493]: recent_inputs
+                    - text: (for tooltips and rerun) must be populated from the raw
+                    - code [ref=e494]: history_line
+                    - text: ", not the sanitized title candidate. This ensures multi-line prompts appear correctly in Terminal Manager and background rerun replays the full command."
+                  - listitem [ref=e495]: Backspace pops from both buffers to keep them in sync for single-character deletion.
+                  - listitem [ref=e496]:
+                    - text: Always use char-safe truncation helpers (e.g.,
+                    - code [ref=e497]: capped_hover_text()
+                    - text: ) for UI display of user text; never use byte-index slicing like
+                    - code [ref=e498]: text[..60]
+                    - text: which can panic on multi-byte UTF-8 sequences or split Unicode code points.
+                - generic [ref=e499]:
+                  - heading "Concurrent AI Sessions" [level=2] [ref=e500]
+                  - 'link "Permalink: Concurrent AI Sessions" [ref=e501] [cursor=pointer]':
+                    - /url: "#concurrent-ai-sessions"
+                    - img [ref=e502]
+                - list [ref=e504]:
+                  - listitem [ref=e505]: Sen (AI agent) çalışırken başka bir AI agent'ı da aynı anda çalışıyor olabilir.
+                  - listitem [ref=e506]: Eğer dosyalarda veya kodda başka birinin yaptığı değişiklikleri fark edersen, bu değişikliklere müdahale etme.
+                  - listitem [ref=e507]: Kendi işlemlerine devam et; başkasının yaptığı değişiklikleri değiştirme, silme veya üzerine yazma.
+                  - listitem [ref=e508]: Çakışma olursa kullanıcıya danış; tek başına karar verip başkasının işini bozma.
+                - generic [ref=e509]:
+                  - heading "Terminal Manager & Input History Guidelines" [level=2] [ref=e510]
+                  - 'link "Permalink: Terminal Manager & Input History Guidelines" [ref=e511] [cursor=pointer]':
+                    - /url: "#terminal-manager--input-history-guidelines"
+                    - img [ref=e512]
+                - list [ref=e514]:
+                  - listitem [ref=e515]:
+                    - strong [ref=e516]: Background terminals use runtime-only input history
+                    - text: ": Do not persist background terminal inputs to"
+                    - code [ref=e517]: history.json
+                    - text: . They use
+                    - code [ref=e518]: recent_inputs
+                    - text: (runtime-only) for the rerun/interrupt button.
+                  - listitem [ref=e519]:
+                    - strong [ref=e520]: Foreground terminals persist input history
+                    - text: ": Foreground terminal inputs are recorded to persistent history and shown in the global Input History panel."
+                  - listitem [ref=e521]:
+                    - strong [ref=e522]: Background rerun/interrupt behavior
+                    - text: ": The background Terminal Manager row shows a refresh (rerun) button that becomes an X (interrupt) button when"
+                    - code [ref=e523]: AiCliStatus::Running
+                    - text: is detected. When clicked while running, it sends
+                    - code [ref=e524]: "0x03"
+                    - text: (Ctrl+C) to the terminal; when idle, it reruns the most recent command from
+                    - code [ref=e525]: recent_inputs
+                    - text: .
+                  - listitem [ref=e526]:
+                    - strong [ref=e527]: Rerun must replay the full stored command
+                    - text: ": Background rerun sends the complete"
+                    - code [ref=e528]: recent_inputs[0]
+                    - text: content (including multi-line content and Unicode), not a trimmed or title-only version. The full raw input is preserved specifically for this purpose.
+                  - listitem [ref=e529]:
+                    - strong [ref=e530]: Do not interpolate GitHub contexts directly
+                    - text: ": In workflow"
+                    - code [ref=e531]: "run:"
+                    - text: steps, use environment variables instead of direct
+                    - code [ref=e532]: "${{ github.ref_name }}"
+                    - text: interpolation to avoid shell injection risks (per Semgrep findings).
+  - alert [ref=e536]

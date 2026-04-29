@@ -59,6 +59,20 @@ If `cargo` is not on PATH in PowerShell, use:
 - Treat `KNOWN_ISSUES.md` as append-only unless the user explicitly asks for a cleanup or rewrite; prefer adding a new dated entry over rewriting history.
 - Record the symptom, root cause, resolution summary, and concrete references (commit/PR/issue) so later regressions can be traced quickly.
 
+## Directory Indexing Performance Guidelines
+- Directory tree indexing must never block the UI thread. Do not use blocking sends or synchronous recursive filesystem scans from egui rendering paths.
+- **Initial indexing must be shallow**: only read the root directory's immediate children. All child directories must be deferred regardless of name; do not recursively scan any directory during initial project open.
+- **Lazy subtree loading must be one-level-only**: when a deferred directory is expanded, load only its immediate children. Child directories discovered during this load must also be deferred.
+- Use `DirectoryScanMode::InitialRoot` for the first project scan and `DirectoryScanMode::LazySubtree` for on-demand expansion. Do not use boolean `allow_defer` flags.
+- Large/generated directories such as `.git`, `target`, `node_modules`, `.next`, `dist`, `build`, caches, and virtual environments are automatically deferred by the shallow scan behavior.
+- Time budgets must be enforced as **hard stops** inside entry iteration and child construction loops, not just at function boundaries. Check `should_stop()` before every expensive operation.
+- Prefer `DirEntry::file_type()` over `fs::symlink_metadata(path)` and `path.is_dir()` to minimize filesystem calls.
+- Prefer fast partial snapshots over waiting for a complete tree. The Directory panel should become usable immediately.
+- `partial_warning` should remain internal state only; do not display it in the Directory panel UI.
+- Preserve symlink safeguards: never recursively descend into symlinked directories.
+- The worker thread should drain stale commands and prefer the latest `Full` command per project to avoid processing outdated requests.
+- Add regression tests whenever directory indexing, deferred loading, or tree rendering behavior changes.
+
 ## Subagent Usage Policy
 - For any non-trivial implementation, debugging, or review task, use subagents instead of running everything in a single agent.
 - When work can be split safely, delegate independent parts in parallel (for example: `explorer` for discovery, `fast_code` for implementation, `test` for verification, `reviewer` for risk checks).

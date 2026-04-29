@@ -1,5 +1,65 @@
 ### Known Issues & Fix Log
 
+#### Directory index time budget was advisory instead of a hard stop {#directory-index-time-budget-hard-stop}
+- Date: 2026-04-29 (follow-up)
+- Context: Directory sidebar indexing still blocking for 20+ seconds despite 150ms time budget
+- Error signature: `Directory panel keeps showing "Indexing files..." for 20+ seconds`
+- Symptoms/Impact:
+  1. Time budget was only checked at function boundaries, not inside expensive loops.
+  2. Non-heavy directories were still recursively scanned during initial indexing.
+  3. Subtree loading disabled deferral (`allow_defer=false`), causing full recursive scan when expanding folders like `node_modules`.
+  4. Extra filesystem metadata calls (`path.is_dir()` after `symlink_metadata()`) caused Windows filesystem overhead.
+  5. Stale worker commands could queue up and delay the latest refresh request.
+- Root cause:
+  1. `time_budget_exceeded()` was only checked at the start of `read_directory_children()`, not during entry iteration.
+  2. The scan continued processing all collected entries even after time budget expired.
+  3. No hard-stop mechanism existed inside child node construction loops.
+  4. Recursive scanning happened for all non-heavy directories regardless of scan mode.
+- Resolution:
+  - Replaced boolean `allow_defer` with explicit `DirectoryScanMode` enum (`InitialRoot`, `LazySubtree`).
+  - Implemented shallow indexing: initial scan reads only root-level children, all child directories deferred.
+  - Implemented one-level lazy subtree loading: expanding a folder loads only its immediate children.
+  - Added hard-stop checks (`should_stop()`) inside entry iteration and child construction loops.
+  - Reduced filesystem calls by using `DirEntry::file_type()` directly instead of `path.is_dir()`.
+  - Added worker command draining to prefer latest `Full` command per project.
+  - Added regression tests for shallow scan behavior and hard-stop enforcement.
+- Prevent recurrence:
+  - Initial scan must never recurse; use `DirectoryScanMode::InitialRoot`.
+  - Lazy expansion must be bounded to one level; use `DirectoryScanMode::LazySubtree`.
+  - Time budget must be enforced as hard stop inside all loops.
+  - Prefer `DirEntry` metadata over path-based lookups.
+  - Worker must drain stale commands before processing.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: 2026-04-29 user report that loading still took 20+ seconds; follow-up to directory-index-large-project-fast-open.
+
+#### Directory index no longer blocks large project opens {#directory-index-large-project-fast-open}
+- Date: 2026-04-29
+- Context: Directory sidebar indexing and large project startup performance
+- Error signature: `Directory panel keeps indexing and large projects may not open responsively`
+- Symptoms/Impact:
+  1. Projects with very large folders such as `node_modules`, `target`, `.git`, `dist`, or cache directories could keep the Directory panel indexing for too long.
+  2. The UI could become unresponsive because directory index requests used a bounded channel with blocking `send()` from the UI path.
+  3. The index worker only returned a snapshot after the recursive scan completed, so users saw no usable tree for large repositories.
+- Root cause:
+  1. Directory index command/event channels were bounded and could block the UI thread under queue pressure.
+  2. Initial indexing recursively walked generated/heavy folders instead of deferring them.
+  3. Recursive scanning had node/depth caps but no short time budget, so slow filesystem traversal could delay the first usable snapshot.
+  4. Sorting directory children repeatedly allocated display strings during comparisons.
+- Resolution:
+  - Changed directory index channels to unbounded to prevent UI-thread blocking.
+  - Added fast initial indexing with deferred heavy/generated directories (`.git`, `target`, `node_modules`, `.next`, `dist`, `build`, caches, venvs).
+  - Added bounded time-budget behavior (150ms for full scan, 100ms for subtree) so partial snapshots are returned quickly.
+  - Added lazy subtree loading when deferred folders are expanded.
+  - Optimized directory child sorting by avoiding repeated path string allocation in comparisons.
+  - Partial/deferred status is tracked internally but not displayed as UI warning to keep the directory panel clean; heavy folders appear as deferred entries that load on demand when expanded.
+- Prevent recurrence:
+  - Never perform blocking channel sends or recursive filesystem work from egui render/update paths.
+  - Keep generated folders deferred or on-demand by default.
+  - Preserve node, depth, and time limits for directory indexing.
+  - Keep regression coverage for large generated folders, deferred expansion, symlink recursion prevention, and partial snapshots.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: 2026-04-29 user report that Directory indexing can prevent large projects from opening quickly; Zed worktree behavior uses background scanning and unloaded/deferred directories.
+
 #### OpenCode AI model configuration with switchable slots {#opencode-model-configuration-slots}
 - Date: 2026-04-29
 - Context: Settings UI / OpenCode integration

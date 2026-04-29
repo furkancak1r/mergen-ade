@@ -1,0 +1,1146 @@
+- generic [ref=e2]:
+  - region
+  - generic [ref=e3]:
+    - link "Skip to content" [ref=e4] [cursor=pointer]:
+      - /url: "#start-of-content"
+    - banner [ref=e6]:
+      - heading "Navigation Menu" [level=2] [ref=e7]
+      - generic [ref=e9]:
+        - button "Toggle navigation" [ref=e11] [cursor=pointer]
+        - link "Homepage" [ref=e17] [cursor=pointer]:
+          - /url: /
+          - img [ref=e18]
+        - generic [ref=e20]:
+          - link "Sign in" [ref=e21] [cursor=pointer]:
+            - /url: /login?return_to=https%3A%2F%2Fgithub.com%2Ffurkancak1r%2Fmergen-ade
+          - button "Appearance settings" [ref=e24] [cursor=pointer]:
+            - img
+  - main [ref=e28]:
+    - generic [ref=e29]:
+      - generic [ref=e30]:
+        - generic [ref=e32]:
+          - img [ref=e33]
+          - link "furkancak1r" [ref=e36] [cursor=pointer]:
+            - /url: /furkancak1r
+          - generic [ref=e37]: /
+          - strong [ref=e38]:
+            - link "mergen-ade" [ref=e39] [cursor=pointer]:
+              - /url: /furkancak1r/mergen-ade
+          - generic [ref=e40]: Public
+        - generic [ref=e41]:
+          - list:
+            - listitem [ref=e42]:
+              - link "You must be signed in to change notification settings" [ref=e43] [cursor=pointer]:
+                - /url: /login?return_to=%2Ffurkancak1r%2Fmergen-ade
+                - img [ref=e44]
+                - text: Notifications
+            - listitem [ref=e46]:
+              - link "Fork 0" [ref=e47] [cursor=pointer]:
+                - /url: /login?return_to=%2Ffurkancak1r%2Fmergen-ade
+                - img [ref=e48]
+                - text: Fork
+                - generic "0" [ref=e50]
+            - listitem [ref=e51]:
+              - link "You must be signed in to star a repository" [ref=e53] [cursor=pointer]:
+                - /url: /login?return_to=%2Ffurkancak1r%2Fmergen-ade
+                - img [ref=e54]
+                - text: Star
+                - generic "6 users starred this repository" [ref=e56]: "6"
+      - navigation "Repository" [ref=e57]:
+        - list [ref=e58]:
+          - listitem [ref=e59]:
+            - link "Code" [ref=e60] [cursor=pointer]:
+              - /url: /furkancak1r/mergen-ade
+              - img [ref=e61]
+              - generic [ref=e63]: Code
+          - listitem [ref=e64]:
+            - link "Issues" [ref=e65] [cursor=pointer]:
+              - /url: /furkancak1r/mergen-ade/issues
+              - img [ref=e66]
+              - generic [ref=e69]: Issues
+          - listitem [ref=e70]:
+            - link "Pull requests" [ref=e71] [cursor=pointer]:
+              - /url: /furkancak1r/mergen-ade/pulls
+              - img [ref=e72]
+              - generic [ref=e74]: Pull requests
+          - listitem [ref=e75]:
+            - link "Actions" [ref=e76] [cursor=pointer]:
+              - /url: /furkancak1r/mergen-ade/actions
+              - img [ref=e77]
+              - generic [ref=e79]: Actions
+          - listitem [ref=e80]:
+            - link "Projects" [ref=e81] [cursor=pointer]:
+              - /url: /furkancak1r/mergen-ade/projects
+              - img [ref=e82]
+              - generic [ref=e84]: Projects
+          - listitem [ref=e85]:
+            - link "Security and quality" [ref=e86] [cursor=pointer]:
+              - /url: /furkancak1r/mergen-ade/security
+              - img [ref=e87]
+              - generic [ref=e89]: Security and quality
+          - listitem [ref=e90]:
+            - link "Insights" [ref=e91] [cursor=pointer]:
+              - /url: /furkancak1r/mergen-ade/pulse
+              - img [ref=e92]
+              - generic [ref=e94]: Insights
+    - generic [ref=e107]:
+      - heading "furkancak1r/mergen-ade" [level=1] [ref=e109]
+      - generic [ref=e110]:
+        - generic [ref=e113]:
+          - generic [ref=e114]:
+            - generic [ref=e115]:
+              - button "main branch" [ref=e117] [cursor=pointer]:
+                - generic [ref=e118]:
+                  - generic [ref=e120]:
+                    - img [ref=e122]
+                    - generic [ref=e125]: main
+                  - generic:
+                    - img
+              - generic [ref=e126]:
+                - link "Go to Branches page" [ref=e127] [cursor=pointer]:
+                  - /url: /furkancak1r/mergen-ade/branches
+                  - img [ref=e128]
+                - link "Go to Tags page" [ref=e130] [cursor=pointer]:
+                  - /url: /furkancak1r/mergen-ade/tags
+                  - img [ref=e131]
+            - generic [ref=e133]:
+              - button "Go to file" [ref=e136] [cursor=pointer]:
+                - generic [ref=e138]: Go to file
+              - button "Code" [ref=e139] [cursor=pointer]:
+                - generic [ref=e140]:
+                  - generic:
+                    - img
+                  - generic [ref=e141]: Code
+                  - generic:
+                    - img
+          - generic [ref=e142]:
+            - generic [ref=e143]:
+              - heading "Folders and files" [level=2] [ref=e144]
+              - table "Folders and files" [ref=e145]:
+                - rowgroup:
+                  - row "Name Last commit message Last commit date":
+                    - columnheader "Name"
+                    - columnheader "Last commit message":
+                      - generic "Last commit message"
+                    - columnheader "Last commit date":
+                      - generic "Last commit date"
+                - rowgroup [ref=e146]:
+                  - row "Latest commit Furkan Çakır Furkan Çakır Furkan Çakır and Furkan Çakır Versiyonu 0.1.25'e yükselt success Commit 3dd4995 · Apr 29, 20262 hours ago History View commit history for this file." [ref=e147]:
+                    - cell "Latest commit Furkan Çakır Furkan Çakır Furkan Çakır and Furkan Çakır Versiyonu 0.1.25'e yükselt success Commit 3dd4995 · Apr 29, 20262 hours ago History View commit history for this file." [ref=e148]:
+                      - generic [ref=e149]:
+                        - heading "Latest commit" [level=2] [ref=e150]
+                        - generic [ref=e151]:
+                          - generic [ref=e152]:
+                            - generic [ref=e154]:
+                              - img "Furkan Çakır" [ref=e155]
+                              - img "Furkan Çakır" [ref=e156]
+                            - generic "Furkan Çakır" [ref=e158]
+                            - generic [ref=e159]: and
+                            - generic "Furkan Çakır" [ref=e161]
+                          - generic [ref=e162]:
+                            - link "Versiyonu 0.1.25'e yükselt" [ref=e165] [cursor=pointer]:
+                              - /url: /furkancak1r/mergen-ade/commit/3dd4995eb39e819a0215e55d3df020eb5cd5f111
+                            - button "success" [ref=e166] [cursor=pointer]:
+                              - img [ref=e167]
+                        - generic [ref=e169]:
+                          - generic [ref=e171]:
+                            - link "Commit 3dd4995" [ref=e172] [cursor=pointer]:
+                              - /url: /furkancak1r/mergen-ade/commit/3dd4995eb39e819a0215e55d3df020eb5cd5f111
+                              - text: 3dd4995
+                            - text: ·
+                            - generic "Apr 29, 2026, 11:12 AM GMT+3" [ref=e173]: Apr 29, 20262 hours ago
+                          - generic [ref=e174]:
+                            - heading "History" [level=2] [ref=e175]
+                            - link "View commit history for this file." [ref=e177] [cursor=pointer]:
+                              - /url: /furkancak1r/mergen-ade/commits/main/
+                              - generic [ref=e178]:
+                                - generic:
+                                  - img
+                  - row ".cargo, (Directory) OpenCode entegrasyonunu ekle, Factory Droid hook sistemini genişlet v… Apr 12, 20262 weeks ago" [ref=e179]:
+                    - cell ".cargo, (Directory)" [ref=e180]:
+                      - generic [ref=e181]:
+                        - img [ref=e182]
+                        - link ".cargo, (Directory)" [ref=e187] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/tree/main/.cargo
+                          - text: .cargo
+                    - cell "OpenCode entegrasyonunu ekle, Factory Droid hook sistemini genişlet v…" [ref=e188]:
+                      - link "OpenCode entegrasyonunu ekle, Factory Droid hook sistemini genişlet v…" [ref=e191] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/1816c3c3473e36dd25c17492cb32fcff34ea816e
+                    - cell "Apr 12, 20262 weeks ago" [ref=e192]:
+                      - generic [ref=e193]: Apr 12, 20262 weeks ago
+                  - row ".github/workflows, (Directory) GitHub Actions workflow shell injection guvenlik aciklarini duzelt - … Apr 28, 2026yesterday" [ref=e194]:
+                    - cell ".github/workflows, (Directory)" [ref=e195]:
+                      - generic [ref=e196]:
+                        - img [ref=e197]
+                        - link ".github/workflows, (Directory)" [ref=e202] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/tree/main/.github/workflows
+                          - text: .github/workflows
+                    - cell "GitHub Actions workflow shell injection guvenlik aciklarini duzelt - …" [ref=e203]:
+                      - link "GitHub Actions workflow shell injection guvenlik aciklarini duzelt - …" [ref=e206] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/21067c5dbd19f72348210388eaab156629e18484
+                    - cell "Apr 28, 2026yesterday" [ref=e207]:
+                      - generic [ref=e208]: Apr 28, 2026yesterday
+                  - row "assets, (Directory) Düzelt launcher ikonlarını ve imleç geri bildirimini Apr 9, 20263 weeks ago" [ref=e209]:
+                    - cell "assets, (Directory)" [ref=e210]:
+                      - generic [ref=e211]:
+                        - img [ref=e212]
+                        - link "assets, (Directory)" [ref=e217] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/tree/main/assets
+                          - text: assets
+                    - cell "Düzelt launcher ikonlarını ve imleç geri bildirimini" [ref=e218]:
+                      - link "Düzelt launcher ikonlarını ve imleç geri bildirimini" [ref=e221] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/ede6ca6443048c0484b44cde879eec9732a2175f
+                    - cell "Apr 9, 20263 weeks ago" [ref=e222]:
+                      - generic [ref=e223]: Apr 9, 20263 weeks ago
+                  - row "diagnostics-v016, (Directory) macOS release teşhis kalıntılarını ekle ve DMG akışını belgeleyerek y… Mar 13, 2026last month" [ref=e224]:
+                    - cell "diagnostics-v016, (Directory)" [ref=e225]:
+                      - generic [ref=e226]:
+                        - img [ref=e227]
+                        - link "diagnostics-v016, (Directory)" [ref=e232] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/tree/main/diagnostics-v016
+                          - text: diagnostics-v016
+                    - cell "macOS release teşhis kalıntılarını ekle ve DMG akışını belgeleyerek y…" [ref=e233]:
+                      - link "macOS release teşhis kalıntılarını ekle ve DMG akışını belgeleyerek y…" [ref=e236] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/9f11690469c09873fc42428e16ad66591c9dc903
+                    - cell "Mar 13, 2026last month" [ref=e237]:
+                      - generic [ref=e238]: Mar 13, 2026last month
+                  - row "scripts, (Directory) Droid Stop algisi ve idle pattern iyilestirmeleri Apr 8, 20263 weeks ago" [ref=e239]:
+                    - cell "scripts, (Directory)" [ref=e240]:
+                      - generic [ref=e241]:
+                        - img [ref=e242]
+                        - link "scripts, (Directory)" [ref=e247] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/tree/main/scripts
+                          - text: scripts
+                    - cell "Droid Stop algisi ve idle pattern iyilestirmeleri" [ref=e248]:
+                      - link "Droid Stop algisi ve idle pattern iyilestirmeleri" [ref=e251] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/87051781a1158e75d56a3c5f2e37c64e2fc79e00
+                    - cell "Apr 8, 20263 weeks ago" [ref=e252]:
+                      - generic [ref=e253]: Apr 8, 20263 weeks ago
+                  - row "src, (Directory) OpenCode model slot yönetimi ekle - tek tıkla model değiştirme desteği Apr 29, 20262 hours ago" [ref=e254]:
+                    - cell "src, (Directory)" [ref=e255]:
+                      - generic [ref=e256]:
+                        - img [ref=e257]
+                        - link "src, (Directory)" [ref=e262] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/tree/main/src
+                          - text: src
+                    - cell "OpenCode model slot yönetimi ekle - tek tıkla model değiştirme desteği" [ref=e263]:
+                      - link "OpenCode model slot yönetimi ekle - tek tıkla model değiştirme desteği" [ref=e266] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/859c4a90c08c79d3dbfe20673a566b8d90bbd785
+                    - cell "Apr 29, 20262 hours ago" [ref=e267]:
+                      - generic [ref=e268]: Apr 29, 20262 hours ago
+                  - row "target_test, (Directory) Lucide simge katmanını entegre et, gri kontrolleri temaya uyarla ve r… Mar 5, 2026last month" [ref=e269]:
+                    - cell "target_test, (Directory)" [ref=e270]:
+                      - generic [ref=e271]:
+                        - img [ref=e272]
+                        - link "target_test, (Directory)" [ref=e277] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/tree/main/target_test
+                          - text: target_test
+                    - cell "Lucide simge katmanını entegre et, gri kontrolleri temaya uyarla ve r…" [ref=e278]:
+                      - link "Lucide simge katmanını entegre et, gri kontrolleri temaya uyarla ve r…" [ref=e281] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/6f7aadb260429d8e45a1c80d5cc6154e2fb622b7
+                    - cell "Mar 5, 2026last month" [ref=e282]:
+                      - generic [ref=e283]: Mar 5, 2026last month
+                  - row "tmp space, (Directory) WVW yayın çalışma dizinini repoya ekle Mar 13, 2026last month" [ref=e284]:
+                    - cell "tmp space, (Directory)" [ref=e285]:
+                      - generic [ref=e286]:
+                        - img [ref=e287]
+                        - link "tmp space, (Directory)" [ref=e292] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/tree/main/tmp%20space
+                          - text: tmp space
+                    - cell "WVW yayın çalışma dizinini repoya ekle" [ref=e293]:
+                      - link "WVW yayın çalışma dizinini repoya ekle" [ref=e296] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/bf618bc16008b7c3e4ece082f37c1555a0c21881
+                    - cell "Mar 13, 2026last month" [ref=e297]:
+                      - generic [ref=e298]: Mar 13, 2026last month
+                  - row ".gitattributes, (File) EXE ikonunu ayrı kırpılmış kaynakla büyüt ve satır sonu politikasını … Mar 11, 2026last month" [ref=e299]:
+                    - cell ".gitattributes, (File)" [ref=e300]:
+                      - generic [ref=e301]:
+                        - img [ref=e302]
+                        - link ".gitattributes, (File)" [ref=e307] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/blob/main/.gitattributes
+                          - text: .gitattributes
+                    - cell "EXE ikonunu ayrı kırpılmış kaynakla büyüt ve satır sonu politikasını …" [ref=e308]:
+                      - link "EXE ikonunu ayrı kırpılmış kaynakla büyüt ve satır sonu politikasını …" [ref=e311] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/958d98cedc1246c332d8a216da2d0e35b1dc0102
+                    - cell "Mar 11, 2026last month" [ref=e312]:
+                      - generic [ref=e313]: Mar 11, 2026last month
+                  - row ".gitignore, (File) Yok say yerel artifaktlari Apr 7, 20263 weeks ago" [ref=e314]:
+                    - cell ".gitignore, (File)" [ref=e315]:
+                      - generic [ref=e316]:
+                        - img [ref=e317]
+                        - link ".gitignore, (File)" [ref=e322] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/blob/main/.gitignore
+                          - text: .gitignore
+                    - cell "Yok say yerel artifaktlari" [ref=e323]:
+                      - link "Yok say yerel artifaktlari" [ref=e326] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/c161ad1eb007172319208e9709fd9c453fd3e054
+                    - cell "Apr 7, 20263 weeks ago" [ref=e327]:
+                      - generic [ref=e328]: Apr 7, 20263 weeks ago
+                  - row "AGENTS.md, (File) Arka plan terminal geçmişini çalışma zamanına özgü yap ve yeniden çal… Apr 28, 2026yesterday" [ref=e329]:
+                    - cell "AGENTS.md, (File)" [ref=e330]:
+                      - generic [ref=e331]:
+                        - img [ref=e332]
+                        - link "AGENTS.md, (File)" [ref=e337] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/blob/main/AGENTS.md
+                          - text: AGENTS.md
+                    - cell "Arka plan terminal geçmişini çalışma zamanına özgü yap ve yeniden çal…" [ref=e338]:
+                      - link "Arka plan terminal geçmişini çalışma zamanına özgü yap ve yeniden çal…" [ref=e341] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/4ec6670dea0722fab66327467a8b169c151e43be
+                    - cell "Apr 28, 2026yesterday" [ref=e342]:
+                      - generic [ref=e343]: Apr 28, 2026yesterday
+                  - row "CODEX_WINDOWS_HOOKS_RESEARCH.md, (File) Windows görev çubuğu ikonu desteği ekle ve Codex hook entegrasyonunu … Apr 17, 20262 weeks ago" [ref=e344]:
+                    - cell "CODEX_WINDOWS_HOOKS_RESEARCH.md, (File)" [ref=e345]:
+                      - generic [ref=e346]:
+                        - img [ref=e347]
+                        - link "CODEX_WINDOWS_HOOKS_RESEARCH.md, (File)" [ref=e352] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/blob/main/CODEX_WINDOWS_HOOKS_RESEARCH.md
+                          - text: CODEX_WINDOWS_HOOKS_RESEARCH.md
+                    - cell "Windows görev çubuğu ikonu desteği ekle ve Codex hook entegrasyonunu …" [ref=e353]:
+                      - link "Windows görev çubuğu ikonu desteği ekle ve Codex hook entegrasyonunu …" [ref=e356] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/4bb94bff147ef72aff9d81dbd18311546c0a4d0e
+                    - cell "Apr 17, 20262 weeks ago" [ref=e357]:
+                      - generic [ref=e358]: Apr 17, 20262 weeks ago
+                  - row "Cargo.lock, (File) Cargo.lock'i v0.1.24 ile senkronize et Apr 28, 2026yesterday" [ref=e359]:
+                    - cell "Cargo.lock, (File)" [ref=e360]:
+                      - generic [ref=e361]:
+                        - img [ref=e362]
+                        - link "Cargo.lock, (File)" [ref=e367] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/blob/main/Cargo.lock
+                          - text: Cargo.lock
+                    - cell "Cargo.lock'i v0.1.24 ile senkronize et" [ref=e368]:
+                      - link "Cargo.lock'i v0.1.24 ile senkronize et" [ref=e371] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/b61189167b620cd93bd8289e288029d048565c6a
+                    - cell "Apr 28, 2026yesterday" [ref=e372]:
+                      - generic [ref=e373]: Apr 28, 2026yesterday
+                  - row "Cargo.toml, (File) Versiyonu 0.1.25'e yükselt Apr 29, 20262 hours ago" [ref=e374]:
+                    - cell "Cargo.toml, (File)" [ref=e375]:
+                      - generic [ref=e376]:
+                        - img [ref=e377]
+                        - link "Cargo.toml, (File)" [ref=e382] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/blob/main/Cargo.toml
+                          - text: Cargo.toml
+                    - cell "Versiyonu 0.1.25'e yükselt" [ref=e383]:
+                      - link "Versiyonu 0.1.25'e yükselt" [ref=e386] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/3dd4995eb39e819a0215e55d3df020eb5cd5f111
+                    - cell "Apr 29, 20262 hours ago" [ref=e387]:
+                      - generic [ref=e388]: Apr 29, 20262 hours ago
+                  - row "KNOWN_ISSUES.md, (File) OpenCode model slot yönetimi ekle - tek tıkla model değiştirme desteği Apr 29, 20262 hours ago" [ref=e389]:
+                    - cell "KNOWN_ISSUES.md, (File)" [ref=e390]:
+                      - generic [ref=e391]:
+                        - img [ref=e392]
+                        - link "KNOWN_ISSUES.md, (File)" [ref=e397] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/blob/main/KNOWN_ISSUES.md
+                          - text: KNOWN_ISSUES.md
+                    - cell "OpenCode model slot yönetimi ekle - tek tıkla model değiştirme desteği" [ref=e398]:
+                      - link "OpenCode model slot yönetimi ekle - tek tıkla model değiştirme desteği" [ref=e401] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/859c4a90c08c79d3dbfe20673a566b8d90bbd785
+                    - cell "Apr 29, 20262 hours ago" [ref=e402]:
+                      - generic [ref=e403]: Apr 29, 20262 hours ago
+                  - row "LICENSE, (File) Projeye MIT lisansı ekle ve paket metadata bilgisini güncelle Mar 10, 2026last month" [ref=e404]:
+                    - cell "LICENSE, (File)" [ref=e405]:
+                      - generic [ref=e406]:
+                        - img [ref=e407]
+                        - link "LICENSE, (File)" [ref=e412] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/blob/main/LICENSE
+                          - text: LICENSE
+                    - cell "Projeye MIT lisansı ekle ve paket metadata bilgisini güncelle" [ref=e413]:
+                      - link "Projeye MIT lisansı ekle ve paket metadata bilgisini güncelle" [ref=e416] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/a083695bcaba24918d9558f6c9a9e73a66b7f5f7
+                    - cell "Mar 10, 2026last month" [ref=e417]:
+                      - generic [ref=e418]: Mar 10, 2026last month
+                  - row "README.md, (File) Droid Stop algisi ve idle pattern iyilestirmeleri Apr 8, 20263 weeks ago" [ref=e419]:
+                    - cell "README.md, (File)" [ref=e420]:
+                      - generic [ref=e421]:
+                        - img [ref=e422]
+                        - link "README.md, (File)" [ref=e427] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/blob/main/README.md
+                          - text: README.md
+                    - cell "Droid Stop algisi ve idle pattern iyilestirmeleri" [ref=e428]:
+                      - link "Droid Stop algisi ve idle pattern iyilestirmeleri" [ref=e431] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/87051781a1158e75d56a3c5f2e37c64e2fc79e00
+                    - cell "Apr 8, 20263 weeks ago" [ref=e432]:
+                      - generic [ref=e433]: Apr 8, 20263 weeks ago
+                  - row "apps.json, (File) Add WVW app manifest Mar 13, 2026last month" [ref=e434]:
+                    - cell "apps.json, (File)" [ref=e435]:
+                      - generic [ref=e436]:
+                        - img [ref=e437]
+                        - link "apps.json, (File)" [ref=e442] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/blob/main/apps.json
+                          - text: apps.json
+                    - cell "Add WVW app manifest" [ref=e443]:
+                      - link "Add WVW app manifest" [ref=e446] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/d36e557fb164fb5f86117d6215b1b01cf7ae443b
+                    - cell "Mar 13, 2026last month" [ref=e447]:
+                      - generic [ref=e448]: Mar 13, 2026last month
+                  - row "build.rs, (File) Düzelt launcher ikonlarını ve imleç geri bildirimini Apr 9, 20263 weeks ago" [ref=e449]:
+                    - cell "build.rs, (File)" [ref=e450]:
+                      - generic [ref=e451]:
+                        - img [ref=e452]
+                        - link "build.rs, (File)" [ref=e457] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/blob/main/build.rs
+                          - text: build.rs
+                    - cell "Düzelt launcher ikonlarını ve imleç geri bildirimini" [ref=e458]:
+                      - link "Düzelt launcher ikonlarını ve imleç geri bildirimini" [ref=e461] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/ede6ca6443048c0484b44cde879eec9732a2175f
+                    - cell "Apr 9, 20263 weeks ago" [ref=e462]:
+                      - generic [ref=e463]: Apr 9, 20263 weeks ago
+                  - row "llms.txt, (File) Dizin sekmesinde proje kaldırma işlevini ekle ve ilişkili durum önbel… Mar 18, 2026last month" [ref=e464]:
+                    - cell "llms.txt, (File)" [ref=e465]:
+                      - generic [ref=e466]:
+                        - img [ref=e467]
+                        - link "llms.txt, (File)" [ref=e472] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/blob/main/llms.txt
+                          - text: llms.txt
+                    - cell "Dizin sekmesinde proje kaldırma işlevini ekle ve ilişkili durum önbel…" [ref=e473]:
+                      - link "Dizin sekmesinde proje kaldırma işlevini ekle ve ilişkili durum önbel…" [ref=e476] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/d219456007ef9f815d1239891763ac6535621fbe
+                    - cell "Mar 18, 2026last month" [ref=e477]:
+                      - generic [ref=e478]: Mar 18, 2026last month
+                  - row "logo.png, (File) EXE ikonunu doğrudan logo kaynağından üret ve güncel görselleri ekle Mar 11, 2026last month" [ref=e479]:
+                    - cell "logo.png, (File)" [ref=e480]:
+                      - generic [ref=e481]:
+                        - img [ref=e482]
+                        - link "logo.png, (File)" [ref=e487] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/blob/main/logo.png
+                          - text: logo.png
+                    - cell "EXE ikonunu doğrudan logo kaynağından üret ve güncel görselleri ekle" [ref=e488]:
+                      - link "EXE ikonunu doğrudan logo kaynağından üret ve güncel görselleri ekle" [ref=e491] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/2c574019a87b0a35783a63123da83985c057f02d
+                    - cell "Mar 11, 2026last month" [ref=e492]:
+                      - generic [ref=e493]: Mar 11, 2026last month
+                  - row "mergen-ade.exe, (File) Terminal Manager navigasyonunu görünen sıraya göre düzelt Apr 22, 2026last week" [ref=e494]:
+                    - cell "mergen-ade.exe, (File)" [ref=e495]:
+                      - generic [ref=e496]:
+                        - img [ref=e497]
+                        - link "mergen-ade.exe, (File)" [ref=e502] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/blob/main/mergen-ade.exe
+                          - text: mergen-ade.exe
+                    - cell "Terminal Manager navigasyonunu görünen sıraya göre düzelt" [ref=e503]:
+                      - link "Terminal Manager navigasyonunu görünen sıraya göre düzelt" [ref=e506] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/bc6ad45fc5c222c0cba51d11ca5c5968c188ebe8
+                    - cell "Apr 22, 2026last week" [ref=e507]:
+                      - generic [ref=e508]: Apr 22, 2026last week
+                  - row "mergen-screenshot.png, (File) Kaldır kullanılmayan logo dosyalarını ve README ekran görüntüsünü gün… Mar 12, 2026last month" [ref=e509]:
+                    - cell "mergen-screenshot.png, (File)" [ref=e510]:
+                      - generic [ref=e511]:
+                        - img [ref=e512]
+                        - link "mergen-screenshot.png, (File)" [ref=e517] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/blob/main/mergen-screenshot.png
+                          - text: mergen-screenshot.png
+                    - cell "Kaldır kullanılmayan logo dosyalarını ve README ekran görüntüsünü gün…" [ref=e518]:
+                      - link "Kaldır kullanılmayan logo dosyalarını ve README ekran görüntüsünü gün…" [ref=e521] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/e3f4945a81b18b01a32422f6357d56810be4c43d
+                    - cell "Mar 12, 2026last month" [ref=e522]:
+                      - generic [ref=e523]: Mar 12, 2026last month
+                  - row "rust-toolchain.toml, (File) macOS release toolchain kilidini kaldır ve DMG yayınını zorunlu yap Mar 12, 2026last month" [ref=e524]:
+                    - cell "rust-toolchain.toml, (File)" [ref=e525]:
+                      - generic [ref=e526]:
+                        - img [ref=e527]
+                        - link "rust-toolchain.toml, (File)" [ref=e532] [cursor=pointer]:
+                          - /url: /furkancak1r/mergen-ade/blob/main/rust-toolchain.toml
+                          - text: rust-toolchain.toml
+                    - cell "macOS release toolchain kilidini kaldır ve DMG yayınını zorunlu yap" [ref=e533]:
+                      - link "macOS release toolchain kilidini kaldır ve DMG yayınını zorunlu yap" [ref=e536] [cursor=pointer]:
+                        - /url: /furkancak1r/mergen-ade/commit/2cc883dbb262ff11c6cdddbbca1de6a2125f9f8a
+                    - cell "Mar 12, 2026last month" [ref=e537]:
+                      - generic [ref=e538]: Mar 12, 2026last month
+            - generic [ref=e540]:
+              - generic [ref=e541]:
+                - heading "Repository files navigation" [level=2] [ref=e542]
+                - navigation "Repository files" [ref=e543]:
+                  - list [ref=e544]:
+                    - listitem [ref=e545]:
+                      - link "README" [ref=e546] [cursor=pointer]:
+                        - /url: "#"
+                        - img [ref=e548]
+                        - generic [ref=e550]: README
+                    - listitem [ref=e551]:
+                      - link "MIT license" [ref=e552] [cursor=pointer]:
+                        - /url: "#"
+                        - img [ref=e554]
+                        - generic [ref=e556]: MIT license
+                - button "Outline" [ref=e557] [cursor=pointer]:
+                  - img [ref=e558]
+              - article [ref=e561]:
+                - paragraph [ref=e562]:
+                  - link "Mergen ADE logo" [ref=e563] [cursor=pointer]:
+                    - /url: /furkancak1r/mergen-ade/blob/main/logo.png
+                    - img "Mergen ADE logo" [ref=e564]
+                - generic [ref=e565]:
+                  - heading "Mergen ADE" [level=1] [ref=e566]
+                  - 'link "Permalink: Mergen ADE" [ref=e567] [cursor=pointer]':
+                    - /url: "#mergen-ade"
+                    - img [ref=e568]
+                - paragraph [ref=e570]: Windows-first terminal workspace for running and organizing multiple project contexts.
+                - paragraph [ref=e571]:
+                  - link "Download Releases" [ref=e572] [cursor=pointer]:
+                    - /url: https://github.com/furkancak1r/mergen-ade/releases/latest
+                    - strong [ref=e573]: Download Releases
+                  - text: "|"
+                  - link "Factory Droid Setup" [ref=e574] [cursor=pointer]:
+                    - /url: "#factory-droid-setup-windows-first"
+                    - strong [ref=e575]: Factory Droid Setup
+                  - text: "|"
+                  - link "Build from Source" [ref=e576] [cursor=pointer]:
+                    - /url: "#build-from-source"
+                    - strong [ref=e577]: Build from Source
+                - paragraph [ref=e578]: No release published yet? Use the one-command local build below.
+                - paragraph [ref=e579]:
+                  - link "Mergen ADE screenshot" [ref=e580] [cursor=pointer]:
+                    - /url: /furkancak1r/mergen-ade/blob/main/mergen-screenshot.png
+                    - img "Mergen ADE screenshot" [ref=e581]
+                - paragraph [ref=e582]: Mergen ADE is a desktop ADE focused on terminal orchestration, project context switching, and lightweight workspace management. The project is still Windows-first, with a signed and notarized macOS ARM64 DMG now produced alongside official GitHub releases.
+                - paragraph [ref=e583]: It is not an IDE. There is no built-in editor, LSP, or debugger UI in this project.
+                - generic [ref=e584]:
+                  - heading "Why Mergen ADE" [level=2] [ref=e585]
+                  - 'link "Permalink: Why Mergen ADE" [ref=e586] [cursor=pointer]':
+                    - /url: "#why-mergen-ade"
+                    - img [ref=e587]
+                - list [ref=e589]:
+                  - listitem [ref=e590]: Keep multiple terminals visible without turning your desktop into window clutter.
+                  - listitem [ref=e591]: Group sessions by project so context switches stay fast and predictable.
+                  - listitem [ref=e592]: Run a native Rust desktop app instead of a browser or Electron shell.
+                  - listitem [ref=e593]: Persist only the small amount of state that helps you get back to work quickly.
+                - generic [ref=e594]:
+                  - heading "Quick Start" [level=2] [ref=e595]
+                  - 'link "Permalink: Quick Start" [ref=e596] [cursor=pointer]':
+                    - /url: "#quick-start"
+                    - img [ref=e597]
+                - generic [ref=e599]:
+                  - heading "Download release assets" [level=3] [ref=e600]
+                  - 'link "Permalink: Download release assets" [ref=e601] [cursor=pointer]':
+                    - /url: "#download-release-assets"
+                    - img [ref=e602]
+                - paragraph [ref=e604]: "The canonical download location is the GitHub Releases page:"
+                - list [ref=e605]:
+                  - listitem [ref=e606]:
+                    - link "https://github.com/furkancak1r/mergen-ade/releases/latest" [ref=e607] [cursor=pointer]:
+                      - /url: https://github.com/furkancak1r/mergen-ade/releases/latest
+                - paragraph [ref=e608]: "Published assets currently target:"
+                - list [ref=e609]:
+                  - listitem [ref=e610]:
+                    - text: "Windows: portable ZIP containing"
+                    - code [ref=e611]: mergen-ade.exe
+                  - listitem [ref=e612]: "macOS: signed and notarized ARM64 DMG"
+                - blockquote [ref=e613]:
+                  - paragraph [ref=e614]:
+                    - text: The Windows release ZIP currently contains only
+                    - code [ref=e615]: mergen-ade.exe
+                    - text: . Factory Droid status badges are a separate one-time setup because Factory hooks and permissions still need to be configured on the machine that runs Mergen ADE.
+                - generic [ref=e616]:
+                  - heading "Local build" [level=3] [ref=e617]
+                  - 'link "Permalink: Local build" [ref=e618] [cursor=pointer]':
+                    - /url: "#local-build"
+                    - img [ref=e619]
+                - paragraph [ref=e621]: "Preferred one-command build:"
+                - generic [ref=e622]:
+                  - generic [ref=e623]: powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
+                  - button "Copy" [ref=e625] [cursor=pointer]:
+                    - img [ref=e626]
+                - paragraph [ref=e629]: "This produces the portable Windows executable at:"
+                - generic [ref=e630]:
+                  - code [ref=e632]: target\x86_64-pc-windows-msvc\release\mergen-ade.exe
+                  - button "Copy" [ref=e634] [cursor=pointer]:
+                    - img [ref=e635]
+                - paragraph [ref=e638]: "For normal local development:"
+                - generic [ref=e639]:
+                  - generic [ref=e640]: cargo build --release cargo test
+                  - button "Copy" [ref=e642] [cursor=pointer]:
+                    - img [ref=e643]
+                - paragraph [ref=e646]:
+                  - code [ref=e647]: cargo build --release
+                  - text: and
+                  - code [ref=e648]: cargo run --release
+                  - text: both use the repo's default Windows MSVC target, so they update the same portable EXE path shown above.
+                - paragraph [ref=e649]: "For an experimental native macOS build, use an explicit target because the repo default target remains Windows-oriented:"
+                - generic [ref=e650]:
+                  - generic [ref=e651]: cargo build --release --target aarch64-apple-darwin
+                  - button "Copy" [ref=e653] [cursor=pointer]:
+                    - img [ref=e654]
+                - paragraph [ref=e657]: "This produces the macOS binary at:"
+                - generic [ref=e658]:
+                  - code [ref=e660]: target/aarch64-apple-darwin/release/mergen-ade
+                  - button "Copy" [ref=e662] [cursor=pointer]:
+                    - img [ref=e663]
+                - paragraph [ref=e666]:
+                  - text: If
+                  - code [ref=e667]: cargo
+                  - text: "is not on PATH in PowerShell:"
+                - generic [ref=e668]:
+                  - generic [ref=e669]:
+                    - generic [ref=e670]: $env:USERPROFILE
+                    - text: \.cargo\bin\cargo.exe build --release
+                    - generic [ref=e671]: $env:USERPROFILE
+                    - text: \.cargo\bin\cargo.exe test
+                  - button "Copy" [ref=e673] [cursor=pointer]:
+                    - img [ref=e674]
+                - generic [ref=e677]:
+                  - heading "Factory Droid Setup (Windows-first)" [level=3] [ref=e678]
+                  - 'link "Permalink: Factory Droid Setup (Windows-first)" [ref=e679] [cursor=pointer]':
+                    - /url: "#factory-droid-setup-windows-first"
+                    - img [ref=e680]
+                - paragraph [ref=e682]:
+                  - text: Factory Droid integration is supported, but it is not enabled just by launching
+                  - code [ref=e683]: mergen-ade.exe
+                  - text: .
+                - paragraph [ref=e684]:
+                  - text: Mergen ADE only supports
+                  - code [ref=e685]: Factory Droid
+                  - text: for this flow. It listens for official
+                  - code [ref=e686]: droid-hook:*
+                  - text: and
+                  - code [ref=e687]: factory-droid-hook:*
+                  - text: signals, turns the badge green on
+                  - code [ref=e688]: UserPromptSubmit
+                  - text: ", turns it yellow on"
+                  - code [ref=e689]: Stop
+                  - text: plus actionable
+                  - code [ref=e690]: Notification
+                  - text: events, and also recognizes the standard Droid title patterns
+                  - code [ref=e691]: "[Working...]"
+                  - text: and
+                  - code [ref=e692]: "[Idle]"
+                  - text: .
+                - paragraph [ref=e693]:
+                  - text: Use the installer-based path below. Manual
+                  - code [ref=e694]: settings.json
+                  - text: editing should be treated as a fallback for inspection only, not the primary setup path.
+                - list [ref=e695]:
+                  - listitem [ref=e696]:
+                    - text: "Choose your starting point. Repo checkout already on disk: Use the existing repo checkout and run the installer from the repository root. Release ZIP only: Keep using the downloaded"
+                    - code [ref=e697]: mergen-ade.exe
+                    - text: ", but clone or download this repository once so you also have the"
+                    - code [ref=e698]: scripts/
+                    - text: folder. The release ZIP does not ship the installer or hook source files.
+                  - listitem [ref=e699]: Run the supported installer from the repo root.
+                - generic [ref=e700]:
+                  - generic [ref=e701]: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-factory-droid-hooks.ps1
+                  - button "Copy" [ref=e703] [cursor=pointer]:
+                    - img [ref=e704]
+                - list [ref=e707]:
+                  - listitem [ref=e708]:
+                    - text: Let the installer manage the Factory hook registration. It copies
+                    - code [ref=e709]: scripts\factory-droid-status-hook.ps1
+                    - text: into
+                    - code [ref=e710]: "%USERPROFILE%\\.factory\\hooks\\mergen-ade-droid-status.ps1"
+                    - text: . It backs up the previous
+                    - code [ref=e711]: "%USERPROFILE%\\.factory\\settings.json"
+                    - text: before rewriting it. It registers exactly one managed command for
+                    - code [ref=e712]: UserPromptSubmit
+                    - text: ","
+                    - code [ref=e713]: Notification
+                    - text: ", and"
+                    - code [ref=e714]: Stop
+                    - text: . It preserves unrelated Factory hooks that are already present in your settings. It writes the canonical quote-safe launcher command, so do not hand-edit the managed entry back to a
+                    - code [ref=e715]: "-File"
+                    - text: variant. If Diagnostics shows
+                    - code [ref=e716]: Factory Droid hook repair needed
+                    - text: ", your global"
+                    - code [ref=e717]: "%USERPROFILE%\\.factory\\hooks\\mergen-ade-droid-status.ps1"
+                    - text: copy is likely stale or
+                    - code [ref=e718]: "%USERPROFILE%\\.factory\\settings.json"
+                    - text: still has a legacy launcher; rerun the installer instead of hand-editing either file.
+                  - listitem [ref=e719]:
+                    - text: Restart or refresh Factory Droid after installation. Restart the
+                    - code [ref=e720]: droid
+                    - text: or
+                    - code [ref=e721]: factory
+                    - text: session, or revisit
+                    - code [ref=e722]: /hooks
+                    - text: ", because Factory snapshots hook settings when the session starts."
+                  - listitem [ref=e723]:
+                    - text: Verify the hook registration. Open
+                    - code [ref=e724]: /hooks
+                    - text: in Factory Droid or inspect
+                    - code [ref=e725]: "%USERPROFILE%\\.factory\\settings.json"
+                    - text: . Confirm that
+                    - code [ref=e726]: UserPromptSubmit
+                    - text: ","
+                    - code [ref=e727]: Notification
+                    - text: ", and"
+                    - code [ref=e728]: Stop
+                    - text: each contain one managed command entry for the Mergen ADE hook. Confirm
+                    - code [ref=e729]: "%USERPROFILE%\\.factory\\hooks\\mergen-ade-droid-status.ps1"
+                    - text: is the freshly copied installer-managed script, not an older manual copy.
+                  - listitem [ref=e730]:
+                    - text: Verify the badge behavior inside Mergen ADE. Open Mergen ADE, start a terminal, and launch
+                    - code [ref=e731]: droid
+                    - text: or
+                    - code [ref=e732]: factory
+                    - text: inside that terminal. Submit a prompt and confirm the badge switches to green
+                    - code [ref=e733]: Running
+                    - text: . Finish a response, trigger a permission prompt, or wait for an input-needed notification and confirm the badge switches to yellow
+                    - code [ref=e734]: Attention
+                    - text: .
+                - generic [ref=e735]:
+                  - heading "Diagnostics and Troubleshooting" [level=4] [ref=e736]
+                  - 'link "Permalink: Diagnostics and Troubleshooting" [ref=e737] [cursor=pointer]':
+                    - /url: "#diagnostics-and-troubleshooting"
+                    - img [ref=e738]
+                - list [ref=e740]:
+                  - listitem [ref=e741]:
+                    - text: "Check Mergen ADE first: in Settings, review"
+                    - code [ref=e742]: Factory Droid Primary
+                    - text: ","
+                    - code [ref=e743]: Factory Droid Fallback
+                    - text: ","
+                    - code [ref=e744]: Factory Droid Inbox
+                    - text: ", and"
+                    - code [ref=e745]: Droid Session Active
+                    - text: before debugging Factory itself.
+                  - listitem [ref=e746]:
+                    - text: Keep
+                    - code [ref=e747]: ai_hooks.global_enabled
+                    - text: enabled in
+                    - code [ref=e748]: "%APPDATA%\\Mergen\\MergenADE\\config\\config.toml"
+                    - text: . If that flag is set to
+                    - code [ref=e749]: "false"
+                    - text: ", Mergen ADE disables the Factory Droid integration path."
+                  - listitem [ref=e750]:
+                    - text: Do not use legacy
+                    - code [ref=e751]: ~/.claude/hooks/*
+                    - text: guidance. Mergen ADE supports only Factory Droid and only the official Factory hook configuration.
+                  - listitem [ref=e752]: Do not replace the managed command with a relative path or a hand-written launcher. The supported command is installed automatically and is intentionally normalized to avoid Windows quoting failures.
+                  - listitem [ref=e753]:
+                    - text: Do not manually set
+                    - code [ref=e754]: MERGEN_ADE_*
+                    - text: environment variables. Mergen ADE injects its own runtime context when it launches the integrated terminal.
+                  - listitem [ref=e755]:
+                    - text: If
+                    - code [ref=e756]: /hooks
+                    - text: shows the correct entries but the badge still does not react, confirm you are testing with the current Mergen ADE build and not an older copied executable elsewhere on disk.
+                - generic [ref=e757]:
+                  - heading "Brief Unix/macOS Note" [level=4] [ref=e758]
+                  - 'link "Permalink: Brief Unix/macOS Note" [ref=e759] [cursor=pointer]':
+                    - /url: "#brief-unixmacos-note"
+                    - img [ref=e760]
+                - paragraph [ref=e762]: "The bundled installer in this repository is PowerShell-based and is currently the supported Windows-first setup path. On Unix-like systems, Factory hook commands still need absolute paths, and custom scripts still need executable permission, for example:"
+                - generic [ref=e763]:
+                  - generic [ref=e764]: chmod +x ~/.factory/hooks/your-hook.sh
+                  - button "Copy" [ref=e766] [cursor=pointer]:
+                    - img [ref=e767]
+                - paragraph [ref=e770]: Do not assume the Windows installer flow is available unchanged outside Windows.
+                - generic [ref=e771]:
+                  - heading "Core Features" [level=2] [ref=e772]
+                  - 'link "Permalink: Core Features" [ref=e773] [cursor=pointer]':
+                    - /url: "#core-features"
+                    - img [ref=e774]
+                - list [ref=e776]:
+                  - listitem [ref=e777]: Native Rust desktop app with a Windows-first release path
+                  - listitem [ref=e778]: Embedded terminal panes with tiled layout management
+                  - listitem [ref=e779]: Project-aware terminal grouping in the side panel
+                  - listitem [ref=e780]: ConPTY-backed shell sessions with responsive IO flow
+                  - listitem [ref=e781]: Lightweight local TOML configuration
+                  - listitem [ref=e782]: Portable Windows release pipeline through GitHub Actions
+                  - listitem [ref=e783]: Signed and notarized macOS ARM64 DMG packaging in GitHub Actions
+                - generic [ref=e784]:
+                  - heading "How It Works" [level=2] [ref=e785]
+                  - 'link "Permalink: How It Works" [ref=e786] [cursor=pointer]':
+                    - /url: "#how-it-works"
+                    - img [ref=e787]
+                - list [ref=e789]:
+                  - listitem [ref=e790]:
+                    - text: Terminal sessions are created through
+                    - code [ref=e791]: portable-pty
+                    - text: using the native PTY backend of the current platform.
+                  - listitem [ref=e792]:
+                    - text: Terminal emulation and parsing are handled by
+                    - code [ref=e793]: tattoy-wezterm-term
+                    - text: .
+                  - listitem [ref=e794]: PTY reads, writes, and resize handling run off the UI thread to keep the app responsive.
+                  - listitem [ref=e795]: The main window combines an activity rail, collapsible side panels, and tiled terminal panes.
+                - generic [ref=e796]:
+                  - heading "UI Overview" [level=2] [ref=e797]
+                  - 'link "Permalink: UI Overview" [ref=e798] [cursor=pointer]':
+                    - /url: "#ui-overview"
+                    - img [ref=e799]
+                - list [ref=e801]:
+                  - listitem [ref=e802]:
+                    - strong [ref=e803]: "Activity rail:"
+                    - text: icon-first left rail for switching between
+                    - code [ref=e804]: Project Explorer
+                    - text: and
+                    - code [ref=e805]: Terminal Manager
+                  - listitem [ref=e806]:
+                    - strong [ref=e807]: "Project Explorer:"
+                    - text: project picker, quick actions, search, indexed folder tree, and source control view
+                  - listitem [ref=e808]:
+                    - strong [ref=e809]: "Terminal Manager:"
+                    - text: project-grouped foreground and background terminal lists
+                  - listitem [ref=e810]:
+                    - strong [ref=e811]: "Main area:"
+                    - text: embedded tiled terminal panes for concurrent terminal work
+                  - listitem [ref=e812]:
+                    - strong [ref=e813]: "Terminal visibility mode:"
+                    - text: configurable between global visibility and selected-project-only visibility
+                - generic [ref=e814]:
+                  - heading "Build From Source" [level=2] [ref=e815]
+                  - 'link "Permalink: Build From Source" [ref=e816] [cursor=pointer]':
+                    - /url: "#build-from-source"
+                    - img [ref=e817]
+                - paragraph [ref=e819]: The release script is the supported path for a portable Windows binary.
+                - paragraph [ref=e820]: "What it does:"
+                - list [ref=e821]:
+                  - listitem [ref=e822]:
+                    - text: Builds a portable release for
+                    - code [ref=e823]: x86_64-pc-windows-msvc
+                  - listitem [ref=e824]:
+                    - text: Ensures the
+                    - code [ref=e825]: stable-x86_64-pc-windows-msvc
+                    - text: toolchain is available
+                  - listitem [ref=e826]: Resolves the local Visual Studio build environment when needed
+                  - listitem [ref=e827]: Statically links the MSVC CRT for a portable EXE workflow
+                  - listitem [ref=e828]:
+                    - text: Verifies imports with repo-local
+                    - code [ref=e829]: llvm-objdump.exe
+                    - text: when available, otherwise
+                    - code [ref=e830]: dumpbin.exe
+                  - listitem [ref=e831]:
+                    - text: Produces
+                    - code [ref=e832]: target\x86_64-pc-windows-msvc\release\mergen-ade.exe
+                - paragraph [ref=e833]: "Regression check:"
+                - generic [ref=e834]:
+                  - generic [ref=e835]: powershell -ExecutionPolicy Bypass -File .\scripts\__tests__\build-release.tests.ps1
+                  - button "Copy" [ref=e837] [cursor=pointer]:
+                    - img [ref=e838]
+                - paragraph [ref=e841]:
+                  - text: For macOS release packaging, GitHub Actions builds
+                  - code [ref=e842]: aarch64-apple-darwin
+                  - text: ", wraps the binary in a minimal"
+                  - code [ref=e843]: .app
+                  - text: ", signs it with a Developer ID Application certificate, notarizes the DMG through"
+                  - code [ref=e844]: notarytool
+                  - text: ", and staples the notarization ticket onto the DMG before publishing. The blocking CI gates are notarization acceptance plus"
+                  - code [ref=e845]: stapler validate
+                  - text: ; the prior headless
+                  - code [ref=e846]: spctl --type open
+                  - text: check was removed because it produced runner-context-specific false negatives after successful notarization. The same script can still package locally without signing when the Apple credentials are not provided.
+                - generic [ref=e847]:
+                  - heading "GitHub Releases" [level=2] [ref=e848]
+                  - 'link "Permalink: GitHub Releases" [ref=e849] [cursor=pointer]':
+                    - /url: "#github-releases"
+                    - img [ref=e850]
+                - paragraph [ref=e852]:
+                  - text: This repository includes a release workflow at
+                  - code [ref=e853]: .github/workflows/release.yml
+                  - text: .
+                - paragraph [ref=e854]:
+                  - text: When a tag starting with
+                  - code [ref=e855]: v
+                  - text: "is pushed, GitHub Actions will:"
+                - list [ref=e856]:
+                  - listitem [ref=e857]:
+                    - text: Build the portable
+                    - code [ref=e858]: mergen-ade.exe
+                    - text: for
+                    - code [ref=e859]: x86_64-pc-windows-msvc
+                  - listitem [ref=e860]:
+                    - text: Package it as
+                    - code [ref=e861]: mergen-ade-<tag>-windows-x64-portable.zip
+                  - listitem [ref=e862]:
+                    - text: Build, sign, notarize, and staple
+                    - code [ref=e863]: mergen-ade-<tag>-macos-arm64.dmg
+                  - listitem [ref=e864]: Publish a GitHub Release and attach every packaged asset that was produced
+                - paragraph [ref=e865]: "The macOS DMG is currently:"
+                - list [ref=e866]:
+                  - listitem [ref=e867]: ARM64 only
+                  - listitem [ref=e868]: signed with a Developer ID Application certificate and notarized through Apple
+                  - listitem [ref=e869]: required for official tagged releases; if signing, notarization, or DMG packaging fails, the release workflow fails instead of publishing a broken Windows-only release
+                  - listitem [ref=e870]: expected to open without the prior "damaged" Gatekeeper warning on a clean supported macOS installation
+                - paragraph [ref=e871]: "Maintainer release prerequisites:"
+                - list [ref=e872]:
+                  - listitem [ref=e873]:
+                    - text: "GitHub repository secrets:"
+                    - code [ref=e874]: APPLE_DEVELOPER_ID_APP_CERT_BASE64
+                    - text: ","
+                    - code [ref=e875]: APPLE_DEVELOPER_ID_APP_CERT_PASSWORD
+                    - text: ","
+                    - code [ref=e876]: APPLE_DEVELOPER_IDENTITY
+                    - text: ","
+                    - code [ref=e877]: APPLE_NOTARY_API_KEY_ID
+                    - text: ","
+                    - code [ref=e878]: APPLE_NOTARY_API_ISSUER_ID
+                    - text: ","
+                    - code [ref=e879]: APPLE_NOTARY_API_PRIVATE_KEY_BASE64
+                  - listitem [ref=e880]:
+                    - text: Apple Developer membership with a Developer ID Application certificate exported as
+                    - code [ref=e881]: .p12
+                  - listitem [ref=e882]: App Store Connect API key with notarization access
+                - paragraph [ref=e883]: This is safe for a public repository because the signing material stays in GitHub Actions secrets and the release workflow runs only on tag pushes in the base repository.
+                - paragraph [ref=e884]: "Maintainer tag example:"
+                - generic [ref=e885]:
+                  - generic [ref=e886]: git tag v0.1.0 git push origin v0.1.0
+                  - button "Copy" [ref=e888] [cursor=pointer]:
+                    - img [ref=e889]
+                - generic [ref=e892]:
+                  - heading "Configuration" [level=2] [ref=e893]
+                  - 'link "Permalink: Configuration" [ref=e894] [cursor=pointer]':
+                    - /url: "#configuration"
+                    - img [ref=e895]
+                - paragraph [ref=e897]:
+                  - text: Config is stored in platform app data via
+                  - code [ref=e898]: ProjectDirs
+                  - text: .
+                - paragraph [ref=e899]: "On Windows the current path is:"
+                - list [ref=e900]:
+                  - listitem [ref=e901]:
+                    - code [ref=e902]: "%APPDATA%\\Mergen\\MergenADE\\config\\config.toml"
+                - paragraph [ref=e903]:
+                  - text: On macOS,
+                  - code [ref=e904]: ProjectDirs
+                  - text: resolves under the user's Library application support/config directories.
+                - paragraph [ref=e905]: "Persisted data includes:"
+                - list [ref=e906]:
+                  - listitem [ref=e907]: global default shell
+                  - listitem [ref=e908]: projects with id, name, and path
+                  - listitem [ref=e909]: per-project saved messages
+                  - listitem [ref=e910]: UI state such as visible panels, selected project, filter mode, and auto tile scope
+                - paragraph [ref=e911]: "Not persisted:"
+                - list [ref=e912]:
+                  - listitem [ref=e913]: terminal scrollback
+                  - listitem [ref=e914]: live terminal sessions
+                - generic [ref=e915]:
+                  - heading "Testing" [level=2] [ref=e916]
+                  - 'link "Permalink: Testing" [ref=e917] [cursor=pointer]':
+                    - /url: "#testing"
+                    - img [ref=e918]
+                - paragraph [ref=e920]: "The project currently includes unit tests for:"
+                - list [ref=e921]:
+                  - listitem [ref=e922]:
+                    - text: tiling grid calculation in
+                    - code [ref=e923]: src/layout.rs
+                  - listitem [ref=e924]:
+                    - text: terminal title update logic in
+                    - code [ref=e925]: src/title.rs
+                  - listitem [ref=e926]: platform-specific shell/config and file-open command behavior
+                  - listitem [ref=e927]:
+                    - text: Windows release helper regressions in
+                    - code [ref=e928]: scripts/__tests__/build-release.tests.ps1
+                - paragraph [ref=e929]: "Run checks:"
+                - generic [ref=e930]:
+                  - generic [ref=e931]: cargo test powershell -ExecutionPolicy Bypass -File .\scripts\__tests__\build-release.tests.ps1
+                  - button "Copy" [ref=e933] [cursor=pointer]:
+                    - img [ref=e934]
+                - generic [ref=e937]:
+                  - heading "Non-goals" [level=2] [ref=e938]
+                  - 'link "Permalink: Non-goals" [ref=e939] [cursor=pointer]':
+                    - /url: "#non-goals"
+                    - img [ref=e940]
+                - list [ref=e942]:
+                  - listitem [ref=e943]: Built-in code editor
+                  - listitem [ref=e944]: LSP or debugger workflows
+                  - listitem [ref=e945]: Telemetry, sign-in, or online account features
+                - generic [ref=e946]:
+                  - heading "Build Troubleshooting" [level=2] [ref=e947]
+                  - 'link "Permalink: Build Troubleshooting" [ref=e948] [cursor=pointer]':
+                    - /url: "#build-troubleshooting"
+                    - img [ref=e949]
+                - list [ref=e951]:
+                  - listitem [ref=e952]:
+                    - code [ref=e953]: link.exe not found
+                    - list [ref=e954]:
+                      - listitem [ref=e955]:
+                        - text: Install Visual Studio Build Tools or Visual Studio 2022 with
+                        - code [ref=e956]: Desktop development with C++
+                        - text: ", then rerun the release script."
+                  - listitem [ref=e957]:
+                    - code [ref=e958]: Required x64 MSVC/SDK libraries were not found in LIB
+                    - list [ref=e959]:
+                      - listitem [ref=e960]: Install the Windows SDK and MSVC CRT libraries that ship with the Desktop development with C++ workload, then rerun the release script.
+                  - listitem [ref=e961]:
+                    - code [ref=e962]: MSVC Rust toolchain not found
+                    - list [ref=e963]:
+                      - listitem [ref=e964]:
+                        - text: The release script provisions
+                        - code [ref=e965]: stable-x86_64-pc-windows-msvc
+                        - text: automatically when
+                        - code [ref=e966]: rustup
+                        - text: is available.
+                  - listitem [ref=e967]:
+                    - code [ref=e968]: toolchain 'stable-x86_64-pc-windows-msvc' is not installed
+                    - list [ref=e969]:
+                      - listitem [ref=e970]:
+                        - text: The release script installs it automatically through
+                        - code [ref=e971]: rustup toolchain install ... --profile minimal
+                        - text: .
+                  - listitem [ref=e972]:
+                    - code [ref=e973]: dependency tool not found
+                    - list [ref=e974]:
+                      - listitem [ref=e975]:
+                        - text: The release script first checks repo-local
+                        - code [ref=e976]: llvm-objdump.exe
+                        - text: ", then resolves"
+                        - code [ref=e977]: dumpbin.exe
+                        - text: from Visual Studio or Build Tools even outside Developer PowerShell.
+                  - listitem [ref=e978]:
+                    - code [ref=e979]: x86_64-w64-mingw32-clang.exe not found
+                    - list [ref=e980]:
+                      - listitem [ref=e981]:
+                        - text: This only affects explicit
+                        - code [ref=e982]: "--target x86_64-pc-windows-gnullvm"
+                        - text: builds. Plain local
+                        - code [ref=e983]: cargo
+                        - text: builds now use the default MSVC target from
+                        - code [ref=e984]: .cargo\config.toml
+                        - text: ; make sure Visual Studio Build Tools and the Windows SDK are installed if the MSVC toolchain is missing.
+                - generic [ref=e985]:
+                  - heading "License" [level=2] [ref=e986]
+                  - 'link "Permalink: License" [ref=e987] [cursor=pointer]':
+                    - /url: "#license"
+                    - img [ref=e988]
+                - paragraph [ref=e990]:
+                  - text: This project is licensed under the MIT License. See
+                  - link "LICENSE" [ref=e991] [cursor=pointer]:
+                    - /url: /furkancak1r/mergen-ade/blob/main/LICENSE
+                  - text: .
+        - generic [ref=e995]:
+          - generic [ref=e998]:
+            - heading "About" [level=2] [ref=e999]
+            - generic [ref=e1000]: No description, website, or topics provided.
+            - heading "Resources" [level=3] [ref=e1001]
+            - link "Readme" [ref=e1003] [cursor=pointer]:
+              - /url: "#readme-ov-file"
+              - img [ref=e1004]
+              - text: Readme
+            - heading "License" [level=3] [ref=e1006]
+            - link "MIT license" [ref=e1008] [cursor=pointer]:
+              - /url: "#MIT-1-ov-file"
+              - img [ref=e1009]
+              - text: MIT license
+            - link "Activity" [ref=e1012] [cursor=pointer]:
+              - /url: /furkancak1r/mergen-ade/activity
+              - img [ref=e1013]
+              - text: Activity
+            - heading "Stars" [level=3] [ref=e1015]
+            - link "6 stars" [ref=e1017] [cursor=pointer]:
+              - /url: /furkancak1r/mergen-ade/stargazers
+              - img [ref=e1018]
+              - strong [ref=e1020]: "6"
+              - text: stars
+            - heading "Watchers" [level=3] [ref=e1021]
+            - link "0 watching" [ref=e1023] [cursor=pointer]:
+              - /url: /furkancak1r/mergen-ade/watchers
+              - img [ref=e1024]
+              - strong [ref=e1026]: "0"
+              - text: watching
+            - heading "Forks" [level=3] [ref=e1027]
+            - link "0 forks" [ref=e1029] [cursor=pointer]:
+              - /url: /furkancak1r/mergen-ade/forks
+              - img [ref=e1030]
+              - strong [ref=e1032]: "0"
+              - text: forks
+            - link "Report repository" [ref=e1034] [cursor=pointer]:
+              - /url: /contact/report-content?content_url=https%3A%2F%2Fgithub.com%2Ffurkancak1r%2Fmergen-ade&report=furkancak1r+%28user%29
+          - generic [ref=e1036]:
+            - heading "Releases 25" [level=2] [ref=e1037]:
+              - link "Releases 25" [ref=e1038] [cursor=pointer]:
+                - /url: /furkancak1r/mergen-ade/releases
+                - text: Releases
+                - generic "25" [ref=e1039]
+            - link "v0.1.25 - OpenCode Model Slot Management Latest Apr 29, 20262 hours ago" [ref=e1040] [cursor=pointer]:
+              - /url: /furkancak1r/mergen-ade/releases/tag/v0.1.25
+              - img [ref=e1041]
+              - generic [ref=e1043]:
+                - generic [ref=e1044]:
+                  - generic [ref=e1045]: v0.1.25 - OpenCode Model Slot Management
+                  - 'generic "Label: Latest" [ref=e1046]': Latest
+                - generic [ref=e1047]: Apr 29, 20262 hours ago
+            - link "+ 24 releases" [ref=e1049] [cursor=pointer]:
+              - /url: /furkancak1r/mergen-ade/releases
+          - generic [ref=e1051]:
+            - heading "Packages" [level=2] [ref=e1052]:
+              - link "Packages" [ref=e1053] [cursor=pointer]:
+                - /url: /users/furkancak1r/packages?repo_name=mergen-ade
+            - generic [ref=e1054]: No packages published
+          - generic [ref=e1056]:
+            - heading "Contributors 3" [level=2] [ref=e1057]:
+              - link "Contributors 3" [ref=e1058] [cursor=pointer]:
+                - /url: /furkancak1r/mergen-ade/graphs/contributors
+                - text: Contributors
+                - generic "3" [ref=e1059]
+            - list [ref=e1060]:
+              - listitem [ref=e1061]:
+                - link "@furkancak1r" [ref=e1062] [cursor=pointer]:
+                  - /url: https://github.com/furkancak1r
+                  - img "@furkancak1r" [ref=e1063]
+                - link "furkancak1r Furkan Çakır" [ref=e1065] [cursor=pointer]:
+                  - /url: https://github.com/furkancak1r
+                  - strong [ref=e1066]: furkancak1r
+                  - text: Furkan Çakır
+              - listitem [ref=e1067]:
+                - link "@factory-droid[bot]" [ref=e1068] [cursor=pointer]:
+                  - /url: https://github.com/apps/factory-droid
+                  - img "@factory-droid[bot]" [ref=e1069]
+                - link "factory-droid[bot]" [ref=e1071] [cursor=pointer]:
+                  - /url: https://github.com/apps/factory-droid
+                  - strong [ref=e1072]: factory-droid[bot]
+              - listitem [ref=e1073]:
+                - link "@claude" [ref=e1074] [cursor=pointer]:
+                  - /url: https://github.com/claude
+                  - img "@claude" [ref=e1075]
+                - link "claude Claude" [ref=e1077] [cursor=pointer]:
+                  - /url: https://github.com/claude
+                  - strong [ref=e1078]: claude
+                  - text: Claude
+          - generic [ref=e1080]:
+            - heading "Languages" [level=2] [ref=e1081]
+            - list [ref=e1088]:
+              - listitem [ref=e1089]:
+                - link "Rust 80.9%" [ref=e1090] [cursor=pointer]:
+                  - /url: /furkancak1r/mergen-ade/search?l=rust
+                  - img [ref=e1091]
+                  - generic [ref=e1093]: Rust
+                  - generic [ref=e1094]: 80.9%
+              - listitem [ref=e1095]:
+                - link "Makefile 13.9%" [ref=e1096] [cursor=pointer]:
+                  - /url: /furkancak1r/mergen-ade/search?l=makefile
+                  - img [ref=e1097]
+                  - generic [ref=e1099]: Makefile
+                  - generic [ref=e1100]: 13.9%
+              - listitem [ref=e1101]:
+                - link "PowerShell 4.8%" [ref=e1102] [cursor=pointer]:
+                  - /url: /furkancak1r/mergen-ade/search?l=powershell
+                  - img [ref=e1103]
+                  - generic [ref=e1105]: PowerShell
+                  - generic [ref=e1106]: 4.8%
+              - listitem [ref=e1107]:
+                - generic [ref=e1108]:
+                  - img [ref=e1109]
+                  - generic [ref=e1111]: Other
+                  - generic [ref=e1112]: 0.4%
+  - contentinfo [ref=e1114]:
+    - heading "Footer" [level=2] [ref=e1115]
+    - generic [ref=e1116]:
+      - generic [ref=e1117]:
+        - link "GitHub Homepage" [ref=e1118] [cursor=pointer]:
+          - /url: https://github.com
+          - img [ref=e1119]
+        - generic [ref=e1121]: © 2026 GitHub, Inc.
+      - navigation "Footer" [ref=e1122]:
+        - heading "Footer navigation" [level=3] [ref=e1123]
+        - list "Footer navigation" [ref=e1124]:
+          - listitem [ref=e1125]:
+            - link "Terms" [ref=e1126] [cursor=pointer]:
+              - /url: https://docs.github.com/site-policy/github-terms/github-terms-of-service
+          - listitem [ref=e1127]:
+            - link "Privacy" [ref=e1128] [cursor=pointer]:
+              - /url: https://docs.github.com/site-policy/privacy-policies/github-privacy-statement
+          - listitem [ref=e1129]:
+            - link "Security" [ref=e1130] [cursor=pointer]:
+              - /url: https://github.com/security
+          - listitem [ref=e1131]:
+            - link "Status" [ref=e1132] [cursor=pointer]:
+              - /url: https://www.githubstatus.com/
+          - listitem [ref=e1133]:
+            - link "Community" [ref=e1134] [cursor=pointer]:
+              - /url: https://github.community/
+          - listitem [ref=e1135]:
+            - link "Docs" [ref=e1136] [cursor=pointer]:
+              - /url: https://docs.github.com/
+          - listitem [ref=e1137]:
+            - link "Contact" [ref=e1138] [cursor=pointer]:
+              - /url: https://support.github.com?tags=dotcom-footer
+          - listitem [ref=e1139]:
+            - button "Manage cookies" [ref=e1141] [cursor=pointer]
+          - listitem [ref=e1142]:
+            - button "Do not share my personal information" [ref=e1144] [cursor=pointer]
