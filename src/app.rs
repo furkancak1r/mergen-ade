@@ -1084,8 +1084,9 @@ pub struct AdeApp {
     /// Browser URL draft input per project (runtime only, not persisted).
     /// Holds the text being typed in the browser panel URL input before submission.
     browser_url_draft_by_project: BTreeMap<u64, String>,
-    /// Embedded browser for in-app web rendering (runtime only, not persisted)
-    embedded_browser: web_browser::EmbeddedBrowser,
+    /// Embedded browsers per project for in-app web rendering (runtime only, not persisted).
+    /// Each project has its own browser instance so switching projects preserves browser state.
+    embedded_browsers_by_project: BTreeMap<u64, web_browser::EmbeddedBrowser>,
     /// Reserved browser content area for native WebView bounds sync (runtime only)
     pending_browser_rect: Option<egui::Rect>,
 }
@@ -3398,7 +3399,7 @@ impl AdeApp {
             checklist_collapsed_by_project: BTreeMap::new(),
             file_editor: FileEditorState::default(),
             browser_url_draft_by_project: BTreeMap::new(),
-            embedded_browser: web_browser::EmbeddedBrowser::new(),
+            embedded_browsers_by_project: BTreeMap::new(),
             pending_browser_rect: None,
         };
         app
@@ -3618,6 +3619,11 @@ impl AdeApp {
         self.saved_message_drafts.remove(&project_id);
         self.directory_pending_tree_open_state_by_project
             .remove(&project_id);
+        // Clean up browser state for the removed project
+        self.browser_url_draft_by_project.remove(&project_id);
+        if let Some(mut browser) = self.embedded_browsers_by_project.remove(&project_id) {
+            browser.shutdown();
+        }
 
         // Remove project from input history and clear selection if needed
         let project_path_str = project.path.display().to_string();
@@ -9766,6 +9772,18 @@ impl AdeApp {
             self.file_editor.hide();
         }
 
+        // Sync selected_project with the active terminal's project
+        // This ensures browser panel and other project-scoped UI follows the active terminal
+        if let Some(terminal_id) = terminal_id {
+            if let Some(terminal) = self.terminals.get(&terminal_id) {
+                if self.selected_project != Some(terminal.project_id) {
+                    self.selected_project = Some(terminal.project_id);
+                    self.note_selection_changed();
+                    self.persist_config();
+                }
+            }
+        }
+
         if self.active_terminal == terminal_id {
             if let Some(terminal_id) = terminal_id {
                 self.acknowledge_terminal_attention(terminal_id);
@@ -14543,6 +14561,13 @@ impl AdeApp {
         }
     }
 
+    /// Get or create the embedded browser for a specific project.
+    fn project_browser(&mut self, project_id: u64) -> &mut web_browser::EmbeddedBrowser {
+        self.embedded_browsers_by_project
+            .entry(project_id)
+            .or_insert_with(web_browser::EmbeddedBrowser::new)
+    }
+
     /// Submit the browser URL for a project.
     /// Normalizes the URL, persists it, and navigates the embedded browser.
     fn submit_browser_url(&mut self, ctx: &egui::Context, project_id: u64, url: &str) {
@@ -14561,36 +14586,75 @@ impl AdeApp {
         self.note_ui_config_changed();
         self.persist_config();
 
-        // Navigate the embedded browser
-        self.embedded_browser.navigate(&normalized);
+        // Navigate the embedded browser for this specific project
+        self.project_browser(project_id).navigate(&normalized);
     }
 
     /// Synchronize embedded browser position with UI state.
     /// Called after UI render to update native WebView bounds.
+    /// Handles multiple project browsers - only the active project's browser is shown.
     fn sync_embedded_browser(&mut self, ctx: &egui::Context) {
+        // Determine which project's browser should be visible
+        let browser_project_id = self
+            .active_terminal
+            .and_then(|tid| self.terminals.get(&tid).map(|t| t.project_id))
+            .or(self.selected_project);
+
+        // Hide all browsers when panel is closed
         if !self.config.ui.browser_panel_expanded {
             self.pending_browser_rect = None;
-            self.embedded_browser.hide();
+            for (_, browser) in &mut self.embedded_browsers_by_project {
+                browser.hide();
+            }
             return;
         }
 
-        if matches!(self.embedded_browser.status(), BrowserStatus::Uninitialized) {
-            self.embedded_browser.ensure_created(self.window_hwnd);
+        // Hide browsers for all projects except the active one
+        for (pid, browser) in &mut self.embedded_browsers_by_project {
+            if Some(*pid) != browser_project_id {
+                browser.hide();
+            }
         }
 
-        match self.embedded_browser.status() {
-            BrowserStatus::Ready => {
-                if let Some(rect) = self.pending_browser_rect.take() {
-                    let bounds =
-                        web_browser::browser_bounds_from_egui_rect(rect, ctx.pixels_per_point());
-                    self.embedded_browser.show();
-                    self.embedded_browser.sync_position(&bounds);
+        // Show and sync the active project's browser
+        if let Some(project_id) = browser_project_id {
+            let window_hwnd = self.window_hwnd;
+
+            let browser_status = self
+                .embedded_browsers_by_project
+                .get(&project_id)
+                .map(|browser| browser.status())
+                .unwrap_or(BrowserStatus::Uninitialized);
+
+            if matches!(browser_status, BrowserStatus::Uninitialized) {
+                self.project_browser(project_id).ensure_created(window_hwnd);
+            }
+
+            let browser_status = self
+                .embedded_browsers_by_project
+                .get(&project_id)
+                .map(|browser| browser.status())
+                .unwrap_or(BrowserStatus::Uninitialized);
+
+            match browser_status {
+                BrowserStatus::Ready => {
+                    if let Some(rect) = self.pending_browser_rect.take() {
+                        let bounds = web_browser::browser_bounds_from_egui_rect(
+                            rect,
+                            ctx.pixels_per_point(),
+                        );
+                        let browser = self.project_browser(project_id);
+                        browser.show();
+                        browser.sync_position(&bounds);
+                    }
                 }
+                BrowserStatus::Failed(_) | BrowserStatus::Unsupported(_) => {
+                    if let Some(browser) = self.embedded_browsers_by_project.get_mut(&project_id) {
+                        browser.hide();
+                    }
+                }
+                BrowserStatus::Creating | BrowserStatus::Uninitialized => {}
             }
-            BrowserStatus::Failed(_) | BrowserStatus::Unsupported(_) => {
-                self.embedded_browser.hide();
-            }
-            BrowserStatus::Creating | BrowserStatus::Uninitialized => {}
         }
     }
 
@@ -14600,6 +14664,19 @@ impl AdeApp {
         if !self.config.ui.browser_panel_expanded {
             return None;
         }
+
+        // Determine which project's browser to show:
+        // 1. If there's an active terminal, use its project
+        // 2. Otherwise fall back to selected_project
+        let browser_project_id = self
+            .active_terminal
+            .and_then(|tid| self.terminals.get(&tid).map(|t| t.project_id))
+            .or(self.selected_project);
+
+        if browser_project_id.is_none() {
+            return None;
+        }
+        let browser_project_id = browser_project_id.unwrap();
 
         let response = egui::SidePanel::right("browser_panel")
             .resizable(false)
@@ -14626,15 +14703,21 @@ impl AdeApp {
                 });
                 ui.separator();
 
-                // Get selected project info
-                let selected_project_info = self.selected_project.and_then(|project_id| {
-                    self.projects
-                        .get(&project_id)
-                        .map(|p| (project_id, p.name.clone(), p.browser_last_url.clone()))
+                // Get browser project info
+                let selected_project_info = self.projects.get(&browser_project_id).map(|p| {
+                    (
+                        browser_project_id,
+                        p.name.clone(),
+                        p.browser_last_url.clone(),
+                    )
                 });
 
                 if let Some((project_id, project_name, browser_last_url)) = selected_project_info {
-                    let browser_status = self.embedded_browser.status();
+                    let browser_status = self
+                        .embedded_browsers_by_project
+                        .get(&browser_project_id)
+                        .map(|browser| browser.status())
+                        .unwrap_or(BrowserStatus::Uninitialized);
 
                     // Project name display
                     ui.label(
@@ -14655,12 +14738,12 @@ impl AdeApp {
                     // URL input with navigation - uses persistent draft state
                     let draft = self
                         .browser_url_draft_by_project
-                        .entry(project_id)
+                        .entry(browser_project_id)
                         .or_default();
                     let url_response = ui.add_sized(
                         [ui.available_width(), CONTROL_ROW_HEIGHT],
                         egui::TextEdit::singleline(draft)
-                            .id(Self::browser_url_input_id(project_id))
+                            .id(Self::browser_url_input_id(browser_project_id))
                             .hint_text("Enter URL (https://...)")
                             .vertical_align(egui::Align::Center),
                     );
@@ -14668,7 +14751,7 @@ impl AdeApp {
                     // Navigate on Enter key
                     if url_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         let url_to_submit = draft.clone();
-                        self.submit_browser_url(ctx, project_id, &url_to_submit);
+                        self.submit_browser_url(ctx, browser_project_id, &url_to_submit);
                     }
 
                     ui.add_space(8.0);
@@ -14686,10 +14769,10 @@ impl AdeApp {
                         ) {
                             let url_to_submit = self
                                 .browser_url_draft_by_project
-                                .get(&project_id)
+                                .get(&browser_project_id)
                                 .cloned()
                                 .unwrap_or_default();
-                            self.submit_browser_url(ctx, project_id, &url_to_submit);
+                            self.submit_browser_url(ctx, browser_project_id, &url_to_submit);
                         }
 
                         ui.add_space(8.0);
@@ -14703,10 +14786,11 @@ impl AdeApp {
                             Color32::from_rgb(186, 58, 58),
                             "Clear saved URL",
                         ) {
-                            if let Some(project) = self.projects.get_mut(&project_id) {
+                            if let Some(project) = self.projects.get_mut(&browser_project_id) {
                                 project.browser_last_url = None;
                                 // Also clear the draft
-                                self.browser_url_draft_by_project.remove(&project_id);
+                                self.browser_url_draft_by_project
+                                    .remove(&browser_project_id);
                                 self.note_projects_changed();
                                 self.persist_config();
                             }
@@ -15807,8 +15891,10 @@ impl eframe::App for AdeApp {
             self.reset_codex_notify_inbox(terminal_id);
         }
 
-        // Shutdown embedded browser to release native resources
-        self.embedded_browser.shutdown();
+        // Shutdown all embedded browsers to release native resources
+        for (_, browser) in &mut self.embedded_browsers_by_project {
+            browser.shutdown();
+        }
 
         self.persist_config();
         self.persist_history();
@@ -30072,7 +30158,7 @@ mod tests {
             ai_hook_manager: None,
             file_editor: FileEditorState::default(),
             browser_url_draft_by_project: BTreeMap::new(),
-            embedded_browser: web_browser::EmbeddedBrowser::new(),
+            embedded_browsers_by_project: BTreeMap::new(),
             pending_browser_rect: None,
         }
     }
@@ -36442,11 +36528,8 @@ mod tests {
         let project = test_project(1, "Demo", "C:/demo", &[], &[]);
         app.projects.insert(1, project);
 
-        // Before submit, browser should be uninitialized
-        assert!(matches!(
-            app.embedded_browser.status(),
-            web_browser::BrowserStatus::Uninitialized
-        ));
+        // Before submit, the project should not have an embedded browser yet.
+        assert!(!app.embedded_browsers_by_project.contains_key(&1));
 
         // Submit a URL
         app.submit_browser_url(&ctx, 1, "example.com");
@@ -36462,6 +36545,15 @@ mod tests {
             app.browser_url_draft_by_project.get(&1),
             Some(&"https://example.com".to_owned())
         );
+
+        // Submitting a URL should create a browser instance for that project.
+        assert!(app.embedded_browsers_by_project.contains_key(&1));
+        assert!(matches!(
+            app.embedded_browsers_by_project
+                .get(&1)
+                .map(|browser| browser.status()),
+            Some(web_browser::BrowserStatus::Uninitialized)
+        ));
     }
 
     #[test]
@@ -36476,10 +36568,7 @@ mod tests {
         app.sync_embedded_browser(&ctx);
 
         assert!(app.pending_browser_rect.is_none());
-        assert!(matches!(
-            app.embedded_browser.status(),
-            web_browser::BrowserStatus::Uninitialized
-        ));
+        assert!(app.embedded_browsers_by_project.is_empty());
     }
 
     #[test]
@@ -36502,5 +36591,135 @@ mod tests {
         // Verify browser panel can be drawn without placeholder text
         // (The actual rendering is tested via egui context in integration tests)
         assert!(app.config.ui.browser_panel_expanded);
+    }
+
+    #[test]
+    fn set_active_terminal_syncs_selected_project_with_terminal_project() {
+        let mut app = test_app([], None);
+        let ctx = egui::Context::default();
+
+        // Add two projects
+        let project1 = test_project(1, "Project1", "C:/proj1", &[], &[]);
+        let project2 = test_project(2, "Project2", "C:/proj2", &[], &[]);
+        app.projects.insert(1, project1);
+        app.projects.insert(2, project2);
+
+        // Create terminals for each project
+        let terminal1 = test_terminal_entry(101, 1);
+        let terminal2 = test_terminal_entry(102, 2);
+        app.terminals.insert(101, terminal1);
+        app.terminals.insert(102, terminal2);
+
+        // Set initial selected project to project 1
+        app.selected_project = Some(1);
+
+        // Activate terminal from project 2
+        app.set_active_terminal(&ctx, Some(102));
+
+        // selected_project should now be synced to project 2
+        assert_eq!(app.selected_project, Some(2));
+    }
+
+    #[test]
+    fn browser_panel_uses_active_terminal_project_over_selected_project() {
+        let mut app = test_app([], None);
+        let ctx = egui::Context::default();
+
+        // Add two projects with browser URLs
+        let mut project1 = test_project(1, "Project1", "C:/proj1", &[], &[]);
+        project1.browser_last_url = Some("https://project1.com".to_owned());
+        let mut project2 = test_project(2, "Project2", "C:/proj2", &[], &[]);
+        project2.browser_last_url = Some("https://project2.com".to_owned());
+        app.projects.insert(1, project1);
+        app.projects.insert(2, project2);
+
+        // Create terminals for each project
+        let terminal1 = test_terminal_entry(101, 1);
+        let terminal2 = test_terminal_entry(102, 2);
+        app.terminals.insert(101, terminal1);
+        app.terminals.insert(102, terminal2);
+
+        // selected_project is project 1, active terminal is project 2
+        app.selected_project = Some(1);
+        app.active_terminal = Some(102);
+        app.config.ui.browser_panel_expanded = true;
+
+        // Synchronize the embedded browser state; it should target project 2
+        app.sync_embedded_browser(&ctx);
+
+        assert!(!app.embedded_browsers_by_project.contains_key(&1));
+        assert!(app.embedded_browsers_by_project.contains_key(&2));
+    }
+
+    #[test]
+    fn project_browser_creates_per_project_instances() {
+        let mut app = test_app([], None);
+
+        // Initially no browsers
+        assert!(app.embedded_browsers_by_project.is_empty());
+
+        // Get browser for project 1
+        let _ = app.project_browser(1);
+        assert!(app.embedded_browsers_by_project.contains_key(&1));
+        assert_eq!(app.embedded_browsers_by_project.len(), 1);
+
+        // Get browser for project 2
+        let _ = app.project_browser(2);
+        assert!(app.embedded_browsers_by_project.contains_key(&2));
+        assert_eq!(app.embedded_browsers_by_project.len(), 2);
+
+        // Getting browser for project 1 again returns same instance
+        let _ = app.project_browser(1);
+        assert_eq!(app.embedded_browsers_by_project.len(), 2);
+    }
+
+    #[test]
+    fn submit_browser_url_navigates_per_project_browser() {
+        let mut app = test_app([], None);
+        let ctx = egui::Context::default();
+
+        // Add two projects
+        let project1 = test_project(1, "Project1", "C:/proj1", &[], &[]);
+        let project2 = test_project(2, "Project2", "C:/proj2", &[], &[]);
+        app.projects.insert(1, project1);
+        app.projects.insert(2, project2);
+
+        // Submit URL for project 1
+        app.submit_browser_url(&ctx, 1, "https://project1.com");
+
+        // Verify project 1's browser was created and has pending navigation
+        assert!(app.embedded_browsers_by_project.contains_key(&1));
+
+        // Project 2 should not have a browser yet
+        assert!(!app.embedded_browsers_by_project.contains_key(&2));
+
+        // Submit URL for project 2
+        app.submit_browser_url(&ctx, 2, "https://project2.com");
+
+        // Now project 2 should have a browser
+        assert!(app.embedded_browsers_by_project.contains_key(&2));
+    }
+
+    #[test]
+    fn remove_project_cleans_up_browser_state() {
+        let mut app = test_app([], None);
+        let ctx = egui::Context::default();
+
+        // Add a project with browser state
+        let project = test_project(1, "Project1", "C:/proj1", &[], &[]);
+        app.projects.insert(1, project);
+        app.browser_url_draft_by_project
+            .insert(1, "draft-url".to_owned());
+
+        // Create browser for the project
+        let _ = app.project_browser(1);
+        assert!(app.embedded_browsers_by_project.contains_key(&1));
+
+        // Remove the project
+        app.remove_project(&ctx, 1);
+
+        // Browser state should be cleaned up
+        assert!(!app.browser_url_draft_by_project.contains_key(&1));
+        assert!(!app.embedded_browsers_by_project.contains_key(&1));
     }
 }

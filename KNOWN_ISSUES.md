@@ -1,5 +1,34 @@
 ### Known Issues & Fix Log
 
+#### Browser panel now follows active terminal project with isolated browser instances {#browser-panel-follows-active-terminal-project}
+- Date: 2026-04-30
+- Context: Browser panel project scoping and terminal synchronization
+- Error signature: `Browser panel shows wrong project when switching terminals`
+- Symptoms/Impact:
+  1. Browser panel always showed the manually selected project, not the active terminal's project.
+  2. Switching between terminals in different projects didn't update the browser panel.
+  3. There was only one browser instance shared across all projects, losing state when switching.
+  4. Users had to manually change the selected project to see the browser for that project.
+- Root cause:
+  1. Browser panel used `selected_project` exclusively to determine which project to show.
+  2. `set_active_terminal()` didn't synchronize `selected_project` with the terminal's project.
+  3. Single `embedded_browser` field meant all projects shared one browser state.
+- Resolution:
+  - Changed from single `embedded_browser` to `embedded_browsers_by_project: BTreeMap<u64, EmbeddedBrowser>` for per-project browser instances.
+  - Updated `set_active_terminal()` to sync `selected_project` with the active terminal's project.
+  - Added `active_browser_project_id()` helper that prioritizes active terminal's project over selected_project.
+  - Updated `draw_browser_panel()` to use the active terminal's project (with fallback to selected_project).
+  - Updated `sync_embedded_browser()` to show only the active project's browser while hiding others.
+  - Updated `submit_browser_url()` to navigate the specific project's browser.
+  - Added cleanup in `remove_project()` to shutdown browser instances for deleted projects.
+  - Updated `on_exit()` to shutdown all project browsers.
+- Prevent recurrence:
+  - Any UI panel scoped to a project should follow the active terminal's project when possible.
+  - Use project-keyed maps for resources that should be isolated per project.
+  - When switching active terminals, synchronize the "current project" state for project-scoped UI.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request for browser panel to automatically follow active terminal project like terminals do.
+
 #### Embedded browser Go action did not create WebView2 and could still open external browser {#embedded-browser-go-did-not-create-webview2}
 - Date: 2026-04-30
 - Context: Browser panel embedded WebView2 navigation
@@ -3054,6 +3083,5 @@
   - Cap per-frame subtree requests to maintain responsiveness in large projects.
 - Files/Commands touched: `src/app.rs` (collect_search_deferred_directory_paths, draw_directory_panel), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User report that directory search cannot find files inside folders.
-
 
 

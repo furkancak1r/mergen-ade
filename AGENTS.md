@@ -209,3 +209,6 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Use WebView2 setter APIs for native state.** Use `ICoreWebView2Controller::SetBounds()` and `SetIsVisible()` for positioning/visibility. `Bounds()` and `IsVisible()` are getters and must not be used for sync.
 - **Browser hide must not depend on a fresh panel rect.** When `browser_panel_expanded` is false, hide the native WebView even if `pending_browser_rect` is `None`.
 - **Browser failures must be visible.** If WebView2 creation or navigation fails, render a clear in-panel error state instead of silently doing nothing or falling back to an external browser.
+- **Browser panel follows active terminal project.** The browser panel shows the active terminal's project, not the manually selected project. When the active terminal changes, the browser panel automatically switches to that terminal's project.
+- **Project browsers are isolated and persistent.** Each project has its own browser instance (`embedded_browsers_by_project`). Switching projects hides the previous browser but preserves its state; returning to that project shows the same browser state.
+- **Browser instances are lazily created.** A browser instance is only created when first needed (when the panel opens for that project). This avoids unnecessary WebView2 resource usage for projects never viewed in the browser.
