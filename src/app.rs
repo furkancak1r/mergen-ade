@@ -197,6 +197,7 @@ const BORDER_COLOR: Color32 = Color32::from_rgb(38, 38, 38);
 const ACCENT: Color32 = Color32::from_rgb(200, 200, 200);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(255, 255, 255);
 const TEXT_MUTED: Color32 = Color32::from_rgb(140, 140, 140);
+const DIRECTORY_SEARCH_MATCH_COLOR: Color32 = Color32::from_rgb(255, 176, 64);
 const PROJECT_EXPLORER_WIDTH: f32 = 352.0;
 const CHECKLIST_PANEL_WIDTH: f32 = 352.0;
 const ACTIVITY_RAIL_WIDTH: f32 = 48.0;
@@ -1060,8 +1061,6 @@ pub struct AdeApp {
     directory_index_generation: BTreeMap<u64, u64>,
     /// Tracks which subtrees are currently loading per project (for deduplication).
     directory_index_subtree_loading_by_project: BTreeMap<u64, BTreeSet<PathBuf>>,
-    /// Cache for visible directory search results per project to keep result list stable.
-    directory_search_result_cache_by_project: BTreeMap<u64, DirectorySearchResultCache>,
     // Terminal input history
     history_path: PathBuf,
     input_history: AppHistory,
@@ -2194,7 +2193,7 @@ enum DirectoryIndexEvent {
 }
 
 /// Visible paths in a directory search result set.
-/// Used to maintain stable search results while background loading continues.
+/// Captures the current snapshot-derived view for rendering.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DirectorySearchVisiblePaths {
     directories: BTreeSet<PathBuf>,
@@ -2207,26 +2206,6 @@ impl DirectorySearchVisiblePaths {
     fn has_results(&self) -> bool {
         !self.directories.is_empty() || !self.files.is_empty()
     }
-
-    fn contains_updates_not_in(&self, other: &Self) -> bool {
-        !self.directories.is_subset(&other.directories) || !self.files.is_subset(&other.files)
-    }
-
-    fn merge_from(&mut self, other: &Self) {
-        self.directories.extend(other.directories.iter().cloned());
-        self.files.extend(other.files.iter().cloned());
-        self.self_matching_directories
-            .extend(other.self_matching_directories.iter().cloned());
-    }
-}
-
-/// Cache for directory search results to keep visible results stable.
-/// Query changes reset the cache; explicit user action updates visible results.
-#[derive(Debug, Clone)]
-struct DirectorySearchResultCache {
-    query: String,
-    visible_paths: DirectorySearchVisiblePaths,
-    pending_visible_paths: Option<DirectorySearchVisiblePaths>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -3395,7 +3374,6 @@ impl AdeApp {
             directory_tree_has_collapsed_cache_by_project: BTreeMap::new(),
             directory_index_generation: BTreeMap::new(),
             directory_index_subtree_loading_by_project: BTreeMap::new(),
-            directory_search_result_cache_by_project: BTreeMap::new(),
             history_path,
             input_history,
             input_history_search_query: String::new(),
@@ -3617,8 +3595,6 @@ impl AdeApp {
         self.directory_index_state.remove(&project_id);
         self.directory_index_generation.remove(&project_id);
         self.directory_tree_has_collapsed_cache_by_project
-            .remove(&project_id);
-        self.directory_search_result_cache_by_project
             .remove(&project_id);
         self.saved_message_drafts.remove(&project_id);
         self.directory_pending_tree_open_state_by_project
@@ -7788,12 +7764,6 @@ impl AdeApp {
 
         if !force && self.directory_index_state.contains_key(&project_id) {
             return;
-        }
-
-        // Clear search result cache on full refresh since directory contents may have changed
-        if force {
-            self.directory_search_result_cache_by_project
-                .remove(&project_id);
         }
 
         let generation = self
@@ -12691,81 +12661,14 @@ impl AdeApp {
                                                 }
                                             }
 
-                                            // Manage search result cache: clear on query change, use cached results when available
-                                            let now = ui.ctx().input(|input| input.time);
-                                            if let Some(query) = search_query.as_deref() {
-                                                // Check if query changed and clear cache if so
-                                                if self.directory_search_result_cache_by_project
-                                                    .get(&project_id)
-                                                    .is_some_and(|cache| cache.query != query)
-                                                {
-                                                    self.directory_search_result_cache_by_project
-                                                        .remove(&project_id);
-                                                }
-                                            } else {
-                                                // Clear cache when not searching
-                                                self.directory_search_result_cache_by_project
-                                                    .remove(&project_id);
-                                            }
-
-                                            // Compute current visible paths from snapshot
+                                            // Compute current visible paths from snapshot for search rendering.
+                                            // Results update automatically as deferred subtree results arrive.
                                             let current_visible_paths = search_query
                                                 .as_deref()
                                                 .map(|query| collect_directory_search_visible_paths(&snapshot.root, query));
 
-                                            // Check for cache and manage updates
-                                            let has_cached_results = self
-                                                .directory_search_result_cache_by_project
-                                                .get(&project_id)
-                                                .is_some_and(|cache| cache.visible_paths.has_results());
-
-                                            // If no cache but we have results, create cache
-                                            if !has_cached_results {
-                                                if let Some(ref visible) = current_visible_paths {
-                                                    if visible.has_results() {
-                                                        if let Some(query) = search_query.clone() {
-                                                            self.directory_search_result_cache_by_project
-                                                                .insert(project_id, DirectorySearchResultCache {
-                                                                    query,
-                                                                    visible_paths: visible.clone(),
-                                                                    pending_visible_paths: None,
-                                                                });
-                                                        }
-                                                    }
-                                                }
-                                            } else if let Some(ref current) = current_visible_paths {
-                                                // Cache exists: split updates into auto-merge vs pending
-                                                let cache = self
-                                                    .directory_search_result_cache_by_project
-                                                    .get(&project_id)
-                                                    .expect("cache exists");
-                                                let (auto_visible, pending) = split_directory_search_updates(
-                                                    current,
-                                                    &cache.visible_paths,
-                                                );
-                                                // Auto-merge descendants under cached self-matching directories
-                                                if let Some(auto) = auto_visible {
-                                                    let cache_mut = self
-                                                        .directory_search_result_cache_by_project
-                                                        .get_mut(&project_id)
-                                                        .expect("cache exists");
-                                                    cache_mut.visible_paths.merge_from(&auto);
-                                                }
-                                                // Store non-auto updates as pending for explicit "Update results"
-                                                if let Some(pending_updates) = pending {
-                                                    let cache_mut = self
-                                                        .directory_search_result_cache_by_project
-                                                        .get_mut(&project_id)
-                                                        .expect("cache exists");
-                                                    cache_mut.pending_visible_paths = Some(pending_updates);
-                                                }
-                                            }
-
-                                            // Get the cached visible paths for rendering (stable results)
-                                            let search_visible_paths: Option<&DirectorySearchVisiblePaths> = self
-                                                .directory_search_result_cache_by_project
-                                                .get(&project_id)
-                                                .map(|cache| &cache.visible_paths);
+                                            let search_visible_paths: Option<&DirectorySearchVisiblePaths> =
+                                                current_visible_paths.as_ref();
 
                                             let (has_results, folder_state_changed, deferred_to_load, file_to_open) =
                                                 draw_folder_tree(
@@ -12863,40 +12766,6 @@ impl AdeApp {
                                                 ui.ctx().request_repaint_after(Duration::from_millis(50));
                                             }
 
-                                            // Show "Update results" button when new matches are available
-                                            // Place this below the tree (not above) to avoid shifting rows during click
-                                            if search_query.is_some() {
-                                                let has_pending_results = self
-                                                    .directory_search_result_cache_by_project
-                                                    .get(&project_id)
-                                                    .and_then(|cache| cache.pending_visible_paths.as_ref())
-                                                    .is_some();
-                                                if has_pending_results {
-                                                    ui.add_space(8.0);
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(
-                                                            RichText::new("New results found")
-                                                                .color(TEXT_MUTED)
-                                                                .small(),
-                                                        );
-                                                        if ui
-                                                            .button(RichText::new("Update results").small().strong())
-                                                            .clicked()
-                                                        {
-                                                            // Apply pending results to visible set
-                                                            if let Some(cache) = self
-                                                                .directory_search_result_cache_by_project
-                                                                .get_mut(&project_id)
-                                                            {
-                                                                if let Some(pending) = cache.pending_visible_paths.take() {
-                                                                    cache.visible_paths = pending;
-                                                                }
-                                                            }
-                                                            self.status_line = "Updated directory search results".to_owned();
-                                                        }
-                                                    });
-                                                }
-                                            }
                                         }
                                     }
 
@@ -17019,7 +16888,9 @@ fn draw_folder_tree(
             }
 
             let (_, header_response, _) = header_state
-                .show_header(ui, |ui| draw_directory_folder_row(ui, &item.name))
+                .show_header(ui, |ui| {
+                    draw_directory_folder_row(ui, &item.name, search_query)
+                })
                 .body(|ui| {
                     let (_, child_state_changed, child_deferred, child_file_open) =
                         draw_folder_tree(
@@ -17109,7 +16980,7 @@ fn draw_folder_tree(
                 continue;
             }
 
-            let response = draw_directory_file_row(ui, &item.name);
+            let response = draw_directory_file_row(ui, &item.name, search_query);
             let double_clicked = response.double_clicked();
             response.context_menu(|ui| {
                 with_minimal_button_chrome(ui, |ui| {
@@ -17250,89 +17121,6 @@ fn directory_search_should_load_deferred(query: &str, now: f64, changed_at: f64)
         return false;
     }
     directory_search_query_stable(now, changed_at)
-}
-
-/// Returns true if `path` is a descendant of `parent` (but not equal to it).
-fn path_is_descendant_of(path: &Path, parent: &Path) -> bool {
-    path != parent && path.starts_with(parent)
-}
-
-/// Splits new search results into auto-merge vs pending updates.
-///
-/// Auto-merge: descendants under cached self-matching directories are merged immediately.
-/// Pending: new matches outside cached self-matching directories require explicit "Update results".
-fn split_directory_search_updates(
-    current: &DirectorySearchVisiblePaths,
-    cached: &DirectorySearchVisiblePaths,
-) -> (
-    Option<DirectorySearchVisiblePaths>,
-    Option<DirectorySearchVisiblePaths>,
-) {
-    let mut auto_visible = DirectorySearchVisiblePaths::default();
-    let mut pending = DirectorySearchVisiblePaths::default();
-
-    // Check directories
-    for dir in &current.directories {
-        if !cached.directories.contains(dir) {
-            // New directory: auto-merge if under cached self-matching dir, else pending
-            let under_self_matching = cached
-                .self_matching_directories
-                .iter()
-                .any(|parent| path_is_descendant_of(dir, parent));
-            if under_self_matching {
-                auto_visible.directories.insert(dir.clone());
-            } else {
-                pending.directories.insert(dir.clone());
-            }
-        }
-    }
-
-    // Check files
-    for file in &current.files {
-        if !cached.files.contains(file) {
-            // New file: auto-merge if under cached self-matching dir, else pending
-            let under_self_matching = cached
-                .self_matching_directories
-                .iter()
-                .any(|parent| path_is_descendant_of(file, parent));
-            if under_self_matching {
-                auto_visible.files.insert(file.clone());
-            } else {
-                pending.files.insert(file.clone());
-            }
-        }
-    }
-
-    // Copy self-matching directories from current for future auto-merge checks
-    for self_match in &current.self_matching_directories {
-        if !cached.self_matching_directories.contains(self_match) {
-            // New self-matching dir: if under cached self-matching, auto-merge; else pending
-            let under_cached_self_matching = cached
-                .self_matching_directories
-                .iter()
-                .any(|parent| path_is_descendant_of(self_match, parent));
-            if under_cached_self_matching {
-                auto_visible
-                    .self_matching_directories
-                    .insert(self_match.clone());
-            } else {
-                pending.self_matching_directories.insert(self_match.clone());
-            }
-        }
-    }
-
-    (
-        if auto_visible.has_results() {
-            Some(auto_visible)
-        } else {
-            None
-        },
-        if pending.has_results() || !pending.self_matching_directories.is_empty() {
-            Some(pending)
-        } else {
-            None
-        },
-    )
 }
 
 /// Collects visible directories and files for a directory search result.
@@ -17628,16 +17416,140 @@ fn directory_row_text_position(
     )
 }
 
-fn draw_directory_file_row(ui: &mut Ui, text: &str) -> egui::Response {
+/// Returns byte ranges within `text` that match `query` (case-insensitive).
+/// This function is char-safe: it operates on character indices first, then converts
+/// to byte ranges to avoid splitting multi-byte UTF-8 sequences.
+fn directory_search_match_ranges(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let query_lower = query.to_lowercase();
+    let text_lower = text.to_lowercase();
+    let mut ranges = Vec::new();
+
+    // Collect char boundaries and lowercase chars for safe iteration
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let lower_chars: Vec<char> = text_lower.chars().collect();
+    let query_chars: Vec<char> = query_lower.chars().collect();
+
+    if query_chars.is_empty() || lower_chars.len() < query_chars.len() {
+        return ranges;
+    }
+
+    let mut i = 0;
+    while i <= lower_chars.len() - query_chars.len() {
+        // Check if query matches at position i
+        let matches = lower_chars[i..i + query_chars.len()] == query_chars[..];
+        if matches {
+            // Convert char indices to byte ranges in original text
+            let start_byte = chars[i].0;
+            let end_byte = if i + query_chars.len() < chars.len() {
+                chars[i + query_chars.len()].0
+            } else {
+                text.len()
+            };
+            ranges.push(start_byte..end_byte);
+            i += query_chars.len();
+        } else {
+            i += 1;
+        }
+    }
+    ranges
+}
+
+/// Creates a LayoutJob for directory search results with highlighted matches.
+fn directory_search_highlight_layout_job(
+    ui: &Ui,
+    text: &str,
+    search_query: Option<&str>,
+    base_color: Color32,
+) -> LayoutJob {
+    let mut layout_job = LayoutJob::default();
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+
+    let Some(query) = search_query else {
+        // No search active - single normal section
+        layout_job.append(
+            text,
+            0.0,
+            TextFormat {
+                font_id,
+                color: base_color,
+                ..TextFormat::default()
+            },
+        );
+        return layout_job;
+    };
+
+    let ranges = directory_search_match_ranges(text, query);
+    if ranges.is_empty() {
+        // No matches found - single normal section
+        layout_job.append(
+            text,
+            0.0,
+            TextFormat {
+                font_id,
+                color: base_color,
+                ..TextFormat::default()
+            },
+        );
+        return layout_job;
+    }
+
+    // Build sections alternating between normal and highlighted
+    let mut last_end = 0;
+    for range in ranges {
+        if range.start > last_end {
+            // Normal text before match
+            layout_job.append(
+                &text[last_end..range.start],
+                0.0,
+                TextFormat {
+                    font_id: font_id.clone(),
+                    color: base_color,
+                    ..TextFormat::default()
+                },
+            );
+        }
+        // Highlighted match
+        layout_job.append(
+            &text[range.start..range.end],
+            0.0,
+            TextFormat {
+                font_id: font_id.clone(),
+                color: DIRECTORY_SEARCH_MATCH_COLOR,
+                ..TextFormat::default()
+            },
+        );
+        last_end = range.end;
+    }
+
+    // Remaining normal text after last match
+    if last_end < text.len() {
+        layout_job.append(
+            &text[last_end..],
+            0.0,
+            TextFormat {
+                font_id,
+                color: base_color,
+                ..TextFormat::default()
+            },
+        );
+    }
+
+    layout_job
+}
+
+fn draw_directory_file_row(ui: &mut Ui, text: &str, search_query: Option<&str>) -> egui::Response {
     let button_padding = ui.spacing().button_padding;
     let available_width = ui.available_width().max(0.0);
     let wrap_width = sidebar_row_wrap_width(available_width, button_padding);
-    let galley = WidgetText::from(text.to_owned()).into_galley(
-        ui,
-        Some(TextWrapMode::Truncate),
-        wrap_width,
-        egui::TextStyle::Body,
-    );
+
+    // Build highlight layout job with search matches
+    let layout_job =
+        directory_search_highlight_layout_job(ui, text, search_query, ui.visuals().text_color());
+    let galley = ui.painter().layout_job(layout_job);
+
     let desired_height = sidebar_row_desired_height(ui, galley.size().y, button_padding);
     let desired_size = egui::vec2(available_width, desired_height);
     let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
@@ -17651,6 +17563,7 @@ fn draw_directory_file_row(ui: &mut Ui, text: &str) -> egui::Response {
         }
 
         let text_pos = directory_row_text_position(rect, button_padding, galley.size());
+        // Paint with default color since colors are baked into galley sections
         ui.painter()
             .galley(text_pos, galley, ui.visuals().text_color());
     }
@@ -17666,22 +17579,27 @@ fn draw_directory_file_row(ui: &mut Ui, text: &str) -> egui::Response {
     )
 }
 
-fn draw_directory_folder_row(ui: &mut Ui, text: &str) -> egui::Response {
+fn draw_directory_folder_row(
+    ui: &mut Ui,
+    text: &str,
+    search_query: Option<&str>,
+) -> egui::Response {
     let button_padding = ui.spacing().button_padding;
     let available_width = ui.available_width().max(0.0);
     let wrap_width = sidebar_row_wrap_width(available_width, button_padding);
-    let galley = WidgetText::from(text.to_owned()).into_galley(
-        ui,
-        Some(TextWrapMode::Truncate),
-        wrap_width,
-        egui::TextStyle::Body,
-    );
+
+    // Build highlight layout job with search matches
+    let layout_job =
+        directory_search_highlight_layout_job(ui, text, search_query, ui.visuals().text_color());
+    let galley = ui.painter().layout_job(layout_job);
+
     let desired_height = sidebar_row_desired_height(ui, galley.size().y, button_padding);
     let desired_size = egui::vec2(available_width, desired_height);
     let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
 
     if ui.is_rect_visible(rect) {
         let text_pos = directory_row_text_position(rect, button_padding, galley.size());
+        // Paint with default color since colors are baked into galley sections
         ui.painter()
             .galley(text_pos, galley, ui.visuals().text_color());
     }
@@ -29800,7 +29718,6 @@ mod tests {
             directory_tree_has_collapsed_cache_by_project: BTreeMap::new(),
             directory_index_generation: BTreeMap::new(),
             directory_index_subtree_loading_by_project: BTreeMap::new(),
-            directory_search_result_cache_by_project: BTreeMap::new(),
             checklist_collapsed_by_project: BTreeMap::new(),
             history_path: PathBuf::new(),
             input_history: AppHistory::default(),
@@ -31180,119 +31097,205 @@ mod tests {
     }
 
     #[test]
-    fn path_is_descendant_of_detects_child_paths() {
-        use super::path_is_descendant_of;
-        use std::path::PathBuf;
+    fn directory_search_match_ranges_finds_case_insensitive_matches() {
+        use super::directory_search_match_ranges;
 
-        let parent = PathBuf::from("/project/migrations");
-        let child = PathBuf::from("/project/migrations/001.sql");
-        let sibling = PathBuf::from("/project/database");
-        let same = PathBuf::from("/project/migrations");
+        let ranges = directory_search_match_ranges("migrations", "mig");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 0..3);
 
-        assert!(
-            path_is_descendant_of(&child, &parent),
-            "Child path should be detected as descendant"
-        );
-        assert!(
-            !path_is_descendant_of(&sibling, &parent),
-            "Sibling path should not be descendant"
-        );
-        assert!(
-            !path_is_descendant_of(&same, &parent),
-            "Same path should not be descendant of itself"
-        );
+        let ranges = directory_search_match_ranges("Migrations", "mig");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 0..3);
+
+        let ranges = directory_search_match_ranges("src/migrations", "MIG");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 4..7);
     }
 
     #[test]
-    fn split_directory_search_updates_auto_merges_under_self_matching() {
-        use super::{split_directory_search_updates, DirectorySearchVisiblePaths};
-        use std::path::PathBuf;
+    fn directory_search_match_ranges_finds_multiple_matches() {
+        use super::directory_search_match_ranges;
 
-        // Cached state: migrations folder is visible and self-matching
-        let mut cached = DirectorySearchVisiblePaths::default();
-        cached
-            .directories
-            .insert(PathBuf::from("/project/migrations"));
-        cached
-            .self_matching_directories
-            .insert(PathBuf::from("/project/migrations"));
-
-        // New state: migrations/001.sql discovered under cached self-matching folder
-        let mut current = DirectorySearchVisiblePaths::default();
-        current
-            .directories
-            .insert(PathBuf::from("/project/migrations"));
-        current
-            .files
-            .insert(PathBuf::from("/project/migrations/001.sql"));
-        current
-            .self_matching_directories
-            .insert(PathBuf::from("/project/migrations"));
-
-        let (auto, pending) = split_directory_search_updates(&current, &cached);
-
-        // The new file should auto-merge because it's under cached self-matching folder
-        assert!(
-            auto.is_some(),
-            "Auto-merge should exist for descendants under self-matching folder"
-        );
-        let auto_visible = auto.unwrap();
-        assert!(
-            auto_visible
-                .files
-                .contains(&PathBuf::from("/project/migrations/001.sql")),
-            "New file under self-matching folder should auto-merge"
-        );
-        // No pending updates
-        assert!(
-            pending.is_none(),
-            "No pending updates when all new items auto-merge"
-        );
+        let ranges = directory_search_match_ranges("migMigMIG", "mig");
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0], 0..3);
+        assert_eq!(ranges[1], 3..6);
+        assert_eq!(ranges[2], 6..9);
     }
 
     #[test]
-    fn split_directory_search_updates_pends_external_matches() {
-        use super::{split_directory_search_updates, DirectorySearchVisiblePaths};
+    fn directory_search_match_ranges_empty_query_returns_empty() {
+        use super::directory_search_match_ranges;
+
+        let ranges = directory_search_match_ranges("migrations", "");
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn directory_search_match_ranges_no_match_returns_empty() {
+        use super::directory_search_match_ranges;
+
+        let ranges = directory_search_match_ranges("src", "mig");
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn directory_search_highlight_layout_job_creates_single_section_when_no_search() {
+        use super::directory_search_highlight_layout_job;
+        use eframe::egui::Color32;
+
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let mut job_result = None;
+        ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                job_result = Some(directory_search_highlight_layout_job(
+                    ui,
+                    "migrations",
+                    None,
+                    Color32::WHITE,
+                ));
+            });
+        });
+
+        let job = job_result.expect("LayoutJob should be created");
+        // Should have single section when no search query
+        assert_eq!(job.sections.len(), 1);
+        // Check byte range points to expected text (job.text contains all text)
+        let section_text = &job.text[job.sections[0].byte_range.clone()];
+        assert_eq!(section_text, "migrations");
+    }
+
+    #[test]
+    fn directory_search_highlight_layout_job_highlights_matches() {
+        use super::{directory_search_highlight_layout_job, DIRECTORY_SEARCH_MATCH_COLOR};
+        use eframe::egui::Color32;
+
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let mut job_result = None;
+        ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                job_result = Some(directory_search_highlight_layout_job(
+                    ui,
+                    "migrations",
+                    Some("mig"),
+                    Color32::WHITE,
+                ));
+            });
+        });
+
+        let job = job_result.expect("LayoutJob should be created");
+
+        // Should have 2 sections: normal prefix + highlighted match ("mig" at start)
+        // Actually 3 sections: empty prefix + highlighted + normal suffix
+        assert!(!job.sections.is_empty(), "Job should have sections");
+
+        // Find section with highlighted match color
+        let highlighted = job
+            .sections
+            .iter()
+            .find(|s| s.format.color == DIRECTORY_SEARCH_MATCH_COLOR);
+        assert!(highlighted.is_some(), "Should have a highlighted section");
+        let highlighted_section = highlighted.unwrap();
+        let highlighted_text = &job.text[highlighted_section.byte_range.clone()];
+        assert_eq!(highlighted_text, "mig");
+    }
+
+    #[test]
+    fn directory_search_match_ranges_handles_unicode_safely() {
+        use super::directory_search_match_ranges;
+
+        // Unicode file name with emoji
+        let ranges = directory_search_match_ranges("readme📄.md", "me");
+        assert_eq!(ranges.len(), 1);
+
+        // Verify we don't panic on Unicode and get reasonable byte range
+        let ranges = directory_search_match_ranges("src/文件.txt", "文");
+        assert_eq!(ranges.len(), 1);
+    }
+
+    #[test]
+    fn directory_search_visible_paths_updates_automatically_with_new_matches() {
+        // Regression test: Search results should update automatically as deferred
+        // subtree results arrive, without requiring manual "Update results" action.
+        use super::{collect_directory_search_visible_paths, DirectoryNode};
         use std::path::PathBuf;
 
-        // Cached state: migrations folder is visible
-        let mut cached = DirectorySearchVisiblePaths::default();
-        cached
-            .directories
-            .insert(PathBuf::from("/project/migrations"));
-        cached
-            .self_matching_directories
-            .insert(PathBuf::from("/project/migrations"));
+        // Initial state: migrations folder is deferred (empty children)
+        let migrations_deferred = DirectoryNode {
+            name: "migrations".to_owned(),
+            path: PathBuf::from("/project/migrations"),
+            is_dir: true,
+            is_placeholder: false,
+            is_deferred: true,
+            children: vec![],
+        };
+        let root_initial = DirectoryNode {
+            name: "project".to_owned(),
+            path: PathBuf::from("/project"),
+            is_dir: true,
+            is_placeholder: false,
+            is_deferred: false,
+            children: vec![migrations_deferred],
+        };
 
-        // New state: database/migrations discovered outside cached folder
-        let mut current = DirectorySearchVisiblePaths::default();
-        current
-            .directories
-            .insert(PathBuf::from("/project/migrations"));
-        current
-            .directories
-            .insert(PathBuf::from("/project/database/migrations"));
-        current
-            .self_matching_directories
-            .insert(PathBuf::from("/project/migrations"));
-        current
-            .self_matching_directories
-            .insert(PathBuf::from("/project/database/migrations"));
-
-        let (auto, pending) = split_directory_search_updates(&current, &cached);
-
-        // The new external folder should be pending, not auto-merged
+        // Search should find migrations folder (name matches)
+        let visible_initial = collect_directory_search_visible_paths(&root_initial, "mig");
         assert!(
-            auto.is_none(),
-            "No auto-merge for items outside cached self-matching folders"
-        );
-        assert!(pending.is_some(), "External match should be pending");
-        let pending_visible = pending.unwrap();
-        assert!(
-            pending_visible
+            visible_initial
                 .directories
-                .contains(&PathBuf::from("/project/database/migrations")),
-            "External folder should be in pending, not auto-merged"
+                .contains(&PathBuf::from("/project/migrations")),
+            "Self-matching directory should be visible"
+        );
+        assert!(
+            visible_initial.files.is_empty(),
+            "No files visible yet since folder is deferred"
+        );
+
+        // Simulated update: migrations folder is now loaded with matching file
+        let migrations_001 = DirectoryNode {
+            name: "001_add_users.sql".to_owned(),
+            path: PathBuf::from("/project/migrations/001_add_users.sql"),
+            is_dir: false,
+            is_placeholder: false,
+            is_deferred: false,
+            children: vec![],
+        };
+        let migrations_loaded = DirectoryNode {
+            name: "migrations".to_owned(),
+            path: PathBuf::from("/project/migrations"),
+            is_dir: true,
+            is_placeholder: false,
+            is_deferred: false,
+            children: vec![migrations_001],
+        };
+        let root_updated = DirectoryNode {
+            name: "project".to_owned(),
+            path: PathBuf::from("/project"),
+            is_dir: true,
+            is_placeholder: false,
+            is_deferred: false,
+            children: vec![migrations_loaded],
+        };
+
+        // New search on updated snapshot should automatically show the file
+        // (no manual "Update results" needed)
+        let visible_updated = collect_directory_search_visible_paths(&root_updated, "mig");
+        assert!(
+            visible_updated
+                .directories
+                .contains(&PathBuf::from("/project/migrations")),
+            "Self-matching directory should still be visible"
+        );
+        assert!(
+            visible_updated
+                .files
+                .contains(&PathBuf::from("/project/migrations/001_add_users.sql")),
+            "Matching file should be automatically visible after subtree loads"
         );
     }
 
@@ -31520,7 +31523,7 @@ mod tests {
                         .max_rect(rect)
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                 );
-                let response = super::draw_directory_file_row(&mut child, "src/app.rs");
+                let response = super::draw_directory_file_row(&mut child, "src/app.rs", None);
                 observed_width = Some(response.rect.width());
             });
         });
@@ -31543,7 +31546,7 @@ mod tests {
                         .max_rect(rect)
                         .layout(egui::Layout::top_down(egui::Align::Center)),
                 );
-                let response = super::draw_directory_folder_row(&mut child, "src");
+                let response = super::draw_directory_folder_row(&mut child, "src", None);
                 observed_width = Some(response.rect.width());
             });
         });

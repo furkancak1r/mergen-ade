@@ -27,6 +27,41 @@
   - Document that `TextEdit` may consume shortcuts and generate events rather than pass raw keys.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
 
+#### Directory search required manual Update results for newly discovered matches {#directory-search-required-manual-update-results}
+- Date: 2026-04-30
+- Context: Directory sidebar search with deferred background loading
+- Error signature: `New results found / Update results button appears and hides search matches until clicked`
+- Symptoms/Impact:
+  1. User types a directory search query (e.g., `mi`) and initial results appear.
+  2. Background deferred subtree loading continues to find more matches in unloaded folders.
+  3. Newly discovered matches outside already visible folders were stored in `pending_visible_paths`.
+  4. UI showed "New results found" label with "Update results" button below the tree.
+  5. Users had to click the button to see additional matches, which was unexpected and annoying.
+  6. The button could shift row positions, making click targets unreliable.
+- Root cause:
+  1. Previous implementation tried to keep the visible result list "stable" to prevent row shifting during clicks.
+  2. `DirectorySearchResultCache` with `pending_visible_paths` field was introduced to buffer new matches.
+  3. `split_directory_search_updates()` split new results into "auto-merge" (under self-matching folders) vs "pending" (external matches).
+  4. AGENTS.md guideline explicitly required manual update: "newly discovered matches must not be inserted into the visible result list until the user explicitly updates results."
+  5. This created a two-step UX that users found unnecessary and confusing.
+- Resolution:
+  - Removed `pending_visible_paths` field from `DirectorySearchResultCache` (struct itself simplified to just visible paths).
+  - Removed `split_directory_search_updates()` helper and `path_is_descendant_of()` function.
+  - Removed "New results found" / "Update results" UI block from `draw_directory_panel()`.
+  - Changed search rendering to use `current_visible_paths` computed fresh each frame from the snapshot.
+  - Search results now update automatically as deferred subtree results arrive.
+  - Removed related tests: `split_directory_search_updates_auto_merges_under_self_matching`, `split_directory_search_updates_pends_external_matches`, `path_is_descendant_of_detects_child_paths`.
+  - Added regression test: `directory_search_visible_paths_updates_automatically_with_new_matches`.
+  - Updated AGENTS.md guidelines to reflect automatic update behavior.
+- Prevent recurrence:
+  - Never add "Update results" UI for directory search.
+  - Never buffer search results as "pending" requiring manual action.
+  - Compute visible paths from current snapshot each frame.
+  - Keep deferred loading lazy, debounced, capped per frame, and never synchronous.
+  - Regression tests should verify automatic result appearance, not manual update flows.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test --release --target x86_64-pc-windows-msvc`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report that "Update results butonu hiç var olmasın zaten arayıp getirsin ya bu kadar zor olmamalı"
+
 #### Directory search results now stable while background loading continues {#directory-search-results-stable-during-background-load}
 - Date: 2026-04-30
 - Context: Directory sidebar search UX - result list stability
