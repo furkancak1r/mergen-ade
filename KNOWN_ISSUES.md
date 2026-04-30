@@ -332,6 +332,36 @@
 - Files/Commands touched: `src/app.rs` (TerminalEntry, rerun_command_in_terminal, process_pending_reruns, update, PENDING_RERUN_SETTLE_MS), `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test background_rerun_two_phase_interrupt_then_command`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: 2026-04-29 user report that rerun did not cancel a running `npm run dev:client` / Vite process.
 
+#### Windows batch confirmation prompt no longer swallows background rerun commands {#background-rerun-windows-batch-confirmation-prompt}
+- Date: 2026-04-30
+- Context: Terminal Manager background rerun on Windows PowerShell/CMD with `.cmd` or batch-backed commands such as `npm`/Vite
+- Error signature: `Terminate batch job (Y/N)?` appears and the rerun command is not executed
+- Symptoms/Impact:
+  1. Background rerun sends `Ctrl+C` to stop a running `.cmd`-based command (e.g., `npm run dev:client`).
+  2. Windows displays `Terminate batch job (Y/N)?` and waits for user confirmation.
+  3. The stored rerun command is sent too early (consumed as prompt input or lost), and the command never replays.
+  4. User sees the batch prompt but the automatic rerun never completes.
+- Root cause:
+  1. The previous two-phase rerun used only a fixed `150ms` settle with no prompt detection or confirmation phase.
+  2. On Windows, batch script interruption requires explicit `y` confirmation after `Ctrl+C`.
+  3. The prompt text (`Terminate batch job (Y/N)?`) appears on the terminal output, but the rerun logic did not check for it before sending the command.
+- Resolution:
+  - Added explicit pending rerun phases (`InterruptSent`, `BatchConfirmSent`) with `pending_rerun_phase` tracking.
+  - On Windows PowerShell/CMD shells, after the initial `Ctrl+C` settle (`PENDING_RERUN_SETTLE_MS`), check the latest runtime snapshot for `Terminate batch job (Y/N)?` on the last non-empty line.
+  - If detected, send automatic `y\r` confirmation, transition to `BatchConfirmSent` phase, wait for `PENDING_RERUN_BATCH_CONFIRM_SETTLE_MS`, then replay the full stored command.
+  - If no prompt appears within `PENDING_RERUN_BATCH_PROMPT_WAIT_MS` (1000ms), proceed with normal command replay.
+  - The automatic `y` confirmation is internal control input and is never added to `recent_inputs` or persisted history.
+  - Added helper functions `terminal_last_line_text()` and `terminal_has_windows_batch_terminate_prompt()` for prompt detection.
+  - Updated `process_pending_reruns()` with full state machine logic for all phases.
+  - Added regression tests: `background_rerun_waits_during_windows_batch_prompt_window_without_prompt`, `background_rerun_confirms_windows_batch_prompt_before_command`, `windows_batch_terminate_prompt_detection_is_case_insensitive`, `windows_batch_terminate_prompt_detection_ignores_old_scrollback`, `pending_rerun_clears_when_terminal_exited`.
+- Prevent recurrence:
+  - Never use fixed-delay-only rerun for interactive shell interruption prompts; always detect and handle platform-specific confirmation prompts.
+  - Test prompt and no-prompt paths on both Windows and non-Windows shells.
+  - Keep internal confirmation input out of history; verify `recent_inputs` does not contain the automatic `y`.
+  - Use runtime snapshots (not just cached UI) for prompt detection to ensure latest PTY state is checked.
+- Files/Commands touched: `src/app.rs` (PendingRerunPhase enum, TerminalEntry, rerun_command_in_terminal, process_pending_reruns, terminal_last_line_text, terminal_has_windows_batch_terminate_prompt, regression tests), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: 2026-04-30 user report with Vite `ETIMEDOUT`, `Ctrl+C`, and `Terminate batch job (Y/N)?` not being handled automatically.
+
 #### Terminal history and background rerun now preserve full raw submitted input {#terminal-history-preserves-full-raw-input}
 - Date: 2026-04-28
 - Context: Terminal Manager input history and background rerun functionality

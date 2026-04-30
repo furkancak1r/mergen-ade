@@ -111,6 +111,14 @@ const TERMINAL_HELD_KEY_REPEAT_MAX_SYNTHETIC_EVENTS_PER_FRAME: usize = 16;
 /// Settle duration before sending the command phase of a background rerun.
 /// Ensures Ctrl+C has been processed by the shell/PTY before the command is typed.
 const PENDING_RERUN_SETTLE_MS: u64 = 150;
+/// Maximum wait time for Windows batch prompt to appear after Ctrl+C.
+/// If no prompt appears within this window, proceed with normal command replay.
+const PENDING_RERUN_BATCH_PROMPT_WAIT_MS: u64 = 1000;
+/// Settle duration after sending Windows batch confirmation (y\r).
+/// Ensures the confirmation is processed before replaying the command.
+const PENDING_RERUN_BATCH_CONFIRM_SETTLE_MS: u64 = 150;
+/// Polling interval while waiting for batch prompt or settle durations.
+const PENDING_RERUN_POLL_MS: u64 = 50;
 
 // Embedded Nerd Font for terminal icon support (Windows-only)
 #[cfg(target_os = "windows")]
@@ -1349,6 +1357,8 @@ struct TerminalEntry {
     pending_rerun_command: Option<String>,
     /// When the pending rerun was queued; used for settle timing before sending command.
     pending_rerun_since: Option<Instant>,
+    /// Current phase of the pending rerun (interrupt, batch confirm, etc.).
+    pending_rerun_phase: Option<PendingRerunPhase>,
     /// When we launched Claude (explicit claim of ownership)
     /// Cleared when Claude session is confirmed active via title/hook
     claude_launch_pending_since: Option<Instant>,
@@ -1364,6 +1374,15 @@ struct TerminalEntry {
     claude_last_title_working_at: Option<Instant>,
     claude_last_title_idle_at: Option<Instant>,
     claude_last_permission_at: Option<Instant>,
+}
+
+/// Phase of a pending background rerun to handle Windows batch confirmation prompts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PendingRerunPhase {
+    /// Ctrl+C has been sent; waiting for interrupt to be processed or batch prompt to appear.
+    InterruptSent,
+    /// Windows batch confirmation "y\r" has been sent; waiting for confirmation to be processed.
+    BatchConfirmSent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3603,6 +3622,7 @@ impl AdeApp {
             stable_input_cursor_row: None,
             render_cache: TerminalSnapshot::default(),
             selection: None,
+            pending_rerun_phase: None,
             selection_snapshot: None,
             pending_link_click: None,
             selection_drag_active: false,
@@ -7707,7 +7727,9 @@ impl AdeApp {
         // Send command and handle failure
         if self.directory_index_commands_tx.send(command).is_err() {
             // Clean up loading set if send failed
-            if let Some(set) = self.directory_index_subtree_loading_by_project.get_mut(&project_id)
+            if let Some(set) = self
+                .directory_index_subtree_loading_by_project
+                .get_mut(&project_id)
             {
                 set.remove(&target_path_for_cleanup);
             }
@@ -10307,41 +10329,124 @@ impl AdeApp {
 
         // Phase 1: send interrupt (Ctrl+C) immediately.
         // Phase 2: command will be sent after settle in process_pending_reruns().
+        // On Windows batch prompts, Phase 2 may include automatic "y\r" confirmation.
         terminal.runtime.send_bytes(vec![0x03]);
         terminal.pending_rerun_command = Some(command.to_owned());
         terminal.pending_rerun_since = Some(Instant::now());
+        terminal.pending_rerun_phase = Some(PendingRerunPhase::InterruptSent);
         terminal.dirty = true;
         ctx.request_repaint();
         self.show_status_feedback(ctx, &format!("Interrupting, will rerun: {}", trimmed));
     }
 
-    /// Process pending reruns: after settle duration, send the stored command.
+    /// Process pending reruns: state machine handles Ctrl+C settle, Windows batch
+    /// confirmation prompt detection, and command replay.
     fn process_pending_reruns(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         let settle_duration = Duration::from_millis(PENDING_RERUN_SETTLE_MS);
+        let batch_prompt_wait = Duration::from_millis(PENDING_RERUN_BATCH_PROMPT_WAIT_MS);
+        let batch_confirm_settle = Duration::from_millis(PENDING_RERUN_BATCH_CONFIRM_SETTLE_MS);
+        let poll_interval = Duration::from_millis(PENDING_RERUN_POLL_MS);
 
-        // Collect pending reruns to process (avoid borrow issues with self.show_status_feedback).
-        let mut to_process: Vec<(u64, String)> = Vec::new();
+        // Collect reruns to send and pending states to clear.
+        let mut to_send: Vec<(u64, String)> = Vec::new();
+        let mut to_clear: Vec<u64> = Vec::new();
+        let mut needs_repaint = false;
+
         for terminal in self.terminals.values_mut() {
-            if let Some(ref command) = terminal.pending_rerun_command {
-                let should_send = terminal
-                    .pending_rerun_since
-                    .is_some_and(|since| now.duration_since(since) >= settle_duration);
+            let Some(ref command) = terminal.pending_rerun_command else {
+                continue;
+            };
+            let Some(since) = terminal.pending_rerun_since else {
+                continue;
+            };
+            let elapsed = now.duration_since(since);
+            let phase = terminal.pending_rerun_phase;
 
-                if should_send {
-                    let trimmed = command.trim();
-                    if !trimmed.is_empty() && !terminal.exited {
-                        to_process.push((terminal.id, command.clone()));
+            // Handle terminal exit during pending rerun.
+            if terminal.exited {
+                to_clear.push(terminal.id);
+                continue;
+            }
+
+            match phase {
+                Some(PendingRerunPhase::InterruptSent) => {
+                    // Wait for initial Ctrl+C settle before checking for batch prompt.
+                    if elapsed < settle_duration {
+                        needs_repaint = true;
+                        continue;
                     }
-                    // Clear pending state regardless of whether we sent (to avoid retries).
-                    terminal.pending_rerun_command = None;
-                    terminal.pending_rerun_since = None;
+
+                    // On Windows shells, check for batch confirmation prompt.
+                    let is_windows_shell =
+                        matches!(terminal.shell, ShellKind::PowerShell | ShellKind::Cmd);
+                    if is_windows_shell {
+                        // Check latest runtime snapshot for the prompt (not cached UI).
+                        let has_prompt =
+                            crate::terminal::try_terminal_snapshots(&terminal.runtime, false)
+                                .map(|(snapshot, _)| {
+                                    terminal_has_windows_batch_terminate_prompt(&snapshot)
+                                })
+                                .unwrap_or(false);
+
+                        if has_prompt {
+                            // Send automatic "y\r" to confirm batch termination.
+                            terminal.runtime.send_bytes(b"y\r".to_vec());
+                            terminal.pending_rerun_since = Some(now);
+                            terminal.pending_rerun_phase =
+                                Some(PendingRerunPhase::BatchConfirmSent);
+                            terminal.dirty = true;
+                            needs_repaint = true;
+                            continue;
+                        }
+
+                        // No prompt yet, but still within batch prompt wait window.
+                        if elapsed < batch_prompt_wait {
+                            needs_repaint = true;
+                            continue;
+                        }
+                        // Prompt wait expired without seeing prompt; proceed with command.
+                    }
+
+                    // Ready to send the command.
+                    let trimmed = command.trim();
+                    if !trimmed.is_empty() {
+                        to_send.push((terminal.id, command.clone()));
+                    }
+                    to_clear.push(terminal.id);
+                }
+                Some(PendingRerunPhase::BatchConfirmSent) => {
+                    // Wait for batch confirmation to be processed before sending command.
+                    if elapsed < batch_confirm_settle {
+                        needs_repaint = true;
+                        continue;
+                    }
+
+                    // Ready to send the command.
+                    let trimmed = command.trim();
+                    if !trimmed.is_empty() {
+                        to_send.push((terminal.id, command.clone()));
+                    }
+                    to_clear.push(terminal.id);
+                }
+                None => {
+                    // No phase set (should not happen), clear to prevent stuck state.
+                    to_clear.push(terminal.id);
                 }
             }
         }
 
-        // Process collected reruns (self is no longer borrowed by terminals loop).
-        for (terminal_id, command) in to_process {
+        // Clear pending states for processed terminals.
+        for terminal_id in to_clear {
+            if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                terminal.pending_rerun_command = None;
+                terminal.pending_rerun_since = None;
+                terminal.pending_rerun_phase = None;
+            }
+        }
+
+        // Send collected commands.
+        for (terminal_id, command) in to_send {
             let trimmed = command.trim();
             if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                 let mut outbound = command.as_bytes().to_vec();
@@ -10359,9 +10464,13 @@ impl AdeApp {
                         update_terminal_title(&sanitized, terminal.id as usize, TITLE_MAX_LEN);
                 }
                 terminal.dirty = true;
-                ctx.request_repaint();
+                needs_repaint = true;
                 self.show_status_feedback(ctx, &format!("Rerunning: {}", trimmed));
             }
+        }
+
+        if needs_repaint {
+            ctx.request_repaint_after(poll_interval);
         }
     }
 
@@ -13713,7 +13822,9 @@ impl AdeApp {
 
                     // Close button - small icon-only
                     let close_btn = egui::Button::new(
-                        RichText::new(format!("{}", icons::X)).size(16.0).color(TEXT_PRIMARY)
+                        RichText::new(format!("{}", icons::X))
+                            .size(16.0)
+                            .color(TEXT_PRIMARY),
                     )
                     .fill(Color32::TRANSPARENT)
                     .stroke(Stroke::NONE)
@@ -13731,7 +13842,9 @@ impl AdeApp {
                     let can_save = is_dirty;
                     let save_icon_color = if can_save { TEXT_PRIMARY } else { TEXT_MUTED };
                     let save_btn = egui::Button::new(
-                        RichText::new(format!("{}", icons::CHECK_CIRCLE)).size(16.0).color(save_icon_color)
+                        RichText::new(format!("{}", icons::CHECK_CIRCLE))
+                            .size(16.0)
+                            .color(save_icon_color),
                     )
                     .fill(Color32::TRANSPARENT)
                     .stroke(Stroke::NONE)
@@ -13739,8 +13852,11 @@ impl AdeApp {
                     .min_size(egui::vec2(28.0, 28.0));
 
                     ui.add_enabled_ui(can_save, |ui| {
-                        let save_response = ui.add(save_btn)
-                            .on_hover_text(if can_save { "Save File (Ctrl+S)" } else { "No unsaved changes" });
+                        let save_response = ui.add(save_btn).on_hover_text(if can_save {
+                            "Save File (Ctrl+S)"
+                        } else {
+                            "No unsaved changes"
+                        });
                         if save_response.clicked() {
                             save_file = true;
                         }
@@ -13750,7 +13866,8 @@ impl AdeApp {
                 ui.add_space(TERMINAL_HEADER_GAP);
 
                 // Editor body - uses FILE_EDITOR_HEADER_HEIGHT for calculation
-                let editor_height = (available.y - FILE_EDITOR_HEADER_HEIGHT - TERMINAL_HEADER_GAP).max(100.0);
+                let editor_height =
+                    (available.y - FILE_EDITOR_HEADER_HEIGHT - TERMINAL_HEADER_GAP).max(100.0);
                 let editor_rect = egui::Rect::from_min_size(
                     ui.cursor().min,
                     egui::vec2(available.x, editor_height),
@@ -13822,9 +13939,8 @@ impl AdeApp {
 
                                     // Apply edge autoscroll when selection drag is active
                                     if is_drag_active {
-                                        let pointer_pos = ui
-                                            .ctx()
-                                            .input(|input| input.pointer.interact_pos());
+                                        let pointer_pos =
+                                            ui.ctx().input(|input| input.pointer.interact_pos());
                                         let viewport_rect = ui.clip_rect();
                                         let autoscroll_delta = selection_edge_autoscroll_delta(
                                             pointer_pos,
@@ -13836,15 +13952,11 @@ impl AdeApp {
                                             // Apply scroll delta to the ScrollArea
                                             // Positive delta = scroll up (content moves up)
                                             // Negative delta = scroll down (content moves down)
-                                            ui.scroll_with_delta(egui::vec2(
-                                                0.0,
-                                                autoscroll_delta,
-                                            ));
+                                            ui.scroll_with_delta(egui::vec2(0.0, autoscroll_delta));
                                             // Request repaint to continue autoscrolling
                                             // while mouse is held near the edge
-                                            ui.ctx().request_repaint_after(
-                                                Duration::from_millis(16),
-                                            );
+                                            ui.ctx()
+                                                .request_repaint_after(Duration::from_millis(16));
                                         }
                                     }
 
@@ -14630,10 +14742,8 @@ impl AdeApp {
                                         terminal.runtime.is_mouse_reporting_active();
                                     // For OpenCode: Mergen scrollback takes priority over runtime wheel
                                     // For other mouse-reporting apps: send wheel to runtime as before
-                                    let is_opencode = terminal
-                                        .ai_session
-                                        .tool
-                                        == Some(AiCliTool::OpenCode);
+                                    let is_opencode =
+                                        terminal.ai_session.tool == Some(AiCliTool::OpenCode);
                                     let is_selection_drag = terminal.selection_drag_active;
 
                                     if mouse_reporting_active && !is_opencode && !is_selection_drag
@@ -16422,14 +16532,15 @@ fn draw_folder_tree(
             let (_, header_response, _) = header_state
                 .show_header(ui, |ui| draw_directory_folder_row(ui, &item.name))
                 .body(|ui| {
-                    let (_, child_state_changed, child_deferred, child_file_open) = draw_folder_tree(
-                        ui,
-                        item,
-                        status_line_update,
-                        search_query,
-                        show_all_descendants,
-                        matching_directories,
-                    );
+                    let (_, child_state_changed, child_deferred, child_file_open) =
+                        draw_folder_tree(
+                            ui,
+                            item,
+                            status_line_update,
+                            search_query,
+                            show_all_descendants,
+                            matching_directories,
+                        );
                     folder_state_changed |= child_state_changed;
                     deferred_to_load.extend(child_deferred);
                     if child_file_open.is_some() {
@@ -16506,7 +16617,10 @@ fn draw_folder_tree(
             let double_clicked = response.double_clicked();
             response.context_menu(|ui| {
                 with_minimal_button_chrome(ui, |ui| {
-                    if ui.button(format!("{} Open in Editor", icons::CODE)).clicked() {
+                    if ui
+                        .button(format!("{} Open in Editor", icons::CODE))
+                        .clicked()
+                    {
                         file_to_open = Some(item.path.clone());
                         *status_line_update = Some(format!("Opening {} in editor...", item.name));
                         ui.close_menu();
@@ -16554,7 +16668,12 @@ fn draw_folder_tree(
         }
     }
 
-    (rendered_any, folder_state_changed, deferred_to_load, file_to_open)
+    (
+        rendered_any,
+        folder_state_changed,
+        deferred_to_load,
+        file_to_open,
+    )
 }
 
 fn collect_matching_directory_paths(
@@ -18088,11 +18207,7 @@ fn editor_header_icon_button(
         .on_hover_cursor(egui::CursorIcon::PointingHand);
 
     // Always show a visible background (not transparent when inactive)
-    let bg_color = if response.hovered() {
-        hover_bg
-    } else {
-        bg
-    };
+    let bg_color = if response.hovered() { hover_bg } else { bg };
     ui.painter().rect_filled(rect.shrink(2.0), 6.0, bg_color);
 
     // Icon color: use provided high-contrast color
@@ -19366,6 +19481,31 @@ fn terminal_last_non_empty_row(snapshot: &TerminalSnapshot) -> Option<usize> {
     })
 }
 
+/// Extracts the text of the last non-empty line from a terminal snapshot.
+fn terminal_last_line_text(snapshot: &TerminalSnapshot) -> Option<String> {
+    let row = terminal_last_non_empty_row(snapshot)?;
+    let line = snapshot.lines.get(row)?;
+    let mut text = String::new();
+    for run in &line.runs {
+        text.push_str(&run.text);
+    }
+    let trimmed = text.trim_end_matches(' ').trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_lowercase())
+}
+
+/// Detects Windows batch "Terminate batch job (Y/N)?" prompt in terminal output.
+/// Returns true if the last non-empty line of the snapshot contains the prompt.
+fn terminal_has_windows_batch_terminate_prompt(snapshot: &TerminalSnapshot) -> bool {
+    let last_line = match terminal_last_line_text(snapshot) {
+        Some(line) => line,
+        None => return false,
+    };
+    last_line.contains("terminate batch job") && last_line.contains("(y/n)")
+}
+
 fn allocate_terminal_output_surface(
     ui: &mut Ui,
     output_size: Vec2,
@@ -19776,22 +19916,22 @@ mod tests {
         configure_terminal_font_family, count_text_line_bytes, cursor_hidden_by_row_filter,
         deduplicated_recent_inputs, default_app_open_command,
         detach_terminal_prompt_scroll_anchor_on_manual_scroll, draw_ai_badge,
-        file_editor_selection_drag_active_after_input,
         draw_terminal_manager_title_and_diff_summary, draw_terminal_status_badges,
-        force_terminal_pane_width, install_terminal_font_family, launcher_icon_for_ai_tool,
+        file_editor_selection_drag_active_after_input, force_terminal_pane_width,
+        install_terminal_font_family, launcher_icon_for_ai_tool,
         merge_source_control_refresh_result, next_active_terminal_after_close,
         next_terminal_in_direction, next_terminal_in_linear_direction,
         normalize_terminal_background, parse_branch_header, parse_git_numstat_totals,
         primary_shortcut_modifier, recent_inputs_tooltip_text, recover_config_state,
-        resolve_ctrl_c_action, settings_accordion_disclosure_icon_rect,
-        settings_diagnostics_accordion_header_layout, settings_diagnostics_uses_single_column,
-        settings_general_inline_control_width, settings_general_uses_stacked_layout,
-        settings_popup_uses_stacked_layout, settings_saved_message_card_width,
-        settings_saved_message_text_width, settings_saved_messages_project_header_layout,
-        settings_saved_messages_project_state_id, settings_saved_messages_stacks_draft_row,
-        settings_text_edit_chrome, settings_window_size_for_screen, should_resolve_terminal_link,
-        source_control_badge_color, source_control_tooltip_lines,
-        terminal_activation_scroll_offset, terminal_cell_metric,
+        resolve_ctrl_c_action, selection_edge_autoscroll_delta, selection_edge_autoscroll_speed,
+        settings_accordion_disclosure_icon_rect, settings_diagnostics_accordion_header_layout,
+        settings_diagnostics_uses_single_column, settings_general_inline_control_width,
+        settings_general_uses_stacked_layout, settings_popup_uses_stacked_layout,
+        settings_saved_message_card_width, settings_saved_message_text_width,
+        settings_saved_messages_project_header_layout, settings_saved_messages_project_state_id,
+        settings_saved_messages_stacks_draft_row, settings_text_edit_chrome,
+        settings_window_size_for_screen, should_resolve_terminal_link, source_control_badge_color,
+        source_control_tooltip_lines, terminal_activation_scroll_offset, terminal_cell_metric,
         terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect, terminal_font_family,
         terminal_font_id, terminal_grid_dimensions, terminal_line_height,
         terminal_link_activation_modifiers, terminal_link_at_point, terminal_logical_line,
@@ -19799,26 +19939,27 @@ mod tests {
         terminal_manager_diff_summary_model, terminal_manager_diff_summary_visual,
         terminal_manager_row_chrome, terminal_manager_row_widths, terminal_output_scroll_behavior,
         terminal_output_surface_size, terminal_output_viewport_size,
-        selection_edge_autoscroll_delta, selection_edge_autoscroll_speed,
         terminal_secondary_click_action, terminal_selection_autoscroll_delta,
         terminal_selection_autoscroll_speed, terminal_selection_point_from_pointer,
-        terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
+        terminal_selection_text, terminal_has_windows_batch_terminate_prompt,
+        to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
         with_minimal_button_chrome, with_settings_text_edit_chrome, AdeApp, AiBadgeModel,
         AiBadgeVisual, CodexAttentionReason, CodexCliStatusSource, CodexTransportStatus,
         CtrlCAction, DirectoryIndexSnapshot, DirectoryIndexTruncationFlags, DirectoryNode,
-        FileEditorState, OpenFileBuffer,
         FactoryDroidAttentionReason, FactoryDroidHookInboxEvent,
         FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
-        FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, OpenCodeAttentionReason,
-        OpenCodeStatusSource, OpenCodeTransportStatus, PendingConfigChanges,
-        PendingTerminalLinkClick, SettingsSection, SourceControlBadgeState, SourceControlFile,
-        SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
-        TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
-        TerminalOutputScrollBehavior, TerminalSecondaryClickAction, TerminalSelection,
-        TerminalSelectionPoint, TransientToast, CODEX_NOTIFY_POLL_MS, CODEX_PROCESS_POLL_MS,
-        CODEX_STOP_SETTLE_MS, CODEX_TRAILING_OUTPUT_GRACE_MS, DIRECTORY_INDEX_CHANNEL_CAPACITY,
-        FACTORY_DROID_HOOK_POLL_MS, OPENCODE_PROCESS_POLL_MS, OPENCODE_RUNNING_GRACE_MS,
-        OPENCODE_TRAILING_OUTPUT_GRACE_MS, PENDING_RERUN_SETTLE_MS,
+        FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, FileEditorState,
+        OpenCodeAttentionReason, OpenCodeStatusSource, OpenCodeTransportStatus, OpenFileBuffer,
+        PendingConfigChanges, PendingRerunPhase, PendingTerminalLinkClick, SettingsSection, SourceControlBadgeState,
+        SourceControlFile, SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay,
+        TerminalEntry, TerminalManagerDiffSummaryVisual, TerminalNavigationDirection,
+        TerminalNavigationShortcut, TerminalOutputScrollBehavior, TerminalSecondaryClickAction,
+        TerminalSelection, TerminalSelectionPoint, TransientToast, CODEX_NOTIFY_POLL_MS,
+        CODEX_PROCESS_POLL_MS, CODEX_STOP_SETTLE_MS, CODEX_TRAILING_OUTPUT_GRACE_MS,
+        DIRECTORY_INDEX_CHANNEL_CAPACITY, FACTORY_DROID_HOOK_POLL_MS, OPENCODE_PROCESS_POLL_MS,
+        OPENCODE_RUNNING_GRACE_MS, OPENCODE_TRAILING_OUTPUT_GRACE_MS,
+        PENDING_RERUN_BATCH_CONFIRM_SETTLE_MS, PENDING_RERUN_BATCH_PROMPT_WAIT_MS,
+        PENDING_RERUN_SETTLE_MS,
         SOURCE_CONTROL_CHANNEL_CAPACITY, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG,
         TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS,
         TERMINAL_OUTPUT_BG, TEXT_MUTED, TEXT_PRIMARY, TRANSIENT_TOAST_SECS,
@@ -24069,18 +24210,12 @@ mod tests {
     fn terminal_selection_autoscroll_delta_returns_zero_for_invalid_line_height() {
         let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(200.0, 150.0));
 
-        let delta = terminal_selection_autoscroll_delta(
-            Some(egui::pos2(50.0, 50.0)),
-            viewport,
-            -1.0,
-        );
+        let delta =
+            terminal_selection_autoscroll_delta(Some(egui::pos2(50.0, 50.0)), viewport, -1.0);
         assert_eq!(delta, 0.0);
 
-        let delta = terminal_selection_autoscroll_delta(
-            Some(egui::pos2(50.0, 50.0)),
-            viewport,
-            0.0,
-        );
+        let delta =
+            terminal_selection_autoscroll_delta(Some(egui::pos2(50.0, 50.0)), viewport, 0.0);
         assert_eq!(delta, 0.0);
     }
 
@@ -24094,7 +24229,10 @@ mod tests {
 
         // Far from edge
         let fast = terminal_selection_autoscroll_speed(100.0, line_height);
-        assert!(fast <= line_height * 8.0, "Maximum speed should be 8x line_height");
+        assert!(
+            fast <= line_height * 8.0,
+            "Maximum speed should be 8x line_height"
+        );
     }
 
     #[test]
@@ -28832,6 +28970,7 @@ mod tests {
             opencode_attention_pending: false,
             pending_rerun_command: None,
             pending_rerun_since: None,
+            pending_rerun_phase: None,
             // Claude Code state (Orca-compatible title-based detection)
             claude_launch_pending_since: None,
             claude_session_active: false,
@@ -29904,10 +30043,10 @@ mod tests {
         // expanded (because they match or contain matches) should trigger lazy loading.
         // This tests the fix for the issue where searching "mig" would show "migrations"
         // folder expanded but with placeholder "... (indexing deferred)" instead of loading it.
-        use super::{DirectoryNode, draw_folder_tree};
-        use std::path::PathBuf;
+        use super::{draw_folder_tree, DirectoryNode};
+        use egui::{pos2, Context, FontDefinitions, RawInput};
         use std::collections::HashSet;
-        use egui::{Context, RawInput, FontDefinitions, pos2};
+        use std::path::PathBuf;
 
         let ctx = Context::default();
         ctx.set_fonts(FontDefinitions::default());
@@ -29918,7 +30057,7 @@ mod tests {
             path: PathBuf::from("/project/migrations"),
             is_dir: true,
             is_placeholder: false,
-            is_deferred: true,  // Key: this directory is deferred
+            is_deferred: true, // Key: this directory is deferred
             children: vec![DirectoryNode {
                 name: "…".to_owned(),
                 path: PathBuf::from("/project/migrations"),
@@ -29969,8 +30108,8 @@ mod tests {
 
         // Critical assertion: The deferred directory should be in the load queue
         // because it is shown expanded during search
-        let deferred_to_load = deferred_to_load_result
-            .expect("draw_folder_tree should have been called");
+        let deferred_to_load =
+            deferred_to_load_result.expect("draw_folder_tree should have been called");
         assert!(
             deferred_to_load.contains(&PathBuf::from("/project/migrations")),
             "Deferred directory shown during search should be queued for lazy loading"
@@ -30080,9 +30219,7 @@ mod tests {
         let subtree_target = batch
             .iter()
             .find_map(|cmd| match cmd {
-                DirectoryIndexCommand::Subtree { target_path, .. } => {
-                    Some(target_path.clone())
-                }
+                DirectoryIndexCommand::Subtree { target_path, .. } => Some(target_path.clone()),
                 _ => None,
             })
             .expect("Expected Subtree command in batch");
@@ -32928,7 +33065,7 @@ mod tests {
     #[test]
     fn background_rerun_two_phase_interrupt_then_command() {
         // Regression: rerun sent the command into long-running processes.
-        // Now two-phase: 1) Ctrl+C immediately, 2) command after settle.
+        // Now state machine: 1) Ctrl+C immediately, 2) wait for settle/batch prompt, 3) command.
         let ctx = Context::default();
         let mut app = test_app(
             [(
@@ -32963,7 +33100,7 @@ mod tests {
             "phase 1 should send only Ctrl+C"
         );
 
-        // Verify pending state is set correctly.
+        // Verify pending state is set correctly with InterruptSent phase.
         let terminal = app.terminals.get(&1).expect("terminal 1");
         assert_eq!(
             terminal.pending_rerun_command,
@@ -32974,11 +33111,21 @@ mod tests {
             terminal.pending_rerun_since.is_some(),
             "pending timestamp should be set"
         );
+        assert_eq!(
+            terminal.pending_rerun_phase,
+            Some(PendingRerunPhase::InterruptSent),
+            "phase should be InterruptSent after initiating rerun"
+        );
 
-        // Phase 2: manually advance pending_rerun_since so settle is satisfied.
+        // Phase 2: advance time past the batch prompt wait window (no prompt on non-Windows shells).
+        // For non-Windows shells, the command should send after PENDING_RERUN_BATCH_PROMPT_WAIT_MS.
         if let Some(terminal) = app.terminals.get_mut(&1) {
-            terminal.pending_rerun_since =
-                Some(Instant::now() - Duration::from_millis(PENDING_RERUN_SETTLE_MS + 10));
+            terminal.pending_rerun_since = Some(
+                Instant::now()
+                    - Duration::from_millis(
+                        PENDING_RERUN_SETTLE_MS + PENDING_RERUN_BATCH_PROMPT_WAIT_MS + 10,
+                    ),
+            );
         }
 
         // Process pending reruns (this sends the actual command).
@@ -33005,6 +33152,258 @@ mod tests {
             terminal.pending_rerun_since.is_none(),
             "pending timestamp should be cleared after phase 2"
         );
+        assert!(
+            terminal.pending_rerun_phase.is_none(),
+            "pending phase should be cleared after phase 2"
+        );
+    }
+
+    #[test]
+    fn background_rerun_waits_during_windows_batch_prompt_window_without_prompt() {
+        // When there's no batch prompt, the command should be sent after the wait window expires.
+        let ctx = Context::default();
+        let mut app = test_app(
+            [(
+                1,
+                test_terminal_entry_with_kind(1, 1, TerminalKind::Background),
+            )],
+            Some(1),
+        );
+
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        app.terminals.insert(
+            1,
+            test_terminal_entry_with_runtime_and_kind(1, 1, runtime, TerminalKind::Background),
+        );
+
+        let command = "npm run dev".to_owned();
+        if let Some(terminal) = app.terminals.get_mut(&1) {
+            terminal.recent_inputs.push_front(command.clone());
+        }
+
+        // Start rerun.
+        app.rerun_command_in_terminal(&ctx, 1, &command);
+        capture.drain();
+        assert_eq!(capture.bytes(), vec![0x03], "should send Ctrl+C first");
+
+        // Advance just past Ctrl+C settle but not past batch prompt wait.
+        if let Some(terminal) = app.terminals.get_mut(&1) {
+            terminal.pending_rerun_since =
+                Some(Instant::now() - Duration::from_millis(PENDING_RERUN_SETTLE_MS + 10));
+        }
+        app.process_pending_reruns(&ctx);
+        capture.drain();
+
+        // Command should NOT be sent yet (still in batch prompt wait window).
+        assert_eq!(
+            capture.bytes(),
+            vec![0x03],
+            "command should not be sent during batch prompt wait window"
+        );
+
+        // Now advance past the batch prompt wait window.
+        if let Some(terminal) = app.terminals.get_mut(&1) {
+            terminal.pending_rerun_since = Some(
+                Instant::now() - Duration::from_millis(PENDING_RERUN_BATCH_PROMPT_WAIT_MS + 20),
+            );
+        }
+        app.process_pending_reruns(&ctx);
+        capture.drain();
+
+        // Now command should be sent.
+        let total_sent = capture.bytes();
+        let mut expected = vec![0x03];
+        expected.extend_from_slice(command.as_bytes());
+        expected.push(b'\r');
+        assert_eq!(
+            total_sent, expected,
+            "command should be sent after wait window"
+        );
+    }
+
+    #[test]
+    fn background_rerun_confirms_windows_batch_prompt_before_command() {
+        // When Windows batch prompt is detected, automatic "y\r" should be sent,
+        // then the command after confirmation settle.
+        let ctx = Context::default();
+        let mut app = test_app(
+            [(
+                1,
+                test_terminal_entry_with_kind(1, 1, TerminalKind::Background),
+            )],
+            Some(1),
+        );
+
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        app.terminals.insert(
+            1,
+            test_terminal_entry_with_runtime_and_kind(1, 1, runtime, TerminalKind::Background),
+        );
+
+        let command = "npm run dev".to_owned();
+        if let Some(terminal) = app.terminals.get_mut(&1) {
+            terminal.recent_inputs.push_front(command.clone());
+            // Set shell to PowerShell to enable Windows batch prompt detection.
+            terminal.shell = ShellKind::PowerShell;
+        }
+
+        // Start rerun.
+        app.rerun_command_in_terminal(&ctx, 1, &command);
+        capture.drain();
+        assert_eq!(capture.bytes(), vec![0x03], "should send Ctrl+C first");
+
+        // Simulate batch prompt appearing in terminal output.
+        if let Some(terminal) = app.terminals.get_mut(&1) {
+            terminal
+                .runtime
+                .advance_terminal_bytes_for_test(b"Terminate batch job (Y/N)? ");
+        }
+
+        // Advance past Ctrl+C settle.
+        if let Some(terminal) = app.terminals.get_mut(&1) {
+            terminal.pending_rerun_since =
+                Some(Instant::now() - Duration::from_millis(PENDING_RERUN_SETTLE_MS + 10));
+        }
+        app.process_pending_reruns(&ctx);
+        capture.drain();
+
+        // Should have sent "y\r" to confirm batch termination (after the initial Ctrl+C).
+        let sent = capture.bytes();
+        assert!(
+            sent.windows(2).any(|w| w == b"y\r"),
+            "should send automatic y\\r when batch prompt detected, got: {:?}",
+            sent
+        );
+
+        // Verify phase changed to BatchConfirmSent.
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.pending_rerun_phase,
+            Some(PendingRerunPhase::BatchConfirmSent),
+            "phase should be BatchConfirmSent after confirming prompt"
+        );
+
+        // Advance past batch confirmation settle.
+        if let Some(terminal) = app.terminals.get_mut(&1) {
+            terminal.pending_rerun_since = Some(
+                Instant::now() - Duration::from_millis(PENDING_RERUN_BATCH_CONFIRM_SETTLE_MS + 10),
+            );
+        }
+        app.process_pending_reruns(&ctx);
+        capture.drain();
+
+        // Now command should be sent.
+        let total_sent = capture.bytes();
+        let mut expected = vec![0x03];
+        expected.extend_from_slice(b"y\r");
+        expected.extend_from_slice(command.as_bytes());
+        expected.push(b'\r');
+        assert_eq!(
+            total_sent, expected,
+            "sequence should be Ctrl+C, y\\r, then command"
+        );
+    }
+
+    #[test]
+    fn windows_batch_terminate_prompt_detection_is_case_insensitive() {
+        let snapshot = TerminalSnapshot {
+            lines: vec![TerminalStyledLine {
+                runs: vec![TerminalStyledRun {
+                    text: "  TERMINATE BATCH JOB (Y/N)?  ".to_owned(),
+                    style: test_terminal_style(),
+                    column: 0,
+                    display_width: 30,
+                }],
+            }],
+            cursor: None,
+            cursor_line: None,
+        };
+        assert!(
+            terminal_has_windows_batch_terminate_prompt(&snapshot),
+            "should detect uppercase prompt"
+        );
+
+        let snapshot_lower = TerminalSnapshot {
+            lines: vec![TerminalStyledLine {
+                runs: vec![TerminalStyledRun {
+                    text: "terminate batch job (y/n)?".to_owned(),
+                    style: test_terminal_style(),
+                    column: 0,
+                    display_width: 26,
+                }],
+            }],
+            cursor: None,
+            cursor_line: None,
+        };
+        assert!(
+            terminal_has_windows_batch_terminate_prompt(&snapshot_lower),
+            "should detect lowercase prompt"
+        );
+    }
+
+    #[test]
+    fn windows_batch_terminate_prompt_detection_ignores_old_scrollback() {
+        // Prompt should only be detected on the last non-empty line.
+        let snapshot = TerminalSnapshot {
+            lines: vec![
+                TerminalStyledLine {
+                    runs: vec![TerminalStyledRun {
+                        text: "Terminate batch job (Y/N)?".to_owned(),
+                        style: test_terminal_style(),
+                        column: 0,
+                        display_width: 28,
+                    }],
+                },
+                TerminalStyledLine {
+                    runs: vec![TerminalStyledRun {
+                        text: "Some new output here".to_owned(),
+                        style: test_terminal_style(),
+                        column: 0,
+                        display_width: 20,
+                    }],
+                },
+            ],
+            cursor: None,
+            cursor_line: None,
+        };
+        assert!(
+            !terminal_has_windows_batch_terminate_prompt(&snapshot),
+            "should not detect prompt when it's not the last line"
+        );
+    }
+
+    #[test]
+    fn pending_rerun_clears_when_terminal_exited() {
+        let ctx = Context::default();
+        let mut app = test_app(
+            [(
+                1,
+                test_terminal_entry_with_kind(1, 1, TerminalKind::Background),
+            )],
+            Some(1),
+        );
+
+        let command = "npm run dev".to_owned();
+        if let Some(terminal) = app.terminals.get_mut(&1) {
+            terminal.recent_inputs.push_front(command.clone());
+        }
+
+        // Start rerun.
+        app.rerun_command_in_terminal(&ctx, 1, &command);
+
+        // Mark terminal as exited.
+        if let Some(terminal) = app.terminals.get_mut(&1) {
+            terminal.exited = true;
+        }
+
+        // Process pending reruns.
+        app.process_pending_reruns(&ctx);
+
+        // Pending state should be cleared.
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(terminal.pending_rerun_command.is_none());
+        assert!(terminal.pending_rerun_since.is_none());
+        assert!(terminal.pending_rerun_phase.is_none());
     }
 
     #[test]
@@ -33013,7 +33412,7 @@ mod tests {
         // to allow ScrollArea to scroll. Previously desired_rows was fixed to visible
         // viewport, causing scroll to not work for files longer than screen height.
         use super::{OpenFileBuffer, FILE_EDITOR_INPUT_ID};
-        use egui::{Context, RawInput, FontDefinitions};
+        use egui::{Context, FontDefinitions, RawInput};
 
         let ctx = Context::default();
         ctx.set_fonts(FontDefinitions::default());
@@ -33072,7 +33471,10 @@ mod tests {
             drag_stopped,
         );
 
-        assert!(result, "Selection drag should start when drag_started is true");
+        assert!(
+            result,
+            "Selection drag should start when drag_started is true"
+        );
     }
 
     #[test]
@@ -33092,7 +33494,10 @@ mod tests {
             drag_stopped,
         );
 
-        assert!(result, "Selection drag should stay active while primary_down is true");
+        assert!(
+            result,
+            "Selection drag should stay active while primary_down is true"
+        );
     }
 
     #[test]
@@ -33287,11 +33692,8 @@ mod tests {
         assert_eq!(delta, 0.0);
 
         // Pointer at center
-        let delta = selection_edge_autoscroll_delta(
-            Some(egui::pos2(50.0, 175.0)),
-            viewport,
-            line_height,
-        );
+        let delta =
+            selection_edge_autoscroll_delta(Some(egui::pos2(50.0, 175.0)), viewport, line_height);
         assert_eq!(delta, 0.0);
 
         // Pointer well inside the viewport, past the bottom safety zone
@@ -33310,12 +33712,12 @@ mod tests {
         let line_height = 10.0;
 
         // Pointer just above the viewport
-        let delta = selection_edge_autoscroll_delta(
-            Some(egui::pos2(50.0, 95.0)),
-            viewport,
-            line_height,
+        let delta =
+            selection_edge_autoscroll_delta(Some(egui::pos2(50.0, 95.0)), viewport, line_height);
+        assert!(
+            delta > 0.0,
+            "Expected positive delta to scroll to previous content"
         );
-        assert!(delta > 0.0, "Expected positive delta to scroll to previous content");
     }
 
     #[test]
@@ -33325,12 +33727,12 @@ mod tests {
         let line_height = 10.0;
 
         // Pointer just below the viewport
-        let delta = selection_edge_autoscroll_delta(
-            Some(egui::pos2(50.0, 260.0)),
-            viewport,
-            line_height,
+        let delta =
+            selection_edge_autoscroll_delta(Some(egui::pos2(50.0, 260.0)), viewport, line_height);
+        assert!(
+            delta < 0.0,
+            "Expected negative delta to scroll to next content"
         );
-        assert!(delta < 0.0, "Expected negative delta to scroll to next content");
     }
 
     #[test]
@@ -33340,18 +33742,12 @@ mod tests {
         let line_height = 10.0;
 
         // Pointer far above the viewport
-        let far_delta = selection_edge_autoscroll_delta(
-            Some(egui::pos2(50.0, 50.0)),
-            viewport,
-            line_height,
-        );
+        let far_delta =
+            selection_edge_autoscroll_delta(Some(egui::pos2(50.0, 50.0)), viewport, line_height);
 
         // Pointer near the viewport edge
-        let near_delta = selection_edge_autoscroll_delta(
-            Some(egui::pos2(50.0, 95.0)),
-            viewport,
-            line_height,
-        );
+        let near_delta =
+            selection_edge_autoscroll_delta(Some(egui::pos2(50.0, 95.0)), viewport, line_height);
 
         assert!(
             far_delta > near_delta,
@@ -33374,18 +33770,10 @@ mod tests {
         // Regression test: should return zero for invalid line height
         let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(200.0, 150.0));
 
-        let delta = selection_edge_autoscroll_delta(
-            Some(egui::pos2(50.0, 50.0)),
-            viewport,
-            -1.0,
-        );
+        let delta = selection_edge_autoscroll_delta(Some(egui::pos2(50.0, 50.0)), viewport, -1.0);
         assert_eq!(delta, 0.0);
 
-        let delta = selection_edge_autoscroll_delta(
-            Some(egui::pos2(50.0, 50.0)),
-            viewport,
-            0.0,
-        );
+        let delta = selection_edge_autoscroll_delta(Some(egui::pos2(50.0, 50.0)), viewport, 0.0);
         assert_eq!(delta, 0.0);
     }
 
@@ -33400,7 +33788,10 @@ mod tests {
 
         // Far from edge
         let fast = selection_edge_autoscroll_speed(100.0, line_height);
-        assert!(fast <= line_height * 8.0, "Maximum speed should be 8x line_height");
+        assert!(
+            fast <= line_height * 8.0,
+            "Maximum speed should be 8x line_height"
+        );
     }
 
     #[test]
@@ -33481,7 +33872,10 @@ mod tests {
             !editor_state.is_visible(),
             "Editor should not be visible after close"
         );
-        assert!(!editor_state.is_open(), "Editor should not have active buffer after close");
+        assert!(
+            !editor_state.is_open(),
+            "Editor should not have active buffer after close"
+        );
     }
 
     #[test]
@@ -33514,8 +33908,9 @@ mod tests {
         // Regression test: Normal deferred directories should NOT have visible placeholder children.
         // Placeholders are only for exceptional states (truncation, errors), not normal lazy-load.
         use super::{
-            build_directory_node_from_entry, DirectoryIndexBuildState, DirectoryScanMode,
-            DirectoryIndexTruncationFlags, DIRECTORY_INDEX_FULL_SCAN_TIME_BUDGET_MS,
+            build_directory_node_from_entry, DirectoryIndexBuildState,
+            DirectoryIndexTruncationFlags, DirectoryScanMode,
+            DIRECTORY_INDEX_FULL_SCAN_TIME_BUDGET_MS,
         };
         use std::path::PathBuf;
 

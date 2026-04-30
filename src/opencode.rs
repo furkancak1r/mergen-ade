@@ -154,10 +154,7 @@ pub fn opencode_env_pairs(
             MERGEN_ADE_OPENCODE_INBOX_TOKEN_ENV_VAR.to_owned(),
             OsString::from(inbox_token),
         ),
-        (
-            OPENCODE_BIN_PATH_ENV_VAR.to_owned(),
-            opencode_baseline_path,
-        ),
+        (OPENCODE_BIN_PATH_ENV_VAR.to_owned(), opencode_baseline_path),
     ]
 }
 
