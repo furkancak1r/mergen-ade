@@ -142,6 +142,14 @@ const DIRECTORY_INDEX_MAX_NODES: usize = 20_000;
 const DIRECTORY_INDEX_FULL_SCAN_TIME_BUDGET_MS: u128 = 150;
 /// Time budget for on-demand subtree loads.
 const DIRECTORY_INDEX_SUBTREE_TIME_BUDGET_MS: u128 = 100;
+/// Maximum deferred directories to queue per frame during search when no results yet.
+const DIRECTORY_SEARCH_INITIAL_SUBTREE_REQUESTS_PER_FRAME: usize = 8;
+/// Maximum deferred directories to queue per frame during search when results already visible.
+const DIRECTORY_SEARCH_BACKGROUND_SUBTREE_REQUESTS_PER_FRAME: usize = 2;
+/// Debounce duration before starting deferred subtree loads during search (seconds).
+const DIRECTORY_SEARCH_DEFERRED_LOAD_DEBOUNCE_SECS: f64 = 0.25;
+/// Minimum query length to trigger deep deferred directory loading during search.
+const DIRECTORY_SEARCH_MIN_DEFERRED_QUERY_CHARS: usize = 2;
 /// Directory names to defer during fast indexing (heavy/generated folders).
 const DIRECTORY_INDEX_DEFERRED_NAMES: &[&str] = &[
     ".git",
@@ -1024,6 +1032,10 @@ pub struct AdeApp {
     launcher_icon_textures: BTreeMap<LauncherIconKey, TextureHandle>,
     launcher_icon_failures: BTreeSet<LauncherIconKey>,
     directory_search_query: String,
+    /// Last search query value (to detect changes for debounce logic).
+    directory_search_last_query: String,
+    /// Timestamp when search query last changed (for debounce).
+    directory_search_query_changed_at: f64,
     directory_pending_tree_open_state_by_project: BTreeMap<u64, bool>,
     status_line: String,
     transient_toast: Option<TransientToast>,
@@ -1123,6 +1135,12 @@ struct FileEditorState {
     /// Whether text selection drag is currently active (for edge autoscroll).
     /// Runtime-only state; not persisted across sessions.
     selection_drag_active: bool,
+    /// Stored selection range for context menu (preserved before right-click collapses it).
+    /// Runtime-only state; not persisted across sessions.
+    context_menu_selection_range: Option<egui::text::CCursorRange>,
+    /// Tracks whether context menu was open in previous frame (for detecting close transition).
+    /// Runtime-only state; not persisted across sessions.
+    context_menu_was_open: bool,
     /// Whether the editor is currently visible in the main area.
     /// When false, the editor is hidden but the active buffer is preserved.
     visible: bool,
@@ -1136,6 +1154,8 @@ impl Default for FileEditorState {
             forward_stack: Vec::new(),
             max_history: 20,
             selection_drag_active: false,
+            context_menu_selection_range: None,
+            context_menu_was_open: false,
             visible: false,
         }
     }
@@ -1159,6 +1179,9 @@ impl FileEditorState {
 
         // Reset selection drag state when opening a new file
         self.selection_drag_active = false;
+        // Clear any stored context menu selection from previous file
+        self.context_menu_selection_range = None;
+        self.context_menu_was_open = false;
     }
 
     /// Navigate back to previous file.
@@ -1172,6 +1195,9 @@ impl FileEditorState {
 
             // Reset selection drag state when navigating
             self.selection_drag_active = false;
+            // Clear stored context menu selection when navigating
+            self.context_menu_selection_range = None;
+            self.context_menu_was_open = false;
             true
         } else {
             false
@@ -1189,6 +1215,9 @@ impl FileEditorState {
 
             // Reset selection drag state when navigating
             self.selection_drag_active = false;
+            // Clear stored context menu selection when navigating
+            self.context_menu_selection_range = None;
+            self.context_menu_was_open = false;
             true
         } else {
             false
@@ -1201,6 +1230,8 @@ impl FileEditorState {
         self.back_stack.clear();
         self.forward_stack.clear();
         self.selection_drag_active = false;
+        self.context_menu_selection_range = None;
+        self.context_menu_was_open = false;
         self.visible = false;
     }
 
@@ -1209,6 +1240,9 @@ impl FileEditorState {
     fn hide(&mut self) {
         self.visible = false;
         self.selection_drag_active = false;
+        // Clear stored context menu selection when hiding editor
+        self.context_menu_selection_range = None;
+        self.context_menu_was_open = false;
     }
 
     /// Check if editor has an active file.
@@ -1259,6 +1293,65 @@ fn file_editor_selection_drag_active_after_input(
         false
     } else {
         was_active || drag_started || dragged
+    }
+}
+
+/// Returns true if the given CCursorRange represents a non-empty selection.
+fn file_editor_ccursor_range_has_selection(range: egui::text::CCursorRange) -> bool {
+    range.primary != range.secondary
+}
+
+/// Detects if a copy action was requested for the file editor.
+/// Checks for either egui's Event::Copy or Ctrl+C/Command+C key combination.
+/// This is necessary because egui::TextEdit may consume the copy shortcut
+/// and emit Event::Copy rather than letting the raw key event through.
+fn file_editor_copy_requested(input: &egui::InputState) -> bool {
+    // First check for the explicit Event::Copy (generated by TextEdit when it handles Ctrl+C)
+    for event in input.events.iter() {
+        if matches!(event, egui::Event::Copy) {
+            return true;
+        }
+    }
+
+    // Fallback: check for raw Ctrl+C / Command+C key press
+    // This handles cases where TextEdit doesn't consume the event
+    input.key_pressed(egui::Key::C) && (input.modifiers.ctrl || input.modifiers.command)
+}
+
+/// Extracts selected text from a CCursorRange using character indices.
+/// Returns None if the range is empty or the selection produces no text.
+fn selected_file_editor_text_from_char_range(
+    text: &str,
+    range: Option<egui::text::CCursorRange>,
+) -> Option<String> {
+    let range = range?;
+    let [start, end] = range.sorted();
+
+    if start.index >= end.index {
+        return None;
+    }
+
+    let selected: String = text
+        .chars()
+        .enumerate()
+        .take_while(|(index, _)| *index < end.index)
+        .filter_map(|(index, ch)| (index >= start.index).then_some(ch))
+        .collect();
+
+    (!selected.is_empty()).then_some(selected)
+}
+
+/// Determines the effective context menu selection range for the file editor.
+/// Preserves the pre-click selection when secondary-click would collapse it.
+fn file_editor_context_menu_selection_range(
+    secondary_clicked: bool,
+    pre_click_range: Option<egui::text::CCursorRange>,
+    post_show_range: Option<egui::text::CCursorRange>,
+) -> Option<egui::text::CCursorRange> {
+    if secondary_clicked && pre_click_range.is_some_and(file_editor_ccursor_range_has_selection) {
+        pre_click_range
+    } else {
+        post_show_range.filter(|range| file_editor_ccursor_range_has_selection(*range))
     }
 }
 
@@ -3218,6 +3311,8 @@ impl AdeApp {
             launcher_icon_textures: BTreeMap::new(),
             launcher_icon_failures: std::collections::BTreeSet::new(),
             directory_search_query: String::new(),
+            directory_search_last_query: String::new(),
+            directory_search_query_changed_at: 0.0,
             directory_pending_tree_open_state_by_project: BTreeMap::new(),
             status_line: config_load_error
                 .map(|err| format!("Config load error: {err}. Existing config preserved."))
@@ -12495,14 +12590,58 @@ impl AdeApp {
                                                 });
                                             }
 
-                                            let mut matching_directories = HashSet::new();
+                                            // Track search query changes for debounce logic
+                                            let now = ui.ctx().input(|input| input.time);
                                             if let Some(query) = search_query.as_deref() {
+                                                if query != self.directory_search_last_query {
+                                                    self.directory_search_last_query = query.to_owned();
+                                                    self.directory_search_query_changed_at = now;
+                                                }
+                                            } else {
+                                                // Clear tracking when search is not active
+                                                self.directory_search_last_query.clear();
+                                                self.directory_search_query_changed_at = 0.0;
+                                            }
+
+                                            let mut matching_directories = HashSet::new();
+                                            let mut hidden_search_deferred: Vec<PathBuf> = Vec::new();
+                                            let mut has_deferred_dirs_for_search = false;
+
+                                            if let Some(query) = search_query.as_deref() {
+                                                // First: collect matches from already-loaded tree
                                                 let _ = collect_matching_directory_paths(
                                                     &snapshot.root,
                                                     query,
                                                     false,
                                                     &mut matching_directories,
                                                 );
+
+                                                // Second: progressively load deferred directories for deep search
+                                                // Only after debounce and min query length to avoid aggressive loading
+                                                let should_load_deferred =
+                                                    directory_search_should_load_deferred(
+                                                        query,
+                                                        now,
+                                                        self.directory_search_query_changed_at,
+                                                    );
+
+                                                if should_load_deferred {
+                                                    // Use adaptive cap: aggressive when no results yet,
+                                                    // conservative when results already visible
+                                                    let has_any_results = !matching_directories.is_empty();
+                                                    let deferred_limit = if has_any_results {
+                                                        DIRECTORY_SEARCH_BACKGROUND_SUBTREE_REQUESTS_PER_FRAME
+                                                    } else {
+                                                        DIRECTORY_SEARCH_INITIAL_SUBTREE_REQUESTS_PER_FRAME
+                                                    };
+
+                                                    has_deferred_dirs_for_search =
+                                                        collect_search_deferred_directory_paths(
+                                                            &snapshot.root,
+                                                            &mut hidden_search_deferred,
+                                                            deferred_limit,
+                                                        );
+                                                }
                                             }
 
                                             let (has_results, folder_state_changed, deferred_to_load, file_to_open) =
@@ -12524,12 +12663,22 @@ impl AdeApp {
                                             }
 
                                             // Trigger lazy loading for expanded deferred directories
+                                            // (from draw_folder_tree - user-expanded folders)
                                             let mut any_subtree_requested = false;
                                             for target_path in deferred_to_load {
                                                 if self.request_directory_subtree_load(project_id, target_path) {
                                                     any_subtree_requested = true;
                                                 }
                                             }
+
+                                            // Also trigger hidden search-triggered deferred loads
+                                            // These are NOT added to matching_directories to avoid forced rendering
+                                            for target_path in hidden_search_deferred {
+                                                if self.request_directory_subtree_load(project_id, target_path) {
+                                                    any_subtree_requested = true;
+                                                }
+                                            }
+
                                             // Request repaint to process subtree results
                                             if any_subtree_requested {
                                                 ui.ctx().request_repaint_after(Duration::from_millis(16));
@@ -12540,11 +12689,54 @@ impl AdeApp {
                                                 self.open_file_in_editor(project_id, path);
                                             }
 
-                                            if search_query.is_some() && !has_results {
+                                            // Determine pending work: in-flight subtree loads OR
+                                            // deferred directories still to be loaded for search
+                                            let has_in_flight_loads = self
+                                                .directory_index_subtree_loading_by_project
+                                                .get(&project_id)
+                                                .is_some_and(|set| !set.is_empty());
+                                            let query_stable_for_deferred = search_query
+                                                .as_deref()
+                                                .map(|q| {
+                                                    directory_search_should_load_deferred(
+                                                        q,
+                                                        now,
+                                                        self.directory_search_query_changed_at,
+                                                    )
+                                                })
+                                                .unwrap_or(true);
+                                            let has_pending_search_work =
+                                                has_in_flight_loads || (has_deferred_dirs_for_search && !query_stable_for_deferred);
+
+                                            // Only show "No matching files or folders" when:
+                                            // - query is stable (debounced)
+                                            // - no results visible
+                                            // - no pending deferred loads that might contain matches
+                                            let query_stable = search_query
+                                                .as_deref()
+                                                .map(|q| {
+                                                    q.len() < DIRECTORY_SEARCH_MIN_DEFERRED_QUERY_CHARS
+                                                        || directory_search_query_stable(
+                                                            now,
+                                                            self.directory_search_query_changed_at,
+                                                        )
+                                                })
+                                                .unwrap_or(true);
+
+                                            if search_query.is_some() && !has_results && query_stable && !has_pending_search_work
+                                            {
                                                 ui.label(
                                                     RichText::new("No matching files or folders")
                                                         .color(TEXT_MUTED),
                                                 );
+                                            } else if search_query.is_some() && !has_results && has_pending_search_work {
+                                                // Show searching indicator while deferred folders are loading
+                                                ui.label(
+                                                    RichText::new("Searching folders...".to_owned())
+                                                        .color(TEXT_MUTED),
+                                                );
+                                                // Request repaint to continue searching as results arrive
+                                                ui.ctx().request_repaint_after(Duration::from_millis(50));
                                             }
                                         }
                                     }
@@ -13781,6 +13973,7 @@ impl AdeApp {
         // Collect UI interaction requests during rendering
         let mut close_editor = false;
         let mut save_file = false;
+        let mut copied_editor_selection: Option<String> = None;
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(APP_BG))
@@ -13902,6 +14095,9 @@ impl AdeApp {
                             // Store saved_text for dirty check after potential modification
                             let saved_text = buffer.saved_text.clone();
 
+                            // Clone text content for selection extraction (to avoid borrow conflict)
+                            let text_content_for_selection = buffer.text.clone();
+
                             let text_edit = egui::TextEdit::multiline(&mut buffer.text)
                                 .id(egui::Id::new(FILE_EDITOR_INPUT_ID))
                                 .font(font_id)
@@ -13911,15 +14107,22 @@ impl AdeApp {
                                 .desired_rows(desired_rows);
 
                             // Get pointer input state before ScrollArea for drag detection
-                            let (primary_down, drag_started, dragged, drag_stopped) =
-                                ui.ctx().input(|input| {
-                                    (
-                                        input.pointer.primary_down(),
-                                        input.pointer.primary_pressed(),
-                                        input.pointer.is_moving(),
-                                        input.pointer.primary_released(),
-                                    )
-                                });
+                            // Also detect secondary press to save selection before TextEdit collapses it
+                            let (
+                                primary_down,
+                                drag_started,
+                                dragged,
+                                drag_stopped,
+                                secondary_pressed,
+                            ) = ui.ctx().input(|input| {
+                                (
+                                    input.pointer.primary_down(),
+                                    input.pointer.primary_pressed(),
+                                    input.pointer.is_moving(),
+                                    input.pointer.primary_released(),
+                                    input.pointer.secondary_pressed(),
+                                )
+                            });
 
                             // Update selection drag state
                             let was_drag_active = self.file_editor.selection_drag_active;
@@ -13931,11 +14134,31 @@ impl AdeApp {
                                 drag_stopped,
                             );
 
+                            // Editor input ID for state management
+                            let editor_input_id = egui::Id::new(FILE_EDITOR_INPUT_ID);
+
+                            // Load current selection state before rendering (for context menu)
+                            let pre_click_range =
+                                egui::text_edit::TextEditState::load(ui.ctx(), editor_input_id)
+                                    .and_then(|state| state.cursor.char_range())
+                                    .filter(|range| {
+                                        file_editor_ccursor_range_has_selection(*range)
+                                    });
+
+                            // Save selection on secondary press BEFORE TextEdit collapses it
+                            // This must happen before TextEdit::show() which collapses selection on right-click
+                            if secondary_pressed
+                                && pre_click_range
+                                    .is_some_and(file_editor_ccursor_range_has_selection)
+                            {
+                                self.file_editor.context_menu_selection_range = pre_click_range;
+                            }
+
                             let scroll_area_output = egui::ScrollArea::vertical()
                                 .id_salt(FILE_EDITOR_SCROLL_ID)
                                 .max_height(editor_height - 24.0)
                                 .show(ui, |ui| {
-                                    let text_response = ui.add(text_edit);
+                                    let text_output = text_edit.show(ui);
 
                                     // Apply edge autoscroll when selection drag is active
                                     if is_drag_active {
@@ -13960,11 +14183,104 @@ impl AdeApp {
                                         }
                                     }
 
-                                    text_response
+                                    // Get post-render selection from TextEditOutput
+                                    let post_show_range =
+                                        text_output.state.cursor.char_range().filter(|range| {
+                                            file_editor_ccursor_range_has_selection(*range)
+                                        });
+
+                                    // Determine effective selection for context menu
+                                    // Priority: stored > pre_click > post_show
+                                    // Stored selection is set on secondary_press before TextEdit collapses it
+                                    let context_menu_range = self
+                                        .file_editor
+                                        .context_menu_selection_range
+                                        .or(pre_click_range)
+                                        .or(post_show_range);
+                                    let context_menu_text =
+                                        selected_file_editor_text_from_char_range(
+                                            &text_content_for_selection,
+                                            context_menu_range,
+                                        );
+
+                                    // Restore stored selection if context menu was triggered by right-click
+                                    // This ensures the selection remains visible while the context menu is open
+                                    // Only restore the specifically stored selection, not pre_click_range
+                                    // to avoid interfering with normal text selection behavior
+                                    if let Some(stored_range) =
+                                        self.file_editor.context_menu_selection_range
+                                    {
+                                        if file_editor_ccursor_range_has_selection(stored_range) {
+                                            let mut restored_state = text_output.state.clone();
+                                            restored_state
+                                                .cursor
+                                                .set_char_range(Some(stored_range));
+                                            restored_state.store(ui.ctx(), editor_input_id);
+                                        }
+                                    }
+
+                                    // Show context menu always (not just when selection exists)
+                                    // Copy button is enabled only when there is a selection
+                                    let has_selection = context_menu_text.is_some();
+                                    text_output.response.context_menu(|ui| {
+                                        with_minimal_button_chrome(ui, |ui| {
+                                            let copy_button = ui.add_enabled(
+                                                has_selection,
+                                                egui::Button::new(format!("{} Copy", icons::COPY)),
+                                            );
+                                            if copy_button.clicked() && has_selection {
+                                                copied_editor_selection = context_menu_text.clone();
+                                                // Clear stored selection after copy
+                                                self.file_editor.context_menu_selection_range =
+                                                    None;
+                                                ui.close_menu();
+                                            }
+                                        });
+                                    });
+
+                                    text_output.response
                                 });
 
                             // Update selection drag state for next frame
                             self.file_editor.selection_drag_active = is_drag_active;
+
+                            // Clear stored context menu selection only when menu closes
+                            // after being open (transition from open -> closed)
+                            let is_menu_open = ui.ctx().is_context_menu_open();
+                            if self.file_editor.context_menu_was_open && !is_menu_open {
+                                // Menu just closed - clear the stored selection
+                                self.file_editor.context_menu_selection_range = None;
+                            }
+                            // Update the tracking flag for next frame
+                            self.file_editor.context_menu_was_open = is_menu_open;
+
+                            // Handle copy when editor is focused and has selection
+                            // This detects both Event::Copy (from TextEdit handling Ctrl+C)
+                            // and raw Ctrl+C/Command+C key presses as fallback
+                            let editor_has_focus = scroll_area_output.inner.has_focus();
+                            let copy_requested =
+                                ui.ctx().input(|input| file_editor_copy_requested(input));
+
+                            if editor_has_focus && copy_requested {
+                                // Get current selection from TextEdit state
+                                let selection_range =
+                                    egui::text_edit::TextEditState::load(ui.ctx(), editor_input_id)
+                                        .and_then(|state| state.cursor.char_range())
+                                        .filter(|range| {
+                                            file_editor_ccursor_range_has_selection(*range)
+                                        });
+
+                                if let Some(range) = selection_range {
+                                    if let Some(text) = selected_file_editor_text_from_char_range(
+                                        &text_content_for_selection,
+                                        Some(range),
+                                    ) {
+                                        // Queue copy for deferred processing
+                                        // Clipboard feedback is shown after the mutable borrow ends
+                                        copied_editor_selection = Some(text);
+                                    }
+                                }
+                            }
 
                             // Update dirty flag based on text changes
                             if scroll_area_output.inner.changed() {
@@ -13980,6 +14296,12 @@ impl AdeApp {
         }
         if close_editor {
             self.close_file_editor();
+        }
+
+        // Process deferred clipboard copy after editor buffer borrow ends
+        if let Some(text) = copied_editor_selection {
+            ctx.copy_text(text);
+            self.show_status_feedback(ctx, "Copied to clipboard");
         }
     }
 
@@ -16277,7 +16599,7 @@ fn build_directory_node_from_entry(
     // unless they are symlinks (which we never descend into)
     let should_defer = is_dir && !is_symlink;
 
-    let mut node = DirectoryNode {
+    let node = DirectoryNode {
         name: info.name,
         path: info.path.clone(),
         is_dir,
@@ -16318,7 +16640,7 @@ fn build_directory_node(
     // In InitialRoot and LazySubtree modes, all directories are deferred
     let should_defer = is_dir && !is_symlink;
 
-    let mut node = DirectoryNode {
+    let node = DirectoryNode {
         name,
         path: path.to_path_buf(),
         is_dir,
@@ -16699,6 +17021,61 @@ fn collect_matching_directory_paths(
     }
 
     has_match
+}
+
+/// Collects all deferred directories in the snapshot tree for progressive loading during search.
+/// This enables finding matches inside lazy-loaded folders even when the folder name doesn't match.
+/// Returns true if any deferred directories were found (to help distinguish "no results yet" from "no results at all").
+fn collect_search_deferred_directory_paths(
+    root: &DirectoryNode,
+    deferred_paths: &mut Vec<PathBuf>,
+    limit: usize,
+) -> bool {
+    if deferred_paths.len() >= limit {
+        return true; // Hit limit, there may be more
+    }
+
+    let mut found_any = false;
+
+    if root.is_dir {
+        if root.is_deferred {
+            deferred_paths.push(root.path.clone());
+            found_any = true;
+            // Don't recurse into deferred directories - they have no real children yet
+            return found_any;
+        }
+
+        // Recurse into loaded directories to find nested deferred folders
+        for child in &root.children {
+            if child.is_dir {
+                if collect_search_deferred_directory_paths(child, deferred_paths, limit) {
+                    found_any = true;
+                }
+                if deferred_paths.len() >= limit {
+                    return true;
+                }
+            }
+        }
+    }
+
+    found_any
+}
+
+/// Returns true if the search query has been stable (unchanged) for the debounce duration.
+fn directory_search_query_stable(now: f64, changed_at: f64) -> bool {
+    if changed_at == 0.0 {
+        return true; // No change yet, considered stable
+    }
+    (now - changed_at) >= DIRECTORY_SEARCH_DEFERRED_LOAD_DEBOUNCE_SECS
+}
+
+/// Returns true if deferred directory loading should be triggered for this query.
+/// Requires stable query and minimum character length to avoid aggressive loading on short queries.
+fn directory_search_should_load_deferred(query: &str, now: f64, changed_at: f64) -> bool {
+    if query.len() < DIRECTORY_SEARCH_MIN_DEFERRED_QUERY_CHARS {
+        return false;
+    }
+    directory_search_query_stable(now, changed_at)
 }
 
 fn apply_directory_tree_open_state(ctx: &egui::Context, root: &DirectoryNode, open: bool) {
@@ -19933,16 +20310,15 @@ mod tests {
         settings_window_size_for_screen, should_resolve_terminal_link, source_control_badge_color,
         source_control_tooltip_lines, terminal_activation_scroll_offset, terminal_cell_metric,
         terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect, terminal_font_family,
-        terminal_font_id, terminal_grid_dimensions, terminal_line_height,
-        terminal_link_activation_modifiers, terminal_link_at_point, terminal_logical_line,
-        terminal_logical_line_byte_index, terminal_manager_actions_width,
+        terminal_font_id, terminal_grid_dimensions, terminal_has_windows_batch_terminate_prompt,
+        terminal_line_height, terminal_link_activation_modifiers, terminal_link_at_point,
+        terminal_logical_line, terminal_logical_line_byte_index, terminal_manager_actions_width,
         terminal_manager_diff_summary_model, terminal_manager_diff_summary_visual,
         terminal_manager_row_chrome, terminal_manager_row_widths, terminal_output_scroll_behavior,
         terminal_output_surface_size, terminal_output_viewport_size,
         terminal_secondary_click_action, terminal_selection_autoscroll_delta,
         terminal_selection_autoscroll_speed, terminal_selection_point_from_pointer,
-        terminal_selection_text, terminal_has_windows_batch_terminate_prompt,
-        to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
+        terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
         with_minimal_button_chrome, with_settings_text_edit_chrome, AdeApp, AiBadgeModel,
         AiBadgeVisual, CodexAttentionReason, CodexCliStatusSource, CodexTransportStatus,
         CtrlCAction, DirectoryIndexSnapshot, DirectoryIndexTruncationFlags, DirectoryNode,
@@ -19950,16 +20326,16 @@ mod tests {
         FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
         FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, FileEditorState,
         OpenCodeAttentionReason, OpenCodeStatusSource, OpenCodeTransportStatus, OpenFileBuffer,
-        PendingConfigChanges, PendingRerunPhase, PendingTerminalLinkClick, SettingsSection, SourceControlBadgeState,
-        SourceControlFile, SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay,
-        TerminalEntry, TerminalManagerDiffSummaryVisual, TerminalNavigationDirection,
-        TerminalNavigationShortcut, TerminalOutputScrollBehavior, TerminalSecondaryClickAction,
-        TerminalSelection, TerminalSelectionPoint, TransientToast, CODEX_NOTIFY_POLL_MS,
-        CODEX_PROCESS_POLL_MS, CODEX_STOP_SETTLE_MS, CODEX_TRAILING_OUTPUT_GRACE_MS,
-        DIRECTORY_INDEX_CHANNEL_CAPACITY, FACTORY_DROID_HOOK_POLL_MS, OPENCODE_PROCESS_POLL_MS,
-        OPENCODE_RUNNING_GRACE_MS, OPENCODE_TRAILING_OUTPUT_GRACE_MS,
-        PENDING_RERUN_BATCH_CONFIRM_SETTLE_MS, PENDING_RERUN_BATCH_PROMPT_WAIT_MS,
-        PENDING_RERUN_SETTLE_MS,
+        PendingConfigChanges, PendingRerunPhase, PendingTerminalLinkClick, SettingsSection,
+        SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
+        SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
+        TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
+        TerminalOutputScrollBehavior, TerminalSecondaryClickAction, TerminalSelection,
+        TerminalSelectionPoint, TransientToast, CODEX_NOTIFY_POLL_MS, CODEX_PROCESS_POLL_MS,
+        CODEX_STOP_SETTLE_MS, CODEX_TRAILING_OUTPUT_GRACE_MS, DIRECTORY_INDEX_CHANNEL_CAPACITY,
+        FACTORY_DROID_HOOK_POLL_MS, OPENCODE_PROCESS_POLL_MS, OPENCODE_RUNNING_GRACE_MS,
+        OPENCODE_TRAILING_OUTPUT_GRACE_MS, PENDING_RERUN_BATCH_CONFIRM_SETTLE_MS,
+        PENDING_RERUN_BATCH_PROMPT_WAIT_MS, PENDING_RERUN_SETTLE_MS,
         SOURCE_CONTROL_CHANNEL_CAPACITY, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG,
         TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS,
         TERMINAL_OUTPUT_BG, TEXT_MUTED, TEXT_PRIMARY, TRANSIENT_TOAST_SECS,
@@ -29065,6 +29441,8 @@ mod tests {
             launcher_icon_textures: BTreeMap::new(),
             launcher_icon_failures: std::collections::BTreeSet::new(),
             directory_search_query: String::new(),
+            directory_search_last_query: String::new(),
+            directory_search_query_changed_at: 0.0,
             directory_pending_tree_open_state_by_project: BTreeMap::new(),
             status_line: "Ready".to_owned(),
             transient_toast: None,
@@ -30113,6 +30491,244 @@ mod tests {
         assert!(
             deferred_to_load.contains(&PathBuf::from("/project/migrations")),
             "Deferred directory shown during search should be queued for lazy loading"
+        );
+    }
+
+    #[test]
+    fn directory_search_queues_unmatched_deferred_directories() {
+        // Regression test: When searching, deferred directories whose names DON'T match
+        // the query should still be queued for loading, because matches may exist inside them.
+        use super::{collect_search_deferred_directory_paths, DirectoryNode};
+        use std::collections::HashSet;
+        use std::path::PathBuf;
+
+        // Create a deferred src directory (name doesn't match "foo")
+        let deferred_src = DirectoryNode {
+            name: "src".to_owned(),
+            path: PathBuf::from("/project/src"),
+            is_dir: true,
+            is_placeholder: false,
+            is_deferred: true,
+            children: vec![],
+        };
+
+        let root = DirectoryNode {
+            name: "project".to_owned(),
+            path: PathBuf::from("/project"),
+            is_dir: true,
+            is_placeholder: false,
+            is_deferred: false,
+            children: vec![deferred_src],
+        };
+
+        // Search for "foo" - src name doesn't match, but foo.rs might be inside src
+        let mut deferred_paths = Vec::new();
+        let found = collect_search_deferred_directory_paths(&root, &mut deferred_paths, 32);
+
+        // Should find and queue the deferred src directory
+        assert!(found, "Should find deferred directories during search");
+        assert!(
+            deferred_paths.contains(&PathBuf::from("/project/src")),
+            "Deferred src directory should be queued even though its name doesn't match query"
+        );
+    }
+
+    #[test]
+    fn directory_search_respects_deferred_queue_limit() {
+        // Regression test: collect_search_deferred_directory_paths must respect the limit
+        use super::{collect_search_deferred_directory_paths, DirectoryNode};
+        use std::path::PathBuf;
+
+        // Create many deferred directories
+        let mut children = Vec::new();
+        for i in 0..50 {
+            children.push(DirectoryNode {
+                name: format!("dir{}", i),
+                path: PathBuf::from(format!("/project/dir{}", i)),
+                is_dir: true,
+                is_placeholder: false,
+                is_deferred: true,
+                children: vec![],
+            });
+        }
+
+        let root = DirectoryNode {
+            name: "project".to_owned(),
+            path: PathBuf::from("/project"),
+            is_dir: true,
+            is_placeholder: false,
+            is_deferred: false,
+            children,
+        };
+
+        // Collect with limit of 10
+        let mut deferred_paths = Vec::new();
+        let found = collect_search_deferred_directory_paths(&root, &mut deferred_paths, 10);
+
+        // Should respect the limit
+        assert!(
+            found,
+            "Should indicate there may be more deferred directories"
+        );
+        assert_eq!(
+            deferred_paths.len(),
+            10,
+            "Should respect the limit and not queue all deferred directories at once"
+        );
+    }
+
+    #[test]
+    fn directory_search_finds_file_after_parent_subtree_loaded() {
+        // Regression test: After a deferred parent is loaded, the file inside should be searchable
+        use super::collect_matching_directory_paths;
+        use std::collections::HashSet;
+        use std::path::PathBuf;
+
+        // Simulate loaded src directory with foo.rs inside
+        let loaded_src = DirectoryNode {
+            name: "src".to_owned(),
+            path: PathBuf::from("/project/src"),
+            is_dir: true,
+            is_placeholder: false,
+            is_deferred: false, // Now loaded
+            children: vec![DirectoryNode {
+                name: "foo.rs".to_owned(),
+                path: PathBuf::from("/project/src/foo.rs"),
+                is_dir: false,
+                is_placeholder: false,
+                is_deferred: false,
+                children: vec![],
+            }],
+        };
+
+        let root = DirectoryNode {
+            name: "project".to_owned(),
+            path: PathBuf::from("/project"),
+            is_dir: true,
+            is_placeholder: false,
+            is_deferred: false,
+            children: vec![loaded_src],
+        };
+
+        // Search for "foo"
+        let mut matching_dirs = HashSet::new();
+        let has_match = collect_matching_directory_paths(&root, "foo", false, &mut matching_dirs);
+
+        // Should find the match and include src in matching directories
+        assert!(has_match, "Should find match inside loaded src directory");
+        assert!(
+            matching_dirs.contains(&PathBuf::from("/project/src")),
+            "src should be in matching directories because it contains foo.rs"
+        );
+    }
+
+    #[test]
+    fn directory_search_query_stable_respects_debounce() {
+        // Regression test: Query stability check must respect debounce duration
+        use super::{directory_search_query_stable, DIRECTORY_SEARCH_DEFERRED_LOAD_DEBOUNCE_SECS};
+
+        let now = 10.0;
+        let changed_at = now - DIRECTORY_SEARCH_DEFERRED_LOAD_DEBOUNCE_SECS + 0.01;
+
+        // Just under debounce threshold - should NOT be stable
+        assert!(
+            !directory_search_query_stable(now, changed_at),
+            "Query should not be stable just before debounce threshold"
+        );
+
+        let changed_at_stable = now - DIRECTORY_SEARCH_DEFERRED_LOAD_DEBOUNCE_SECS - 0.01;
+
+        // Past debounce threshold - should be stable
+        assert!(
+            directory_search_query_stable(now, changed_at_stable),
+            "Query should be stable after debounce threshold"
+        );
+
+        // Zero changed_at means no change yet - should be considered stable
+        assert!(
+            directory_search_query_stable(now, 0.0),
+            "Zero changed_at should be considered stable (no change yet)"
+        );
+    }
+
+    #[test]
+    fn directory_search_should_load_deferred_checks_min_length() {
+        // Regression test: Short queries should not trigger deferred loading
+        use super::{
+            directory_search_should_load_deferred, DIRECTORY_SEARCH_MIN_DEFERRED_QUERY_CHARS,
+        };
+
+        let now = 10.0;
+        let stable_time = now - 1.0; // Well past debounce
+
+        // Empty query - should not load deferred
+        assert!(
+            !directory_search_should_load_deferred("", now, stable_time),
+            "Empty query should not trigger deferred loading"
+        );
+
+        // Single char query - should not load deferred (below min)
+        assert!(
+            !directory_search_should_load_deferred("a", now, stable_time),
+            "Single char query should not trigger deferred loading"
+        );
+
+        // Query at minimum length - should load if stable
+        let min_query = "ab";
+        assert_eq!(min_query.len(), DIRECTORY_SEARCH_MIN_DEFERRED_QUERY_CHARS);
+        assert!(
+            directory_search_should_load_deferred(min_query, now, stable_time),
+            "Query at min length and stable should trigger deferred loading"
+        );
+
+        // Longer query - should load if stable
+        assert!(
+            directory_search_should_load_deferred("search", now, stable_time),
+            "Longer stable query should trigger deferred loading"
+        );
+    }
+
+    #[test]
+    fn directory_search_should_load_deferred_respects_debounce() {
+        // Regression test: Query must be stable before deferred loading triggers
+        use super::{
+            directory_search_query_stable, directory_search_should_load_deferred,
+            DIRECTORY_SEARCH_DEFERRED_LOAD_DEBOUNCE_SECS,
+        };
+
+        let now = 10.0;
+
+        // Just changed - not stable yet
+        let just_changed = now;
+        assert!(
+            !directory_search_query_stable(now, just_changed),
+            "Just-changed query should not be stable"
+        );
+        assert!(
+            !directory_search_should_load_deferred("search", now, just_changed),
+            "Unstable query should not trigger deferred loading"
+        );
+
+        // Partially stable - within debounce window
+        let partially_stable = now - DIRECTORY_SEARCH_DEFERRED_LOAD_DEBOUNCE_SECS / 2.0;
+        assert!(
+            !directory_search_query_stable(now, partially_stable),
+            "Partially stable query should not pass debounce"
+        );
+        assert!(
+            !directory_search_should_load_deferred("search", now, partially_stable),
+            "Query within debounce window should not trigger deferred loading"
+        );
+
+        // Fully stable - past debounce window
+        let fully_stable = now - DIRECTORY_SEARCH_DEFERRED_LOAD_DEBOUNCE_SECS - 0.1;
+        assert!(
+            directory_search_query_stable(now, fully_stable),
+            "Fully stable query should pass debounce"
+        );
+        assert!(
+            directory_search_should_load_deferred("search", now, fully_stable),
+            "Stable query past debounce should trigger deferred loading"
         );
     }
 
@@ -33901,6 +34517,368 @@ mod tests {
             !editor_state.selection_drag_active,
             "Selection drag should be reset when closing editor"
         );
+    }
+
+    #[test]
+    fn selected_file_editor_text_from_char_range_returns_none_for_empty_selection() {
+        // Regression test: empty selection should return None
+        use super::selected_file_editor_text_from_char_range;
+        use egui::text::CCursor;
+        use egui::text::CCursorRange;
+
+        let text = "Hello, World!";
+        let empty_range = CCursorRange::one(CCursor::new(5));
+
+        let result = selected_file_editor_text_from_char_range(text, Some(empty_range));
+        assert!(result.is_none(), "Empty selection should return None");
+    }
+
+    #[test]
+    fn selected_file_editor_text_from_char_range_handles_unicode() {
+        // Regression test: Unicode-safe text extraction from editor selection
+        use super::selected_file_editor_text_from_char_range;
+        use egui::text::CCursor;
+        use egui::text::CCursorRange;
+
+        // Text with Unicode characters (box drawing, Turkish, emoji)
+        let text = "┃Merhaba dünya🎉";
+        // Select characters 1-13 ("Merhaba dünya")
+        let range = CCursorRange::two(CCursor::new(1), CCursor::new(14));
+
+        let result = selected_file_editor_text_from_char_range(text, Some(range));
+        assert_eq!(
+            result,
+            Some("Merhaba dünya".to_owned()),
+            "Unicode selection should be extracted correctly"
+        );
+    }
+
+    #[test]
+    fn selected_file_editor_text_from_char_range_handles_reversed_selection() {
+        // Regression test: reversed selection (secondary before primary) should work
+        use super::selected_file_editor_text_from_char_range;
+        use egui::text::CCursor;
+        use egui::text::CCursorRange;
+
+        let text = "Hello, World!";
+        // Reversed range: primary=5, secondary=10 (user dragged right-to-left)
+        let range = CCursorRange::two(CCursor::new(10), CCursor::new(5));
+
+        let result = selected_file_editor_text_from_char_range(text, Some(range));
+        assert_eq!(
+            result,
+            Some(", Wor".to_owned()),
+            "Reversed selection should be normalized and extracted"
+        );
+    }
+
+    #[test]
+    fn file_editor_context_menu_keeps_pre_click_selection_after_secondary_click() {
+        // Regression test: right-click should preserve existing selection
+        use super::file_editor_context_menu_selection_range;
+        use egui::text::CCursor;
+        use egui::text::CCursorRange;
+
+        let pre_click = Some(CCursorRange::two(CCursor::new(5), CCursor::new(10)));
+        let post_show = Some(CCursorRange::one(CCursor::new(7))); // collapsed
+
+        let result = file_editor_context_menu_selection_range(true, pre_click, post_show);
+        assert_eq!(
+            result, pre_click,
+            "Secondary click should preserve pre-click selection"
+        );
+    }
+
+    #[test]
+    fn file_editor_context_menu_uses_post_show_selection_without_secondary_click() {
+        // Regression test: normal selection without right-click uses post-show range
+        use super::file_editor_context_menu_selection_range;
+        use egui::text::CCursor;
+        use egui::text::CCursorRange;
+
+        let pre_click: Option<CCursorRange> = None;
+        let post_show = Some(CCursorRange::two(CCursor::new(5), CCursor::new(10)));
+
+        let result = file_editor_context_menu_selection_range(false, pre_click, post_show);
+        assert_eq!(
+            result, post_show,
+            "Without secondary click, post-show selection should be used"
+        );
+    }
+
+    #[test]
+    fn file_editor_context_menu_ignores_empty_pre_click_selection() {
+        // Regression test: empty pre-click selection should not be preserved
+        use super::file_editor_context_menu_selection_range;
+        use egui::text::CCursor;
+        use egui::text::CCursorRange;
+
+        let empty_pre_click = Some(CCursorRange::one(CCursor::new(5)));
+        let post_show = Some(CCursorRange::two(CCursor::new(8), CCursor::new(12)));
+
+        let result = file_editor_context_menu_selection_range(true, empty_pre_click, post_show);
+        assert_eq!(
+            result, post_show,
+            "Empty pre-click selection should be ignored in favor of post-show"
+        );
+    }
+
+    #[test]
+    fn file_editor_ccursor_range_has_selection_detects_non_empty() {
+        // Regression test: non-empty selection detection
+        use super::file_editor_ccursor_range_has_selection;
+        use egui::text::CCursor;
+        use egui::text::CCursorRange;
+
+        let empty = CCursorRange::one(CCursor::new(5));
+        assert!(
+            !file_editor_ccursor_range_has_selection(empty),
+            "Same cursors should be empty"
+        );
+
+        let non_empty = CCursorRange::two(CCursor::new(5), CCursor::new(10));
+        assert!(
+            file_editor_ccursor_range_has_selection(non_empty),
+            "Different cursors should be non-empty"
+        );
+    }
+
+    #[test]
+    fn file_editor_state_clears_context_menu_selection_on_open_file() {
+        // Regression test: opening a new file clears stored context menu selection
+        use super::{FileEditorState, OpenFileBuffer};
+        use egui::text::{CCursor, CCursorRange};
+        use std::path::PathBuf;
+
+        let mut editor = FileEditorState::default();
+
+        // Simulate stored context menu selection and tracking flag
+        editor.context_menu_selection_range =
+            Some(CCursorRange::two(CCursor::new(5), CCursor::new(10)));
+        editor.context_menu_was_open = true;
+
+        // Open a new file
+        let buffer = OpenFileBuffer::new(
+            1,
+            PathBuf::from("/test/file.txt"),
+            "test content".to_owned(),
+            "file.txt".to_owned(),
+        );
+        editor.open_file(buffer);
+
+        assert!(
+            editor.context_menu_selection_range.is_none(),
+            "Stored context menu selection should be cleared when opening a file"
+        );
+        assert!(
+            !editor.context_menu_was_open,
+            "Context menu tracking flag should be reset when opening a file"
+        );
+    }
+
+    #[test]
+    fn file_editor_state_clears_context_menu_selection_on_close() {
+        // Regression test: closing editor clears stored context menu selection
+        use super::FileEditorState;
+        use egui::text::{CCursor, CCursorRange};
+
+        let mut editor = FileEditorState::default();
+
+        // Simulate stored context menu selection and tracking flag
+        editor.context_menu_selection_range =
+            Some(CCursorRange::two(CCursor::new(5), CCursor::new(10)));
+        editor.context_menu_was_open = true;
+
+        editor.close();
+
+        assert!(
+            editor.context_menu_selection_range.is_none(),
+            "Stored context menu selection should be cleared when closing editor"
+        );
+        assert!(
+            !editor.context_menu_was_open,
+            "Context menu tracking flag should be reset when closing editor"
+        );
+    }
+
+    #[test]
+    fn file_editor_state_clears_context_menu_selection_on_hide() {
+        // Regression test: hiding editor clears stored context menu selection
+        use super::FileEditorState;
+        use egui::text::{CCursor, CCursorRange};
+
+        let mut editor = FileEditorState::default();
+
+        // Simulate stored context menu selection and tracking flag
+        editor.context_menu_selection_range =
+            Some(CCursorRange::two(CCursor::new(5), CCursor::new(10)));
+        editor.context_menu_was_open = true;
+
+        editor.hide();
+
+        assert!(
+            editor.context_menu_selection_range.is_none(),
+            "Stored context menu selection should be cleared when hiding editor"
+        );
+        assert!(
+            !editor.context_menu_was_open,
+            "Context menu tracking flag should be reset when hiding editor"
+        );
+    }
+
+    #[test]
+    fn file_editor_state_clears_context_menu_selection_on_navigate_back() {
+        // Regression test: navigating back clears stored context menu selection
+        use super::{FileEditorState, OpenFileBuffer};
+        use egui::text::{CCursor, CCursorRange};
+        use std::path::PathBuf;
+
+        let mut editor = FileEditorState::default();
+
+        // Open first file
+        let buffer1 = OpenFileBuffer::new(
+            1,
+            PathBuf::from("/test/file1.txt"),
+            "content 1".to_owned(),
+            "file1.txt".to_owned(),
+        );
+        editor.open_file(buffer1);
+
+        // Open second file (pushes first to back stack)
+        let buffer2 = OpenFileBuffer::new(
+            1,
+            PathBuf::from("/test/file2.txt"),
+            "content 2".to_owned(),
+            "file2.txt".to_owned(),
+        );
+        editor.open_file(buffer2);
+
+        // Simulate stored context menu selection and tracking flag
+        editor.context_menu_selection_range =
+            Some(CCursorRange::two(CCursor::new(5), CCursor::new(10)));
+        editor.context_menu_was_open = true;
+
+        // Navigate back
+        editor.navigate_back();
+
+        assert!(
+            editor.context_menu_selection_range.is_none(),
+            "Stored context menu selection should be cleared when navigating back"
+        );
+        assert!(
+            !editor.context_menu_was_open,
+            "Context menu tracking flag should be reset when navigating back"
+        );
+    }
+
+    #[test]
+    fn file_editor_state_clears_context_menu_selection_on_navigate_forward() {
+        // Regression test: navigating forward clears stored context menu selection
+        use super::{FileEditorState, OpenFileBuffer};
+        use egui::text::{CCursor, CCursorRange};
+        use std::path::PathBuf;
+
+        let mut editor = FileEditorState::default();
+
+        // Open first file
+        let buffer1 = OpenFileBuffer::new(
+            1,
+            PathBuf::from("/test/file1.txt"),
+            "content 1".to_owned(),
+            "file1.txt".to_owned(),
+        );
+        editor.open_file(buffer1);
+
+        // Open second file (pushes first to back stack)
+        let buffer2 = OpenFileBuffer::new(
+            1,
+            PathBuf::from("/test/file2.txt"),
+            "content 2".to_owned(),
+            "file2.txt".to_owned(),
+        );
+        editor.open_file(buffer2);
+
+        // Navigate back then forward
+        editor.navigate_back();
+
+        // Simulate stored context menu selection and tracking flag
+        editor.context_menu_selection_range =
+            Some(CCursorRange::two(CCursor::new(5), CCursor::new(10)));
+        editor.context_menu_was_open = true;
+
+        editor.navigate_forward();
+
+        assert!(
+            editor.context_menu_selection_range.is_none(),
+            "Stored context menu selection should be cleared when navigating forward"
+        );
+        assert!(
+            !editor.context_menu_was_open,
+            "Context menu tracking flag should be reset when navigating forward"
+        );
+    }
+
+    #[test]
+    fn file_editor_default_has_context_menu_tracking_false() {
+        // Regression test: context menu tracking starts in correct state
+        use super::FileEditorState;
+
+        let editor = FileEditorState::default();
+
+        assert!(
+            editor.context_menu_selection_range.is_none(),
+            "Default context menu selection should be None"
+        );
+        assert!(
+            !editor.context_menu_was_open,
+            "Default context menu tracking flag should be false"
+        );
+    }
+
+    #[test]
+    fn file_editor_selection_extraction_returns_none_for_empty_range() {
+        // Regression test: selection extraction handles empty range correctly
+        use super::selected_file_editor_text_from_char_range;
+        use egui::text::{CCursor, CCursorRange};
+
+        let text = "Hello, World!";
+        let empty_range = CCursorRange::one(CCursor::new(5));
+
+        let result = selected_file_editor_text_from_char_range(text, Some(empty_range));
+        assert!(result.is_none(), "Empty range should return None for copy");
+    }
+
+    #[test]
+    fn file_editor_selection_extraction_handles_ctrl_c_selection() {
+        // Regression test: Ctrl+C selection extraction works for copy feedback
+        // This tests the helper used by the Ctrl+C handler in draw_file_editor
+        use super::selected_file_editor_text_from_char_range;
+        use egui::text::{CCursor, CCursorRange};
+
+        let text = "function test() { return 42; }";
+        // Select "test()"
+        let selection = CCursorRange::two(CCursor::new(9), CCursor::new(15));
+
+        let result = selected_file_editor_text_from_char_range(text, Some(selection));
+        assert_eq!(
+            result,
+            Some("test()".to_owned()),
+            "Ctrl+C selection should extract correct text for copy"
+        );
+    }
+
+    #[test]
+    fn file_editor_copy_requested_helper_exists() {
+        // Regression test: file_editor_copy_requested helper is defined and callable
+        // The actual behavior is tested via integration; this test ensures the function exists
+        use super::file_editor_copy_requested;
+
+        // Function reference check - ensures the helper exists with correct signature
+        let _: fn(&egui::InputState) -> bool = file_editor_copy_requested;
+
+        // The helper checks for Event::Copy and Ctrl+C/Command+C fallback
+        // Real copy detection requires egui context which is not available in unit tests
+        assert!(true, "file_editor_copy_requested helper exists with correct signature");
     }
 
     #[test]

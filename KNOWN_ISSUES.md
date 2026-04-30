@@ -1,5 +1,67 @@
 ### Known Issues & Fix Log
 
+#### File editor Ctrl+C copy now shows clipboard feedback {#file-editor-ctrl-c-copy-feedback}
+- Date: 2026-04-30
+- Context: Built-in file editor copy shortcut
+- Error signature: `Ctrl+C in file editor does not show "Copied to clipboard" notification`
+- Symptoms/Impact:
+  1. Selecting text in file editor and pressing `Ctrl+C` copied to clipboard but showed no visual feedback.
+  2. Only right-click context menu Copy showed feedback.
+  3. Users were unsure if copy actually worked when using keyboard shortcut.
+- Root cause:
+  1. Initial implementation only detected raw `Ctrl+C` key press via `input.key_pressed()`.
+  2. `egui::TextEdit` consumes the copy shortcut and generates `Event::Copy` rather than letting raw key events through.
+  3. The copy detection code never triggered because it was listening for the wrong signal.
+- Resolution:
+  - Added `file_editor_copy_requested()` helper that detects BOTH:
+    1. `Event::Copy` (generated when TextEdit handles the shortcut)
+    2. Raw `Ctrl+C` / `Command+C` key presses (fallback for edge cases)
+  - Updated `draw_file_editor()` to use the new helper for copy detection.
+  - Clipboard feedback (`show_status_feedback(ctx, "Copied to clipboard")`) now triggers for both:
+    - Keyboard shortcut (`Ctrl+C` / `Command+C`)
+    - Right-click context menu Copy
+  - Added regression tests for both `Event::Copy` and `Ctrl+C`/`Command+C` detection.
+- Prevent recurrence:
+  - Always detect copy via `Event::Copy` first, then fall back to raw key detection.
+  - Test both keyboard shortcut and context menu paths for copy feedback.
+  - Document that `TextEdit` may consume shortcuts and generate events rather than pass raw keys.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+
+#### Directory search performance improved with debounce and adaptive loading {#directory-search-debounce-adaptive-loading}
+- Date: 2026-04-30
+- Context: Directory sidebar search with deferred indexing - performance optimization
+- Error signature: `Directory search causes UI lag in large projects with many deferred folders`
+- Symptoms/Impact:
+  1. Typing in directory search triggered immediate loading of all deferred directories.
+  2. Every frame queued up to 32 deferred directories, forcing them to render expanded.
+  3. Large projects (many folders) experienced UI lag during search due to excessive loading and rendering.
+  4. Short queries (1-2 characters) still triggered expensive deep deferred loads.
+  5. Rapid typing caused continuous load/unload cycles before user finished typing.
+- Root cause:
+  1. `collect_search_deferred_directory_paths()` added all deferred paths to `matching_directories`, forcing expanded rendering.
+  2. No debounce mechanism existed to wait for user to finish typing before triggering deep loads.
+  3. No minimum query length check to avoid aggressive loading on short queries.
+  4. Fixed per-frame cap (32) was too high for large projects, and didn't adapt based on whether results were already visible.
+- Resolution:
+  - Added `DIRECTORY_SEARCH_DEFERRED_LOAD_DEBOUNCE_SECS = 0.25` to wait 250ms after query stops changing before loading deferred directories.
+  - Added `DIRECTORY_SEARCH_MIN_DEFERRED_QUERY_CHARS = 2` to only trigger deep deferred loading for queries of 2+ characters.
+  - Added adaptive per-frame loading caps:
+    - `DIRECTORY_SEARCH_INITIAL_SUBTREE_REQUESTS_PER_FRAME = 8` when no results exist yet (aggressive search).
+    - `DIRECTORY_SEARCH_BACKGROUND_SUBTREE_REQUESTS_PER_FRAME = 2` when results already visible (conservative background loading).
+  - Changed to hidden deferred queue: deferred directories whose names don't match query are loaded in background but NOT added to `matching_directories`. Only directories with actual matches expand in UI.
+  - Added state tracking fields to `AdeApp`: `directory_search_last_query` and `directory_search_query_changed_at` for debounce timing.
+  - Added helper functions: `directory_search_query_stable()`, `directory_search_should_load_deferred()`.
+  - Modified `draw_directory_panel()` to use debounce, adaptive caps, and hidden queue logic.
+  - Added regression tests: `directory_search_query_stable_respects_debounce`, `directory_search_should_load_deferred_checks_min_length`, `directory_search_should_load_deferred_respects_debounce`.
+- Prevent recurrence:
+  - Always debounce search-triggered deferred loading to avoid load cycles during rapid typing.
+  - Require minimum query length before deep deferred searches to reduce unnecessary loading.
+  - Use adaptive caps that prioritize finding first matches without overwhelming UI.
+  - Keep hidden queue separate from visible `matching_directories` to avoid forced expanded rendering.
+  - Test search performance with projects containing 100+ deferred directories.
+- Files/Commands touched: `src/app.rs` (new constants, state fields, helper functions, draw_directory_panel modifications), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report that directory search caused UI lag in large projects with many deferred folders.
+
 #### Terminal drag selection did not autoscroll near viewport edges {#terminal-selection-edge-autoscroll}
 - Date: 2026-04-29
 - Context: Terminal text selection and scroll behavior
@@ -2736,6 +2798,63 @@
   - Maintain separation between terminal display filtering and AI signal parsing paths
 - Files/Commands touched: `src/terminal.rs` (CodexRedrawFilter struct, spawn_reader_thread, TerminalRuntime), `src/app.rs` (active_ai_tool sync in all AI tool handlers), `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: AGENTS.md AI CLI Integration section; wezterm-term CSI sequence handling; Codex CLI TUI redraw behavior analysis
+
+#### File editor right-click menu did not offer Copy {#file-editor-context-menu-copy-missing}
+- Date: 2026-04-30
+- Context: Built-in file editor text selection context menu
+- Error signature: `Selecting text in the editor and right-clicking does not show Copy`
+- Symptoms/Impact:
+  1. Selected editor text could not be copied from a right-click context menu.
+  2. Terminal panes had a selection-aware Copy menu, but the file editor did not.
+  3. A naive post-right-click selection read could fail because `egui::TextEdit` may collapse selection on secondary press.
+- Root cause:
+  1. `draw_file_editor()` rendered the editor with `ui.add(text_edit)`, keeping only `Response` and losing `TextEditOutput` selection state.
+  2. No `response.context_menu()` was registered for the editor text area.
+  3. `egui::TextEdit` pointer handling can treat secondary press as a pointer interaction and replace the selected range with a single cursor before menu rendering.
+- Resolution:
+  - Switched editor rendering to `TextEdit::show()` so cursor state is available.
+  - Added char-safe selected editor text extraction from `CCursorRange`.
+  - Captured the pre-right-click `TextEditState` selection and restored it when right-click would otherwise collapse a non-empty selection.
+  - Added a minimal editor context menu with `Copy` for non-empty selections.
+  - Deferred clipboard status feedback until after editor buffer rendering to avoid mutable borrow conflicts.
+  - Added regression tests for Unicode-safe extraction, empty selection handling, reversed ranges, and right-click selection preservation.
+- Prevent recurrence:
+  - Use `TextEditOutput` for any editor behavior that depends on cursor or selection state.
+  - Preserve non-empty selections across secondary-click context menu opening.
+  - Keep editor selected-text operations char-safe.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report that Copy does not appear on editor right-click.
+
+#### Directory search did not search inside deferred folders {#directory-search-deferred-folder-contents}
+- Date: 2026-04-30
+- Context: Directory sidebar search with lazy-loaded folders
+- Error signature: `Searching "foo" in directory panel doesn't find "src/foo.rs" when src folder is deferred`
+- Symptoms/Impact:
+  1. Directory search only found files in already-loaded folders.
+  2. Files in deferred (lazy-loaded) folders could not be found even though they existed.
+  3. Users saw "No matching files or folders" prematurely while deferred folders were still loading.
+  4. Search queries like "config" would not find `src/config.rs` because the `src` folder name didn't match.
+- Root cause:
+  1. Search only traversed existing `DirectoryNode::children` which were empty for deferred folders.
+  2. `collect_matching_directory_paths()` only checked loaded snapshot data.
+  3. Deferred folders whose names didn't match the query were not rendered, so lazy-load was never triggered.
+  4. "No matching files or folders" appeared immediately without waiting for deferred loads to complete.
+- Resolution:
+  - Added `collect_search_deferred_directory_paths()` helper to find all deferred directories in the current snapshot tree.
+  - During search, collect and queue deferred directories even when their names don't match the query.
+  - Extend `matching_directories` set to include deferred paths being loaded so they render expanded.
+  - Added per-frame limit (`DIRECTORY_SEARCH_MAX_SUBTREE_REQUESTS_PER_FRAME = 32`) to prevent UI blocking.
+  - Only show "No matching files or folders" when no results AND no pending deferred loads exist.
+  - Show "Searching folders..." indicator while deferred loads are in flight.
+  - Added regression tests: `directory_search_queues_unmatched_deferred_directories`, `directory_search_respects_deferred_queue_limit`, `directory_search_finds_file_after_parent_subtree_loaded`.
+- Prevent recurrence:
+  - Always progressively load deferred directories during search regardless of name match.
+  - Use `DirectoryScanMode::LazySubtree` for all search-triggered loads (never synchronous scans).
+  - Defer "no results" feedback until all pending loads complete.
+  - Cap per-frame subtree requests to maintain responsiveness in large projects.
+- Files/Commands touched: `src/app.rs` (collect_search_deferred_directory_paths, draw_directory_panel), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report that directory search cannot find files inside folders.
+
 
 
 

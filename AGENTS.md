@@ -84,6 +84,14 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Directory worker command draining must never silently drop distinct `Subtree` commands**. Use batch draining (`Vec<DirectoryIndexCommand>`) to preserve all subtree load requests. Only deduplicate Full commands per project (keep latest generation).
 - **When the UI queues a subtree load, request a repaint** (`request_repaint_after`) to process worker events promptly without waiting for unrelated input.
 - **`request_directory_subtree_load()` must report whether work was queued** (`bool`) and must clean up loading state (`directory_index_subtree_loading_by_project`) if command send fails, to prevent stuck loading indicators.
+- **Directory search must progressively queue deferred directories** even when the folder name itself does not match the query; otherwise matches inside lazy-loaded folders can never be discovered.
+- **Search-triggered directory loading must still use `DirectoryScanMode::LazySubtree`**; never perform synchronous recursive scans from the UI thread.
+- **While deferred search loads are queued or in flight, do not show final "No matching files or folders" feedback.** Instead show a "Searching folders..." indicator and continue loading.
+- **Cap search-triggered subtree queueing per frame** (`DIRECTORY_SEARCH_MAX_SUBTREE_REQUESTS_PER_FRAME`) to keep large projects responsive; defer additional directories in subsequent frames via repaint.
+- **Debounce search-triggered deferred loading**: Wait `DIRECTORY_SEARCH_DEFERRED_LOAD_DEBOUNCE_SECS` (250ms) after query stops changing before starting deep deferred loads. This prevents aggressive loading during rapid typing.
+- **Minimum query length for deferred loading**: Require `DIRECTORY_SEARCH_MIN_DEFERRED_QUERY_CHARS` (2 characters) before triggering deep deferred directory searches. Short queries should only search already-loaded tree.
+- **Adaptive per-frame loading caps**: Use aggressive cap (`DIRECTORY_SEARCH_INITIAL_SUBTREE_REQUESTS_PER_FRAME` = 8) when no results exist yet, conservative cap (`DIRECTORY_SEARCH_BACKGROUND_SUBTREE_REQUESTS_PER_FRAME` = 2) when results already visible. This prioritizes finding first matches without overwhelming UI.
+- **Hidden deferred queue for search**: Deferred directories whose names don't match the query should be loaded in background without being added to `matching_directories`. Only directories that actually contain matches should be expanded in UI; others load hidden.
 - Add regression tests whenever directory indexing, deferred loading, or tree rendering behavior changes.
 
 ## Subagent Usage Policy
@@ -131,6 +139,13 @@ If `cargo` is not on PATH in PowerShell, use:
 - Use `FileEditorState::is_visible()` for main area rendering, `is_open()` for buffer existence checks.
 - Call `FileEditorState::hide()` when switching to terminal; call `close()` when truly closing.
 - `set_active_terminal()` must hide the editor before early-return checks to ensure terminal click always switches from editor.
+- File editor selection-aware context menus must use `TextEdit::show()`/`TextEditOutput`, not plain `ui.add(text_edit)`, so cursor state and selection data remain available.
+- Right-clicking `egui::TextEdit` can collapse the active selection before menu handling; capture the pre-click `TextEditState` selection and restore non-empty selections when opening editor copy menus.
+- Copying selected editor text must use character cursor ranges (`CCursorRange`/`CursorRange`) and char-safe slicing; never byte-index slice editor text.
+- Defer clipboard feedback that mutates `AdeApp` state until after the active editor buffer mutable borrow ends.
+- Detect editor copy requests using `Event::Copy` (generated when TextEdit handles the copy shortcut) rather than just raw key detection, with `Ctrl+C`/`Command+C` as fallback. This ensures copy feedback works regardless of whether TextEdit consumed the shortcut.
+- Add regression tests for editor context menu selection preservation, Unicode-safe selected-text extraction, and empty-selection behavior.
+- Test both `Event::Copy` and raw `Ctrl+C`/`Command+C` paths for editor copy feedback.
 
 ## Terminal Input & History Invariants
 - `pending_line_for_title` is for title/AI command detection only; it clears on newlines (\r or \n) since titles should reflect only the current logical line. This buffer is capped to `TERMINAL_PENDING_LINE_MAX_CHARS` (512) to prevent unbounded growth.
