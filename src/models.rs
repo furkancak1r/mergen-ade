@@ -362,6 +362,7 @@ pub struct UiConfig {
     pub main_visibility_mode: MainVisibilityMode,
     pub left_sidebar_tab: LeftSidebarTab,
     pub checklist_panel_expanded: bool,
+    pub browser_panel_expanded: bool,
     pub input_history_filter: InputHistoryFilter,
 }
 
@@ -379,6 +380,7 @@ impl Default for UiConfig {
             main_visibility_mode: MainVisibilityMode::Global,
             left_sidebar_tab: LeftSidebarTab::Directory,
             checklist_panel_expanded: false,
+            browser_panel_expanded: false,
             input_history_filter: InputHistoryFilter::default(),
         }
     }
@@ -397,6 +399,9 @@ pub struct ProjectRecord {
     /// Persisted across sessions; survives terminal closure.
     #[serde(default)]
     pub checklist: Vec<String>,
+    /// Last browser URL for this project (project-scoped browsing).
+    #[serde(default)]
+    pub browser_last_url: Option<String>,
 }
 
 /// A single recorded terminal input.

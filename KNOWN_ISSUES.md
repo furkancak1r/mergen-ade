@@ -1,5 +1,70 @@
 ### Known Issues & Fix Log
 
+#### Embedded browser Go action did not create WebView2 and could still open external browser {#embedded-browser-go-did-not-create-webview2}
+- Date: 2026-04-30
+- Context: Browser panel embedded WebView2 navigation
+- Error signature: `Clicking Go to URL does nothing, or the Browser panel still exposes an external browser path`
+- Symptoms/Impact:
+  1. User enters a URL in the Browser panel and clicks Go, but no website appears inside Mergen ADE.
+  2. Browser panel still includes an "Open Saved URL in External Browser" action that can launch Chrome/Edge/default browser.
+  3. Terminal HTTP/HTTPS link routing is intended to open the project browser panel, but the native WebView may not exist yet.
+  4. Failures are silent, creating the impression that the Go button is broken.
+- Root cause:
+  1. `submit_browser_url()` called `EmbeddedBrowser::navigate()` before any WebView2 controller/webview was created.
+  2. `sync_embedded_browser()` never called `EmbeddedBrowser::ensure_created(self.window_hwnd)`.
+  3. `sync_embedded_browser()` only hid/synced the browser when `pending_browser_rect` existed, so hidden-panel state was not guaranteed to reach the native WebView.
+  4. `web_browser.rs` used `ICoreWebView2Controller::Bounds()` and `IsVisible()`, which are getters, instead of `SetBounds()` and `SetIsVisible()`.
+  5. WebView2 async environment/controller creation used raw channel waits instead of a message-pumping wait, preventing callbacks from being delivered reliably.
+  6. Browser panel still contained a `ctx.open_url()` external-browser action.
+- Resolution:
+  - Call `EmbeddedBrowser::ensure_created(self.window_hwnd)` from `sync_embedded_browser()` before showing/syncing the browser.
+  - Use `webview2_com::wait_with_pump()` for WebView2 environment/controller creation callbacks.
+  - Replace `Bounds()` with `SetBounds()` and `IsVisible()` with `SetIsVisible()`.
+  - Keep URL submissions pending until the WebView2 instance is ready, then call `ICoreWebView2::Navigate()`.
+  - Hide the native WebView whenever the browser panel is collapsed, regardless of whether a new rect was produced.
+  - Remove the browser panel's external-open action and all browser-panel `ctx.open_url()` calls.
+  - Render an in-panel error state for WebView2 creation/navigation failures.
+- Prevent recurrence:
+  - Browser panel navigation must always be embedded-only.
+  - Tests should prove Go and terminal links route through `submit_browser_url()` and not `ctx.open_url()`.
+  - WebView2 positioning/visibility tests or compile-time review should verify setter APIs are used.
+  - WebView2 async setup must use a message-pumping wait, never raw blocking `recv()`.
+  - Manual verification must include entering a normal URL and confirming no Chrome/Edge/default browser launches.
+- Files/Commands touched: `src/web_browser.rs`, `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: Follow-up to `#embedded-browser-webview2-implementation`; user clarified that sites must open inside Mergen ADE, not Chrome or another browser.
+
+#### Embedded browser replaced placeholder with WebView2 {#embedded-browser-webview2-implementation}
+- Date: 2026-04-30
+- Context: Browser panel showed placeholder text instead of rendering embedded WebView
+- Error signature: `Browser panel displays "(Embedded browser coming...)" placeholder instead of actual WebView content`
+- Symptoms/Impact:
+  1. Browser panel showed placeholder text "(Embedded browser coming in next update)" instead of rendering web content.
+  2. Terminal HTTP/HTTPS links opened in external browser instead of project browser panel.
+  3. No native WebView integration existed for Windows platform.
+  4. macOS builds would fail if Windows-only dependencies were not properly gated.
+- Root cause:
+  1. `draw_browser_panel()` rendered placeholder label instead of allocating space for WebView content.
+  2. Terminal link handler (`link_to_open`) routed to `ctx.open_url()` for external browser instead of embedded browser.
+  3. No embedded browser module existed; no facade pattern for platform-specific implementations.
+  4. No bounds synchronization between egui UI rect and native WebView position.
+- Resolution:
+  - Added `src/web_browser.rs` with `EmbeddedBrowser` facade, `BrowserBounds`, `BrowserEvent`, `BrowserStatus`.
+  - Implemented target-gated WebView2 integration: Windows uses `webview2-com` + `windows` crates; non-Windows returns `BrowserStatus::Unsupported`.
+  - Updated `Cargo.toml` with `[target.'cfg(target_os = "windows")'.dependencies]` for platform-specific deps.
+  - Added `embedded_browser: web_browser::EmbeddedBrowser` and `pending_browser_rect: Option<egui::Rect>` to `AdeApp`.
+  - Initialized browser in `AdeApp::new()`, shutdown in `on_exit()`, sync via `sync_embedded_browser()` after render.
+  - Updated `submit_browser_url()` to navigate embedded browser and open browser panel automatically.
+  - Updated terminal link handler to route HTTP/HTTPS links to `submit_browser_url()` instead of `ctx.open_url()`.
+  - Allocated browser content rect in `draw_browser_panel()` instead of showing placeholder text.
+  - Added `browser_bounds_from_egui_rect()` for physical pixel conversion using `ctx.pixels_per_point()`.
+  - Updated AGENTS.md with embedded browser invariants (platform-specific integration, bounds sync, no placeholder).
+- Prevent recurrence:
+  - Always use facade pattern with target-gated implementations for platform-specific features.
+  - Never show placeholder text for features intended to be functional.
+  - Route terminal links to embedded browser when possible; external browser only for explicit user action.
+  - Test cross-platform builds to ensure non-Windows compiles successfully with stub implementations.
+- Files/Commands touched: `src/web_browser.rs`, `src/app.rs` (submit_browser_url, draw_browser_panel, sync_embedded_browser, terminal link handler), `src/main.rs` (mod web_browser), `Cargo.toml` (target-gated deps), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+
 #### File editor Ctrl+C copy now shows clipboard feedback {#file-editor-ctrl-c-copy-feedback}
 - Date: 2026-04-30
 - Context: Built-in file editor copy shortcut
@@ -2989,7 +3054,6 @@
   - Cap per-frame subtree requests to maintain responsiveness in large projects.
 - Files/Commands touched: `src/app.rs` (collect_search_deferred_directory_paths, draw_directory_panel), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User report that directory search cannot find files inside folders.
-
 
 
 

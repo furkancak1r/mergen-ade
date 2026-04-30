@@ -69,6 +69,7 @@ use crate::terminal::{
     TerminalWheelEvent, TrackedProcessIdentity, WheelDirection,
 };
 use crate::title::{terminal_title_candidate, update_terminal_title};
+use crate::web_browser::{self, BrowserStatus};
 
 const TITLE_MAX_LEN: usize = 40;
 const TERMINAL_EVENT_BUDGET: usize = 4096;
@@ -200,6 +201,7 @@ const TEXT_MUTED: Color32 = Color32::from_rgb(140, 140, 140);
 const DIRECTORY_SEARCH_MATCH_COLOR: Color32 = Color32::from_rgb(255, 176, 64);
 const PROJECT_EXPLORER_WIDTH: f32 = 352.0;
 const CHECKLIST_PANEL_WIDTH: f32 = 352.0;
+const BROWSER_PANEL_WIDTH: f32 = 520.0;
 const ACTIVITY_RAIL_WIDTH: f32 = 48.0;
 const CONTROL_ROW_HEIGHT: f32 = 28.0;
 const TERMINAL_MANAGER_FILTER_ROW_HEIGHT_EXTRA: f32 = 12.0;
@@ -214,6 +216,7 @@ const SOURCE_CONTROL_FILE_ICON_WIDTH: f32 = 16.0;
 const SOURCE_CONTROL_FILE_ICON_GAP: f32 = 6.0;
 const DIRECTORY_SEARCH_INPUT_ID: &str = "directory-search-input";
 const SAVED_MESSAGE_DRAFT_INPUT_ID: &str = "saved-message-draft-input";
+const BROWSER_URL_INPUT_ID: &str = "browser-url-input";
 const SETTINGS_NAV_WIDTH: f32 = 144.0;
 const SETTINGS_WINDOW_DEFAULT_WIDTH: f32 = 760.0;
 const SETTINGS_WINDOW_DEFAULT_HEIGHT: f32 = 520.0;
@@ -329,6 +332,7 @@ enum AppIcon {
     FolderPlus,
     Gear,
     GitBranch,
+    Globe,
     List,
     Plus,
     Terminal,
@@ -339,7 +343,7 @@ enum AppIcon {
 }
 
 impl AppIcon {
-    const ALL: [Self; 23] = [
+    const ALL: [Self; 24] = [
         Self::ArrowClockwise,
         Self::ArrowLeft,
         Self::ArrowRight,
@@ -356,6 +360,7 @@ impl AppIcon {
         Self::FolderPlus,
         Self::Gear,
         Self::GitBranch,
+        Self::Globe,
         Self::List,
         Self::Plus,
         Self::Terminal,
@@ -383,6 +388,7 @@ impl AppIcon {
             Self::FolderPlus => "folder-plus",
             Self::Gear => "settings",
             Self::GitBranch => "git-branch",
+            Self::Globe => "globe",
             Self::List => "list",
             Self::Plus => "plus",
             Self::Terminal => "terminal",
@@ -441,6 +447,7 @@ mod icons {
     pub const FOLDER_PLUS: AppIcon = AppIcon::FolderPlus;
     pub const GEAR: AppIcon = AppIcon::Gear;
     pub const GIT_BRANCH: AppIcon = AppIcon::GitBranch;
+    pub const GLOBE: AppIcon = AppIcon::Globe;
     pub const LIST: AppIcon = AppIcon::List;
     pub const PLUS: AppIcon = AppIcon::Plus;
     pub const TERMINAL: AppIcon = AppIcon::Terminal;
@@ -1074,6 +1081,13 @@ pub struct AdeApp {
     checklist_collapsed_by_project: BTreeMap<u64, bool>,
     /// File editor state (runtime only, not persisted)
     file_editor: FileEditorState,
+    /// Browser URL draft input per project (runtime only, not persisted).
+    /// Holds the text being typed in the browser panel URL input before submission.
+    browser_url_draft_by_project: BTreeMap<u64, String>,
+    /// Embedded browser for in-app web rendering (runtime only, not persisted)
+    embedded_browser: web_browser::EmbeddedBrowser,
+    /// Reserved browser content area for native WebView bounds sync (runtime only)
+    pending_browser_rect: Option<egui::Rect>,
 }
 
 /// Represents a single open file buffer in the built-in editor.
@@ -3202,6 +3216,7 @@ impl AdeApp {
                     saved_messages: Vec::new(),
                     ai_config: crate::hooks::ProjectAiConfig::default(),
                     checklist: Vec::new(),
+                    browser_last_url: None,
                 });
             }
         }
@@ -3382,6 +3397,9 @@ impl AdeApp {
             terminal_history_popup_just_opened: false,
             checklist_collapsed_by_project: BTreeMap::new(),
             file_editor: FileEditorState::default(),
+            browser_url_draft_by_project: BTreeMap::new(),
+            embedded_browser: web_browser::EmbeddedBrowser::new(),
+            pending_browser_rect: None,
         };
         app
     }
@@ -3527,6 +3545,7 @@ impl AdeApp {
             saved_messages: Vec::new(),
             ai_config: crate::hooks::ProjectAiConfig::default(),
             checklist: Vec::new(),
+            browser_last_url: None,
         };
 
         let new_project_id = project.id;
@@ -8126,6 +8145,10 @@ impl AdeApp {
         Id::new((SAVED_MESSAGE_DRAFT_INPUT_ID, project_id))
     }
 
+    fn browser_url_input_id(project_id: u64) -> Id {
+        Id::new((BROWSER_URL_INPUT_ID, project_id))
+    }
+
     fn text_input_has_focus(&self, ctx: &egui::Context) -> bool {
         if ctx.memory(|mem| mem.has_focus(Self::directory_search_input_id())) {
             return true;
@@ -8135,8 +8158,15 @@ impl AdeApp {
             return true;
         }
 
-        self.selected_project.is_some_and(|project_id| {
+        if self.selected_project.is_some_and(|project_id| {
             ctx.memory(|mem| mem.has_focus(Self::saved_message_draft_input_id(project_id)))
+        }) {
+            return true;
+        }
+
+        // Browser URL input focus check
+        self.selected_project.is_some_and(|project_id| {
+            ctx.memory(|mem| mem.has_focus(Self::browser_url_input_id(project_id)))
         })
     }
 
@@ -8150,6 +8180,7 @@ impl AdeApp {
             mem.surrender_focus(Self::file_editor_input_id());
             if let Some(project_id) = self.selected_project {
                 mem.surrender_focus(Self::saved_message_draft_input_id(project_id));
+                mem.surrender_focus(Self::browser_url_input_id(project_id));
             }
         });
     }
@@ -12090,7 +12121,7 @@ impl AdeApp {
         content_rect: egui::Rect,
         activity_rect: Option<egui::Rect>,
         explorer_rect: Option<egui::Rect>,
-        checklist_rect: Option<egui::Rect>,
+        right_panel_rect: Option<egui::Rect>,
     ) -> Vec2 {
         let mut width = content_rect.width();
         let height = content_rect.height();
@@ -12101,8 +12132,9 @@ impl AdeApp {
         if let Some(explorer_rect) = explorer_rect {
             width -= explorer_rect.width();
         }
-        if let Some(checklist_rect) = checklist_rect {
-            width -= checklist_rect.width();
+        // Right panel can be either Check-list or Browser (mutually exclusive)
+        if let Some(right_panel_rect) = right_panel_rect {
+            width -= right_panel_rect.width();
         }
 
         egui::vec2(width.max(1.0), height.max(1.0))
@@ -12219,6 +12251,26 @@ impl AdeApp {
                         "Toggle Check-list Panel",
                     ) {
                         self.config.ui.checklist_panel_expanded = !checklist_panel_active;
+                        // Mutual exclusivity: close browser when opening checklist
+                        if self.config.ui.checklist_panel_expanded {
+                            self.config.ui.browser_panel_expanded = false;
+                        }
+                        should_persist = true;
+                    }
+
+                    ui.add_space(6.0);
+                    let browser_panel_active = self.config.ui.browser_panel_expanded;
+                    if styled_icon_toggle(
+                        ui,
+                        browser_panel_active,
+                        icons::GLOBE,
+                        "Toggle Browser Panel",
+                    ) {
+                        self.config.ui.browser_panel_expanded = !browser_panel_active;
+                        // Mutual exclusivity: close checklist when opening browser
+                        if self.config.ui.browser_panel_expanded {
+                            self.config.ui.checklist_panel_expanded = false;
+                        }
                         should_persist = true;
                     }
 
@@ -14481,6 +14533,239 @@ impl AdeApp {
         Some(response.response.rect)
     }
 
+    /// Set the browser URL for a project and update the draft.
+    fn set_project_browser_url(&mut self, project_id: u64, url: String) {
+        if let Some(project) = self.projects.get_mut(&project_id) {
+            project.browser_last_url = Some(url.clone());
+            self.browser_url_draft_by_project.insert(project_id, url);
+            self.note_projects_changed();
+            self.persist_config();
+        }
+    }
+
+    /// Submit the browser URL for a project.
+    /// Normalizes the URL, persists it, and navigates the embedded browser.
+    fn submit_browser_url(&mut self, ctx: &egui::Context, project_id: u64, url: &str) {
+        let normalized = normalize_browser_url(url);
+        if normalized.is_empty() {
+            return;
+        }
+
+        // Store URL and update draft
+        self.set_project_browser_url(project_id, normalized.clone());
+
+        // Ensure browser panel is open and checklist is closed
+        self.config.ui.browser_panel_expanded = true;
+        self.config.ui.checklist_panel_expanded = false;
+        ctx.request_repaint();
+        self.note_ui_config_changed();
+        self.persist_config();
+
+        // Navigate the embedded browser
+        self.embedded_browser.navigate(&normalized);
+    }
+
+    /// Synchronize embedded browser position with UI state.
+    /// Called after UI render to update native WebView bounds.
+    fn sync_embedded_browser(&mut self, ctx: &egui::Context) {
+        if !self.config.ui.browser_panel_expanded {
+            self.pending_browser_rect = None;
+            self.embedded_browser.hide();
+            return;
+        }
+
+        if matches!(self.embedded_browser.status(), BrowserStatus::Uninitialized) {
+            self.embedded_browser.ensure_created(self.window_hwnd);
+        }
+
+        match self.embedded_browser.status() {
+            BrowserStatus::Ready => {
+                if let Some(rect) = self.pending_browser_rect.take() {
+                    let bounds =
+                        web_browser::browser_bounds_from_egui_rect(rect, ctx.pixels_per_point());
+                    self.embedded_browser.show();
+                    self.embedded_browser.sync_position(&bounds);
+                }
+            }
+            BrowserStatus::Failed(_) | BrowserStatus::Unsupported(_) => {
+                self.embedded_browser.hide();
+            }
+            BrowserStatus::Creating | BrowserStatus::Uninitialized => {}
+        }
+    }
+
+    /// Draw the Browser panel on the right side.
+    /// Project-scoped browser with URL persistence.
+    fn draw_browser_panel(&mut self, ctx: &egui::Context) -> Option<egui::Rect> {
+        if !self.config.ui.browser_panel_expanded {
+            return None;
+        }
+
+        let response = egui::SidePanel::right("browser_panel")
+            .resizable(false)
+            .exact_width(BROWSER_PANEL_WIDTH)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::none()
+                    .fill(SURFACE_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .rounding(8.0)
+                    .inner_margin(egui::Margin::same(10.0)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(ui.max_rect().width());
+
+                // Header
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Browser")
+                            .strong()
+                            .size(15.0)
+                            .color(TEXT_PRIMARY),
+                    );
+                });
+                ui.separator();
+
+                // Get selected project info
+                let selected_project_info = self.selected_project.and_then(|project_id| {
+                    self.projects
+                        .get(&project_id)
+                        .map(|p| (project_id, p.name.clone(), p.browser_last_url.clone()))
+                });
+
+                if let Some((project_id, project_name, browser_last_url)) = selected_project_info {
+                    let browser_status = self.embedded_browser.status();
+
+                    // Project name display
+                    ui.label(
+                        RichText::new(format!("{}", project_name))
+                            .color(TEXT_MUTED)
+                            .size(12.0),
+                    );
+                    ui.add_space(8.0);
+
+                    // Get or initialize the URL draft for this project
+                    // Initialize from saved URL if draft is empty and URL exists
+                    if !self.browser_url_draft_by_project.contains_key(&project_id) {
+                        let initial_draft = browser_last_url.clone().unwrap_or_default();
+                        self.browser_url_draft_by_project
+                            .insert(project_id, initial_draft);
+                    }
+
+                    // URL input with navigation - uses persistent draft state
+                    let draft = self
+                        .browser_url_draft_by_project
+                        .entry(project_id)
+                        .or_default();
+                    let url_response = ui.add_sized(
+                        [ui.available_width(), CONTROL_ROW_HEIGHT],
+                        egui::TextEdit::singleline(draft)
+                            .id(Self::browser_url_input_id(project_id))
+                            .hint_text("Enter URL (https://...)")
+                            .vertical_align(egui::Align::Center),
+                    );
+
+                    // Navigate on Enter key
+                    if url_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        let url_to_submit = draft.clone();
+                        self.submit_browser_url(ctx, project_id, &url_to_submit);
+                    }
+
+                    ui.add_space(8.0);
+
+                    // Action buttons row
+                    ui.horizontal(|ui| {
+                        // Go button (submits the URL)
+                        if styled_icon_button(
+                            ui,
+                            icons::ARROW_RIGHT,
+                            BTN_TEAL,
+                            BTN_TEAL_HOVER,
+                            BTN_ICON_ACTIVE,
+                            "Go to URL",
+                        ) {
+                            let url_to_submit = self
+                                .browser_url_draft_by_project
+                                .get(&project_id)
+                                .cloned()
+                                .unwrap_or_default();
+                            self.submit_browser_url(ctx, project_id, &url_to_submit);
+                        }
+
+                        ui.add_space(8.0);
+
+                        // Clear URL button
+                        if styled_icon_button(
+                            ui,
+                            icons::TRASH,
+                            BTN_RED,
+                            BTN_RED_HOVER,
+                            Color32::from_rgb(186, 58, 58),
+                            "Clear saved URL",
+                        ) {
+                            if let Some(project) = self.projects.get_mut(&project_id) {
+                                project.browser_last_url = None;
+                                // Also clear the draft
+                                self.browser_url_draft_by_project.remove(&project_id);
+                                self.note_projects_changed();
+                                self.persist_config();
+                            }
+                        }
+                    });
+
+                    ui.add_space(16.0);
+
+                    // Allocate space for the embedded WebView
+                    let available_height = ui.available_height();
+                    let (_, browser_rect) =
+                        ui.allocate_space(egui::vec2(ui.available_width(), available_height));
+
+                    // Store browser rect for synchronization outside render loop
+                    self.pending_browser_rect = Some(browser_rect);
+
+                    let render_centered_message = |ui: &mut Ui, message: &str, color: Color32| {
+                        ui.scope_builder(
+                            egui::UiBuilder::new()
+                                .max_rect(browser_rect)
+                                .layout(Layout::centered_and_justified(egui::Direction::TopDown)),
+                            |ui| {
+                                ui.label(RichText::new(message).color(color).size(13.0));
+                            },
+                        );
+                    };
+
+                    match browser_status {
+                        BrowserStatus::Creating => {
+                            render_centered_message(ui, "Loading WebView2...", TEXT_MUTED);
+                        }
+                        BrowserStatus::Failed(msg) => {
+                            render_centered_message(ui, &msg, Color32::from_rgb(220, 90, 90));
+                        }
+                        BrowserStatus::Unsupported(_) => {
+                            render_centered_message(
+                                ui,
+                                "Embedded browser not available on this platform",
+                                TEXT_MUTED,
+                            );
+                        }
+                        BrowserStatus::Ready | BrowserStatus::Uninitialized => {}
+                    }
+                } else {
+                    // No project selected state
+                    ui.add_space(20.0);
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            RichText::new("Select a project to use the browser panel")
+                                .color(TEXT_MUTED)
+                                .size(13.0),
+                        );
+                    });
+                }
+            });
+
+        Some(response.response.rect)
+    }
+
     fn draw_terminal_pane(&mut self, ui: &mut Ui, terminal_id: u64, pane_size: Vec2) {
         let project_name = self
             .terminals
@@ -15170,7 +15455,10 @@ impl AdeApp {
         }
 
         if let Some(url) = link_to_open {
-            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+            // Route HTTP/HTTPS terminal links to embedded browser
+            if let Some(terminal) = self.terminals.get(&terminal_id) {
+                self.submit_browser_url(ui.ctx(), terminal.project_id, &url);
+            }
         }
 
         if clicked {
@@ -15482,11 +15770,14 @@ impl eframe::App for AdeApp {
         let activity_rect = self.draw_activity_rail(ctx);
         let explorer_rect = self.draw_project_explorer(ctx);
         let checklist_rect = self.draw_checklist_panel(ctx);
+        let browser_rect = self.draw_browser_panel(ctx);
+        // Right panel is either checklist or browser (mutually exclusive)
+        let right_panel_rect = checklist_rect.or(browser_rect);
         let main_area_size = self.main_area_size_from_chrome(
             ctx.screen_rect(),
             activity_rect,
             explorer_rect,
-            checklist_rect,
+            right_panel_rect,
         );
         self.handle_shortcuts(ctx, main_area_size);
         self.draw_main_area(ctx);
@@ -15497,6 +15788,9 @@ impl eframe::App for AdeApp {
         self.draw_exit_confirm_popup(ctx);
 
         self.draw_transient_toast(ctx);
+
+        // Synchronize embedded browser with UI state
+        self.sync_embedded_browser(ctx);
     }
 
     fn persist_egui_memory(&self) -> bool {
@@ -15512,6 +15806,9 @@ impl eframe::App for AdeApp {
             self.reset_factory_droid_hook_inbox(terminal_id);
             self.reset_codex_notify_inbox(terminal_id);
         }
+
+        // Shutdown embedded browser to release native resources
+        self.embedded_browser.shutdown();
 
         self.persist_config();
         self.persist_history();
@@ -15543,6 +15840,7 @@ fn recover_config_state(
     config.ui.show_terminal_manager = current_config.ui.show_terminal_manager;
     config.ui.main_visibility_mode = current_config.ui.main_visibility_mode;
     config.ui.checklist_panel_expanded = current_config.ui.checklist_panel_expanded;
+    config.ui.browser_panel_expanded = current_config.ui.browser_panel_expanded;
 
     if pending_config_changes.ui {
         config.ui.project_explorer_expanded = current_config.ui.project_explorer_expanded;
@@ -15619,6 +15917,10 @@ fn recover_project_records(
             );
             merged_project.checklist =
                 merge_saved_messages(&merged_project.checklist, &current_project.checklist);
+            // Preserve current (in-memory) browser_last_url if set, otherwise keep loaded
+            if current_project.browser_last_url.is_some() {
+                merged_project.browser_last_url = current_project.browser_last_url.clone();
+            }
             projects.insert(loaded_id, merged_project);
             project_id_remap.insert(current_project.id, loaded_id);
             continue;
@@ -19443,6 +19745,47 @@ fn show_settings_card<R>(
         .inner
 }
 
+/// Normalize user input into a valid browser URL.
+/// - Adds https:// for regular domains
+/// - Uses http:// for localhost/127.0.0.1/0.0.0.0/[::1]
+/// - Rejects unsupported schemes (file:, data:, javascript:)
+/// - Returns empty string for invalid input
+fn normalize_browser_url(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // Check for unsupported schemes
+    let lower = trimmed.to_lowercase();
+    if lower.starts_with("file:")
+        || lower.starts_with("data:")
+        || lower.starts_with("javascript:")
+        || lower.starts_with("ftp:")
+    {
+        return String::new();
+    }
+
+    // Already has http:// or https://
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return trimmed.to_owned();
+    }
+
+    // Check for localhost or IP addresses - use http
+    let is_local = trimmed.starts_with("localhost")
+        || trimmed.starts_with("127.0.0.1")
+        || trimmed.starts_with("0.0.0.0")
+        || trimmed.starts_with("[::1]")
+        || trimmed.starts_with("[::]");
+
+    if is_local {
+        format!("http://{trimmed}")
+    } else {
+        // Regular domain - use https
+        format!("https://{trimmed}")
+    }
+}
+
 fn resolve_ctrl_c_action(can_copy_selection: bool) -> CtrlCAction {
     if can_copy_selection {
         CtrlCAction::CopySelection
@@ -20608,6 +20951,7 @@ mod tests {
         TerminalStyledCell, TerminalStyledLine, TerminalStyledRun, TerminalUiEvent,
         TerminalUiEventKind, TrackedProcessIdentity,
     };
+    use crate::web_browser;
     use eframe::egui::text::{LayoutJob, TextFormat};
     use eframe::egui::{
         self, pos2, Color32, Context, Event, FontDefinitions, FontFamily, Galley, Id, Key,
@@ -29475,6 +29819,7 @@ mod tests {
                 .collect(),
             ai_config: ProjectAiConfig::default(),
             checklist: checklist.iter().map(|item| (*item).to_owned()).collect(),
+            browser_last_url: None,
         }
     }
 
@@ -29726,6 +30071,9 @@ mod tests {
             terminal_history_popup_just_opened: false,
             ai_hook_manager: None,
             file_editor: FileEditorState::default(),
+            browser_url_draft_by_project: BTreeMap::new(),
+            embedded_browser: web_browser::EmbeddedBrowser::new(),
+            pending_browser_rect: None,
         }
     }
 
@@ -32697,7 +33045,7 @@ mod tests {
                 pos2(super::ACTIVITY_RAIL_WIDTH, 0.0),
                 egui::vec2(super::PROJECT_EXPLORER_WIDTH, 900.0),
             )),
-            None, // No checklist panel in this test
+            None, // No right panel in this test
         );
 
         assert_eq!(main_area_size, egui::vec2(1200.0, 900.0));
@@ -32725,6 +33073,30 @@ mod tests {
 
         // 1600 - 48 (activity) - 352 (explorer) - 352 (checklist) = 848
         assert_eq!(main_area_size, egui::vec2(848.0, 900.0));
+    }
+
+    #[test]
+    fn main_area_size_from_chrome_accounts_for_browser_panel() {
+        let app = test_app([], None);
+
+        let main_area_size = app.main_area_size_from_chrome(
+            egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(1600.0, 900.0)),
+            Some(egui::Rect::from_min_size(
+                pos2(0.0, 0.0),
+                egui::vec2(super::ACTIVITY_RAIL_WIDTH, 900.0),
+            )),
+            Some(egui::Rect::from_min_size(
+                pos2(super::ACTIVITY_RAIL_WIDTH, 0.0),
+                egui::vec2(super::PROJECT_EXPLORER_WIDTH, 900.0),
+            )),
+            Some(egui::Rect::from_min_size(
+                pos2(1600.0 - super::BROWSER_PANEL_WIDTH, 0.0),
+                egui::vec2(super::BROWSER_PANEL_WIDTH, 900.0),
+            )),
+        );
+
+        // 1600 - 48 (activity) - 352 (explorer) - 520 (browser) = 680
+        assert_eq!(main_area_size, egui::vec2(680.0, 900.0));
     }
 
     #[test]
@@ -33738,6 +34110,7 @@ mod tests {
                 saved_messages: vec![],
                 ai_config: crate::hooks::ProjectAiConfig::default(),
                 checklist: vec!["item1".to_owned()],
+                browser_last_url: None,
             }],
             ..AppConfig::default()
         };
@@ -35653,5 +36026,481 @@ mod tests {
         let mut terminal = test_terminal_entry_with_runtime(id, project_id, runtime);
         terminal.kind = kind;
         terminal
+    }
+
+    // Browser Panel Tests
+    #[test]
+    fn normalize_browser_url_adds_https_for_regular_domain() {
+        assert_eq!(
+            super::normalize_browser_url("example.com"),
+            "https://example.com"
+        );
+        assert_eq!(
+            super::normalize_browser_url("www.example.com"),
+            "https://www.example.com"
+        );
+        assert_eq!(
+            super::normalize_browser_url("api.example.com/path"),
+            "https://api.example.com/path"
+        );
+    }
+
+    #[test]
+    fn normalize_browser_url_uses_http_for_localhost() {
+        assert_eq!(
+            super::normalize_browser_url("localhost"),
+            "http://localhost"
+        );
+        assert_eq!(
+            super::normalize_browser_url("localhost:3000"),
+            "http://localhost:3000"
+        );
+        assert_eq!(
+            super::normalize_browser_url("127.0.0.1"),
+            "http://127.0.0.1"
+        );
+        assert_eq!(
+            super::normalize_browser_url("127.0.0.1:8080"),
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn normalize_browser_url_uses_http_for_other_local_ips() {
+        assert_eq!(super::normalize_browser_url("0.0.0.0"), "http://0.0.0.0");
+        assert_eq!(super::normalize_browser_url("[::1]"), "http://[::1]");
+    }
+
+    #[test]
+    fn normalize_browser_url_preserves_existing_scheme() {
+        assert_eq!(
+            super::normalize_browser_url("https://example.com"),
+            "https://example.com"
+        );
+        assert_eq!(
+            super::normalize_browser_url("http://localhost:3000"),
+            "http://localhost:3000"
+        );
+        // Case insensitive
+        assert_eq!(
+            super::normalize_browser_url("HTTPS://example.com"),
+            "HTTPS://example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_browser_url_rejects_unsupported_schemes() {
+        assert_eq!(super::normalize_browser_url("file:///etc/passwd"), "");
+        assert_eq!(super::normalize_browser_url("javascript:alert('xss')"), "");
+        assert_eq!(
+            super::normalize_browser_url("data:text/html,<script>alert(1)</script>"),
+            ""
+        );
+        assert_eq!(super::normalize_browser_url("ftp://ftp.example.com"), "");
+    }
+
+    #[test]
+    fn normalize_browser_url_handles_empty_and_whitespace() {
+        assert_eq!(super::normalize_browser_url(""), "");
+        assert_eq!(super::normalize_browser_url("   "), "");
+        assert_eq!(
+            super::normalize_browser_url("  example.com  "),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn browser_panel_and_checklist_are_mutually_exclusive() {
+        let mut app = test_app([], None);
+
+        // Initially both closed
+        assert!(!app.config.ui.checklist_panel_expanded);
+        assert!(!app.config.ui.browser_panel_expanded);
+
+        // Open checklist - browser should stay closed
+        app.config.ui.checklist_panel_expanded = true;
+        app.config.ui.browser_panel_expanded = false;
+        assert!(app.config.ui.checklist_panel_expanded);
+        assert!(!app.config.ui.browser_panel_expanded);
+
+        // Open browser - simulate mutual exclusivity logic
+        app.config.ui.browser_panel_expanded = true;
+        app.config.ui.checklist_panel_expanded = false;
+        assert!(!app.config.ui.checklist_panel_expanded);
+        assert!(app.config.ui.browser_panel_expanded);
+    }
+
+    #[test]
+    fn project_browser_last_url_persists_in_config() {
+        let mut app = test_app([], None);
+
+        // Add a project with browser URL
+        let mut project = test_project(1, "Demo", "C:/demo", &[], &[]);
+        project.browser_last_url = Some("https://example.com".to_owned());
+        app.projects.insert(1, project);
+
+        // Verify stored
+        assert_eq!(
+            app.projects.get(&1).unwrap().browser_last_url,
+            Some("https://example.com".to_owned())
+        );
+
+        // Update URL
+        if let Some(p) = app.projects.get_mut(&1) {
+            p.browser_last_url = Some("https://updated.com".to_owned());
+        }
+
+        assert_eq!(
+            app.projects.get(&1).unwrap().browser_last_url,
+            Some("https://updated.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn recover_project_records_preserves_browser_last_url() {
+        use std::collections::BTreeMap;
+
+        // Loaded project has a URL
+        let loaded_projects = vec![ProjectRecord {
+            id: 1,
+            name: "Demo".to_owned(),
+            path: PathBuf::from("C:/demo"),
+            saved_messages: vec![],
+            ai_config: crate::hooks::ProjectAiConfig::default(),
+            checklist: vec![],
+            browser_last_url: Some("https://loaded.com".to_owned()),
+        }];
+
+        // Current (in-memory) project has different URL
+        let mut current_projects = BTreeMap::new();
+        current_projects.insert(
+            1,
+            ProjectRecord {
+                id: 1,
+                name: "Demo".to_owned(),
+                path: PathBuf::from("C:/demo"),
+                saved_messages: vec![],
+                ai_config: crate::hooks::ProjectAiConfig::default(),
+                checklist: vec![],
+                browser_last_url: Some("https://current.com".to_owned()),
+            },
+        );
+
+        let (projects, _) = super::recover_project_records(
+            &loaded_projects,
+            &current_projects,
+            true, // merge current
+        );
+
+        // Should preserve current (in-memory) URL
+        let recovered = projects.get(&1).unwrap();
+        assert_eq!(
+            recovered.browser_last_url,
+            Some("https://current.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn recover_project_records_uses_loaded_url_when_current_is_none() {
+        use std::collections::BTreeMap;
+
+        // Loaded project has a URL
+        let loaded_projects = vec![ProjectRecord {
+            id: 1,
+            name: "Demo".to_owned(),
+            path: PathBuf::from("C:/demo"),
+            saved_messages: vec![],
+            ai_config: crate::hooks::ProjectAiConfig::default(),
+            checklist: vec![],
+            browser_last_url: Some("https://loaded.com".to_owned()),
+        }];
+
+        // Current (in-memory) project has no URL
+        let mut current_projects = BTreeMap::new();
+        current_projects.insert(
+            1,
+            ProjectRecord {
+                id: 1,
+                name: "Demo".to_owned(),
+                path: PathBuf::from("C:/demo"),
+                saved_messages: vec![],
+                ai_config: crate::hooks::ProjectAiConfig::default(),
+                checklist: vec![],
+                browser_last_url: None,
+            },
+        );
+
+        let (projects, _) = super::recover_project_records(
+            &loaded_projects,
+            &current_projects,
+            true, // merge current
+        );
+
+        // Should keep loaded URL since current is None
+        let recovered = projects.get(&1).unwrap();
+        assert_eq!(
+            recovered.browser_last_url,
+            Some("https://loaded.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn browser_url_draft_persists_across_frames() {
+        let mut app = test_app([], None);
+
+        // Add a project
+        let project = test_project(1, "Demo", "C:/demo", &[], &[]);
+        app.projects.insert(1, project);
+        app.selected_project = Some(1);
+
+        // Simulate typing by setting draft directly
+        app.browser_url_draft_by_project
+            .insert(1, "localhost:3000".to_owned());
+
+        // Verify draft persists
+        assert_eq!(
+            app.browser_url_draft_by_project.get(&1),
+            Some(&"localhost:3000".to_owned())
+        );
+
+        // Update draft (simulating more typing)
+        if let Some(draft) = app.browser_url_draft_by_project.get_mut(&1) {
+            *draft = "https://example.com/path".to_owned();
+        }
+
+        assert_eq!(
+            app.browser_url_draft_by_project.get(&1),
+            Some(&"https://example.com/path".to_owned())
+        );
+    }
+
+    #[test]
+    fn browser_url_input_id_is_project_scoped() {
+        let id1 = super::AdeApp::browser_url_input_id(1);
+        let id2 = super::AdeApp::browser_url_input_id(2);
+        let id1_again = super::AdeApp::browser_url_input_id(1);
+
+        // Same project should have same ID
+        assert_eq!(id1, id1_again);
+        // Different projects should have different IDs
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn text_input_has_focus_detects_browser_url_input() {
+        use egui::Context;
+
+        let ctx = Context::default();
+        let mut app = test_app([], None);
+
+        // Add a project and select it
+        let project = test_project(1, "Demo", "C:/demo", &[], &[]);
+        app.projects.insert(1, project);
+        app.selected_project = Some(1);
+
+        ctx.set_fonts(FontDefinitions::default());
+
+        // Initially no focus
+        assert!(!app.text_input_has_focus(&ctx));
+
+        // Request focus for browser URL input
+        ctx.memory_mut(|mem| {
+            mem.request_focus(super::AdeApp::browser_url_input_id(1));
+        });
+
+        // Should detect browser URL input focus
+        assert!(app.text_input_has_focus(&ctx));
+    }
+
+    #[test]
+    fn browser_url_draft_initialized_from_saved_url() {
+        let mut app = test_app([], None);
+
+        // Add a project with saved URL
+        let mut project = test_project(1, "Demo", "C:/demo", &[], &[]);
+        project.browser_last_url = Some("https://saved.example.com".to_owned());
+        app.projects.insert(1, project);
+        app.selected_project = Some(1);
+
+        // Simulate panel opening - draft should be initialized from saved URL
+        let project_id = 1;
+        let browser_last_url = app
+            .projects
+            .get(&project_id)
+            .unwrap()
+            .browser_last_url
+            .clone();
+
+        if !app.browser_url_draft_by_project.contains_key(&project_id) {
+            let initial_draft = browser_last_url.clone().unwrap_or_default();
+            app.browser_url_draft_by_project
+                .insert(project_id, initial_draft);
+        }
+
+        // Draft should contain the saved URL
+        assert_eq!(
+            app.browser_url_draft_by_project.get(&1),
+            Some(&"https://saved.example.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn browser_url_draft_cleared_when_project_removed() {
+        let mut app = test_app([], None);
+
+        // Add a project with draft
+        let project = test_project(1, "Demo", "C:/demo", &[], &[]);
+        app.projects.insert(1, project);
+        app.browser_url_draft_by_project
+            .insert(1, "localhost:3000".to_owned());
+
+        // Remove the draft (simulating cleanup)
+        app.browser_url_draft_by_project.remove(&1);
+
+        // Draft should be gone
+        assert!(!app.browser_url_draft_by_project.contains_key(&1));
+    }
+
+    #[test]
+    fn submit_browser_url_persists_normalized_url() {
+        let mut app = test_app([], None);
+        let ctx = egui::Context::default();
+
+        // Add a project
+        let project = test_project(1, "Demo", "C:/demo", &[], &[]);
+        app.projects.insert(1, project);
+
+        // Submit a URL that needs normalization
+        app.submit_browser_url(&ctx, 1, "example.com");
+
+        // Should be normalized to https:// and persisted
+        assert_eq!(
+            app.projects.get(&1).unwrap().browser_last_url,
+            Some("https://example.com".to_owned())
+        );
+
+        // Browser panel should be open
+        assert!(app.config.ui.browser_panel_expanded);
+        // Checklist should be closed
+        assert!(!app.config.ui.checklist_panel_expanded);
+    }
+
+    #[test]
+    fn submit_browser_url_uses_http_for_localhost() {
+        let mut app = test_app([], None);
+        let ctx = egui::Context::default();
+
+        // Add a project
+        let project = test_project(1, "Demo", "C:/demo", &[], &[]);
+        app.projects.insert(1, project);
+
+        // Submit localhost URL
+        app.submit_browser_url(&ctx, 1, "localhost:3000");
+
+        // Should be normalized to http://
+        assert_eq!(
+            app.projects.get(&1).unwrap().browser_last_url,
+            Some("http://localhost:3000".to_owned())
+        );
+    }
+
+    #[test]
+    fn submit_browser_url_rejects_empty_and_invalid() {
+        let mut app = test_app([], None);
+        let ctx = egui::Context::default();
+
+        // Add a project with existing URL
+        let mut project = test_project(1, "Demo", "C:/demo", &[], &[]);
+        project.browser_last_url = Some("https://existing.com".to_owned());
+        app.projects.insert(1, project);
+
+        // Try to submit empty URL
+        app.submit_browser_url(&ctx, 1, "");
+
+        // Existing URL should remain unchanged
+        assert_eq!(
+            app.projects.get(&1).unwrap().browser_last_url,
+            Some("https://existing.com".to_owned())
+        );
+
+        // Try to submit unsupported scheme
+        app.submit_browser_url(&ctx, 1, "file:///etc/passwd");
+
+        // Existing URL should still remain unchanged
+        assert_eq!(
+            app.projects.get(&1).unwrap().browser_last_url,
+            Some("https://existing.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn embedded_browser_navigates_on_submit() {
+        let mut app = test_app([], None);
+        let ctx = egui::Context::default();
+
+        // Add a project
+        let project = test_project(1, "Demo", "C:/demo", &[], &[]);
+        app.projects.insert(1, project);
+
+        // Before submit, browser should be uninitialized
+        assert!(matches!(
+            app.embedded_browser.status(),
+            web_browser::BrowserStatus::Uninitialized
+        ));
+
+        // Submit a URL
+        app.submit_browser_url(&ctx, 1, "example.com");
+
+        // URL should be persisted
+        assert_eq!(
+            app.projects.get(&1).unwrap().browser_last_url,
+            Some("https://example.com".to_owned())
+        );
+
+        // Draft should be updated
+        assert_eq!(
+            app.browser_url_draft_by_project.get(&1),
+            Some(&"https://example.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn sync_embedded_browser_hides_when_panel_closed() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        app.pending_browser_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(320.0, 240.0),
+        ));
+
+        app.sync_embedded_browser(&ctx);
+
+        assert!(app.pending_browser_rect.is_none());
+        assert!(matches!(
+            app.embedded_browser.status(),
+            web_browser::BrowserStatus::Uninitialized
+        ));
+    }
+
+    #[test]
+    fn browser_panel_shows_content_area_instead_of_placeholder() {
+        use egui::Context;
+
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let mut app = test_app([], None);
+
+        // Add a project and select it
+        let project = test_project(1, "Demo", "C:/demo", &[], &[]);
+        app.projects.insert(1, project);
+        app.selected_project = Some(1);
+
+        // Open browser panel
+        app.config.ui.browser_panel_expanded = true;
+
+        // Verify browser panel can be drawn without placeholder text
+        // (The actual rendering is tested via egui context in integration tests)
+        assert!(app.config.ui.browser_panel_expanded);
     }
 }

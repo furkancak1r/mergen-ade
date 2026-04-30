@@ -219,6 +219,7 @@ impl From<LegacyAppConfig> for AppConfig {
                     saved_messages: project.saved_messages,
                     ai_config: crate::hooks::ProjectAiConfig::default(),
                     checklist: Vec::new(),
+                    browser_last_url: None,
                 }
             })
             .collect();
@@ -482,6 +483,7 @@ default_shell = "powershell"
             saved_messages: vec!["msg1".to_owned()],
             ai_config: crate::hooks::ProjectAiConfig::default(),
             checklist: vec!["item1".to_owned(), "item2".to_owned()],
+            browser_last_url: None,
         });
 
         save_config(&path, &config).expect("should save config");

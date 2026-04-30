@@ -37,6 +37,7 @@ mod opencode_config;
 mod opencode_hook_service;
 mod terminal;
 mod title;
+mod web_browser;
 
 use eframe::egui;
 use eframe::icon_data;

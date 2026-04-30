@@ -187,3 +187,25 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Window close confirmation must not early-return before rendering.** When intercepting a close request (`ViewportCommand::CancelClose`), do not use `return` to exit the update function early. The confirmation popup should be rendered in the same frame by setting the state flag and allowing the normal render path to continue.
 - **Avoid `request_repaint()` after showing the confirmation popup.** Since the popup will be drawn later in the same update cycle by `draw_exit_confirm_popup()`, an explicit repaint request is unnecessary and can cause visual flicker.
 - **Popup overlay should use appropriate layer order.** Modal confirmation dialogs should render above the main UI surface; use `egui::Order::Foreground` or appropriate z-ordering for overlay backdrops to ensure the modal appears on top without obscuring the underlying content during the same-frame transition.
+
+## Embedded Browser Panel Guidelines
+- **Browser panel is a right-side project tool panel.** It must be mutually exclusive with the Check-list panel; only one right panel can be open at a time.
+- **Browser state is project-scoped.** Persist only `ProjectRecord::browser_last_url`; do not persist browsing history, cookies, or runtime state in Mergen config.
+- **Terminal links route to project browser.** When user clicks an `http://` or `https://` link in a terminal, it should open in that terminal's project browser panel rather than externally.
+- **URL input uses persistent draft state, not local variable.** Browser URL text input must use `browser_url_draft_by_project: BTreeMap<u64, String>` to persist typed text across frames. Never use a local `let mut url_input` variable that resets each frame.
+- **URL normalization is mandatory.** Use `normalize_browser_url()` to ensure all URLs have valid schemes. Allow only `http://` and `https://`; reject `file:`, `data:`, `javascript:`, and other unsupported schemes.
+- **Localhost detection uses http.** Automatically use `http://` for `localhost`, `127.0.0.1`, `0.0.0.0`, and `[::1]`; use `https://` for all other domains.
+- **Right panel width accounting.** Update `main_area_size_from_chrome()` to accept a generic `right_panel_rect` parameter that works for both Check-list and Browser panels.
+- **Activity rail toggle icon.** Use `icons::GLOBE` for the browser panel toggle button in the activity rail.
+- **Config recovery preserves browser state.** Ensure `recover_config_state()` preserves `browser_panel_expanded` and `recover_project_records()` preserves `browser_last_url` when merging.
+- **Add regression tests for browser behavior.** Test URL normalization (domain vs localhost, scheme handling, rejection of unsupported schemes), panel mutual exclusivity, URL draft persistence across frames, and config persistence.
+- **Platform-specific WebView2 integration.** Use `web_browser::EmbeddedBrowser` facade with target-gated implementation: Windows uses `webview2-com` + `windows` crates; non-Windows returns `BrowserStatus::Unsupported`.
+- **Browser bounds synchronization.** Call `sync_embedded_browser()` after UI render to update native WebView position using `browser_bounds_from_egui_rect()` for physical pixel conversion.
+- **Browser lifecycle management.** Initialize in `AdeApp::new()`, shutdown in `on_exit()`, and sync position via `pending_browser_rect` set during `draw_browser_panel()`.
+- **No placeholder text in browser panel.** The browser panel must render actual WebView content or a neutral empty state; never show placeholder text like "(Embedded browser coming...)".
+- **Browser panel navigation must be embedded-only.** Browser panel Go actions and terminal HTTP/HTTPS links must never call `ctx.open_url()` or launch the system/default browser. External browser behavior must not be exposed from the browser panel unless explicitly requested for a separate feature.
+- **WebView2 must be created before navigation.** `sync_embedded_browser()` must call `EmbeddedBrowser::ensure_created(window_hwnd)` when the browser panel is visible before syncing bounds or navigating pending URLs.
+- **WebView2 async creation must pump messages.** Do not block WebView2 environment/controller creation with raw `recv()`. Use `webview2_com::wait_with_pump()` or an equivalent UI-message-pumping wait so WebView2 callbacks can fire.
+- **Use WebView2 setter APIs for native state.** Use `ICoreWebView2Controller::SetBounds()` and `SetIsVisible()` for positioning/visibility. `Bounds()` and `IsVisible()` are getters and must not be used for sync.
+- **Browser hide must not depend on a fresh panel rect.** When `browser_panel_expanded` is false, hide the native WebView even if `pending_browser_rect` is `None`.
+- **Browser failures must be visible.** If WebView2 creation or navigation fails, render a clear in-panel error state instead of silently doing nothing or falling back to an external browser.
