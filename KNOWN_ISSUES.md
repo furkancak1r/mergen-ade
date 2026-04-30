@@ -58,6 +58,85 @@
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User screenshot/report showing selection starting near the bottom of a long SQL file and failing to scroll upward while dragging.
 
+#### File editor header buttons had low contrast {#file-editor-header-actions-low-contrast}
+- Date: 2026-04-29
+- Context: Editor header close/save/back/forward buttons visibility
+- Error signature: `Close Editor and Save File buttons hard to see on dark background`
+- Symptoms/Impact:
+  1. Editor header buttons (Close, Save, Back, Forward) were hard to see.
+  2. `styled_icon_button()` helper ignored background color parameters and only showed hover highlight.
+  3. Low contrast between button icons and dark surface background.
+- Root cause:
+  1. `styled_icon_button()` used transparent background for inactive state.
+  2. Button colors were not actually applied to the button background.
+  3. Icon colors had insufficient contrast on dark surfaces.
+- Resolution:
+  - Created new `editor_header_icon_button()` helper with always-visible background.
+  - Helper applies background color directly with `rect_filled()`.
+  - Uses high-contrast icon colors (white on colored backgrounds).
+  - Close button uses `BTN_RED` with white X icon.
+  - Save button uses `BTN_TEAL` when dirty, muted `BTN_SUBTLE` when clean.
+  - Back/Forward buttons use `BTN_ICON` when enabled, `BTN_SUBTLE` when disabled.
+  - Updated editor header to use new helper for all action buttons.
+- Prevent recurrence:
+  - Always use high-contrast button helpers for dark surface UI.
+  - Test button visibility on actual dark backgrounds.
+  - Do not rely on transparent-background buttons for important actions.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report that editor header buttons were hard to see.
+
+#### Could not switch from editor to terminal {#file-editor-terminal-switch-blocked}
+- Date: 2026-04-29
+- Context: Editor open and trying to switch to terminal view
+- Error signature: `Editor open but clicking on terminal doesn't switch views`
+- Symptoms/Impact:
+  1. When file editor was open, clicking on terminal in Terminal Manager did not switch to terminal view.
+  2. Main area remained showing editor even though a terminal was selected.
+  3. Only way to see terminal was to close the editor completely.
+- Root cause:
+  1. `draw_main_area()` checked `is_open()` which was true as long as a file was loaded.
+  2. No distinction between "editor has a file open" vs "editor is currently visible".
+  3. Terminal selection did not hide the editor.
+- Resolution:
+  - Added `visible` field to `FileEditorState` separate from `active` buffer.
+  - `is_visible()` returns true only when editor should be shown in main area.
+  - `is_open()` returns true when a file buffer exists (may be hidden).
+  - Added `hide()` method to hide editor while preserving buffer.
+  - Updated `draw_main_area()` to check `is_visible()` instead of `is_open()`.
+  - Updated `set_active_terminal()` to hide editor when selecting any terminal.
+  - Opening a file sets `visible = true`, switching to terminal calls `hide()`.
+- Prevent recurrence:
+  - Maintain separation between "has content" and "is displayed" states.
+  - Always hide editor when switching to terminal view.
+  - Test switching between editor and terminal views.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report that could not switch from editor to terminal view.
+
+#### OpenCode terminal mouse wheel was captured by runtime {#opencode-terminal-scrollback-selection-captured}
+- Date: 2026-04-29
+- Context: OpenCode running in terminal, trying to scroll Mergen scrollback
+- Error signature: `Mouse wheel in OpenCode terminal doesn't scroll Mergen, sends to OpenCode instead`
+- Symptoms/Impact:
+  1. When OpenCode was running in terminal, mouse wheel scrolled OpenCode's TUI instead of Mergen's scrollback.
+  2. Could not scroll up to see previous output while OpenCode was running.
+  3. Selection drag also sent wheel events to OpenCode instead of scrolling Mergen.
+- Root cause:
+  1. Mouse wheel handling checked `is_mouse_reporting_active()` and sent all wheel events to runtime.
+  2. No distinction between OpenCode (where Mergen scrollback should take priority) and other mouse-reporting apps.
+  3. Wheel delta was zeroed after sending to runtime, preventing Mergen scroll.
+- Resolution:
+  - Added check for `AiCliTool::OpenCode` in mouse wheel handling.
+  - For OpenCode: skip runtime wheel sending, allow Mergen `ScrollArea` to scroll.
+  - For selection drag active: also skip runtime wheel sending to allow scroll during selection.
+  - Only send wheel to runtime for non-OpenCode apps when mouse reporting is active.
+  - OpenCode scrollback now scrolls with wheel; selection drag also works.
+- Prevent recurrence:
+  - OpenCode terminal should always prioritize Mergen scrollback over runtime wheel events.
+  - Selection drag should disable runtime wheel capture across all tools.
+  - Test mouse wheel behavior with OpenCode running.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report that OpenCode terminal mouse wheel didn't scroll Mergen output.
+
 #### Deferred directory folders could stay as ellipsis after opening {#deferred-directory-ellipsis-stuck}
 - Date: 2026-04-29 (follow-up)
 - Context: Directory sidebar lazy subtree loading after shallow indexing

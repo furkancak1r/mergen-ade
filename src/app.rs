@@ -157,6 +157,8 @@ const FILE_EDITOR_MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// Input ID for file editor text area.
 const FILE_EDITOR_INPUT_ID: &str = "file-editor-input";
 const FILE_EDITOR_SCROLL_ID: &str = "file-editor-scroll";
+/// Header height for file editor - larger than terminal to fit text buttons.
+const FILE_EDITOR_HEADER_HEIGHT: f32 = 48.0;
 const SOURCE_CONTROL_PRIORITY_REFRESH_SECS: f64 = 5.0;
 const SOURCE_CONTROL_BACKGROUND_REFRESH_SECS: f64 = 20.0;
 const SOURCE_CONTROL_CHANNEL_CAPACITY: usize = 1;
@@ -1113,6 +1115,9 @@ struct FileEditorState {
     /// Whether text selection drag is currently active (for edge autoscroll).
     /// Runtime-only state; not persisted across sessions.
     selection_drag_active: bool,
+    /// Whether the editor is currently visible in the main area.
+    /// When false, the editor is hidden but the active buffer is preserved.
+    visible: bool,
 }
 
 impl Default for FileEditorState {
@@ -1123,12 +1128,14 @@ impl Default for FileEditorState {
             forward_stack: Vec::new(),
             max_history: 20,
             selection_drag_active: false,
+            visible: false,
         }
     }
 }
 
 impl FileEditorState {
     /// Open a new file, pushing current to back stack if present.
+    /// The editor becomes visible when a file is opened.
     fn open_file(&mut self, buffer: OpenFileBuffer) {
         // Clear forward stack when opening a new file
         self.forward_stack.clear();
@@ -1138,8 +1145,9 @@ impl FileEditorState {
             self.push_to_back_stack(current);
         }
 
-        // Set new buffer as active
+        // Set new buffer as active and make visible
         self.active = Some(buffer);
+        self.visible = true;
 
         // Reset selection drag state when opening a new file
         self.selection_drag_active = false;
@@ -1185,11 +1193,24 @@ impl FileEditorState {
         self.back_stack.clear();
         self.forward_stack.clear();
         self.selection_drag_active = false;
+        self.visible = false;
+    }
+
+    /// Hide the editor (preserves active buffer for later restore).
+    /// The file remains open but the editor is not shown in the main area.
+    fn hide(&mut self) {
+        self.visible = false;
+        self.selection_drag_active = false;
     }
 
     /// Check if editor has an active file.
     fn is_open(&self) -> bool {
         self.active.is_some()
+    }
+
+    /// Check if editor is currently visible in the main area.
+    fn is_visible(&self) -> bool {
+        self.visible && self.active.is_some()
     }
 
     /// Check if there are files in back stack.
@@ -9573,6 +9594,13 @@ impl AdeApp {
     }
 
     fn set_active_terminal(&mut self, ctx: &egui::Context, terminal_id: Option<u64>) {
+        // Hide file editor when selecting a terminal (allows switching from editor to terminal)
+        // This runs even if the same terminal is already active, to handle the case where
+        // the editor is visible and user clicks on the active terminal in Terminal Manager.
+        if terminal_id.is_some() && self.file_editor.is_visible() {
+            self.file_editor.hide();
+        }
+
         if self.active_terminal == terminal_id {
             if let Some(terminal_id) = terminal_id {
                 self.acknowledge_terminal_attention(terminal_id);
@@ -13528,8 +13556,10 @@ impl AdeApp {
     }
 
     fn draw_main_area(&mut self, ctx: &egui::Context) {
-        // Check if file editor is active - if so, show editor instead of terminals
-        if self.file_editor.is_open() {
+        // Check if file editor is visible - if so, show editor instead of terminals.
+        // Note: editor can be "open" (has active buffer) but not "visible"
+        // when user switches to a terminal.
+        if self.file_editor.is_visible() {
             self.draw_file_editor(ctx);
             return;
         }
@@ -13639,13 +13669,7 @@ impl AdeApp {
             return;
         }
 
-        // Extract data we need before borrowing
-        let can_go_back = self.file_editor.can_go_back();
-        let can_go_forward = self.file_editor.can_go_forward();
-
         // Collect UI interaction requests during rendering
-        let mut navigate_back = false;
-        let mut navigate_forward = false;
         let mut close_editor = false;
         let mut save_file = false;
 
@@ -13655,137 +13679,78 @@ impl AdeApp {
                 let available = ui.available_size();
 
                 // Get buffer data for rendering
-                let (project_name, display_name, is_dirty, _has_error, error_msg) =
+                let (is_dirty, _has_error, error_msg) =
                     if let Some(buffer) = &self.file_editor.active {
-                        let project_name = self
-                            .projects
-                            .get(&buffer.project_id)
-                            .map(|p| p.name.clone())
-                            .unwrap_or_else(|| "Unknown Project".to_owned());
                         (
-                            project_name,
-                            buffer.display_name.clone(),
                             buffer.is_dirty(),
                             buffer.last_error.is_some(),
                             buffer.last_error.clone(),
                         )
                     } else {
-                        ("".to_owned(), "".to_owned(), false, false, None)
+                        (false, false, None)
                     };
 
-                // Header
-                let header_height = TERMINAL_HEADER_HEIGHT;
+                // Simplified header: only Save and Close buttons, right-aligned in fixed-height area
+                let header_height = FILE_EDITOR_HEADER_HEIGHT;
+                // Shift left by 8px for better alignment with window title bar X button
+                let header_width = (available.x - 8.0).max(100.0);
                 let header_rect = egui::Rect::from_min_size(
                     ui.cursor().min,
-                    egui::vec2(available.x, header_height),
+                    egui::vec2(header_width, header_height),
                 );
 
+                // Allocate fixed height for header
+                let header_response = ui.allocate_rect(header_rect, egui::Sense::hover());
                 let mut header_ui = ui.new_child(
                     egui::UiBuilder::new()
-                        .max_rect(header_rect)
-                        .layout(Layout::left_to_right(Align::Center)),
+                        .max_rect(header_response.rect)
+                        .layout(Layout::right_to_left(Align::Center)),
                 );
 
-                header_ui.set_min_size(egui::vec2(available.x, header_height));
+                // Minimal header with small icon-only buttons (like toolbar buttons)
+                header_ui.scope(|ui| {
+                    ui.style_mut().spacing.button_padding = egui::vec2(4.0, 4.0);
 
-                egui::Frame::none()
-                    .fill(SURFACE_BG)
-                    .stroke(Stroke::new(1.0, BORDER_COLOR))
-                    .rounding(8.0)
-                    .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-                    .show(&mut header_ui, |ui| {
-                        ui.set_min_height(header_height - 12.0);
+                    // Close button - small icon-only
+                    let close_btn = egui::Button::new(
+                        RichText::new(format!("{}", icons::X)).size(16.0).color(TEXT_PRIMARY)
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::NONE)
+                    .rounding(4.0)
+                    .min_size(egui::vec2(28.0, 28.0));
 
-                        // Back button
-                        ui.add_enabled_ui(can_go_back, |ui| {
-                            if styled_icon_button(
-                                ui,
-                                icons::ARROW_LEFT,
-                                if can_go_back { BTN_ICON } else { BTN_SUBTLE },
-                                if can_go_back { BTN_ICON_HOVER } else { BTN_SUBTLE_HOVER },
-                                if can_go_back { BTN_ICON_ACTIVE } else { BTN_SUBTLE },
-                                "Previous File",
-                            ) {
-                                navigate_back = true;
-                            }
-                        });
+                    let close_response = ui.add(close_btn).on_hover_text("Close Editor");
+                    if close_response.clicked() {
+                        close_editor = true;
+                    }
 
-                        // Forward button
-                        ui.add_enabled_ui(can_go_forward, |ui| {
-                            if styled_icon_button(
-                                ui,
-                                icons::ARROW_RIGHT,
-                                if can_go_forward { BTN_ICON } else { BTN_SUBTLE },
-                                if can_go_forward { BTN_ICON_HOVER } else { BTN_SUBTLE_HOVER },
-                                if can_go_forward { BTN_ICON_ACTIVE } else { BTN_SUBTLE },
-                                "Next File",
-                            ) {
-                                navigate_forward = true;
-                            }
-                        });
+                    ui.add_space(4.0);
 
-                        ui.add_space(8.0);
+                    // Save button - small icon-only
+                    let can_save = is_dirty;
+                    let save_icon_color = if can_save { TEXT_PRIMARY } else { TEXT_MUTED };
+                    let save_btn = egui::Button::new(
+                        RichText::new(format!("{}", icons::CHECK_CIRCLE)).size(16.0).color(save_icon_color)
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::NONE)
+                    .rounding(4.0)
+                    .min_size(egui::vec2(28.0, 28.0));
 
-                        // File icon and name
-                        ui.label(RichText::new(format!("{}  ", icons::CODE)).size(16.0));
-                        let title_text = if is_dirty {
-                            format!("{} *", display_name)
-                        } else {
-                            display_name
-                        };
-                        ui.label(
-                            RichText::new(title_text)
-                                .strong()
-                                .size(14.0)
-                                .color(if is_dirty { ACCENT } else { TEXT_PRIMARY }),
-                        );
-
-                        ui.add_space(8.0);
-
-                        // Project label
-                        ui.label(
-                            RichText::new(format!("{}  {}", icons::FOLDER, project_name))
-                                .size(12.0)
-                                .color(TEXT_MUTED),
-                        );
-
-                        // Spacer to push buttons to the right
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            // Close button
-                            if styled_icon_button(
-                                ui,
-                                icons::X,
-                                BTN_RED,
-                                BTN_RED_HOVER,
-                                Color32::from_rgb(186, 58, 58),
-                                "Close Editor",
-                            ) {
-                                close_editor = true;
-                            }
-
-                            ui.add_space(8.0);
-
-                            // Save button (only enabled if dirty)
-                            let can_save = is_dirty;
-                            ui.add_enabled_ui(can_save, |ui| {
-                                if styled_icon_button(
-                                    ui,
-                                    icons::CHECK_CIRCLE,
-                                    if can_save { BTN_TEAL } else { BTN_SUBTLE },
-                                    if can_save { BTN_TEAL_HOVER } else { BTN_SUBTLE_HOVER },
-                                    if can_save { BTN_ICON_ACTIVE } else { BTN_SUBTLE },
-                                    "Save File",
-                                ) {
-                                    save_file = true;
-                                }
-                            });
-                        });
+                    ui.add_enabled_ui(can_save, |ui| {
+                        let save_response = ui.add(save_btn)
+                            .on_hover_text(if can_save { "Save File (Ctrl+S)" } else { "No unsaved changes" });
+                        if save_response.clicked() {
+                            save_file = true;
+                        }
                     });
+                });
 
                 ui.add_space(TERMINAL_HEADER_GAP);
 
-                // Editor body
-                let editor_height = (available.y - header_height - TERMINAL_HEADER_GAP).max(100.0);
+                // Editor body - uses FILE_EDITOR_HEADER_HEIGHT for calculation
+                let editor_height = (available.y - FILE_EDITOR_HEADER_HEIGHT - TERMINAL_HEADER_GAP).max(100.0);
                 let editor_rect = egui::Rect::from_min_size(
                     ui.cursor().min,
                     egui::vec2(available.x, editor_height),
@@ -13898,12 +13863,6 @@ impl AdeApp {
             });
 
         // Process deferred UI actions after rendering is complete
-        if navigate_back {
-            self.navigate_editor_back();
-        }
-        if navigate_forward {
-            self.navigate_editor_forward();
-        }
         if save_file {
             self.save_current_file();
         }
@@ -14669,7 +14628,16 @@ impl AdeApp {
                                 if rect.contains(pointer_pos) {
                                     let mouse_reporting_active =
                                         terminal.runtime.is_mouse_reporting_active();
-                                    if mouse_reporting_active {
+                                    // For OpenCode: Mergen scrollback takes priority over runtime wheel
+                                    // For other mouse-reporting apps: send wheel to runtime as before
+                                    let is_opencode = terminal
+                                        .ai_session
+                                        .tool
+                                        == Some(AiCliTool::OpenCode);
+                                    let is_selection_drag = terminal.selection_drag_active;
+
+                                    if mouse_reporting_active && !is_opencode && !is_selection_drag
+                                    {
                                         let direction = if wheel_delta.y > 0.0 {
                                             WheelDirection::Up
                                         } else if wheel_delta.y < 0.0 {
@@ -14696,6 +14664,8 @@ impl AdeApp {
                                             input.smooth_scroll_delta = Vec2::ZERO;
                                         });
                                     } else {
+                                        // OpenCode: allow Mergen scrollback to work
+                                        // Selection drag: don't interrupt with runtime wheel
                                         detach_terminal_prompt_scroll_anchor_on_manual_scroll(
                                             terminal,
                                         );
@@ -18093,6 +18063,50 @@ fn styled_icon_button(
         format!("{icon}"),
         egui::FontId::proportional(15.0),
         icon_color,
+    );
+
+    response.clicked()
+}
+
+/// Draws an icon button specifically for the editor header with high contrast.
+/// Unlike `styled_icon_button`, this helper always shows a visible background
+/// and uses high-contrast colors suitable for dark surfaces.
+fn editor_header_icon_button(
+    ui: &mut Ui,
+    icon: AppIcon,
+    bg: Color32,
+    hover_bg: Color32,
+    icon_color: Color32,
+    tooltip: &str,
+) -> bool {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT),
+        Sense::click(),
+    );
+    let response = response
+        .on_hover_text(tooltip)
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    // Always show a visible background (not transparent when inactive)
+    let bg_color = if response.hovered() {
+        hover_bg
+    } else {
+        bg
+    };
+    ui.painter().rect_filled(rect.shrink(2.0), 6.0, bg_color);
+
+    // Icon color: use provided high-contrast color
+    let final_icon_color = if response.is_pointer_button_down_on() {
+        Color32::from_rgb(255, 255, 255)
+    } else {
+        icon_color
+    };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        format!("{icon}"),
+        egui::FontId::proportional(15.0),
+        final_icon_color,
     );
 
     response.clicked()
@@ -33387,6 +33401,112 @@ mod tests {
         // Far from edge
         let fast = selection_edge_autoscroll_speed(100.0, line_height);
         assert!(fast <= line_height * 8.0, "Maximum speed should be 8x line_height");
+    }
+
+    #[test]
+    fn file_editor_open_file_sets_visible() {
+        // Regression test: opening a file should make the editor visible
+        use super::OpenFileBuffer;
+        use std::path::PathBuf;
+
+        let mut editor_state = super::FileEditorState::default();
+        assert!(!editor_state.is_visible());
+
+        let buffer = OpenFileBuffer::new(
+            1,
+            PathBuf::from("/test/file.rs"),
+            "content".to_owned(),
+            "file.rs".to_owned(),
+        );
+        editor_state.open_file(buffer);
+
+        assert!(
+            editor_state.is_visible(),
+            "Editor should be visible after opening a file"
+        );
+        assert!(editor_state.is_open());
+    }
+
+    #[test]
+    fn file_editor_hide_preserves_active_buffer() {
+        // Regression test: hiding editor should preserve the active buffer
+        use super::OpenFileBuffer;
+        use std::path::PathBuf;
+
+        let mut editor_state = super::FileEditorState::default();
+
+        let buffer = OpenFileBuffer::new(
+            1,
+            PathBuf::from("/test/file.rs"),
+            "content".to_owned(),
+            "file.rs".to_owned(),
+        );
+        editor_state.open_file(buffer);
+
+        // Hide the editor
+        editor_state.hide();
+
+        assert!(
+            !editor_state.is_visible(),
+            "Editor should not be visible after hide"
+        );
+        assert!(
+            editor_state.is_open(),
+            "Editor should still have an active buffer after hide"
+        );
+    }
+
+    #[test]
+    fn file_editor_close_clears_visibility_and_buffer() {
+        // Regression test: closing editor should clear both visibility and buffer
+        use super::OpenFileBuffer;
+        use std::path::PathBuf;
+
+        let mut editor_state = super::FileEditorState::default();
+
+        let buffer = OpenFileBuffer::new(
+            1,
+            PathBuf::from("/test/file.rs"),
+            "content".to_owned(),
+            "file.rs".to_owned(),
+        );
+        editor_state.open_file(buffer);
+        assert!(editor_state.is_visible());
+        assert!(editor_state.is_open());
+
+        // Close the editor
+        editor_state.close();
+
+        assert!(
+            !editor_state.is_visible(),
+            "Editor should not be visible after close"
+        );
+        assert!(!editor_state.is_open(), "Editor should not have active buffer after close");
+    }
+
+    #[test]
+    fn file_editor_close_clears_selection_drag_state() {
+        // Regression test: closing editor should clear drag state
+        use super::OpenFileBuffer;
+        use std::path::PathBuf;
+
+        let mut editor_state = super::FileEditorState::default();
+
+        let buffer = OpenFileBuffer::new(
+            1,
+            PathBuf::from("/test/file.rs"),
+            "content".to_owned(),
+            "file.rs".to_owned(),
+        );
+        editor_state.open_file(buffer);
+        editor_state.selection_drag_active = true;
+
+        editor_state.close();
+
+        assert!(
+            !editor_state.selection_drag_active,
+            "Selection drag should be reset when closing editor"
+        );
     }
 
     #[test]

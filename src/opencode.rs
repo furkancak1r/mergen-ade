@@ -124,11 +124,19 @@ pub fn opencode_notify_inbox_path_for_dir(
     dir.join(format!("opencode-{terminal_id}-{inbox_token}.jsonl"))
 }
 
+/// Environment variable name for forcing OpenCode to use a specific binary.
+/// Used to workaround AVX2 segfault by pointing to baseline binary.
+pub const OPENCODE_BIN_PATH_ENV_VAR: &str = "OPENCODE_BIN_PATH";
+
 pub fn opencode_env_pairs(
     terminal_id: u64,
     inbox_dir: &Path,
     inbox_token: &str,
-) -> [(String, OsString); 4] {
+) -> [(String, OsString); 5] {
+    // Determine the baseline OpenCode binary path to avoid AVX2 segfault
+    // The baseline binary works on all CPUs without AVX2 requirements
+    let opencode_baseline_path = opencode_baseline_binary_path();
+
     [
         (
             MERGEN_TERMINAL_ID_ENV_VAR.to_owned(),
@@ -146,7 +154,39 @@ pub fn opencode_env_pairs(
             MERGEN_ADE_OPENCODE_INBOX_TOKEN_ENV_VAR.to_owned(),
             OsString::from(inbox_token),
         ),
+        (
+            OPENCODE_BIN_PATH_ENV_VAR.to_owned(),
+            opencode_baseline_path,
+        ),
     ]
+}
+
+/// Returns the path to the baseline OpenCode binary.
+/// This binary works on all CPUs without AVX2 requirements.
+/// The path is determined based on the npm global installation location.
+fn opencode_baseline_binary_path() -> OsString {
+    // Default path based on standard npm global installation
+    let default_path = PathBuf::from(
+        std::env::var("APPDATA")
+            .as_deref()
+            .unwrap_or("C:\\Users\\Default\\AppData\\Roaming"),
+    )
+    .join("npm")
+    .join("node_modules")
+    .join("opencode-ai")
+    .join("node_modules")
+    .join("opencode-windows-x64-baseline")
+    .join("bin")
+    .join("opencode.exe");
+
+    // If OPENCODE_BIN_PATH is already set externally, use that
+    if let Ok(existing) = std::env::var(OPENCODE_BIN_PATH_ENV_VAR) {
+        if !existing.is_empty() {
+            return OsString::from(existing);
+        }
+    }
+
+    OsString::from(default_path)
 }
 
 pub fn write_opencode_notify_event(

@@ -126,6 +126,11 @@ If `cargo` is not on PATH in PowerShell, use:
 - Use `input.pointer.interact_pos()` as the pointer fallback for file editor drag autoscroll; do not rely only on `TextEdit` hover state.
 - Use shared `selection_edge_autoscroll_delta()` helper for consistent edge autoscroll behavior across terminal and file editor.
 - Add regression tests for file editor selection drag state transitions and edge autoscroll delta behavior.
+- Editor header buttons must use high-contrast `editor_header_icon_button()` helper to ensure visibility against dark surfaces.
+- Editor has separate "open" (has active buffer) and "visible" (shown in main area) states.
+- Use `FileEditorState::is_visible()` for main area rendering, `is_open()` for buffer existence checks.
+- Call `FileEditorState::hide()` when switching to terminal; call `close()` when truly closing.
+- `set_active_terminal()` must hide the editor before early-return checks to ensure terminal click always switches from editor.
 
 ## Terminal Input & History Invariants
 - `pending_line_for_title` is for title/AI command detection only; it clears on newlines (\r or \n) since titles should reflect only the current logical line. This buffer is capped to `TERMINAL_PENDING_LINE_MAX_CHARS` (512) to prevent unbounded growth.
