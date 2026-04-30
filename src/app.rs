@@ -1060,6 +1060,8 @@ pub struct AdeApp {
     directory_index_generation: BTreeMap<u64, u64>,
     /// Tracks which subtrees are currently loading per project (for deduplication).
     directory_index_subtree_loading_by_project: BTreeMap<u64, BTreeSet<PathBuf>>,
+    /// Cache for visible directory search results per project to keep result list stable.
+    directory_search_result_cache_by_project: BTreeMap<u64, DirectorySearchResultCache>,
     // Terminal input history
     history_path: PathBuf,
     input_history: AppHistory,
@@ -2189,6 +2191,42 @@ enum DirectoryIndexEvent {
         partial_warning: Option<String>,
         truncation: DirectoryIndexTruncationFlags,
     },
+}
+
+/// Visible paths in a directory search result set.
+/// Used to maintain stable search results while background loading continues.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DirectorySearchVisiblePaths {
+    directories: BTreeSet<PathBuf>,
+    files: BTreeSet<PathBuf>,
+    /// Directories whose own names match the query (allowed to auto-hydrate descendants).
+    self_matching_directories: BTreeSet<PathBuf>,
+}
+
+impl DirectorySearchVisiblePaths {
+    fn has_results(&self) -> bool {
+        !self.directories.is_empty() || !self.files.is_empty()
+    }
+
+    fn contains_updates_not_in(&self, other: &Self) -> bool {
+        !self.directories.is_subset(&other.directories) || !self.files.is_subset(&other.files)
+    }
+
+    fn merge_from(&mut self, other: &Self) {
+        self.directories.extend(other.directories.iter().cloned());
+        self.files.extend(other.files.iter().cloned());
+        self.self_matching_directories
+            .extend(other.self_matching_directories.iter().cloned());
+    }
+}
+
+/// Cache for directory search results to keep visible results stable.
+/// Query changes reset the cache; explicit user action updates visible results.
+#[derive(Debug, Clone)]
+struct DirectorySearchResultCache {
+    query: String,
+    visible_paths: DirectorySearchVisiblePaths,
+    pending_visible_paths: Option<DirectorySearchVisiblePaths>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -3357,6 +3395,7 @@ impl AdeApp {
             directory_tree_has_collapsed_cache_by_project: BTreeMap::new(),
             directory_index_generation: BTreeMap::new(),
             directory_index_subtree_loading_by_project: BTreeMap::new(),
+            directory_search_result_cache_by_project: BTreeMap::new(),
             history_path,
             input_history,
             input_history_search_query: String::new(),
@@ -3578,6 +3617,8 @@ impl AdeApp {
         self.directory_index_state.remove(&project_id);
         self.directory_index_generation.remove(&project_id);
         self.directory_tree_has_collapsed_cache_by_project
+            .remove(&project_id);
+        self.directory_search_result_cache_by_project
             .remove(&project_id);
         self.saved_message_drafts.remove(&project_id);
         self.directory_pending_tree_open_state_by_project
@@ -7747,6 +7788,12 @@ impl AdeApp {
 
         if !force && self.directory_index_state.contains_key(&project_id) {
             return;
+        }
+
+        // Clear search result cache on full refresh since directory contents may have changed
+        if force {
+            self.directory_search_result_cache_by_project
+                .remove(&project_id);
         }
 
         let generation = self
@@ -12644,6 +12691,82 @@ impl AdeApp {
                                                 }
                                             }
 
+                                            // Manage search result cache: clear on query change, use cached results when available
+                                            let now = ui.ctx().input(|input| input.time);
+                                            if let Some(query) = search_query.as_deref() {
+                                                // Check if query changed and clear cache if so
+                                                if self.directory_search_result_cache_by_project
+                                                    .get(&project_id)
+                                                    .is_some_and(|cache| cache.query != query)
+                                                {
+                                                    self.directory_search_result_cache_by_project
+                                                        .remove(&project_id);
+                                                }
+                                            } else {
+                                                // Clear cache when not searching
+                                                self.directory_search_result_cache_by_project
+                                                    .remove(&project_id);
+                                            }
+
+                                            // Compute current visible paths from snapshot
+                                            let current_visible_paths = search_query
+                                                .as_deref()
+                                                .map(|query| collect_directory_search_visible_paths(&snapshot.root, query));
+
+                                            // Check for cache and manage updates
+                                            let has_cached_results = self
+                                                .directory_search_result_cache_by_project
+                                                .get(&project_id)
+                                                .is_some_and(|cache| cache.visible_paths.has_results());
+
+                                            // If no cache but we have results, create cache
+                                            if !has_cached_results {
+                                                if let Some(ref visible) = current_visible_paths {
+                                                    if visible.has_results() {
+                                                        if let Some(query) = search_query.clone() {
+                                                            self.directory_search_result_cache_by_project
+                                                                .insert(project_id, DirectorySearchResultCache {
+                                                                    query,
+                                                                    visible_paths: visible.clone(),
+                                                                    pending_visible_paths: None,
+                                                                });
+                                                        }
+                                                    }
+                                                }
+                                            } else if let Some(ref current) = current_visible_paths {
+                                                // Cache exists: split updates into auto-merge vs pending
+                                                let cache = self
+                                                    .directory_search_result_cache_by_project
+                                                    .get(&project_id)
+                                                    .expect("cache exists");
+                                                let (auto_visible, pending) = split_directory_search_updates(
+                                                    current,
+                                                    &cache.visible_paths,
+                                                );
+                                                // Auto-merge descendants under cached self-matching directories
+                                                if let Some(auto) = auto_visible {
+                                                    let cache_mut = self
+                                                        .directory_search_result_cache_by_project
+                                                        .get_mut(&project_id)
+                                                        .expect("cache exists");
+                                                    cache_mut.visible_paths.merge_from(&auto);
+                                                }
+                                                // Store non-auto updates as pending for explicit "Update results"
+                                                if let Some(pending_updates) = pending {
+                                                    let cache_mut = self
+                                                        .directory_search_result_cache_by_project
+                                                        .get_mut(&project_id)
+                                                        .expect("cache exists");
+                                                    cache_mut.pending_visible_paths = Some(pending_updates);
+                                                }
+                                            }
+
+                                            // Get the cached visible paths for rendering (stable results)
+                                            let search_visible_paths: Option<&DirectorySearchVisiblePaths> = self
+                                                .directory_search_result_cache_by_project
+                                                .get(&project_id)
+                                                .map(|cache| &cache.visible_paths);
+
                                             let (has_results, folder_state_changed, deferred_to_load, file_to_open) =
                                                 draw_folder_tree(
                                                 ui,
@@ -12654,6 +12777,7 @@ impl AdeApp {
                                                 search_query
                                                     .as_deref()
                                                     .map(|_| &matching_directories),
+                                                search_visible_paths,
                                             );
 
                                             if folder_state_changed {
@@ -12737,6 +12861,41 @@ impl AdeApp {
                                                 );
                                                 // Request repaint to continue searching as results arrive
                                                 ui.ctx().request_repaint_after(Duration::from_millis(50));
+                                            }
+
+                                            // Show "Update results" button when new matches are available
+                                            // Place this below the tree (not above) to avoid shifting rows during click
+                                            if search_query.is_some() {
+                                                let has_pending_results = self
+                                                    .directory_search_result_cache_by_project
+                                                    .get(&project_id)
+                                                    .and_then(|cache| cache.pending_visible_paths.as_ref())
+                                                    .is_some();
+                                                if has_pending_results {
+                                                    ui.add_space(8.0);
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(
+                                                            RichText::new("New results found")
+                                                                .color(TEXT_MUTED)
+                                                                .small(),
+                                                        );
+                                                        if ui
+                                                            .button(RichText::new("Update results").small().strong())
+                                                            .clicked()
+                                                        {
+                                                            // Apply pending results to visible set
+                                                            if let Some(cache) = self
+                                                                .directory_search_result_cache_by_project
+                                                                .get_mut(&project_id)
+                                                            {
+                                                                if let Some(pending) = cache.pending_visible_paths.take() {
+                                                                    cache.visible_paths = pending;
+                                                                }
+                                                            }
+                                                            self.status_line = "Updated directory search results".to_owned();
+                                                        }
+                                                    });
+                                                }
                                             }
                                         }
                                     }
@@ -16809,6 +16968,7 @@ fn draw_folder_tree(
     search_query: Option<&str>,
     force_show_all_descendants: bool,
     matching_directories: Option<&HashSet<PathBuf>>,
+    search_visible_paths: Option<&DirectorySearchVisiblePaths>,
 ) -> (bool, bool, Vec<PathBuf>, Option<PathBuf>) {
     let mut rendered_any = false;
     let mut folder_state_changed = false;
@@ -16819,9 +16979,15 @@ fn draw_folder_tree(
         let item_matches = search_query.is_some_and(|query| item_name_lower.contains(query));
 
         if item.is_dir {
-            let should_show_dir = match search_query {
-                Some(_) => matching_directories.is_some_and(|dirs| dirs.contains(&item.path)),
-                None => true,
+            // When search_visible_paths is provided, use it to filter directories
+            // This keeps the visible result set stable during background loading
+            let should_show_dir = if let Some(visible) = search_visible_paths {
+                visible.directories.contains(&item.path)
+            } else {
+                match search_query {
+                    Some(_) => matching_directories.is_some_and(|dirs| dirs.contains(&item.path)),
+                    None => true,
+                }
             };
             if !should_show_dir {
                 continue;
@@ -16840,9 +17006,10 @@ fn draw_folder_tree(
             let previous_open_state = search_active.then(|| header_state.is_open());
 
             // Check if deferred directory is expanded and needs loading
-            // During search, folders are shown expanded if they match or contain matches
+            // Visible cached deferred folders must still hydrate; hidden background results stay pending
             let is_expanded = header_state.is_open();
             let is_rendered_expanded = is_expanded || search_active;
+            // Queue deferred loads for visible folders (cached or not) to allow hydration
             if item.is_deferred && is_rendered_expanded {
                 deferred_to_load.push(item.path.clone());
             }
@@ -16862,6 +17029,7 @@ fn draw_folder_tree(
                             search_query,
                             show_all_descendants,
                             matching_directories,
+                            search_visible_paths,
                         );
                     folder_state_changed |= child_state_changed;
                     deferred_to_load.extend(child_deferred);
@@ -16916,9 +17084,15 @@ fn draw_folder_tree(
                 });
             });
         } else {
-            let should_show_file = match search_query {
-                Some(_) => item.is_placeholder || force_show_all_descendants || item_matches,
-                None => true,
+            // When search_visible_paths is provided, only show files in the cache
+            // This keeps the visible result set stable during background loading
+            let should_show_file = if let Some(visible) = search_visible_paths {
+                visible.files.contains(&item.path)
+            } else {
+                match search_query {
+                    Some(_) => item.is_placeholder || force_show_all_descendants || item_matches,
+                    None => true,
+                }
             };
             if !should_show_file {
                 continue;
@@ -17076,6 +17250,166 @@ fn directory_search_should_load_deferred(query: &str, now: f64, changed_at: f64)
         return false;
     }
     directory_search_query_stable(now, changed_at)
+}
+
+/// Returns true if `path` is a descendant of `parent` (but not equal to it).
+fn path_is_descendant_of(path: &Path, parent: &Path) -> bool {
+    path != parent && path.starts_with(parent)
+}
+
+/// Splits new search results into auto-merge vs pending updates.
+///
+/// Auto-merge: descendants under cached self-matching directories are merged immediately.
+/// Pending: new matches outside cached self-matching directories require explicit "Update results".
+fn split_directory_search_updates(
+    current: &DirectorySearchVisiblePaths,
+    cached: &DirectorySearchVisiblePaths,
+) -> (
+    Option<DirectorySearchVisiblePaths>,
+    Option<DirectorySearchVisiblePaths>,
+) {
+    let mut auto_visible = DirectorySearchVisiblePaths::default();
+    let mut pending = DirectorySearchVisiblePaths::default();
+
+    // Check directories
+    for dir in &current.directories {
+        if !cached.directories.contains(dir) {
+            // New directory: auto-merge if under cached self-matching dir, else pending
+            let under_self_matching = cached
+                .self_matching_directories
+                .iter()
+                .any(|parent| path_is_descendant_of(dir, parent));
+            if under_self_matching {
+                auto_visible.directories.insert(dir.clone());
+            } else {
+                pending.directories.insert(dir.clone());
+            }
+        }
+    }
+
+    // Check files
+    for file in &current.files {
+        if !cached.files.contains(file) {
+            // New file: auto-merge if under cached self-matching dir, else pending
+            let under_self_matching = cached
+                .self_matching_directories
+                .iter()
+                .any(|parent| path_is_descendant_of(file, parent));
+            if under_self_matching {
+                auto_visible.files.insert(file.clone());
+            } else {
+                pending.files.insert(file.clone());
+            }
+        }
+    }
+
+    // Copy self-matching directories from current for future auto-merge checks
+    for self_match in &current.self_matching_directories {
+        if !cached.self_matching_directories.contains(self_match) {
+            // New self-matching dir: if under cached self-matching, auto-merge; else pending
+            let under_cached_self_matching = cached
+                .self_matching_directories
+                .iter()
+                .any(|parent| path_is_descendant_of(self_match, parent));
+            if under_cached_self_matching {
+                auto_visible
+                    .self_matching_directories
+                    .insert(self_match.clone());
+            } else {
+                pending.self_matching_directories.insert(self_match.clone());
+            }
+        }
+    }
+
+    (
+        if auto_visible.has_results() {
+            Some(auto_visible)
+        } else {
+            None
+        },
+        if pending.has_results() || !pending.self_matching_directories.is_empty() {
+            Some(pending)
+        } else {
+            None
+        },
+    )
+}
+
+/// Collects visible directories and files for a directory search result.
+/// This captures the current state of what should be shown in the search results,
+/// independent of future snapshot mutations from background loading.
+///
+/// Visibility rules:
+/// - A directory is visible if it contains any matching descendant OR its own name matches.
+/// - A file is visible if its own name matches the query.
+/// - Descendants are only auto-shown under directories whose OWN names match the query
+///   (not under directories that are merely visible because they contain a match).
+fn collect_directory_search_visible_paths(
+    root: &DirectoryNode,
+    query: &str,
+) -> DirectorySearchVisiblePaths {
+    let lower_query = query.to_lowercase();
+    let mut result = DirectorySearchVisiblePaths::default();
+    let mut matching_directories: HashSet<PathBuf> = HashSet::new();
+
+    // First pass: find all directories that contain matches (including parent paths)
+    collect_matching_directory_paths(root, &lower_query, true, &mut matching_directories);
+
+    // Second pass: collect visible directories and files
+    // A directory is visible if it's in matching_directories
+    // A file is visible if its name matches the query
+    // Descendants are auto-shown only under directories whose OWN names match
+    fn collect_visible_recursive(
+        node: &DirectoryNode,
+        query: &str,
+        matching_dirs: &HashSet<PathBuf>,
+        parent_forces_descendants: bool,
+        result: &mut DirectorySearchVisiblePaths,
+    ) {
+        let name_matches = node.name.to_lowercase().contains(query);
+
+        if node.is_dir {
+            // Directory is visible if it's in matching directories
+            let dir_visible = matching_dirs.contains(&node.path);
+            if dir_visible {
+                result.directories.insert(node.path.clone());
+            }
+            // Track directories whose own names match (allowed to auto-hydrate descendants)
+            if name_matches {
+                result.self_matching_directories.insert(node.path.clone());
+            }
+            // Recurse to collect visible children
+            // Only force-show descendants if this directory's own name matches
+            let this_forces_descendants = name_matches;
+            let child_forces_descendants = parent_forces_descendants || this_forces_descendants;
+            for child in &node.children {
+                collect_visible_recursive(
+                    child,
+                    query,
+                    matching_dirs,
+                    child_forces_descendants,
+                    result,
+                );
+            }
+        } else {
+            // File is visible if name matches OR parent forces descendants
+            // (parent only forces descendants if parent's own name matched)
+            let file_visible = name_matches || parent_forces_descendants;
+            if file_visible {
+                result.files.insert(node.path.clone());
+            }
+        }
+    }
+
+    collect_visible_recursive(
+        root,
+        &lower_query,
+        &matching_directories,
+        false,
+        &mut result,
+    );
+
+    result
 }
 
 fn apply_directory_tree_open_state(ctx: &egui::Context, root: &DirectoryNode, open: bool) {
@@ -29466,6 +29800,7 @@ mod tests {
             directory_tree_has_collapsed_cache_by_project: BTreeMap::new(),
             directory_index_generation: BTreeMap::new(),
             directory_index_subtree_loading_by_project: BTreeMap::new(),
+            directory_search_result_cache_by_project: BTreeMap::new(),
             checklist_collapsed_by_project: BTreeMap::new(),
             history_path: PathBuf::new(),
             input_history: AppHistory::default(),
@@ -30479,6 +30814,7 @@ mod tests {
                     search_query,
                     false,
                     Some(&matching_dirs),
+                    None, // No cached visible paths for this test
                 );
                 deferred_to_load_result = Some(deferred_to_load);
             });
@@ -30729,6 +31065,234 @@ mod tests {
         assert!(
             directory_search_should_load_deferred("search", now, fully_stable),
             "Stable query past debounce should trigger deferred loading"
+        );
+    }
+
+    #[test]
+    fn directory_search_visible_paths_distinguishes_parent_visibility_from_self_match() {
+        // Regression test: A parent directory shown because it contains a matching file
+        // should NOT make unrelated sibling files visible
+        use super::{collect_directory_search_visible_paths, DirectoryNode};
+        use std::path::PathBuf;
+
+        // Create a src folder with user.rs and main.rs (unrelated sibling)
+        let user_rs = DirectoryNode {
+            name: "user.rs".to_owned(),
+            path: PathBuf::from("/project/src/user.rs"),
+            is_dir: false,
+            is_placeholder: false,
+            is_deferred: false,
+            children: vec![],
+        };
+        let main_rs = DirectoryNode {
+            name: "main.rs".to_owned(),
+            path: PathBuf::from("/project/src/main.rs"),
+            is_dir: false,
+            is_placeholder: false,
+            is_deferred: false,
+            children: vec![],
+        };
+        let src = DirectoryNode {
+            name: "src".to_owned(),
+            path: PathBuf::from("/project/src"),
+            is_dir: true,
+            is_placeholder: false,
+            is_deferred: false,
+            children: vec![user_rs, main_rs],
+        };
+        let root = DirectoryNode {
+            name: "project".to_owned(),
+            path: PathBuf::from("/project"),
+            is_dir: true,
+            is_placeholder: false,
+            is_deferred: false,
+            children: vec![src],
+        };
+
+        let visible = collect_directory_search_visible_paths(&root, "user");
+
+        // src is visible because it contains the match
+        assert!(
+            visible.directories.contains(&PathBuf::from("/project/src")),
+            "Parent directory containing match should be visible"
+        );
+        // user.rs is visible because it matches
+        assert!(
+            visible
+                .files
+                .contains(&PathBuf::from("/project/src/user.rs")),
+            "Matching file should be visible"
+        );
+        // main.rs is NOT visible (sibling of match, not forced by parent's visibility)
+        assert!(
+            !visible.files.contains(&PathBuf::from("/project/src/main.rs")),
+            "Unmatched sibling file should not be visible when parent is visible due to containing a match"
+        );
+    }
+
+    #[test]
+    fn directory_search_visible_paths_marks_self_matching_directory() {
+        // Regression test: Searching for a folder name should mark it as self-matching
+        use super::{collect_directory_search_visible_paths, DirectoryNode};
+        use std::path::PathBuf;
+
+        // Create a migrations folder
+        let migrations_001 = DirectoryNode {
+            name: "001.sql".to_owned(),
+            path: PathBuf::from("/project/migrations/001.sql"),
+            is_dir: false,
+            is_placeholder: false,
+            is_deferred: false,
+            children: vec![],
+        };
+        let migrations = DirectoryNode {
+            name: "migrations".to_owned(),
+            path: PathBuf::from("/project/migrations"),
+            is_dir: true,
+            is_placeholder: false,
+            is_deferred: false,
+            children: vec![migrations_001],
+        };
+        let root = DirectoryNode {
+            name: "project".to_owned(),
+            path: PathBuf::from("/project"),
+            is_dir: true,
+            is_placeholder: false,
+            is_deferred: false,
+            children: vec![migrations],
+        };
+
+        let visible = collect_directory_search_visible_paths(&root, "migrations");
+
+        // migrations is visible and self-matching
+        assert!(
+            visible
+                .directories
+                .contains(&PathBuf::from("/project/migrations")),
+            "Self-matching directory should be in directories"
+        );
+        assert!(
+            visible
+                .self_matching_directories
+                .contains(&PathBuf::from("/project/migrations")),
+            "Self-matching directory should be in self_matching_directories"
+        );
+    }
+
+    #[test]
+    fn path_is_descendant_of_detects_child_paths() {
+        use super::path_is_descendant_of;
+        use std::path::PathBuf;
+
+        let parent = PathBuf::from("/project/migrations");
+        let child = PathBuf::from("/project/migrations/001.sql");
+        let sibling = PathBuf::from("/project/database");
+        let same = PathBuf::from("/project/migrations");
+
+        assert!(
+            path_is_descendant_of(&child, &parent),
+            "Child path should be detected as descendant"
+        );
+        assert!(
+            !path_is_descendant_of(&sibling, &parent),
+            "Sibling path should not be descendant"
+        );
+        assert!(
+            !path_is_descendant_of(&same, &parent),
+            "Same path should not be descendant of itself"
+        );
+    }
+
+    #[test]
+    fn split_directory_search_updates_auto_merges_under_self_matching() {
+        use super::{split_directory_search_updates, DirectorySearchVisiblePaths};
+        use std::path::PathBuf;
+
+        // Cached state: migrations folder is visible and self-matching
+        let mut cached = DirectorySearchVisiblePaths::default();
+        cached
+            .directories
+            .insert(PathBuf::from("/project/migrations"));
+        cached
+            .self_matching_directories
+            .insert(PathBuf::from("/project/migrations"));
+
+        // New state: migrations/001.sql discovered under cached self-matching folder
+        let mut current = DirectorySearchVisiblePaths::default();
+        current
+            .directories
+            .insert(PathBuf::from("/project/migrations"));
+        current
+            .files
+            .insert(PathBuf::from("/project/migrations/001.sql"));
+        current
+            .self_matching_directories
+            .insert(PathBuf::from("/project/migrations"));
+
+        let (auto, pending) = split_directory_search_updates(&current, &cached);
+
+        // The new file should auto-merge because it's under cached self-matching folder
+        assert!(
+            auto.is_some(),
+            "Auto-merge should exist for descendants under self-matching folder"
+        );
+        let auto_visible = auto.unwrap();
+        assert!(
+            auto_visible
+                .files
+                .contains(&PathBuf::from("/project/migrations/001.sql")),
+            "New file under self-matching folder should auto-merge"
+        );
+        // No pending updates
+        assert!(
+            pending.is_none(),
+            "No pending updates when all new items auto-merge"
+        );
+    }
+
+    #[test]
+    fn split_directory_search_updates_pends_external_matches() {
+        use super::{split_directory_search_updates, DirectorySearchVisiblePaths};
+        use std::path::PathBuf;
+
+        // Cached state: migrations folder is visible
+        let mut cached = DirectorySearchVisiblePaths::default();
+        cached
+            .directories
+            .insert(PathBuf::from("/project/migrations"));
+        cached
+            .self_matching_directories
+            .insert(PathBuf::from("/project/migrations"));
+
+        // New state: database/migrations discovered outside cached folder
+        let mut current = DirectorySearchVisiblePaths::default();
+        current
+            .directories
+            .insert(PathBuf::from("/project/migrations"));
+        current
+            .directories
+            .insert(PathBuf::from("/project/database/migrations"));
+        current
+            .self_matching_directories
+            .insert(PathBuf::from("/project/migrations"));
+        current
+            .self_matching_directories
+            .insert(PathBuf::from("/project/database/migrations"));
+
+        let (auto, pending) = split_directory_search_updates(&current, &cached);
+
+        // The new external folder should be pending, not auto-merged
+        assert!(
+            auto.is_none(),
+            "No auto-merge for items outside cached self-matching folders"
+        );
+        assert!(pending.is_some(), "External match should be pending");
+        let pending_visible = pending.unwrap();
+        assert!(
+            pending_visible
+                .directories
+                .contains(&PathBuf::from("/project/database/migrations")),
+            "External folder should be in pending, not auto-merged"
         );
     }
 
@@ -34878,7 +35442,10 @@ mod tests {
 
         // The helper checks for Event::Copy and Ctrl+C/Command+C fallback
         // Real copy detection requires egui context which is not available in unit tests
-        assert!(true, "file_editor_copy_requested helper exists with correct signature");
+        assert!(
+            true,
+            "file_editor_copy_requested helper exists with correct signature"
+        );
     }
 
     #[test]

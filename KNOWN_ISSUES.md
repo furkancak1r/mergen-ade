@@ -27,6 +27,75 @@
   - Document that `TextEdit` may consume shortcuts and generate events rather than pass raw keys.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
 
+#### Directory search results now stable while background loading continues {#directory-search-results-stable-during-background-load}
+- Date: 2026-04-30
+- Context: Directory sidebar search UX - result list stability
+- Error signature: `Search result list changes while user is trying to click a result`
+- Symptoms/Impact:
+  1. User types a directory search query and visible results appear.
+  2. Background deferred subtree loading continues to find more matches.
+  3. As subtree results arrive, the rendered search tree changes automatically.
+  4. Rows can shift, expand, disappear, or reorder while the user is moving the mouse.
+  5. Clicking a result becomes unreliable because the intended row may move before click release.
+- Root cause:
+  1. Directory search render uses live snapshot-derived `matching_directories` every frame.
+  2. Search-triggered deferred loads continue after visible results exist.
+  3. `process_directory_index_events()` applies subtree updates and requests repaint immediately.
+  4. No stable visible result cache exists between query changes.
+  5. Newly discovered matches are inserted into the visible tree automatically, causing row shifts.
+- Resolution:
+  - Added `DirectorySearchVisiblePaths` struct to capture visible directories and files for a query.
+  - Added `DirectorySearchResultCache` struct with `query`, `visible_paths`, and `pending_visible_paths` fields.
+  - Added `directory_search_result_cache_by_project: BTreeMap<u64, DirectorySearchResultCache>` to `AdeApp` state.
+  - Added `collect_directory_search_visible_paths()` helper to compute visible paths from snapshot.
+  - Cache is cleared when: query changes, project is removed, or directory index is force-refreshed.
+  - Cache is created when first visible results are found for a query.
+  - `draw_folder_tree()` now accepts `search_visible_paths` parameter to filter results from cache.
+  - Modified `draw_directory_panel()` to use cached paths for rendering, keeping list stable.
+  - Background subtree loading continues, but newly discovered matches are stored as `pending_visible_paths`.
+  - Added "Update results" button below the tree (not above) when pending results exist:
+    - Shows "New results found" label with "Update results" button.
+    - Clicking applies pending results to visible set explicitly.
+    - Button placement below tree avoids shifting existing rows during click.
+  - Hidden/background deferred loading does not mutate the cached visible result list directly; visible cached deferred folders still queue lazy subtree loads so matching folder contents can hydrate.
+- Prevent recurrence:
+  - Search result rows must remain stable after first visible results.
+  - Never add dynamic search status/update rows above the result tree.
+  - Cache visible paths and only mutate list on explicit user action or query change.
+  - Test background subtree result arrival while a cached search result set is rendered.
+  - Test query-change cache reset and explicit update-results behavior.
+- Files/Commands touched: `src/app.rs` (`DirectorySearchVisiblePaths`, `DirectorySearchResultCache`, `collect_directory_search_visible_paths`, `draw_folder_tree` signature, `draw_directory_panel` cache management), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+
+#### Directory search cached folder results did not hydrate deferred children {#directory-search-cached-folder-results-did-not-hydrate}
+- Date: 2026-04-30
+- Context: Directory sidebar search with stable cached results and deferred subtree loading
+- Error signature: `Searching migrations shows the folder but does not load its contents`
+- Symptoms/Impact:
+  1. User searches for a folder name such as `migrations`.
+  2. Directory search finds and displays the matching folder.
+  3. The folder is deferred, but its children are not loaded while cached search results are active.
+  4. User sees the folder but cannot see or open files inside it from the search result.
+- Root cause:
+  1. Stable search cache rendering passed `search_visible_paths` into `draw_folder_tree()`.
+  2. `draw_folder_tree()` skipped deferred subtree queueing whenever `search_visible_paths` was present.
+  3. This preserved row stability but also blocked visible deferred folders from hydrating.
+  4. `collect_directory_search_visible_paths()` also conflated directory visibility with own-name matches, so parent directories could force-show unrelated descendants.
+  5. New subtree results under a visible folder were treated as pending updates instead of being merged into the visible cached folder contents.
+- Resolution:
+  - Allow visible cached deferred folders to queue `DirectoryScanMode::LazySubtree`.
+  - Keep hidden/background deferred search loading separate from visible cached folder hydration.
+  - Track directories whose own names match the query in `DirectorySearchVisiblePaths::self_matching_directories`.
+  - Auto-merge newly loaded descendants under cached self-matching directories.
+  - Keep newly discovered matches outside visible self-matching directories pending until explicit `Update results`.
+  - Fix visible path collection so parent directories shown for matching files do not force-show unrelated sibling files.
+- Prevent recurrence:
+  - Test cached visible deferred folders queue lazy subtree loads.
+  - Test folder-name search auto-hydrates children after subtree load.
+  - Test file-name search does not reveal unmatched siblings.
+  - Test hidden/background matches still require explicit update.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test --release --target x86_64-pc-windows-msvc`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report that searching `migrations` finds the folder but does not load its contents.
+
 #### Directory search performance improved with debounce and adaptive loading {#directory-search-debounce-adaptive-loading}
 - Date: 2026-04-30
 - Context: Directory sidebar search with deferred indexing - performance optimization
