@@ -27,6 +27,37 @@
   - Document that `TextEdit` may consume shortcuts and generate events rather than pass raw keys.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
 
+#### Window close confirmation popup caused visual flicker/refresh {#window-close-confirmation-popup-flicker}
+- Date: 2026-04-30
+- Context: Application exit confirmation dialog UX
+- Error signature: `Clicking X to close app shows popup but screen appears to refresh/blink`
+- Symptoms/Impact:
+  1. User clicks the window close button (X) to exit the application.
+  2. The exit confirmation popup appears, but there's a noticeable visual flicker.
+  3. The underlying UI appears to "refresh" or disappear momentarily before the popup is shown.
+  4. This creates a jarring user experience, making the app feel less polished.
+- Root cause:
+  1. When intercepting the close request, the code used `ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose)` to prevent the window from closing.
+  2. Then it set `self.show_exit_confirm_popup = true` to show the confirmation dialog.
+  3. The code then called `ctx.request_repaint()` and immediately returned with `return`, exiting the `update()` function early.
+  4. Because of the early return, the normal UI rendering path was skipped for that frame.
+  5. The main window content was not drawn, creating a blank/black frame.
+  6. On the next frame (triggered by `request_repaint()`), the full UI was drawn again along with the popup.
+  7. This one-frame gap created the "refresh" visual artifact.
+- Resolution:
+  - Removed the `return` statement after intercepting the close request.
+  - Removed the `ctx.request_repaint()` call as it became unnecessary.
+  - The `show_exit_confirm_popup = true` state is now set, but the function continues to render normally.
+  - The `draw_exit_confirm_popup()` call later in the same `update()` function now renders the popup in the same frame.
+  - The popup overlay with `egui::Order::Background` renders on top of the already-drawn UI.
+  - The visual flicker is eliminated because there's no gap frame where the UI is missing.
+- Prevent recurrence:
+  - Never use early `return` when intercepting window events that require UI feedback.
+  - Always allow the normal render path to complete when showing modal dialogs.
+  - Modal overlays should be drawn in the same frame after setting their visibility state.
+  - Test window close behavior visually to confirm no flicker occurs.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test --release --target x86_64-pc-windows-msvc`, `cargo build --release --target x86_64-pc-windows-msvc`
+
 #### Directory search required manual Update results for newly discovered matches {#directory-search-required-manual-update-results}
 - Date: 2026-04-30
 - Context: Directory sidebar search with deferred background loading

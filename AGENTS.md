@@ -182,3 +182,8 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Windows batch confirmation prompt detection**: On Windows PowerShell/CMD shells, after sending `Ctrl+C`, check the latest runtime snapshot for `Terminate batch job (Y/N)?` on the last non-empty line. If detected, send automatic `y\r` confirmation, wait for `PENDING_RERUN_BATCH_CONFIRM_SETTLE_MS`, then replay the command.
 - **Internal confirmation input must not be recorded**: The automatic `y` sent to confirm batch termination is internal control input and must never be added to `recent_inputs` or persisted history.
 - **Do not interpolate GitHub contexts directly**: In workflow `run:` steps, use environment variables instead of direct `${{ github.ref_name }}` interpolation to avoid shell injection risks (per Semgrep findings).
+
+## Window Close Confirmation Guidelines
+- **Window close confirmation must not early-return before rendering.** When intercepting a close request (`ViewportCommand::CancelClose`), do not use `return` to exit the update function early. The confirmation popup should be rendered in the same frame by setting the state flag and allowing the normal render path to continue.
+- **Avoid `request_repaint()` after showing the confirmation popup.** Since the popup will be drawn later in the same update cycle by `draw_exit_confirm_popup()`, an explicit repaint request is unnecessary and can cause visual flicker.
+- **Popup overlay should use appropriate layer order.** Modal confirmation dialogs should render above the main UI surface; use `egui::Order::Foreground` or appropriate z-ordering for overlay backdrops to ensure the modal appears on top without obscuring the underlying content during the same-frame transition.

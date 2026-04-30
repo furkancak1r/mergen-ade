@@ -15434,11 +15434,10 @@ impl eframe::App for AdeApp {
                 // User confirmed - allow close to proceed, reset flag
                 self.allow_confirmed_close = false;
             } else {
-                // Cancel the close and show confirmation popup
+                // Cancel the close and show confirmation popup in the same frame
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.show_exit_confirm_popup = true;
-                ctx.request_repaint();
-                return;
+                // Continue rendering - popup will be drawn by draw_exit_confirm_popup()
             }
         }
 
