@@ -41,6 +41,8 @@ pub struct EmbeddedBrowser {
     status: BrowserStatus,
     event_sender: Sender<BrowserEvent>,
     event_receiver: Receiver<BrowserEvent>,
+    /// Last requested visibility state (for testability and state tracking)
+    requested_visible: bool,
     #[cfg(target_os = "windows")]
     inner: Option<WindowsWebView>,
     #[cfg(target_os = "windows")]
@@ -60,6 +62,7 @@ impl EmbeddedBrowser {
             status: BrowserStatus::Uninitialized,
             event_sender,
             event_receiver,
+            requested_visible: false,
             #[cfg(target_os = "windows")]
             inner: None,
             #[cfg(target_os = "windows")]
@@ -95,10 +98,11 @@ impl EmbeddedBrowser {
         let result = create_webview_sync(hwnd, self.event_sender.clone());
 
         match result {
-            Ok((controller, webview)) => {
+            Ok((controller, webview, source_changed_token)) => {
                 self.inner = Some(WindowsWebView {
                     controller,
                     webview,
+                    source_changed_token: Some(source_changed_token),
                 });
                 self.status = BrowserStatus::Ready;
                 log::info!("WebView2 created successfully");
@@ -185,6 +189,7 @@ impl EmbeddedBrowser {
 
     /// Set the visibility of the browser view.
     pub fn set_visible(&mut self, visible: bool) {
+        self.requested_visible = visible;
         #[cfg(target_os = "windows")]
         {
             if self.inner.is_some() {
@@ -336,12 +341,24 @@ impl EmbeddedBrowser {
     pub fn shutdown(&mut self) {
         #[cfg(target_os = "windows")]
         {
-            if let Some(_inner) = self.inner.take() {
-                // Controller and webview are dropped automatically
+            if let Some(inner) = self.inner.take() {
+                // Remove SourceChanged event handler before dropping WebView
+                if let Some(token) = inner.source_changed_token {
+                    unsafe {
+                        let _ = inner.webview.remove_SourceChanged(token);
+                    }
+                }
                 log::info!("WebView2 resources released");
             }
         }
         self.status = BrowserStatus::Uninitialized;
+        self.requested_visible = false;
+    }
+
+    /// Get the last requested visibility state (for testing).
+    #[cfg(test)]
+    pub fn requested_visible(&self) -> bool {
+        self.requested_visible
     }
 }
 
@@ -375,18 +392,43 @@ pub fn browser_bounds_from_egui_rect(rect: egui::Rect, pixels_per_point: f32) ->
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     CreateCoreWebView2Environment, ICoreWebView2, ICoreWebView2Controller,
 };
+#[cfg(target_os = "windows")]
+use webview2_com::SourceChangedEventHandler;
+#[cfg(target_os = "windows")]
+use windows::Win32::System::WinRT::EventRegistrationToken;
 
 #[cfg(target_os = "windows")]
 struct WindowsWebView {
     controller: ICoreWebView2Controller,
     webview: ICoreWebView2,
+    source_changed_token: Option<EventRegistrationToken>,
+}
+
+#[cfg(target_os = "windows")]
+fn current_webview_source(webview: &ICoreWebView2) -> windows::core::Result<String> {
+    use webview2_com::take_pwstr;
+    use windows::core::PWSTR;
+
+    let mut source_ptr = PWSTR::null();
+    unsafe {
+        webview.Source(&mut source_ptr)?;
+    }
+    // take_pwstr converts the COM-allocated PWSTR to String and frees it
+    Ok(take_pwstr(source_ptr))
 }
 
 #[cfg(target_os = "windows")]
 fn create_webview_sync(
     parent_hwnd: windows::Win32::Foundation::HWND,
-    _event_sender: Sender<BrowserEvent>,
-) -> Result<(ICoreWebView2Controller, ICoreWebView2), Box<dyn std::error::Error>> {
+    event_sender: Sender<BrowserEvent>,
+) -> Result<
+    (
+        ICoreWebView2Controller,
+        ICoreWebView2,
+        EventRegistrationToken,
+    ),
+    Box<dyn std::error::Error>,
+> {
     use std::sync::mpsc;
     use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment;
     use webview2_com::{
@@ -471,8 +513,36 @@ fn create_webview_sync(
     let (controller, webview) = webview2_com::wait_with_pump(ctrl_rx)
         .map_err(|e| std::io::Error::other(e.to_string()))??;
 
+    // Register SourceChanged event handler to emit BrowserEvent::UrlChanged
+    let source_sender = event_sender.clone();
+    let source_changed_handler =
+        SourceChangedEventHandler::create(Box::new(move |webview, _args| {
+            if let Some(webview) = webview {
+                match current_webview_source(&webview) {
+                    Ok(url) if !url.is_empty() => {
+                        let _ = source_sender.send(BrowserEvent::UrlChanged(url));
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        let _ = source_sender.send(BrowserEvent::Error(format!(
+                            "WebView2 source read failed: {:?}",
+                            err
+                        )));
+                    }
+                }
+            }
+            Ok(())
+        }));
+
+    let mut source_changed_token = EventRegistrationToken::default();
+    unsafe {
+        webview
+            .add_SourceChanged(&source_changed_handler, &mut source_changed_token)
+            .map_err(|e| format!("Failed to register WebView2 SourceChanged handler: {:?}", e))?;
+    }
+
     log::info!("WebView2 environment and controller created successfully");
-    Ok((controller, webview))
+    Ok((controller, webview, source_changed_token))
 }
 
 #[cfg(test)]

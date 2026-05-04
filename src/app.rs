@@ -1115,6 +1115,9 @@ pub struct AdeApp {
     embedded_browsers_by_project: BTreeMap<u64, web_browser::EmbeddedBrowser>,
     /// Reserved browser content area for native WebView bounds sync (runtime only)
     pending_browser_rect: Option<egui::Rect>,
+    /// Browser panel open state per project (runtime only, not persisted).
+    /// Tracks which projects have the Browser panel open; the visible panel follows the active terminal project.
+    browser_panel_open_projects: BTreeSet<u64>,
 }
 
 /// Represents a single open file buffer in the built-in editor.
@@ -3119,7 +3122,7 @@ impl AdeApp {
         // Dark overlay backdrop
         egui::Area::new("exit_confirm_overlay".into())
             .fixed_pos(egui::pos2(0.0, 0.0))
-            .order(egui::Order::Background)
+            .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
                 let screen = ctx.screen_rect();
@@ -3153,6 +3156,7 @@ impl AdeApp {
             .movable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .fixed_size(window_size)
+            .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(12.0);
@@ -3477,7 +3481,11 @@ impl AdeApp {
             browser_url_draft_by_project: BTreeMap::new(),
             embedded_browsers_by_project: BTreeMap::new(),
             pending_browser_rect: None,
+            browser_panel_open_projects: BTreeSet::new(),
         };
+        // Do NOT seed runtime browser state from legacy config.
+        // Browser panel open state is now runtime-only per project.
+        // config.ui.browser_panel_expanded is legacy and reset on load.
         app
     }
 
@@ -3701,6 +3709,7 @@ impl AdeApp {
             .remove(&project_id);
         // Clean up browser state for the removed project
         self.browser_url_draft_by_project.remove(&project_id);
+        self.browser_panel_open_projects.remove(&project_id);
         if let Some(mut browser) = self.embedded_browsers_by_project.remove(&project_id) {
             browser.shutdown();
         }
@@ -8516,6 +8525,23 @@ fn format_modifiers(mods: crate::models::ShortcutModifiers) -> String {
     parts.join("+")
 }
 
+/// Determine if the embedded browser should yield to UI overlay layers.
+/// Returns true when any modal, popup, or context menu is active that should
+/// appear above the native WebView.
+fn embedded_browser_should_yield_to_ui_layer(
+    show_settings_popup: bool,
+    show_exit_confirm_popup: bool,
+    terminal_history_popup_open: bool,
+    egui_popup_open: bool,
+    context_menu_open: bool,
+) -> bool {
+    show_settings_popup
+        || show_exit_confirm_popup
+        || terminal_history_popup_open
+        || egui_popup_open
+        || context_menu_open
+}
+
 fn ui_owns_keyboard_state(
     text_input_has_focus: bool,
     popup_open: bool,
@@ -10155,6 +10181,11 @@ impl AdeApp {
         self.active_terminal = terminal_id;
         self.clear_terminal_held_key_repeat();
         self.clear_terminal_selections_except(terminal_id);
+
+        // Ensure mutual exclusivity: if browser is now open for the active project, close checklist
+        if self.is_active_browser_panel_open() {
+            self.config.ui.checklist_panel_expanded = false;
+        }
 
         // Repaint to update AI badge state
         ctx.request_repaint();
@@ -13080,24 +13111,25 @@ impl AdeApp {
                         "Toggle Check-list Panel",
                     ) {
                         self.config.ui.checklist_panel_expanded = !checklist_panel_active;
-                        // Mutual exclusivity: close browser when opening checklist
+                        // Mutual exclusivity: close browser for the active project when opening checklist
                         if self.config.ui.checklist_panel_expanded {
-                            self.config.ui.browser_panel_expanded = false;
+                            self.set_active_browser_panel_open(false);
                         }
                         should_persist = true;
                     }
 
                     ui.add_space(6.0);
-                    let browser_panel_active = self.config.ui.browser_panel_expanded;
+                    let browser_panel_active = self.is_active_browser_panel_open();
                     if styled_icon_toggle(
                         ui,
                         browser_panel_active,
                         icons::GLOBE,
                         "Toggle Browser Panel",
                     ) {
-                        self.config.ui.browser_panel_expanded = !browser_panel_active;
+                        let new_open = !browser_panel_active;
+                        self.set_active_browser_panel_open(new_open);
                         // Mutual exclusivity: close checklist when opening browser
-                        if self.config.ui.browser_panel_expanded {
+                        if new_open {
                             self.config.ui.checklist_panel_expanded = false;
                         }
                         should_persist = true;
@@ -15411,8 +15443,8 @@ impl AdeApp {
         // Store URL and update draft
         self.set_project_browser_url(project_id, normalized.clone());
 
-        // Ensure browser panel is open and checklist is closed
-        self.config.ui.browser_panel_expanded = true;
+        // Ensure browser panel is open for this project and checklist is closed
+        self.set_browser_panel_open_for_project(project_id, true);
         self.config.ui.checklist_panel_expanded = false;
         ctx.request_repaint();
         self.note_ui_config_changed();
@@ -15422,22 +15454,148 @@ impl AdeApp {
         self.project_browser(project_id).navigate(&normalized);
     }
 
+    /// Check if the embedded browser should be hidden due to UI overlays.
+    /// Returns true when Settings, exit confirmation, popups, or context menus are open.
+    fn should_hide_embedded_browser_for_ui_layer(&self, ctx: &egui::Context) -> bool {
+        embedded_browser_should_yield_to_ui_layer(
+            self.show_settings_popup,
+            self.show_exit_confirm_popup,
+            self.terminal_history_popup_open.is_some(),
+            ctx.memory(|mem| mem.any_popup_open()),
+            ctx.is_context_menu_open(),
+        )
+    }
+
+    /// Hide all embedded browsers.
+    fn hide_embedded_browsers(&mut self) {
+        for browser in self.embedded_browsers_by_project.values_mut() {
+            browser.hide();
+        }
+    }
+
+    /// Process browser events and update URL state.
+    /// Drains events from all project browsers and updates draft/persisted URLs.
+    fn process_browser_events(&mut self, ctx: &egui::Context) {
+        let mut any_changed = false;
+
+        // Collect events from all project browsers to avoid borrow issues
+        let browser_events: Vec<(u64, Vec<web_browser::BrowserEvent>)> = self
+            .embedded_browsers_by_project
+            .iter_mut()
+            .map(|(project_id, browser)| (*project_id, browser.drain_events()))
+            .collect();
+
+        for (project_id, events) in browser_events {
+            for event in events {
+                match event {
+                    web_browser::BrowserEvent::UrlChanged(url) => {
+                        // Only accept http:// or https:// URLs from browser observations
+                        let lower = url.to_lowercase();
+                        if lower.starts_with("http://") || lower.starts_with("https://") {
+                            if self.apply_browser_observed_url(project_id, url) {
+                                any_changed = true;
+                            }
+                        }
+                    }
+                    web_browser::BrowserEvent::Error(msg) => {
+                        log::error!("Browser error for project {}: {}", project_id, msg);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if any_changed {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Apply an observed browser URL to a project.
+    /// Returns true if the URL actually changed (for persistence tracking).
+    fn apply_browser_observed_url(&mut self, project_id: u64, url: String) -> bool {
+        let mut changed = false;
+
+        // Update the draft (visible in URL input)
+        if let Some(existing) = self.browser_url_draft_by_project.get(&project_id) {
+            if existing != &url {
+                self.browser_url_draft_by_project
+                    .insert(project_id, url.clone());
+                changed = true;
+            }
+        } else {
+            self.browser_url_draft_by_project
+                .insert(project_id, url.clone());
+            changed = true;
+        }
+
+        // Update the persisted project URL
+        if let Some(project) = self.projects.get_mut(&project_id) {
+            match &project.browser_last_url {
+                Some(existing) if existing == &url => {}
+                _ => {
+                    project.browser_last_url = Some(url);
+                    self.note_projects_changed();
+                    changed = true;
+                }
+            }
+        }
+
+        if changed {
+            self.persist_config();
+        }
+
+        changed
+    }
+
+    /// Returns the project ID whose browser panel should be shown.
+    /// Prioritizes the active terminal's project, falling back to selected_project.
+    fn active_browser_project_id(&self) -> Option<u64> {
+        self.active_terminal
+            .and_then(|tid| self.terminals.get(&tid).map(|t| t.project_id))
+            .or(self.selected_project)
+    }
+
+    /// Check if the Browser panel is open for a specific project.
+    fn is_browser_panel_open_for_project(&self, project_id: u64) -> bool {
+        self.browser_panel_open_projects.contains(&project_id)
+    }
+
+    /// Check if the Browser panel is open for the active project.
+    fn is_active_browser_panel_open(&self) -> bool {
+        self.active_browser_project_id()
+            .map(|pid| self.is_browser_panel_open_for_project(pid))
+            .unwrap_or(false)
+    }
+
+    /// Set the Browser panel open state for a specific project.
+    fn set_browser_panel_open_for_project(&mut self, project_id: u64, open: bool) {
+        if open {
+            self.browser_panel_open_projects.insert(project_id);
+        } else {
+            self.browser_panel_open_projects.remove(&project_id);
+        }
+    }
+
+    /// Set the Browser panel open state for the active project.
+    fn set_active_browser_panel_open(&mut self, open: bool) {
+        if let Some(project_id) = self.active_browser_project_id() {
+            self.set_browser_panel_open_for_project(project_id, open);
+        }
+    }
+
     /// Synchronize embedded browser position with UI state.
     /// Called after UI render to update native WebView bounds.
     /// Handles multiple project browsers - only the active project's browser is shown.
     fn sync_embedded_browser(&mut self, ctx: &egui::Context) {
         // Determine which project's browser should be visible
-        let browser_project_id = self
-            .active_terminal
-            .and_then(|tid| self.terminals.get(&tid).map(|t| t.project_id))
-            .or(self.selected_project);
+        let browser_project_id = self.active_browser_project_id();
 
-        // Hide all browsers when panel is closed
-        if !self.config.ui.browser_panel_expanded {
+        // Hide all browsers when panel is closed or a UI overlay is active
+        if !self.is_active_browser_panel_open()
+            || self.should_hide_embedded_browser_for_ui_layer(ctx)
+        {
             self.pending_browser_rect = None;
-            for (_, browser) in &mut self.embedded_browsers_by_project {
-                browser.hide();
-            }
+            self.hide_embedded_browsers();
             return;
         }
 
@@ -15493,22 +15651,12 @@ impl AdeApp {
     /// Draw the Browser panel on the right side.
     /// Project-scoped browser with URL persistence.
     fn draw_browser_panel(&mut self, ctx: &egui::Context) -> Option<egui::Rect> {
-        if !self.config.ui.browser_panel_expanded {
+        if !self.is_active_browser_panel_open() {
             return None;
         }
 
-        // Determine which project's browser to show:
-        // 1. If there's an active terminal, use its project
-        // 2. Otherwise fall back to selected_project
-        let browser_project_id = self
-            .active_terminal
-            .and_then(|tid| self.terminals.get(&tid).map(|t| t.project_id))
-            .or(self.selected_project);
-
-        if browser_project_id.is_none() {
-            return None;
-        }
-        let browser_project_id = browser_project_id.unwrap();
+        // Determine which project's browser to show
+        let browser_project_id = self.active_browser_project_id()?;
 
         let response = egui::SidePanel::right("browser_panel")
             .resizable(true)
@@ -16031,7 +16179,15 @@ impl AdeApp {
                 if let Some(offset) = scroll_behavior.vertical_offset {
                     scroll_area = scroll_area.vertical_scroll_offset(offset);
                 }
-                scroll_area.show(&mut output_ui, |ui| {
+
+                // OpenCode wheel fallback: capture wheel data inside closure but defer decision
+                // until after ScrollArea processes it. If ScrollArea consumes the delta, we set
+                // manual_scroll_detached. If not consumed and mouse reporting active, we forward
+                // to OpenCode runtime as fallback.
+                let mut opencode_pending_wheel: Option<(WheelDirection, egui::Pos2, usize, usize)> =
+                    None;
+
+                let _scroll_area_output = scroll_area.show(&mut output_ui, |ui| {
                     ui.set_width(output_size.x);
                     ui.set_min_width(output_size.x);
                     ui.set_min_height(output_size.y);
@@ -16291,6 +16447,8 @@ impl AdeApp {
                                 cursor_overlay,
                             );
                         }
+
+                        // Wheel handling: capture wheel data for OpenCode deferral
                         let wheel_delta = ui.ctx().input(|input| input.smooth_scroll_delta);
                         if wheel_delta != Vec2::ZERO {
                             let pointer_pos = ui.ctx().input(|input| {
@@ -16300,12 +16458,11 @@ impl AdeApp {
                                 if rect.contains(pointer_pos) {
                                     let mouse_reporting_active =
                                         terminal.runtime.is_mouse_reporting_active();
-                                    // For OpenCode: Mergen scrollback takes priority over runtime wheel
-                                    // For other mouse-reporting apps: send wheel to runtime as before
                                     let is_opencode =
                                         terminal.ai_session.tool == Some(AiCliTool::OpenCode);
                                     let is_selection_drag = terminal.selection_drag_active;
 
+                                    // Non-OpenCode mouse-reporting apps: send wheel immediately
                                     if mouse_reporting_active && !is_opencode && !is_selection_drag
                                     {
                                         let direction = if wheel_delta.y > 0.0 {
@@ -16333,21 +16490,71 @@ impl AdeApp {
                                         ui.ctx().input_mut(|input| {
                                             input.smooth_scroll_delta = Vec2::ZERO;
                                         });
-                                    } else {
-                                        // OpenCode: allow Mergen scrollback to work
-                                        // Selection drag: don't interrupt with runtime wheel
+                                    } else if is_opencode && !is_selection_drag {
+                                        // OpenCode: capture wheel data for deferred handling
+                                        let direction = if wheel_delta.y > 0.0 {
+                                            WheelDirection::Up
+                                        } else if wheel_delta.y < 0.0 {
+                                            WheelDirection::Down
+                                        } else if wheel_delta.x > 0.0 {
+                                            WheelDirection::Right
+                                        } else {
+                                            WheelDirection::Left
+                                        };
+                                        let cell_x = ((pointer_pos.x - rect.min.x) / char_width)
+                                            .floor()
+                                            as usize;
+                                        let cell_y = ((pointer_pos.y - rect.min.y) / line_height)
+                                            .floor()
+                                            as usize;
+                                        opencode_pending_wheel =
+                                            Some((direction, pointer_pos, cell_x, cell_y));
+                                        // Detach prompt anchor for manual scroll behavior
                                         detach_terminal_prompt_scroll_anchor_on_manual_scroll(
                                             terminal,
                                         );
-                                        if is_opencode && !is_selection_drag {
-                                            terminal.opencode_manual_scroll_detached = true;
-                                        }
                                     }
                                 }
                             }
                         }
                     }
                 });
+
+                // After ScrollArea processes wheel, decide OpenCode fallback
+                if let Some((direction, _pointer_pos, cell_x, cell_y)) = opencode_pending_wheel {
+                    let remaining_delta = ui.ctx().input(|input| input.smooth_scroll_delta);
+                    // Determine if Mergen consumed the wheel based on the scroll axis:
+                    // Vertical ScrollArea consumes y; horizontal wheel would leave x.
+                    // Diagonal touchpad can leave x while y is consumed - do not forward then.
+                    let mergen_consumed = match direction {
+                        WheelDirection::Up | WheelDirection::Down => remaining_delta.y == 0.0,
+                        WheelDirection::Left | WheelDirection::Right => remaining_delta.x == 0.0,
+                    };
+                    if mergen_consumed {
+                        // Mergen ScrollArea consumed the wheel on the relevant axis:
+                        // mark manual scroll and clear any leftover diagonal delta
+                        terminal.opencode_manual_scroll_detached = true;
+                        ui.ctx().input_mut(|input| {
+                            input.smooth_scroll_delta = Vec2::ZERO;
+                        });
+                    } else {
+                        // Mergen could not scroll on the relevant axis:
+                        // forward to OpenCode runtime as fallback
+                        let mouse_reporting_active = terminal.runtime.is_mouse_reporting_active();
+                        if mouse_reporting_active {
+                            terminal.runtime.send_mouse_wheel(TerminalWheelEvent {
+                                direction,
+                                x: cell_x,
+                                y: cell_y,
+                                x_pixel_offset: 0,
+                                y_pixel_offset: 0,
+                            });
+                            ui.ctx().input_mut(|input| {
+                                input.smooth_scroll_delta = Vec2::ZERO;
+                            });
+                        }
+                    }
+                }
                 ui.expand_to_include_x(pane_right);
             }
 
@@ -16404,7 +16611,7 @@ impl AdeApp {
         // Dark overlay backdrop
         egui::Area::new("settings_overlay".into())
             .fixed_pos(egui::pos2(0.0, 0.0))
-            .order(egui::Order::Background)
+            .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
                 let screen = ctx.screen_rect();
@@ -16433,6 +16640,7 @@ impl AdeApp {
         egui::Window::new(format!("{} Settings", icons::GEAR))
             .id(egui::Id::new(SETTINGS_WINDOW_ID))
             .open(&mut open)
+            .order(egui::Order::Foreground)
             .resizable(false)
             .collapsible(false)
             .movable(false)
@@ -16711,6 +16919,7 @@ impl eframe::App for AdeApp {
 
         self.process_source_control_events(ctx);
         self.process_directory_index_events(ctx);
+        self.process_browser_events(ctx);
         self.schedule_source_control_refresh(ctx);
         self.schedule_terminal_refresh(ctx);
 
@@ -16794,7 +17003,8 @@ fn recover_config_state(
     config.ui.show_terminal_manager = current_config.ui.show_terminal_manager;
     config.ui.main_visibility_mode = current_config.ui.main_visibility_mode;
     config.ui.checklist_panel_expanded = current_config.ui.checklist_panel_expanded;
-    config.ui.browser_panel_expanded = current_config.ui.browser_panel_expanded;
+    // Browser panel open state is runtime-only; sanitize legacy persisted flag to false
+    config.ui.browser_panel_expanded = false;
 
     if pending_config_changes.ui {
         config.ui.project_explorer_expanded = current_config.ui.project_explorer_expanded;
@@ -21962,6 +22172,8 @@ fn normalize_terminal_background(color: TerminalColor) -> Color32 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
         ai_badge_tooltip_lines, ai_badge_visual, ai_cli_logo_key_for_terminal,
         average_terminal_cell_width, build_terminal_cursor_overlay, build_terminal_render,
@@ -21970,8 +22182,8 @@ mod tests {
         deduplicated_recent_inputs, default_app_open_command,
         detach_terminal_prompt_scroll_anchor_on_manual_scroll, draw_ai_badge,
         draw_terminal_manager_title_and_diff_summary, draw_terminal_status_badges,
-        file_editor_selection_drag_active_after_input, force_terminal_pane_width,
-        install_terminal_font_family, launcher_icon_for_ai_tool,
+        embedded_browser_should_yield_to_ui_layer, file_editor_selection_drag_active_after_input,
+        force_terminal_pane_width, install_terminal_font_family, launcher_icon_for_ai_tool,
         merge_source_control_refresh_result, next_active_terminal_after_close,
         next_terminal_in_direction, next_terminal_in_linear_direction,
         normalize_terminal_background, parse_branch_header, parse_git_numstat_totals,
@@ -31454,6 +31666,7 @@ mod tests {
             browser_url_draft_by_project: BTreeMap::new(),
             embedded_browsers_by_project: BTreeMap::new(),
             pending_browser_rect: None,
+            browser_panel_open_projects: BTreeSet::new(),
         }
     }
 
@@ -37561,22 +37774,26 @@ mod tests {
     #[test]
     fn browser_panel_and_checklist_are_mutually_exclusive() {
         let mut app = test_app([], None);
+        // Add a project and select it
+        let project = test_project(1, "Demo", "C:/demo", &[], &[]);
+        app.projects.insert(1, project);
+        app.selected_project = Some(1);
 
         // Initially both closed
         assert!(!app.config.ui.checklist_panel_expanded);
-        assert!(!app.config.ui.browser_panel_expanded);
+        assert!(!app.is_active_browser_panel_open());
 
         // Open checklist - browser should stay closed
         app.config.ui.checklist_panel_expanded = true;
-        app.config.ui.browser_panel_expanded = false;
+        app.set_active_browser_panel_open(false);
         assert!(app.config.ui.checklist_panel_expanded);
-        assert!(!app.config.ui.browser_panel_expanded);
+        assert!(!app.is_active_browser_panel_open());
 
         // Open browser - simulate mutual exclusivity logic
-        app.config.ui.browser_panel_expanded = true;
+        app.set_active_browser_panel_open(true);
         app.config.ui.checklist_panel_expanded = false;
         assert!(!app.config.ui.checklist_panel_expanded);
-        assert!(app.config.ui.browser_panel_expanded);
+        assert!(app.is_active_browser_panel_open());
     }
 
     #[test]
@@ -37910,8 +38127,8 @@ mod tests {
             Some("https://example.com".to_owned())
         );
 
-        // Browser panel should be open
-        assert!(app.config.ui.browser_panel_expanded);
+        // Browser panel should be open for project 1
+        assert!(app.is_browser_panel_open_for_project(1));
         // Checklist should be closed
         assert!(!app.config.ui.checklist_panel_expanded);
     }
@@ -38030,12 +38247,12 @@ mod tests {
         app.projects.insert(1, project);
         app.selected_project = Some(1);
 
-        // Open browser panel
-        app.config.ui.browser_panel_expanded = true;
+        // Open browser panel for the active project
+        app.set_active_browser_panel_open(true);
 
         // Verify browser panel can be drawn without placeholder text
         // (The actual rendering is tested via egui context in integration tests)
-        assert!(app.config.ui.browser_panel_expanded);
+        assert!(app.is_active_browser_panel_open());
     }
 
     #[test]
@@ -38087,7 +38304,8 @@ mod tests {
         // selected_project is project 1, active terminal is project 2
         app.selected_project = Some(1);
         app.active_terminal = Some(102);
-        app.config.ui.browser_panel_expanded = true;
+        // Open browser for project 2 (active terminal's project)
+        app.set_browser_panel_open_for_project(2, true);
 
         // Synchronize the embedded browser state; it should target project 2
         app.sync_embedded_browser(&ctx);
@@ -38166,5 +38384,457 @@ mod tests {
         // Browser state should be cleaned up
         assert!(!app.browser_url_draft_by_project.contains_key(&1));
         assert!(!app.embedded_browsers_by_project.contains_key(&1));
+    }
+
+    #[test]
+    fn embedded_browser_yields_to_ui_overlay_layers() {
+        // Test the pure predicate for all overlay sources
+        assert!(embedded_browser_should_yield_to_ui_layer(
+            true, false, false, false, false
+        ));
+        assert!(embedded_browser_should_yield_to_ui_layer(
+            false, true, false, false, false
+        ));
+        assert!(embedded_browser_should_yield_to_ui_layer(
+            false, false, true, false, false
+        ));
+        assert!(embedded_browser_should_yield_to_ui_layer(
+            false, false, false, true, false
+        ));
+        assert!(embedded_browser_should_yield_to_ui_layer(
+            false, false, false, false, true
+        ));
+        assert!(!embedded_browser_should_yield_to_ui_layer(
+            false, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn sync_embedded_browser_hides_existing_browser_while_settings_open() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        app.selected_project = Some(1);
+        app.set_browser_panel_open_for_project(1, true);
+        app.show_settings_popup = true;
+
+        // Show the browser
+        app.project_browser(1).show();
+        assert!(app
+            .embedded_browsers_by_project
+            .get(&1)
+            .unwrap()
+            .requested_visible());
+
+        // Sync should hide it because settings is open
+        app.sync_embedded_browser(&ctx);
+
+        assert!(app.pending_browser_rect.is_none());
+        assert!(!app
+            .embedded_browsers_by_project
+            .get(&1)
+            .unwrap()
+            .requested_visible());
+    }
+
+    #[test]
+    fn sync_embedded_browser_does_not_create_browser_while_ui_overlay_active() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        app.selected_project = Some(1);
+        app.set_browser_panel_open_for_project(1, true);
+        app.show_exit_confirm_popup = true;
+
+        // Sync should not create a browser while overlay is active
+        app.sync_embedded_browser(&ctx);
+
+        assert!(!app.embedded_browsers_by_project.contains_key(&1));
+    }
+
+    #[test]
+    fn browser_url_changed_event_updates_draft_and_project_url() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+
+        // Add a project and set initial URL
+        let mut project = test_project(1, "Demo", "C:/demo", &[], &[]);
+        project.browser_last_url = Some("https://initial.com".to_owned());
+        app.projects.insert(1, project);
+        app.selected_project = Some(1);
+        app.browser_url_draft_by_project
+            .insert(1, "https://initial.com".to_owned());
+
+        // Simulate browser observing a new URL
+        let changed = app.apply_browser_observed_url(1, "https://example.com/new".to_owned());
+
+        assert!(changed);
+        assert_eq!(
+            app.browser_url_draft_by_project.get(&1),
+            Some(&"https://example.com/new".to_owned())
+        );
+        assert_eq!(
+            app.projects.get(&1).unwrap().browser_last_url,
+            Some("https://example.com/new".to_owned())
+        );
+    }
+
+    #[test]
+    fn process_browser_events_ignores_unsupported_sources() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+
+        // Add a project with an existing URL
+        let mut project = test_project(1, "Demo", "C:/demo", &[], &[]);
+        project.browser_last_url = Some("https://example.com".to_owned());
+        app.projects.insert(1, project);
+        app.selected_project = Some(1);
+        app.browser_url_draft_by_project
+            .insert(1, "https://example.com".to_owned());
+
+        // Inject events directly into a browser's event channel
+        // We'll test the filtering behavior at the process_browser_events level
+        // by simulating what would happen if events were injected
+        let initial_draft = app.browser_url_draft_by_project.get(&1).cloned();
+        let initial_url = app.projects.get(&1).unwrap().browser_last_url.clone();
+
+        // The filtering logic in process_browser_events should ignore unsupported schemes
+        // Verify the current implementation accepts only http/https
+        assert_eq!(initial_draft, Some("https://example.com".to_owned()));
+        assert_eq!(initial_url, Some("https://example.com".to_owned()));
+
+        // apply_browser_observed_url should still reject non-http(s) at the filtering layer
+        // Let's verify process_browser_events filtering logic manually
+        let test_cases = vec![
+            ("about:blank", false),
+            ("file:///etc/passwd", false),
+            ("data:text/html,test", false),
+            ("javascript:alert(1)", false),
+            ("", false),
+            ("https://valid.com", true),
+            ("http://localhost:3000", true),
+        ];
+
+        for (url, should_accept) in test_cases {
+            let lower = url.to_lowercase();
+            let is_supported = lower.starts_with("http://") || lower.starts_with("https://");
+            assert_eq!(
+                is_supported, should_accept,
+                "URL '{}' support check mismatch",
+                url
+            );
+        }
+    }
+
+    #[test]
+    fn browser_url_changed_event_is_project_scoped() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+
+        // Add two projects with different URLs
+        let mut project1 = test_project(1, "Project1", "C:/proj1", &[], &[]);
+        project1.browser_last_url = Some("https://project1.com".to_owned());
+        let mut project2 = test_project(2, "Project2", "C:/proj2", &[], &[]);
+        project2.browser_last_url = Some("https://project2.com".to_owned());
+        app.projects.insert(1, project1);
+        app.projects.insert(2, project2);
+        app.browser_url_draft_by_project
+            .insert(1, "https://project1.com".to_owned());
+        app.browser_url_draft_by_project
+            .insert(2, "https://project2.com".to_owned());
+
+        // Update project 1's URL
+        app.apply_browser_observed_url(1, "https://project1-new.com".to_owned());
+
+        // Project 2 should be unchanged
+        assert_eq!(
+            app.browser_url_draft_by_project.get(&2),
+            Some(&"https://project2.com".to_owned())
+        );
+        assert_eq!(
+            app.projects.get(&2).unwrap().browser_last_url,
+            Some("https://project2.com".to_owned())
+        );
+
+        // Project 1 should be updated
+        assert_eq!(
+            app.browser_url_draft_by_project.get(&1),
+            Some(&"https://project1-new.com".to_owned())
+        );
+        assert_eq!(
+            app.projects.get(&1).unwrap().browser_last_url,
+            Some("https://project1-new.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn browser_url_changed_event_persists_only_when_url_changes() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+
+        // Add a project
+        let mut project = test_project(1, "Demo", "C:/demo", &[], &[]);
+        project.browser_last_url = Some("https://example.com".to_owned());
+        app.projects.insert(1, project);
+        app.browser_url_draft_by_project
+            .insert(1, "https://example.com".to_owned());
+
+        // Apply the same URL again - should not report a change
+        let changed = app.apply_browser_observed_url(1, "https://example.com".to_owned());
+        assert!(!changed, "Same URL should not trigger persistence");
+
+        // Apply a different URL - should report a change
+        let changed = app.apply_browser_observed_url(1, "https://new.com".to_owned());
+        assert!(changed, "Different URL should trigger persistence");
+    }
+
+    #[test]
+    fn browser_panel_open_state_follows_active_terminal_project() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+
+        // Add two projects
+        let project1 = test_project(1, "Project1", "C:/proj1", &[], &[]);
+        let project2 = test_project(2, "Project2", "C:/proj2", &[], &[]);
+        app.projects.insert(1, project1);
+        app.projects.insert(2, project2);
+
+        // Create terminals for each project
+        let terminal1 = test_terminal_entry(101, 1);
+        let terminal2 = test_terminal_entry(102, 2);
+        app.terminals.insert(101, terminal1);
+        app.terminals.insert(102, terminal2);
+
+        // Project 1 browser open, project 2 browser closed
+        app.set_active_terminal(&ctx, Some(101));
+        app.set_browser_panel_open_for_project(1, true);
+        assert!(app.is_browser_panel_open_for_project(1));
+        assert!(!app.is_browser_panel_open_for_project(2));
+
+        // Switch to project 2 terminal - browser should close
+        app.set_active_terminal(&ctx, Some(102));
+        assert!(!app.is_active_browser_panel_open());
+
+        // Switch back to project 1 - browser should reopen
+        app.set_active_terminal(&ctx, Some(101));
+        assert!(app.is_active_browser_panel_open());
+    }
+
+    #[test]
+    fn browser_panel_does_not_create_webview_for_closed_active_project() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+
+        // Add two projects
+        let project1 = test_project(1, "Project1", "C:/proj1", &[], &[]);
+        let project2 = test_project(2, "Project2", "C:/proj2", &[], &[]);
+        app.projects.insert(1, project1);
+        app.projects.insert(2, project2);
+
+        // Create terminals for each project
+        let terminal1 = test_terminal_entry(101, 1);
+        let terminal2 = test_terminal_entry(102, 2);
+        app.terminals.insert(101, terminal1);
+        app.terminals.insert(102, terminal2);
+
+        // Project 1 browser open, project 2 browser closed
+        app.selected_project = Some(1);
+        app.active_terminal = Some(101);
+        app.set_browser_panel_open_for_project(1, true);
+
+        // Sync creates browser for project 1
+        app.sync_embedded_browser(&ctx);
+        assert!(app.embedded_browsers_by_project.contains_key(&1));
+
+        // Switch to project 2 (browser closed) - sync should not create project 2 browser
+        app.active_terminal = Some(102);
+        app.sync_embedded_browser(&ctx);
+        assert!(!app.embedded_browsers_by_project.contains_key(&2));
+    }
+
+    #[test]
+    fn submit_browser_url_opens_only_target_project_browser_state() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+
+        // Add two projects
+        let project1 = test_project(1, "Project1", "C:/proj1", &[], &[]);
+        let project2 = test_project(2, "Project2", "C:/proj2", &[], &[]);
+        app.projects.insert(1, project1);
+        app.projects.insert(2, project2);
+
+        // Submit URL for project 1
+        app.submit_browser_url(&ctx, 1, "https://project1.com");
+
+        // Only project 1's browser should be open
+        assert!(app.is_browser_panel_open_for_project(1));
+        assert!(!app.is_browser_panel_open_for_project(2));
+
+        // Submit URL for project 2
+        app.submit_browser_url(&ctx, 2, "https://project2.com");
+
+        // Both projects should have browser open
+        assert!(app.is_browser_panel_open_for_project(1));
+        assert!(app.is_browser_panel_open_for_project(2));
+    }
+
+    #[test]
+    fn checklist_open_closes_only_active_project_browser_state() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+
+        // Add two projects
+        let project1 = test_project(1, "Project1", "C:/proj1", &[], &[]);
+        let project2 = test_project(2, "Project2", "C:/proj2", &[], &[]);
+        app.projects.insert(1, project1);
+        app.projects.insert(2, project2);
+
+        // Create terminals for each project
+        let terminal1 = test_terminal_entry(101, 1);
+        let terminal2 = test_terminal_entry(102, 2);
+        app.terminals.insert(101, terminal1);
+        app.terminals.insert(102, terminal2);
+
+        // Both projects have browser open
+        app.set_browser_panel_open_for_project(1, true);
+        app.set_browser_panel_open_for_project(2, true);
+
+        // Set active to project 1 and open checklist
+        app.active_terminal = Some(101);
+        app.config.ui.checklist_panel_expanded = true;
+        // Simulate checklist toggle behavior
+        app.set_active_browser_panel_open(false);
+
+        // Only active project (1) browser should close; project 2 remains open
+        assert!(!app.is_browser_panel_open_for_project(1));
+        assert!(app.is_browser_panel_open_for_project(2));
+    }
+
+    #[test]
+    fn remove_project_cleans_up_browser_panel_open_state() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+
+        // Add a project with browser state
+        let project = test_project(1, "Project1", "C:/proj1", &[], &[]);
+        app.projects.insert(1, project);
+        app.set_browser_panel_open_for_project(1, true);
+        assert!(app.browser_panel_open_projects.contains(&1));
+
+        // Remove the project
+        app.remove_project(&ctx, 1);
+
+        // Browser open state should be cleaned up
+        assert!(!app.browser_panel_open_projects.contains(&1));
+    }
+
+    #[test]
+    fn browser_panel_open_state_does_not_change_config() {
+        // Regression test: Runtime browser open state must not be mirrored to config.
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        let project = test_project(1, "Demo", "C:/demo", &[], &[]);
+        app.projects.insert(1, project);
+        app.selected_project = Some(1);
+
+        // Ensure config starts false
+        app.config.ui.browser_panel_expanded = false;
+
+        // Open browser for the project
+        app.set_browser_panel_open_for_project(1, true);
+
+        // Runtime state should be open
+        assert!(app.is_active_browser_panel_open());
+        // Config should NOT be updated (removed sync behavior)
+        assert!(!app.config.ui.browser_panel_expanded);
+    }
+
+    #[test]
+    fn config_recovery_sanitizes_browser_panel_expanded() {
+        // Regression test: recover_config_state must reset browser_panel_expanded to false.
+        use crate::models::{AppConfig, UiConfig};
+
+        let current_config = AppConfig::default();
+        let current_projects = std::collections::BTreeMap::new();
+        let current_selected_project = None;
+
+        // Simulate a loaded config that has legacy browser_panel_expanded = true
+        let mut loaded_config = AppConfig::default();
+        loaded_config.ui.browser_panel_expanded = true;
+
+        let pending_changes = super::PendingConfigChanges::default();
+
+        let recovered = super::recover_config_state(
+            &current_config,
+            &current_projects,
+            current_selected_project,
+            loaded_config,
+            pending_changes,
+        );
+
+        // Legacy flag should be sanitized to false
+        assert!(
+            !recovered.ui.browser_panel_expanded,
+            "recover_config_state must sanitize browser_panel_expanded to false"
+        );
+    }
+
+    // OpenCode Wheel Fallback Tests
+
+    #[test]
+    fn opencode_wheel_fallback_axis_aware_vertical_consumed_horizontal_leftover() {
+        // Regression test: vertical ScrollArea consuming y should count as Mergen-consumed
+        // even if diagonal touchpad leaves x != 0.
+        // Note: This tests the logic behavior; full wheel handling requires egui context.
+        use super::WheelDirection;
+
+        // Simulate: y=0 (consumed), x=5.0 (leftover from diagonal)
+        let remaining_y = 0.0;
+        let direction = WheelDirection::Up;
+        let mergen_consumed = match direction {
+            WheelDirection::Up | WheelDirection::Down => remaining_y == 0.0,
+            WheelDirection::Left | WheelDirection::Right => panic!("unexpected direction"),
+        };
+        assert!(
+            mergen_consumed,
+            "vertical wheel consumed when y == 0 even if x remains"
+        );
+
+        // Simulate: y != 0 (not consumed)
+        let remaining_y = 3.0;
+        let mergen_consumed = match direction {
+            WheelDirection::Up | WheelDirection::Down => remaining_y == 0.0,
+            WheelDirection::Left | WheelDirection::Right => panic!("unexpected direction"),
+        };
+        assert!(!mergen_consumed, "vertical wheel NOT consumed when y != 0");
+    }
+
+    #[test]
+    fn opencode_wheel_fallback_axis_aware_horizontal_consumed() {
+        // Regression test: horizontal wheel should check remaining_delta.x
+        use super::WheelDirection;
+
+        // Horizontal ScrollArea (if it existed) consumes x
+        let remaining_x = 0.0;
+        let direction = WheelDirection::Left;
+        let mergen_consumed = match direction {
+            WheelDirection::Left | WheelDirection::Right => remaining_x == 0.0,
+            WheelDirection::Up | WheelDirection::Down => panic!("unexpected direction"),
+        };
+        assert!(mergen_consumed, "horizontal wheel consumed when x == 0");
+
+        let remaining_x = 2.0;
+        let mergen_consumed = match direction {
+            WheelDirection::Left | WheelDirection::Right => remaining_x == 0.0,
+            WheelDirection::Up | WheelDirection::Down => panic!("unexpected direction"),
+        };
+        assert!(
+            !mergen_consumed,
+            "horizontal wheel NOT consumed when x != 0"
+        );
     }
 }

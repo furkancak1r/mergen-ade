@@ -1,5 +1,172 @@
 ### Known Issues & Fix Log
 
+#### Browser panel runtime open state no longer persisted to config {#browser-panel-runtime-state-not-persisted}
+- Date: 2026-05-04
+- Context: Browser panel visibility persistence across application restarts
+- Error signature: `Browser panel open state saved to config and restored on next launch`
+- Symptoms/Impact:
+  1. Opening Browser panel for a project persisted `browser_panel_expanded: true` to `ui_config.json`.
+  2. On next app launch, the legacy config value was used to seed `browser_panel_open_projects`.
+  3. This caused Browser panel to open automatically for projects that had it open in a previous session, even if the user closed it.
+  4. Browser open state leaked between sessions incorrectly, violating the runtime-only state design.
+- Root cause:
+  1. `set_browser_panel_open_for_project()` called `sync_browser_panel_expanded_mirror()` which wrote runtime state back to `config.ui.browser_panel_expanded`.
+  2. App startup in `AdeApp::new()` seeded `browser_panel_open_projects` from the legacy config field if the active project had Browser open.
+  3. `recover_config_state()` preserved the legacy `browser_panel_expanded` value instead of sanitizing it to `false`.
+  4. The intent was to have runtime-only state, but the implementation mirrored it to persisted config.
+- Resolution:
+  - Removed `sync_browser_panel_expanded_mirror()` function and all call sites.
+  - Removed startup seeding of `browser_panel_open_projects` from `config.ui.browser_panel_expanded`.
+  - Modified `recover_config_state()` to set `config.ui.browser_panel_expanded = false` (sanitize legacy flag).
+  - Browser panel open state is now purely runtime in `browser_panel_open_projects: BTreeSet<u64>`.
+  - `UiConfig::browser_panel_expanded` is treated as legacy-only and always `false`; it exists only for backward compatibility.
+  - Updated tests that called the removed `sync_browser_panel_expanded_mirror()` function.
+  - Added regression tests: `browser_panel_open_state_does_not_change_config`, `config_recovery_sanitizes_browser_panel_expanded`.
+- Prevent recurrence:
+  - Never mirror runtime Browser open state into persisted config.
+  - Never use `config.ui.browser_panel_expanded` as source-of-truth for panel visibility.
+  - Always sanitize legacy flags during config recovery.
+  - When adding new project-scoped UI state, default to runtime-only unless persistence is explicitly required.
+- Files/Commands touched: `src/app.rs`, `src/models.rs` (indirect), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request on 2026-05-04 to stop persisting Browser panel open state in config.
+
+#### OpenCode wheel fallback now axis-aware to prevent false runtime forwarding {#opencode-wheel-axis-aware-fallback}
+- Date: 2026-05-04
+- Context: OpenCode running in terminal with mouse reporting enabled
+- Error signature: `Diagonal touchpad scroll incorrectly triggers OpenCode runtime wheel forwarding`
+- Symptoms/Impact:
+  1. User scrolls with a touchpad on a diagonal axis (e.g., 45-degree swipe).
+  2. egui reports a wheel event with both X and Y delta (e.g., `x=5.0, y=5.0`).
+  3. The scroll direction is determined to be `WheelDirection::Up` based on Y magnitude.
+  4. Mergen terminal `ScrollArea` consumes only the Y delta (`remaining_delta.y == 0.0`), leaving X unconsumed (`remaining_delta.x == 5.0`).
+  5. Old code checked `smooth_scroll_delta.length() == 0.0` which was false (X remains).
+  6. This caused the wheel to be incorrectly forwarded to OpenCode runtime, even though Mergen scrollback was already at the edge and the Y scroll was the intended action.
+- Root cause:
+  1. The wheel fallback check used a length-based (`length() == 0.0`) comparison which is axis-agnostic.
+  2. Diagonal touchpad input creates mixed-axis deltas that should be evaluated per-axis.
+  3. The check did not account for the fact that the ScrollArea only consumes the dominant scroll axis.
+- Resolution:
+  - Changed OpenCode wheel fallback check to be axis-aware based on the determined `WheelDirection`.
+  - For `WheelDirection::Up`/`Down`: check `smooth_scroll_delta.y == 0.0` (Y axis consumed).
+  - For `WheelDirection::Left`/`Right`: check `smooth_scroll_delta.x == 0.0` (X axis consumed).
+  - After Mergen consumes the wheel, clear `smooth_scroll_delta` to `Vec2::ZERO` to prevent any residual delta from leaking.
+  - Only forward to OpenCode runtime when the specific axis matching the scroll direction was not consumed by Mergen.
+  - Preserved existing behavior for non-OpenCode mouse-reporting applications.
+- Prevent recurrence:
+  - Wheel fallback checks must be axis-specific, not length-based.
+  - Diagonal touchpad input must be handled per-axis.
+  - Always clear delta state after Mergen consumption to prevent leakage.
+  - Regression tests must cover axis-aware consumption (vertical, horizontal, diagonal with leftover).
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: Code review finding on 2026-05-04 that diagonal touchpad wheel events could incorrectly trigger runtime fallback.
+
+#### Browser panel open state leaked between projects {#browser-panel-open-state-leaked-between-projects}
+- Date: 2026-05-04
+- Context: Browser panel visibility and project switching
+- Error signature: `Browser panel remains open when switching to a project/terminal that never opened Browser`
+- Symptoms/Impact:
+  1. When Promes (or any project) has Browser panel open, switching to another project's terminal keeps the Browser panel open.
+  2. The new project inherits the previous project's Browser open state even though it never opened Browser.
+  3. Returning to the original project does not restore its Browser state if the user closed Browser in the meantime while on another project.
+- Root cause:
+  1. `config.ui.browser_panel_expanded` was used as global source-of-truth for Browser visibility.
+  2. Browser content followed active terminal project, but open/closed state did not follow the same project-scoped logic.
+  3. No per-project tracking of which projects had Browser panel open.
+- Resolution:
+  - Add runtime-only `browser_panel_open_projects: BTreeSet<u64>` to track which projects have Browser open.
+  - Replace global `browser_panel_expanded` checks with project-scoped `is_browser_panel_open_for_project()` and `is_active_browser_panel_open()` helpers.
+  - Update `set_active_terminal()` to sync visible Browser panel with active project's open state via `sync_browser_panel_expanded_mirror()`.
+  - Update activity rail toggle to operate on active project's Browser state, not global flag.
+  - Update Check-list mutual exclusivity to close only active project's Browser state when opening Check-list.
+  - Update `submit_browser_url()` to open Browser for the specific target project.
+  - Update `remove_project()` cleanup to also remove from `browser_panel_open_projects`.
+  - Preserve `config.ui.browser_panel_expanded` only as backward-compatible mirror/startup seed, not source-of-truth.
+- Prevent recurrence:
+  - Browser visible state must always be derived from active terminal's project state, not global flag.
+  - Tests must verify: switching from open project to closed project hides panel; switching back restores it; other projects' states are preserved.
+  - When adding new project-scoped UI panels, always track open/closed state per-project in runtime-only sets/maps.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request on 2026-05-04 that Browser panel should close when switching to projects that never opened it, and restore when returning.
+
+#### OpenCode wheel could be dropped when Mergen scrollback could not move {#opencode-wheel-dropped-when-mergen-scrollback-stuck}
+- Date: 2026-05-04
+- Context: OpenCode running in terminal with mouse reporting enabled
+- Error signature: `OpenCode wheel does not scroll Mergen or OpenCode`
+- Symptoms/Impact:
+  1. Mouse wheel over an OpenCode terminal sometimes appears to do nothing.
+  2. This happens when Mergen scrollback has no movable overflow or is already at the scroll edge.
+  3. Bottom-stick can be detached even though Mergen did not actually scroll.
+- Root cause:
+  1. OpenCode wheel handling skipped runtime forwarding unconditionally.
+  2. The code let egui `ScrollArea` handle wheel input but did not check whether `ScrollArea` actually consumed the delta.
+  3. `opencode_manual_scroll_detached` was set before confirming a real Mergen scroll occurred.
+- Resolution:
+  - Defer OpenCode wheel fallback until after `ScrollArea::show`.
+  - Treat zero remaining `smooth_scroll_delta` as Mergen-consumed scroll and detach bottom-stick only then.
+  - If Mergen leaves the wheel delta unconsumed and OpenCode mouse reporting is active, forward the wheel to OpenCode runtime and clear the delta.
+  - Preserve non-OpenCode mouse-reporting behavior and selection-drag suppression.
+- Prevent recurrence:
+  - OpenCode wheel handling must remain Mergen-first, not Mergen-only.
+  - Do not mark manual OpenCode scroll detach unless Mergen consumed wheel input.
+  - Regression tests must cover consumed, unconsumed fallback, and selection-drag paths.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User report on 2026-05-04 that scroll does not work in OpenCode.
+
+#### Embedded browser covered Settings and other egui popups {#embedded-browser-covers-egui-popups}
+- Date: 2026-05-04
+- Context: Browser panel native WebView2 z-order with egui modals and popups
+- Error signature: `Browser panel stays above Settings / exit confirmation / egui popup`
+- Symptoms/Impact:
+  1. When the Browser panel is open, opening Settings can show the Settings popup behind the browser content.
+  2. Exit confirmation, context menus, ComboBoxes, and Terminal Manager history popups can also be visually covered if they overlap the browser panel.
+  3. Users cannot reliably read or interact with modal controls over the browser area.
+- Root cause:
+  1. WebView2 renders as a native child surface, so egui paint order cannot place Settings or other egui overlays above it.
+  2. `sync_embedded_browser()` only hid native browsers when the Browser panel was closed or the browser failed/was unsupported.
+  3. Settings and exit confirmation modal backdrops used `egui::Order::Background`, which was not explicit modal foreground layering.
+- Resolution:
+  - Add a centralized overlay predicate for Settings, exit confirmation, Terminal Manager history popup, egui popups, and context menus.
+  - Hide all project browser instances and clear `pending_browser_rect` while an overlay is active.
+  - Restore the active project browser on the next sync after the overlay closes, without destroying browser state.
+  - Move Settings and exit confirmation modal backdrops/windows to `egui::Order::Foreground`.
+  - Track requested browser visibility in `EmbeddedBrowser` for regression tests.
+- Prevent recurrence:
+  - Native WebView surfaces must yield to egui overlays; egui draw order alone is not enough.
+  - Any new egui modal, popup, or context menu that can overlap the Browser panel must be included in the browser-yield predicate.
+  - Tests should cover both the predicate and `sync_embedded_browser()` hide behavior.
+  - Manual Windows verification should confirm WebView2 content returns after closing the modal.
+- Files/Commands touched: `src/app.rs`, `src/web_browser.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User report on 2026-05-04 that Settings opens behind the Browser panel.
+
+#### Embedded browser URL input did not follow in-page navigation {#embedded-browser-url-input-did-not-follow-in-page-navigation}
+- Date: 2026-05-04
+- Context: Embedded browser panel URL input synchronization
+- Error signature: `Clicking links inside the embedded browser changes the page, but the Browser panel URL input stays on the old URL`
+- Symptoms/Impact:
+  1. User navigates inside the embedded WebView by clicking links, redirects, or SPA/hash navigation.
+  2. The native WebView displays the new page, but the URL input above the browser keeps the previous submitted URL.
+  3. `ProjectRecord::browser_last_url` can remain stale, so reopening the project/browser may restore an older URL.
+  4. Per-project browser isolation still works, but each project's persisted URL can desync from its actual WebView source.
+- Root cause:
+  1. `create_webview_sync()` accepted an event sender but never registered WebView2 source/navigation handlers.
+  2. `BrowserEvent::UrlChanged` existed but was never emitted by WebView2.
+  3. `EmbeddedBrowser::drain_events()` existed but `AdeApp` never drained browser events during the frame update.
+  4. `set_project_browser_url()` was only called for app-submitted navigations from Enter/Go/terminal links, not for native WebView navigations.
+- Resolution:
+  - Register a WebView2 `SourceChanged` handler when creating the embedded browser.
+  - Read `ICoreWebView2::Source()` in the handler and emit `BrowserEvent::UrlChanged`.
+  - Drain browser events before rendering the browser panel.
+  - Update `browser_url_draft_by_project` and `ProjectRecord::browser_last_url` from observed `http://` and `https://` source changes.
+  - Batch config persistence so repeated events in one frame write at most once.
+  - Remove the WebView2 source-change event handler during browser shutdown.
+- Prevent recurrence:
+  - Native WebView source changes must be treated as authoritative for the browser URL input.
+  - Browser events must be drained before browser panel rendering.
+  - Persist only supported observed URL schemes to keep browser config safe.
+  - Add regression tests for project-scoped URL-change events and unsupported observed sources.
+- Files/Commands touched: `src/web_browser.rs`, `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User reported that clicking inside the Browser panel changes the page URL, but the URL input above it does not update.
+
 #### Shortcut focus, modifier normalization, recording cancel, and CF_HDROP handle follow-up {#shortcut-focus-modifier-normalization-recording-cancel-cf-hdrop-handle-follow-up}
 - Date: 2026-05-04
 - Context: Code review follow-up fixing focus gating, modifier semantics, recording cancellation, and Windows clipboard handle usage
