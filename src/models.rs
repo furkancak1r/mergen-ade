@@ -353,6 +353,9 @@ pub enum LeftSidebarTab {
 pub struct UiConfig {
     pub show_project_explorer: bool,
     pub project_explorer_expanded: bool,
+    // Panel widths (persisted user resizing)
+    #[serde(default = "default_project_explorer_width")]
+    pub project_explorer_width: f32,
     pub show_terminal_manager: bool,
     pub terminal_manager_expanded: bool,
     pub multi_terminal_view_enabled: bool,
@@ -363,7 +366,23 @@ pub struct UiConfig {
     pub left_sidebar_tab: LeftSidebarTab,
     pub checklist_panel_expanded: bool,
     pub browser_panel_expanded: bool,
+    #[serde(default = "default_checklist_panel_width")]
+    pub checklist_panel_width: f32,
+    #[serde(default = "default_browser_panel_width")]
+    pub browser_panel_width: f32,
     pub input_history_filter: InputHistoryFilter,
+}
+
+const fn default_project_explorer_width() -> f32 {
+    352.0
+}
+
+const fn default_checklist_panel_width() -> f32 {
+    352.0
+}
+
+const fn default_browser_panel_width() -> f32 {
+    520.0
 }
 
 impl Default for UiConfig {
@@ -371,6 +390,7 @@ impl Default for UiConfig {
         Self {
             show_project_explorer: true,
             project_explorer_expanded: true,
+            project_explorer_width: default_project_explorer_width(),
             show_terminal_manager: true,
             terminal_manager_expanded: true,
             multi_terminal_view_enabled: false,
@@ -381,6 +401,8 @@ impl Default for UiConfig {
             left_sidebar_tab: LeftSidebarTab::Directory,
             checklist_panel_expanded: false,
             browser_panel_expanded: false,
+            checklist_panel_width: default_checklist_panel_width(),
+            browser_panel_width: default_browser_panel_width(),
             input_history_filter: InputHistoryFilter::default(),
         }
     }
@@ -494,6 +516,77 @@ impl OpenCodeModelConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
+#[serde(default)]
+pub struct ShortcutModifiers {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub command: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TerminalShortcutEntry {
+    pub id: String,
+    pub label: String,
+    pub key: String, // e.g., "F6", "P", "Enter"
+    pub modifiers: ShortcutModifiers,
+    pub command: String, // e.g., "/prepare-fix-plan"
+    pub enabled: bool,
+}
+
+impl Default for TerminalShortcutEntry {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            label: String::new(),
+            key: String::new(),
+            modifiers: ShortcutModifiers::default(),
+            command: String::new(),
+            enabled: true,
+        }
+    }
+}
+
+/// Returns the default terminal shortcuts that ship with Mergen ADE.
+pub fn default_terminal_shortcuts() -> Vec<TerminalShortcutEntry> {
+    vec![
+        TerminalShortcutEntry {
+            id: "semgrep-check".to_owned(),
+            label: "Semgrep Check".to_owned(),
+            key: "F5".to_owned(),
+            modifiers: ShortcutModifiers::default(),
+            command: "/gt".to_owned(),
+            enabled: true,
+        },
+        TerminalShortcutEntry {
+            id: "prepare-fix-plan".to_owned(),
+            label: "Prepare Fix Plan".to_owned(),
+            key: "F6".to_owned(),
+            modifiers: ShortcutModifiers::default(),
+            command: "/prepare-fix-plan".to_owned(),
+            enabled: true,
+        },
+        TerminalShortcutEntry {
+            id: "implement-plan".to_owned(),
+            label: "Implement Plan".to_owned(),
+            key: "F7".to_owned(),
+            modifiers: ShortcutModifiers::default(),
+            command: "/implement-plan".to_owned(),
+            enabled: true,
+        },
+        TerminalShortcutEntry {
+            id: "review-guard".to_owned(),
+            label: "Review Guard".to_owned(),
+            key: "F8".to_owned(),
+            modifiers: ShortcutModifiers::default(),
+            command: "/review-guard".to_owned(),
+            enabled: true,
+        },
+    ]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -502,6 +595,8 @@ pub struct AppConfig {
     pub ui: UiConfig,
     #[serde(default = "default_launchers")]
     pub launchers: Vec<LauncherEntry>,
+    #[serde(default = "default_terminal_shortcuts")]
+    pub terminal_shortcuts: Vec<TerminalShortcutEntry>,
     pub projects: Vec<ProjectRecord>,
     pub ai_hooks: AiHooksConfig,
     #[serde(default)]
@@ -515,6 +610,7 @@ impl Default for AppConfig {
             default_shell: ShellKind::default(),
             ui: UiConfig::default(),
             launchers: default_launchers(),
+            terminal_shortcuts: default_terminal_shortcuts(),
             projects: Vec::new(),
             ai_hooks: AiHooksConfig::default(),
             opencode: OpenCodeModelConfig::default(),
@@ -525,8 +621,9 @@ impl Default for AppConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_launchers, normalize_launcher_entries, BuiltinLauncherKind, LauncherEntry,
-        LauncherIconKey, OpenCodeModelConfig, ShellKind,
+        default_launchers, default_terminal_shortcuts, normalize_launcher_entries, AppConfig,
+        BuiltinLauncherKind, LauncherEntry, LauncherIconKey, OpenCodeModelConfig, ShellKind,
+        ShortcutModifiers, TerminalShortcutEntry, UiConfig,
     };
 
     #[test]
@@ -574,6 +671,51 @@ mod tests {
             launchers[3],
             LauncherEntry::builtin(BuiltinLauncherKind::Claude)
         );
+    }
+
+    #[test]
+    fn default_terminal_shortcuts_include_expected_entries() {
+        let shortcuts = default_terminal_shortcuts();
+
+        assert_eq!(shortcuts.len(), 4);
+        assert_eq!(shortcuts[0].id, "semgrep-check");
+        assert_eq!(shortcuts[0].label, "Semgrep Check");
+        assert_eq!(shortcuts[0].key, "F5");
+        assert_eq!(shortcuts[0].command, "/gt");
+        assert!(shortcuts[0].enabled);
+        assert_eq!(shortcuts[1].id, "prepare-fix-plan");
+        assert_eq!(shortcuts[1].label, "Prepare Fix Plan");
+        assert_eq!(shortcuts[1].key, "F6");
+        assert_eq!(shortcuts[2].id, "implement-plan");
+        assert_eq!(shortcuts[3].id, "review-guard");
+    }
+
+    #[test]
+    fn app_config_default_includes_terminal_shortcuts() {
+        let config = AppConfig::default();
+
+        assert_eq!(config.terminal_shortcuts, default_terminal_shortcuts());
+    }
+
+    #[test]
+    fn terminal_shortcut_entry_default_is_enabled_and_empty() {
+        let shortcut = TerminalShortcutEntry::default();
+
+        assert!(shortcut.enabled);
+        assert_eq!(shortcut.modifiers, ShortcutModifiers::default());
+        assert!(shortcut.id.is_empty());
+        assert!(shortcut.label.is_empty());
+        assert!(shortcut.key.is_empty());
+        assert!(shortcut.command.is_empty());
+    }
+
+    #[test]
+    fn ui_config_defaults_include_panel_widths() {
+        let config = UiConfig::default();
+
+        assert_eq!(config.project_explorer_width, 352.0);
+        assert_eq!(config.checklist_panel_width, 352.0);
+        assert_eq!(config.browser_panel_width, 520.0);
     }
 
     #[test]

@@ -1,5 +1,120 @@
 ### Known Issues & Fix Log
 
+#### Shortcut focus, modifier normalization, recording cancel, and CF_HDROP handle follow-up {#shortcut-focus-modifier-normalization-recording-cancel-cf-hdrop-handle-follow-up}
+- Date: 2026-05-04
+- Context: Code review follow-up fixing focus gating, modifier semantics, recording cancellation, and Windows clipboard handle usage
+- Error signature: `Terminal shortcuts fire after Settings closes; Ctrl-only shortcuts fail on Windows/Linux; Cancel button doesn't stop recording; Explorer image paste uses wrong handle`
+- Symptoms/Impact:
+  1. Terminal command shortcuts buffered in `raw_input_hook` would execute after Settings popup closed, even though they were pressed while UI had focus.
+  2. On Windows/Linux, a shortcut configured with only Ctrl checkbox never matched because egui's `command` alias is true for Ctrl, and stored `command=false` didn't match `egui::Modifiers::command=true`.
+  3. Settings shortcut recording Cancel button set a flag that was checked before the UI rendered, so cancellation was delayed by one frame.
+  4. Windows CF_HDROP image paste used `GlobalLock` pointer as `HDROP` handle, causing `DragQueryFileW` to fail silently and fall through to bitmap materialization instead of using the original file path.
+- Root cause:
+  1. `partition_terminal_command_shortcuts()` was called in `raw_input_hook` before checking `should_capture_terminal_keyboard()`, so shortcuts were buffered even when UI owned keyboard. `handle_shortcuts()` did not drain the buffer when UI owned keyboard.
+  2. Stored `ShortcutModifiers::command` was compared to `egui::Modifiers::command` (cross-platform alias), but egui sets `command=true` for Ctrl on Windows/Linux. The stored `command` should represent physical macOS Cmd via `mac_cmd`.
+  3. `draw_settings_shortcuts_section()` checked `if capture_cancelled` before rendering shortcut cards, so the Cancel button click (which set `capture_cancelled = true`) was processed one frame late.
+  4. `GlobalLock` returns a pointer to a `DROPFILES` structure, not an `HDROP` handle. `DragQueryFileW` expects the handle directly from `GetClipboardData(CF_HDROP)`.
+- Resolution:
+  - Add `should_capture_terminal_keyboard()` check before `partition_terminal_command_shortcuts()` in `raw_input_hook`; only buffer command shortcuts when terminal owns keyboard.
+  - Add else branch in `handle_shortcuts()` to drain `buffered_terminal_command_shortcuts` when UI owns keyboard, preventing stale execution.
+  - Add `egui_modifiers_to_stored()` helper that maps `egui::Modifiers::mac_cmd` to `ShortcutModifiers::command` (physical Cmd only).
+  - Update `match_terminal_shortcut_result()` to compare stored `command` with `egui::Modifiers::mac_cmd` (not `command` alias).
+  - On non-macOS, treat stored `command=true` as `false` for backward compatibility with old captures that had the alias bug.
+  - Update key capture in Settings to use `egui_modifiers_to_stored()` so Ctrl on Windows stores `command=false`.
+  - Change Cancel button to directly set `settings_shortcut_recording_index = None` instead of using a flag.
+  - Clear `key_captured` when `capture_cancelled` is true to prevent assigning a key during the same frame as Escape.
+  - Remove `GlobalLock`/`GlobalUnlock` from CF_HDROP handling; use the `HDROP` handle directly from `GetClipboardData`.
+  - Add RAII scope guard to ensure `CloseClipboard()` is always called after successful `OpenClipboard()`.
+  - Add regression tests: `raw_input_hook_does_not_buffer_terminal_shortcuts_when_settings_owns_keyboard`, `handle_shortcuts_discards_buffered_shortcuts_when_ui_owns_keyboard`, `ctrl_only_terminal_shortcut_matches_windows_command_alias`, `shortcut_capture_uses_mac_cmd_not_command_alias`, `shortcut_recording_cancel_button_clears_recording_state`.
+- Prevent recurrence:
+  - Shortcut partitioning must be gated by keyboard capture before buffering or consuming events.
+  - Buffered terminal command shortcuts must be drained when UI gains focus.
+  - `ShortcutModifiers::command` must mean physical macOS Cmd via `egui::Modifiers::mac_cmd`, not egui's cross-platform `command` alias.
+  - Capture, matching, display, and duplicate detection must share one normalized modifier representation.
+  - Shortcut recording Cancel/Escape must clear runtime recording state in the same frame without persisting config.
+  - CF_HDROP handle must be passed directly to `DragQueryFileW` without `GlobalLock`.
+  - `CloseClipboard()` must be guaranteed on all return paths after successful `OpenClipboard()`.
+- Files/Commands touched: `src/app.rs` (shortcut focus gating, modifier normalization, recording cancel, CF_HDROP handle), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: Review findings from 2026-05-04 addressing focus gating, modifier semantics, cancellation timing, and clipboard handle usage.
+
+#### Shortcut customization and Windows image file paste fully implemented {#shortcut-customization-and-windows-image-file-paste-complete}
+- Date: 2026-05-04
+- Context: Configurable terminal shortcuts with arbitrary key/modifier editing, Windows CF_HDROP clipboard support, and config recovery fixes
+- Error signature: `Runtime only checks F6/F7/F8; Settings cannot set arbitrary keys; Windows copied image files not pasted as paths; Panel widths not recovered on restart`
+- Symptoms/Impact:
+  1. Runtime shortcut dispatch was hard-coded to only check F6/F7/F8, ignoring other configured shortcuts.
+  2. Settings UI could not capture arbitrary keys or edit modifiers for shortcuts.
+  3. Duplicate enabled shortcut combos would execute the first match instead of blocking.
+  4. Copied image files from Windows Explorer were not read from CF_HDROP clipboard data.
+  5. Panel widths were not preserved during config recovery when `config_save_requires_reload` was true.
+- Root cause:
+  1. `handle_shortcuts()` used a fixed array `[F6, F7, F8]` instead of iterating enabled config entries.
+  2. Settings UI exposed command/label editing but not key capture or modifier checkboxes.
+  3. Conflict detection showed warnings but did not prevent ambiguous execution.
+  4. `clipboard_image_path()` relied on text path detection or bitmap extraction, not Windows file-drop API.
+  5. `recover_config_state()` did not include `project_explorer_width`, `checklist_panel_width`, or `browser_panel_width`.
+- Resolution:
+  - Add `TerminalShortcutMatchResult` enum with `Command`, `Conflict`, and `None` variants.
+  - Add `match_terminal_shortcut_result()` helper that detects and reports duplicate enabled combos.
+  - Add `partition_terminal_command_shortcuts()` to filter shortcut events before terminal input routing.
+  - Update `raw_input_hook()` to capture command shortcuts before `partition_terminal_input_events()`.
+  - Add `buffered_terminal_command_shortcuts` field and `take_buffered_terminal_command_shortcuts()` method.
+  - Update `handle_shortcuts()` to process buffered command shortcuts from config.
+  - Add `settings_shortcut_recording_index` state for key capture mode.
+  - Add key capture button and modifier checkboxes (Ctrl/Alt/Shift/Cmd) to Settings UI.
+  - Add "Add Custom Shortcut" button with timestamp-based ID generation.
+  - Block execution when duplicate enabled combos are detected; show conflict in status line.
+  - Add Windows-only `clipboard_image_path_from_hdrop()` using `OpenClipboard`, `GetClipboardData(CF_HDROP)`, and `DragQueryFileW`.
+  - Add `windows` crate features: `Win32_System_DataExchange`, `Win32_System_Memory`, `Win32_UI_Shell`.
+  - Preserve panel widths in `recover_config_state()` when `pending_config_changes.ui` is true.
+  - Add `format_modifiers()` and `format_shortcut_for_display()` helpers.
+  - Add `find_terminal_shortcut_duplicates()` for Settings conflict display.
+- Prevent recurrence:
+  - Runtime shortcut matching must inspect all enabled entries in `AppConfig::terminal_shortcuts`.
+  - Settings must allow creating arbitrary shortcut entries with full key/modifier editing.
+  - Duplicate enabled shortcut combos must block execution, not merely warn.
+  - On Windows, copied image files from Explorer must be read from CF_HDROP before bitmap materialization.
+  - Config recovery must preserve persisted panel width fields.
+  - Add regression tests for config-driven shortcut dispatch, conflict detection, and key capture.
+- Files/Commands touched: `src/models.rs` (modifiers helper), `src/app.rs` (shortcut system, key capture, CF_HDROP), `Cargo.toml` (Windows features), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: Fix plan prepared on 2026-05-04 implementing remaining shortcut and clipboard features.
+
+#### Configurable terminal shortcuts, image paste paths, resizable panels, directory icons, and OpenCode scroll regressions {#configurable-shortcuts-image-paste-resizable-panels-directory-icons-opencode-scroll}
+- Date: 2026-04-30
+- Context: Terminal workflow shortcuts, clipboard paste behavior, panel resizing, Directory UI, and OpenCode terminal scrollback
+- Error signature: `Function-key command shortcuts are unavailable; image paste does not paste a path; side panels are fixed-width; Directory rows lack file icons; OpenCode scrollback may not scroll`
+- Symptoms/Impact:
+  1. Users cannot configure arbitrary terminal command shortcuts from Settings.
+  2. Default workflow shortcuts such as `F6`, `F7`, and `F8` do not submit common commands automatically.
+  3. Clipboard image paste cannot insert an image file path into the terminal.
+  4. Left and right panels use fixed widths and cannot be resized with the mouse.
+  5. Directory files/folders are text-only and lack IDE-style visual file type cues.
+  6. OpenCode terminal scrollback can fail to scroll correctly when wheel hit-testing misses the terminal or bottom-stick behavior overrides manual scroll.
+- Root cause:
+  1. `AppConfig` has no persisted terminal shortcut model.
+  2. `handle_shortcuts()` only handles built-in navigation shortcuts, not user-configured command shortcuts.
+  3. `paste_clipboard_to_terminal()` reads only clipboard text through `arboard::Clipboard::get_text()`.
+  4. Project Explorer, Check-list, and Browser panels use fixed constants with `.resizable(false)` and `.exact_width(...)`.
+  5. `draw_directory_file_row()` and `draw_directory_folder_row()` render only highlighted text.
+  6. Terminal wheel handling relies on `pointer.interact_pos()` and OpenCode scroll can be pulled back by terminal bottom-stick behavior.
+- Resolution:
+  - Add persisted `terminal_shortcuts` config with defaults for `F6 -> /prepare-fix-plan`, `F7 -> /implement-plan`, and `F8 -> /review-guard`.
+  - Add a Settings Shortcuts section to create, edit, remove, enable, disable, and reset shortcut entries.
+  - Route handled shortcuts to the active terminal through the existing command submission path and consume the original key event.
+  - Extend terminal paste to detect clipboard image file paths and bitmap image data; paste a path, saving bitmap data to disk when necessary.
+  - Replace fixed-width SidePanel usage with horizontally resizable persisted widths for Project Explorer, Check-list, and Browser panels.
+  - Add extension-based Directory row icons without adding filesystem metadata calls or changing search/lazy-load behavior.
+  - Fix OpenCode scroll by using hover-position fallback for wheel hit-testing and disabling bottom-stick after manual OpenCode wheel scroll.
+- Prevent recurrence:
+  - Keep user-configurable shortcuts in config, not hard-coded event branches.
+  - Add regression tests for shortcut dispatch, focus blocking, and duplicate conflict detection.
+  - Preserve text paste fallback whenever image paste extraction fails.
+  - Persist panel widths only on meaningful changes and clamp them to safe ranges.
+  - Directory icons must use existing node data and must not trigger extra filesystem work.
+  - OpenCode wheel behavior must remain narrowly scoped so other mouse-reporting TUIs keep runtime wheel forwarding.
+- Files/Commands touched: `src/models.rs`, `src/app.rs`, `Cargo.toml` (added chrono), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User requested configurable shortcuts, image-path paste, resizable panels, Directory icons, and OpenCode scroll verification.
+
 #### Browser panel now follows active terminal project with isolated browser instances {#browser-panel-follows-active-terminal-project}
 - Date: 2026-04-30
 - Context: Browser panel project scoping and terminal synchronization
@@ -3083,5 +3198,4 @@
   - Cap per-frame subtree requests to maintain responsiveness in large projects.
 - Files/Commands touched: `src/app.rs` (collect_search_deferred_directory_paths, draw_directory_panel), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User report that directory search cannot find files inside folders.
-
 

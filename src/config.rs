@@ -7,8 +7,8 @@ use directories::ProjectDirs;
 use serde::Deserialize;
 
 use crate::models::{
-    default_launchers, normalize_launcher_entries, AppConfig, AppHistory, ProjectRecord, ShellKind,
-    UiConfig,
+    default_launchers, default_terminal_shortcuts, normalize_launcher_entries, AppConfig,
+    AppHistory, ProjectRecord, ShellKind, UiConfig,
 };
 
 const QUALIFIER: &str = "com";
@@ -229,6 +229,7 @@ impl From<LegacyAppConfig> for AppConfig {
             default_shell: value.default_shell,
             ui: value.ui,
             launchers: default_launchers(),
+            terminal_shortcuts: default_terminal_shortcuts(),
             projects,
             ai_hooks: crate::hooks::AiHooksConfig::default(),
             opencode: crate::models::OpenCodeModelConfig::default(),

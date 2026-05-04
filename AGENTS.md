@@ -110,6 +110,9 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Factory Droid hook format:** Only `droid-hook:*` and `factory-droid-hook:*` format patterns are recognized for Factory Droid. The `claude-hook:*` format is not supported.
 - **Factory Droid detection commands:** Only `droid` and `factory` trigger Factory Droid session detection. Do not add `cc`, `claude`, or other AI CLI commands.
 - **OpenCode detection commands:** `opencode` triggers OpenCode session detection. OpenCode is tracked through explicit launch detection, process-based status, visible UI/title parsing, notify/inbox status paths, and the Mergen-owned `mergen-opencode-status.js` plugin. If OpenCode hangs at `Loading plugins`, inspect MCP startup load before disabling the plugin path.
+- **OpenCode scrollback should prioritize Mergen scrolling.** When OpenCode is active, mouse wheel events over terminal output should scroll Mergen's terminal scrollback, not be forwarded to OpenCode's TUI.
+- **OpenCode wheel handling must not affect other TUIs.** Preserve runtime mouse-wheel forwarding for non-OpenCode mouse-reporting applications.
+- **Wheel hit-testing must use hover fallback.** Terminal wheel handling should use hover position before falling back to interaction position so passive wheel scrolling works.
 - **Codex CLI integration:** Codex uses strict hook-only integration with narrow visible-state exceptions. Mergen configures `hooks.json` with `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, and `Stop` events that route to the Mergen bridge. The status transitions are:
   - `UserPromptSubmit`, `PreToolUse`, and `PostToolUse` hooks → Running (gray spinner)
   - `PermissionRequest` hook → `ApprovalRequested` / amber pulse (waiting for user)
@@ -212,3 +215,44 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Browser panel follows active terminal project.** The browser panel shows the active terminal's project, not the manually selected project. When the active terminal changes, the browser panel automatically switches to that terminal's project.
 - **Project browsers are isolated and persistent.** Each project has its own browser instance (`embedded_browsers_by_project`). Switching projects hides the previous browser but preserves its state; returning to that project shows the same browser state.
 - **Browser instances are lazily created.** A browser instance is only created when first needed (when the panel opens for that project). This avoids unnecessary WebView2 resource usage for projects never viewed in the browser.
+
+## Terminal Shortcut Guidelines
+- **Terminal shortcuts are user-configurable.** Store custom terminal command shortcuts in `AppConfig::terminal_shortcuts`; do not hard-code new terminal command shortcuts directly in input handling.
+- **Runtime shortcut matching must inspect all enabled entries in `AppConfig::terminal_shortcuts`.** Never hard-code only F6/F7/F8; match any enabled shortcut from config with its key and modifiers.
+- **Default terminal shortcuts must remain available.** Defaults are `F5 -> /gt`, `F6 -> /prepare-fix-plan`, `F7 -> /implement-plan`, and `F8 -> /review-guard`, and missing config fields should recover these defaults.
+- **Shortcuts send commands to the active terminal.** A triggered terminal shortcut must submit the configured command plus Enter using the same terminal command path used by launcher/saved-message submission.
+- **Settings must allow creating arbitrary shortcut entries.** Support key capture, modifier editing (Ctrl/Alt/Shift/Cmd), label editing, command editing, add/remove, and reset to defaults.
+- **Text input focus must block terminal shortcuts.** Do not trigger command shortcuts while settings fields, file editor, directory search, browser URL input, or other text inputs own keyboard focus.
+- **Shortcut key events must be consumed before PTY routing.** Handle command shortcuts in `raw_input_hook` before `partition_terminal_input_events` so matched events are removed from the stream.
+- **Duplicate enabled shortcut combos must block ambiguous execution.** When multiple enabled shortcuts share the same key/modifier combination, detect the conflict, show a warning status, and execute none of them.
+- **Shortcut conflicts must be visible in Settings.** Display duplicate key combination warnings in the Shortcuts settings panel with specific combo details.
+- **Shortcut partitioning must be gated by keyboard capture before buffering.** In `raw_input_hook`, check `should_capture_terminal_keyboard()` before calling `partition_terminal_command_shortcuts()`. Only buffer shortcuts when the terminal owns the keyboard; when the UI owns the keyboard (Settings open), leave events for the UI.
+- **Buffered terminal command shortcuts must be drained when UI gains focus.** In `handle_shortcuts()`, if `ui_owns_keyboard` is true, drain `buffered_terminal_command_shortcuts` without executing to prevent stale shortcuts from firing after Settings closes.
+- **`ShortcutModifiers::command` means physical macOS Command key only.** Use `egui::Modifiers::mac_cmd` (physical Command key) when storing and matching shortcuts, not `egui::Modifiers::command` which is a cross-platform alias that equals Ctrl on Windows/Linux.
+- **Normalize captured modifiers using `egui_modifiers_to_stored()`.** Convert egui modifiers to stored representation using `mac_cmd` for the `command` field to ensure Ctrl on Windows/Linux doesn't incorrectly set `command=true`.
+- **Backward compatibility for stored shortcuts on non-macOS.** When matching on Windows/Linux, ignore `ShortcutModifiers::command` in stored shortcuts (treat it as false) since old captures may have `command=true` due to the egui alias bug; only physical Ctrl should matter.
+- **Shortcut recording cancellation must clear runtime state immediately.** Both Escape key and Cancel button must set `settings_shortcut_recording_index = None` in the same frame. When cancelling, discard any key captured during that frame to prevent unwanted assignment.
+
+## Clipboard Paste Guidelines
+- **Terminal paste should preserve text fallback.** Text clipboard paste must continue to use the existing queued paste path.
+- **Clipboard images paste as paths.** If the clipboard contains an image file path, paste the image path into the terminal instead of image bytes.
+- **On Windows, copied image files from Explorer must be read from CF_HDROP before bitmap materialization.** This preserves the original file path and avoids creating duplicate saved images.
+- **Prefer the original copied image file path over saving a duplicate bitmap.** When CF_HDROP provides an image file path, use that path directly instead of materializing a new screenshot.
+- **Bitmap clipboard images must be materialized.** If the clipboard contains bitmap/image data without a file path, save it to a user-accessible screenshots folder and paste the saved file path.
+- **Do not block normal paste on image failures.** If image extraction or saving fails, fall back to text clipboard paste when text exists; otherwise show a clear status-line error.
+- **Generated image paths must be terminal-safe.** Normalize generated paths consistently and avoid control characters in filenames.
+- **Clipboard image path normalization must reject control characters and produce terminal-safe paths.**
+- **CF_HDROP handle must be used directly without GlobalLock.** The handle returned by `GetClipboardData(CF_HDROP)` is an `HDROP` handle; pass it directly to `DragQueryFileW`. Do not call `GlobalLock` on it - that returns a pointer to `DROPFILES`, not an `HDROP` handle.
+- **Clipboard close must be guaranteed on all return paths.** Use a scope guard or RAII pattern to ensure `CloseClipboard()` is called after successful `OpenClipboard()`, even on early returns or errors.
+
+## Resizable Panel Guidelines
+- **Side panels should be horizontally resizable.** Project Explorer, Check-list, and Browser panels should allow mouse-driven width resizing while keeping full-height SidePanel behavior.
+- **Panel widths are persisted UI config.** Store user-resized widths in `UiConfig` and clamp them to safe min/max ranges.
+- **Do not make settings popups resizable.** Modal/pop-up windows such as Settings must keep their fixed sizing unless explicitly redesigned.
+- **Avoid per-frame config writes.** Persist resized panel widths only when width changes meaningfully to prevent excessive disk writes.
+- **Config recovery must preserve persisted panel width fields.** Ensure `recover_config_state()` preserves `project_explorer_width`, `checklist_panel_width`, and `browser_panel_width` when `pending_config_changes.ui` is true.
+
+## Directory Icons Guidelines
+- **Directory rows must include stable icons.** File and folder rows should render IDE-like icons without changing lazy loading, search filtering, or row ordering behavior.
+- **Directory file icons are extension-based only.** Do not add blocking metadata reads just to choose icons; use the existing `DirectoryNode` path/name data.
+- **Directory search highlighting must remain char-safe with icons.** Adding icons must not alter UTF-8-safe match highlighting or split multi-byte characters.

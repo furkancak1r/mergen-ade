@@ -199,6 +199,7 @@ const ACCENT: Color32 = Color32::from_rgb(200, 200, 200);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(255, 255, 255);
 const TEXT_MUTED: Color32 = Color32::from_rgb(140, 140, 140);
 const DIRECTORY_SEARCH_MATCH_COLOR: Color32 = Color32::from_rgb(255, 176, 64);
+// Fallback defaults for persisted, resizable side panels.
 const PROJECT_EXPLORER_WIDTH: f32 = 352.0;
 const CHECKLIST_PANEL_WIDTH: f32 = 352.0;
 const BROWSER_PANEL_WIDTH: f32 = 520.0;
@@ -335,6 +336,13 @@ enum AppIcon {
     Globe,
     List,
     Plus,
+    File,
+    FileText,
+    FileCode,
+    FileJson,
+    FileImage,
+    FileArchive,
+    Database,
     Terminal,
     TerminalWindow,
     Trash,
@@ -343,7 +351,7 @@ enum AppIcon {
 }
 
 impl AppIcon {
-    const ALL: [Self; 24] = [
+    const ALL: [Self; 31] = [
         Self::ArrowClockwise,
         Self::ArrowLeft,
         Self::ArrowRight,
@@ -363,6 +371,13 @@ impl AppIcon {
         Self::Globe,
         Self::List,
         Self::Plus,
+        Self::File,
+        Self::FileText,
+        Self::FileCode,
+        Self::FileJson,
+        Self::FileImage,
+        Self::FileArchive,
+        Self::Database,
         Self::Terminal,
         Self::TerminalWindow,
         Self::Trash,
@@ -391,6 +406,13 @@ impl AppIcon {
             Self::Globe => "globe",
             Self::List => "list",
             Self::Plus => "plus",
+            Self::File => "file",
+            Self::FileText => "file-text",
+            Self::FileCode => "file-code",
+            Self::FileJson => "file-json",
+            Self::FileImage => "file-image",
+            Self::FileArchive => "file-archive",
+            Self::Database => "database",
             Self::Terminal => "terminal",
             Self::TerminalWindow => "app-window",
             Self::Trash => "trash-2",
@@ -1024,6 +1046,8 @@ pub struct AdeApp {
     input_routing_gate_ms: u64,
     buffered_terminal_input: Vec<Event>,
     buffered_terminal_navigation: Vec<TerminalNavigationShortcut>,
+    /// Buffered terminal command shortcuts (key, modifiers, command) captured in raw_input_hook
+    buffered_terminal_command_shortcuts: Vec<(egui::Key, egui::Modifiers, String)>,
     terminal_held_key_repeat: Option<TerminalHeldKeyRepeat>,
     allow_attention_terminal_input_routing_once: bool,
     pending_terminal_pastes: Vec<PendingTerminalPaste>,
@@ -1035,6 +1059,8 @@ pub struct AdeApp {
     allow_confirmed_close: bool,
     active_settings_section: SettingsSection,
     settings_diagnostics_expanded: bool,
+    /// Which shortcut index is currently recording a key (None if not recording)
+    settings_shortcut_recording_index: Option<usize>,
     saved_message_drafts: BTreeMap<u64, String>,
     launcher_draft: LauncherDraftState,
     launcher_icon_textures: BTreeMap<LauncherIconKey, TextureHandle>,
@@ -1394,6 +1420,8 @@ struct TerminalEntry {
     selection_snapshot: Option<TerminalSelectionSnapshot>,
     pending_link_click: Option<PendingTerminalLinkClick>,
     selection_drag_active: bool,
+    /// Track if user manually scrolled in OpenCode to disable stick-to-bottom.
+    opencode_manual_scroll_detached: bool,
     snapshot_refresh_deferred: bool,
     activation_scroll_align_pending: bool,
     prompt_scroll_anchor_detached: bool,
@@ -2227,6 +2255,7 @@ impl DirectorySearchVisiblePaths {
 struct PendingConfigChanges {
     default_shell: bool,
     launchers: bool,
+    shortcuts: bool,
     opencode: bool,
     ui: bool,
     projects: bool,
@@ -2240,15 +2269,17 @@ enum SettingsSection {
     Launchers,
     OpenCode,
     SavedMessages,
+    Shortcuts,
     Diagnostics,
 }
 
 impl SettingsSection {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::General,
         Self::Launchers,
         Self::OpenCode,
         Self::SavedMessages,
+        Self::Shortcuts,
         Self::Diagnostics,
     ];
 
@@ -2258,6 +2289,7 @@ impl SettingsSection {
             Self::Launchers => "Launchers",
             Self::OpenCode => "OpenCode",
             Self::SavedMessages => "Saved Messages",
+            Self::Shortcuts => "Shortcuts",
             Self::Diagnostics => "Diagnostics",
         }
     }
@@ -2268,6 +2300,7 @@ impl SettingsSection {
             Self::Launchers => "Launchers",
             Self::OpenCode => "OpenCode",
             Self::SavedMessages => "Saved Messages",
+            Self::Shortcuts => "Shortcuts",
             Self::Diagnostics => "Diagnostics",
         }
     }
@@ -2284,6 +2317,9 @@ impl SettingsSection {
             Self::SavedMessages => {
                 "Manage saved messages per project and send them to active terminals."
             }
+            Self::Shortcuts => {
+                "Configure keyboard shortcuts to send commands to the active terminal."
+            }
             Self::Diagnostics => {
                 "Inspect Factory Droid and Codex CLI wiring, health, and runtime signals."
             }
@@ -2296,6 +2332,7 @@ impl SettingsSection {
             Self::Launchers => AppIcon::TerminalWindow,
             Self::OpenCode => AppIcon::ChatText,
             Self::SavedMessages => AppIcon::ChatText,
+            Self::Shortcuts => AppIcon::Terminal,
             Self::Diagnostics => AppIcon::Eye,
         }
     }
@@ -2306,6 +2343,7 @@ impl SettingsSection {
             Self::Launchers => "settings-launchers-scroll",
             Self::OpenCode => "settings-opencode-scroll",
             Self::SavedMessages => "settings-saved-messages-scroll",
+            Self::Shortcuts => "settings-shortcuts-scroll",
             Self::Diagnostics => "settings-diagnostics-scroll",
         }
     }
@@ -2336,6 +2374,7 @@ struct SettingsEditOutcome {
     launchers_changed: bool,
     opencode_changed: bool,
     projects_changed: bool,
+    shortcuts_changed: bool,
 }
 
 impl SettingsEditOutcome {
@@ -2362,6 +2401,41 @@ impl SettingsEditOutcome {
     fn note_projects_change(&mut self) {
         self.should_persist = true;
         self.projects_changed = true;
+    }
+
+    fn note_shortcuts_change(&mut self) {
+        self.should_persist = true;
+        self.shortcuts_changed = true;
+    }
+}
+
+/// Result type for terminal shortcut matching with conflict detection
+enum TerminalShortcutMatchResult<'a> {
+    /// Shortcut found with command to execute
+    Command(&'a str),
+    /// Duplicate enabled shortcut combo detected
+    Conflict(String),
+    /// No matching enabled shortcut
+    None,
+}
+
+impl<'a> TerminalShortcutMatchResult<'a> {
+    fn command(&self) -> Option<&'a str> {
+        match self {
+            TerminalShortcutMatchResult::Command(cmd) => Some(cmd),
+            _ => None,
+        }
+    }
+
+    fn is_conflict(&self) -> bool {
+        matches!(self, TerminalShortcutMatchResult::Conflict(_))
+    }
+
+    fn conflict_message(&self) -> Option<&str> {
+        match self {
+            TerminalShortcutMatchResult::Conflict(msg) => Some(msg),
+            _ => None,
+        }
     }
 }
 
@@ -3328,6 +3402,7 @@ impl AdeApp {
             input_routing_gate_ms: 0,
             buffered_terminal_input: Vec::new(),
             buffered_terminal_navigation: Vec::new(),
+            buffered_terminal_command_shortcuts: Vec::new(),
             terminal_held_key_repeat: None,
             allow_attention_terminal_input_routing_once: false,
             pending_terminal_pastes: Vec::new(),
@@ -3339,6 +3414,7 @@ impl AdeApp {
             allow_confirmed_close: false,
             active_settings_section: SettingsSection::General,
             settings_diagnostics_expanded: false,
+            settings_shortcut_recording_index: None,
             saved_message_drafts: BTreeMap::new(),
             launcher_draft: LauncherDraftState::default(),
             launcher_icon_textures: BTreeMap::new(),
@@ -3485,6 +3561,10 @@ impl AdeApp {
 
     fn note_launchers_changed(&mut self) {
         self.pending_config_changes.launchers = true;
+    }
+
+    fn note_shortcuts_changed(&mut self) {
+        self.pending_config_changes.shortcuts = true;
     }
 
     fn note_opencode_changed(&mut self) {
@@ -3763,6 +3843,7 @@ impl AdeApp {
             selection_snapshot: None,
             pending_link_click: None,
             selection_drag_active: false,
+            opencode_manual_scroll_detached: false,
             snapshot_refresh_deferred: false,
             activation_scroll_align_pending: false,
             prompt_scroll_anchor_detached: false,
@@ -8000,6 +8081,29 @@ impl AdeApp {
     fn handle_shortcuts(&mut self, ctx: &egui::Context, main_area_size: Vec2) {
         let ui_owns_keyboard = self.ui_owns_keyboard(ctx);
 
+        // Process buffered terminal command shortcuts from raw_input_hook.
+        // Only execute when terminal owns keyboard; drain stale buffer when UI owns keyboard.
+        if !ui_owns_keyboard && !self.text_input_has_focus_extended(ctx) {
+            let buffered_shortcuts = self.take_buffered_terminal_command_shortcuts();
+            if !buffered_shortcuts.is_empty() {
+                // Execute the first valid shortcut (conflicts were already filtered in raw_input_hook)
+                for (_key, _modifiers, command) in buffered_shortcuts {
+                    if !command.is_empty() {
+                        if self.execute_terminal_shortcut(ctx, &command) {
+                            self.show_status_feedback(ctx, &format!("Sent: {command}"));
+                        }
+                        ctx.request_repaint();
+                        // Only execute one shortcut per frame
+                        break;
+                    }
+                }
+            }
+        } else {
+            // UI owns keyboard: discard any buffered shortcuts to prevent
+            // stale shortcuts from executing after Settings closes.
+            let _ = self.take_buffered_terminal_command_shortcuts();
+        }
+
         // Always process buffered navigation shortcuts (including when Terminal Manager is open)
         let buffered_shortcuts = self.take_buffered_terminal_navigation_shortcuts();
 
@@ -8136,13 +8240,6 @@ impl AdeApp {
         self.single_terminal_id_for_main()
     }
 
-    fn should_capture_terminal_keyboard_state(
-        active_terminal_accepts_input: bool,
-        ui_owns_keyboard: bool,
-    ) -> bool {
-        active_terminal_accepts_input && !ui_owns_keyboard
-    }
-
     fn directory_search_input_id() -> Id {
         Id::new(DIRECTORY_SEARCH_INPUT_ID)
     }
@@ -8176,6 +8273,29 @@ impl AdeApp {
         })
     }
 
+    /// Returns true if any text input field currently has keyboard focus.
+    fn text_input_has_focus_extended(&self, ctx: &egui::Context) -> bool {
+        // Base text inputs
+        if self.text_input_has_focus(ctx) {
+            return true;
+        }
+        // File editor
+        if ctx.memory(|mem| mem.has_focus(egui::Id::new(FILE_EDITOR_INPUT_ID))) {
+            return true;
+        }
+        // Browser URL input for any project
+        for project_id in self.projects.keys() {
+            if ctx.memory(|mem| mem.has_focus(Self::browser_url_input_id(*project_id))) {
+                return true;
+            }
+        }
+        // Check if settings popup is open (it has text inputs)
+        if self.show_settings_popup {
+            return true;
+        }
+        false
+    }
+
     fn file_editor_input_id() -> Id {
         Id::new(FILE_EDITOR_INPUT_ID)
     }
@@ -8186,29 +8306,242 @@ impl AdeApp {
             mem.surrender_focus(Self::file_editor_input_id());
             if let Some(project_id) = self.selected_project {
                 mem.surrender_focus(Self::saved_message_draft_input_id(project_id));
-                mem.surrender_focus(Self::browser_url_input_id(project_id));
+            }
+            for project_id in self.projects.keys() {
+                mem.surrender_focus(Self::browser_url_input_id(*project_id));
             }
         });
     }
 
-    fn ui_owns_keyboard_state(
-        text_input_has_focus: bool,
-        popup_open: bool,
-        context_menu_open: bool,
-        show_settings_popup: bool,
-        show_exit_confirm_popup: bool,
-        wants_keyboard_input: bool,
-    ) -> bool {
-        text_input_has_focus
-            || popup_open
-            || context_menu_open
-            || show_exit_confirm_popup
-            || (show_settings_popup && wants_keyboard_input)
+    /// Execute a terminal shortcut by sending its command to the active terminal.
+    /// Returns true if the shortcut was handled (to consume the event).
+    fn execute_terminal_shortcut(&mut self, ctx: &egui::Context, command: &str) -> bool {
+        // Only execute if we have an active terminal that accepts input
+        let Some(terminal_id) = self.active_terminal_accepts_input() else {
+            return false;
+        };
+
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        if terminal.exited {
+            return false;
+        }
+
+        // Send the command
+        if Self::send_command_to_terminal(terminal, command, ctx) {
+            self.show_status_feedback(ctx, &format!("Sent: {command}"));
+            true
+        } else {
+            false
+        }
     }
 
+    /// Check if a key event matches any enabled terminal shortcut.
+    /// Returns the command to execute if matched, None otherwise.
+    fn match_terminal_shortcut(
+        &self,
+        key: &egui::Key,
+        modifiers: &egui::Modifiers,
+    ) -> Option<&str> {
+        self.match_terminal_shortcut_result(key, modifiers)
+            .command()
+    }
+
+    /// Convert egui modifiers to stored ShortcutModifiers.
+    /// Uses `mac_cmd` (physical Command key on macOS) for the `command` field,
+    /// not egui's `command` alias which equals Ctrl on Windows/Linux.
+    fn egui_modifiers_to_stored(modifiers: &egui::Modifiers) -> crate::models::ShortcutModifiers {
+        crate::models::ShortcutModifiers {
+            ctrl: modifiers.ctrl,
+            alt: modifiers.alt,
+            shift: modifiers.shift,
+            command: modifiers.mac_cmd, // Physical Cmd on macOS; always false elsewhere
+        }
+    }
+
+    /// Match a key/modifier combo against enabled shortcuts with conflict detection.
+    /// Compares stored `command` (physical macOS Cmd) against egui `mac_cmd`.
+    fn match_terminal_shortcut_result(
+        &self,
+        key: &egui::Key,
+        modifiers: &egui::Modifiers,
+    ) -> TerminalShortcutMatchResult<'_> {
+        let key_str = format!("{:?}", key);
+        let mut matches: Vec<&crate::models::TerminalShortcutEntry> = Vec::new();
+
+        for shortcut in &self.config.terminal_shortcuts {
+            if !shortcut.enabled || shortcut.key.is_empty() || shortcut.command.is_empty() {
+                continue;
+            }
+            // Normalize stored modifiers for non-macOS backward compatibility:
+            // Old captures may have command=true due to the egui alias bug.
+            // On non-macOS, treat command=true as command=false since there's no Cmd key.
+            let stored_command = if cfg!(target_os = "macos") {
+                shortcut.modifiers.command
+            } else {
+                false // Ignore stored command on non-macOS; only Ctrl matters
+            };
+            if shortcut.key.eq_ignore_ascii_case(&key_str)
+                && shortcut.modifiers.ctrl == modifiers.ctrl
+                && shortcut.modifiers.alt == modifiers.alt
+                && shortcut.modifiers.shift == modifiers.shift
+                && stored_command == modifiers.mac_cmd
+            {
+                matches.push(shortcut);
+            }
+        }
+
+        match matches.len() {
+            0 => TerminalShortcutMatchResult::None,
+            1 => TerminalShortcutMatchResult::Command(&matches[0].command),
+            _ => {
+                let conflict_key = format!("{} {:?}", key_str, modifiers);
+                let conflict_msg = format!(
+                    "Shortcut conflict: {} shortcuts use {} - none executed",
+                    matches.len(),
+                    conflict_key
+                );
+                TerminalShortcutMatchResult::Conflict(conflict_msg)
+            }
+        }
+    }
+
+    /// Find all duplicate enabled shortcut combos for warning display
+    fn find_terminal_shortcut_duplicates(&self) -> Vec<(String, Vec<String>)> {
+        use std::collections::HashMap;
+        let mut combo_map: HashMap<(String, crate::models::ShortcutModifiers), Vec<String>> =
+            HashMap::new();
+
+        for shortcut in &self.config.terminal_shortcuts {
+            if !shortcut.enabled || shortcut.key.is_empty() {
+                continue;
+            }
+            let key_upper = shortcut.key.to_ascii_uppercase();
+            let combo = (key_upper, shortcut.modifiers);
+            combo_map
+                .entry(combo)
+                .or_default()
+                .push(shortcut.label.clone());
+        }
+
+        combo_map
+            .into_iter()
+            .filter(|(_, labels)| labels.len() > 1)
+            .map(|((key, mods), labels)| {
+                let combo_str = if mods.ctrl || mods.alt || mods.shift || mods.command {
+                    format!("{}+{}", format_modifiers(mods), key)
+                } else {
+                    key
+                };
+                (combo_str, labels)
+            })
+            .collect()
+    }
+
+    /// Capture a key press for shortcut recording
+    fn capture_shortcut_key(key: &egui::Key) -> String {
+        format!("{:?}", key)
+    }
+
+    /// Format modifiers for display (helper function)
+    fn format_shortcut_for_display(key: &str, mods: &crate::models::ShortcutModifiers) -> String {
+        if mods.ctrl || mods.alt || mods.shift || mods.command {
+            format!("{}+{}", format_modifiers(*mods), key)
+        } else {
+            key.to_string()
+        }
+    }
+
+    /// Partition terminal command shortcut events from input events
+    /// Returns (matched_shortcut_events, remaining_events, conflict_messages)
+    fn partition_terminal_command_shortcuts(
+        &self,
+        events: Vec<egui::Event>,
+    ) -> (
+        Vec<(egui::Key, egui::Modifiers, String)>,
+        Vec<egui::Event>,
+        Vec<String>,
+    ) {
+        let mut matched = Vec::new();
+        let mut remaining = Vec::new();
+        let mut conflicts = Vec::new();
+
+        for event in events {
+            if let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            {
+                let result = self.match_terminal_shortcut_result(&key, &modifiers);
+                match result {
+                    TerminalShortcutMatchResult::Command(cmd) => {
+                        matched.push((key, modifiers, cmd.to_string()));
+                    }
+                    TerminalShortcutMatchResult::Conflict(msg) => {
+                        conflicts.push(msg);
+                        // Consume the conflicting event but don't execute
+                    }
+                    TerminalShortcutMatchResult::None => {
+                        remaining.push(event);
+                    }
+                }
+            } else {
+                remaining.push(event);
+            }
+        }
+
+        (matched, remaining, conflicts)
+    }
+}
+
+/// Format modifiers for display
+fn format_modifiers(mods: crate::models::ShortcutModifiers) -> String {
+    let mut parts = Vec::new();
+    if mods.ctrl {
+        parts.push("Ctrl");
+    }
+    if mods.alt {
+        parts.push("Alt");
+    }
+    if mods.shift {
+        parts.push("Shift");
+    }
+    if mods.command {
+        parts.push("Cmd");
+    }
+    parts.join("+")
+}
+
+fn ui_owns_keyboard_state(
+    text_input_has_focus: bool,
+    popup_open: bool,
+    context_menu_open: bool,
+    show_settings_popup: bool,
+    show_exit_confirm_popup: bool,
+    wants_keyboard_input: bool,
+) -> bool {
+    text_input_has_focus
+        || popup_open
+        || context_menu_open
+        || show_exit_confirm_popup
+        || (show_settings_popup && wants_keyboard_input)
+}
+
+fn should_capture_terminal_keyboard_state(
+    active_terminal_accepts_input: bool,
+    ui_owns_keyboard: bool,
+) -> bool {
+    active_terminal_accepts_input && !ui_owns_keyboard
+}
+
+impl AdeApp {
     fn ui_owns_keyboard(&self, ctx: &egui::Context) -> bool {
-        Self::ui_owns_keyboard_state(
-            self.text_input_has_focus(ctx),
+        ui_owns_keyboard_state(
+            self.text_input_has_focus_extended(ctx),
             ctx.memory(|mem| mem.any_popup_open()),
             ctx.is_context_menu_open(),
             self.show_settings_popup,
@@ -8218,7 +8551,7 @@ impl AdeApp {
     }
 
     fn should_capture_terminal_keyboard(&self, ctx: &egui::Context) -> bool {
-        Self::should_capture_terminal_keyboard_state(
+        should_capture_terminal_keyboard_state(
             self.active_terminal_accepts_input().is_some(),
             self.ui_owns_keyboard(ctx),
         )
@@ -8347,7 +8680,7 @@ impl AdeApp {
             return false;
         }
 
-        if !self.text_input_has_focus(ctx) {
+        if !self.text_input_has_focus_extended(ctx) {
             return false;
         }
 
@@ -8774,6 +9107,12 @@ impl AdeApp {
 
     fn take_buffered_terminal_navigation_shortcuts(&mut self) -> Vec<TerminalNavigationShortcut> {
         std::mem::take(&mut self.buffered_terminal_navigation)
+    }
+
+    fn take_buffered_terminal_command_shortcuts(
+        &mut self,
+    ) -> Vec<(egui::Key, egui::Modifiers, String)> {
+        std::mem::take(&mut self.buffered_terminal_command_shortcuts)
     }
 
     fn take_terminal_navigation_shortcuts(
@@ -9588,6 +9927,7 @@ impl AdeApp {
 
         reset_terminal_prompt_scroll_anchor(terminal);
         terminal.runtime.send_bytes(std::mem::take(outbound));
+        reset_opencode_manual_scroll_detached(terminal);
         terminal.dirty = true;
         ctx.request_repaint();
     }
@@ -9601,6 +9941,7 @@ impl AdeApp {
         Self::clear_terminal_selection(terminal);
         reset_terminal_prompt_scroll_anchor(terminal);
         terminal.runtime.send_paste_bytes(paste_bytes);
+        reset_opencode_manual_scroll_detached(terminal);
         Self::append_pending_line(&mut terminal.pending_line_for_title, text);
         Self::append_pending_input_for_history(&mut terminal.pending_input_for_history, text);
         terminal.dirty = true;
@@ -9781,6 +10122,12 @@ impl AdeApp {
                     self.note_selection_changed();
                     self.persist_config();
                 }
+            }
+        }
+
+        if let Some(terminal_id) = terminal_id {
+            if let Some(entry) = self.terminals.get_mut(&terminal_id) {
+                reset_opencode_manual_scroll_detached(entry);
             }
         }
 
@@ -10184,7 +10531,170 @@ impl AdeApp {
             .and_then(|snapshot| terminal_selection_text(snapshot, terminal.selection.as_ref()))
     }
 
+    /// Try to get an image path from clipboard for terminal paste.
+    /// Checks for:
+    /// 1. File path to image (Windows CF_HDROP)
+    /// 2. Bitmap data that needs to be saved
+    /// Returns Some(path) if an image was found/saved, None for normal text paste.
+    fn clipboard_image_path(&self) -> Option<String> {
+        // First try Windows CF_HDROP for copied files from Explorer
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(path) = Self::clipboard_image_path_from_hdrop() {
+                return Some(path);
+            }
+        }
+
+        if let Ok(mut clipboard) = Clipboard::new() {
+            #[cfg(target_os = "windows")]
+            {
+                // Fallback: check if clipboard text is an image path
+                if let Ok(text) = clipboard.get_text() {
+                    let trimmed = text.trim();
+                    if Self::looks_like_image_path(trimmed) {
+                        return Some(trimmed.to_owned());
+                    }
+                }
+            }
+
+            if let Ok(image_data) = clipboard.get_image() {
+                return Self::save_clipboard_image(image_data);
+            }
+        }
+
+        None
+    }
+
+    /// Windows-specific: Read CF_HDROP clipboard data for copied image files.
+    /// CF_HDROP data is an HDROP handle (not a pointer to DROPFILES);
+    /// pass it directly to DragQueryFileW without GlobalLock.
+    #[cfg(target_os = "windows")]
+    fn clipboard_image_path_from_hdrop() -> Option<String> {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::System::DataExchange::{
+            CloseClipboard, GetClipboardData, OpenClipboard,
+        };
+        use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+
+        const CF_HDROP: u32 = 15;
+
+        unsafe {
+            // Open clipboard
+            let hwnd = HWND(std::ptr::null_mut());
+            if OpenClipboard(hwnd).is_err() {
+                return None;
+            }
+
+            // Get clipboard data: the handle itself is the HDROP
+            let hdrop: HDROP = match GetClipboardData(CF_HDROP) {
+                Ok(handle) => HDROP(handle.0 as *mut _), // HDROP is a handle type; no GlobalLock needed
+                Err(_) => {
+                    let _ = CloseClipboard();
+                    return None;
+                }
+            };
+
+            // Scope guard to ensure CloseClipboard is always called
+            struct ClipboardGuard;
+            impl Drop for ClipboardGuard {
+                fn drop(&mut self) {
+                    unsafe {
+                        let _ = CloseClipboard();
+                    }
+                }
+            }
+            let _guard = ClipboardGuard;
+
+            // Get file count
+            let file_count = DragQueryFileW(hdrop, u32::MAX, None);
+
+            // Check each file for image extension
+            for i in 0..file_count {
+                // Get required buffer size
+                let required_len = DragQueryFileW(hdrop, i, None);
+                if required_len == 0 {
+                    continue;
+                }
+
+                // Allocate buffer and get file path
+                let mut buffer: Vec<u16> = vec![0; (required_len + 1) as usize];
+                let len_copied = DragQueryFileW(hdrop, i, Some(&mut buffer));
+                if len_copied == 0 {
+                    continue;
+                }
+
+                // Convert to string
+                let os_string = OsString::from_wide(&buffer[..len_copied as usize]);
+                let path_str = os_string.to_string_lossy();
+
+                // Check if it's an image file
+                if Self::looks_like_image_path(&path_str) {
+                    return Some(path_str.to_string());
+                }
+            }
+
+            None
+        }
+    }
+
+    /// Check if a string looks like an image file path.
+    fn looks_like_image_path(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        let image_exts = [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg"];
+
+        if !image_exts.iter().any(|ext| lower.ends_with(ext)) {
+            return false;
+        }
+
+        text.contains('/') || text.contains('\\') || text.starts_with("C:")
+    }
+
+    /// Save clipboard image data to a file and return the path.
+    fn save_clipboard_image(image_data: arboard::ImageData<'_>) -> Option<String> {
+        let target_dir = if let Some(pictures) = directories::UserDirs::new()
+            .and_then(|dirs| dirs.picture_dir().map(|path| path.to_path_buf()))
+        {
+            pictures.join("Screenshots")
+        } else {
+            directories::BaseDirs::new()
+                .map(|dirs| dirs.data_dir().join("mergen-ade").join("clipboard-images"))
+                .unwrap_or_else(|| PathBuf::from("clipboard-images"))
+        };
+
+        if fs::create_dir_all(&target_dir).is_err() {
+            return None;
+        }
+
+        let timestamp = chrono::Local::now().format("%Y-%m-%d_%H%M%S");
+        let filename = format!("Mergen_clipboard_{}.png", timestamp);
+        let filepath = target_dir.join(&filename);
+
+        let img = image::RgbaImage::from_raw(
+            image_data.width as u32,
+            image_data.height as u32,
+            image_data.bytes.to_vec(),
+        )?;
+
+        if img
+            .save_with_format(&filepath, image::ImageFormat::Png)
+            .is_err()
+        {
+            return None;
+        }
+
+        Some(filepath.to_string_lossy().replace('\\', "/"))
+    }
+
     fn paste_clipboard_to_terminal(&mut self, terminal_id: u64) {
+        if let Some(image_path) = self.clipboard_image_path() {
+            if self.queue_pasted_text_to_terminal(terminal_id, &image_path) {
+                self.status_line = format!("Pasted image path: {}", image_path);
+            }
+            return;
+        }
+
         let text = match Clipboard::new()
             .map_err(|err| err.to_string())
             .and_then(|mut clipboard| clipboard.get_text().map_err(|err| err.to_string()))
@@ -10227,6 +10737,7 @@ impl AdeApp {
             outbound.push(b'\r');
             reset_terminal_prompt_scroll_anchor(terminal);
             terminal.runtime.send_bytes(outbound);
+            reset_opencode_manual_scroll_detached(terminal);
             Self::clear_terminal_selection(terminal);
             Self::append_pending_line(&mut terminal.pending_line_for_title, message);
             // Clear history buffer since we're sending a saved message (direct command)
@@ -10412,6 +10923,7 @@ impl AdeApp {
         outbound.push(b'\r');
         reset_terminal_prompt_scroll_anchor(terminal);
         terminal.runtime.send_bytes(outbound);
+        reset_opencode_manual_scroll_detached(terminal);
         Self::clear_terminal_selection(terminal);
         Self::append_pending_line(&mut terminal.pending_line_for_title, command);
         // Clear history buffer since we're sending a direct command
@@ -10440,6 +10952,7 @@ impl AdeApp {
         outbound.push(b'\r');
         reset_terminal_prompt_scroll_anchor(terminal);
         terminal.runtime.send_bytes(outbound);
+        reset_opencode_manual_scroll_detached(terminal);
         Self::clear_terminal_selection(terminal);
         terminal.pending_line_for_title.clear();
         terminal.pending_input_for_history.clear();
@@ -10614,6 +11127,7 @@ impl AdeApp {
                 outbound.push(b'\r');
                 reset_terminal_prompt_scroll_anchor(terminal);
                 terminal.runtime.send_bytes(outbound);
+                reset_opencode_manual_scroll_detached(terminal);
                 Self::clear_terminal_selection(terminal);
                 terminal.pending_line_for_title.clear();
                 terminal.pending_input_for_history.clear();
@@ -10855,6 +11369,9 @@ impl AdeApp {
                             }
                             SettingsSection::SavedMessages => {
                                 self.draw_settings_saved_messages_section(ctx, ui, changes);
+                            }
+                            SettingsSection::Shortcuts => {
+                                self.draw_settings_shortcuts_section(ctx, ui, changes);
                             }
                             SettingsSection::Diagnostics => {
                                 self.draw_settings_diagnostics_section(ctx, ui, diagnostics);
@@ -11669,6 +12186,300 @@ impl AdeApp {
         }
     }
 
+    fn draw_settings_shortcuts_section(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut Ui,
+        changes: &mut SettingsEditOutcome,
+    ) {
+        use crate::models::{default_terminal_shortcuts, ShortcutModifiers, TerminalShortcutEntry};
+
+        ui.label(
+            RichText::new("Configure keyboard shortcuts to send commands to the active terminal.")
+                .small()
+                .color(TEXT_MUTED),
+        );
+        ui.add_space(12.0);
+
+        // Check for duplicates using the new helper
+        let duplicates = self.find_terminal_shortcut_duplicates();
+        if !duplicates.is_empty() {
+            let dup_summary = duplicates
+                .iter()
+                .map(|(combo, _)| combo.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            ui.label(
+                RichText::new(format!(
+                    "Warning: Duplicate key combinations detected: {}. Conflicted shortcuts will not execute.",
+                    dup_summary
+                ))
+                .small()
+                .color(Color32::from_rgb(232, 184, 76)),
+            );
+            ui.add_space(8.0);
+        }
+
+        // Handle key capture mode
+        let mut key_captured: Option<(usize, String, ShortcutModifiers)> = None;
+        let mut capture_cancelled = false;
+
+        if let Some(recording_index) = self.settings_shortcut_recording_index {
+            // Check for key press
+            ctx.input(|input| {
+                for event in &input.events {
+                    if let egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } = event
+                    {
+                        // Escape cancels recording
+                        if *key == egui::Key::Escape {
+                            capture_cancelled = true;
+                            break;
+                        }
+                        // Any other key captures
+                        let key_str = Self::capture_shortcut_key(key);
+                        let mods = Self::egui_modifiers_to_stored(modifiers);
+                        key_captured = Some((recording_index, key_str, mods));
+                        break;
+                    }
+                }
+            });
+
+            // Show recording overlay
+            ui.label(
+                RichText::new("Recording key... Press any key to assign, or Escape to cancel.")
+                    .strong()
+                    .color(Color32::from_rgb(114, 209, 152)),
+            );
+            ui.add_space(8.0);
+        }
+
+        if capture_cancelled {
+            self.settings_shortcut_recording_index = None;
+            // Discard any key captured during the same frame as Escape
+            key_captured = None;
+        }
+
+        if let Some((index, key, mods)) = key_captured {
+            if index < self.config.terminal_shortcuts.len() {
+                self.config.terminal_shortcuts[index].key = key;
+                self.config.terminal_shortcuts[index].modifiers = mods;
+                changes.note_shortcuts_change();
+            }
+            self.settings_shortcut_recording_index = None;
+        }
+
+        // List existing shortcuts
+        let mut remove_index: Option<usize> = None;
+        let mut shortcut_changed = false;
+
+        for (index, shortcut) in self.config.terminal_shortcuts.iter_mut().enumerate() {
+            let shortcut_title = shortcut.label.clone();
+            let display_combo =
+                Self::format_shortcut_for_display(&shortcut.key, &shortcut.modifiers);
+            let shortcut_summary = format!("{} → {}", display_combo, shortcut.command);
+
+            show_settings_card(
+                ui,
+                AppIcon::Terminal,
+                &shortcut_title,
+                &shortcut_summary,
+                |ui| {
+                    ui.horizontal(|ui| {
+                        // Enable/disable toggle
+                        let mut enabled = shortcut.enabled;
+                        if ui.checkbox(&mut enabled, "Enabled").changed() {
+                            shortcut.enabled = enabled;
+                            shortcut_changed = true;
+                        }
+
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if styled_icon_button(
+                                ui,
+                                icons::TRASH,
+                                BTN_RED,
+                                BTN_RED_HOVER,
+                                BTN_ICON_ACTIVE,
+                                "Remove shortcut",
+                            ) {
+                                remove_index = Some(index);
+                            }
+                        });
+                    });
+
+                    ui.add_space(8.0);
+
+                    // Key capture row
+                    ui.horizontal(|ui| {
+                        ui.label("Key:");
+                        let is_recording = self.settings_shortcut_recording_index == Some(index);
+                        let button_text = if is_recording {
+                            "Recording..."
+                        } else if shortcut.key.is_empty() {
+                            "Click to record"
+                        } else {
+                            &display_combo
+                        };
+                        if ui.button(button_text).clicked() && !is_recording {
+                            self.settings_shortcut_recording_index = Some(index);
+                        }
+                        if is_recording {
+                            if ui.button("Cancel").clicked() {
+                                // Cancel immediately; Escape path also lands here via the flag below.
+                                self.settings_shortcut_recording_index = None;
+                            }
+                        }
+                    });
+
+                    // Modifiers checkboxes
+                    ui.horizontal(|ui| {
+                        ui.label("Modifiers:");
+                        let mut mods = shortcut.modifiers;
+                        if ui.checkbox(&mut mods.ctrl, "Ctrl").changed() {
+                            shortcut.modifiers = mods;
+                            shortcut_changed = true;
+                        }
+                        if ui.checkbox(&mut mods.alt, "Alt").changed() {
+                            shortcut.modifiers = mods;
+                            shortcut_changed = true;
+                        }
+                        if ui.checkbox(&mut mods.shift, "Shift").changed() {
+                            shortcut.modifiers = mods;
+                            shortcut_changed = true;
+                        }
+                        if ui.checkbox(&mut mods.command, "Cmd").changed() {
+                            shortcut.modifiers = mods;
+                            shortcut_changed = true;
+                        }
+                    });
+
+                    // Command edit
+                    ui.label(RichText::new("Command to send").small().color(TEXT_MUTED));
+                    if with_settings_text_edit_chrome(ui, |ui| {
+                        ui.add_sized(
+                            [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
+                            egui::TextEdit::singleline(&mut shortcut.command)
+                                .hint_text("e.g., /prepare-fix-plan"),
+                        )
+                    })
+                    .changed()
+                    {
+                        shortcut_changed = true;
+                    }
+
+                    // Label edit
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Label (for display)")
+                            .small()
+                            .color(TEXT_MUTED),
+                    );
+                    if with_settings_text_edit_chrome(ui, |ui| {
+                        ui.add_sized(
+                            [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
+                            egui::TextEdit::singleline(&mut shortcut.label)
+                                .hint_text("Shortcut name"),
+                        )
+                    })
+                    .changed()
+                    {
+                        shortcut_changed = true;
+                    }
+                },
+            );
+            ui.add_space(12.0);
+        }
+
+        if let Some(index) = remove_index {
+            if index < self.config.terminal_shortcuts.len() {
+                self.config.terminal_shortcuts.remove(index);
+                // Cancel recording if the removed shortcut was being recorded
+                if self.settings_shortcut_recording_index == Some(index) {
+                    self.settings_shortcut_recording_index = None;
+                }
+                changes.note_shortcuts_change();
+            }
+        }
+
+        if shortcut_changed {
+            changes.note_shortcuts_change();
+        }
+
+        // Add new shortcut section
+        ui.add_space(8.0);
+        show_settings_card(
+            ui,
+            AppIcon::Plus,
+            "Add New Shortcut",
+            "Create a custom keyboard shortcut.",
+            |ui| {
+                // Add custom shortcut button
+                if ui.button("Add Custom Shortcut").clicked() {
+                    let new_id = format!(
+                        "custom-{}-{}",
+                        self.config.terminal_shortcuts.len(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis()
+                    );
+                    let new_shortcut = TerminalShortcutEntry {
+                        id: new_id,
+                        label: "New Shortcut".to_owned(),
+                        key: String::new(),
+                        modifiers: ShortcutModifiers::default(),
+                        command: String::new(),
+                        enabled: true,
+                    };
+                    self.config.terminal_shortcuts.push(new_shortcut);
+                    changes.note_shortcuts_change();
+                }
+
+                ui.add_space(8.0);
+
+                // Available default shortcuts
+                ui.label(
+                    RichText::new("Or add default shortcuts:")
+                        .small()
+                        .color(TEXT_MUTED),
+                );
+                ui.add_space(4.0);
+
+                let defaults: Vec<TerminalShortcutEntry> = default_terminal_shortcuts();
+                for default in &defaults {
+                    // Only show if not already present
+                    let exists = self
+                        .config
+                        .terminal_shortcuts
+                        .iter()
+                        .any(|s| s.id == default.id);
+                    if !exists {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{} → {}", default.key, default.command));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button("Add").clicked() {
+                                    self.config.terminal_shortcuts.push(default.clone());
+                                    changes.note_shortcuts_change();
+                                }
+                            });
+                        });
+                    }
+                }
+
+                // Reset to defaults button
+                ui.add_space(8.0);
+                if ui.button("Reset All to Defaults").clicked() {
+                    self.config.terminal_shortcuts = default_terminal_shortcuts();
+                    changes.note_shortcuts_change();
+                }
+            },
+        );
+    }
+
     fn draw_settings_diagnostics_section(
         &mut self,
         ctx: &egui::Context,
@@ -12324,8 +13135,10 @@ impl AdeApp {
         }
 
         let response = egui::SidePanel::left("project_explorer")
-            .resizable(false)
-            .exact_width(PROJECT_EXPLORER_WIDTH)
+            .resizable(true)
+            .default_width(self.config.ui.project_explorer_width)
+            .min_width(260.0)
+            .max_width(560.0)
             .show_separator_line(false)
             .frame(
                 egui::Frame::none()
@@ -13116,7 +13929,17 @@ impl AdeApp {
                 }
                 ui.expand_to_include_x(panel_right);
             });
-        response.map(|inner| inner.response.rect)
+        if let Some(response) = response {
+            let actual_width = response.response.rect.width();
+            if (actual_width - self.config.ui.project_explorer_width).abs() > 0.5 {
+                self.config.ui.project_explorer_width = actual_width;
+                self.note_ui_config_changed();
+            }
+
+            Some(response.response.rect)
+        } else {
+            None
+        }
     }
 
     fn draw_input_history_contents(&mut self, ctx: &egui::Context, ui: &mut Ui) {
@@ -13405,7 +14228,8 @@ impl AdeApp {
                         // Calculate max available tooltip right edge based on checklist panel
                         let max_tooltip_right = if self.config.ui.checklist_panel_expanded {
                             let screen_right = ui.ctx().screen_rect().right();
-                            (screen_right - CHECKLIST_PANEL_WIDTH - 8.0).max(panel_right + 100.0)
+                            (screen_right - self.config.ui.checklist_panel_width - 8.0)
+                                .max(panel_right + 100.0)
                         } else {
                             ui.ctx().screen_rect().right() - 16.0
                         };
@@ -14448,8 +15272,10 @@ impl AdeApp {
         };
 
         let response = egui::SidePanel::right("checklist_panel")
-            .resizable(false)
-            .exact_width(CHECKLIST_PANEL_WIDTH)
+            .resizable(true)
+            .default_width(self.config.ui.checklist_panel_width)
+            .min_width(280.0)
+            .max_width(560.0)
             .show_separator_line(false)
             .frame(
                 egui::Frame::none()
@@ -14547,6 +15373,12 @@ impl AdeApp {
                         }
                     });
             });
+
+        let actual_width = response.response.rect.width();
+        if (actual_width - self.config.ui.checklist_panel_width).abs() > 0.5 {
+            self.config.ui.checklist_panel_width = actual_width;
+            self.note_ui_config_changed();
+        }
 
         Some(response.response.rect)
     }
@@ -14679,8 +15511,10 @@ impl AdeApp {
         let browser_project_id = browser_project_id.unwrap();
 
         let response = egui::SidePanel::right("browser_panel")
-            .resizable(false)
-            .exact_width(BROWSER_PANEL_WIDTH)
+            .resizable(true)
+            .default_width(self.config.ui.browser_panel_width)
+            .min_width(360.0)
+            .max_width(820.0)
             .show_separator_line(false)
             .frame(
                 egui::Frame::none()
@@ -14846,6 +15680,12 @@ impl AdeApp {
                     });
                 }
             });
+
+        let actual_width = response.response.rect.width();
+        if (actual_width - self.config.ui.browser_panel_width).abs() > 0.5 {
+            self.config.ui.browser_panel_width = actual_width;
+            self.note_ui_config_changed();
+        }
 
         Some(response.response.rect)
     }
@@ -15453,9 +16293,10 @@ impl AdeApp {
                         }
                         let wheel_delta = ui.ctx().input(|input| input.smooth_scroll_delta);
                         if wheel_delta != Vec2::ZERO {
-                            if let Some(pointer_pos) =
-                                ui.ctx().input(|input| input.pointer.interact_pos())
-                            {
+                            let pointer_pos = ui.ctx().input(|input| {
+                                input.pointer.hover_pos().or(input.pointer.interact_pos())
+                            });
+                            if let Some(pointer_pos) = pointer_pos {
                                 if rect.contains(pointer_pos) {
                                     let mouse_reporting_active =
                                         terminal.runtime.is_mouse_reporting_active();
@@ -15498,6 +16339,9 @@ impl AdeApp {
                                         detach_terminal_prompt_scroll_anchor_on_manual_scroll(
                                             terminal,
                                         );
+                                        if is_opencode && !is_selection_drag {
+                                            terminal.opencode_manual_scroll_detached = true;
+                                        }
                                     }
                                 }
                             }
@@ -15603,7 +16447,7 @@ impl AdeApp {
                 );
                 ui.label(
                     RichText::new(
-                        "Workspace defaults, launchers, saved messages, and diagnostics.",
+                        "Workspace defaults, launchers, shortcuts, saved messages, and diagnostics.",
                     )
                     .small()
                     .color(TEXT_MUTED),
@@ -15687,6 +16531,9 @@ impl AdeApp {
             if changes.launchers_changed {
                 self.note_launchers_changed();
             }
+            if changes.shortcuts_changed {
+                self.note_shortcuts_changed();
+            }
             if changes.opencode_changed {
                 // OpenCode config changes are persisted via Mergen config
                 // The actual OpenCode config files are written immediately
@@ -15703,11 +16550,28 @@ impl AdeApp {
 
 impl eframe::App for AdeApp {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        let events = std::mem::take(&mut raw_input.events);
+        let mut events = std::mem::take(&mut raw_input.events);
         let global_modifiers = raw_input.modifiers;
         let single_view_shortcuts_enabled = !self.config.ui.multi_terminal_view_enabled;
 
         let capture_keyboard = self.should_capture_terminal_keyboard(ctx);
+
+        // Only capture terminal command shortcuts when terminal owns keyboard.
+        // If UI owns keyboard (Settings open, text inputs focused), leave shortcut
+        // key events for the UI so Settings key capture and shortcut recording work.
+        if capture_keyboard {
+            let (command_shortcuts, remaining, conflict_messages) =
+                self.partition_terminal_command_shortcuts(events);
+            if !command_shortcuts.is_empty() {
+                self.buffered_terminal_command_shortcuts
+                    .extend(command_shortcuts);
+            }
+            if !conflict_messages.is_empty() {
+                // Show conflict warning for the first conflict
+                self.status_line = conflict_messages[0].clone();
+            }
+            events = remaining;
+        }
 
         // Only handle Alt+M shortcut when terminal is NOT capturing keyboard
         if !capture_keyboard {
@@ -15918,6 +16782,10 @@ fn recover_config_state(
         config.launchers = current_config.launchers.clone();
     }
 
+    if pending_config_changes.shortcuts {
+        config.terminal_shortcuts = current_config.terminal_shortcuts.clone();
+    }
+
     if pending_config_changes.opencode {
         config.opencode = current_config.opencode.clone();
     }
@@ -15936,6 +16804,10 @@ fn recover_config_state(
         config.ui.terminal_manager_hide_inactive_projects =
             current_config.ui.terminal_manager_hide_inactive_projects;
         config.ui.left_sidebar_tab = current_config.ui.left_sidebar_tab;
+        // Preserve panel widths
+        config.ui.project_explorer_width = current_config.ui.project_explorer_width;
+        config.ui.checklist_panel_width = current_config.ui.checklist_panel_width;
+        config.ui.browser_panel_width = current_config.ui.browser_panel_width;
     }
 
     let (projects, project_id_remap) = recover_project_records(
@@ -17273,10 +18145,11 @@ fn draw_folder_tree(
             if search_active {
                 header_state.set_open(true);
             }
+            let folder_is_open = header_state.is_open();
 
             let (_, header_response, _) = header_state
                 .show_header(ui, |ui| {
-                    draw_directory_folder_row(ui, &item.name, search_query)
+                    draw_directory_folder_row(ui, &item.name, folder_is_open, search_query)
                 })
                 .body(|ui| {
                     let (_, child_state_changed, child_deferred, child_file_open) =
@@ -17795,12 +18668,88 @@ fn directory_row_text_position(
     rect: egui::Rect,
     button_padding: Vec2,
     galley_size: Vec2,
+    leading_offset: f32,
 ) -> egui::Pos2 {
     let content_rect = sidebar_row_content_rect(rect, button_padding);
     egui::pos2(
-        content_rect.min.x,
+        (content_rect.min.x + leading_offset).min(content_rect.max.x),
         content_rect.center().y - (galley_size.y * 0.5),
     )
+}
+
+fn directory_folder_icon(is_open: bool) -> AppIcon {
+    if is_open {
+        AppIcon::FolderOpen
+    } else {
+        AppIcon::Folder
+    }
+}
+
+/// Determine the appropriate file icon based on file extension.
+fn file_icon_for_extension(name: &str) -> AppIcon {
+    let lower = name.to_lowercase();
+
+    // Code files
+    if lower.ends_with(".rs")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".tsx")
+        || lower.ends_with(".js")
+        || lower.ends_with(".jsx")
+        || lower.ends_with(".py")
+        || lower.ends_with(".go")
+        || lower.ends_with(".java")
+        || lower.ends_with(".cs")
+        || lower.ends_with(".cpp")
+        || lower.ends_with(".c")
+        || lower.ends_with(".h")
+        || lower.ends_with(".hpp")
+    {
+        return AppIcon::FileCode;
+    }
+
+    // Config/JSON files
+    if lower.ends_with(".json")
+        || lower.ends_with(".toml")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".yml")
+    {
+        return AppIcon::FileJson;
+    }
+
+    // Text/Markdown
+    if lower.ends_with(".md") || lower.ends_with(".txt") || lower.ends_with(".log") {
+        return AppIcon::FileText;
+    }
+
+    // Images
+    if lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".gif")
+        || lower.ends_with(".svg")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".bmp")
+    {
+        return AppIcon::FileImage;
+    }
+
+    // Archives
+    if lower.ends_with(".zip")
+        || lower.ends_with(".tar")
+        || lower.ends_with(".gz")
+        || lower.ends_with(".rar")
+        || lower.ends_with(".7z")
+    {
+        return AppIcon::FileArchive;
+    }
+
+    // Database
+    if lower.ends_with(".sql") || lower.ends_with(".db") || lower.ends_with(".sqlite") {
+        return AppIcon::Database;
+    }
+
+    // Default
+    AppIcon::File
 }
 
 /// Returns byte ranges within `text` that match `query` (case-insensitive).
@@ -17930,7 +18879,11 @@ fn directory_search_highlight_layout_job(
 fn draw_directory_file_row(ui: &mut Ui, text: &str, search_query: Option<&str>) -> egui::Response {
     let button_padding = ui.spacing().button_padding;
     let available_width = ui.available_width().max(0.0);
-    let wrap_width = sidebar_row_wrap_width(available_width, button_padding);
+    let icon_width = SOURCE_CONTROL_FILE_ICON_WIDTH;
+    let icon_gap = SOURCE_CONTROL_FILE_ICON_GAP;
+    let text_width =
+        (sidebar_row_wrap_width(available_width, button_padding) - icon_width - icon_gap).max(0.0);
+    let icon_glyph_str = icon_glyph(file_icon_for_extension(text));
 
     // Build highlight layout job with search matches
     let layout_job =
@@ -17949,7 +18902,21 @@ fn draw_directory_file_row(ui: &mut Ui, text: &str, search_query: Option<&str>) 
                 .rect_filled(rect.shrink2(egui::vec2(1.0, 1.0)), 8.0, fill);
         }
 
-        let text_pos = directory_row_text_position(rect, button_padding, galley.size());
+        let content_rect = sidebar_row_content_rect(rect, button_padding);
+        let icon_rect = egui::Rect::from_min_size(
+            content_rect.min,
+            egui::vec2(icon_width.min(content_rect.width()), content_rect.height()),
+        );
+        ui.painter().text(
+            icon_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            icon_glyph_str,
+            egui::FontId::proportional(12.0),
+            ui.visuals().text_color(),
+        );
+
+        let text_pos =
+            directory_row_text_position(rect, button_padding, galley.size(), icon_width + icon_gap);
         // Paint with default color since colors are baked into galley sections
         ui.painter()
             .galley(text_pos, galley, ui.visuals().text_color());
@@ -17962,18 +18929,23 @@ fn draw_directory_file_row(ui: &mut Ui, text: &str, search_query: Option<&str>) 
         text,
         &font_id,
         ui.visuals().text_color(),
-        wrap_width,
+        text_width,
     )
 }
 
 fn draw_directory_folder_row(
     ui: &mut Ui,
     text: &str,
+    is_open: bool,
     search_query: Option<&str>,
 ) -> egui::Response {
     let button_padding = ui.spacing().button_padding;
     let available_width = ui.available_width().max(0.0);
-    let wrap_width = sidebar_row_wrap_width(available_width, button_padding);
+    let icon_width = SOURCE_CONTROL_FILE_ICON_WIDTH;
+    let icon_gap = SOURCE_CONTROL_FILE_ICON_GAP;
+    let text_width =
+        (sidebar_row_wrap_width(available_width, button_padding) - icon_width - icon_gap).max(0.0);
+    let icon_glyph_str = icon_glyph(directory_folder_icon(is_open));
 
     // Build highlight layout job with search matches
     let layout_job =
@@ -17985,7 +18957,21 @@ fn draw_directory_folder_row(
     let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
 
     if ui.is_rect_visible(rect) {
-        let text_pos = directory_row_text_position(rect, button_padding, galley.size());
+        let content_rect = sidebar_row_content_rect(rect, button_padding);
+        let icon_rect = egui::Rect::from_min_size(
+            content_rect.min,
+            egui::vec2(icon_width.min(content_rect.width()), content_rect.height()),
+        );
+        ui.painter().text(
+            icon_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            icon_glyph_str,
+            egui::FontId::proportional(12.0),
+            ui.visuals().text_color(),
+        );
+
+        let text_pos =
+            directory_row_text_position(rect, button_padding, galley.size(), icon_width + icon_gap);
         // Paint with default color since colors are baked into galley sections
         ui.painter()
             .galley(text_pos, galley, ui.visuals().text_color());
@@ -17998,7 +18984,7 @@ fn draw_directory_folder_row(
         text,
         &font_id,
         ui.visuals().text_color(),
-        wrap_width,
+        text_width,
     )
 }
 
@@ -18025,7 +19011,7 @@ where
     let (rect, response) = ui.allocate_exact_size(desired_size, Sense::hover());
 
     if ui.is_rect_visible(rect) {
-        let text_pos = directory_row_text_position(rect, button_padding, galley.size());
+        let text_pos = directory_row_text_position(rect, button_padding, galley.size(), 0.0);
         ui.painter().galley(text_pos, galley, fallback_color);
     }
 
@@ -20355,12 +21341,18 @@ fn terminal_output_scroll_behavior(
             .flatten()
     });
 
-    // Disable stick_to_bottom while selection drag is active to allow autoscroll
+    // Disable stick_to_bottom while selection drag is active to allow autoscroll.
+    // Also disable it for OpenCode when the user has manually scrolled away from bottom.
     let selection_drag_active = terminal.selection_drag_active;
+    let opencode_manual_scroll = terminal.ai_session.tool == Some(AiCliTool::OpenCode)
+        && terminal.opencode_manual_scroll_detached;
 
     TerminalOutputScrollBehavior {
         vertical_offset: prompt_anchor_offset,
-        stick_to_bottom: has_content && prompt_anchor_offset.is_none() && !selection_drag_active,
+        stick_to_bottom: has_content
+            && prompt_anchor_offset.is_none()
+            && !selection_drag_active
+            && !opencode_manual_scroll,
         keep_activation_alignment_pending: terminal.activation_scroll_align_pending && !has_content,
     }
 }
@@ -20381,6 +21373,10 @@ fn detach_terminal_prompt_scroll_anchor_on_manual_scroll(terminal: &mut Terminal
     if terminal_prompt_scroll_anchor_enabled(terminal) {
         terminal.prompt_scroll_anchor_detached = true;
     }
+}
+
+fn reset_opencode_manual_scroll_detached(terminal: &mut TerminalEntry) {
+    terminal.opencode_manual_scroll_detached = false;
 }
 
 fn terminal_activation_scroll_offset(
@@ -21000,7 +21996,7 @@ mod tests {
         terminal_selection_autoscroll_speed, terminal_selection_point_from_pointer,
         terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
         with_minimal_button_chrome, with_settings_text_edit_chrome, AdeApp, AiBadgeModel,
-        AiBadgeVisual, CodexAttentionReason, CodexCliStatusSource, CodexTransportStatus,
+        AiBadgeVisual, AppIcon, CodexAttentionReason, CodexCliStatusSource, CodexTransportStatus,
         CtrlCAction, DirectoryIndexSnapshot, DirectoryIndexTruncationFlags, DirectoryNode,
         FactoryDroidAttentionReason, FactoryDroidHookInboxEvent,
         FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
@@ -21028,7 +22024,8 @@ mod tests {
     use crate::layout;
     use crate::models::{
         AppConfig, AppHistory, BuiltinLauncherKind, LauncherEntry, LauncherIconKey, LeftSidebarTab,
-        MainVisibilityMode, ProjectRecord, ShellKind, TerminalKind, TerminalManagerFilter,
+        MainVisibilityMode, ProjectRecord, ShellKind, ShortcutModifiers, TerminalKind,
+        TerminalManagerFilter, TerminalShortcutEntry,
     };
     use crate::terminal::{
         test_terminal_runtime, test_terminal_runtime_with_capture, TerminalColor, TerminalCursor,
@@ -21046,8 +22043,21 @@ mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
     use std::time::{Duration, Instant};
+
+    static TEST_TEMP_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn test_temp_path(prefix: &str, extension: &str) -> PathBuf {
+        let sequence = TEST_TEMP_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{sequence}.{extension}",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn maps_navigation_keys_to_escape_sequences() {
@@ -21062,6 +22072,20 @@ mod tests {
     fn maps_backspace_to_delete_byte() {
         let backspace = AdeApp::key_to_terminal_bytes(Key::Backspace, Modifiers::default());
         assert_eq!(backspace, Some(b"\x7f".to_vec()));
+    }
+
+    #[test]
+    fn recognizes_image_paths_from_clipboard_text() {
+        assert!(AdeApp::looks_like_image_path(
+            r"C:\Users\furkan\Pictures\screenshot.PNG"
+        ));
+        assert!(AdeApp::looks_like_image_path(
+            "/home/furkan/Pictures/photo.jpeg"
+        ));
+        assert!(!AdeApp::looks_like_image_path("photo.png"));
+        assert!(!AdeApp::looks_like_image_path(
+            r"C:\Users\furkan\Documents\notes.txt"
+        ));
     }
 
     #[test]
@@ -21449,35 +22473,33 @@ mod tests {
     #[test]
     fn ui_keyboard_ownership_blocks_terminal_capture() {
         // text_input_has_focus
-        assert!(AdeApp::ui_owns_keyboard_state(
+        assert!(super::ui_owns_keyboard_state(
             true, false, false, false, false, false
         ));
         // popup_open
-        assert!(AdeApp::ui_owns_keyboard_state(
+        assert!(super::ui_owns_keyboard_state(
             false, true, false, false, false, false
         ));
         // context_menu_open
-        assert!(AdeApp::ui_owns_keyboard_state(
+        assert!(super::ui_owns_keyboard_state(
             false, false, true, false, false, false
         ));
         // show_settings_popup && wants_keyboard_input
-        assert!(AdeApp::ui_owns_keyboard_state(
+        assert!(super::ui_owns_keyboard_state(
             false, false, false, true, false, true
         ));
         // show_exit_confirm_popup
-        assert!(AdeApp::ui_owns_keyboard_state(
+        assert!(super::ui_owns_keyboard_state(
             false, false, false, false, true, false
         ));
         // none - should not own keyboard
-        assert!(!AdeApp::ui_owns_keyboard_state(
+        assert!(!super::ui_owns_keyboard_state(
             false, false, false, false, false, false
         ));
 
-        assert!(!AdeApp::should_capture_terminal_keyboard_state(true, true));
-        assert!(AdeApp::should_capture_terminal_keyboard_state(true, false));
-        assert!(!AdeApp::should_capture_terminal_keyboard_state(
-            false, false
-        ));
+        assert!(!super::should_capture_terminal_keyboard_state(true, true));
+        assert!(super::should_capture_terminal_keyboard_state(true, false));
+        assert!(!super::should_capture_terminal_keyboard_state(false, false));
     }
 
     #[test]
@@ -21853,6 +22875,25 @@ mod tests {
         assert_eq!(
             SettingsSection::Diagnostics.navigation_title(),
             "Diagnostics"
+        );
+    }
+
+    #[test]
+    fn settings_navigation_includes_shortcuts_section_metadata() {
+        assert_eq!(SettingsSection::ALL.len(), 6);
+        assert!(SettingsSection::ALL.contains(&SettingsSection::Shortcuts));
+        assert_eq!(SettingsSection::ALL[4], SettingsSection::Shortcuts);
+        assert_eq!(SettingsSection::ALL[5], SettingsSection::Diagnostics);
+        assert_eq!(SettingsSection::Shortcuts.title(), "Shortcuts");
+        assert_eq!(SettingsSection::Shortcuts.navigation_title(), "Shortcuts");
+        assert_eq!(
+            SettingsSection::Shortcuts.description(),
+            "Configure keyboard shortcuts to send commands to the active terminal."
+        );
+        assert_eq!(SettingsSection::Shortcuts.icon(), AppIcon::Terminal);
+        assert_eq!(
+            SettingsSection::Shortcuts.scroll_id(),
+            "settings-shortcuts-scroll"
         );
     }
 
@@ -25169,6 +26210,28 @@ mod tests {
     }
 
     #[test]
+    fn opencode_output_scroll_behavior_respects_manual_detach() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.ai_session.tool = Some(AiCliTool::OpenCode);
+        terminal.render_cache = TerminalSnapshot {
+            lines: vec![TerminalStyledLine::default(); 20],
+            cursor: Some(TerminalCursor {
+                x: 0,
+                y: 10,
+                shape: TerminalCursorShape::Block,
+                blinking: false,
+            }),
+            cursor_line: None,
+        };
+        terminal.opencode_manual_scroll_detached = true;
+
+        let behavior = terminal_output_scroll_behavior(&terminal, 10.0, 50.0);
+
+        assert!(!behavior.stick_to_bottom);
+        assert_eq!(behavior.vertical_offset, None);
+    }
+
+    #[test]
     fn terminal_selection_autoscroll_delta_returns_zero_inside_safe_zone() {
         let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(200.0, 150.0));
         let line_height = 10.0;
@@ -25410,6 +26473,19 @@ mod tests {
         AdeApp::flush_terminal_outbound(&mut terminal, &ctx, &mut outbound);
 
         assert!(!terminal.prompt_scroll_anchor_detached);
+    }
+
+    #[test]
+    fn opencode_manual_scroll_resets_when_terminal_bytes_are_sent() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.ai_session.tool = Some(AiCliTool::OpenCode);
+        terminal.opencode_manual_scroll_detached = true;
+
+        let ctx = Context::default();
+        let mut outbound = b"continue".to_vec();
+        AdeApp::flush_terminal_outbound(&mut terminal, &ctx, &mut outbound);
+
+        assert!(!terminal.opencode_manual_scroll_detached);
     }
 
     #[test]
@@ -26910,6 +27986,178 @@ mod tests {
         assert_eq!(raw_input.events, vec![Event::Text("hello".to_owned())]);
         assert!(app.buffered_terminal_input.is_empty());
         assert!(ctx.memory(|mem| mem.has_focus(AdeApp::directory_search_input_id())));
+    }
+
+    #[test]
+    fn raw_input_hook_does_not_buffer_terminal_shortcuts_when_settings_owns_keyboard() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+
+        // Simulate Settings popup open (UI owns keyboard)
+        app.show_settings_popup = true;
+
+        let mut raw_input = RawInput {
+            events: vec![Event::Key {
+                key: egui::Key::F6,
+                physical_key: Some(egui::Key::F6),
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+                repeat: false,
+            }],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        // F6 should remain in events for Settings UI, not be buffered for terminal
+        assert!(
+            raw_input.events.iter().any(|e| matches!(
+                e,
+                Event::Key {
+                    key: egui::Key::F6,
+                    ..
+                }
+            )),
+            "F6 key event should remain for Settings UI when popup is open"
+        );
+        assert!(
+            app.buffered_terminal_command_shortcuts.is_empty(),
+            "Terminal command shortcuts should not be buffered when UI owns keyboard"
+        );
+    }
+
+    #[test]
+    fn handle_shortcuts_discards_buffered_shortcuts_when_ui_owns_keyboard() {
+        let ctx = Context::default();
+        let (runtime, _capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+
+        // Buffer a stale shortcut (simulating it was buffered before Settings opened)
+        app.buffered_terminal_command_shortcuts = vec![(
+            egui::Key::F6,
+            egui::Modifiers::default(),
+            "/prepare-fix-plan".to_string(),
+        )];
+
+        // Simulate Settings popup open (UI owns keyboard)
+        app.show_settings_popup = true;
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        // Buffered shortcut should be drained, not executed
+        assert!(
+            app.buffered_terminal_command_shortcuts.is_empty(),
+            "Stale buffered shortcuts should be drained when UI owns keyboard"
+        );
+        assert_ne!(
+            app.status_line, "Sent: /prepare-fix-plan",
+            "Shortcut should not execute when UI owns keyboard"
+        );
+    }
+
+    #[test]
+    fn ctrl_only_terminal_shortcut_matches_windows_command_alias() {
+        // On Windows/Linux, egui sets both ctrl=true and command=true for Ctrl key.
+        // Stored shortcuts with ctrl=true should match even when egui command alias is true.
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+
+        // Configure a Ctrl+P shortcut with only ctrl=true (command=false)
+        app.config.terminal_shortcuts = vec![crate::models::TerminalShortcutEntry {
+            id: "test-ctrl-p".to_owned(),
+            label: "Test Ctrl+P".to_owned(),
+            key: "P".to_owned(),
+            modifiers: crate::models::ShortcutModifiers {
+                ctrl: true,
+                alt: false,
+                shift: false,
+                command: false, // Physical Cmd only; should match on Windows/Linux too
+            },
+            command: "/test-cmd".to_owned(),
+            enabled: true,
+        }];
+
+        // Simulate Windows/Linux egui event: Ctrl key sets both ctrl=true AND command=true (alias)
+        let windows_ctrl_modifiers = egui::Modifiers {
+            ctrl: true,
+            command: true,  // egui alias on Windows/Linux
+            mac_cmd: false, // Physical Cmd not pressed
+            ..egui::Modifiers::default()
+        };
+
+        let result = app.match_terminal_shortcut_result(&egui::Key::P, &windows_ctrl_modifiers);
+
+        assert!(
+            matches!(
+                result,
+                super::TerminalShortcutMatchResult::Command("/test-cmd")
+            ),
+            "Ctrl-only stored shortcut should match egui event with command alias true"
+        );
+    }
+
+    #[test]
+    fn shortcut_capture_uses_mac_cmd_not_command_alias() {
+        // When capturing a Ctrl key on Windows/Linux, it should store command=false
+        // because mac_cmd (physical Cmd) is the correct source for stored command.
+        let windows_ctrl_modifiers = egui::Modifiers {
+            ctrl: true,
+            command: true,  // egui alias
+            mac_cmd: false, // Physical Cmd not pressed
+            ..egui::Modifiers::default()
+        };
+
+        let stored = super::AdeApp::egui_modifiers_to_stored(&windows_ctrl_modifiers);
+
+        assert!(stored.ctrl, "Ctrl should be stored as true");
+        assert!(
+            !stored.command,
+            "Command should be stored as false when mac_cmd is false (physical Cmd not pressed)"
+        );
+
+        // When capturing Cmd key on macOS, it should store command=true
+        let macos_cmd_modifiers = egui::Modifiers {
+            mac_cmd: true, // Physical Cmd pressed
+            command: true, // egui also sets this
+            ctrl: false,
+            ..egui::Modifiers::default()
+        };
+
+        let stored_mac = super::AdeApp::egui_modifiers_to_stored(&macos_cmd_modifiers);
+
+        assert!(
+            stored_mac.command,
+            "Command should be stored as true when mac_cmd is true (physical Cmd pressed)"
+        );
+    }
+
+    #[test]
+    fn shortcut_recording_cancel_button_clears_recording_state() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+
+        // Start recording for shortcut index 0
+        app.settings_shortcut_recording_index = Some(0);
+        app.config.terminal_shortcuts = vec![crate::models::TerminalShortcutEntry {
+            id: "test".to_owned(),
+            label: "Test".to_owned(),
+            key: String::new(),
+            modifiers: crate::models::ShortcutModifiers::default(),
+            command: "/test".to_owned(),
+            enabled: true,
+        }];
+
+        // Simulate Cancel button click by directly clearing the index
+        // (In actual UI this happens in the button click handler)
+        app.settings_shortcut_recording_index = None;
+
+        assert!(
+            app.settings_shortcut_recording_index.is_none(),
+            "Cancel should clear recording index immediately"
+        );
     }
 
     #[test]
@@ -29722,6 +30970,49 @@ mod tests {
     }
 
     #[test]
+    fn recovered_config_preserves_terminal_shortcuts_when_shortcuts_changed_in_session() {
+        use crate::models::{ShortcutModifiers, TerminalShortcutEntry};
+
+        let loaded_config = AppConfig {
+            terminal_shortcuts: vec![TerminalShortcutEntry {
+                id: "loaded-shortcut".to_owned(),
+                label: "Loaded Shortcut".to_owned(),
+                key: "F6".to_owned(),
+                modifiers: ShortcutModifiers::default(),
+                command: "/loaded".to_owned(),
+                enabled: true,
+            }],
+            ..AppConfig::default()
+        };
+
+        let mut current_config = boot_failed_current_config();
+        current_config.terminal_shortcuts = vec![TerminalShortcutEntry {
+            id: "current-shortcut".to_owned(),
+            label: "Current Shortcut".to_owned(),
+            key: "F7".to_owned(),
+            modifiers: ShortcutModifiers::default(),
+            command: "/current".to_owned(),
+            enabled: true,
+        }];
+
+        let recovered = recover_config_state(
+            &current_config,
+            &BTreeMap::new(),
+            None,
+            loaded_config,
+            PendingConfigChanges {
+                shortcuts: true,
+                ..PendingConfigChanges::default()
+            },
+        );
+
+        assert_eq!(
+            recovered.terminal_shortcuts,
+            current_config.terminal_shortcuts
+        );
+    }
+
+    #[test]
     fn recovered_config_always_shows_projects_without_live_terminals_on_startup() {
         // Config kayıtlı olarak hide_inactive = true olsa bile
         let loaded_config = AppConfig {
@@ -29974,6 +31265,7 @@ mod tests {
             selection_snapshot: None,
             pending_link_click: None,
             selection_drag_active: false,
+            opencode_manual_scroll_detached: false,
             snapshot_refresh_deferred: false,
             activation_scroll_align_pending: false,
             prompt_scroll_anchor_detached: false,
@@ -30071,7 +31363,7 @@ mod tests {
             crossbeam_channel::bounded(DIRECTORY_INDEX_CHANNEL_CAPACITY);
 
         AdeApp {
-            config_path: PathBuf::new(),
+            config_path: test_temp_path("mergen-ade-test-config", "toml"),
             current_executable_path: PathBuf::from(r"C:\tests\mergen-ade.exe"),
             factory_droid_hooks_dir: None,
             factory_droid_hooks_dir_error: None,
@@ -30108,6 +31400,7 @@ mod tests {
             input_routing_gate_ms: 0,
             buffered_terminal_input: Vec::new(),
             buffered_terminal_navigation: Vec::new(),
+            buffered_terminal_command_shortcuts: Vec::new(),
             terminal_held_key_repeat: None,
             allow_attention_terminal_input_routing_once: false,
             pending_terminal_pastes: Vec::new(),
@@ -30118,6 +31411,7 @@ mod tests {
             allow_confirmed_close: false,
             active_settings_section: SettingsSection::General,
             settings_diagnostics_expanded: false,
+            settings_shortcut_recording_index: None,
             saved_message_drafts: BTreeMap::new(),
             launcher_draft: super::LauncherDraftState::default(),
             launcher_icon_textures: BTreeMap::new(),
@@ -30149,7 +31443,7 @@ mod tests {
             directory_index_generation: BTreeMap::new(),
             directory_index_subtree_loading_by_project: BTreeMap::new(),
             checklist_collapsed_by_project: BTreeMap::new(),
-            history_path: PathBuf::new(),
+            history_path: test_temp_path("mergen-ade-test-history", "json"),
             input_history: AppHistory::default(),
             input_history_search_query: String::new(),
             input_history_selected_project_id: None,
@@ -31979,7 +33273,7 @@ mod tests {
                         .max_rect(rect)
                         .layout(egui::Layout::top_down(egui::Align::Center)),
                 );
-                let response = super::draw_directory_folder_row(&mut child, "src", None);
+                let response = super::draw_directory_folder_row(&mut child, "src", false, None);
                 observed_width = Some(response.rect.width());
             });
         });
@@ -32031,7 +33325,7 @@ mod tests {
         let button_padding = egui::vec2(8.0, 4.0);
         let galley_size = egui::vec2(56.0, 12.0);
 
-        let text_pos = super::directory_row_text_position(rect, button_padding, galley_size);
+        let text_pos = super::directory_row_text_position(rect, button_padding, galley_size, 0.0);
         let content_rect = rect.shrink2(button_padding);
 
         assert_eq!(
@@ -32039,6 +33333,70 @@ mod tests {
             content_rect.min.x + super::SIDEBAR_ROW_LEADING_INSET
         );
         assert_eq!(text_pos.y, content_rect.center().y - (galley_size.y * 0.5));
+    }
+
+    #[test]
+    fn directory_row_text_position_accounts_for_icon_offset() {
+        let rect = egui::Rect::from_min_size(pos2(32.0, 10.0), egui::vec2(240.0, 28.0));
+        let button_padding = egui::vec2(8.0, 4.0);
+        let galley_size = egui::vec2(56.0, 12.0);
+        let icon_offset =
+            super::SOURCE_CONTROL_FILE_ICON_WIDTH + super::SOURCE_CONTROL_FILE_ICON_GAP;
+
+        let text_pos =
+            super::directory_row_text_position(rect, button_padding, galley_size, icon_offset);
+        let content_rect = rect.shrink2(button_padding);
+
+        assert_eq!(
+            text_pos.x,
+            content_rect.min.x + super::SIDEBAR_ROW_LEADING_INSET + icon_offset
+        );
+        assert_eq!(text_pos.y, content_rect.center().y - (galley_size.y * 0.5));
+    }
+
+    #[test]
+    fn directory_folder_icon_tracks_open_state() {
+        assert_eq!(super::directory_folder_icon(false), super::AppIcon::Folder);
+        assert_eq!(
+            super::directory_folder_icon(true),
+            super::AppIcon::FolderOpen
+        );
+    }
+
+    #[test]
+    fn file_icon_for_extension_maps_common_extensions() {
+        assert_eq!(
+            super::file_icon_for_extension("main.rs"),
+            super::AppIcon::FileCode
+        );
+        assert_eq!(
+            super::file_icon_for_extension("component.TSX"),
+            super::AppIcon::FileCode
+        );
+        assert_eq!(
+            super::file_icon_for_extension("config.yaml"),
+            super::AppIcon::FileJson
+        );
+        assert_eq!(
+            super::file_icon_for_extension("notes.md"),
+            super::AppIcon::FileText
+        );
+        assert_eq!(
+            super::file_icon_for_extension("photo.PNG"),
+            super::AppIcon::FileImage
+        );
+        assert_eq!(
+            super::file_icon_for_extension("archive.tar"),
+            super::AppIcon::FileArchive
+        );
+        assert_eq!(
+            super::file_icon_for_extension("data.sqlite"),
+            super::AppIcon::Database
+        );
+        assert_eq!(
+            super::file_icon_for_extension("LICENSE"),
+            super::AppIcon::File
+        );
     }
 
     #[test]
@@ -33625,6 +34983,7 @@ mod tests {
         entry2.dirty = false;
         entry2.snapshot_refresh_deferred = true; // deferred from prior state
         entry2.prompt_scroll_anchor_detached = true;
+        entry2.opencode_manual_scroll_detached = true;
 
         let mut app = test_app([(1, entry1), (2, entry2)], Some(1));
 
@@ -33648,6 +35007,10 @@ mod tests {
         assert!(
             !entry.prompt_scroll_anchor_detached,
             "newly active terminal should re-enable prompt scroll anchoring"
+        );
+        assert!(
+            !entry.opencode_manual_scroll_detached,
+            "newly active terminal should re-enable OpenCode stick-to-bottom"
         );
     }
 
@@ -36396,6 +37759,88 @@ mod tests {
 
         // Should detect browser URL input focus
         assert!(app.text_input_has_focus(&ctx));
+    }
+
+    #[test]
+    fn text_input_has_focus_extended_detects_browser_url_input_for_any_project() {
+        use egui::Context;
+
+        let ctx = Context::default();
+        let mut app = test_app([], None);
+
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        app.projects
+            .insert(2, test_project(2, "Other", "C:/other", &[], &[]));
+        app.selected_project = Some(1);
+
+        ctx.memory_mut(|mem| {
+            mem.request_focus(super::AdeApp::browser_url_input_id(2));
+        });
+
+        assert!(!app.text_input_has_focus(&ctx));
+        assert!(app.text_input_has_focus_extended(&ctx));
+    }
+
+    #[test]
+    fn text_input_has_focus_extended_detects_settings_popup() {
+        use egui::Context;
+
+        let ctx = Context::default();
+        let mut app = test_app([], None);
+
+        app.show_settings_popup = true;
+
+        assert!(!app.text_input_has_focus(&ctx));
+        assert!(app.text_input_has_focus_extended(&ctx));
+    }
+
+    #[test]
+    fn surrender_ui_text_focus_clears_browser_url_focus_for_any_project() {
+        use egui::Context;
+
+        let ctx = Context::default();
+        let mut app = test_app([], None);
+
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        app.projects
+            .insert(2, test_project(2, "Other", "C:/other", &[], &[]));
+
+        ctx.memory_mut(|mem| {
+            mem.request_focus(super::AdeApp::browser_url_input_id(2));
+        });
+
+        app.surrender_ui_text_focus(&ctx);
+
+        assert!(!ctx.memory(|mem| mem.has_focus(super::AdeApp::browser_url_input_id(2))));
+    }
+
+    #[test]
+    fn handle_shortcuts_executes_terminal_shortcut_from_config() {
+        let ctx = Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+
+        // Buffer the command shortcut directly (normally populated by raw_input_hook)
+        app.buffered_terminal_command_shortcuts = vec![(
+            egui::Key::F6,
+            egui::Modifiers::default(),
+            "/prepare-fix-plan".to_string(),
+        )];
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+        capture.drain();
+
+        assert_eq!(capture.bytes(), b"/prepare-fix-plan\r".to_vec());
+        assert_eq!(app.status_line, "Sent: /prepare-fix-plan");
+        assert!(app
+            .terminals
+            .get(&1)
+            .is_some_and(|terminal| terminal.recent_inputs.is_empty()));
     }
 
     #[test]
