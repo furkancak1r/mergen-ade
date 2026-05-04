@@ -7,8 +7,8 @@ use directories::ProjectDirs;
 use serde::Deserialize;
 
 use crate::models::{
-    default_launchers, default_terminal_shortcuts, normalize_launcher_entries, AppConfig,
-    AppHistory, ProjectRecord, ShellKind, UiConfig,
+    default_launchers, default_terminal_shortcuts, normalize_launcher_entries,
+    normalize_terminal_shortcut_entries, AppConfig, AppHistory, ProjectRecord, ShellKind, UiConfig,
 };
 
 const QUALIFIER: &str = "com";
@@ -244,12 +244,16 @@ const fn default_config_version() -> u32 {
 fn normalize_config_for_current_platform(config: &mut AppConfig) {
     config.default_shell = config.default_shell.normalize_for_current_platform();
     normalize_launcher_entries(&mut config.launchers);
+    normalize_terminal_shortcut_entries(&mut config.terminal_shortcuts);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{load_config, load_history, save_config, save_history};
-    use crate::models::{AppConfig, BuiltinLauncherKind, ShellKind, TerminalManagerFilter};
+    use crate::models::{
+        default_terminal_shortcuts, AppConfig, BuiltinLauncherKind, ShellKind, ShortcutModifiers,
+        TerminalManagerFilter, TerminalShortcutEntry,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -441,6 +445,124 @@ default_shell = "powershell"
             config.launchers[3].builtin,
             Some(BuiltinLauncherKind::Claude)
         );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn missing_terminal_shortcuts_field_restores_default_shortcuts() {
+        let path = unique_temp_path("missing-terminal-shortcuts-field");
+        fs::write(
+            &path,
+            r#"
+version = 1
+default_shell = "powershell"
+"#,
+        )
+        .expect("should write config");
+
+        let config = load_config(&path).expect("should load config");
+
+        assert_eq!(config.terminal_shortcuts, default_terminal_shortcuts());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_config_restores_missing_default_terminal_shortcuts() {
+        let path = unique_temp_path("restore-missing-default-terminal-shortcuts");
+        fs::write(
+            &path,
+            r#"
+version = 1
+default_shell = "powershell"
+
+[[terminal_shortcuts]]
+id = "prepare-fix-plan"
+label = "Prepare Fix Plan"
+key = "F6"
+command = "/prepare-fix-plan"
+enabled = true
+
+[terminal_shortcuts.modifiers]
+ctrl = false
+alt = false
+shift = false
+command = false
+
+[[terminal_shortcuts]]
+id = "implement-plan"
+label = "Implement Plan"
+key = "F7"
+command = "/implement-plan"
+enabled = true
+
+[terminal_shortcuts.modifiers]
+ctrl = false
+alt = false
+shift = false
+command = false
+
+[[terminal_shortcuts]]
+id = "review-guard"
+label = "Review Guard"
+key = "F8"
+command = "/review-guard"
+enabled = true
+
+[terminal_shortcuts.modifiers]
+ctrl = false
+alt = false
+shift = false
+command = false
+"#,
+        )
+        .expect("should write config");
+
+        let config = load_config(&path).expect("should load config");
+
+        assert_eq!(config.terminal_shortcuts.len(), 4);
+        assert_eq!(config.terminal_shortcuts[0].id, "semgrep-check");
+        assert_eq!(config.terminal_shortcuts[0].key, "F5");
+        assert_eq!(config.terminal_shortcuts[0].command, "/gt");
+        assert!(config
+            .terminal_shortcuts
+            .iter()
+            .any(|shortcut| shortcut.id == "prepare-fix-plan"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn load_config_normalizes_legacy_shortcut_command_alias_on_non_macos() {
+        let path = unique_temp_path("legacy-shortcut-command-alias");
+        let config = AppConfig {
+            terminal_shortcuts: vec![TerminalShortcutEntry {
+                id: "legacy-ctrl-p".to_owned(),
+                label: "Legacy Ctrl P".to_owned(),
+                key: "P".to_owned(),
+                modifiers: ShortcutModifiers {
+                    ctrl: true,
+                    command: true,
+                    ..ShortcutModifiers::default()
+                },
+                command: "/legacy".to_owned(),
+                enabled: true,
+            }],
+            ..AppConfig::default()
+        };
+
+        save_config(&path, &config).expect("should save config");
+        let loaded = load_config(&path).expect("should load config");
+
+        let legacy = loaded
+            .terminal_shortcuts
+            .iter()
+            .find(|shortcut| shortcut.id == "legacy-ctrl-p")
+            .expect("legacy shortcut");
+        assert!(legacy.modifiers.ctrl);
+        assert!(!legacy.modifiers.command);
 
         let _ = fs::remove_file(path);
     }

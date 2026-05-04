@@ -8338,8 +8338,9 @@ impl AdeApp {
             return false;
         }
 
-        // Send the command
-        if Self::send_command_to_terminal(terminal, command, ctx) {
+        // Shortcut commands are delivered through paste bytes so slash-prefixed
+        // AI CLI commands are not interpreted as an interactive slash-menu key stream.
+        if Self::send_shortcut_command_to_terminal(terminal, command, ctx) {
             self.show_status_feedback(ctx, &format!("Sent: {command}"));
             true
         } else {
@@ -8384,19 +8385,16 @@ impl AdeApp {
             if !shortcut.enabled || shortcut.key.is_empty() || shortcut.command.is_empty() {
                 continue;
             }
-            // Normalize stored modifiers for non-macOS backward compatibility:
-            // Old captures may have command=true due to the egui alias bug.
-            // On non-macOS, treat command=true as command=false since there's no Cmd key.
-            let stored_command = if cfg!(target_os = "macos") {
-                shortcut.modifiers.command
-            } else {
-                false // Ignore stored command on non-macOS; only Ctrl matters
+            let Some(stored_modifiers) =
+                Self::effective_terminal_shortcut_modifiers_for_matching(shortcut.modifiers)
+            else {
+                continue;
             };
             if shortcut.key.eq_ignore_ascii_case(&key_str)
-                && shortcut.modifiers.ctrl == modifiers.ctrl
-                && shortcut.modifiers.alt == modifiers.alt
-                && shortcut.modifiers.shift == modifiers.shift
-                && stored_command == modifiers.mac_cmd
+                && stored_modifiers.ctrl == modifiers.ctrl
+                && stored_modifiers.alt == modifiers.alt
+                && stored_modifiers.shift == modifiers.shift
+                && stored_modifiers.command == modifiers.mac_cmd
             {
                 matches.push(shortcut);
             }
@@ -8417,6 +8415,31 @@ impl AdeApp {
         }
     }
 
+    fn effective_terminal_shortcut_modifiers_for_matching(
+        modifiers: crate::models::ShortcutModifiers,
+    ) -> Option<crate::models::ShortcutModifiers> {
+        #[cfg(target_os = "macos")]
+        {
+            Some(modifiers)
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            if modifiers.command && !modifiers.ctrl {
+                // Command-only shortcuts cannot be pressed on non-macOS; do not
+                // degrade them to plain key matches. Ctrl+command is the legacy
+                // egui alias shape and is handled as Ctrl-only.
+                return None;
+            }
+
+            let mut effective = modifiers;
+            if effective.ctrl {
+                effective.command = false;
+            }
+            Some(effective)
+        }
+    }
+
     /// Find all duplicate enabled shortcut combos for warning display
     fn find_terminal_shortcut_duplicates(&self) -> Vec<(String, Vec<String>)> {
         use std::collections::HashMap;
@@ -8424,11 +8447,16 @@ impl AdeApp {
             HashMap::new();
 
         for shortcut in &self.config.terminal_shortcuts {
-            if !shortcut.enabled || shortcut.key.is_empty() {
+            if !shortcut.enabled || shortcut.key.is_empty() || shortcut.command.is_empty() {
                 continue;
             }
+            let Some(modifiers) =
+                Self::effective_terminal_shortcut_modifiers_for_matching(shortcut.modifiers)
+            else {
+                continue;
+            };
             let key_upper = shortcut.key.to_ascii_uppercase();
-            let combo = (key_upper, shortcut.modifiers);
+            let combo = (key_upper, modifiers);
             combo_map
                 .entry(combo)
                 .or_default()
@@ -10983,6 +11011,39 @@ impl AdeApp {
         outbound.push(b'\r');
         reset_terminal_prompt_scroll_anchor(terminal);
         terminal.runtime.send_bytes(outbound);
+        reset_opencode_manual_scroll_detached(terminal);
+        Self::clear_terminal_selection(terminal);
+        terminal.pending_line_for_title.clear();
+        terminal.pending_input_for_history.clear();
+        Self::append_pending_line(&mut terminal.pending_line_for_title, trimmed);
+        let line = std::mem::take(&mut terminal.pending_line_for_title);
+        if let Some(sanitized) = terminal_title_candidate(&line) {
+            terminal.full_title = sanitized.clone();
+            terminal.title = update_terminal_title(&sanitized, terminal.id as usize, TITLE_MAX_LEN);
+        }
+        Self::push_recent_input(&mut terminal.recent_inputs, trimmed);
+        terminal.dirty = true;
+        ctx.request_repaint();
+        true
+    }
+
+    fn send_shortcut_command_to_terminal(
+        terminal: &mut TerminalEntry,
+        command: &str,
+        ctx: &egui::Context,
+    ) -> bool {
+        let trimmed = command.trim();
+        if trimmed.is_empty() || terminal.exited {
+            return false;
+        }
+
+        let Some(paste_bytes) = terminal.runtime.capture_paste_bytes(trimmed) else {
+            return false;
+        };
+
+        reset_terminal_prompt_scroll_anchor(terminal);
+        terminal.runtime.send_paste_bytes(paste_bytes);
+        terminal.runtime.send_bytes(vec![b'\r']);
         reset_opencode_manual_scroll_detached(terminal);
         Self::clear_terminal_selection(terminal);
         terminal.pending_line_for_title.clear();
@@ -28201,6 +28262,35 @@ mod tests {
     }
 
     #[test]
+    fn raw_input_hook_buffers_terminal_shortcut_and_consumes_function_key() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+
+        let mut raw_input = RawInput {
+            events: vec![Event::Key {
+                key: egui::Key::F6,
+                physical_key: Some(egui::Key::F6),
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+                repeat: false,
+            }],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(raw_input.events.is_empty());
+        assert_eq!(
+            app.buffered_terminal_command_shortcuts,
+            vec![(
+                egui::Key::F6,
+                egui::Modifiers::default(),
+                "/prepare-fix-plan".to_owned(),
+            )]
+        );
+    }
+
+    #[test]
     fn raw_input_hook_does_not_buffer_terminal_shortcuts_when_settings_owns_keyboard() {
         let ctx = Context::default();
         let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
@@ -28274,7 +28364,6 @@ mod tests {
     fn ctrl_only_terminal_shortcut_matches_windows_command_alias() {
         // On Windows/Linux, egui sets both ctrl=true and command=true for Ctrl key.
         // Stored shortcuts with ctrl=true should match even when egui command alias is true.
-        let ctx = Context::default();
         let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
 
         // Configure a Ctrl+P shortcut with only ctrl=true (command=false)
@@ -28309,6 +28398,86 @@ mod tests {
             ),
             "Ctrl-only stored shortcut should match egui event with command alias true"
         );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn command_only_terminal_shortcut_does_not_match_plain_key_on_non_macos() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.config.terminal_shortcuts = vec![crate::models::TerminalShortcutEntry {
+            id: "test-command-p".to_owned(),
+            label: "Test Command+P".to_owned(),
+            key: "P".to_owned(),
+            modifiers: crate::models::ShortcutModifiers {
+                command: true,
+                ..crate::models::ShortcutModifiers::default()
+            },
+            command: "/test-cmd".to_owned(),
+            enabled: true,
+        }];
+
+        let result = app.match_terminal_shortcut_result(&egui::Key::P, &egui::Modifiers::default());
+
+        assert!(matches!(result, super::TerminalShortcutMatchResult::None));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn shortcut_duplicate_detection_uses_effective_non_macos_modifiers() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.config.terminal_shortcuts = vec![
+            crate::models::TerminalShortcutEntry {
+                id: "ctrl-p".to_owned(),
+                label: "Ctrl P".to_owned(),
+                key: "P".to_owned(),
+                modifiers: crate::models::ShortcutModifiers {
+                    ctrl: true,
+                    ..crate::models::ShortcutModifiers::default()
+                },
+                command: "/ctrl-p".to_owned(),
+                enabled: true,
+            },
+            crate::models::TerminalShortcutEntry {
+                id: "legacy-ctrl-p".to_owned(),
+                label: "Legacy Ctrl P".to_owned(),
+                key: "P".to_owned(),
+                modifiers: crate::models::ShortcutModifiers {
+                    ctrl: true,
+                    command: true,
+                    ..crate::models::ShortcutModifiers::default()
+                },
+                command: "/legacy-ctrl-p".to_owned(),
+                enabled: true,
+            },
+            crate::models::TerminalShortcutEntry {
+                id: "command-p".to_owned(),
+                label: "Command P".to_owned(),
+                key: "P".to_owned(),
+                modifiers: crate::models::ShortcutModifiers {
+                    command: true,
+                    ..crate::models::ShortcutModifiers::default()
+                },
+                command: "/command-p".to_owned(),
+                enabled: true,
+            },
+            crate::models::TerminalShortcutEntry {
+                id: "incomplete-ctrl-p".to_owned(),
+                label: "Incomplete Ctrl P".to_owned(),
+                key: "P".to_owned(),
+                modifiers: crate::models::ShortcutModifiers {
+                    ctrl: true,
+                    ..crate::models::ShortcutModifiers::default()
+                },
+                command: String::new(),
+                enabled: true,
+            },
+        ];
+
+        let duplicates = app.find_terminal_shortcut_duplicates();
+
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(duplicates[0].0, "Ctrl+P");
+        assert_eq!(duplicates[0].1, vec!["Ctrl P", "Legacy Ctrl P"]);
     }
 
     #[test]
@@ -28348,7 +28517,6 @@ mod tests {
 
     #[test]
     fn shortcut_recording_cancel_button_clears_recording_state() {
-        let ctx = Context::default();
         let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
 
         // Start recording for shortcut index 0
@@ -38058,6 +38226,61 @@ mod tests {
             .terminals
             .get(&1)
             .is_some_and(|terminal| terminal.recent_inputs.is_empty()));
+    }
+
+    #[test]
+    fn handle_shortcuts_uses_bracketed_paste_for_slash_shortcut() {
+        let ctx = Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
+        let mut app = test_app(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+
+        app.buffered_terminal_command_shortcuts = vec![(
+            egui::Key::F6,
+            egui::Modifiers::default(),
+            "/prepare-fix-plan".to_string(),
+        )];
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+        capture.drain();
+
+        assert_eq!(
+            capture.bytes(),
+            b"\x1b[200~/prepare-fix-plan\x1b[201~\r".to_vec()
+        );
+        assert_eq!(app.status_line, "Sent: /prepare-fix-plan");
+        assert!(app
+            .terminals
+            .get(&1)
+            .is_some_and(|terminal| terminal.recent_inputs.is_empty()));
+    }
+
+    #[test]
+    fn handle_shortcuts_preserves_recent_inputs_for_non_slash_shortcut() {
+        let ctx = Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
+        let mut app = test_app(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+
+        app.buffered_terminal_command_shortcuts = vec![(
+            egui::Key::F9,
+            egui::Modifiers::default(),
+            "cargo test".to_string(),
+        )];
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+        capture.drain();
+
+        assert_eq!(capture.bytes(), b"\x1b[200~cargo test\x1b[201~\r".to_vec());
+        assert!(app.terminals.get(&1).is_some_and(|terminal| {
+            terminal.recent_inputs.len() == 1 && terminal.recent_inputs[0] == "cargo test"
+        }));
     }
 
     #[test]

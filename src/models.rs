@@ -587,6 +587,56 @@ pub fn default_terminal_shortcuts() -> Vec<TerminalShortcutEntry> {
     ]
 }
 
+pub fn normalize_terminal_shortcut_entries(entries: &mut Vec<TerminalShortcutEntry>) {
+    let existing_entries = std::mem::take(entries);
+    let defaults = default_terminal_shortcuts();
+    let mut normalized = Vec::new();
+
+    for default in &defaults {
+        if let Some(existing) = existing_entries.iter().find(|entry| entry.id == default.id) {
+            let mut entry = existing.clone();
+            entry.id = default.id.clone();
+            if entry.label.trim().is_empty() {
+                entry.label = default.label.clone();
+            }
+            if entry.key.trim().is_empty() {
+                entry.key = default.key.clone();
+            }
+            if entry.command.trim().is_empty() {
+                entry.command = default.command.clone();
+            }
+            normalize_shortcut_modifiers_for_current_platform(&mut entry.modifiers);
+            normalized.push(entry);
+        } else {
+            let mut entry = default.clone();
+            normalize_shortcut_modifiers_for_current_platform(&mut entry.modifiers);
+            normalized.push(entry);
+        }
+    }
+
+    for (index, mut entry) in existing_entries.into_iter().enumerate() {
+        if defaults.iter().any(|default| default.id == entry.id) {
+            continue;
+        }
+        if entry.id.trim().is_empty() {
+            entry.id = format!("custom-{}", index + 1);
+        }
+        normalize_shortcut_modifiers_for_current_platform(&mut entry.modifiers);
+        normalized.push(entry);
+    }
+
+    *entries = normalized;
+}
+
+fn normalize_shortcut_modifiers_for_current_platform(modifiers: &mut ShortcutModifiers) {
+    #[cfg(not(target_os = "macos"))]
+    {
+        if modifiers.ctrl {
+            modifiers.command = false;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -621,9 +671,10 @@ impl Default for AppConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_launchers, default_terminal_shortcuts, normalize_launcher_entries, AppConfig,
-        BuiltinLauncherKind, LauncherEntry, LauncherIconKey, OpenCodeModelConfig, ShellKind,
-        ShortcutModifiers, TerminalShortcutEntry, UiConfig,
+        default_launchers, default_terminal_shortcuts, normalize_launcher_entries,
+        normalize_terminal_shortcut_entries, AppConfig, BuiltinLauncherKind, LauncherEntry,
+        LauncherIconKey, OpenCodeModelConfig, ShellKind, ShortcutModifiers, TerminalShortcutEntry,
+        UiConfig,
     };
 
     #[test]
@@ -682,12 +733,21 @@ mod tests {
         assert_eq!(shortcuts[0].label, "Semgrep Check");
         assert_eq!(shortcuts[0].key, "F5");
         assert_eq!(shortcuts[0].command, "/gt");
+        assert_eq!(shortcuts[0].modifiers, ShortcutModifiers::default());
         assert!(shortcuts[0].enabled);
         assert_eq!(shortcuts[1].id, "prepare-fix-plan");
         assert_eq!(shortcuts[1].label, "Prepare Fix Plan");
         assert_eq!(shortcuts[1].key, "F6");
+        assert_eq!(shortcuts[1].command, "/prepare-fix-plan");
+        assert_eq!(shortcuts[1].modifiers, ShortcutModifiers::default());
         assert_eq!(shortcuts[2].id, "implement-plan");
+        assert_eq!(shortcuts[2].key, "F7");
+        assert_eq!(shortcuts[2].command, "/implement-plan");
+        assert_eq!(shortcuts[2].modifiers, ShortcutModifiers::default());
         assert_eq!(shortcuts[3].id, "review-guard");
+        assert_eq!(shortcuts[3].key, "F8");
+        assert_eq!(shortcuts[3].command, "/review-guard");
+        assert_eq!(shortcuts[3].modifiers, ShortcutModifiers::default());
     }
 
     #[test]
@@ -707,6 +767,109 @@ mod tests {
         assert!(shortcut.label.is_empty());
         assert!(shortcut.key.is_empty());
         assert!(shortcut.command.is_empty());
+    }
+
+    #[test]
+    fn normalize_terminal_shortcuts_restores_missing_defaults() {
+        let mut shortcuts = default_terminal_shortcuts()
+            .into_iter()
+            .filter(|shortcut| shortcut.id != "semgrep-check")
+            .collect::<Vec<_>>();
+
+        normalize_terminal_shortcut_entries(&mut shortcuts);
+
+        assert_eq!(shortcuts.len(), 4);
+        assert_eq!(shortcuts[0].id, "semgrep-check");
+        assert_eq!(shortcuts[0].key, "F5");
+        assert_eq!(shortcuts[0].command, "/gt");
+    }
+
+    #[test]
+    fn normalize_terminal_shortcuts_preserves_user_edits() {
+        let mut shortcuts = default_terminal_shortcuts();
+        let prepare = shortcuts
+            .iter_mut()
+            .find(|shortcut| shortcut.id == "prepare-fix-plan")
+            .expect("prepare shortcut");
+        prepare.label = "Planla".to_owned();
+        prepare.key = "P".to_owned();
+        prepare.command = "/custom-plan".to_owned();
+        prepare.modifiers.ctrl = true;
+        prepare.enabled = false;
+        shortcuts.push(TerminalShortcutEntry {
+            id: "custom-extra".to_owned(),
+            label: "Custom Extra".to_owned(),
+            key: "F9".to_owned(),
+            modifiers: ShortcutModifiers::default(),
+            command: "cargo test".to_owned(),
+            enabled: true,
+        });
+
+        normalize_terminal_shortcut_entries(&mut shortcuts);
+
+        let prepare = shortcuts
+            .iter()
+            .find(|shortcut| shortcut.id == "prepare-fix-plan")
+            .expect("prepare shortcut");
+        assert_eq!(prepare.label, "Planla");
+        assert_eq!(prepare.key, "P");
+        assert_eq!(prepare.command, "/custom-plan");
+        assert!(prepare.modifiers.ctrl);
+        assert!(!prepare.enabled);
+        assert!(shortcuts
+            .iter()
+            .any(|shortcut| shortcut.id == "custom-extra" && shortcut.command == "cargo test"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn normalize_terminal_shortcuts_clears_legacy_command_alias_on_non_macos() {
+        let mut shortcuts = vec![TerminalShortcutEntry {
+            id: "legacy-ctrl-p".to_owned(),
+            label: "Legacy Ctrl P".to_owned(),
+            key: "P".to_owned(),
+            modifiers: ShortcutModifiers {
+                ctrl: true,
+                command: true,
+                ..ShortcutModifiers::default()
+            },
+            command: "/legacy".to_owned(),
+            enabled: true,
+        }];
+
+        normalize_terminal_shortcut_entries(&mut shortcuts);
+
+        let legacy = shortcuts
+            .iter()
+            .find(|shortcut| shortcut.id == "legacy-ctrl-p")
+            .expect("legacy shortcut");
+        assert!(legacy.modifiers.ctrl);
+        assert!(!legacy.modifiers.command);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn normalize_terminal_shortcuts_preserves_command_only_shortcut_on_non_macos() {
+        let mut shortcuts = vec![TerminalShortcutEntry {
+            id: "command-only".to_owned(),
+            label: "Command Only".to_owned(),
+            key: "P".to_owned(),
+            modifiers: ShortcutModifiers {
+                command: true,
+                ..ShortcutModifiers::default()
+            },
+            command: "/command-only".to_owned(),
+            enabled: true,
+        }];
+
+        normalize_terminal_shortcut_entries(&mut shortcuts);
+
+        let command_only = shortcuts
+            .iter()
+            .find(|shortcut| shortcut.id == "command-only")
+            .expect("command-only shortcut");
+        assert!(!command_only.modifiers.ctrl);
+        assert!(command_only.modifiers.command);
     }
 
     #[test]

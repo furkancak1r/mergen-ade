@@ -1,5 +1,31 @@
 ### Known Issues & Fix Log
 
+#### Function-key slash shortcuts now submit through paste-safe dispatch {#function-key-slash-shortcuts-paste-safe-dispatch}
+- Date: 2026-05-04
+- Context: User-configurable terminal command shortcuts for AI CLI slash commands
+- Error signature: `F6/F7/F8 behaves as if "/" was typed and Enter was pressed`
+- Symptoms/Impact:
+  1. Pressing `F6`, `F7`, or `F8` in an AI CLI terminal did not reliably submit `/prepare-fix-plan`, `/implement-plan`, or `/review-guard`.
+  2. The AI CLI slash-command UI could treat the initial `/` as an interactive menu trigger.
+  3. Enter could then submit the slash menu state instead of the full configured command.
+  4. Existing configs could also miss newer default shortcuts such as `F5 -> /gt`.
+- Root cause:
+  1. Terminal shortcuts reused raw command submission and wrote `<command>\r` directly to the PTY.
+  2. Slash-prefixed commands are not safe to deliver as simulated typing in AI CLI TUIs.
+  3. Config load normalized launchers but did not normalize missing built-in terminal shortcuts.
+- Resolution:
+  - Added a shortcut-specific paste-safe command submission path using runtime paste bytes followed by a separate Enter input.
+  - Preserved launcher command submission behavior for AI launch detection.
+  - Added terminal shortcut normalization so missing built-in defaults are restored on config load.
+  - Added regression tests for bracketed-paste shortcut dispatch, raw shortcut event buffering, custom non-slash shortcut history behavior, and missing default shortcut recovery.
+- Prevent recurrence:
+  - Do not route slash-prefixed terminal shortcuts through raw key-stream command submission.
+  - Keep shortcut dispatch tests covering bracketed paste and command ordering.
+  - Normalize built-in terminal shortcuts whenever config is loaded.
+  - On non-macOS, treat `ctrl=true, command=true` as legacy Ctrl-only but never degrade `command=true, ctrl=false` to a plain-key shortcut.
+- Files/Commands touched: `src/app.rs`, `src/models.rs`, `src/config.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test shortcut`, `cargo test config`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report on 2026-05-04 that F6-style shortcuts acted like only `/` plus Enter was submitted.
+
 #### Browser panel runtime open state no longer persisted to config {#browser-panel-runtime-state-not-persisted}
 - Date: 2026-05-04
 - Context: Browser panel visibility persistence across application restarts
