@@ -1536,7 +1536,7 @@ pub(crate) fn browser_mcp_output_from_devtools_runtime_raw(
 
 #[cfg(target_os = "windows")]
 const MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT: &str = r#"
-if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 6) {
+if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 8) {
   window.__mergenMcpState = window.__mergenMcpState || { refCounter: 1, consoleMessages: [], networkRequests: [], routes: [], highlighted: null };
 
   const state = window.__mergenMcpState;
@@ -1622,45 +1622,13 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 6) {
   const buttonMask = (button) => ({ left: 1, middle: 4, right: 2 }[buttonName(button)]);
   const ensureCursorStyle = () => {
     const existing = document.querySelector('style[data-mergen-mcp-cursor-style]');
-    if (existing?.getAttribute('data-mergen-mcp-cursor-style') === '6') return;
+    if (existing?.getAttribute('data-mergen-mcp-cursor-style') === '8') return;
     existing?.remove();
     const style = document.createElement('style');
-    style.setAttribute('data-mergen-mcp-cursor-style', '6');
+    style.setAttribute('data-mergen-mcp-cursor-style', '8');
     style.textContent = `
-@keyframes mergenMcpCursorPulse {
-  0% { opacity: 0; transform: translate(-50%, -50%) scale(0.55); box-shadow: 0 0 0 0 rgba(56,189,248,0.34), 0 8px 20px rgba(2,6,23,0.26); }
-  22% { opacity: 0.95; }
-  100% { opacity: 0; transform: translate(-50%, -50%) scale(1.85); box-shadow: 0 0 0 12px rgba(56,189,248,0), 0 12px 28px rgba(2,6,23,0); }
-}
-@keyframes mergenMcpCursorIdleAura {
-  0%, 100% { opacity: 0.52; transform: translate(-50%, -50%) scale(0.96); }
-  50% { opacity: 0.68; transform: translate(-50%, -50%) scale(1.04); }
-}
-[data-mergen-mcp-cursor] [data-mergen-mcp-cursor-aura],
-[data-mergen-mcp-cursor] [data-mergen-mcp-cursor-focus],
 [data-mergen-mcp-cursor] [data-mergen-mcp-cursor-pointer] {
-  transition: opacity 130ms ease, transform 150ms cubic-bezier(0.16, 1, 0.3, 1), filter 150ms ease;
-}
-[data-mergen-mcp-cursor] [data-mergen-mcp-cursor-aura] {
-  animation: mergenMcpCursorIdleAura 1500ms ease-in-out infinite;
-}
-[data-mergen-mcp-cursor][data-mergen-mcp-cursor-phase="moving"] [data-mergen-mcp-cursor-aura] {
-  opacity: 0.76;
-  transform: translate(-50%, -50%) scale(1.12);
-}
-[data-mergen-mcp-cursor][data-mergen-mcp-cursor-phase="targeting"] [data-mergen-mcp-cursor-aura],
-[data-mergen-mcp-cursor][data-mergen-mcp-cursor-phase="click"] [data-mergen-mcp-cursor-aura] {
-  opacity: 0.9;
-  transform: translate(-50%, -50%) scale(0.82);
-  animation: none;
-}
-[data-mergen-mcp-cursor][data-mergen-mcp-cursor-phase="targeting"] [data-mergen-mcp-cursor-focus],
-[data-mergen-mcp-cursor][data-mergen-mcp-cursor-phase="click"] [data-mergen-mcp-cursor-focus] {
-  opacity: 0.9;
-  transform: translate(-50%, -50%) scale(0.86);
-}
-[data-mergen-mcp-cursor][data-mergen-mcp-cursor-phase="moving"] [data-mergen-mcp-cursor-pointer] {
-  filter: drop-shadow(0 2px 2px rgba(15,23,42,0.82)) drop-shadow(0 13px 22px rgba(2,6,23,0.28));
+  transition: transform 120ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 `;
     document.documentElement.appendChild(style);
@@ -1670,6 +1638,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 6) {
     if (
       state.cursorElement &&
       document.documentElement.contains(state.cursorElement) &&
+      state.cursorElement.getAttribute?.('data-mergen-mcp-cursor-version') === '8' &&
       state.cursorElement.querySelector?.('[data-mergen-mcp-cursor-pointer]')
     ) {
       return state.cursorElement;
@@ -1677,83 +1646,44 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 6) {
     state.cursorElement?.remove?.();
     const cursor = document.createElement('div');
     cursor.setAttribute('data-mergen-mcp-cursor', 'true');
+    cursor.setAttribute('data-mergen-mcp-cursor-version', '8');
     cursor.setAttribute('data-mergen-mcp-cursor-phase', state.cursor.phase || 'idle');
     Object.assign(cursor.style, {
       position: 'fixed',
       left: '0px',
       top: '0px',
-      width: '48px',
-      height: '48px',
+      width: '30px',
+      height: '38px',
       pointerEvents: 'none',
       zIndex: '2147483647',
       display: 'none',
       transform: 'translate(0px, 0px)',
       transformOrigin: '0px 0px',
       willChange: 'transform',
-      contain: 'layout style paint',
+      overflow: 'visible',
     });
     cursor.style.setProperty('--mergen-mcp-cursor-tilt', '0deg');
-    const aura = document.createElement('div');
-    aura.setAttribute('data-mergen-mcp-cursor-aura', 'true');
-    Object.assign(aura.style, {
-      position: 'absolute',
-      left: '12px',
-      top: '14px',
-      width: '42px',
-      height: '42px',
-      borderRadius: '999px',
-      background: 'radial-gradient(circle, rgba(15,23,42,0.24) 0%, rgba(15,23,42,0.15) 36%, rgba(56,189,248,0.12) 58%, rgba(56,189,248,0) 72%)',
-      boxShadow: '0 10px 24px rgba(2,6,23,0.22)',
-      transform: 'translate(-50%, -50%)',
-      opacity: '0.62',
-      mixBlendMode: 'normal',
-    });
-    const focus = document.createElement('div');
-    focus.setAttribute('data-mergen-mcp-cursor-focus', 'true');
-    Object.assign(focus.style, {
-      position: 'absolute',
-      left: '12px',
-      top: '14px',
-      width: '25px',
-      height: '25px',
-      borderRadius: '999px',
-      border: '1px solid rgba(226,232,240,0.62)',
-      boxShadow: '0 0 0 1px rgba(15,23,42,0.22), 0 8px 20px rgba(2,6,23,0.18)',
-      transform: 'translate(-50%, -50%) scale(0.98)',
-      opacity: '0.42',
-    });
     const pointer = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     pointer.setAttribute('data-mergen-mcp-cursor-pointer', 'true');
-    pointer.setAttribute('viewBox', '0 0 30 36');
+    pointer.setAttribute('viewBox', '-2 -2 30 38');
     pointer.setAttribute('aria-hidden', 'true');
     Object.assign(pointer.style, {
       position: 'absolute',
-      left: '-3px',
-      top: '-3px',
+      left: '-2px',
+      top: '-2px',
       width: '30px',
-      height: '36px',
+      height: '38px',
       overflow: 'visible',
       transform: 'rotate(var(--mergen-mcp-cursor-tilt))',
-      transformOrigin: '4px 4px',
-      filter: 'drop-shadow(0 1px 1px rgba(15,23,42,0.9)) drop-shadow(0 9px 16px rgba(2,6,23,0.32))',
+      transformOrigin: '2px 2px',
     });
     const pointerPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    pointerPath.setAttribute('d', 'M3.8 3.1 3.2 28.4 10.7 21.7 15.9 33.2 21.8 30.4 16.4 19.2 26.7 19.6 3.8 3.1Z');
-    pointerPath.setAttribute('fill', 'rgba(248,250,252,0.98)');
-    pointerPath.setAttribute('stroke', 'rgba(15,23,42,0.9)');
-    pointerPath.setAttribute('stroke-width', '1.45');
+    pointerPath.setAttribute('d', 'M0 0 0 27.6 7.6 20.4 12.5 32.7 17.7 30.5 12.8 18.9 23.7 18.9 0 0Z');
+    pointerPath.setAttribute('fill', 'rgba(3,7,18,0.98)');
+    pointerPath.setAttribute('stroke', 'rgba(255,255,255,0.98)');
+    pointerPath.setAttribute('stroke-width', '2.05');
     pointerPath.setAttribute('stroke-linejoin', 'round');
-    const pointerSheen = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    pointerSheen.setAttribute('d', 'M6.7 8.6 6.4 22.1 10.1 18.6 13.5 25.9');
-    pointerSheen.setAttribute('fill', 'none');
-    pointerSheen.setAttribute('stroke', 'rgba(255,255,255,0.72)');
-    pointerSheen.setAttribute('stroke-width', '1.15');
-    pointerSheen.setAttribute('stroke-linecap', 'round');
-    pointerSheen.setAttribute('stroke-linejoin', 'round');
     pointer.appendChild(pointerPath);
-    pointer.appendChild(pointerSheen);
-    cursor.appendChild(aura);
-    cursor.appendChild(focus);
     cursor.appendChild(pointer);
     document.documentElement.appendChild(cursor);
     state.cursorElement = cursor;
@@ -1813,6 +1743,50 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 6) {
     return point;
   };
   const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+  const easeInOutSine = (t) => 0.5 - Math.cos(Math.PI * t) / 2;
+  const flightCursorPoint = (start, end, t, distance, options = {}) => {
+    if (options.straight || distance < 22 || t >= 0.995) {
+      const eased = easeOutCubic(t);
+      return {
+        x: start.x + (end.x - start.x) * eased,
+        y: start.y + (end.y - start.y) * eased,
+        tilt: 0,
+      };
+    }
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const length = Math.max(1, distance);
+    const normalX = -dy / length;
+    const normalY = dx / length;
+    const arcHeight = clamp(distance * 0.18, 28, 118);
+    const sideDrift = clamp(distance * 0.055, 8, 42) * Math.sign(dx || 1);
+    const curvePoint = (progress) => {
+      const eased = easeInOutSine(progress);
+      const baseX = start.x + dx * eased;
+      const baseY = start.y + dy * eased;
+      const parabola = Math.sin(Math.PI * progress);
+      const straighten = 1 - clamp((progress - 0.56) / 0.18, 0, 1);
+      const lift = -arcHeight * parabola * straighten;
+      const drift = sideDrift * parabola * straighten;
+      const tilt = clamp(Math.sign(dx || 1) * 11 * parabola * straighten, -12, 12);
+      return {
+        x: baseX + normalX * drift,
+        y: baseY + normalY * drift + lift,
+        tilt,
+      };
+    };
+    const straightenAt = 0.74;
+    if (t >= straightenAt) {
+      const approachStart = curvePoint(straightenAt);
+      const approach = easeOutCubic((t - straightenAt) / (1 - straightenAt));
+      return {
+        x: approachStart.x + (end.x - approachStart.x) * approach,
+        y: approachStart.y + (end.y - approachStart.y) * approach,
+        tilt: approachStart.tilt * (1 - approach),
+      };
+    }
+    return curvePoint(t);
+  };
   const organicCursorPoint = (start, end, t, distance, options = {}) => {
     const eased = easeOutCubic(t);
     const baseX = start.x + (end.x - start.x) * eased;
@@ -1836,7 +1810,10 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 6) {
     const end = clampPoint(x, y);
     const start = state.cursor.visible ? clampPoint(state.cursor.x, state.cursor.y) : clampPoint(end.x - 96, end.y - 64);
     const distance = Math.hypot(end.x - start.x, end.y - start.y);
-    const duration = options.duration ?? clamp(Math.round(distance * 1.15), 650, 900);
+    const defaultDuration = options.clickFlight
+      ? clamp(Math.round(distance * 1.25), 720, 1050)
+      : clamp(Math.round(distance * 1.15), 650, 900);
+    const duration = options.duration ?? defaultDuration;
     setCursorPosition(start.x, start.y, { tilt: 0, phase: 'moving' });
     if (duration <= 0 || distance < 1) {
       const point = setCursorPosition(end.x, end.y, { tilt: 0, phase: 'idle' });
@@ -1848,8 +1825,10 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 6) {
     const started = performance.now();
     const step = (now) => {
       const t = clamp((now - started) / duration, 0, 1);
-      const visual = organicCursorPoint(start, end, t, distance, options);
-      const phase = t > 0.72 ? 'targeting' : 'moving';
+      const visual = options.clickFlight
+        ? flightCursorPoint(start, end, t, distance, options)
+        : organicCursorPoint(start, end, t, distance, options);
+      const phase = t > (options.clickFlight ? 0.74 : 0.72) ? 'targeting' : 'moving';
       const point = setCursorPosition(visual.x, visual.y, { tilt: visual.tilt, phase });
       options.onStep?.(point);
       if (t < 1) requestAnimationFrame(step);
@@ -1864,28 +1843,6 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 6) {
     setCursorPosition(point.x, point.y, { tilt: 0, phase: 'targeting' });
     await new Promise((resolve) => setTimeout(resolve, delay));
     return setCursorPosition(point.x, point.y, { tilt: 0, phase: 'targeting' });
-  };
-  const pulseCursor = (point) => {
-    ensureCursorStyle();
-    const pulse = document.createElement('div');
-    pulse.setAttribute('data-mergen-mcp-cursor-pulse', 'true');
-    Object.assign(pulse.style, {
-      position: 'fixed',
-      left: `${point.x}px`,
-      top: `${point.y}px`,
-      width: '18px',
-      height: '18px',
-      border: '1px solid rgba(226,232,240,0.92)',
-      borderRadius: '999px',
-      background: 'radial-gradient(circle, rgba(56,189,248,0.22), rgba(56,189,248,0.02) 58%, rgba(56,189,248,0) 70%)',
-      boxShadow: '0 0 0 1px rgba(15,23,42,0.22), 0 8px 20px rgba(2,6,23,0.26)',
-      pointerEvents: 'none',
-      zIndex: '2147483646',
-      transform: 'translate(-50%, -50%)',
-      animation: 'mergenMcpCursorPulse 360ms cubic-bezier(0.16, 1, 0.3, 1) forwards',
-    });
-    document.documentElement.appendChild(pulse);
-    setTimeout(() => pulse.remove(), 440);
   };
   const stableElementCenterAfterScroll = async (element) => {
     element.scrollIntoView({ block: 'center', inline: 'center' });
@@ -1903,6 +1860,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 6) {
   };
   const elementCenter = async (element) => stableElementCenterAfterScroll(element);
   const targetAt = (point, fallback = null) => document.elementFromPoint(point.x, point.y) || fallback || document.body || document.documentElement;
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const scrollableAncestor = (element, deltaX, deltaY) => {
     let node = element && element.nodeType === Node.ELEMENT_NODE ? element : element?.parentElement;
     while (node && node !== document.documentElement) {
@@ -1914,7 +1872,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 6) {
     }
     return document.scrollingElement || document.documentElement;
   };
-  const applyWheelScrollFallback = async (target, point, deltaX, deltaY) => {
+  const applyWheelStep = (target, point, deltaX, deltaY) => {
     const wheelEvent = new WheelEvent('wheel', { bubbles: true, cancelable: true, clientX: point.x, clientY: point.y, deltaX, deltaY, deltaMode: 0 });
     const wasNotCanceled = target.dispatchEvent(wheelEvent);
     if (wasNotCanceled) {
@@ -1924,7 +1882,38 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 6) {
       } else {
         window.scrollBy({ left: deltaX, top: deltaY, behavior: 'auto' });
       }
+    }
+    return wasNotCanceled;
+  };
+  const humanWheelSteps = (deltaX, deltaY) => {
+    const distance = Math.max(Math.abs(deltaX), Math.abs(deltaY));
+    if (distance <= 0) return [];
+    const count = clamp(Math.ceil(distance / 90), 3, 14);
+    const steps = [];
+    let previous = 0;
+    for (let index = 1; index <= count; index++) {
+      const t = index / count;
+      const progress = 0.5 - Math.cos(Math.PI * t) / 2;
+      steps.push({
+        deltaX: deltaX * (progress - previous),
+        deltaY: deltaY * (progress - previous),
+      });
+      previous = progress;
+    }
+    return steps;
+  };
+  const applyWheelScrollFallback = async (target, point, deltaX, deltaY) => {
+    const steps = humanWheelSteps(deltaX, deltaY);
+    if (!steps.length) {
+      dispatchMoveAt(point, targetAt(point, target));
+      return;
+    }
+    setCursorPosition(point.x, point.y, { tilt: 0, phase: 'targeting' });
+    for (const step of steps) {
+      const currentTarget = targetAt(point, target);
+      applyWheelStep(currentTarget, point, step.deltaX, step.deltaY);
       await nextFrame();
+      await sleep(42);
     }
     setCursorPosition(point.x, point.y, { tilt: 0, phase: 'idle' });
     dispatchMoveAt(point, targetAt(point, target));
@@ -2000,7 +1989,6 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 6) {
     }
     if (button === 'right') dispatchMouse(target, 'contextmenu', point, button, 1, 0);
     setCursorPosition(point.x, point.y, { tilt: 0, phase: 'click' });
-    pulseCursor(point);
     scheduleCursorIdle();
     await settleAfterInteraction();
     return target;
@@ -2195,7 +2183,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 6) {
       const { element, target } = requiredElement(params, tool);
       const point = await elementCenter(element);
       anchorCursorTo(element);
-      await moveCursorTo(point.x, point.y);
+      await moveCursorTo(point.x, point.y, { clickFlight: true });
       await clickAt(point, { target: element, button: params.button, doubleClick: params.doubleClick });
       return ok(`Clicked ${target}`);
     }
@@ -2275,7 +2263,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 6) {
     if (tool === 'browser_mouse_click_xy') {
       clearCursorAnchor();
       const point = requiredPoint(params);
-      await moveCursorTo(point.x, point.y);
+      await moveCursorTo(point.x, point.y, { clickFlight: true });
       await clickAt(point, { button: params.button, doubleClick: params.doubleClick });
       return ok(`Clicked mouse at ${Math.round(point.x)}, ${Math.round(point.y)}`, { x: point.x, y: point.y });
     }
@@ -2542,7 +2530,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 6) {
   };
   window.addEventListener('scroll', scheduleCursorAnchorSync, true);
   window.addEventListener('resize', scheduleCursorAnchorSync);
-  window.__mergenMcpRun.version = 6;
+  window.__mergenMcpRun.version = 8;
 }
 "#;
 
@@ -3231,15 +3219,20 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn browser_mcp_automation_script_includes_visible_cursor_and_mouse_tools() {
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 6"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 8"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor"));
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-aura"));
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-focus"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-version"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-pointer"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
             .contains("createElementNS('http://www.w3.org/2000/svg', 'svg')"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("moveCursorTo"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("organicCursorPoint"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("flightCursorPoint"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("easeInOutSine"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("straightenAt = 0.74"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("options.clickFlight"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("await moveCursorTo(point.x, point.y, { clickFlight: true })"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("steadyCursorForAction"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-phase"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("0.72"));
@@ -3248,9 +3241,24 @@ mod tests {
         ));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
             .contains("state.cursor.visible ? clampPoint(state.cursor.x, state.cursor.y) : clampPoint(end.x - 96, end.y - 64)"));
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("transform: 'translate(-50%, -50%)'"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("pointer.setAttribute('viewBox', '-2 -2 30 38')"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("left: '-2px'"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("top: '-2px'"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("transformOrigin: '2px 2px'"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("pointerPath.setAttribute('fill', 'rgba(3,7,18,0.98)')"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("pointerPath.setAttribute('stroke', 'rgba(255,255,255,0.98)')"));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("left: '-13px'"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-aura"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-focus"));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-halo"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-pulse"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("drop-shadow("));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("mergenMcpCursorPulse"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("mergenMcpCursorIdleAura"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("contain: 'layout style paint'"));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("rgba(245,158,11,0.20)"));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
             .contains("border: '2px solid rgba(245,158,11,0.95)'"));
@@ -3258,6 +3266,9 @@ mod tests {
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("anchorCursorTo(element)"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
             .contains("window.addEventListener('scroll', scheduleCursorAnchorSync, true)"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("humanWheelSteps"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("Math.ceil(distance / 90)"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("await sleep(42)"));
         assert!(
             MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("scrollBy({ left: deltaX, top: deltaY")
         );
