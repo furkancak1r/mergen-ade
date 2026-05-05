@@ -27,6 +27,7 @@ use eframe::egui::{
 use iconflow::{fonts as icon_fonts, try_icon, Pack, Size, Style};
 use image::ImageError;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tattoy_wezterm_surface::hyperlink::{
     Rule, CLOSING_PARENTHESIS_HYPERLINK_PATTERN, GENERIC_HYPERLINK_PATTERN,
 };
@@ -42,7 +43,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, SPI_GETKEYBOARDDELAY, SPI_GETKEYBOARDSPEED,
 };
 
-use crate::browser_mcp_service::{BrowserMcpAuthScope, BrowserMcpIpcResponse, BrowserMcpService};
+use crate::browser_mcp_service::{
+    BrowserMcpAuthScope, BrowserMcpCommand, BrowserMcpIpcRequest, BrowserMcpIpcResponse,
+    BrowserMcpService,
+};
+use crate::browser_video::{encode_browser_video_mp4, BrowserVideoChapter, BrowserVideoFrame};
 use crate::codex::{self, CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
 use crate::config;
 use crate::hooks::{
@@ -78,6 +83,10 @@ const TERMINAL_EVENT_QUEUE_CAPACITY: usize = 512;
 const TERMINAL_RETRY_MS: u64 = 8;
 const TERMINAL_FALLBACK_REFRESH_MS: u64 = 16;
 const TERMINAL_FALLBACK_REFRESH_MAX_MS: u64 = 64;
+const BROWSER_MCP_PENDING_POLL_MS: u64 = 16;
+const BROWSER_VIDEO_FPS: u32 = 10;
+const BROWSER_VIDEO_FRAME_INTERVAL_MS: u64 = 100;
+const BROWSER_VIDEO_FRAME_REQUEST_PREFIX: &str = "browser-video-frame";
 const TERMINAL_SNAPSHOT_BUDGET_PER_FRAME: usize = 2;
 const REPAINT_DEBOUNCE_MS: u64 = 5;
 const INPUT_ROUTING_GATE_MS: u64 = 75;
@@ -264,6 +273,7 @@ const WINDOWS_TERMINAL_FONT_CANDIDATES: [(&str, &str); 2] = [
 static FACTORY_DROID_INBOX_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CODEX_NOTIFY_INBOX_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static OPENCODE_NOTIFY_INBOX_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
+static BROWSER_MCP_PENDING_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 // Default blank project constants
 const RESERVED_BLANK_PROJECT_ID: u64 = 0;
@@ -1013,6 +1023,54 @@ enum FactoryDroidManagedEventStatus {
     Missing,
 }
 
+#[derive(Debug, Clone)]
+struct BrowserVideoRecordingState {
+    project_id: u64,
+    output_path: PathBuf,
+    started_at: Instant,
+    last_frame_started_at: Option<Instant>,
+    frame_interval: Duration,
+    capture_in_flight: bool,
+    next_frame_index: u64,
+    frames: Vec<BrowserVideoFrame>,
+    chapters: Vec<BrowserVideoChapter>,
+    last_error: Option<String>,
+}
+
+impl BrowserVideoRecordingState {
+    fn new(project_id: u64, output_path: PathBuf, started_at: Instant) -> Self {
+        Self {
+            project_id,
+            output_path,
+            started_at,
+            last_frame_started_at: None,
+            frame_interval: Duration::from_millis(BROWSER_VIDEO_FRAME_INTERVAL_MS),
+            capture_in_flight: false,
+            next_frame_index: 0,
+            frames: Vec::new(),
+            chapters: Vec::new(),
+            last_error: None,
+        }
+    }
+}
+
+fn browser_video_frame_request_id(project_id: u64, frame_index: u64) -> String {
+    format!("{BROWSER_VIDEO_FRAME_REQUEST_PREFIX}:{project_id}:{frame_index}")
+}
+
+fn parse_browser_video_frame_request_id(request_id: &str) -> Option<(u64, u64)> {
+    let mut parts = request_id.split(':');
+    if parts.next()? != BROWSER_VIDEO_FRAME_REQUEST_PREFIX {
+        return None;
+    }
+    let project_id = parts.next()?.parse::<u64>().ok()?;
+    let frame_index = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((project_id, frame_index))
+}
+
 pub struct AdeApp {
     config_path: PathBuf,
     current_executable_path: PathBuf,
@@ -1035,6 +1093,7 @@ pub struct AdeApp {
     opencode_hook_service: Option<OpenCodeHookService>,
     opencode_hook_last_poll_at: Option<Instant>,
     browser_mcp_service: Option<BrowserMcpService>,
+    browser_mcp_pending_responses: BTreeMap<String, std::sync::mpsc::Sender<BrowserMcpIpcResponse>>,
     config: AppConfig,
     config_load_error: Option<String>,
     config_save_requires_reload: bool,
@@ -1136,6 +1195,8 @@ pub struct AdeApp {
     /// Last design inspect selection delivered per project/terminal destination, used to prevent paste floods.
     browser_design_inspect_last_delivery_by_destination:
         BTreeMap<(u64, u64), DesignInspectDeliveryState>,
+    /// Active embedded-browser video recordings per project.
+    browser_video_recordings_by_project: BTreeMap<u64, BrowserVideoRecordingState>,
 }
 
 /// Represents a single open file buffer in the built-in editor.
@@ -3426,6 +3487,7 @@ impl AdeApp {
             opencode_hook_service: OpenCodeHookService::start().ok(),
             opencode_hook_last_poll_at: None,
             browser_mcp_service,
+            browser_mcp_pending_responses: BTreeMap::new(),
             config,
             config_load_error: config_load_error.clone(),
             config_save_requires_reload: config_load_error.is_some(),
@@ -3524,6 +3586,7 @@ impl AdeApp {
             browser_design_inspect_terminal_by_project: BTreeMap::new(),
             browser_design_inspect_target_changed_at_by_project: BTreeMap::new(),
             browser_design_inspect_last_delivery_by_destination: BTreeMap::new(),
+            browser_video_recordings_by_project: BTreeMap::new(),
         };
         // Do NOT seed runtime browser state from legacy config.
         // Browser panel open state is now runtime-only per project.
@@ -3765,6 +3828,7 @@ impl AdeApp {
             .remove(&project_id);
         self.browser_design_inspect_last_delivery_by_destination
             .retain(|(pid, _), _| *pid != project_id);
+        self.browser_video_recordings_by_project.remove(&project_id);
         if let Some(service) = self.browser_mcp_service.as_ref() {
             service.revoke_project(project_id);
         }
@@ -15833,6 +15897,11 @@ impl AdeApp {
                     web_browser::BrowserEvent::DesignElementClicked(element) => {
                         self.forward_design_inspect_click_to_terminal(ctx, project_id, element);
                     }
+                    web_browser::BrowserEvent::McpToolResult { request_id, result } => {
+                        self.handle_browser_mcp_tool_result_event(
+                            ctx, project_id, request_id, result,
+                        );
+                    }
                     web_browser::BrowserEvent::LoadStarted(_)
                     | web_browser::BrowserEvent::LoadFinished(_) => {}
                 }
@@ -15841,6 +15910,46 @@ impl AdeApp {
 
         if any_changed {
             ctx.request_repaint();
+        }
+    }
+
+    fn handle_browser_mcp_tool_result_event(
+        &mut self,
+        ctx: &egui::Context,
+        event_project_id: u64,
+        request_id: String,
+        result: Result<web_browser::BrowserMcpToolOutput, String>,
+    ) {
+        if let Some((project_id, _frame_index)) = parse_browser_video_frame_request_id(&request_id)
+        {
+            if project_id != event_project_id {
+                log::debug!(
+                    "Browser video frame project mismatch: request={}, event_project={}",
+                    request_id,
+                    event_project_id
+                );
+            }
+            self.handle_browser_video_frame_result(ctx, project_id, result);
+            return;
+        }
+
+        if let Some(respond_to) = self.browser_mcp_pending_responses.remove(&request_id) {
+            let _ = respond_to.send(Self::browser_mcp_response_from_tool_result(result));
+            ctx.request_repaint();
+        } else {
+            log::debug!("Ignoring browser MCP result for unknown request id: {request_id}");
+        }
+    }
+
+    fn browser_mcp_response_from_tool_result(
+        result: Result<web_browser::BrowserMcpToolOutput, String>,
+    ) -> BrowserMcpIpcResponse {
+        match result {
+            Ok(output) => match output.data {
+                Some(data) => BrowserMcpIpcResponse::ok_with_data(output.text, data),
+                None => BrowserMcpIpcResponse::ok(output.text),
+            },
+            Err(err) => BrowserMcpIpcResponse::error(err),
         }
     }
 
@@ -15855,11 +15964,392 @@ impl AdeApp {
         }
 
         for command in commands {
-            let response =
-                self.handle_browser_mcp_request(ctx, command.request, command.auth_scope);
-            let _ = command.respond_to.send(response);
+            let tool = command.request.tool.clone();
+            match tool.as_str() {
+                "browser_take_screenshot" => {
+                    self.handle_browser_mcp_screenshot_command(ctx, command);
+                }
+                "browser_start_video" => {
+                    let response = self.handle_browser_mcp_start_video_request(
+                        ctx,
+                        command.request,
+                        command.auth_scope,
+                    );
+                    let _ = command.respond_to.send(response);
+                }
+                "browser_stop_video" => {
+                    self.handle_browser_mcp_stop_video_command(ctx, command);
+                }
+                "browser_video_chapter" => {
+                    let response = self.handle_browser_mcp_video_chapter_request(
+                        &command.request,
+                        &command.auth_scope,
+                    );
+                    let _ = command.respond_to.send(response);
+                }
+                _ => {
+                    let response =
+                        self.handle_browser_mcp_request(ctx, command.request, command.auth_scope);
+                    let _ = command.respond_to.send(response);
+                }
+            }
         }
         ctx.request_repaint();
+        if !self.browser_mcp_pending_responses.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(BROWSER_MCP_PENDING_POLL_MS));
+        }
+    }
+
+    fn handle_browser_mcp_screenshot_command(
+        &mut self,
+        ctx: &egui::Context,
+        command: BrowserMcpCommand,
+    ) {
+        let project_id =
+            match self.prepare_browser_mcp_tool_project(ctx, &command.request, &command.auth_scope)
+            {
+                Ok(project_id) => project_id,
+                Err(response) => {
+                    let _ = command.respond_to.send(response);
+                    return;
+                }
+            };
+
+        let request_id = self.next_browser_mcp_pending_request_id(&command.request);
+        self.browser_mcp_pending_responses
+            .insert(request_id.clone(), command.respond_to);
+        let start_result = self
+            .project_browser(project_id)
+            .start_mcp_screenshot_tool(request_id.clone(), &command.request.params);
+        if let Err(err) = start_result {
+            if let Some(respond_to) = self.browser_mcp_pending_responses.remove(&request_id) {
+                let _ = respond_to.send(BrowserMcpIpcResponse::error(err));
+            }
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(BROWSER_MCP_PENDING_POLL_MS));
+        }
+    }
+
+    fn prepare_browser_mcp_tool_project(
+        &mut self,
+        ctx: &egui::Context,
+        request: &BrowserMcpIpcRequest,
+        auth_scope: &BrowserMcpAuthScope,
+    ) -> Result<u64, BrowserMcpIpcResponse> {
+        let project_id = self
+            .resolve_browser_mcp_project_id(request, auth_scope)
+            .map_err(BrowserMcpIpcResponse::error)?;
+        if !self.projects.contains_key(&project_id) {
+            return Err(BrowserMcpIpcResponse::error(format!(
+                "Browser MCP target project does not exist: {project_id}"
+            )));
+        }
+
+        self.set_browser_panel_open_for_project(project_id, true);
+        self.config.ui.checklist_panel_expanded = false;
+        ctx.request_repaint();
+
+        if let Some(error) = self.prepare_browser_mcp_project(project_id) {
+            return Err(error);
+        }
+        Ok(project_id)
+    }
+
+    fn next_browser_mcp_pending_request_id(&self, request: &BrowserMcpIpcRequest) -> String {
+        let base = if request.request_id.trim().is_empty() {
+            let counter = BROWSER_MCP_PENDING_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+            format!("browser-mcp-generated-{counter}")
+        } else {
+            request.request_id.clone()
+        };
+        if !self.browser_mcp_pending_responses.contains_key(&base) {
+            return base;
+        }
+        let counter = BROWSER_MCP_PENDING_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{base}-{counter}")
+    }
+
+    fn handle_browser_mcp_start_video_request(
+        &mut self,
+        ctx: &egui::Context,
+        request: BrowserMcpIpcRequest,
+        auth_scope: BrowserMcpAuthScope,
+    ) -> BrowserMcpIpcResponse {
+        let project_id = match self.prepare_browser_mcp_tool_project(ctx, &request, &auth_scope) {
+            Ok(project_id) => project_id,
+            Err(response) => return response,
+        };
+        if self
+            .browser_video_recordings_by_project
+            .contains_key(&project_id)
+        {
+            return BrowserMcpIpcResponse::error(
+                "Browser video recording is already running for this project",
+            );
+        }
+
+        let output_path = match self.browser_video_output_path(project_id) {
+            Ok(path) => path,
+            Err(err) => return BrowserMcpIpcResponse::error(err),
+        };
+        let state =
+            BrowserVideoRecordingState::new(project_id, output_path.clone(), Instant::now());
+        self.browser_video_recordings_by_project
+            .insert(project_id, state);
+        ctx.request_repaint_after(Duration::from_millis(BROWSER_MCP_PENDING_POLL_MS));
+
+        BrowserMcpIpcResponse::ok_with_data(
+            format!(
+                "Started embedded Mergen browser video recording: {}",
+                output_path.display()
+            ),
+            json!({
+                "videoPath": output_path.display().to_string(),
+                "fps": BROWSER_VIDEO_FPS
+            }),
+        )
+    }
+
+    fn handle_browser_mcp_stop_video_command(
+        &mut self,
+        ctx: &egui::Context,
+        command: BrowserMcpCommand,
+    ) {
+        let project_id =
+            match self.resolve_browser_mcp_project_id(&command.request, &command.auth_scope) {
+                Ok(project_id) => project_id,
+                Err(message) => {
+                    let _ = command
+                        .respond_to
+                        .send(BrowserMcpIpcResponse::error(message));
+                    return;
+                }
+            };
+        if !self.projects.contains_key(&project_id) {
+            let _ = command
+                .respond_to
+                .send(BrowserMcpIpcResponse::error(format!(
+                    "Browser MCP target project does not exist: {project_id}"
+                )));
+            return;
+        }
+
+        let Some(state) = self.browser_video_recordings_by_project.remove(&project_id) else {
+            let _ = command.respond_to.send(BrowserMcpIpcResponse::error(
+                "Browser video recording is not running for this project",
+            ));
+            return;
+        };
+
+        if state.frames.is_empty() {
+            let detail = state
+                .last_error
+                .as_deref()
+                .map(|err| format!(" Last capture error: {err}"))
+                .unwrap_or_default();
+            let _ = command
+                .respond_to
+                .send(BrowserMcpIpcResponse::error(format!(
+                    "Browser video recording stopped before any frames were captured.{detail}"
+                )));
+            return;
+        }
+
+        let respond_to = command.respond_to;
+        let output_path = state.output_path;
+        let frames = state.frames;
+        let chapters = state.chapters;
+        std::thread::spawn(move || {
+            let response =
+                match encode_browser_video_mp4(output_path, frames, chapters, BROWSER_VIDEO_FPS) {
+                    Ok(result) => {
+                        let chapters = result
+                            .chapters
+                            .iter()
+                            .map(|chapter| {
+                                json!({
+                                    "elapsedMs": chapter.elapsed_ms,
+                                    "label": chapter.label
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        BrowserMcpIpcResponse::ok_with_data(
+                            format!(
+                                "Saved embedded Mergen browser video: {} ({} frames).",
+                                result.path.display(),
+                                result.frame_count
+                            ),
+                            json!({
+                                "videoPath": result.path.display().to_string(),
+                                "mimeType": "video/mp4",
+                                "frameCount": result.frame_count,
+                                "durationMs": result.duration_ms,
+                                "chapters": chapters
+                            }),
+                        )
+                    }
+                    Err(err) => BrowserMcpIpcResponse::error(err),
+                };
+            let _ = respond_to.send(response);
+        });
+        ctx.request_repaint();
+    }
+
+    fn handle_browser_mcp_video_chapter_request(
+        &mut self,
+        request: &BrowserMcpIpcRequest,
+        auth_scope: &BrowserMcpAuthScope,
+    ) -> BrowserMcpIpcResponse {
+        let project_id = match self.resolve_browser_mcp_project_id(request, auth_scope) {
+            Ok(project_id) => project_id,
+            Err(message) => return BrowserMcpIpcResponse::error(message),
+        };
+        if !self.projects.contains_key(&project_id) {
+            return BrowserMcpIpcResponse::error(format!(
+                "Browser MCP target project does not exist: {project_id}"
+            ));
+        }
+
+        let Some(state) = self
+            .browser_video_recordings_by_project
+            .get_mut(&project_id)
+        else {
+            return BrowserMcpIpcResponse::error(
+                "Browser video recording is not running for this project",
+            );
+        };
+        let label = request
+            .params
+            .get("title")
+            .or_else(|| request.params.get("label"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Chapter")
+            .trim();
+        let label = if label.is_empty() {
+            "Chapter".to_owned()
+        } else {
+            label.to_owned()
+        };
+        let elapsed_ms = state.started_at.elapsed().as_millis();
+        state.chapters.push(BrowserVideoChapter {
+            elapsed_ms,
+            label: label.clone(),
+        });
+        BrowserMcpIpcResponse::ok(format!(
+            "Added browser video chapter at {elapsed_ms}ms: {label}"
+        ))
+    }
+
+    fn process_browser_video_recordings(&mut self, ctx: &egui::Context) {
+        if self.browser_video_recordings_by_project.is_empty() {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut captures = Vec::new();
+        for (project_id, state) in self.browser_video_recordings_by_project.iter_mut() {
+            if state.capture_in_flight {
+                continue;
+            }
+            let due = state
+                .last_frame_started_at
+                .map(|last| now.duration_since(last) >= state.frame_interval)
+                .unwrap_or(true);
+            if due {
+                let frame_index = state.next_frame_index;
+                state.next_frame_index += 1;
+                state.capture_in_flight = true;
+                state.last_frame_started_at = Some(now);
+                captures.push((*project_id, frame_index));
+            }
+        }
+
+        for (project_id, frame_index) in captures {
+            let request_id = browser_video_frame_request_id(project_id, frame_index);
+            let params = json!({
+                "type": "jpeg",
+                "fullPage": false
+            });
+            let start_result = if let Some(error) = self.prepare_browser_mcp_project(project_id) {
+                Err(error.text)
+            } else {
+                self.project_browser(project_id)
+                    .start_mcp_screenshot_tool(request_id, &params)
+            };
+            if let Err(err) = start_result {
+                if let Some(state) = self
+                    .browser_video_recordings_by_project
+                    .get_mut(&project_id)
+                {
+                    state.capture_in_flight = false;
+                    state.last_error = Some(err);
+                }
+            }
+        }
+
+        ctx.request_repaint_after(Duration::from_millis(BROWSER_MCP_PENDING_POLL_MS));
+    }
+
+    fn handle_browser_video_frame_result(
+        &mut self,
+        ctx: &egui::Context,
+        project_id: u64,
+        result: Result<web_browser::BrowserMcpToolOutput, String>,
+    ) {
+        let Some(state) = self
+            .browser_video_recordings_by_project
+            .get_mut(&project_id)
+        else {
+            return;
+        };
+        state.capture_in_flight = false;
+        match result {
+            Ok(output) => {
+                match Self::browser_video_frame_from_output(output, state.started_at.elapsed()) {
+                    Ok(frame) => state.frames.push(frame),
+                    Err(err) => state.last_error = Some(err),
+                }
+            }
+            Err(err) => state.last_error = Some(err),
+        }
+        ctx.request_repaint_after(Duration::from_millis(BROWSER_MCP_PENDING_POLL_MS));
+    }
+
+    fn browser_video_frame_from_output(
+        output: web_browser::BrowserMcpToolOutput,
+        elapsed: Duration,
+    ) -> Result<BrowserVideoFrame, String> {
+        let data = output
+            .data
+            .ok_or_else(|| "Browser screenshot did not include image data".to_owned())?;
+        let image_type = data
+            .get("imageType")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("jpeg")
+            .to_owned();
+        let base64 = data
+            .get("base64")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if base64.is_empty() {
+            return Err("Browser screenshot did not include base64 image data".to_owned());
+        }
+        Ok(BrowserVideoFrame {
+            elapsed,
+            image_type,
+            base64,
+        })
+    }
+
+    fn browser_video_output_path(&self, project_id: u64) -> Result<PathBuf, String> {
+        let dir = config::browser_recordings_dir(project_id)
+            .map_err(|err| format!("Could not create browser recordings directory: {err}"))?;
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+        Ok(dir.join(format!("mergen-browser-project-{project_id}-{millis}.mp4")))
     }
 
     fn handle_browser_mcp_request(
@@ -17610,6 +18100,7 @@ impl eframe::App for AdeApp {
         self.process_directory_index_events(ctx);
         self.process_browser_events(ctx);
         self.process_browser_mcp_commands(ctx);
+        self.process_browser_video_recordings(ctx);
         self.schedule_source_control_refresh(ctx);
         self.schedule_terminal_refresh(ctx);
 
@@ -32681,6 +33172,7 @@ mod tests {
             opencode_notify_last_poll_at: None,
             opencode_process_last_poll_at: None,
             browser_mcp_service: None,
+            browser_mcp_pending_responses: BTreeMap::new(),
             config: AppConfig::default(),
             config_load_error: None,
             config_save_requires_reload: false,
@@ -32758,6 +33250,7 @@ mod tests {
             browser_design_inspect_terminal_by_project: BTreeMap::new(),
             browser_design_inspect_target_changed_at_by_project: BTreeMap::new(),
             browser_design_inspect_last_delivery_by_destination: BTreeMap::new(),
+            browser_video_recordings_by_project: BTreeMap::new(),
         }
     }
 
@@ -40279,6 +40772,70 @@ mod tests {
             app.projects.get(&1).unwrap().browser_last_url,
             Some(supported_url)
         );
+    }
+
+    #[test]
+    fn browser_mcp_tool_result_completes_pending_response() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        app.project_browser(1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.browser_mcp_pending_responses
+            .insert("req-1".to_owned(), tx);
+
+        {
+            let browser = app.embedded_browsers_by_project.get(&1).unwrap();
+            browser.send_test_event(web_browser::BrowserEvent::McpToolResult {
+                request_id: "req-1".to_owned(),
+                result: Ok(web_browser::BrowserMcpToolOutput {
+                    text: "done".to_owned(),
+                    data: Some(serde_json::json!({ "value": 1 })),
+                }),
+            });
+        }
+
+        app.process_browser_events(&ctx);
+
+        let response = rx.try_recv().expect("pending response should complete");
+        assert!(!response.is_error);
+        assert_eq!(response.text, "done");
+        assert_eq!(response.data.unwrap()["value"].as_i64(), Some(1));
+        assert!(app.browser_mcp_pending_responses.is_empty());
+    }
+
+    #[test]
+    fn browser_video_frame_request_id_round_trips() {
+        let request_id = super::browser_video_frame_request_id(7, 42);
+
+        assert_eq!(
+            super::parse_browser_video_frame_request_id(&request_id),
+            Some((7, 42))
+        );
+        assert_eq!(
+            super::parse_browser_video_frame_request_id("other:7:42"),
+            None
+        );
+    }
+
+    #[test]
+    fn browser_video_frame_from_screenshot_output_extracts_image_data() {
+        let frame = AdeApp::browser_video_frame_from_output(
+            web_browser::BrowserMcpToolOutput {
+                text: "screenshot".to_owned(),
+                data: Some(serde_json::json!({
+                    "imageType": "jpeg",
+                    "base64": "abcd"
+                })),
+            },
+            Duration::from_millis(250),
+        )
+        .expect("frame should be built from screenshot output");
+
+        assert_eq!(frame.image_type, "jpeg");
+        assert_eq!(frame.base64, "abcd");
+        assert_eq!(frame.elapsed, Duration::from_millis(250));
     }
 
     #[test]

@@ -777,18 +777,50 @@ fn devtools_tools() -> Vec<JsonValue> {
 }
 
 fn vision_tools() -> Vec<JsonValue> {
-    vec![tool(
-        "browser_take_screenshot",
-        "Take a screenshot of the browser page",
-        json!({
-            "type": "object",
-            "properties": element_props(json!({
-                "ref": json!({"type": "string"}),
-                "width": json!({"type": "integer"}),
-                "height": json!({"type": "integer"})
-            }))
-        }),
-    )]
+    vec![
+        tool(
+            "browser_take_screenshot",
+            "Take a screenshot of the embedded Mergen browser page",
+            json!({
+                "type": "object",
+                "properties": element_props(json!({
+                    "ref": json!({"type": "string"}),
+                    "type": json!({"type": "string", "enum": ["png", "jpeg"]}),
+                    "fullPage": json!({"type": "boolean"})
+                }))
+            }),
+        ),
+        tool(
+            "browser_start_video",
+            "Start recording the embedded Mergen browser panel to an MP4 file",
+            json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        ),
+        tool(
+            "browser_stop_video",
+            "Stop recording the embedded Mergen browser panel and save the MP4 file",
+            json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        ),
+        tool(
+            "browser_video_chapter",
+            "Add a timestamped chapter marker to the active embedded Mergen browser video recording",
+            json!({
+                "type": "object",
+                "properties": {
+                    "title": json!({"type": "string"}),
+                    "label": json!({"type": "string"})
+                },
+                "required": []
+            }),
+        ),
+    ]
 }
 
 fn network_tools() -> Vec<JsonValue> {
@@ -920,6 +952,23 @@ mod tests {
         assert!(names.contains(&"browser_snapshot".to_owned()));
         assert!(names.contains(&"browser_click".to_owned()));
         assert!(names.contains(&"browser_evaluate".to_owned()));
+    }
+
+    #[test]
+    fn vision_tool_schemas_include_screenshot_and_video() {
+        let names = vision_tools()
+            .into_iter()
+            .filter_map(|tool| {
+                tool.get("name")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"browser_take_screenshot".to_owned()));
+        assert!(names.contains(&"browser_start_video".to_owned()));
+        assert!(names.contains(&"browser_stop_video".to_owned()));
+        assert!(names.contains(&"browser_video_chapter".to_owned()));
     }
 
     #[test]

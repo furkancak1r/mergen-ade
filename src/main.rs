@@ -29,6 +29,7 @@
 mod app;
 mod browser_mcp_helper;
 mod browser_mcp_service;
+mod browser_video;
 mod codex;
 mod config;
 mod hooks;

@@ -30,6 +30,10 @@ pub enum BrowserEvent {
     LoadFinished(String),
     DesignInspectReady,
     DesignElementClicked(DesignElementInfo),
+    McpToolResult {
+        request_id: String,
+        result: Result<BrowserMcpToolOutput, String>,
+    },
     Error(String),
 }
 
@@ -90,6 +94,54 @@ struct DesignInspectWireMessage {
 
 const DESIGN_INSPECT_MESSAGE_SOURCE: &str = "mergen-ade-design-inspect";
 static DESIGN_INSPECT_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn screenshot_format_from_params(params: &JsonValue) -> &'static str {
+    let image_type = params
+        .get("type")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("png");
+    if image_type.eq_ignore_ascii_case("jpeg") || image_type.eq_ignore_ascii_case("jpg") {
+        "jpeg"
+    } else {
+        "png"
+    }
+}
+
+fn screenshot_cdp_params(params: &JsonValue) -> (&'static str, JsonValue) {
+    let format = screenshot_format_from_params(params);
+    let capture_beyond_viewport = params
+        .get("fullPage")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    (
+        format,
+        json!({
+            "format": format,
+            "captureBeyondViewport": capture_beyond_viewport
+        }),
+    )
+}
+
+pub(crate) fn browser_mcp_screenshot_output_from_devtools_raw(
+    raw: &str,
+    format: &str,
+) -> Result<BrowserMcpToolOutput, String> {
+    let parsed = serde_json::from_str::<JsonValue>(&raw).unwrap_or_else(|_| json!({}));
+    let data = parsed
+        .get("data")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    if data.is_empty() {
+        return Err("WebView2 did not return screenshot data".to_owned());
+    }
+    Ok(BrowserMcpToolOutput {
+        text: format!(
+            "Screenshot captured from the embedded Mergen browser ({} base64 bytes).",
+            data.len()
+        ),
+        data: Some(json!({ "imageType": format, "base64": data })),
+    })
+}
 
 fn new_design_inspect_token() -> String {
     let counter = DESIGN_INSPECT_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -771,44 +823,37 @@ impl EmbeddedBrowser {
     ) -> Result<BrowserMcpToolOutput, String> {
         #[cfg(target_os = "windows")]
         {
-            let image_type = params
-                .get("type")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("png");
-            let format = if image_type.eq_ignore_ascii_case("jpeg") {
-                "jpeg"
-            } else {
-                "png"
-            };
-            let capture_beyond_viewport = params
-                .get("fullPage")
-                .and_then(JsonValue::as_bool)
-                .unwrap_or(false);
-            let cdp_params = json!({
-                "format": format,
-                "captureBeyondViewport": capture_beyond_viewport
-            });
+            let (format, cdp_params) = screenshot_cdp_params(params);
             let raw = self.call_devtools_protocol_method("Page.captureScreenshot", &cdp_params)?;
-            let parsed = serde_json::from_str::<JsonValue>(&raw).unwrap_or_else(|_| json!({}));
-            let data = parsed
-                .get("data")
-                .and_then(JsonValue::as_str)
-                .unwrap_or_default();
-            if data.is_empty() {
-                return Err("WebView2 did not return screenshot data".to_owned());
-            }
-            Ok(BrowserMcpToolOutput {
-                text: format!(
-                    "Screenshot captured from the embedded Mergen browser ({} base64 bytes).",
-                    data.len()
-                ),
-                data: Some(json!({ "imageType": format, "base64": data })),
-            })
+            browser_mcp_screenshot_output_from_devtools_raw(&raw, format)
         }
 
         #[cfg(not(target_os = "windows"))]
         {
             let _ = params;
+            Err("Embedded browser screenshots are currently Windows-only".to_owned())
+        }
+    }
+
+    pub fn start_mcp_screenshot_tool(
+        &mut self,
+        request_id: String,
+        params: &JsonValue,
+    ) -> Result<(), String> {
+        #[cfg(target_os = "windows")]
+        {
+            let (format, cdp_params) = screenshot_cdp_params(params);
+            self.call_devtools_protocol_method_for_screenshot_async(
+                request_id,
+                format.to_owned(),
+                "Page.captureScreenshot",
+                &cdp_params,
+            )
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (request_id, params);
             Err("Embedded browser screenshots are currently Windows-only".to_owned())
         }
     }
@@ -902,6 +947,50 @@ impl EmbeddedBrowser {
             .ok()
             .and_then(|mut slot| slot.take())
             .ok_or_else(|| "WebView2 DevTools method completed without a result".to_owned())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn call_devtools_protocol_method_for_screenshot_async(
+        &mut self,
+        request_id: String,
+        format: String,
+        method: &str,
+        params: &JsonValue,
+    ) -> Result<(), String> {
+        use webview2_com::{CallDevToolsProtocolMethodCompletedHandler, CoTaskMemPWSTR};
+
+        let Some(inner) = &self.inner else {
+            return Err("Embedded browser is not ready".to_owned());
+        };
+        let webview = inner.webview.clone();
+        let event_sender = self.event_sender.clone();
+        let method = method.to_owned();
+        let params = serde_json::to_string(params).map_err(|err| err.to_string())?;
+        let callback = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+            move |error_code, result| -> windows::core::Result<()> {
+                let tool_result = match error_code {
+                    Ok(()) => browser_mcp_screenshot_output_from_devtools_raw(&result, &format),
+                    Err(err) => Err(format!("WebView2 DevTools method failed: {err:?}")),
+                };
+                let _ = event_sender.send(BrowserEvent::McpToolResult {
+                    request_id: request_id.clone(),
+                    result: tool_result,
+                });
+                Ok(())
+            },
+        ));
+        let method = CoTaskMemPWSTR::from(method.as_str());
+        let params = CoTaskMemPWSTR::from(params.as_str());
+        unsafe {
+            webview
+                .CallDevToolsProtocolMethod(
+                    *method.as_ref().as_pcwstr(),
+                    *params.as_ref().as_pcwstr(),
+                    &callback,
+                )
+                .map_err(|err| format!("WebView2 DevTools method failed: {err:?}"))?;
+        }
+        Ok(())
     }
 
     /// Drain all pending browser events.
@@ -1546,6 +1635,23 @@ mod tests {
         let mut browser = EmbeddedBrowser::new();
         let events = browser.drain_events();
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn browser_mcp_screenshot_output_extracts_base64_data() {
+        let output = browser_mcp_screenshot_output_from_devtools_raw(r#"{"data":"abcd"}"#, "png")
+            .expect("screenshot output should parse");
+
+        assert!(output.text.contains("4 base64 bytes"));
+        assert_eq!(output.data.unwrap()["base64"].as_str(), Some("abcd"));
+    }
+
+    #[test]
+    fn browser_mcp_screenshot_output_rejects_empty_data() {
+        let err =
+            browser_mcp_screenshot_output_from_devtools_raw(r#"{"data":""}"#, "png").unwrap_err();
+
+        assert!(err.contains("did not return screenshot data"));
     }
 
     #[test]

@@ -3682,3 +3682,29 @@
 - Files/Commands touched: `src/browser_mcp_helper.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test browser_mcp_helper`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User report on 2026-05-05: OpenCode says Mergen Browser MCP tools are unsupported even though `mergen-browser connected Enabled` is visible.
 
+#### Mergen Browser MCP screenshot froze UI and video recording was missing {#mergen-browser-mcp-async-screenshot-video}
+- Date: 2026-05-05
+- Context: OpenCode using `mergen-browser` MCP against the embedded Mergen Browser panel.
+- Error signature: Taking a Browser MCP screenshot makes Mergen visually freeze for a short period, and Playwright-style video recording tools are not available in the Mergen Browser MCP.
+- Symptoms/Impact:
+  1. `browser_take_screenshot` blocks the egui update path while WebView2 completes `Page.captureScreenshot`.
+  2. Repeated screenshots during agent workflows make the desktop app feel unresponsive.
+  3. `browser_start_video`, `browser_stop_video`, and `browser_video_chapter` are listed by Playwright MCP users as expected capabilities but were not implemented for Mergen's embedded browser.
+- Root cause:
+  1. Screenshot capture used WebView2's synchronous `wait_for_async_operation` helper from the UI frame.
+  2. Browser MCP command handling waited for screenshot output before replying to the helper request.
+  3. There was no recording state, periodic frame capture loop, or native MP4 encoder path for embedded-browser recordings.
+- Resolution:
+  - Added an async WebView2 DevTools screenshot path that returns `BrowserEvent::McpToolResult` instead of blocking the UI thread.
+  - Added app-side pending MCP response tracking so screenshot responses are completed when the WebView2 event arrives.
+  - Added Browser MCP video tools: `browser_start_video`, `browser_stop_video`, and `browser_video_chapter`.
+  - Record video from the embedded Browser panel by capturing JPEG frames asynchronously and encoding them to native MP4 with Windows Media Foundation on a background thread.
+  - Store recordings under the app data browser recordings directory, scoped by project.
+  - Added regression tests for screenshot output parsing, pending response completion, video tool schemas, video frame request IDs, frame extraction, recording directory scoping, and empty-frame encode rejection.
+- Prevent recurrence:
+  - Browser MCP tools that call async WebView2 APIs must not use blocking waits from egui rendering/update paths.
+  - Long-running browser outputs should complete through event/pending-response plumbing or background worker threads.
+  - Video support must remain single-binary and embedded-browser-only; do not add external Chrome or ffmpeg dependencies without an explicit feature decision.
+- Files/Commands touched: `Cargo.toml`, `src/app.rs`, `src/browser_mcp_helper.rs`, `src/browser_video.rs`, `src/config.rs`, `src/main.rs`, `src/opencode_config.rs`, `src/web_browser.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test browser_mcp`, `cargo test browser_video`
+- References: User report on 2026-05-05: screenshot briefly freezes Mergen and Mergen Browser MCP should have video recording like Playwright.
+
