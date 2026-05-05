@@ -5,7 +5,6 @@ $targetRoot = Join-Path $repoRoot "target"
 $target = "x86_64-pc-windows-msvc"
 $releaseDir = Join-Path $targetRoot "$target\release"
 $exePath = Join-Path $releaseDir "mergen-ade.exe"
-$helperExePath = Join-Path $releaseDir "mergen-browser-mcp.exe"
 $toolchain = "stable-x86_64-pc-windows-msvc"
 $blockedDlls = @(
     "libunwind.dll",
@@ -791,7 +790,8 @@ function Remove-UnsupportedConvenienceArtifacts {
 function Get-UnsupportedConvenienceArtifactPaths {
     return @(
         (Join-Path $repoRoot "target\release\mergen-ade.exe"),
-        (Join-Path $repoRoot "mergen-ade.exe")
+        (Join-Path $repoRoot "mergen-ade.exe"),
+        (Join-Path $releaseDir "mergen-browser-mcp.exe")
     )
 }
 
@@ -818,16 +818,13 @@ function Invoke-BuildRelease {
             throw "Portable release clean failed."
         }
 
-        & $cargo build --release --target $target --bins -j 1
+        & $cargo build --release --target $target --bin mergen-ade -j 1
         if ($LASTEXITCODE -ne 0) {
             throw "Portable release build failed."
         }
 
         if (-not (Test-Path $exePath)) {
             throw "Portable release EXE was not created: $exePath"
-        }
-        if (-not (Test-Path $helperExePath)) {
-            throw "Browser MCP helper EXE was not created: $helperExePath"
         }
 
         $imports = Get-ImportedDllNames -ExecutablePath $exePath
@@ -836,18 +833,10 @@ function Invoke-BuildRelease {
             $joined = ($blockedImports | Sort-Object -Unique) -join ", "
             throw "Portable EXE still depends on blocked runtime DLLs: $joined"
         }
-        $helperImports = Get-ImportedDllNames -ExecutablePath $helperExePath
-        $helperBlockedImports = $helperImports | Where-Object { $blockedDlls -contains $_ }
-        if ($helperBlockedImports) {
-            $joined = ($helperBlockedImports | Sort-Object -Unique) -join ", "
-            throw "Browser MCP helper EXE still depends on blocked runtime DLLs: $joined"
-        }
 
         $finalHash = (Get-FileHash -Path $exePath -Algorithm SHA256).Hash
-        $helperHash = (Get-FileHash -Path $helperExePath -Algorithm SHA256).Hash
         Remove-UnsupportedConvenienceArtifacts
         Write-Host "Portable release EXE ready: $exePath (SHA256: $finalHash)"
-        Write-Host "Browser MCP helper EXE ready: $helperExePath (SHA256: $helperHash)"
     }
     finally {
         Pop-Location

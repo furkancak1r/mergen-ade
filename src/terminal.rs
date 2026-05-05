@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::browser_mcp_service::{helper_path_from_current_exe, BrowserMcpService};
+use crate::browser_mcp_service::BrowserMcpService;
 use crate::codex::codex_env_pairs;
 use crate::hooks::{AiCliStatus, AiCliTool, AiHookEvent};
 use crate::hooks::{
@@ -732,28 +732,19 @@ impl TerminalRuntime {
                 // Also write the runtime config with the build model override
                 if let Some(build_model) = opencode_build_model {
                     let browser_mcp = browser_mcp_service.and_then(|service| {
-                        std::env::current_exe().ok().and_then(|current_exe| {
-                            let helper_path = helper_path_from_current_exe(&current_exe);
-                            if helper_path.is_file() {
-                                Some((
-                                    helper_path,
-                                    service.endpoint_env(terminal_id, Some(project_id)),
-                                ))
-                            } else {
-                                log::warn!(
-                                    "OpenCode Browser MCP helper is missing: {}",
-                                    helper_path.display()
-                                );
-                                None
-                            }
+                        std::env::current_exe().ok().map(|current_exe| {
+                            (
+                                current_exe,
+                                service.endpoint_env(terminal_id, Some(project_id)),
+                            )
                         })
                     });
-                    let write_result = if let Some((helper_path, endpoint)) = browser_mcp.as_ref() {
+                    let write_result = if let Some((exe_path, endpoint)) = browser_mcp.as_ref() {
                         opencode_config::write_terminal_runtime_config_with_browser_mcp(
                             opencode_dir,
                             terminal_id,
                             build_model,
-                            Some((helper_path.as_path(), endpoint.clone())),
+                            Some((exe_path.as_path(), endpoint.clone())),
                         )
                     } else {
                         opencode_config::write_terminal_runtime_config(

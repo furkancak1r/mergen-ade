@@ -238,6 +238,16 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Browser MCP waits must not block egui update paths.** Fixed waits and polling should run in the MCP helper or another non-UI pending flow, not inside `AdeApp::process_browser_mcp_commands()` or WebView script execution that blocks the UI frame.
 - **Native WebView focus must yield to terminal activation.** When a terminal is activated—including re-selecting the same terminal—clear app text-input focus via `surrender_ui_text_focus()` and restore the host window focus via `SetFocus(hwnd)` on Windows. This ensures browser URL input and native WebView2 keyboard focus do not block terminal input capture.
 
+## Browser MCP Single-Binary Guidelines
+- **Browser MCP helper runs inside the main executable.** Browser MCP functionality must run via `mergen-ade(.exe) --browser-mcp-helper`, not as a separate sidecar binary.
+- **Do not ship a separate `mergen-browser-mcp(.exe)` binary.** Release ZIP/DMG must contain only the main Mergen executable; sidecar binaries are unsupported and must be removed.
+- **Do not place Browser MCP helper code under `src/bin/`.** Code under `src/bin/` creates implicit Cargo binary targets that produce separate release executables. Place helper code in `src/browser_mcp_helper.rs` as a regular module.
+- **OpenCode runtime config must use the helper-mode argument.** The MCP command array must be `[current_exe, "--browser-mcp-helper", "--caps=devtools,vision,network,storage"]`.
+- **Release builds must target only `--bin mergen-ade`.** Do not use `--bins` in release workflows; it builds all binary targets including stale sidecars.
+- **Clean stale `mergen-browser-mcp(.exe)` artifacts.** Release scripts must remove any existing sidecar executable from previous builds to prevent accidental packaging.
+- **Helper mode runs headless before GUI initialization.** When `--browser-mcp-helper` is detected, run the MCP JSON-RPC loop and exit; skip all eframe/egui initialization, wgpu setup, and window creation.
+- **Helper mode uses stdio pipes.** The helper reads JSON-RPC requests from stdin and writes responses to stdout; GUI subsystem executables on Windows still support stdio redirection via pipes.
+
 ## Terminal Shortcut Guidelines
 - **Terminal shortcuts are user-configurable.** Store custom terminal command shortcuts in `AppConfig::terminal_shortcuts`; do not hard-code new terminal command shortcuts directly in input handling.
 - **Runtime shortcut matching must inspect all enabled entries in `AppConfig::terminal_shortcuts`.** Never hard-code only F6/F7/F8; match any enabled shortcut from config with its key and modifiers.

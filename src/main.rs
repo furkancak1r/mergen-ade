@@ -27,6 +27,7 @@
 )]
 
 mod app;
+mod browser_mcp_helper;
 mod browser_mcp_service;
 mod codex;
 mod config;
@@ -44,6 +45,7 @@ use eframe::egui;
 use eframe::icon_data;
 use std::any::Any;
 use std::ffi::OsString;
+use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};
 use std::time::Duration;
 
@@ -661,6 +663,13 @@ fn main() -> Result<(), eframe::Error> {
                 let event_name = args[2].to_string_lossy();
                 if let Err(err) = codex::handle_codex_hook_from_env(&event_name) {
                     eprintln!("Failed to process Codex hook event: {err}");
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            "--browser-mcp-helper" => {
+                if let Err(err) = browser_mcp_helper::run() {
+                    let _ = writeln!(std::io::stderr(), "Mergen Browser MCP failed: {err}");
                     std::process::exit(1);
                 }
                 return Ok(());

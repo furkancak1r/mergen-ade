@@ -7,7 +7,6 @@ version="${tag#v}"
 asset_name="mergen-ade-${tag}-macos-arm64.dmg"
 asset_path="$(pwd)/${asset_name}"
 binary_path="target/${target_triple}/release/mergen-ade"
-helper_binary_path="target/${target_triple}/release/mergen-browser-mcp"
 stage_root="$(pwd)/release-staging/macos"
 app_name="Mergen ADE.app"
 app_dir="${stage_root}/${app_name}"
@@ -41,18 +40,12 @@ if [[ ! -f "${binary_path}" ]]; then
     echo "macOS release binary not found at ${binary_path}" >&2
     exit 1
 fi
-if [[ ! -f "${helper_binary_path}" ]]; then
-    echo "macOS Browser MCP helper binary not found at ${helper_binary_path}" >&2
-    exit 1
-fi
 
 rm -rf "${stage_root}"
 mkdir -p "${macos_dir}" "${resources_dir}" "${iconset_dir}" "${dmg_root}"
 
 cp "${binary_path}" "${macos_dir}/Mergen ADE"
 chmod +x "${macos_dir}/Mergen ADE"
-cp "${helper_binary_path}" "${macos_dir}/mergen-browser-mcp"
-chmod +x "${macos_dir}/mergen-browser-mcp"
 
 sips -z 16 16 logo.png --out "${iconset_dir}/icon_16x16.png" >/dev/null
 sips -z 32 32 logo.png --out "${iconset_dir}/icon_16x16@2x.png" >/dev/null
@@ -105,7 +98,6 @@ if [[ "${sign_and_notarize}" == "1" ]]; then
 
     xattr -cr "${app_dir}"
     codesign --force --timestamp --options runtime --sign "${MACOS_CODESIGN_IDENTITY}" "${macos_dir}/Mergen ADE"
-    codesign --force --timestamp --options runtime --sign "${MACOS_CODESIGN_IDENTITY}" "${macos_dir}/mergen-browser-mcp"
     codesign --force --timestamp --options runtime --sign "${MACOS_CODESIGN_IDENTITY}" "${app_dir}"
     codesign --verify --deep --strict --verbose=2 "${app_dir}"
 fi

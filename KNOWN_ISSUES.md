@@ -3550,3 +3550,34 @@
 - Files/Commands touched: src/app.rs, AGENTS.md, KNOWN_ISSUES.md, cargo fmt, cargo test, cargo build --release --target x86_64-pc-windows-msvc
 - References: User report that Directory search in prosolocal only works after selecting another project and returning.
 
+#### Browser MCP sidecar EXE appeared in Windows release output {#browser-mcp-sidecar-exe-in-release-output}
+- Date: 2026-05-05
+- Context: Browser MCP helper integration and Windows/macOS release packaging
+- Error signature: `target\x86_64-pc-windows-msvc\release` contains both `mergen-ade.exe` and `mergen-browser-mcp.exe`
+- Symptoms/Impact:
+  1. The Windows release output contradicted the single-executable distribution expectation.
+  2. Users could see or launch the helper as if it were a separate app.
+  3. Browser MCP depended on a sidecar file next to `mergen-ade.exe`, so copying only the main executable could silently disable Browser MCP.
+  4. Release packaging could accidentally ship extra executables despite README claims that Windows releases contain only `mergen-ade.exe`.
+- Root cause:
+  1. Browser MCP helper code lived under `src/bin/mergen-browser-mcp.rs`, so Cargo treated it as an implicit binary target.
+  2. Windows and macOS release flows used `--bins`, building all binary targets.
+  3. Release scripts explicitly validated, copied, packaged, and signed `mergen-browser-mcp(.exe)`.
+  4. Runtime OpenCode config resolved a sibling helper executable instead of invoking a helper mode in the main executable.
+- Resolution:
+  - Move Browser MCP helper code into the main crate as an embedded helper mode (`src/browser_mcp_helper.rs`).
+  - Dispatch `mergen-ade(.exe) --browser-mcp-helper` before GUI startup.
+  - Write OpenCode MCP command arrays using the current Mergen executable plus `--browser-mcp-helper`.
+  - Remove the `src/bin` helper target so Cargo no longer builds a second release executable.
+  - Change release scripts/workflows to build only `--bin mergen-ade`.
+  - Remove helper copy/sign/package steps from Windows ZIP and macOS DMG flows.
+  - Clean stale `mergen-browser-mcp(.exe)` artifacts from release output.
+  - Add regression tests for helper-mode command generation and single-binary release scripts.
+- Prevent recurrence:
+  - Browser MCP helper code must remain embedded in the main executable unless a future explicit multi-executable product requirement is approved.
+  - Do not use `cargo build --bins` in release flows for this project.
+  - Keep release output checks/tests proving `mergen-browser-mcp(.exe)` is not produced or packaged.
+  - Keep OpenCode config tests proving Browser MCP launches through `mergen-ade(.exe) --browser-mcp-helper`.
+- Files/Commands touched: `src/browser_mcp_helper.rs`, `src/bin/mergen-browser-mcp.rs` (removed), `src/main.rs`, `src/browser_mcp_service.rs`, `src/opencode_config.rs`, `src/app.rs`, `src/terminal.rs`, `scripts/build-release.ps1`, `scripts/package-macos-release.sh`, `scripts/__tests__/build-release.tests.ps1`, `.github/workflows/release.yml`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc --bin mergen-ade`
+- References: User report on 2026-05-05: release folder should contain one EXE and Browser MCP should run inside the main executable.
+

@@ -953,9 +953,10 @@ function Test-EnsureMsvcBuildEnvironmentRetriesAfterImportFailure {
 function Test-UnsupportedConvenienceArtifactsExcludeGnullvmDevOutputs {
     $paths = @(Get-UnsupportedConvenienceArtifactPaths)
 
-    Assert-Equal -Actual $paths.Count -Expected 2 -Message "Expected only unsupported convenience artifact paths to be cleaned."
+    Assert-Equal -Actual $paths.Count -Expected 3 -Message "Expected unsupported convenience artifact paths to include stale sidecar."
     Assert-True -Condition ($paths -contains (Join-Path $repoRoot "target\release\mergen-ade.exe")) -Message "Expected flat target\\release EXE to remain an unsupported cleanup target."
     Assert-True -Condition ($paths -contains (Join-Path $repoRoot "mergen-ade.exe")) -Message "Expected repo-root EXE to remain an unsupported cleanup target."
+    Assert-True -Condition ($paths -contains (Join-Path $repoRoot "target\x86_64-pc-windows-msvc\release\mergen-browser-mcp.exe")) -Message "Expected stale Browser MCP sidecar EXE to be cleaned."
     Assert-True -Condition (-not ($paths -contains (Join-Path $repoRoot "target\x86_64-pc-windows-gnullvm\release\mergen-ade.exe"))) -Message "Expected the gnullvm dev EXE to survive release cleanup."
     Assert-True -Condition (-not ($paths -contains (Join-Path $repoRoot "target\x86_64-pc-windows-gnullvm\release\libunwind.dll"))) -Message "Expected the gnullvm libunwind.dll to survive release cleanup."
 }
@@ -1024,7 +1025,7 @@ function Test-CleanupRunsAfterSuccessfulBuildValidation {
     $targetRootIndex = $scriptContent.IndexOf('$targetRoot = Join-Path $repoRoot "target"')
     $targetDirOverrideIndex = $scriptContent.IndexOf('Set-Item -Path "Env:CARGO_TARGET_DIR" -Value $targetRoot')
     $cleanIndex = $scriptContent.IndexOf('& $cargo clean --target $target')
-    $buildIndex = $scriptContent.IndexOf('& $cargo build --release --target $target -j 1')
+    $buildIndex = $scriptContent.IndexOf('& $cargo build --release --target $target --bin mergen-ade -j 1')
     $importValidationIndex = $scriptContent.IndexOf('$blockedImports = $imports | Where-Object { $blockedDlls -contains $_ }')
     $hashIndex = $scriptContent.IndexOf('$finalHash = (Get-FileHash -Path $exePath -Algorithm SHA256).Hash')
     $cleanupIndex = $scriptContent.LastIndexOf('Remove-UnsupportedConvenienceArtifacts')

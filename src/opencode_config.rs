@@ -6,9 +6,9 @@ use directories::BaseDirs;
 use serde_json::{json, Value as JsonValue};
 
 use crate::browser_mcp_service::{
-    BrowserMcpEndpointEnv, DEFAULT_BROWSER_MCP_TIMEOUT_MS, MERGEN_BROWSER_MCP_PORT_ENV_VAR,
-    MERGEN_BROWSER_MCP_PROJECT_ID_ENV_VAR, MERGEN_BROWSER_MCP_TERMINAL_ID_ENV_VAR,
-    MERGEN_BROWSER_MCP_TOKEN_ENV_VAR,
+    BrowserMcpEndpointEnv, DEFAULT_BROWSER_MCP_TIMEOUT_MS, MERGEN_BROWSER_MCP_HELPER_ARG,
+    MERGEN_BROWSER_MCP_PORT_ENV_VAR, MERGEN_BROWSER_MCP_PROJECT_ID_ENV_VAR,
+    MERGEN_BROWSER_MCP_TERMINAL_ID_ENV_VAR, MERGEN_BROWSER_MCP_TOKEN_ENV_VAR,
 };
 
 /// Returns the global OpenCode config path (~/.config/opencode/opencode.json).
@@ -155,6 +155,7 @@ pub fn write_terminal_runtime_config_with_browser_mcp(
                 "timeout": DEFAULT_BROWSER_MCP_TIMEOUT_MS,
                 "command": [
                     helper_path.to_string_lossy().to_string(),
+                    MERGEN_BROWSER_MCP_HELPER_ARG,
                     "--caps=devtools,vision,network,storage"
                 ],
                 "environment": environment
@@ -392,6 +393,14 @@ mod tests {
         assert_eq!(
             mcp["command"][0].as_str(),
             Some(helper_path.to_str().unwrap())
+        );
+        assert_eq!(
+            mcp["command"][1].as_str(),
+            Some(MERGEN_BROWSER_MCP_HELPER_ARG)
+        );
+        assert_eq!(
+            mcp["command"][2].as_str(),
+            Some("--caps=devtools,vision,network,storage")
         );
         assert_eq!(
             mcp["environment"][MERGEN_BROWSER_MCP_PORT_ENV_VAR].as_str(),

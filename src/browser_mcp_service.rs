@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -14,10 +14,8 @@ pub const MERGEN_BROWSER_MCP_TOKEN_ENV_VAR: &str = "MERGEN_BROWSER_MCP_TOKEN";
 pub const MERGEN_BROWSER_MCP_TERMINAL_ID_ENV_VAR: &str = "MERGEN_BROWSER_MCP_TERMINAL_ID";
 pub const MERGEN_BROWSER_MCP_PROJECT_ID_ENV_VAR: &str = "MERGEN_BROWSER_MCP_PROJECT_ID";
 pub const MERGEN_BROWSER_MCP_ENDPOINT_PATH: &str = "/browser-mcp";
-#[cfg(target_os = "windows")]
-pub const MERGEN_BROWSER_MCP_HELPER_EXE: &str = "mergen-browser-mcp.exe";
-#[cfg(not(target_os = "windows"))]
-pub const MERGEN_BROWSER_MCP_HELPER_EXE: &str = "mergen-browser-mcp";
+/// CLI argument to run Browser MCP helper mode from the main executable.
+pub const MERGEN_BROWSER_MCP_HELPER_ARG: &str = "--browser-mcp-helper";
 pub const DEFAULT_BROWSER_MCP_TIMEOUT_MS: u64 = 90_000;
 const MAX_BROWSER_MCP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BROWSER_MCP_REQUEST_BYTES: usize = 10 * 1024 * 1024;
@@ -238,10 +236,6 @@ pub struct BrowserMcpEndpointEnv {
     pub token: String,
     pub terminal_id: u64,
     pub project_id: Option<u64>,
-}
-
-pub fn helper_path_from_current_exe(current_exe: &Path) -> PathBuf {
-    current_exe.with_file_name(MERGEN_BROWSER_MCP_HELPER_EXE)
 }
 
 fn run_listener(
@@ -527,18 +521,6 @@ mod tests {
             token_registry: Arc::new(Mutex::new(BrowserMcpTokenRegistry::default())),
             _listener_thread: None,
         }
-    }
-
-    #[test]
-    fn helper_path_uses_sibling_binary() {
-        let path = PathBuf::from(format!(
-            "C:/Mergen/mergen-ade{}",
-            std::env::consts::EXE_SUFFIX
-        ));
-        assert_eq!(
-            helper_path_from_current_exe(&path),
-            PathBuf::from("C:/Mergen").join(MERGEN_BROWSER_MCP_HELPER_EXE)
-        );
     }
 
     #[test]

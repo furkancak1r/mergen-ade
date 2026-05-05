@@ -12236,29 +12236,18 @@ impl AdeApp {
         };
 
         for (terminal_id, terminal) in &self.terminals {
-            let browser_mcp = self.browser_mcp_service.as_ref().and_then(|service| {
-                let helper_path = crate::browser_mcp_service::helper_path_from_current_exe(
-                    &self.current_executable_path,
-                );
-                if helper_path.is_file() {
-                    Some((
-                        helper_path,
-                        service.endpoint_env(*terminal_id, Some(terminal.project_id)),
-                    ))
-                } else {
-                    log::warn!(
-                        "OpenCode Browser MCP helper is missing: {}",
-                        helper_path.display()
-                    );
-                    None
-                }
+            let browser_mcp = self.browser_mcp_service.as_ref().map(|service| {
+                (
+                    self.current_executable_path.clone(),
+                    service.endpoint_env(*terminal_id, Some(terminal.project_id)),
+                )
             });
-            let write_result = if let Some((helper_path, endpoint)) = browser_mcp.as_ref() {
+            let write_result = if let Some((exe_path, endpoint)) = browser_mcp.as_ref() {
                 crate::opencode_config::write_terminal_runtime_config_with_browser_mcp(
                     opencode_runtime_dir,
                     *terminal_id,
                     build_model,
-                    Some((helper_path.as_path(), endpoint.clone())),
+                    Some((exe_path.as_path(), endpoint.clone())),
                 )
             } else {
                 crate::opencode_config::write_terminal_runtime_config(

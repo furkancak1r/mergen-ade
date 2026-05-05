@@ -38,7 +38,6 @@ jobs:
           $staging = "release-staging"
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
           Copy-Item "target/x86_64-pc-windows-msvc/release/mergen-ade.exe" "$staging/mergen-ade.exe" -Force
-          Copy-Item "target/x86_64-pc-windows-msvc/release/mergen-browser-mcp.exe" "$staging/mergen-browser-mcp.exe" -Force
           if (Test-Path $assetName) { Remove-Item $assetName -Force }
           Compress-Archive -Path "$staging/*" -DestinationPath $assetName
           "asset_name=$assetName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
@@ -99,7 +98,7 @@ jobs:
 
       - name: Build macOS ARM64 binary
         id: build
-        run: cargo +stable build --release --target aarch64-apple-darwin --bins
+        run: cargo +stable build --release --target aarch64-apple-darwin --bin mergen-ade
 
       - name: Prepare Apple signing credentials
         id: apple-credentials
