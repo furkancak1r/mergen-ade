@@ -27,6 +27,7 @@
 )]
 
 mod app;
+mod browser_mcp_service;
 mod codex;
 mod config;
 mod hooks;

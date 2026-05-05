@@ -42,6 +42,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, SPI_GETKEYBOARDDELAY, SPI_GETKEYBOARDSPEED,
 };
 
+use crate::browser_mcp_service::{BrowserMcpAuthScope, BrowserMcpIpcResponse, BrowserMcpService};
 use crate::codex::{self, CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
 use crate::config;
 use crate::hooks::{
@@ -118,6 +119,10 @@ const PENDING_RERUN_BATCH_PROMPT_WAIT_MS: u64 = 1000;
 /// Settle duration after sending Windows batch confirmation (y\r).
 /// Ensures the confirmation is processed before replaying the command.
 const PENDING_RERUN_BATCH_CONFIRM_SETTLE_MS: u64 = 150;
+const DESIGN_INSPECT_DELIVERY_DEDUPE_MS: u64 = 1500;
+const DESIGN_INSPECT_TARGET_SWITCH_QUIET_MS: u64 = 150;
+const DESIGN_INSPECT_MAX_FIELD_CHARS: usize = 280;
+const DESIGN_INSPECT_MAX_TEXT_CHARS: usize = 180;
 /// Polling interval while waiting for batch prompt or settle durations.
 const PENDING_RERUN_POLL_MS: u64 = 50;
 
@@ -1029,6 +1034,7 @@ pub struct AdeApp {
     opencode_process_last_poll_at: Option<Instant>,
     opencode_hook_service: Option<OpenCodeHookService>,
     opencode_hook_last_poll_at: Option<Instant>,
+    browser_mcp_service: Option<BrowserMcpService>,
     config: AppConfig,
     config_load_error: Option<String>,
     config_save_requires_reload: bool,
@@ -1118,6 +1124,15 @@ pub struct AdeApp {
     /// Browser panel open state per project (runtime only, not persisted).
     /// Tracks which projects have the Browser panel open; the visible panel follows the active terminal project.
     browser_panel_open_projects: BTreeSet<u64>,
+    /// Browser design inspect mode open state per project (runtime only, not persisted).
+    browser_design_inspect_enabled_projects: BTreeSet<u64>,
+    /// Terminal selected as design inspect destination per project (runtime only, not persisted).
+    browser_design_inspect_terminal_by_project: BTreeMap<u64, u64>,
+    /// Last time the design inspect target terminal changed per project.
+    browser_design_inspect_target_changed_at_by_project: BTreeMap<u64, Instant>,
+    /// Last design inspect hover delivered per project/terminal destination, used to prevent paste floods.
+    browser_design_inspect_last_delivery_by_destination:
+        BTreeMap<(u64, u64), DesignInspectDeliveryState>,
 }
 
 /// Represents a single open file buffer in the built-in editor.
@@ -1604,6 +1619,12 @@ struct PendingTerminalPaste {
     terminal_id: u64,
     text: String,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct DesignInspectDeliveryState {
+    signature: String,
+    delivered_at: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3368,6 +3389,18 @@ impl AdeApp {
             Err(err) => (AppHistory::default(), Some(err.to_string())),
         };
 
+        let browser_mcp_service = {
+            let repaint_ctx = _cc.egui_ctx.clone();
+            let repaint = Arc::new(move || repaint_ctx.request_repaint());
+            match BrowserMcpService::start(Some(repaint)) {
+                Ok(service) => Some(service),
+                Err(err) => {
+                    log::warn!("Browser MCP service unavailable: {err}");
+                    None
+                }
+            }
+        };
+
         let app = Self {
             config_path,
             current_executable_path,
@@ -3389,6 +3422,7 @@ impl AdeApp {
             opencode_process_last_poll_at: None,
             opencode_hook_service: OpenCodeHookService::start().ok(),
             opencode_hook_last_poll_at: None,
+            browser_mcp_service,
             config,
             config_load_error: config_load_error.clone(),
             config_save_requires_reload: config_load_error.is_some(),
@@ -3482,6 +3516,10 @@ impl AdeApp {
             embedded_browsers_by_project: BTreeMap::new(),
             pending_browser_rect: None,
             browser_panel_open_projects: BTreeSet::new(),
+            browser_design_inspect_enabled_projects: BTreeSet::new(),
+            browser_design_inspect_terminal_by_project: BTreeMap::new(),
+            browser_design_inspect_target_changed_at_by_project: BTreeMap::new(),
+            browser_design_inspect_last_delivery_by_destination: BTreeMap::new(),
         };
         // Do NOT seed runtime browser state from legacy config.
         // Browser panel open state is now runtime-only per project.
@@ -3680,6 +3718,9 @@ impl AdeApp {
                 self.reset_factory_droid_hook_inbox(terminal_id);
                 self.clear_codex_state(terminal_id);
                 self.reset_codex_notify_inbox(terminal_id);
+                if let Some(service) = self.browser_mcp_service.as_ref() {
+                    service.revoke_terminal(terminal_id);
+                }
                 self.terminals.remove(&terminal_id);
             }
         }
@@ -3710,6 +3751,17 @@ impl AdeApp {
         // Clean up browser state for the removed project
         self.browser_url_draft_by_project.remove(&project_id);
         self.browser_panel_open_projects.remove(&project_id);
+        self.browser_design_inspect_enabled_projects
+            .remove(&project_id);
+        self.browser_design_inspect_terminal_by_project
+            .remove(&project_id);
+        self.browser_design_inspect_target_changed_at_by_project
+            .remove(&project_id);
+        self.browser_design_inspect_last_delivery_by_destination
+            .retain(|(pid, _), _| *pid != project_id);
+        if let Some(service) = self.browser_mcp_service.as_ref() {
+            service.revoke_project(project_id);
+        }
         if let Some(mut browser) = self.embedded_browsers_by_project.remove(&project_id) {
             browser.shutdown();
         }
@@ -3800,6 +3852,7 @@ impl AdeApp {
         let opencode_build_model = Some(self.config.opencode.active_build_model());
         let runtime = match TerminalRuntime::spawn(
             terminal_id,
+            project_id,
             shell,
             project.path.clone(),
             self.terminal_events_tx.clone(),
@@ -3813,6 +3866,7 @@ impl AdeApp {
             self.opencode_cli_runtime_dir.clone(),
             opencode_notify_inbox_token.clone(),
             self.opencode_hook_service.as_ref(),
+            self.browser_mcp_service.as_ref(),
             opencode_build_model,
         ) {
             Ok(runtime) => runtime,
@@ -4763,6 +4817,14 @@ impl AdeApp {
             || entry.codex_prompt_submit_since.is_some()
     }
 
+    fn should_accept_opencode_turn_complete_chunk(entry: &TerminalEntry) -> bool {
+        !(entry.opencode_normalized_status == Some(OpenCodeTransportStatus::Working)
+            && matches!(
+                entry.opencode_last_status_source,
+                Some(OpenCodeStatusSource::Hook | OpenCodeStatusSource::Notify)
+            ))
+    }
+
     fn opencode_status_from_chunk(
         chunk: &str,
     ) -> Option<(
@@ -5534,6 +5596,17 @@ impl AdeApp {
         source: OpenCodeStatusSource,
         attention_reason: Option<OpenCodeAttentionReason>,
     ) -> bool {
+        if status == AiCliStatus::Attention
+            && source == OpenCodeStatusSource::VisibleUi
+            && attention_reason == Some(OpenCodeAttentionReason::TurnComplete)
+            && self
+                .terminals
+                .get(&terminal_id)
+                .is_some_and(|entry| !Self::should_accept_opencode_turn_complete_chunk(entry))
+        {
+            return false;
+        }
+
         let Some(manager) = self.ai_hook_manager.as_ref().cloned() else {
             return false;
         };
@@ -6356,6 +6429,10 @@ impl AdeApp {
         let mut changed = false;
 
         for event in events {
+            if event.is_subagent_event() {
+                continue;
+            }
+
             if let Ok(terminal_id) = event.terminal_id.parse::<u64>() {
                 let (transport_status, reason_hint) = match event.event_kind.as_deref() {
                     Some("working") => (OpenCodeTransportStatus::Working, None),
@@ -7026,6 +7103,9 @@ impl AdeApp {
         if event.inbox_token.as_deref() != expected_inbox_token {
             return false;
         }
+        if event.is_subagent_event() {
+            return false;
+        }
 
         // Use normalized OpenCode status if available (Orca-compatible)
         // This preserves the semantic distinction between idle and permission
@@ -7472,6 +7552,14 @@ impl AdeApp {
                         if let Some((status, source, reason)) =
                             Self::opencode_status_from_chunk(&chunk)
                         {
+                            if chunk == "opencode-turn-complete"
+                                && !self
+                                    .terminals
+                                    .get(&terminal_id)
+                                    .is_some_and(Self::should_accept_opencode_turn_complete_chunk)
+                            {
+                                continue;
+                            }
                             if self.apply_opencode_status(terminal_id, status, source, reason) {
                                 dirty_ids.insert(terminal_id);
                             }
@@ -10128,10 +10216,12 @@ impl AdeApp {
     }
 
     fn close_terminal(&mut self, ctx: &egui::Context, terminal_id: u64) {
-        let Some((title, close_result)) = self.terminals.get(&terminal_id).map(|terminal| {
-            let close_result = terminal.runtime.terminate();
-            (terminal.title.clone(), close_result)
-        }) else {
+        let Some((title, project_id, close_result)) =
+            self.terminals.get(&terminal_id).map(|terminal| {
+                let close_result = terminal.runtime.terminate();
+                (terminal.title.clone(), terminal.project_id, close_result)
+            })
+        else {
             return;
         };
 
@@ -10140,7 +10230,21 @@ impl AdeApp {
         self.reset_factory_droid_hook_inbox(terminal_id);
         self.clear_codex_state(terminal_id);
         self.reset_codex_notify_inbox(terminal_id);
+        if let Some(service) = self.browser_mcp_service.as_ref() {
+            service.revoke_terminal(terminal_id);
+        }
         self.terminals.remove(&terminal_id);
+        self.browser_design_inspect_terminal_by_project
+            .retain(|_, target_terminal_id| *target_terminal_id != terminal_id);
+        if !self
+            .browser_design_inspect_terminal_by_project
+            .contains_key(&project_id)
+        {
+            self.browser_design_inspect_target_changed_at_by_project
+                .remove(&project_id);
+        }
+        self.browser_design_inspect_last_delivery_by_destination
+            .retain(|(_, target_terminal_id), _| *target_terminal_id != terminal_id);
         self.status_line = match close_result {
             Ok(()) => format!("Closed {title}"),
             Err(err) => format!("Closed {title} (cleanup failed: {err})"),
@@ -10176,6 +10280,17 @@ impl AdeApp {
                     self.note_selection_changed();
                     self.persist_config();
                 }
+            }
+        }
+
+        let design_inspect_binding = terminal_id.and_then(|terminal_id| {
+            self.terminals
+                .get(&terminal_id)
+                .map(|terminal| (terminal.project_id, terminal_id))
+        });
+        if let Some((project_id, terminal_id)) = design_inspect_binding {
+            if self.is_browser_design_inspect_enabled_for_project(project_id) {
+                self.bind_browser_design_inspect_terminal_for_project(project_id, terminal_id);
             }
         }
 
@@ -12067,12 +12182,39 @@ impl AdeApp {
             return;
         };
 
-        for (terminal_id, _terminal) in &self.terminals {
-            if let Err(err) = crate::opencode_config::write_terminal_runtime_config(
-                opencode_runtime_dir,
-                *terminal_id,
-                build_model,
-            ) {
+        for (terminal_id, terminal) in &self.terminals {
+            let browser_mcp = self.browser_mcp_service.as_ref().and_then(|service| {
+                let helper_path = crate::browser_mcp_service::helper_path_from_current_exe(
+                    &self.current_executable_path,
+                );
+                if helper_path.is_file() {
+                    Some((
+                        helper_path,
+                        service.endpoint_env(*terminal_id, Some(terminal.project_id)),
+                    ))
+                } else {
+                    log::warn!(
+                        "OpenCode Browser MCP helper is missing: {}",
+                        helper_path.display()
+                    );
+                    None
+                }
+            });
+            let write_result = if let Some((helper_path, endpoint)) = browser_mcp.as_ref() {
+                crate::opencode_config::write_terminal_runtime_config_with_browser_mcp(
+                    opencode_runtime_dir,
+                    *terminal_id,
+                    build_model,
+                    Some((helper_path.as_path(), endpoint.clone())),
+                )
+            } else {
+                crate::opencode_config::write_terminal_runtime_config(
+                    opencode_runtime_dir,
+                    *terminal_id,
+                    build_model,
+                )
+            };
+            if let Err(err) = write_result {
                 log::warn!(
                     "Failed to update OpenCode runtime config for terminal {}: {}",
                     terminal_id,
@@ -15488,9 +15630,30 @@ impl AdeApp {
 
     /// Get or create the embedded browser for a specific project.
     fn project_browser(&mut self, project_id: u64) -> &mut web_browser::EmbeddedBrowser {
+        if !self.embedded_browsers_by_project.contains_key(&project_id) {
+            let user_data_folder = match config::browser_user_data_dir_path(project_id) {
+                Ok(path) => Some(path),
+                Err(err) => {
+                    log::error!(
+                        "Browser profile folder setup failed for project {}: {}",
+                        project_id,
+                        err
+                    );
+                    self.status_line =
+                        "Browser profile folder could not be prepared; passwords may not persist"
+                            .to_owned();
+                    None
+                }
+            };
+            self.embedded_browsers_by_project.insert(
+                project_id,
+                web_browser::EmbeddedBrowser::new_with_user_data_folder(user_data_folder),
+            );
+        }
+
         self.embedded_browsers_by_project
-            .entry(project_id)
-            .or_insert_with(web_browser::EmbeddedBrowser::new)
+            .get_mut(&project_id)
+            .expect("browser was inserted for project")
     }
 
     /// Submit the browser URL for a project.
@@ -15561,13 +15724,201 @@ impl AdeApp {
                     web_browser::BrowserEvent::Error(msg) => {
                         log::error!("Browser error for project {}: {}", project_id, msg);
                     }
-                    _ => {}
+                    web_browser::BrowserEvent::DesignInspectReady => {
+                        let enabled =
+                            self.is_browser_design_inspect_enabled_for_project(project_id);
+                        if let Some(browser) =
+                            self.embedded_browsers_by_project.get_mut(&project_id)
+                        {
+                            browser.set_design_inspect_enabled(enabled);
+                        }
+                    }
+                    web_browser::BrowserEvent::DesignElementHovered(element) => {
+                        self.forward_design_inspect_hover_to_terminal(ctx, project_id, element);
+                    }
+                    web_browser::BrowserEvent::LoadStarted(_)
+                    | web_browser::BrowserEvent::LoadFinished(_) => {}
                 }
             }
         }
 
         if any_changed {
             ctx.request_repaint();
+        }
+    }
+
+    fn process_browser_mcp_commands(&mut self, ctx: &egui::Context) {
+        let commands = self
+            .browser_mcp_service
+            .as_ref()
+            .map(BrowserMcpService::drain_commands)
+            .unwrap_or_default();
+        if commands.is_empty() {
+            return;
+        }
+
+        for command in commands {
+            let response =
+                self.handle_browser_mcp_request(ctx, command.request, command.auth_scope);
+            let _ = command.respond_to.send(response);
+        }
+        ctx.request_repaint();
+    }
+
+    fn handle_browser_mcp_request(
+        &mut self,
+        ctx: &egui::Context,
+        request: crate::browser_mcp_service::BrowserMcpIpcRequest,
+        auth_scope: BrowserMcpAuthScope,
+    ) -> BrowserMcpIpcResponse {
+        let project_id = match self.resolve_browser_mcp_project_id(&request, &auth_scope) {
+            Ok(project_id) => project_id,
+            Err(message) => return BrowserMcpIpcResponse::error(message),
+        };
+        if !self.projects.contains_key(&project_id) {
+            return BrowserMcpIpcResponse::error(format!(
+                "Browser MCP target project does not exist: {project_id}"
+            ));
+        }
+
+        self.set_browser_panel_open_for_project(project_id, true);
+        self.config.ui.checklist_panel_expanded = false;
+        ctx.request_repaint();
+
+        match request.tool.as_str() {
+            "browser_navigate" => {
+                let url = request
+                    .params
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let normalized = normalize_browser_url(url);
+                if normalized.is_empty() {
+                    return BrowserMcpIpcResponse::error(format!("Invalid browser URL: {url}"));
+                }
+                if let Some(error) = self.prepare_browser_mcp_project(project_id) {
+                    return error;
+                }
+                self.set_project_browser_url(project_id, normalized.clone());
+                self.project_browser(project_id).navigate(&normalized);
+                BrowserMcpIpcResponse::ok(format!(
+                    "Navigated embedded Mergen browser to {normalized}"
+                ))
+            }
+            "browser_navigate_back" => {
+                if let Some(error) = self.prepare_browser_mcp_project(project_id) {
+                    return error;
+                }
+                self.project_browser(project_id).go_back();
+                BrowserMcpIpcResponse::ok("Navigated embedded Mergen browser back")
+            }
+            "browser_navigate_forward" => {
+                if let Some(error) = self.prepare_browser_mcp_project(project_id) {
+                    return error;
+                }
+                self.project_browser(project_id).go_forward();
+                BrowserMcpIpcResponse::ok("Navigated embedded Mergen browser forward")
+            }
+            "browser_reload" => {
+                if let Some(error) = self.prepare_browser_mcp_project(project_id) {
+                    return error;
+                }
+                self.project_browser(project_id).reload();
+                BrowserMcpIpcResponse::ok("Reloaded embedded Mergen browser")
+            }
+            _ => self.run_browser_mcp_tool_for_project(project_id, &request.tool, &request.params),
+        }
+    }
+
+    fn prepare_browser_mcp_project(&mut self, project_id: u64) -> Option<BrowserMcpIpcResponse> {
+        #[cfg(target_os = "windows")]
+        {
+            let window_hwnd = self.window_hwnd;
+            let design_inspect_enabled =
+                self.is_browser_design_inspect_enabled_for_project(project_id);
+            let browser = self.project_browser(project_id);
+            browser.set_design_inspect_enabled(design_inspect_enabled);
+            match browser.ensure_created(window_hwnd) {
+                BrowserStatus::Ready => None,
+                BrowserStatus::Failed(message) => Some(BrowserMcpIpcResponse::error(message)),
+                BrowserStatus::Unsupported(message) => Some(BrowserMcpIpcResponse::error(message)),
+                BrowserStatus::Creating | BrowserStatus::Uninitialized => Some(
+                    BrowserMcpIpcResponse::error("Embedded browser is not ready yet"),
+                ),
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = project_id;
+            Some(BrowserMcpIpcResponse::error(
+                "Embedded browser MCP is currently Windows-only",
+            ))
+        }
+    }
+
+    fn resolve_browser_mcp_project_id(
+        &self,
+        request: &crate::browser_mcp_service::BrowserMcpIpcRequest,
+        auth_scope: &BrowserMcpAuthScope,
+    ) -> Result<u64, String> {
+        if request
+            .terminal_id
+            .is_some_and(|terminal_id| terminal_id != auth_scope.terminal_id)
+        {
+            return Err("Browser MCP terminal authorization mismatch".to_owned());
+        }
+
+        let terminal = self
+            .terminals
+            .get(&auth_scope.terminal_id)
+            .ok_or_else(|| "Browser MCP target terminal does not exist".to_owned())?;
+        if terminal.exited {
+            return Err("Browser MCP target terminal is no longer running".to_owned());
+        }
+
+        let project_id = terminal.project_id;
+        if auth_scope
+            .project_id
+            .is_some_and(|scoped_project_id| scoped_project_id != project_id)
+        {
+            return Err("Browser MCP project authorization is stale".to_owned());
+        }
+        if request
+            .project_id
+            .is_some_and(|requested_project_id| requested_project_id != project_id)
+        {
+            return Err("Browser MCP project authorization mismatch".to_owned());
+        }
+
+        Ok(project_id)
+    }
+
+    fn run_browser_mcp_tool_for_project(
+        &mut self,
+        project_id: u64,
+        tool: &str,
+        params: &serde_json::Value,
+    ) -> BrowserMcpIpcResponse {
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(error) = self.prepare_browser_mcp_project(project_id) {
+                return error;
+            }
+            let browser = self.project_browser(project_id);
+            match browser.run_mcp_tool(tool, params) {
+                Ok(output) => match output.data {
+                    Some(data) => BrowserMcpIpcResponse::ok_with_data(output.text, data),
+                    None => BrowserMcpIpcResponse::ok(output.text),
+                },
+                Err(err) => BrowserMcpIpcResponse::error(err),
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (project_id, tool, params);
+            BrowserMcpIpcResponse::error("Embedded browser MCP is currently Windows-only")
         }
     }
 
@@ -15608,6 +15959,86 @@ impl AdeApp {
         changed
     }
 
+    fn forward_design_inspect_hover_to_terminal(
+        &mut self,
+        ctx: &egui::Context,
+        project_id: u64,
+        element: web_browser::DesignElementInfo,
+    ) {
+        if !self.is_browser_design_inspect_enabled_for_project(project_id)
+            || self.active_browser_project_id() != Some(project_id)
+        {
+            return;
+        }
+
+        if self.projects.get(&project_id).is_some_and(|project| {
+            project
+                .browser_last_url
+                .as_ref()
+                .is_some_and(|url| !design_inspect_matches_current_page(url, &element))
+        }) {
+            return;
+        }
+
+        let Some(terminal_id) = self
+            .browser_design_inspect_terminal_by_project
+            .get(&project_id)
+            .copied()
+        else {
+            self.status_line = "No active terminal for design inspect".to_owned();
+            return;
+        };
+
+        if !self
+            .terminals
+            .get(&terminal_id)
+            .is_some_and(|terminal| terminal.project_id == project_id && !terminal.exited)
+        {
+            self.browser_design_inspect_terminal_by_project
+                .remove(&project_id);
+            self.browser_design_inspect_last_delivery_by_destination
+                .retain(|(_, target_terminal_id), _| *target_terminal_id != terminal_id);
+            self.status_line = "Design inspect target terminal is unavailable".to_owned();
+            return;
+        }
+
+        if self
+            .browser_design_inspect_target_changed_at_by_project
+            .get(&project_id)
+            .is_some_and(|changed_at| {
+                changed_at.elapsed() < Duration::from_millis(DESIGN_INSPECT_TARGET_SWITCH_QUIET_MS)
+            })
+        {
+            return;
+        }
+
+        let signature = design_inspect_delivery_signature(&element);
+        let now = Instant::now();
+        let delivery_key = (project_id, terminal_id);
+        if !design_inspect_should_deliver(
+            self.browser_design_inspect_last_delivery_by_destination
+                .get(&delivery_key),
+            &signature,
+            now,
+        ) {
+            return;
+        }
+
+        let text = format_design_inspect_terminal_text(&element);
+        if self.queue_pasted_text_to_terminal(terminal_id, &text) {
+            self.browser_design_inspect_last_delivery_by_destination
+                .insert(
+                    delivery_key,
+                    DesignInspectDeliveryState {
+                        signature,
+                        delivered_at: now,
+                    },
+                );
+            self.show_status_feedback(ctx, "Design inspect info sent to terminal");
+            ctx.request_repaint();
+        }
+    }
+
     /// Returns the project ID whose browser panel should be shown.
     /// Prioritizes the active terminal's project, falling back to selected_project.
     fn active_browser_project_id(&self) -> Option<u64> {
@@ -15641,6 +16072,71 @@ impl AdeApp {
     fn set_active_browser_panel_open(&mut self, open: bool) {
         if let Some(project_id) = self.active_browser_project_id() {
             self.set_browser_panel_open_for_project(project_id, open);
+        }
+    }
+
+    fn is_browser_design_inspect_enabled_for_project(&self, project_id: u64) -> bool {
+        self.browser_design_inspect_enabled_projects
+            .contains(&project_id)
+    }
+
+    fn is_active_browser_design_inspect_enabled(&self) -> bool {
+        self.active_browser_project_id()
+            .map(|pid| self.is_browser_design_inspect_enabled_for_project(pid))
+            .unwrap_or(false)
+    }
+
+    fn bind_browser_design_inspect_terminal_for_project(
+        &mut self,
+        project_id: u64,
+        terminal_id: u64,
+    ) {
+        let previous = self
+            .browser_design_inspect_terminal_by_project
+            .insert(project_id, terminal_id);
+        if previous.is_some_and(|previous| previous != terminal_id) {
+            self.browser_design_inspect_target_changed_at_by_project
+                .insert(project_id, Instant::now());
+            self.browser_design_inspect_last_delivery_by_destination
+                .retain(|(pid, _), _| *pid != project_id);
+        }
+    }
+
+    fn set_browser_design_inspect_enabled_for_project(&mut self, project_id: u64, enabled: bool) {
+        if enabled {
+            self.browser_design_inspect_enabled_projects
+                .insert(project_id);
+            if let Some(terminal_id) = self.active_terminal.filter(|terminal_id| {
+                self.terminals
+                    .get(terminal_id)
+                    .is_some_and(|terminal| terminal.project_id == project_id && !terminal.exited)
+            }) {
+                self.bind_browser_design_inspect_terminal_for_project(project_id, terminal_id);
+            } else {
+                self.browser_design_inspect_terminal_by_project
+                    .remove(&project_id);
+                self.browser_design_inspect_target_changed_at_by_project
+                    .remove(&project_id);
+            }
+        } else {
+            self.browser_design_inspect_enabled_projects
+                .remove(&project_id);
+            self.browser_design_inspect_terminal_by_project
+                .remove(&project_id);
+            self.browser_design_inspect_target_changed_at_by_project
+                .remove(&project_id);
+        }
+        self.browser_design_inspect_last_delivery_by_destination
+            .retain(|(pid, _), _| *pid != project_id);
+
+        if let Some(browser) = self.embedded_browsers_by_project.get_mut(&project_id) {
+            browser.set_design_inspect_enabled(enabled);
+        }
+    }
+
+    fn set_active_browser_design_inspect_enabled(&mut self, enabled: bool) {
+        if let Some(project_id) = self.active_browser_project_id() {
+            self.set_browser_design_inspect_enabled_for_project(project_id, enabled);
         }
     }
 
@@ -15678,7 +16174,11 @@ impl AdeApp {
                 .unwrap_or(BrowserStatus::Uninitialized);
 
             if matches!(browser_status, BrowserStatus::Uninitialized) {
-                self.project_browser(project_id).ensure_created(window_hwnd);
+                let design_inspect_enabled =
+                    self.is_browser_design_inspect_enabled_for_project(project_id);
+                let browser = self.project_browser(project_id);
+                browser.set_design_inspect_enabled(design_inspect_enabled);
+                browser.ensure_created(window_hwnd);
             }
 
             let browser_status = self
@@ -15837,6 +16337,37 @@ impl AdeApp {
                                 self.note_projects_changed();
                                 self.persist_config();
                             }
+                        }
+
+                        ui.add_space(8.0);
+
+                        let design_inspect_enabled =
+                            self.is_browser_design_inspect_enabled_for_project(browser_project_id);
+                        let inspect_tooltip = if design_inspect_enabled {
+                            "Disable Design Inspect"
+                        } else {
+                            "Enable Design Inspect"
+                        };
+                        if activity_rail_icon_button(
+                            ui,
+                            design_inspect_enabled,
+                            icons::EYE,
+                            inspect_tooltip,
+                        )
+                        .clicked()
+                        {
+                            let enabled = !design_inspect_enabled;
+                            self.set_browser_design_inspect_enabled_for_project(
+                                browser_project_id,
+                                enabled,
+                            );
+                            self.status_line = if enabled {
+                                "Design inspect enabled: hover page elements to send context to the active terminal"
+                                    .to_owned()
+                            } else {
+                                "Design inspect disabled".to_owned()
+                            };
+                            ctx.request_repaint();
                         }
                     });
 
@@ -16981,6 +17512,7 @@ impl eframe::App for AdeApp {
         self.process_source_control_events(ctx);
         self.process_directory_index_events(ctx);
         self.process_browser_events(ctx);
+        self.process_browser_mcp_commands(ctx);
         self.schedule_source_control_refresh(ctx);
         self.schedule_terminal_refresh(ctx);
 
@@ -21088,6 +21620,143 @@ fn show_settings_card<R>(
         .inner
 }
 
+fn sanitize_design_inspect_value(value: &str, max_chars: usize) -> String {
+    let mut result = String::new();
+    let mut pending_space = false;
+    let mut chars_written = 0usize;
+
+    for ch in value.chars() {
+        let normalized = if ch.is_control() { ' ' } else { ch };
+        if normalized.is_whitespace() {
+            pending_space = !result.is_empty();
+            continue;
+        }
+
+        if pending_space {
+            if chars_written >= max_chars {
+                result.push_str("...");
+                return result;
+            }
+            result.push(' ');
+            chars_written += 1;
+            pending_space = false;
+        }
+
+        if chars_written >= max_chars {
+            result.push_str("...");
+            return result;
+        }
+        result.push(normalized);
+        chars_written += 1;
+    }
+
+    result
+}
+
+fn design_inspect_element_label(info: &web_browser::DesignElementInfo) -> String {
+    let tag = sanitize_design_inspect_value(&info.tag, 40).to_lowercase();
+    let id = sanitize_design_inspect_value(&info.id, 80);
+    let classes = info
+        .classes
+        .iter()
+        .take(4)
+        .map(|class_name| sanitize_design_inspect_value(class_name, 60))
+        .filter(|class_name| !class_name.is_empty())
+        .map(|class_name| format!(".{class_name}"))
+        .collect::<String>();
+
+    if id.is_empty() {
+        format!("{tag}{classes}")
+    } else {
+        format!("{tag}#{id}{classes}")
+    }
+}
+
+fn design_inspect_styles_text(styles: &BTreeMap<String, String>) -> String {
+    const STYLE_KEYS: [&str; 11] = [
+        "display",
+        "position",
+        "margin",
+        "padding",
+        "font",
+        "color",
+        "background-color",
+        "border",
+        "border-radius",
+        "z-index",
+        "transform",
+    ];
+
+    STYLE_KEYS
+        .iter()
+        .filter_map(|key| {
+            styles.get(*key).map(|value| {
+                format!(
+                    "{key}: {}",
+                    sanitize_design_inspect_value(value, DESIGN_INSPECT_MAX_FIELD_CHARS)
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn design_inspect_delivery_signature(info: &web_browser::DesignElementInfo) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}",
+        info.page_url,
+        info.url,
+        info.selector,
+        info.rect.x,
+        info.rect.y,
+        info.rect.width,
+        info.rect.height
+    )
+}
+
+fn design_inspect_matches_current_page(
+    current_url: &str,
+    info: &web_browser::DesignElementInfo,
+) -> bool {
+    let observed_page_url = if info.page_url.is_empty() {
+        info.url.as_str()
+    } else {
+        info.page_url.as_str()
+    };
+    current_url == observed_page_url
+}
+
+fn design_inspect_should_deliver(
+    last: Option<&DesignInspectDeliveryState>,
+    signature: &str,
+    now: Instant,
+) -> bool {
+    !last.is_some_and(|last| {
+        last.signature == signature
+            && now.saturating_duration_since(last.delivered_at)
+                < Duration::from_millis(DESIGN_INSPECT_DELIVERY_DEDUPE_MS)
+    })
+}
+
+fn format_design_inspect_terminal_text(info: &web_browser::DesignElementInfo) -> String {
+    let element = design_inspect_element_label(info);
+    let selector = sanitize_design_inspect_value(&info.selector, DESIGN_INSPECT_MAX_FIELD_CHARS);
+    let text = sanitize_design_inspect_value(&info.text, DESIGN_INSPECT_MAX_TEXT_CHARS);
+    let styles = design_inspect_styles_text(&info.styles);
+    let url = sanitize_design_inspect_value(&info.url, DESIGN_INSPECT_MAX_FIELD_CHARS);
+    let page_url = sanitize_design_inspect_value(&info.page_url, DESIGN_INSPECT_MAX_FIELD_CHARS);
+    let url = if !page_url.is_empty() && page_url != url {
+        format!("{url}; page={page_url}")
+    } else {
+        url
+    };
+
+    format!(
+        "Design inspect: element=\"{element}\" selector=\"{selector}\" text=\"{text}\" rect=\"x={} y={} w={} h={}\" styles=\"{styles}\" url=\"{url}\" | Change request: ",
+        info.rect.x, info.rect.y, info.rect.width, info.rect.height
+    )
+}
+
 /// Normalize user input into a valid browser URL.
 /// - Adds https:// for regular domains
 /// - Uses http:// for localhost/127.0.0.1/0.0.0.0/[::1]
@@ -21114,12 +21783,13 @@ fn normalize_browser_url(input: &str) -> String {
         return trimmed.to_owned();
     }
 
-    // Check for localhost or IP addresses - use http
-    let is_local = trimmed.starts_with("localhost")
-        || trimmed.starts_with("127.0.0.1")
-        || trimmed.starts_with("0.0.0.0")
-        || trimmed.starts_with("[::1]")
-        || trimmed.starts_with("[::]");
+    // Check exact localhost/IP hosts - use http
+    let is_local = browser_url_input_host(trimmed).is_some_and(|host| {
+        matches!(
+            host.to_lowercase().as_str(),
+            "localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]" | "[::]"
+        )
+    });
 
     if is_local {
         format!("http://{trimmed}")
@@ -21127,6 +21797,24 @@ fn normalize_browser_url(input: &str) -> String {
         // Regular domain - use https
         format!("https://{trimmed}")
     }
+}
+
+fn browser_url_input_host(input: &str) -> Option<&str> {
+    let authority = input
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|authority| !authority.is_empty())?;
+    if authority.starts_with('[') {
+        let close_idx = authority.find(']')?;
+        let host_end = close_idx + 1;
+        let remainder = &authority[host_end..];
+        if remainder.is_empty() || remainder.starts_with(':') {
+            return Some(&authority[..host_end]);
+        }
+        return Some(authority);
+    }
+
+    Some(authority.split(':').next().unwrap_or(authority))
 }
 
 fn resolve_ctrl_c_action(can_copy_selection: bool) -> CtrlCAction {
@@ -22240,24 +22928,27 @@ mod tests {
         average_terminal_cell_width, build_terminal_cursor_overlay, build_terminal_render,
         collect_source_control_line_totals, collect_source_control_snapshot,
         configure_terminal_font_family, count_text_line_bytes, cursor_hidden_by_row_filter,
-        deduplicated_recent_inputs, default_app_open_command,
+        deduplicated_recent_inputs, default_app_open_command, design_inspect_delivery_signature,
+        design_inspect_matches_current_page, design_inspect_should_deliver,
         detach_terminal_prompt_scroll_anchor_on_manual_scroll, draw_ai_badge,
         draw_terminal_manager_title_and_diff_summary, draw_terminal_status_badges,
         embedded_browser_should_yield_to_ui_layer, file_editor_selection_drag_active_after_input,
-        force_terminal_pane_width, install_terminal_font_family, launcher_icon_for_ai_tool,
+        force_terminal_pane_width, format_design_inspect_terminal_text,
+        install_terminal_font_family, launcher_icon_for_ai_tool,
         merge_source_control_refresh_result, next_active_terminal_after_close,
         next_terminal_in_direction, next_terminal_in_linear_direction,
         normalize_terminal_background, parse_branch_header, parse_git_numstat_totals,
         primary_shortcut_modifier, recent_inputs_tooltip_text, recover_config_state,
-        resolve_ctrl_c_action, selection_edge_autoscroll_delta, selection_edge_autoscroll_speed,
-        settings_accordion_disclosure_icon_rect, settings_diagnostics_accordion_header_layout,
-        settings_diagnostics_uses_single_column, settings_general_inline_control_width,
-        settings_general_uses_stacked_layout, settings_popup_uses_stacked_layout,
-        settings_saved_message_card_width, settings_saved_message_text_width,
-        settings_saved_messages_project_header_layout, settings_saved_messages_project_state_id,
-        settings_saved_messages_stacks_draft_row, settings_text_edit_chrome,
-        settings_window_size_for_screen, should_resolve_terminal_link, source_control_badge_color,
-        source_control_tooltip_lines, terminal_activation_scroll_offset, terminal_cell_metric,
+        resolve_ctrl_c_action, sanitize_design_inspect_value, selection_edge_autoscroll_delta,
+        selection_edge_autoscroll_speed, settings_accordion_disclosure_icon_rect,
+        settings_diagnostics_accordion_header_layout, settings_diagnostics_uses_single_column,
+        settings_general_inline_control_width, settings_general_uses_stacked_layout,
+        settings_popup_uses_stacked_layout, settings_saved_message_card_width,
+        settings_saved_message_text_width, settings_saved_messages_project_header_layout,
+        settings_saved_messages_project_state_id, settings_saved_messages_stacks_draft_row,
+        settings_text_edit_chrome, settings_window_size_for_screen, should_resolve_terminal_link,
+        source_control_badge_color, source_control_tooltip_lines,
+        terminal_activation_scroll_offset, terminal_cell_metric,
         terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect, terminal_font_family,
         terminal_font_id, terminal_grid_dimensions, terminal_has_windows_batch_terminate_prompt,
         terminal_line_height, terminal_link_activation_modifiers, terminal_link_at_point,
@@ -22270,24 +22961,26 @@ mod tests {
         terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
         with_minimal_button_chrome, with_settings_text_edit_chrome, AdeApp, AiBadgeModel,
         AiBadgeVisual, AppIcon, CodexAttentionReason, CodexCliStatusSource, CodexTransportStatus,
-        CtrlCAction, DirectoryIndexSnapshot, DirectoryIndexTruncationFlags, DirectoryNode,
-        FactoryDroidAttentionReason, FactoryDroidHookInboxEvent,
-        FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
-        FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, FileEditorState,
-        OpenCodeAttentionReason, OpenCodeStatusSource, OpenCodeTransportStatus, OpenFileBuffer,
-        PendingConfigChanges, PendingRerunPhase, PendingTerminalLinkClick, SettingsSection,
-        SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
-        SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
-        TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
-        TerminalOutputScrollBehavior, TerminalSecondaryClickAction, TerminalSelection,
-        TerminalSelectionPoint, TransientToast, CODEX_NOTIFY_POLL_MS, CODEX_PROCESS_POLL_MS,
-        CODEX_STOP_SETTLE_MS, CODEX_TRAILING_OUTPUT_GRACE_MS, DIRECTORY_INDEX_CHANNEL_CAPACITY,
-        FACTORY_DROID_HOOK_POLL_MS, OPENCODE_PROCESS_POLL_MS, OPENCODE_RUNNING_GRACE_MS,
-        OPENCODE_TRAILING_OUTPUT_GRACE_MS, PENDING_RERUN_BATCH_CONFIRM_SETTLE_MS,
-        PENDING_RERUN_BATCH_PROMPT_WAIT_MS, PENDING_RERUN_SETTLE_MS,
-        SOURCE_CONTROL_CHANNEL_CAPACITY, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG,
-        TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS,
-        TERMINAL_OUTPUT_BG, TEXT_MUTED, TEXT_PRIMARY, TRANSIENT_TOAST_SECS,
+        CtrlCAction, DesignInspectDeliveryState, DirectoryIndexSnapshot,
+        DirectoryIndexTruncationFlags, DirectoryNode, FactoryDroidAttentionReason,
+        FactoryDroidHookInboxEvent, FactoryDroidManagedInstallComponent,
+        FactoryDroidManagedInstallDiagnostics, FactoryDroidStatusSource,
+        FactoryDroidTransportDiagnostics, FileEditorState, OpenCodeAttentionReason,
+        OpenCodeStatusSource, OpenCodeTransportStatus, OpenFileBuffer, PendingConfigChanges,
+        PendingRerunPhase, PendingTerminalLinkClick, SettingsSection, SourceControlBadgeState,
+        SourceControlFile, SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay,
+        TerminalEntry, TerminalManagerDiffSummaryVisual, TerminalNavigationDirection,
+        TerminalNavigationShortcut, TerminalOutputScrollBehavior, TerminalSecondaryClickAction,
+        TerminalSelection, TerminalSelectionPoint, TransientToast, CODEX_NOTIFY_POLL_MS,
+        CODEX_PROCESS_POLL_MS, CODEX_STOP_SETTLE_MS, CODEX_TRAILING_OUTPUT_GRACE_MS,
+        DESIGN_INSPECT_DELIVERY_DEDUPE_MS, DESIGN_INSPECT_TARGET_SWITCH_QUIET_MS,
+        DIRECTORY_INDEX_CHANNEL_CAPACITY, FACTORY_DROID_HOOK_POLL_MS, OPENCODE_PROCESS_POLL_MS,
+        OPENCODE_RUNNING_GRACE_MS, OPENCODE_TRAILING_OUTPUT_GRACE_MS,
+        PENDING_RERUN_BATCH_CONFIRM_SETTLE_MS, PENDING_RERUN_BATCH_PROMPT_WAIT_MS,
+        PENDING_RERUN_SETTLE_MS, SOURCE_CONTROL_CHANNEL_CAPACITY,
+        SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG, TERMINAL_COPY_FEEDBACK_TEXT,
+        TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS, TERMINAL_OUTPUT_BG,
+        TEXT_MUTED, TEXT_PRIMARY, TRANSIENT_TOAST_SECS,
     };
     use crate::codex::{CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
     use crate::hooks::{
@@ -22300,6 +22993,7 @@ mod tests {
         MainVisibilityMode, ProjectRecord, ShellKind, ShortcutModifiers, TerminalKind,
         TerminalManagerFilter, TerminalShortcutEntry,
     };
+    use crate::opencode::{OpenCodeNotifyInboxEvent, OPENCODE_SESSION_IDLE_EVENT};
     use crate::terminal::{
         test_terminal_runtime, test_terminal_runtime_with_capture, TerminalColor, TerminalCursor,
         TerminalCursorLine, TerminalCursorShape, TerminalRuntime, TerminalSelectionHyperlink,
@@ -30830,6 +31524,97 @@ mod tests {
     }
 
     #[test]
+    fn subagent_opencode_notify_idle_does_not_change_running_spinner() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::OpenCode);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.opencode_session_active = true;
+            entry.opencode_normalized_status = Some(OpenCodeTransportStatus::Working);
+            entry.opencode_last_status_source = Some(OpenCodeStatusSource::Hook);
+            entry.opencode_attention_pending = false;
+            entry.opencode_attention_reason = None;
+        }
+
+        let subagent_idle = OpenCodeNotifyInboxEvent {
+            terminal_id: "1".to_owned(),
+            session_id: Some("sub-session".to_owned()),
+            parent_session_id: Some("main-session".to_owned()),
+            tool: "opencode".to_owned(),
+            status: "attention".to_owned(),
+            inbox_token: Some(test_opencode_inbox_token(1)),
+            event_kind: Some(OPENCODE_SESSION_IDLE_EVENT.to_owned()),
+            opencode_status: Some(OpenCodeTransportStatus::Idle),
+            raw_json: "{}".to_owned(),
+            timestamp_utc: "2026-05-04T00:00:00Z".to_owned(),
+        };
+
+        assert!(!app.apply_opencode_notify_inbox_event(1, &subagent_idle));
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+        assert_eq!(
+            terminal.opencode_normalized_status,
+            Some(OpenCodeTransportStatus::Working)
+        );
+        assert!(!terminal.opencode_attention_pending);
+        assert_eq!(terminal.opencode_attention_reason, None);
+
+        let main_idle = OpenCodeNotifyInboxEvent {
+            session_id: Some("main-session".to_owned()),
+            parent_session_id: None,
+            ..subagent_idle
+        };
+
+        assert!(app.apply_opencode_notify_inbox_event(1, &main_idle));
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.opencode_normalized_status,
+            Some(OpenCodeTransportStatus::Idle)
+        );
+        assert!(terminal.opencode_attention_pending);
+        assert_eq!(
+            terminal.opencode_attention_reason,
+            Some(OpenCodeAttentionReason::TurnComplete)
+        );
+    }
+
+    #[test]
+    fn visible_opencode_turn_complete_does_not_override_hook_working_state() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::OpenCode);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.opencode_session_active = true;
+            entry.opencode_normalized_status = Some(OpenCodeTransportStatus::Working);
+            entry.opencode_last_status_source = Some(OpenCodeStatusSource::Hook);
+            entry.opencode_attention_pending = false;
+            entry.opencode_attention_reason = None;
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "opencode-turn-complete".to_owned(),
+                },
+            })
+            .expect("send opencode turn complete chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+        assert_eq!(
+            terminal.opencode_normalized_status,
+            Some(OpenCodeTransportStatus::Working)
+        );
+        assert!(!terminal.opencode_attention_pending);
+        assert_eq!(terminal.opencode_attention_reason, None);
+    }
+
+    #[test]
     fn typing_codex_inside_opencode_session_does_not_switch_ownership() {
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
@@ -31763,6 +32548,7 @@ mod tests {
             opencode_notify_inboxes: BTreeMap::new(),
             opencode_notify_last_poll_at: None,
             opencode_process_last_poll_at: None,
+            browser_mcp_service: None,
             config: AppConfig::default(),
             config_load_error: None,
             config_save_requires_reload: false,
@@ -31835,6 +32621,10 @@ mod tests {
             embedded_browsers_by_project: BTreeMap::new(),
             pending_browser_rect: None,
             browser_panel_open_projects: BTreeSet::new(),
+            browser_design_inspect_enabled_projects: BTreeSet::new(),
+            browser_design_inspect_terminal_by_project: BTreeMap::new(),
+            browser_design_inspect_target_changed_at_by_project: BTreeMap::new(),
+            browser_design_inspect_last_delivery_by_destination: BTreeMap::new(),
         }
     }
 
@@ -37858,6 +38648,35 @@ mod tests {
         terminal
     }
 
+    fn test_design_element_info(selector: &str) -> web_browser::DesignElementInfo {
+        let mut styles = BTreeMap::new();
+        styles.insert("display".to_owned(), "flex".to_owned());
+        styles.insert("position".to_owned(), "relative".to_owned());
+        styles.insert("padding".to_owned(), "8px 12px".to_owned());
+        styles.insert("color".to_owned(), "rgb(255, 255, 255)".to_owned());
+        styles.insert(
+            "background-color".to_owned(),
+            "rgb(24, 118, 172)".to_owned(),
+        );
+
+        web_browser::DesignElementInfo {
+            page_url: "https://example.com/dashboard".to_owned(),
+            url: "https://example.com/dashboard".to_owned(),
+            tag: "button".to_owned(),
+            id: "save".to_owned(),
+            classes: vec!["primary".to_owned(), "wide".to_owned()],
+            text: "Save changes".to_owned(),
+            selector: selector.to_owned(),
+            rect: web_browser::DesignElementRect {
+                x: 12,
+                y: 24,
+                width: 160,
+                height: 40,
+            },
+            styles,
+        }
+    }
+
     // Browser Panel Tests
     #[test]
     fn normalize_browser_url_adds_https_for_regular_domain() {
@@ -37896,9 +38715,29 @@ mod tests {
     }
 
     #[test]
+    fn normalize_browser_url_does_not_treat_localhost_prefixes_as_local() {
+        assert_eq!(
+            super::normalize_browser_url("localhost.attacker.com"),
+            "https://localhost.attacker.com"
+        );
+        assert_eq!(
+            super::normalize_browser_url("127.0.0.1.evil.com"),
+            "https://127.0.0.1.evil.com"
+        );
+        assert_eq!(
+            super::normalize_browser_url("[::1].evil.com"),
+            "https://[::1].evil.com"
+        );
+    }
+
+    #[test]
     fn normalize_browser_url_uses_http_for_other_local_ips() {
         assert_eq!(super::normalize_browser_url("0.0.0.0"), "http://0.0.0.0");
         assert_eq!(super::normalize_browser_url("[::1]"), "http://[::1]");
+        assert_eq!(
+            super::normalize_browser_url("[::1]:3000"),
+            "http://[::1]:3000"
+        );
     }
 
     #[test]
@@ -37937,6 +38776,321 @@ mod tests {
             super::normalize_browser_url("  example.com  "),
             "https://example.com"
         );
+    }
+
+    #[test]
+    fn design_inspect_terminal_text_is_single_line_and_sanitized() {
+        let mut info = test_design_element_info("main > button#save.primary");
+        info.text = "Save\nchanges\u{0007} now".to_owned();
+
+        let text = format_design_inspect_terminal_text(&info);
+
+        assert!(text.starts_with("Design inspect: element=\"button#save.primary.wide\""));
+        assert!(text.contains("selector=\"main > button#save.primary\""));
+        assert!(text.contains("text=\"Save changes now\""));
+        assert!(text.contains("rect=\"x=12 y=24 w=160 h=40\""));
+        assert!(text.contains("background-color: rgb(24, 118, 172)"));
+        assert!(text.ends_with("| Change request: "));
+        assert!(!text.contains('\n'));
+        assert!(!text.contains('\r'));
+        assert!(!text.contains('\u{0007}'));
+    }
+
+    #[test]
+    fn sanitize_design_inspect_value_truncates_at_char_boundary() {
+        assert_eq!(sanitize_design_inspect_value("üğışöç abc", 4), "üğış...");
+    }
+
+    #[test]
+    fn design_inspect_delivery_dedupes_immediate_same_signature() {
+        let now = Instant::now();
+        let state = DesignInspectDeliveryState {
+            signature: "same".to_owned(),
+            delivered_at: now,
+        };
+
+        assert!(!design_inspect_should_deliver(Some(&state), "same", now));
+        assert!(design_inspect_should_deliver(Some(&state), "other", now));
+        assert!(design_inspect_should_deliver(
+            Some(&state),
+            "same",
+            now + Duration::from_millis(DESIGN_INSPECT_DELIVERY_DEDUPE_MS + 1)
+        ));
+    }
+
+    #[test]
+    fn browser_design_inspect_state_is_project_scoped_and_runtime_only() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        app.projects
+            .insert(2, test_project(2, "Other", "C:/other", &[], &[]));
+
+        app.set_browser_design_inspect_enabled_for_project(1, true);
+
+        assert!(app.is_browser_design_inspect_enabled_for_project(1));
+        assert!(!app.is_browser_design_inspect_enabled_for_project(2));
+        assert!(!app.config.ui.browser_panel_expanded);
+    }
+
+    #[test]
+    fn design_inspect_hover_queues_single_terminal_paste_for_duplicate_event() {
+        let ctx = Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
+        let mut app = test_app(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        app.projects
+            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
+        app.selected_project = Some(7);
+        app.set_browser_panel_open_for_project(7, true);
+        app.set_browser_design_inspect_enabled_for_project(7, true);
+
+        let info = test_design_element_info("main > button#save.primary");
+        app.forward_design_inspect_hover_to_terminal(&ctx, 7, info.clone());
+        app.forward_design_inspect_hover_to_terminal(&ctx, 7, info);
+
+        assert_eq!(app.pending_terminal_pastes.len(), 1);
+        app.flush_pending_terminal_pastes(&ctx);
+        capture.drain();
+
+        let bytes = capture.bytes();
+        assert!(bytes.starts_with(b"\x1b[200~Design inspect:"));
+        assert!(bytes.ends_with(b"| Change request: \x1b[201~"));
+    }
+
+    #[test]
+    fn design_inspect_rebinding_allows_same_element_for_different_terminal() {
+        let ctx = Context::default();
+        let (runtime1, _capture1) = test_terminal_runtime_with_capture();
+        let (runtime2, _capture2) = test_terminal_runtime_with_capture();
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry_with_runtime(1, 7, runtime1)),
+                (2, test_terminal_entry_with_runtime(2, 7, runtime2)),
+            ],
+            Some(1),
+        );
+        app.projects
+            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
+        app.selected_project = Some(7);
+        app.set_browser_panel_open_for_project(7, true);
+        app.set_browser_design_inspect_enabled_for_project(7, true);
+
+        let info = test_design_element_info("main > button#save.primary");
+        app.forward_design_inspect_hover_to_terminal(&ctx, 7, info.clone());
+        app.active_terminal = Some(2);
+        app.set_browser_design_inspect_enabled_for_project(7, true);
+        app.browser_design_inspect_target_changed_at_by_project
+            .insert(
+                7,
+                Instant::now() - Duration::from_millis(DESIGN_INSPECT_TARGET_SWITCH_QUIET_MS + 1),
+            );
+        app.forward_design_inspect_hover_to_terminal(&ctx, 7, info);
+
+        assert_eq!(app.pending_terminal_pastes.len(), 2);
+        assert_eq!(app.pending_terminal_pastes[0].terminal_id, 1);
+        assert_eq!(app.pending_terminal_pastes[1].terminal_id, 2);
+    }
+
+    #[test]
+    fn design_inspect_active_terminal_switch_rebinds_after_quiet_window() {
+        let ctx = Context::default();
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(1),
+        );
+        app.projects
+            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
+        app.selected_project = Some(7);
+        app.set_browser_panel_open_for_project(7, true);
+        app.set_browser_design_inspect_enabled_for_project(7, true);
+
+        app.set_active_terminal(&ctx, Some(2));
+        assert_eq!(
+            app.browser_design_inspect_terminal_by_project.get(&7),
+            Some(&2)
+        );
+
+        let info = test_design_element_info("main > button#save.primary");
+        app.forward_design_inspect_hover_to_terminal(&ctx, 7, info.clone());
+        assert!(app.pending_terminal_pastes.is_empty());
+
+        app.browser_design_inspect_target_changed_at_by_project
+            .insert(
+                7,
+                Instant::now() - Duration::from_millis(DESIGN_INSPECT_TARGET_SWITCH_QUIET_MS + 1),
+            );
+        app.forward_design_inspect_hover_to_terminal(&ctx, 7, info);
+
+        assert_eq!(app.pending_terminal_pastes.len(), 1);
+        assert_eq!(app.pending_terminal_pastes[0].terminal_id, 2);
+    }
+
+    #[test]
+    fn design_inspect_ignores_hover_from_stale_browser_url() {
+        let ctx = Context::default();
+        let (runtime, _capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        let mut project = test_project(7, "Demo", "C:/demo", &[], &[]);
+        project.browser_last_url = Some("https://example.com/current".to_owned());
+        app.projects.insert(7, project);
+        app.selected_project = Some(7);
+        app.set_browser_panel_open_for_project(7, true);
+        app.set_browser_design_inspect_enabled_for_project(7, true);
+
+        let mut info = test_design_element_info("main > button#save.primary");
+        info.url = "https://example.com/previous".to_owned();
+        info.page_url = "https://example.com/previous".to_owned();
+        app.forward_design_inspect_hover_to_terminal(&ctx, 7, info);
+
+        assert!(app.pending_terminal_pastes.is_empty());
+    }
+
+    #[test]
+    fn design_inspect_allows_iframe_hover_when_page_url_matches() {
+        let ctx = Context::default();
+        let (runtime, _capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        let mut project = test_project(7, "Demo", "C:/demo", &[], &[]);
+        project.browser_last_url = Some("https://example.com/current".to_owned());
+        app.projects.insert(7, project);
+        app.selected_project = Some(7);
+        app.set_browser_panel_open_for_project(7, true);
+        app.set_browser_design_inspect_enabled_for_project(7, true);
+
+        let mut info = test_design_element_info("iframe > button#save.primary");
+        info.page_url = "https://example.com/current".to_owned();
+        info.url = "https://widgets.example/frame".to_owned();
+        app.forward_design_inspect_hover_to_terminal(&ctx, 7, info);
+
+        assert_eq!(app.pending_terminal_pastes.len(), 1);
+    }
+
+    #[test]
+    fn close_terminal_cleans_design_inspect_destination_state() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
+        app.selected_project = Some(7);
+        app.set_browser_design_inspect_enabled_for_project(7, true);
+        app.browser_design_inspect_last_delivery_by_destination
+            .insert(
+                (7, 1),
+                DesignInspectDeliveryState {
+                    signature: "same".to_owned(),
+                    delivered_at: Instant::now(),
+                },
+            );
+
+        app.close_terminal(&ctx, 1);
+
+        assert!(app.browser_design_inspect_terminal_by_project.is_empty());
+        assert!(app
+            .browser_design_inspect_target_changed_at_by_project
+            .is_empty());
+        assert!(app
+            .browser_design_inspect_last_delivery_by_destination
+            .is_empty());
+    }
+
+    #[test]
+    fn design_inspect_delivery_signature_changes_by_selector() {
+        let first = test_design_element_info("main > button#save.primary");
+        let second = test_design_element_info("main > button#cancel.secondary");
+
+        assert_ne!(
+            design_inspect_delivery_signature(&first),
+            design_inspect_delivery_signature(&second)
+        );
+    }
+
+    #[test]
+    fn browser_mcp_request_uses_authenticated_terminal_project() {
+        let app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let request = crate::browser_mcp_service::BrowserMcpIpcRequest {
+            request_id: "request".to_owned(),
+            terminal_id: None,
+            project_id: None,
+            tool: "browser_snapshot".to_owned(),
+            params: serde_json::json!({}),
+        };
+        let scope = crate::browser_mcp_service::BrowserMcpAuthScope {
+            terminal_id: 1,
+            project_id: Some(7),
+        };
+
+        assert_eq!(app.resolve_browser_mcp_project_id(&request, &scope), Ok(7));
+    }
+
+    #[test]
+    fn browser_mcp_rejects_cross_project_request_before_ui_mutation() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Allowed", "C:/allowed", &[], &[]));
+        app.projects
+            .insert(8, test_project(8, "Blocked", "C:/blocked", &[], &[]));
+        app.config.ui.checklist_panel_expanded = true;
+        let request = crate::browser_mcp_service::BrowserMcpIpcRequest {
+            request_id: "request".to_owned(),
+            terminal_id: Some(1),
+            project_id: Some(8),
+            tool: "browser_navigate".to_owned(),
+            params: serde_json::json!({ "url": "https://blocked.example" }),
+        };
+        let scope = crate::browser_mcp_service::BrowserMcpAuthScope {
+            terminal_id: 1,
+            project_id: Some(7),
+        };
+
+        let response = app.handle_browser_mcp_request(&ctx, request, scope);
+
+        assert!(response.is_error);
+        assert_eq!(response.text, "Browser MCP project authorization mismatch");
+        assert!(app.config.ui.checklist_panel_expanded);
+        assert!(!app.browser_panel_open_projects.contains(&8));
+        assert!(!app.embedded_browsers_by_project.contains_key(&8));
+        assert_eq!(app.projects.get(&8).unwrap().browser_last_url, None);
+    }
+
+    #[test]
+    fn browser_mcp_missing_terminal_does_not_fallback_to_active_project() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Active", "C:/active", &[], &[]));
+        app.selected_project = Some(7);
+        let request = crate::browser_mcp_service::BrowserMcpIpcRequest {
+            request_id: "request".to_owned(),
+            terminal_id: None,
+            project_id: None,
+            tool: "browser_navigate".to_owned(),
+            params: serde_json::json!({ "url": "https://active.example" }),
+        };
+        let scope = crate::browser_mcp_service::BrowserMcpAuthScope {
+            terminal_id: 99,
+            project_id: Some(7),
+        };
+
+        let response = app.handle_browser_mcp_request(&ctx, request, scope);
+
+        assert!(response.is_error);
+        assert_eq!(response.text, "Browser MCP target terminal does not exist");
+        assert!(app.browser_panel_open_projects.is_empty());
+        assert!(app.embedded_browsers_by_project.is_empty());
     }
 
     #[test]
@@ -38610,6 +39764,23 @@ mod tests {
     }
 
     #[test]
+    fn project_browser_uses_project_scoped_webview_profile_folder() {
+        let mut app = test_app([], None);
+
+        let browser = app.project_browser(7);
+        let path = browser
+            .user_data_folder()
+            .expect("project browser should have a persistent profile folder");
+        let normalized = path.to_string_lossy().replace('\\', "/");
+
+        assert!(
+            normalized.ends_with("/webview2/projects/7"),
+            "unexpected browser profile path: {}",
+            path.display()
+        );
+    }
+
+    #[test]
     fn embedded_browser_yields_to_ui_overlay_layers() {
         // Test the pure predicate for all overlay sources
         assert!(embedded_browser_should_yield_to_ui_layer(
@@ -38711,46 +39882,50 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = test_app([], None);
 
-        // Add a project with an existing URL
+        // Add a project with an existing URL.
         let mut project = test_project(1, "Demo", "C:/demo", &[], &[]);
-        project.browser_last_url = Some("https://example.com".to_owned());
+        let initial_url = "https://example.com".to_owned();
+        project.browser_last_url = Some(initial_url.clone());
         app.projects.insert(1, project);
         app.selected_project = Some(1);
+
         app.browser_url_draft_by_project
-            .insert(1, "https://example.com".to_owned());
+            .insert(1, initial_url.clone());
 
-        // Inject events directly into a browser's event channel
-        // We'll test the filtering behavior at the process_browser_events level
-        // by simulating what would happen if events were injected
-        let initial_draft = app.browser_url_draft_by_project.get(&1).cloned();
-        let initial_url = app.projects.get(&1).unwrap().browser_last_url.clone();
-
-        // The filtering logic in process_browser_events should ignore unsupported schemes
-        // Verify the current implementation accepts only http/https
-        assert_eq!(initial_draft, Some("https://example.com".to_owned()));
-        assert_eq!(initial_url, Some("https://example.com".to_owned()));
-
-        // apply_browser_observed_url should still reject non-http(s) at the filtering layer
-        // Let's verify process_browser_events filtering logic manually
-        let test_cases = vec![
-            ("about:blank", false),
-            ("file:///etc/passwd", false),
-            ("data:text/html,test", false),
-            ("javascript:alert(1)", false),
-            ("", false),
-            ("https://valid.com", true),
-            ("http://localhost:3000", true),
-        ];
-
-        for (url, should_accept) in test_cases {
-            let lower = url.to_lowercase();
-            let is_supported = lower.starts_with("http://") || lower.starts_with("https://");
-            assert_eq!(
-                is_supported, should_accept,
-                "URL '{}' support check mismatch",
-                url
-            );
+        {
+            let browser = app.project_browser(1);
+            browser.send_test_event(web_browser::BrowserEvent::UrlChanged(
+                "about:blank".to_owned(),
+            ));
+            browser.send_test_event(web_browser::BrowserEvent::UrlChanged(
+                "file:///etc/passwd".to_owned(),
+            ));
         }
+
+        app.process_browser_events(&ctx);
+
+        assert_eq!(app.browser_url_draft_by_project.get(&1), Some(&initial_url));
+        assert_eq!(
+            app.projects.get(&1).unwrap().browser_last_url,
+            Some(initial_url.clone())
+        );
+
+        let supported_url = "https://valid.com".to_owned();
+        {
+            let browser = app.project_browser(1);
+            browser.send_test_event(web_browser::BrowserEvent::UrlChanged(supported_url.clone()));
+        }
+
+        app.process_browser_events(&ctx);
+
+        assert_eq!(
+            app.browser_url_draft_by_project.get(&1),
+            Some(&supported_url)
+        );
+        assert_eq!(
+            app.projects.get(&1).unwrap().browser_last_url,
+            Some(supported_url)
+        );
     }
 
     #[test]

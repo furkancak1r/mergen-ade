@@ -1,5 +1,30 @@
 ### Known Issues & Fix Log
 
+#### Embedded browser did not persist saved passwords {#embedded-browser-persistent-passwords}
+- Date: 2026-05-04
+- Context: Browser panel WebView2 session, cookie, autofill, and password persistence
+- Error signature: `Browser asks for login/password again after reopening Mergen ADE`
+- Symptoms/Impact:
+  1. Users had to re-enter website credentials in Mergen's embedded Browser panel.
+  2. WebView2 session/profile data was not tied to a stable Mergen-owned data folder.
+  3. The Browser panel preserved only `browser_last_url`, not WebView2's cookies, autofill, or password state.
+- Root cause:
+  1. The Windows embedded browser was created with `CreateCoreWebView2Environment`, which relies on WebView2's default user-data-folder behavior.
+  2. Mergen did not provide an explicit per-project WebView2 profile folder under app data.
+  3. Password autosave and general autofill were not explicitly enabled on the WebView2 profile.
+- Resolution:
+  - Added a stable project-scoped WebView2 user data folder path under Mergen app data: `webview2/projects/<project_id>`.
+  - Changed WebView2 creation to `CreateCoreWebView2EnvironmentWithOptions` with that explicit user data folder.
+  - Best-effort enabled WebView2 profile password autosave and general autofill via `ICoreWebView2_13::Profile()` and `ICoreWebView2Profile6`.
+  - Kept passwords out of Mergen config; WebView2 stores profile data using its native storage.
+  - Added regression tests for project-scoped browser profile paths and `EmbeddedBrowser` profile-folder retention.
+- Prevent recurrence:
+  - Always create WebView2 with an explicit Mergen-owned user data folder for persistent browser state.
+  - Do not serialize browser cookies, sessions, autofill, or passwords into TOML config.
+  - Keep Browser panel tests verifying project-scoped profile folder selection.
+- Files/Commands touched: `src/app.rs`, `src/config.rs`, `src/web_browser.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test browser`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report on 2026-05-04 that Mergen's embedded browser does not save passwords and requires credentials every time.
+
 #### Function-key slash shortcuts now submit through paste-safe dispatch {#function-key-slash-shortcuts-paste-safe-dispatch}
 - Date: 2026-05-04
 - Context: User-configurable terminal command shortcuts for AI CLI slash commands
@@ -3391,4 +3416,82 @@
   - Cap per-frame subtree requests to maintain responsiveness in large projects.
 - Files/Commands touched: `src/app.rs` (collect_search_deferred_directory_paths, draw_directory_panel), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User report that directory search cannot find files inside folders.
+
+#### OpenCode subagent completion stopped the main-agent spinner {#opencode-subagent-completion-stopped-main-spinner}
+- Date: 2026-05-04
+- Context: OpenCode CLI sessions using the Mergen-managed status plugin while a subagent is running under the main agent.
+- Error signature: `OpenCode spinner changes to turn-complete/pulse when a subagent finishes, even though the main agent is still working.`
+- Symptoms/Impact:
+  1. The Terminal Manager badge stopped showing the gray working spinner too early.
+  2. Users could think the main OpenCode turn had finished while it was still continuing after subagent work.
+- Root cause:
+  1. The OpenCode status plugin treated every `session.idle` event as terminal-wide completion.
+  2. OpenCode subagents have their own sessions, so a subagent `session.idle` was indistinguishable from the main session finishing.
+  3. Hook/notify events did not preserve `sessionID`/`parentID`, so Rust-side state transitions could not filter subagent events.
+- Resolution:
+  - Added OpenCode session metadata (`session_id`, `parent_session_id`) to notify and hook events.
+  - Updated the OpenCode plugin to track `session.created`/`session.updated` parent relationships and avoid posting subagent status events.
+  - Added hook-service and app-side filtering for events with `parent_session_id`.
+  - Prevented visible `opencode-turn-complete` text from overriding authoritative hook/notify `Working` state.
+  - Added regression tests for subagent notify idle filtering, main-session completion, hook-service filtering, and notify metadata round-tripping.
+- Prevent recurrence:
+  - OpenCode status changes must be scoped to the root/main session when session metadata is available.
+  - Do not collapse subagent lifecycle events into terminal-wide AI status.
+- Files/Commands touched: `src/app.rs`, `src/opencode.rs`, `src/opencode_hook_service.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted `cargo test`
+- References: User report: "opencodeda subagent çalışmayı bitirince spinner durumu değişiyor ama değişmemesi lazım sadece ana ajanı kontrol etmesi lazım".
+
+#### Browser MCP could target another project's embedded browser {#browser-mcp-cross-project-targeting}
+- Date: 2026-05-04
+- Context: OpenCode Browser MCP helper controlling Mergen's embedded Browser panel
+- Error signature: `Browser MCP request from project A includes project_id for project B and operates project B browser state`
+- Symptoms/Impact:
+  1. A terminal process that inherited Browser MCP environment variables could submit a request with another project's `project_id`.
+  2. Mergen accepted the body-provided project id before deriving ownership from the authenticated terminal.
+  3. Browser MCP tools such as navigation, storage, cookies, and page evaluation could act on a different project's persistent WebView profile.
+  4. Missing authorization data could fall back to active/selected UI state, making request routing depend on mutable UI focus.
+- Root cause:
+  1. `BrowserMcpService` issued one shared app-wide token to terminals.
+  2. `resolve_browser_mcp_project_id()` trusted request body claims before terminal ownership and fell back to `active_browser_project_id()`.
+  3. Initial OpenCode runtime config writes did not consistently include project scope for the Browser MCP endpoint.
+- Resolution:
+  - Replaced the shared Browser MCP token with terminal/project-scoped capability tokens stored server-side.
+  - Attached authenticated token scope to queued Browser MCP commands.
+  - Changed Browser MCP project resolution to derive from the authenticated terminal's current project and reject body `terminal_id`/`project_id` mismatches.
+  - Removed active/selected project fallback from terminal-originated Browser MCP routing.
+  - Threaded project id into terminal spawn so initial Browser MCP env/config is project-scoped.
+  - Revoked Browser MCP tokens when terminals close or projects are removed.
+  - Added regression tests for scoped token issuance, revocation, cross-project rejection, and missing-terminal fallback denial.
+- Prevent recurrence:
+  - Treat Browser MCP body ids as claims only; never as authority.
+  - Reject stale or mismatched token/project/terminal combinations before UI mutation.
+  - Keep Browser MCP authorization tests covering cross-project requests and missing terminal cases.
+  - Never route terminal-originated Browser MCP commands through `active_browser_project_id()` or `selected_project`.
+- Files/Commands touched: `src/browser_mcp_service.rs`, `src/app.rs`, `src/terminal.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted `cargo test`, `cargo test`
+- References: Code review finding on 2026-05-04 that Browser MCP accepted caller-supplied project ids while using a shared token.
+
+#### Browser MCP fixed waits returned success immediately {#browser-mcp-fixed-waits-returned-immediately}
+- Date: 2026-05-04
+- Context: Browser MCP `browser_wait_for` tool used by OpenCode/Playwright-compatible browser automation
+- Error signature: `browser_wait_for({"time": 5}) returns immediately`
+- Symptoms/Impact:
+  1. Automation that requested a fixed wait continued without the requested delay.
+  2. Follow-up Browser MCP commands could run against stale DOM state after navigation, redirects, or asynchronous UI updates.
+  3. The success text claimed the wait was accepted while no wait had elapsed.
+- Root cause:
+  1. The embedded page automation script returned `ok(...)` as soon as `params.time` was present.
+  2. There was no helper-side fixed wait or polling loop for text/textGone conditions.
+  3. Implementing the delay inside `AdeApp::process_browser_mcp_commands()` would have blocked egui update frames, so the wait needed to live outside the UI path.
+- Resolution:
+  - Moved fixed-duration `browser_wait_for` handling into the `mergen-browser-mcp` helper process.
+  - Added helper-side polling for `text` and `textGone` conditions with timeout validation.
+  - Removed the embedded script branch that faked fixed-wait success.
+  - Kept page script checks immediate so egui/WebView script execution is not used for long blocking waits.
+  - Added regression tests for fixed wait planning, condition polling params, invalid waits, ambiguous wait requests, and the page script no-fake-success invariant.
+- Prevent recurrence:
+  - `browser_wait_for` may report success only after a requested duration elapses or the requested condition is true.
+  - Do not add sleeps or long polling loops to egui update paths.
+  - Keep wait validation capped below the Browser MCP bridge timeout.
+  - Keep tests proving `params.time` is not treated as immediate success in the embedded script.
+- Files/Commands touched: `src/bin/mergen-browser-mcp.rs`, `src/web_browser.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted `cargo test`, `cargo test`
+- References: Code review finding on 2026-05-04 that `browser_wait_for({time})` reported success without waiting.
 

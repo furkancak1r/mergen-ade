@@ -17,6 +17,7 @@ const APPLICATION: &str = "MergenADE";
 const FACTORY_DROID_HOOK_RUNTIME_DIR: &str = "runtime/factory-droid-hooks";
 const CODEX_CLI_RUNTIME_DIR: &str = "runtime/codex-cli";
 const OPENCODE_RUNTIME_DIR: &str = "runtime/opencode";
+const WEBVIEW2_USER_DATA_DIR: &str = "webview2";
 const CODEX_BRIDGE_DIR: &str = "bin";
 const CODEX_BRIDGE_EXE: &str = "mergen-codex-bridge.exe";
 
@@ -56,6 +57,26 @@ pub fn history_path() -> io::Result<PathBuf> {
     let data_dir = project_dirs()?.data_dir().to_path_buf();
     fs::create_dir_all(&data_dir)?;
     Ok(data_dir.join("history.json"))
+}
+
+pub fn browser_user_data_dir(project_id: u64) -> io::Result<PathBuf> {
+    let dir = browser_user_data_dir_path(project_id)?;
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+pub fn browser_user_data_dir_path(project_id: u64) -> io::Result<PathBuf> {
+    Ok(browser_user_data_dir_from_data_dir(
+        project_dirs()?.data_dir(),
+        project_id,
+    ))
+}
+
+pub(crate) fn browser_user_data_dir_from_data_dir(data_dir: &Path, project_id: u64) -> PathBuf {
+    data_dir
+        .join(WEBVIEW2_USER_DATA_DIR)
+        .join("projects")
+        .join(project_id.to_string())
 }
 
 pub fn load_history(path: &Path) -> io::Result<AppHistory> {
@@ -249,7 +270,9 @@ fn normalize_config_for_current_platform(config: &mut AppConfig) {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_config, load_history, save_config, save_history};
+    use super::{
+        browser_user_data_dir_from_data_dir, load_config, load_history, save_config, save_history,
+    };
     use crate::models::{
         default_terminal_shortcuts, AppConfig, BuiltinLauncherKind, ShellKind, ShortcutModifiers,
         TerminalManagerFilter, TerminalShortcutEntry,
@@ -618,6 +641,15 @@ command = false
         assert!(loaded.projects[0].checklist.contains(&"item2".to_owned()));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn browser_user_data_dir_is_project_scoped_under_app_data() {
+        let data_dir = PathBuf::from(r"C:\Users\demo\AppData\Roaming\Mergen\MergenADE\data");
+
+        let dir = browser_user_data_dir_from_data_dir(&data_dir, 42);
+
+        assert_eq!(dir, data_dir.join("webview2").join("projects").join("42"));
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {

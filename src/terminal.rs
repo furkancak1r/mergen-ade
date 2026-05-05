@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::browser_mcp_service::{helper_path_from_current_exe, BrowserMcpService};
 use crate::codex::codex_env_pairs;
 use crate::hooks::{AiCliStatus, AiCliTool, AiHookEvent};
 use crate::hooks::{
@@ -658,6 +659,7 @@ impl Write for SharedWriter {
 impl TerminalRuntime {
     pub fn spawn(
         terminal_id: u64,
+        project_id: u64,
         shell: ShellKind,
         working_directory: PathBuf,
         ui_event_tx: Sender<TerminalUiEvent>,
@@ -671,6 +673,7 @@ impl TerminalRuntime {
         opencode_runtime_dir: Option<PathBuf>,
         opencode_notify_inbox_token: Option<String>,
         opencode_hook_service: Option<&OpenCodeHookService>,
+        browser_mcp_service: Option<&BrowserMcpService>,
         opencode_build_model: Option<&str>,
     ) -> io::Result<Self> {
         let pty_system = native_pty_system();
@@ -728,11 +731,38 @@ impl TerminalRuntime {
                 }
                 // Also write the runtime config with the build model override
                 if let Some(build_model) = opencode_build_model {
-                    if let Err(err) = opencode_config::write_terminal_runtime_config(
-                        opencode_dir,
-                        terminal_id,
-                        build_model,
-                    ) {
+                    let browser_mcp = browser_mcp_service.and_then(|service| {
+                        std::env::current_exe().ok().and_then(|current_exe| {
+                            let helper_path = helper_path_from_current_exe(&current_exe);
+                            if helper_path.is_file() {
+                                Some((
+                                    helper_path,
+                                    service.endpoint_env(terminal_id, Some(project_id)),
+                                ))
+                            } else {
+                                log::warn!(
+                                    "OpenCode Browser MCP helper is missing: {}",
+                                    helper_path.display()
+                                );
+                                None
+                            }
+                        })
+                    });
+                    let write_result = if let Some((helper_path, endpoint)) = browser_mcp.as_ref() {
+                        opencode_config::write_terminal_runtime_config_with_browser_mcp(
+                            opencode_dir,
+                            terminal_id,
+                            build_model,
+                            Some((helper_path.as_path(), endpoint.clone())),
+                        )
+                    } else {
+                        opencode_config::write_terminal_runtime_config(
+                            opencode_dir,
+                            terminal_id,
+                            build_model,
+                        )
+                    };
+                    if let Err(err) = write_result {
                         log::warn!(
                             "Failed to write OpenCode runtime config for terminal {}: {}",
                             terminal_id,
@@ -740,6 +770,11 @@ impl TerminalRuntime {
                         );
                     }
                 }
+            }
+        }
+        if let Some(browser_mcp_service) = browser_mcp_service {
+            for (name, value) in browser_mcp_service.build_pty_env(terminal_id, Some(project_id)) {
+                command.env(name, value);
             }
         }
         // ConEmuANSI and ANSICON removed - they can interfere with ConPTY emulation

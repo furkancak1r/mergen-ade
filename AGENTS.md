@@ -228,6 +228,11 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Native WebView source changes must update the URL input.** Drain `EmbeddedBrowser::drain_events()` before rendering the browser panel, and apply `BrowserEvent::UrlChanged` to both `browser_url_draft_by_project` and `ProjectRecord::browser_last_url`.
 - **Observed browser URLs remain scheme-gated.** Persist and display observed WebView URLs only when they are non-empty `http://` or `https://` URLs; ignore transient or unsupported sources such as `about:blank`, `file:`, `data:`, and `javascript:`.
 - **WebView2 event handlers are part of browser lifecycle.** Register `SourceChanged` when the WebView2 instance is created, keep its event token with the browser instance, and remove it during shutdown before dropping native WebView resources.
+- **Browser MCP tokens must be terminal-scoped capabilities.** Do not expose one global Browser MCP token to every terminal; each token must resolve server-side to the terminal/project it was issued for.
+- **Browser MCP project selection must be derived from authenticated terminal ownership.** Client-supplied `terminal_id` and `project_id` are claims only; reject mismatches and never use them to choose another project.
+- **Browser MCP must fail closed without active-project fallback.** Terminal-originated MCP commands must never fall back to `active_browser_project_id()`, `selected_project`, or other mutable UI state when authorization data is missing or stale.
+- **Browser MCP waits must not fake success.** `browser_wait_for` may report success only after the requested duration has elapsed or the requested text/textGone condition is true.
+- **Browser MCP waits must not block egui update paths.** Fixed waits and polling should run in the MCP helper or another non-UI pending flow, not inside `AdeApp::process_browser_mcp_commands()` or WebView script execution that blocks the UI frame.
 
 ## Terminal Shortcut Guidelines
 - **Terminal shortcuts are user-configurable.** Store custom terminal command shortcuts in `AppConfig::terminal_shortcuts`; do not hard-code new terminal command shortcuts directly in input handling.

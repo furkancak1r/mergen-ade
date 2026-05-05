@@ -102,6 +102,10 @@ impl OpenCodeTransportStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenCodeNotifyInboxEvent {
     pub terminal_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
     pub tool: String,
     /// Generic status for legacy compatibility ("running" | "attention")
     pub status: String,
@@ -114,6 +118,14 @@ pub struct OpenCodeNotifyInboxEvent {
     pub opencode_status: Option<OpenCodeTransportStatus>,
     pub raw_json: String,
     pub timestamp_utc: String,
+}
+
+impl OpenCodeNotifyInboxEvent {
+    pub fn is_subagent_event(&self) -> bool {
+        self.parent_session_id
+            .as_deref()
+            .is_some_and(|parent| !parent.trim().is_empty())
+    }
 }
 
 pub fn opencode_notify_inbox_path_for_dir(
@@ -256,8 +268,12 @@ pub fn write_opencode_notify_event(
         .map(|s| s.to_generic_status())
         .unwrap_or_else(|| "attention".to_owned());
 
+    let (session_id, parent_session_id) = extract_session_metadata(payload);
+
     let event = OpenCodeNotifyInboxEvent {
         terminal_id: terminal_id.to_string(),
+        session_id,
+        parent_session_id,
         tool: MERGEN_AI_TOOL_HINT_OPENCODE.to_owned(),
         status: legacy_status,
         inbox_token: Some(inbox_token.to_owned()),
@@ -304,6 +320,78 @@ fn extract_event_kind(payload: &str) -> Option<String> {
         .or_else(|| parsed.get("event_type"));
 
     kind.and_then(|v| v.as_str()).map(|s| s.to_lowercase())
+}
+
+fn extract_session_metadata(payload: &str) -> (Option<String>, Option<String>) {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return (None, None);
+    };
+
+    (
+        string_at_any_path(
+            &parsed,
+            &[
+                &["properties", "sessionID"],
+                &["properties", "sessionId"],
+                &["properties", "session_id"],
+                &["properties", "part", "sessionID"],
+                &["properties", "part", "sessionId"],
+                &["properties", "tool", "sessionID"],
+                &["properties", "tool", "sessionId"],
+                &["properties", "request", "sessionID"],
+                &["properties", "request", "sessionId"],
+                &["properties", "info", "id"],
+                &["sessionID"],
+                &["sessionId"],
+                &["session_id"],
+                &["session", "id"],
+            ],
+        ),
+        string_at_any_path(
+            &parsed,
+            &[
+                &["properties", "parentSessionID"],
+                &["properties", "parentSessionId"],
+                &["properties", "parent_session_id"],
+                &["properties", "parentID"],
+                &["properties", "parentId"],
+                &["properties", "parent_id"],
+                &["properties", "info", "parentID"],
+                &["properties", "info", "parentId"],
+                &["properties", "info", "parent_session_id"],
+                &["parentSessionID"],
+                &["parentSessionId"],
+                &["parent_session_id"],
+                &["parentID"],
+                &["parentId"],
+                &["parent_id"],
+                &["session", "parentID"],
+                &["session", "parentId"],
+            ],
+        ),
+    )
+}
+
+fn string_at_any_path(value: &serde_json::Value, paths: &[&[&str]]) -> Option<String> {
+    paths.iter().find_map(|path| string_at_path(value, path))
+}
+
+fn string_at_path(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    json_value_to_non_empty_string(current)
+}
+
+fn json_value_to_non_empty_string(value: &serde_json::Value) -> Option<String> {
+    let text = match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Number(number) => number.to_string(),
+        _ => return None,
+    };
+    let trimmed = text.trim();
+    (!trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("null")).then(|| trimmed.to_owned())
 }
 
 pub fn maybe_handle_opencode_notify_mode() -> io::Result<Option<OpenCodeNotifyInboxEvent>> {
@@ -376,8 +464,12 @@ pub fn maybe_handle_opencode_notify_mode() -> io::Result<Option<OpenCodeNotifyIn
                     .map(|s| s.to_generic_status())
                     .unwrap_or_else(|| "attention".to_owned());
 
+                let (session_id, parent_session_id) = extract_session_metadata(&payload);
+
                 let event = OpenCodeNotifyInboxEvent {
                     terminal_id: tid,
+                    session_id,
+                    parent_session_id,
                     tool: MERGEN_AI_TOOL_HINT_OPENCODE.to_owned(),
                     status: legacy_status,
                     inbox_token: Some(token),
@@ -528,6 +620,36 @@ mod tests {
         assert_eq!(events[0].status, "attention");
         assert_eq!(events[0].event_kind.as_deref(), Some("turn-complete"));
         assert_eq!(events[0].raw_json, payload);
+    }
+
+    #[test]
+    fn write_notify_inbox_preserves_session_metadata() {
+        let temp = TestTempDir::new("opencode-notify-session");
+        let payload = r#"{"type":"session.idle","properties":{"sessionID":"sub-session","parentID":"main-session"}}"#;
+
+        write_opencode_notify_event(payload, "17", &temp.path, "test-token-17", None)
+            .expect("write should succeed");
+
+        let mut processed = std::collections::HashSet::new();
+        let events = read_opencode_notify_inbox(&temp.path, 17, "test-token-17", &mut processed)
+            .expect("read should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id.as_deref(), Some("sub-session"));
+        assert_eq!(events[0].parent_session_id.as_deref(), Some("main-session"));
+        assert!(events[0].is_subagent_event());
+    }
+
+    #[test]
+    fn notify_event_deserializes_legacy_records_without_session_metadata() {
+        let event: OpenCodeNotifyInboxEvent = serde_json::from_str(
+            r#"{"terminal_id":"1","tool":"opencode","status":"attention","raw_json":"{}","timestamp_utc":"2026-05-04T00:00:00Z"}"#,
+        )
+        .expect("legacy event should deserialize");
+
+        assert_eq!(event.session_id, None);
+        assert_eq!(event.parent_session_id, None);
+        assert!(!event.is_subagent_event());
     }
 
     #[test]
