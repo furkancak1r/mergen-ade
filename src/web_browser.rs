@@ -126,6 +126,7 @@ pub(crate) fn browser_mcp_tool_uses_async_script(tool: &str) -> bool {
     matches!(
         tool,
         "browser_evaluate"
+            | "browser_page_summary"
             | "browser_click"
             | "browser_hover"
             | "browser_select_option"
@@ -784,6 +785,7 @@ impl EmbeddedBrowser {
     ) -> Result<BrowserMcpToolOutput, String> {
         match tool {
             "browser_snapshot"
+            | "browser_page_summary"
             | "browser_click"
             | "browser_hover"
             | "browser_select_option"
@@ -1224,7 +1226,7 @@ pub(crate) fn browser_mcp_output_from_devtools_runtime_raw(
 
 #[cfg(target_os = "windows")]
 const MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT: &str = r#"
-if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 4) {
+if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 5) {
   window.__mergenMcpState = window.__mergenMcpState || { refCounter: 1, consoleMessages: [], networkRequests: [], routes: [], highlighted: null };
 
   const state = window.__mergenMcpState;
@@ -1238,6 +1240,15 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 4) {
     const rect = element.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
   };
+  const inViewport = (rect) => rect.bottom >= 0 && rect.right >= 0 && rect.top <= window.innerHeight && rect.left <= window.innerWidth;
+  const isDisabled = (element) => Boolean(
+    element?.disabled ||
+    element?.ariaDisabled === 'true' ||
+    element?.getAttribute?.('aria-disabled') === 'true' ||
+    element?.inert ||
+    element?.closest?.('[inert]') ||
+    (element?.closest?.('fieldset[disabled]') && element.tagName !== 'FIELDSET')
+  );
   const roleOf = (element) => {
     const explicit = element.getAttribute('role');
     if (explicit) return explicit;
@@ -1491,6 +1502,33 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 4) {
     dispatchMouse(target, 'mousemove', point, 'left', 0, state.cursor.mouseDownButton ? buttonMask(state.cursor.mouseDownButton) : 0);
     return target;
   };
+  const settleAfterInteraction = () => new Promise((resolve) => {
+    let done = false;
+    let quietTimer = null;
+    let observer = null;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      if (quietTimer) clearTimeout(quietTimer);
+      observer?.disconnect();
+      resolve();
+    };
+    const armQuietTimer = () => {
+      if (quietTimer) clearTimeout(quietTimer);
+      quietTimer = setTimeout(finish, 45);
+    };
+    try {
+      observer = new MutationObserver(armQuietTimer);
+      observer.observe(document.documentElement, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        characterData: true,
+      });
+    } catch (_) {}
+    requestAnimationFrame(() => requestAnimationFrame(armQuietTimer));
+    setTimeout(finish, 180);
+  });
   const clickAt = async (point, options = {}) => {
     const button = buttonName(options.button);
     const doubleClick = Boolean(options.doubleClick);
@@ -1512,6 +1550,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 4) {
     }
     if (button === 'right') dispatchMouse(target, 'contextmenu', point, button, 1, 0);
     pulseCursor(point);
+    await settleAfterInteraction();
     return target;
   };
   const cssEscape = (value) => window.CSS?.escape ? window.CSS.escape(value) : String(value).replace(/[^a-zA-Z0-9_-]/g, '\\$&');
@@ -1727,6 +1766,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 4) {
       setNativeProperty(element, 'value', String(values[0] ?? ''));
       event(element, 'input');
       await commitField(element, params.commit !== false);
+      await settleAfterInteraction();
       return ok(`Selected option ${element.value || values[0] || ''} in ${target}`);
     }
     if (tool === 'browser_type') {
@@ -1743,11 +1783,13 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 4) {
         dispatchKeyEvent(element, 'keydown', 'Enter');
         dispatchKeyEvent(element, 'keyup', 'Enter');
       }
+      await settleAfterInteraction();
       return ok(`Typed into ${target || 'active element'}`);
     }
     if (tool === 'browser_fill_form') {
       const fields = Array.isArray(params.fields) ? params.fields : [];
       for (const field of fields) await fillOneField(field);
+      await settleAfterInteraction();
       return ok('Form fields filled');
     }
     if (tool === 'browser_press_key') {
@@ -1768,6 +1810,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 4) {
       active.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
       if (key === 'Enter' && active.form) active.form.requestSubmit?.();
       active.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true }));
+      await settleAfterInteraction();
       return ok(`Pressed ${key}`);
     }
     if (tool === 'browser_mouse_move_xy') {
@@ -1804,6 +1847,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 4) {
       });
       dispatchMouse(targetAt(end, target), 'mouseup', end, button, 1, 0);
       state.cursor.mouseDownButton = null;
+      await settleAfterInteraction();
       return ok(`Dragged mouse from ${Math.round(start.x)}, ${Math.round(start.y)} to ${Math.round(end.x)}, ${Math.round(end.y)}`, { startX: start.x, startY: start.y, endX: end.x, endY: end.y });
     }
     if (tool === 'browser_mouse_down') {
@@ -1824,6 +1868,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 4) {
       await moveCursorTo(point.x, point.y);
       dispatchMouse(targetAt(point), 'mouseup', point, button, 1, 0);
       state.cursor.mouseDownButton = null;
+      await settleAfterInteraction();
       return ok(`Mouse ${button} button up at ${Math.round(point.x)}, ${Math.round(point.y)}`, { x: point.x, y: point.y, button });
     }
     if (tool === 'browser_mouse_wheel') {
@@ -1860,6 +1905,130 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 4) {
     walk(document.body || document.documentElement, 0);
     return { ok: true, text: lines.join('\n'), data: { url: location.href, title: document.title || '' } };
   };
+  const pageSummary = (params = {}) => {
+    const query = clean(params.query || '', 120).toLowerCase();
+    const includeBoxes = Boolean(params.includeBoxes);
+    const rawMaxItems = Number(params.maxItems ?? 40);
+    const maxItems = Number.isFinite(rawMaxItems) ? clamp(rawMaxItems, 5, 120) : 40;
+    const roleFilter = new Set((Array.isArray(params.roles) ? params.roles : []).map((role) => String(role).toLowerCase()));
+    const selector = [
+      'button',
+      'a[href]',
+      'input',
+      'textarea',
+      'select',
+      '[role]',
+      '[tabindex]',
+      '[contenteditable]',
+      'summary',
+      'label',
+      'h1',
+      'h2',
+      'h3',
+      'h4',
+      'h5',
+      'h6',
+      '[aria-live]',
+      '.alert',
+      '[data-testid]',
+    ].join(',');
+    const uniqueElements = [];
+    const seen = new Set();
+    for (const element of Array.from(document.querySelectorAll(selector)).slice(0, 1600)) {
+      if (!element || seen.has(element) || !visible(element)) continue;
+      seen.add(element);
+      uniqueElements.push(element);
+      if (uniqueElements.length >= 500) break;
+    }
+    const scoreItem = (item) => {
+      if (!query) return item.inViewport ? 10 : 0;
+      const haystack = `${item.role} ${item.name} ${item.value} ${item.placeholder}`.toLowerCase();
+      if (haystack === query) return 120;
+      if (haystack.startsWith(query)) return 100;
+      if (haystack.includes(query)) return 80;
+      return item.inViewport ? 5 : 0;
+    };
+    const describe = (element) => {
+      const role = roleOf(element);
+      const rect = element.getBoundingClientRect();
+      const name = nameOf(element);
+      const value = 'value' in element ? clean(element.value, 80) : '';
+      const placeholder = clean(element.getAttribute?.('placeholder') || '', 80);
+      const disabled = isDisabled(element);
+      const item = {
+        ref: ensureRef(element),
+        role,
+        name,
+        enabled: !disabled,
+        disabled,
+        visible: true,
+        inViewport: inViewport(rect),
+        required: Boolean(element.required || element.getAttribute?.('aria-required') === 'true'),
+        invalid: Boolean(element.matches?.(':invalid') || element.getAttribute?.('aria-invalid') === 'true'),
+        value,
+        placeholder,
+        checked: 'checked' in element ? Boolean(element.checked) : undefined,
+        box: { x: Math.round(rect.left), y: Math.round(rect.top), width: Math.round(rect.width), height: Math.round(rect.height) },
+      };
+      item.score = scoreItem(item);
+      return item;
+    };
+    const allItems = uniqueElements
+      .map(describe)
+      .filter((item) => !roleFilter.size || roleFilter.has(item.role));
+    const actionRoles = new Set(['button', 'link', 'checkbox', 'radio', 'combobox', 'textbox']);
+    const isAction = (item) => actionRoles.has(item.role) || item.name || item.placeholder;
+    const ranked = (items) => items
+      .slice()
+      .sort((a, b) => b.score - a.score || Number(b.inViewport) - Number(a.inViewport) || Number(b.enabled) - Number(a.enabled) || a.ref.localeCompare(b.ref))
+      .slice(0, maxItems);
+    const actionTargets = ranked(allItems.filter((item) => isAction(item) && item.enabled));
+    const formFields = ranked(allItems.filter((item) => ['textbox', 'checkbox', 'radio', 'combobox'].includes(item.role)));
+    const disabledControls = ranked(allItems.filter((item) => item.disabled));
+    const semantic = ranked(allItems.filter((item) => ['heading', 'tab', 'alert', 'status'].includes(item.role) || item.role.startsWith('h')));
+    const topMatches = query ? ranked(allItems.filter((item) => item.score >= 80)) : [];
+    const formatItem = (item) => {
+      const name = item.name || item.placeholder || item.value || '';
+      const quoted = name ? ` "${name.replace(/"/g, '\\"')}"` : '';
+      const flags = [
+        item.enabled ? 'enabled' : 'disabled',
+        item.inViewport ? 'inViewport' : 'offscreen',
+        item.required ? 'required' : '',
+        item.invalid ? 'invalid' : '',
+        item.value ? `value="${item.value.replace(/"/g, '\\"')}"` : '',
+      ].filter(Boolean).join(' ');
+      const box = includeBoxes ? ` [box=${item.box.x},${item.box.y},${item.box.width},${item.box.height}]` : '';
+      return `- ${item.role}${quoted} [ref=${item.ref}] ${flags}${box}`;
+    };
+    const section = (title, items) => [`${title}:`, ...(items.length ? items.map(formatItem) : ['- none'])];
+    const lines = [
+      `- Page URL: ${location.href}`,
+      `- Page Title: ${document.title || ''}`,
+      `- Active: ${document.activeElement ? formatItem(describe(document.activeElement)) : 'none'}`,
+      query ? `- Query: "${query}"` : '- Query: none',
+      '',
+      ...section('Top matches', topMatches),
+      '',
+      ...section('Action targets', actionTargets),
+      '',
+      ...section('Form fields', formFields),
+      '',
+      ...section('Disabled controls', disabledControls),
+      '',
+      ...section('Headings/Tabs/Alerts', semantic),
+    ];
+    return ok(lines.join('\n'), {
+      url: location.href,
+      title: document.title || '',
+      query,
+      active: document.activeElement ? describe(document.activeElement) : null,
+      topMatches,
+      actionTargets,
+      formFields,
+      disabledControls,
+      semantic,
+    });
+  };
   const highlight = (element, style) => {
     const rect = element.getBoundingClientRect();
     let overlay = state.highlighted;
@@ -1878,6 +2047,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 4) {
   window.__mergenMcpRun = (tool, params = {}) => {
     try {
       if (tool === 'browser_snapshot') return snapshot(params);
+      if (tool === 'browser_page_summary') return pageSummary(params);
       if (tool === 'browser_console_messages') return fail('Console capture is not implemented by Mergen Browser MCP yet.');
       if (tool === 'browser_network_requests') return fail('Network request capture is not implemented by Mergen Browser MCP yet.');
       if (tool === 'browser_network_request') return fail('Detailed network capture is not implemented by Mergen Browser MCP yet.');
@@ -1920,7 +2090,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 4) {
   };
   window.addEventListener('scroll', scheduleCursorAnchorSync, true);
   window.addEventListener('resize', scheduleCursorAnchorSync);
-  window.__mergenMcpRun.version = 4;
+  window.__mergenMcpRun.version = 5;
 }
 "#;
 
@@ -2320,6 +2490,7 @@ mod tests {
     fn browser_mcp_visual_tools_use_async_script_path() {
         for tool in [
             "browser_evaluate",
+            "browser_page_summary",
             "browser_click",
             "browser_hover",
             "browser_select_option",
@@ -2449,7 +2620,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn browser_mcp_automation_script_includes_visible_cursor_and_mouse_tools() {
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 4"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 5"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-halo"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("moveCursorTo"));
@@ -2518,6 +2689,35 @@ mod tests {
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("params.commit !== false"));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("const inputText ="));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("element.value = text"));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn browser_mcp_automation_script_includes_fast_page_summary() {
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("const pageSummary ="));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("browser_page_summary"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("Top matches"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("Action targets"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("Form fields"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("Disabled controls"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("Headings/Tabs/Alerts"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("scoreItem"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("roleFilter"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("includeBoxes"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("uniqueElements.length >= 500"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains(".slice(0, 1600)"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("isDisabled"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("inViewport"));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn browser_mcp_automation_script_settles_after_interactions() {
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("settleAfterInteraction"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("new MutationObserver"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("setTimeout(finish, 180)"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("requestAnimationFrame(() => requestAnimationFrame(armQuietTimer))"));
     }
 
     #[test]

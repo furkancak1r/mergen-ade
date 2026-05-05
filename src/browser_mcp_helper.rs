@@ -746,8 +746,22 @@ fn devtools_tools() -> Vec<JsonValue> {
             }),
         ),
         tool(
+            "browser_page_summary",
+            "Fast page map for deciding what to click or type next. Use this before browser_click/screenshot to get prioritized refs, enabled/disabled state, form fields, and top query matches.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": json!({"type": "string", "description": "Optional target text such as a button or tab label to rank first"}),
+                    "roles": json!({"type": "array", "items": {"type": "string"}, "description": "Optional role filter such as button, link, textbox, combobox"}),
+                    "includeBoxes": json!({"type": "boolean", "default": false}),
+                    "maxItems": json!({"type": "integer", "default": 40})
+                },
+                "required": []
+            }),
+        ),
+        tool(
             "browser_snapshot",
-            "Take a DOM snapshot (accessibility snapshot) of the page",
+            "Take a DOM snapshot (accessibility snapshot) of the page. Prefer browser_page_summary first when deciding where to click.",
             json!({
                 "type": "object",
                 "properties": element_props(json!({
@@ -1112,10 +1126,50 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(names.contains(&"browser_snapshot".to_owned()));
+        assert!(names.contains(&"browser_page_summary".to_owned()));
         assert!(names.contains(&"browser_click".to_owned()));
         assert!(names.contains(&"browser_hover".to_owned()));
         assert!(names.contains(&"browser_fill_form".to_owned()));
         assert!(names.contains(&"browser_evaluate".to_owned()));
+    }
+
+    #[test]
+    fn devtools_tool_schemas_include_fast_page_summary() {
+        let tools = devtools_tools();
+        let summary = tools
+            .iter()
+            .find(|tool| {
+                tool.get("name").and_then(JsonValue::as_str) == Some("browser_page_summary")
+            })
+            .expect("browser_page_summary schema");
+        let props = &summary["inputSchema"]["properties"];
+
+        assert!(summary["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Fast page map"));
+        assert_eq!(props["query"]["type"].as_str(), Some("string"));
+        assert_eq!(props["roles"]["type"].as_str(), Some("array"));
+        assert_eq!(props["includeBoxes"]["default"].as_bool(), Some(false));
+        assert_eq!(props["maxItems"]["default"].as_i64(), Some(40));
+        assert_eq!(
+            summary["inputSchema"]["required"].as_array().unwrap().len(),
+            0
+        );
+
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(JsonValue::as_str))
+            .collect::<Vec<_>>();
+        let summary_index = names
+            .iter()
+            .position(|name| *name == "browser_page_summary")
+            .expect("browser_page_summary exists");
+        let snapshot_index = names
+            .iter()
+            .position(|name| *name == "browser_snapshot")
+            .expect("browser_snapshot exists");
+        assert!(summary_index < snapshot_index);
     }
 
     #[test]

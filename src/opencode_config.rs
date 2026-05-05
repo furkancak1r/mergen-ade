@@ -212,6 +212,7 @@ const BROWSER_MCP_PERMISSION_TOOL_NAMES: &[&str] = &[
     "browser_resize",
     "browser_console_messages",
     "browser_snapshot",
+    "browser_page_summary",
     "browser_click",
     "browser_drag",
     "browser_hover",
@@ -449,6 +450,10 @@ mod tests {
         assert_eq!(global_playwright["enabled"].as_bool(), Some(false));
         assert_eq!(
             parsed["permission"]["mergen-browser_browser_navigate"].as_str(),
+            Some("allow")
+        );
+        assert_eq!(
+            parsed["permission"]["mergen-browser_browser_page_summary"].as_str(),
             Some("allow")
         );
         assert_eq!(
