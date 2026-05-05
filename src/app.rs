@@ -90,6 +90,12 @@ const BROWSER_VIDEO_FPS: u32 = 10;
 const BROWSER_VIDEO_FRAME_INTERVAL_MS: u64 = 100;
 const BROWSER_VIDEO_FRAME_REQUEST_PREFIX: &str = "browser-video-frame";
 const BROWSER_MAX_TABS_PER_PROJECT: usize = 5;
+const BROWSER_TAB_WIDTH: f32 = 126.0;
+const BROWSER_TAB_HEIGHT: f32 = 26.0;
+const BROWSER_TAB_CLOSE_SIZE: f32 = 18.0;
+const BROWSER_TAB_CLOSE_MARGIN: f32 = 4.0;
+const BROWSER_TAB_LABEL_LEFT_PADDING: f32 = 10.0;
+const BROWSER_TAB_LABEL_RIGHT_GAP: f32 = 4.0;
 const TERMINAL_SNAPSHOT_BUDGET_PER_FRAME: usize = 2;
 const REPAINT_DEBOUNCE_MS: u64 = 5;
 const INPUT_ROUTING_GATE_MS: u64 = 75;
@@ -1064,6 +1070,14 @@ struct BrowserTabState {
     kind: BrowserTabKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserTabUrlMatch {
+    tab_id: u64,
+    index: usize,
+    title: String,
+    active: bool,
+}
+
 impl BrowserTabState {
     fn new_page(id: u64, url: Option<String>) -> Self {
         let draft = url.clone().unwrap_or_default();
@@ -1159,6 +1173,32 @@ fn browser_recording_file_url(path: &Path) -> String {
         normalized = format!("/{normalized}");
     }
     format!("file://{}", percent_encode_file_url_path(&normalized))
+}
+
+fn browser_tab_close_rect(tab_rect: egui::Rect) -> egui::Rect {
+    let size = BROWSER_TAB_CLOSE_SIZE
+        .min(tab_rect.width())
+        .min(tab_rect.height());
+    let top = tab_rect.top() + ((tab_rect.height() - size) / 2.0).max(0.0);
+    egui::Rect::from_min_size(
+        egui::pos2(tab_rect.right() - BROWSER_TAB_CLOSE_MARGIN - size, top),
+        egui::vec2(size, size),
+    )
+}
+
+fn browser_tab_label_rect(tab_rect: egui::Rect) -> egui::Rect {
+    let close_rect = browser_tab_close_rect(tab_rect);
+    egui::Rect::from_min_max(
+        egui::pos2(
+            tab_rect.left() + BROWSER_TAB_LABEL_LEFT_PADDING,
+            tab_rect.top(),
+        ),
+        egui::pos2(
+            (close_rect.left() - BROWSER_TAB_LABEL_RIGHT_GAP)
+                .max(tab_rect.left() + BROWSER_TAB_LABEL_LEFT_PADDING),
+            tab_rect.bottom(),
+        ),
+    )
 }
 
 fn percent_encode_file_url_path(value: &str) -> String {
@@ -15991,6 +16031,34 @@ impl AdeApp {
             .position(|tab| tab.id == tab_id)
     }
 
+    fn find_browser_tab_by_url(
+        &self,
+        project_id: u64,
+        normalized_url: &str,
+    ) -> Option<BrowserTabUrlMatch> {
+        let active_tab_id = self.active_browser_tab_id(project_id);
+        self.browser_tabs_by_project
+            .get(&project_id)?
+            .iter()
+            .enumerate()
+            .find_map(|(index, tab)| {
+                if tab.kind == BrowserTabKind::Page && tab.url.as_deref() == Some(normalized_url) {
+                    Some(BrowserTabUrlMatch {
+                        tab_id: tab.id,
+                        index,
+                        title: if tab.title.trim().is_empty() {
+                            "New Tab".to_owned()
+                        } else {
+                            tab.title.clone()
+                        },
+                        active: active_tab_id == Some(tab.id),
+                    })
+                } else {
+                    None
+                }
+            })
+    }
+
     fn browser_tab_summary(&self, project_id: u64) -> Vec<(u64, String, Option<String>, bool)> {
         let active = self.active_browser_tab_id(project_id);
         self.browser_tabs_by_project
@@ -16962,6 +17030,15 @@ impl AdeApp {
                     Err(err) => return BrowserMcpIpcResponse::error(err),
                 };
 
+                if let Some(url) = normalized_url.as_deref() {
+                    if let Some(existing) = self.find_browser_tab_by_url(project_id, url) {
+                        return BrowserMcpIpcResponse::error(format!(
+                            "Bu sekme zaten {} numaralı sekmede açık (index {}). Orayı kullan: browser_tabs action=select tabId={}.",
+                            existing.tab_id, existing.index, existing.tab_id
+                        ));
+                    }
+                }
+
                 let tab_id =
                     match self.add_browser_tab(project_id, None, BrowserTabKind::Page, None) {
                         Ok(tab_id) => tab_id,
@@ -17571,7 +17648,6 @@ impl AdeApp {
                     let mut add_tab_requested = false;
                     ui.horizontal_wrapped(|ui| {
                         for (tab_id, title, url, is_active) in &tab_summaries {
-                            let label = capped_hover_text(title, 18);
                             let fill = if *is_active {
                                 with_alpha(BTN_ICON_HOVER, 130)
                             } else {
@@ -17582,41 +17658,79 @@ impl AdeApp {
                             } else {
                                 Stroke::new(1.0, with_alpha(TEXT_PRIMARY, 24))
                             };
-                            let tab_response = ui
-                                .add_sized(
-                                    [126.0, 26.0],
-                                    egui::Button::new(
-                                        RichText::new(label).size(12.0).color(if *is_active {
-                                            TEXT_PRIMARY
-                                        } else {
-                                            TEXT_MUTED
-                                        }),
-                                    )
-                                    .fill(fill)
-                                    .stroke(stroke),
+
+                            let (tab_rect, tab_response) = ui.allocate_exact_size(
+                                egui::vec2(BROWSER_TAB_WIDTH, BROWSER_TAB_HEIGHT),
+                                Sense::click(),
+                            );
+                            let close_rect = browser_tab_close_rect(tab_rect);
+                            let label_rect = browser_tab_label_rect(tab_rect);
+                            let close_response = ui
+                                .interact(
+                                    close_rect,
+                                    ui.make_persistent_id(("browser-tab-close", project_id, tab_id)),
+                                    Sense::click(),
                                 )
+                                .on_hover_text("Close tab")
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            let tab_response = tab_response
                                 .on_hover_text(
                                     url.as_deref().unwrap_or(title.as_str()).to_owned(),
                                 )
                                 .on_hover_cursor(egui::CursorIcon::PointingHand);
-                            if tab_response.clicked() {
-                                tab_to_select = Some(*tab_id);
-                            }
+                            let tab_hovered = tab_response.hovered() || close_response.hovered();
+                            let painted_fill = if *is_active {
+                                fill
+                            } else if tab_hovered {
+                                with_alpha(BTN_ICON_HOVER, 54)
+                            } else {
+                                fill
+                            };
 
-                            let close_response = ui
-                                .add_sized(
-                                    [24.0, 26.0],
-                                    egui::Button::new(
-                                        RichText::new(format!("{}", icons::X))
-                                            .size(11.0)
-                                            .color(TEXT_MUTED),
-                                    )
-                                    .frame(false),
+                            ui.painter()
+                                .rect_filled(tab_rect.shrink(0.5), 6.0, painted_fill);
+                            ui.painter()
+                                .rect_stroke(tab_rect.shrink(0.5), 6.0, stroke);
+
+                            let mut label_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(label_rect)
+                                    .layout(Layout::left_to_right(Align::Center)),
+                            );
+                            label_ui.set_clip_rect(label_rect);
+                            label_ui.add(
+                                egui::Label::new(
+                                    RichText::new(capped_hover_text(title, 18))
+                                        .size(12.0)
+                                        .color(if *is_active { TEXT_PRIMARY } else { TEXT_MUTED }),
                                 )
-                                .on_hover_text("Close tab")
-                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                .truncate()
+                                .selectable(false),
+                            );
+
+                            if close_response.hovered() {
+                                ui.painter().rect_filled(
+                                    close_rect.shrink(1.0),
+                                    4.0,
+                                    with_alpha(BTN_ICON_HOVER, 115),
+                                );
+                            }
+                            ui.painter().text(
+                                close_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                format!("{}", icons::X),
+                                FontId::proportional(11.0),
+                                if close_response.hovered() {
+                                    TEXT_PRIMARY
+                                } else {
+                                    TEXT_MUTED
+                                },
+                            );
+
                             if close_response.clicked() {
                                 tab_to_close = Some(*tab_id);
+                            } else if tab_response.clicked() {
+                                tab_to_select = Some(*tab_id);
                             }
                             ui.add_space(2.0);
                         }
@@ -41772,6 +41886,141 @@ mod tests {
     }
 
     #[test]
+    fn browser_mcp_tabs_new_rejects_duplicate_url() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
+        let scope = crate::browser_mcp_service::BrowserMcpAuthScope {
+            terminal_id: 1,
+            project_id: Some(7),
+        };
+        let request = |tool: &str, params: serde_json::Value| {
+            crate::browser_mcp_service::BrowserMcpIpcRequest {
+                request_id: "request".to_owned(),
+                terminal_id: Some(1),
+                project_id: Some(7),
+                tool: tool.to_owned(),
+                params,
+            }
+        };
+
+        let response = app.handle_browser_mcp_request(
+            &ctx,
+            request(
+                "browser_tabs",
+                serde_json::json!({ "action": "new", "url": "example.com/path" }),
+            ),
+            scope.clone(),
+        );
+        assert!(!response.is_error, "{}", response.text);
+        let duplicate_tab_id = app.active_browser_tab_id(7).unwrap();
+
+        let response = app.handle_browser_mcp_request(
+            &ctx,
+            request(
+                "browser_tabs",
+                serde_json::json!({ "action": "select", "index": 0 }),
+            ),
+            scope.clone(),
+        );
+        assert!(!response.is_error, "{}", response.text);
+        let active_before_duplicate = app.active_browser_tab_id(7);
+        let tab_count_before_duplicate = app.browser_tabs_by_project.get(&7).unwrap().len();
+
+        let response = app.handle_browser_mcp_request(
+            &ctx,
+            request(
+                "browser_tabs",
+                serde_json::json!({ "action": "new", "url": "https://example.com/path" }),
+            ),
+            scope,
+        );
+
+        assert!(response.is_error);
+        assert!(response
+            .text
+            .contains(&format!("{} numaralı sekmede açık", duplicate_tab_id)));
+        assert!(response.text.contains("index 1"));
+        assert!(response.text.contains(&format!(
+            "browser_tabs action=select tabId={duplicate_tab_id}"
+        )));
+        assert_eq!(
+            app.browser_tabs_by_project.get(&7).unwrap().len(),
+            tab_count_before_duplicate
+        );
+        assert_eq!(app.active_browser_tab_id(7), active_before_duplicate);
+    }
+
+    #[test]
+    fn browser_mcp_tabs_duplicate_uses_normalized_url() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
+        let scope = crate::browser_mcp_service::BrowserMcpAuthScope {
+            terminal_id: 1,
+            project_id: Some(7),
+        };
+        let request =
+            |params: serde_json::Value| crate::browser_mcp_service::BrowserMcpIpcRequest {
+                request_id: "request".to_owned(),
+                terminal_id: Some(1),
+                project_id: Some(7),
+                tool: "browser_tabs".to_owned(),
+                params,
+            };
+
+        let response = app.handle_browser_mcp_request(
+            &ctx,
+            request(serde_json::json!({ "action": "new", "url": "example.com/path" })),
+            scope.clone(),
+        );
+        assert!(!response.is_error, "{}", response.text);
+
+        let response = app.handle_browser_mcp_request(
+            &ctx,
+            request(serde_json::json!({ "action": "new", "url": "https://example.com/path" })),
+            scope,
+        );
+
+        assert!(response.is_error);
+        assert!(response.text.contains("Bu sekme zaten"));
+        assert_eq!(app.browser_tabs_by_project.get(&7).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn browser_mcp_tabs_allows_different_query_or_hash() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
+        let scope = crate::browser_mcp_service::BrowserMcpAuthScope {
+            terminal_id: 1,
+            project_id: Some(7),
+        };
+        let request = |url: &str| crate::browser_mcp_service::BrowserMcpIpcRequest {
+            request_id: "request".to_owned(),
+            terminal_id: Some(1),
+            project_id: Some(7),
+            tool: "browser_tabs".to_owned(),
+            params: serde_json::json!({ "action": "new", "url": url }),
+        };
+
+        for url in [
+            "example.com/path?a=1",
+            "example.com/path?a=2",
+            "example.com/path#first",
+            "example.com/path#second",
+        ] {
+            let response = app.handle_browser_mcp_request(&ctx, request(url), scope.clone());
+            assert!(!response.is_error, "{url}: {}", response.text);
+        }
+
+        assert_eq!(app.browser_tabs_by_project.get(&7).unwrap().len(), 5);
+    }
+
+    #[test]
     fn browser_video_encode_event_opens_recording_tab() {
         let ctx = egui::Context::default();
         let mut app = test_app([], None);
@@ -41852,6 +42101,27 @@ mod tests {
 
         assert!(url.starts_with("file:///"));
         assert!(url.ends_with("my%20video.mp4"));
+    }
+
+    #[test]
+    fn browser_tab_close_rect_stays_inside_tab_top_right() {
+        let tab_rect = egui::Rect::from_min_size(
+            egui::pos2(20.0, 40.0),
+            egui::vec2(super::BROWSER_TAB_WIDTH, super::BROWSER_TAB_HEIGHT),
+        );
+
+        let close_rect = super::browser_tab_close_rect(tab_rect);
+        let label_rect = super::browser_tab_label_rect(tab_rect);
+
+        assert!(tab_rect.contains(close_rect.min));
+        assert!(tab_rect.contains(close_rect.max));
+        assert_eq!(
+            close_rect.right(),
+            tab_rect.right() - super::BROWSER_TAB_CLOSE_MARGIN
+        );
+        assert_eq!(close_rect.top(), tab_rect.top() + 4.0);
+        assert!(label_rect.right() <= close_rect.left() - super::BROWSER_TAB_LABEL_RIGHT_GAP);
+        assert!(!label_rect.intersects(close_rect));
     }
 
     #[test]

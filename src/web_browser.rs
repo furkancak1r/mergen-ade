@@ -1313,22 +1313,39 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 3) {
       position: 'fixed',
       left: '0px',
       top: '0px',
-      width: '22px',
-      height: '28px',
+      width: '38px',
+      height: '38px',
       pointerEvents: 'none',
       zIndex: '2147483647',
       display: 'none',
       transform: 'translate(0px, 0px)',
       willChange: 'transform',
     });
+    const halo = document.createElement('div');
+    halo.setAttribute('data-mergen-mcp-cursor-halo', 'true');
+    Object.assign(halo.style, {
+      position: 'absolute',
+      left: '-13px',
+      top: '-13px',
+      width: '34px',
+      height: '34px',
+      borderRadius: '999px',
+      background: 'rgba(245,158,11,0.20)',
+      border: '1px solid rgba(245,158,11,0.70)',
+      boxShadow: '0 0 0 4px rgba(245,158,11,0.08), 0 2px 9px rgba(15,23,42,0.35)',
+    });
     const pointer = document.createElement('div');
     Object.assign(pointer.style, {
+      position: 'absolute',
+      left: '0px',
+      top: '0px',
       width: '18px',
       height: '24px',
       background: 'rgba(248,250,252,0.98)',
       clipPath: 'polygon(0 0, 0 22px, 6px 17px, 10px 24px, 14px 22px, 10px 15px, 18px 15px)',
       filter: 'drop-shadow(0 0 1px rgba(15,23,42,0.95)) drop-shadow(0 2px 5px rgba(0,0,0,0.45))',
     });
+    cursor.appendChild(halo);
     cursor.appendChild(pointer);
     document.documentElement.appendChild(cursor);
     state.cursorElement = cursor;
@@ -1348,7 +1365,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 3) {
     const end = clampPoint(x, y);
     const start = clampPoint(state.cursor.x, state.cursor.y);
     const distance = Math.hypot(end.x - start.x, end.y - start.y);
-    const duration = options.duration ?? clamp(Math.round(distance * 0.7), 180, 340);
+    const duration = options.duration ?? clamp(Math.round(distance * 1.15), 650, 900);
     setCursorPosition(start.x, start.y);
     if (duration <= 0 || distance < 1) {
       const point = setCursorPosition(end.x, end.y);
@@ -1386,14 +1403,48 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 3) {
     document.documentElement.appendChild(pulse);
     setTimeout(() => pulse.remove(), 500);
   };
-  const elementCenter = async (element) => {
+  const stableElementCenterAfterScroll = async (element) => {
     element.scrollIntoView({ block: 'center', inline: 'center' });
-    await nextFrame();
-    const rect = element.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) throw new Error('Element is not visible after scrolling');
-    return clampPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    let previous = null;
+    let latest = null;
+    for (let frame = 0; frame < 5; frame++) {
+      await nextFrame();
+      const rect = element.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) throw new Error('Element is not visible after scrolling');
+      latest = clampPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      if (previous && Math.abs(previous.x - latest.x) < 0.5 && Math.abs(previous.y - latest.y) < 0.5) return latest;
+      previous = latest;
+    }
+    return latest;
   };
+  const elementCenter = async (element) => stableElementCenterAfterScroll(element);
   const targetAt = (point, fallback = null) => document.elementFromPoint(point.x, point.y) || fallback || document.body || document.documentElement;
+  const scrollableAncestor = (element, deltaX, deltaY) => {
+    let node = element && element.nodeType === Node.ELEMENT_NODE ? element : element?.parentElement;
+    while (node && node !== document.documentElement) {
+      const style = window.getComputedStyle(node);
+      const canScrollY = deltaY && node.scrollHeight > node.clientHeight && /(auto|scroll|overlay)/.test(style.overflowY);
+      const canScrollX = deltaX && node.scrollWidth > node.clientWidth && /(auto|scroll|overlay)/.test(style.overflowX);
+      if (canScrollY || canScrollX) return node;
+      node = node.parentElement;
+    }
+    return document.scrollingElement || document.documentElement;
+  };
+  const applyWheelScrollFallback = async (target, point, deltaX, deltaY) => {
+    const wheelEvent = new WheelEvent('wheel', { bubbles: true, cancelable: true, clientX: point.x, clientY: point.y, deltaX, deltaY, deltaMode: 0 });
+    const wasNotCanceled = target.dispatchEvent(wheelEvent);
+    if (wasNotCanceled) {
+      const scrollTarget = scrollableAncestor(target, deltaX, deltaY);
+      if (scrollTarget && scrollTarget !== document.documentElement && scrollTarget !== document.body) {
+        scrollTarget.scrollBy({ left: deltaX, top: deltaY, behavior: 'auto' });
+      } else {
+        window.scrollBy({ left: deltaX, top: deltaY, behavior: 'auto' });
+      }
+      await nextFrame();
+    }
+    setCursorPosition(point.x, point.y);
+    dispatchMoveAt(point, targetAt(point, target));
+  };
   const dispatchMouse = (target, type, point, button = 'left', detail = 0, buttonsOverride = null) => {
     const activeButton = buttonName(button);
     const buttons = buttonsOverride ?? (state.cursor.mouseDownButton ? buttonMask(state.cursor.mouseDownButton) : 0);
@@ -1583,7 +1634,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 3) {
       dispatchMouse(target, 'mousedown', start, button, 1, buttonMask(button));
       state.cursor.mouseDownButton = button;
       await moveCursorTo(end.x, end.y, {
-        duration: 340,
+        duration: 900,
         onStep: (point) => {
           target = targetAt(point, target);
           dispatchMouse(target, 'mousemove', point, button, 0, buttonMask(button));
@@ -1617,7 +1668,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 3) {
       const deltaY = numberParam(params, 'deltaY', false) ?? 0;
       await moveCursorTo(point.x, point.y);
       const target = targetAt(point);
-      target.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, clientX: point.x, clientY: point.y, deltaX, deltaY, deltaMode: 0 }));
+      await applyWheelScrollFallback(target, point, deltaX, deltaY);
       return ok(`Scrolled mouse wheel at ${Math.round(point.x)}, ${Math.round(point.y)}`, { x: point.x, y: point.y, deltaX, deltaY });
     }
     throw new Error(`Unsupported visual browser MCP tool: ${tool}`);
@@ -2235,13 +2286,22 @@ mod tests {
     #[cfg(target_os = "windows")]
     fn browser_mcp_automation_script_includes_visible_cursor_and_mouse_tools() {
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-halo"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("moveCursorTo"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("stableElementCenterAfterScroll"));
+        assert!(
+            MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("scrollBy({ left: deltaX, top: deltaY")
+        );
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("clamp(Math.round(distance * 1.15), 650, 900)"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("duration: 900"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("browser_mouse_move_xy"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("browser_mouse_click_xy"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("browser_mouse_drag_xy"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("browser_mouse_down"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("browser_mouse_up"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("browser_mouse_wheel"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("180, 340"));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("browser_mouse_')) return fail"));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
             .contains("is not implemented by Mergen Browser MCP yet.`);"));
