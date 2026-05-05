@@ -289,7 +289,11 @@ fn non_empty_param<'a>(params: &'a JsonValue, key: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
-fn parse_browser_wait_duration(seconds: f64, max: Duration, allow_zero: bool) -> Result<Duration, String> {
+fn parse_browser_wait_duration(
+    seconds: f64,
+    max: Duration,
+    allow_zero: bool,
+) -> Result<Duration, String> {
     if seconds < 0.0 {
         return Err(format!(
             "browser_wait_for 'time' must be a non-negative number, got: {seconds}"

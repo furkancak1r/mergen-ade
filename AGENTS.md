@@ -291,3 +291,11 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Directory rows must include stable icons.** File and folder rows should render IDE-like icons without changing lazy loading, search filtering, or row ordering behavior.
 - **Directory file icons are extension-based only.** Do not add blocking metadata reads just to choose icons; use the existing `DirectoryNode` path/name data.
 - **Directory search highlighting must remain char-safe with icons.** Adding icons must not alter UTF-8-safe match highlighting or split multi-byte characters.
+
+## Browser Design Inspect Guidelines
+- **Design Inspect delivery is click-only.** Hover and pointer movement may update the highlight overlay but must never send context to the terminal.
+- **Design Inspect clicks must block page actions.** While inspect mode is enabled, selecting an element must prevent normal page click behavior such as link navigation, button handlers, and form submission.
+- **Browser events must use selection semantics.** Use click/selection event names such as `DesignElementClicked`; do not reintroduce terminal forwarding from hover events.
+- **Stale hover messages must fail closed.** Ignore `type: "hover"` design-inspect messages from old injected scripts instead of forwarding them to terminals.
+- **Bump the injected script version when Design Inspect behavior changes.** This prevents an existing `window.__mergenDesignInspect` implementation from short-circuiting around newer behavior.
+- **Add regression tests for Design Inspect behavior.** Cover click parsing, hover rejection, duplicate click dedupe, stale URL gating, iframe page URL gating, and user-facing enable/status copy.

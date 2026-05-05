@@ -3581,3 +3581,33 @@
 - Files/Commands touched: `src/browser_mcp_helper.rs`, `src/bin/mergen-browser-mcp.rs` (removed), `src/main.rs`, `src/browser_mcp_service.rs`, `src/opencode_config.rs`, `src/app.rs`, `src/terminal.rs`, `scripts/build-release.ps1`, `scripts/package-macos-release.sh`, `scripts/__tests__/build-release.tests.ps1`, `.github/workflows/release.yml`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc --bin mergen-ade`
 - References: User report on 2026-05-05: release folder should contain one EXE and Browser MCP should run inside the main executable.
 
+#### Design Inspect wrote terminal context on hover instead of explicit click {#design-inspect-hover-terminal-paste}
+- Date: 2026-05-05
+- Context: Embedded Browser panel Design Inspect mode forwarding DOM context to the active terminal
+- Error signature: `Hovering browser elements writes Design inspect context into the terminal`
+- Symptoms/Impact:
+  1. User enables Browser Design Inspect.
+  2. Moving the mouse over page elements sends `Design inspect:` text to the active terminal.
+  3. Terminal input is polluted without an explicit user selection.
+  4. Users cannot inspect visually first and choose only the desired element.
+- Root cause:
+  1. The injected WebView2 Design Inspect script posted a `type: "hover"` message from `pointermove` after a short timer.
+  2. `BrowserEvent::DesignElementHovered` was forwarded directly into terminal paste handling.
+  3. UI copy and tests encoded hover as the intended delivery trigger.
+- Resolution:
+  - Change hover/pointer movement to update only the inspect overlay.
+  - Send terminal context only from an explicit click/selection event.
+  - Prevent normal page click behavior while Design Inspect is enabled so selection does not navigate or trigger page actions.
+  - Ignore stale `type: "hover"` inspect messages from old injected scripts.
+  - Bump the injected Design Inspect script version.
+  - Update user-facing status text from hover semantics to click semantics.
+  - Add regression tests for click parsing, hover rejection, duplicate click dedupe, stale URL gating, and iframe page URL matching.
+- Prevent recurrence:
+  - Design Inspect terminal delivery must remain click-only.
+  - Hover may highlight elements but must never enqueue terminal paste.
+  - Stale hover messages must fail closed.
+  - Any injected script behavior change must bump the script version.
+  - Keep tests proving Design Inspect does not write to the terminal on hover.
+- Files/Commands touched: `src/web_browser.rs`, `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test design_inspect`, `cargo test parse_design_inspect`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc --bin mergen-ade`
+- References: User report on 2026-05-05: "design mode da hover olunca terminale yazıyor hayır ben tıklayayım tıkladığım alanı yazsın sadece".
+

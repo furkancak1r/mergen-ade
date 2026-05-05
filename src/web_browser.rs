@@ -29,7 +29,7 @@ pub enum BrowserEvent {
     LoadStarted(String),
     LoadFinished(String),
     DesignInspectReady,
-    DesignElementHovered(DesignElementInfo),
+    DesignElementClicked(DesignElementInfo),
     Error(String),
 }
 
@@ -115,18 +115,16 @@ const DESIGN_INSPECT_BOOTSTRAP_SCRIPT_TEMPLATE: &str = r#"
   const webview = window.chrome?.webview;
   const postMessage = webview && typeof webview.postMessage === "function" ? webview.postMessage.bind(webview) : null;
   const addWebMessageListener = webview && typeof webview.addEventListener === "function" ? webview.addEventListener.bind(webview) : null;
-  if (window.__mergenDesignInspect && window.__mergenDesignInspect.version === 1) {
+  if (window.__mergenDesignInspect && window.__mergenDesignInspect.version === 2) {
     postMessage?.(JSON.stringify({ source: SOURCE, token: TOKEN, type: "ready" }));
     return;
   }
 
   const state = {
-    version: 1,
+    version: 2,
     enabled: false,
     current: null,
     overlay: null,
-    lastSignature: "",
-    pendingTimer: 0,
   };
 
   const importantStyleKeys = [
@@ -209,7 +207,7 @@ const DESIGN_INSPECT_BOOTSTRAP_SCRIPT_TEMPLATE: &str = r#"
     if (state.overlay) state.overlay.style.display = "none";
   }
 
-  function elementPayload(element) {
+  function elementPayload(element, kind) {
     const rect = element.getBoundingClientRect();
     const computed = window.getComputedStyle(element);
     const styles = {};
@@ -226,7 +224,7 @@ const DESIGN_INSPECT_BOOTSTRAP_SCRIPT_TEMPLATE: &str = r#"
     return {
       source: SOURCE,
       token: TOKEN,
-      type: "hover",
+      type: kind,
       pageUrl: pageUrl || frameUrl,
       url: frameUrl,
       tag: clean(element.tagName.toLowerCase(), 40),
@@ -244,18 +242,9 @@ const DESIGN_INSPECT_BOOTSTRAP_SCRIPT_TEMPLATE: &str = r#"
     };
   }
 
-  function postHover(element) {
+  function postSelection(element) {
     if (!postMessage || !element) return;
-    const payload = elementPayload(element);
-    const signature = `${payload.url}|${payload.selector}|${payload.rect.x}|${payload.rect.y}|${payload.rect.width}|${payload.rect.height}`;
-    if (signature === state.lastSignature) return;
-    state.lastSignature = signature;
-    postMessage(JSON.stringify(payload));
-  }
-
-  function scheduleHover(element) {
-    window.clearTimeout(state.pendingTimer);
-    state.pendingTimer = window.setTimeout(() => postHover(element), 120);
+    postMessage(JSON.stringify(elementPayload(element, "click")));
   }
 
   function onPointerMove(event) {
@@ -264,7 +253,20 @@ const DESIGN_INSPECT_BOOTSTRAP_SCRIPT_TEMPLATE: &str = r#"
     if (!element || element === state.overlay || element.nodeType !== Node.ELEMENT_NODE) return;
     state.current = element;
     updateOverlay(element);
-    scheduleHover(element);
+  }
+
+  function onInspectClick(event) {
+    if (!state.enabled) return;
+    // Only handle primary button (left click)
+    if (event.button !== 0) return;
+    // Prevent page actions (navigation, button handlers, form submission)
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+    // Use event.target if available, otherwise fallback to tracked current element
+    const element = event.target || state.current;
+    if (!element || element === state.overlay || element.nodeType !== Node.ELEMENT_NODE) return;
+    postSelection(element);
   }
 
   function refreshOverlay() {
@@ -277,14 +279,14 @@ const DESIGN_INSPECT_BOOTSTRAP_SCRIPT_TEMPLATE: &str = r#"
 
   function setEnabled(enabled) {
     state.enabled = Boolean(enabled);
-    state.lastSignature = "";
-    window.clearTimeout(state.pendingTimer);
     if (state.enabled) {
       document.addEventListener("pointermove", onPointerMove, true);
+      document.addEventListener("click", onInspectClick, true);
       window.addEventListener("scroll", refreshOverlay, true);
       window.addEventListener("resize", refreshOverlay, true);
     } else {
       document.removeEventListener("pointermove", onPointerMove, true);
+      document.removeEventListener("click", onInspectClick, true);
       window.removeEventListener("scroll", refreshOverlay, true);
       window.removeEventListener("resize", refreshOverlay, true);
       state.current = null;
@@ -298,7 +300,7 @@ const DESIGN_INSPECT_BOOTSTRAP_SCRIPT_TEMPLATE: &str = r#"
     setEnabled(data.enabled);
   });
 
-  window.__mergenDesignInspect = { version: 1, setEnabled };
+  window.__mergenDesignInspect = { version: 2, setEnabled };
   postMessage?.(JSON.stringify({ source: SOURCE, token: TOKEN, type: "ready" }));
 })();
 "#;
@@ -314,11 +316,11 @@ pub(crate) fn parse_design_inspect_message(
 
     match wire.kind.as_str() {
         "ready" => Some(BrowserEvent::DesignInspectReady),
-        "hover" => {
+        "click" => {
             if wire.tag.trim().is_empty() || wire.selector.trim().is_empty() {
                 return None;
             }
-            Some(BrowserEvent::DesignElementHovered(DesignElementInfo {
+            Some(BrowserEvent::DesignElementClicked(DesignElementInfo {
                 page_url: wire.page_url,
                 url: wire.url,
                 tag: wire.tag,
@@ -1557,7 +1559,38 @@ mod tests {
     }
 
     #[test]
-    fn parse_design_inspect_hover_message() {
+    fn parse_design_inspect_click_message() {
+        let event = parse_design_inspect_message(
+            r#"{
+                "source":"mergen-ade-design-inspect",
+                "token":"test-token",
+                "type":"click",
+                "pageUrl":"https://example.com/page",
+                "url":"https://example.com",
+                "tag":"button",
+                "id":"save",
+                "classes":["primary"],
+                "text":"Save",
+                "selector":"button#save",
+                "rect":{"x":1,"y":2,"width":3,"height":4},
+                "styles":{"display":"flex"}
+            }"#,
+            "test-token",
+        );
+
+        let Some(BrowserEvent::DesignElementClicked(info)) = event else {
+            panic!("expected click event");
+        };
+        assert_eq!(info.page_url, "https://example.com/page");
+        assert_eq!(info.tag, "button");
+        assert_eq!(info.selector, "button#save");
+        assert_eq!(info.rect.width, 3);
+        assert_eq!(info.styles.get("display"), Some(&"flex".to_owned()));
+    }
+
+    #[test]
+    fn parse_design_inspect_ignores_hover_message() {
+        // Stale hover messages from old injected scripts should be ignored
         let event = parse_design_inspect_message(
             r#"{
                 "source":"mergen-ade-design-inspect",
@@ -1576,14 +1609,7 @@ mod tests {
             "test-token",
         );
 
-        let Some(BrowserEvent::DesignElementHovered(info)) = event else {
-            panic!("expected hover event");
-        };
-        assert_eq!(info.page_url, "https://example.com/page");
-        assert_eq!(info.tag, "button");
-        assert_eq!(info.selector, "button#save");
-        assert_eq!(info.rect.width, 3);
-        assert_eq!(info.styles.get("display"), Some(&"flex".to_owned()));
+        assert!(event.is_none(), "hover messages should be ignored");
     }
 
     #[test]

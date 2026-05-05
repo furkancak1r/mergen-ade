@@ -1133,7 +1133,7 @@ pub struct AdeApp {
     browser_design_inspect_terminal_by_project: BTreeMap<u64, u64>,
     /// Last time the design inspect target terminal changed per project.
     browser_design_inspect_target_changed_at_by_project: BTreeMap<u64, Instant>,
-    /// Last design inspect hover delivered per project/terminal destination, used to prevent paste floods.
+    /// Last design inspect selection delivered per project/terminal destination, used to prevent paste floods.
     browser_design_inspect_last_delivery_by_destination:
         BTreeMap<(u64, u64), DesignInspectDeliveryState>,
 }
@@ -15796,8 +15796,8 @@ impl AdeApp {
                             browser.set_design_inspect_enabled(enabled);
                         }
                     }
-                    web_browser::BrowserEvent::DesignElementHovered(element) => {
-                        self.forward_design_inspect_hover_to_terminal(ctx, project_id, element);
+                    web_browser::BrowserEvent::DesignElementClicked(element) => {
+                        self.forward_design_inspect_click_to_terminal(ctx, project_id, element);
                     }
                     web_browser::BrowserEvent::LoadStarted(_)
                     | web_browser::BrowserEvent::LoadFinished(_) => {}
@@ -16022,7 +16022,7 @@ impl AdeApp {
         changed
     }
 
-    fn forward_design_inspect_hover_to_terminal(
+    fn forward_design_inspect_click_to_terminal(
         &mut self,
         ctx: &egui::Context,
         project_id: u64,
@@ -16425,7 +16425,7 @@ impl AdeApp {
                                 enabled,
                             );
                             self.status_line = if enabled {
-                                "Design inspect enabled: hover page elements to send context to the active terminal"
+                                "Design inspect enabled: click a page element to send context to the active terminal; page click actions are blocked while inspecting"
                                     .to_owned()
                             } else {
                                 "Design inspect disabled".to_owned()
@@ -39071,7 +39071,7 @@ mod tests {
     }
 
     #[test]
-    fn design_inspect_hover_queues_single_terminal_paste_for_duplicate_event() {
+    fn design_inspect_click_queues_single_terminal_paste_for_duplicate_event() {
         let ctx = Context::default();
         let (runtime, capture) = test_terminal_runtime_with_capture();
         runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
@@ -39086,8 +39086,8 @@ mod tests {
         app.set_browser_design_inspect_enabled_for_project(7, true);
 
         let info = test_design_element_info("main > button#save.primary");
-        app.forward_design_inspect_hover_to_terminal(&ctx, 7, info.clone());
-        app.forward_design_inspect_hover_to_terminal(&ctx, 7, info);
+        app.forward_design_inspect_click_to_terminal(&ctx, 7, info.clone());
+        app.forward_design_inspect_click_to_terminal(&ctx, 7, info);
 
         assert_eq!(app.pending_terminal_pastes.len(), 1);
         app.flush_pending_terminal_pastes(&ctx);
@@ -39117,7 +39117,7 @@ mod tests {
         app.set_browser_design_inspect_enabled_for_project(7, true);
 
         let info = test_design_element_info("main > button#save.primary");
-        app.forward_design_inspect_hover_to_terminal(&ctx, 7, info.clone());
+        app.forward_design_inspect_click_to_terminal(&ctx, 7, info.clone());
         app.active_terminal = Some(2);
         app.set_browser_design_inspect_enabled_for_project(7, true);
         app.browser_design_inspect_target_changed_at_by_project
@@ -39125,7 +39125,7 @@ mod tests {
                 7,
                 Instant::now() - Duration::from_millis(DESIGN_INSPECT_TARGET_SWITCH_QUIET_MS + 1),
             );
-        app.forward_design_inspect_hover_to_terminal(&ctx, 7, info);
+        app.forward_design_inspect_click_to_terminal(&ctx, 7, info);
 
         assert_eq!(app.pending_terminal_pastes.len(), 2);
         assert_eq!(app.pending_terminal_pastes[0].terminal_id, 1);
@@ -39155,7 +39155,7 @@ mod tests {
         );
 
         let info = test_design_element_info("main > button#save.primary");
-        app.forward_design_inspect_hover_to_terminal(&ctx, 7, info.clone());
+        app.forward_design_inspect_click_to_terminal(&ctx, 7, info.clone());
         assert!(app.pending_terminal_pastes.is_empty());
 
         app.browser_design_inspect_target_changed_at_by_project
@@ -39163,7 +39163,7 @@ mod tests {
                 7,
                 Instant::now() - Duration::from_millis(DESIGN_INSPECT_TARGET_SWITCH_QUIET_MS + 1),
             );
-        app.forward_design_inspect_hover_to_terminal(&ctx, 7, info);
+        app.forward_design_inspect_click_to_terminal(&ctx, 7, info);
 
         assert_eq!(app.pending_terminal_pastes.len(), 1);
         assert_eq!(app.pending_terminal_pastes[0].terminal_id, 2);
@@ -39187,7 +39187,7 @@ mod tests {
         let mut info = test_design_element_info("main > button#save.primary");
         info.url = "https://example.com/previous".to_owned();
         info.page_url = "https://example.com/previous".to_owned();
-        app.forward_design_inspect_hover_to_terminal(&ctx, 7, info);
+        app.forward_design_inspect_click_to_terminal(&ctx, 7, info);
 
         assert!(app.pending_terminal_pastes.is_empty());
     }
@@ -39210,7 +39210,7 @@ mod tests {
         let mut info = test_design_element_info("iframe > button#save.primary");
         info.page_url = "https://example.com/current".to_owned();
         info.url = "https://widgets.example/frame".to_owned();
-        app.forward_design_inspect_hover_to_terminal(&ctx, 7, info);
+        app.forward_design_inspect_click_to_terminal(&ctx, 7, info);
 
         assert_eq!(app.pending_terminal_pastes.len(), 1);
     }
