@@ -429,4 +429,62 @@ mod tests {
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn write_terminal_runtime_config_uses_main_exe_with_helper_arg_not_sidecar() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "mergen-single-binary-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Simulate main executable path (not a sidecar)
+        let main_exe_path = temp_dir.join("mergen-ade.exe");
+        let endpoint = BrowserMcpEndpointEnv {
+            port: 54321,
+            token: "single-binary-token".to_owned(),
+            terminal_id: 99,
+            project_id: Some(1),
+        };
+
+        let config_dir = write_terminal_runtime_config_with_browser_mcp(
+            &temp_dir,
+            99,
+            "test-model",
+            Some((main_exe_path.as_path(), endpoint)),
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(config_dir.join("opencode.json")).unwrap();
+        let parsed: JsonValue = serde_json::from_str(&content).unwrap();
+        let mcp = &parsed["mcp"]["mcp-server-playwright"];
+        let command = mcp["command"].as_array().unwrap();
+
+        // CRITICAL: Command must use main exe + --browser-mcp-helper, not sidecar
+        assert_eq!(
+            command[0].as_str(),
+            Some(main_exe_path.to_str().unwrap()),
+            "MCP command should use main executable, not sidecar"
+        );
+        assert_eq!(
+            command[1].as_str(),
+            Some(MERGEN_BROWSER_MCP_HELPER_ARG),
+            "MCP command should include --browser-mcp-helper argument"
+        );
+
+        // Ensure no stale sidecar executable name is used
+        // Old sidecar was named "mergen-browser-mcp.exe" - must not be referenced
+        let command_exe = std::path::Path::new(command[0].as_str().unwrap())
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_ne!(
+            command_exe, "mergen-browser-mcp.exe",
+            "Command must NOT use old sidecar executable 'mergen-browser-mcp.exe'"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 }

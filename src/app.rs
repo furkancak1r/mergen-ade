@@ -5398,6 +5398,40 @@ impl AdeApp {
         entry.opencode_process_missing_since = None;
         entry.opencode_attention_reason = None;
         entry.dirty = true;
+
+        // Safeguard: Ensure runtime config is up-to-date with current Browser MCP settings
+        // before OpenCode launches. This handles stale sidecar paths from old binaries.
+        if let Some(ref opencode_runtime_dir) = self.opencode_cli_runtime_dir {
+            let build_model = self.config.opencode.active_build_model();
+            let browser_mcp = self.browser_mcp_service.as_ref().map(|service| {
+                (
+                    self.current_executable_path.clone(),
+                    service.endpoint_env(terminal_id, Some(entry.project_id)),
+                )
+            });
+            let write_result = if let Some((exe_path, endpoint)) = browser_mcp.as_ref() {
+                crate::opencode_config::write_terminal_runtime_config_with_browser_mcp(
+                    opencode_runtime_dir,
+                    terminal_id,
+                    &build_model,
+                    Some((exe_path.as_path(), endpoint.clone())),
+                )
+            } else {
+                crate::opencode_config::write_terminal_runtime_config(
+                    opencode_runtime_dir,
+                    terminal_id,
+                    &build_model,
+                )
+            };
+            if let Err(err) = write_result {
+                log::warn!(
+                    "Failed to update OpenCode runtime config for terminal {} before launch: {}",
+                    terminal_id,
+                    err
+                );
+            }
+        }
+
         changed
     }
 

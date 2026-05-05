@@ -141,6 +141,8 @@ impl OpenCodeHookService {
 
     /// Build environment variables for a specific terminal's PTY
     pub fn build_pty_env(&self, terminal_id: u64, config_dir: &Path) -> Vec<(String, String)> {
+        let config_dir_str = config_dir.to_string_lossy().to_string();
+        let config_file_path = config_dir.join("opencode.json");
         vec![
             (
                 MERGEN_OPENCODE_HOOK_PORT_ENV_VAR.to_owned(),
@@ -153,7 +155,11 @@ impl OpenCodeHookService {
             ),
             (
                 OPENCODE_CONFIG_DIR_ENV_VAR.to_owned(),
-                config_dir.to_string_lossy().to_string(),
+                config_dir_str.clone(),
+            ),
+            (
+                "OPENCODE_CONFIG".to_owned(),
+                config_file_path.to_string_lossy().to_string(),
             ),
         ]
     }
@@ -760,5 +766,49 @@ mod tests {
             events[0].opencode_status,
             Some(OpenCodeTransportStatus::Idle)
         );
+    }
+
+    #[test]
+    fn build_pty_env_includes_opencode_config_and_config_dir() {
+        use std::collections::HashMap;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let service = OpenCodeHookService::start().expect("start service");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "mergen-opencode-env-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config_dir = temp_dir.join("hooks").join("123");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let env_pairs = service.build_pty_env(123, &config_dir);
+        let env_map: HashMap<String, String> = env_pairs.into_iter().collect();
+
+        // Must have OPENCODE_CONFIG_DIR for directory-scoped plugins
+        assert!(
+            env_map.contains_key(OPENCODE_CONFIG_DIR_ENV_VAR),
+            "OPENCODE_CONFIG_DIR must be set"
+        );
+        assert_eq!(
+            env_map[OPENCODE_CONFIG_DIR_ENV_VAR],
+            config_dir.to_string_lossy().to_string()
+        );
+
+        // Must also have OPENCODE_CONFIG pointing to the config file for older OpenCode versions
+        assert!(
+            env_map.contains_key("OPENCODE_CONFIG"),
+            "OPENCODE_CONFIG must be set for backward compatibility"
+        );
+        let expected_config_path = config_dir.join("opencode.json");
+        assert_eq!(
+            env_map["OPENCODE_CONFIG"],
+            expected_config_path.to_string_lossy().to_string()
+        );
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
