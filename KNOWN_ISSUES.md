@@ -3708,3 +3708,29 @@
 - Files/Commands touched: `Cargo.toml`, `src/app.rs`, `src/browser_mcp_helper.rs`, `src/browser_video.rs`, `src/config.rs`, `src/main.rs`, `src/opencode_config.rs`, `src/web_browser.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test browser_mcp`, `cargo test browser_video`
 - References: User report on 2026-05-05: screenshot briefly freezes Mergen and Mergen Browser MCP should have video recording like Playwright.
 
+#### Mergen Browser needed tab control and recording playback focus {#mergen-browser-tabs-recording-playback-focus}
+- Date: 2026-05-05
+- Context: Embedded Browser panel and `mergen-browser` MCP tab management.
+- Error signature: Browser panel has no tabs; saved MCP video recordings are only returned as file paths and are not opened/focused in Mergen.
+- Symptoms/Impact:
+  1. Users cannot keep multiple Browser pages open inside one project.
+  2. MCP agents cannot create, select, or close Mergen Browser tabs.
+  3. After `browser_stop_video`, the saved MP4 does not automatically open in the Browser panel for review.
+- Root cause:
+  1. Browser runtime state mapped one visible WebView per project with no tab metadata.
+  2. `browser_tabs` was advertised only as a single-current-tab list operation.
+  3. Video encode completion replied directly from the worker thread, so the UI thread had no chance to create and focus a recording tab.
+- Resolution:
+  - Added runtime-only project browser tabs with a five-tab limit.
+  - Added UI tab strip controls for selecting, closing, and creating Browser tabs.
+  - Added app-side `browser_tabs` MCP actions: `list`, `new`, `select`, and `close`; `browser_close` now closes the active Mergen Browser tab.
+  - Route video encode completion back to the app thread, then open the saved MP4 as a focused recording tab when capacity allows.
+  - Return an MCP error with saved video metadata if the recording is saved but no new tab can be opened because the tab limit is full.
+  - Added regression tests for tab limit enforcement, MCP tab control, last-tab replacement, recording tab focus, full-tab recording fallback, and recording file URL encoding.
+- Prevent recurrence:
+  - Keep Browser tab state runtime-only and project-scoped.
+  - Do not bypass app-thread state updates when background workers need to affect UI-visible Browser state.
+  - Preserve the explicit five-tab limit and return actionable MCP errors rather than silently closing old tabs.
+- Files/Commands touched: `src/app.rs`, `src/browser_mcp_helper.rs`, `src/browser_mcp_service.rs`, `src/web_browser.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test browser_tabs`, `cargo test browser_mcp_tabs_new_select_and_close_control_tabs`, `cargo test browser_video_encode_event`, `cargo test browser_recording_file_url_encodes_spaces`
+- References: User request on 2026-05-05: Browser panel should have up to five tabs, MCP should control them, and saved videos should open in a newly focused tab.
+

@@ -47,7 +47,9 @@ use crate::browser_mcp_service::{
     BrowserMcpAuthScope, BrowserMcpCommand, BrowserMcpIpcRequest, BrowserMcpIpcResponse,
     BrowserMcpService,
 };
-use crate::browser_video::{encode_browser_video_mp4, BrowserVideoChapter, BrowserVideoFrame};
+use crate::browser_video::{
+    encode_browser_video_mp4, BrowserVideoChapter, BrowserVideoEncodeResult, BrowserVideoFrame,
+};
 use crate::codex::{self, CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
 use crate::config;
 use crate::hooks::{
@@ -87,6 +89,7 @@ const BROWSER_MCP_PENDING_POLL_MS: u64 = 16;
 const BROWSER_VIDEO_FPS: u32 = 10;
 const BROWSER_VIDEO_FRAME_INTERVAL_MS: u64 = 100;
 const BROWSER_VIDEO_FRAME_REQUEST_PREFIX: &str = "browser-video-frame";
+const BROWSER_MAX_TABS_PER_PROJECT: usize = 5;
 const TERMINAL_SNAPSHOT_BUDGET_PER_FRAME: usize = 2;
 const REPAINT_DEBOUNCE_MS: u64 = 5;
 const INPUT_ROUTING_GATE_MS: u64 = 75;
@@ -1037,6 +1040,64 @@ struct BrowserVideoRecordingState {
     last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserTabKind {
+    Page,
+    Recording,
+}
+
+impl BrowserTabKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Page => "page",
+            Self::Recording => "recording",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BrowserTabState {
+    id: u64,
+    title: String,
+    url: Option<String>,
+    draft: String,
+    kind: BrowserTabKind,
+}
+
+impl BrowserTabState {
+    fn new_page(id: u64, url: Option<String>) -> Self {
+        let draft = url.clone().unwrap_or_default();
+        let title = url
+            .as_deref()
+            .and_then(browser_tab_title_from_url)
+            .unwrap_or("New Tab")
+            .to_owned();
+        Self {
+            id,
+            title,
+            url,
+            draft,
+            kind: BrowserTabKind::Page,
+        }
+    }
+
+    fn new_recording(id: u64, url: String, title: String) -> Self {
+        Self {
+            id,
+            title,
+            draft: url.clone(),
+            url: Some(url),
+            kind: BrowserTabKind::Recording,
+        }
+    }
+}
+
+struct BrowserVideoEncodeEvent {
+    project_id: u64,
+    respond_to: std::sync::mpsc::Sender<BrowserMcpIpcResponse>,
+    result: Result<BrowserVideoEncodeResult, String>,
+}
+
 impl BrowserVideoRecordingState {
     fn new(project_id: u64, output_path: PathBuf, started_at: Instant) -> Self {
         Self {
@@ -1069,6 +1130,48 @@ fn parse_browser_video_frame_request_id(request_id: &str) -> Option<(u64, u64)> 
         return None;
     }
     Some((project_id, frame_index))
+}
+
+fn browser_tab_title_from_url(url: &str) -> Option<&str> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("file://") {
+        return trimmed
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.trim().is_empty());
+    }
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|host| !host.trim().is_empty())
+}
+
+fn browser_recording_file_url(path: &Path) -> String {
+    let mut normalized = path.display().to_string().replace('\\', "/");
+    if !normalized.starts_with('/') {
+        normalized = format!("/{normalized}");
+    }
+    format!("file://{}", percent_encode_file_url_path(&normalized))
+}
+
+fn percent_encode_file_url_path(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b':' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 pub struct AdeApp {
@@ -1181,6 +1284,13 @@ pub struct AdeApp {
     /// Embedded browsers per project for in-app web rendering (runtime only, not persisted).
     /// Each project has its own browser instance so switching projects preserves browser state.
     embedded_browsers_by_project: BTreeMap<u64, web_browser::EmbeddedBrowser>,
+    /// Browser tab metadata per project (runtime only, not persisted).
+    browser_tabs_by_project: BTreeMap<u64, Vec<BrowserTabState>>,
+    /// Active browser tab per project (runtime only, not persisted).
+    active_browser_tab_by_project: BTreeMap<u64, u64>,
+    /// Inactive browser tab WebViews, stored off the visible active browser map.
+    inactive_browser_tab_browsers: BTreeMap<(u64, u64), web_browser::EmbeddedBrowser>,
+    next_browser_tab_id: u64,
     /// Reserved browser content area for native WebView bounds sync (runtime only)
     pending_browser_rect: Option<egui::Rect>,
     /// Browser panel open state per project (runtime only, not persisted).
@@ -1197,6 +1307,8 @@ pub struct AdeApp {
         BTreeMap<(u64, u64), DesignInspectDeliveryState>,
     /// Active embedded-browser video recordings per project.
     browser_video_recordings_by_project: BTreeMap<u64, BrowserVideoRecordingState>,
+    browser_video_encode_events_tx: Sender<BrowserVideoEncodeEvent>,
+    browser_video_encode_events_rx: Receiver<BrowserVideoEncodeEvent>,
 }
 
 /// Represents a single open file buffer in the built-in editor.
@@ -3440,6 +3552,8 @@ impl AdeApp {
         let (directory_index_commands_tx, directory_index_commands_rx) =
             crossbeam_channel::unbounded();
         let (directory_index_events_tx, directory_index_events_rx) = crossbeam_channel::unbounded();
+        let (browser_video_encode_events_tx, browser_video_encode_events_rx) =
+            crossbeam_channel::unbounded();
         spawn_source_control_worker(source_control_commands_rx, source_control_events_tx.clone());
         spawn_directory_index_worker(
             directory_index_commands_rx,
@@ -3580,6 +3694,10 @@ impl AdeApp {
             file_editor: FileEditorState::default(),
             browser_url_draft_by_project: BTreeMap::new(),
             embedded_browsers_by_project: BTreeMap::new(),
+            browser_tabs_by_project: BTreeMap::new(),
+            active_browser_tab_by_project: BTreeMap::new(),
+            inactive_browser_tab_browsers: BTreeMap::new(),
+            next_browser_tab_id: 1,
             pending_browser_rect: None,
             browser_panel_open_projects: BTreeSet::new(),
             browser_design_inspect_enabled_projects: BTreeSet::new(),
@@ -3587,6 +3705,8 @@ impl AdeApp {
             browser_design_inspect_target_changed_at_by_project: BTreeMap::new(),
             browser_design_inspect_last_delivery_by_destination: BTreeMap::new(),
             browser_video_recordings_by_project: BTreeMap::new(),
+            browser_video_encode_events_tx,
+            browser_video_encode_events_rx,
         };
         // Do NOT seed runtime browser state from legacy config.
         // Browser panel open state is now runtime-only per project.
@@ -3819,6 +3939,17 @@ impl AdeApp {
             .remove(&project_id);
         // Clean up browser state for the removed project
         self.browser_url_draft_by_project.remove(&project_id);
+        self.browser_tabs_by_project.remove(&project_id);
+        self.active_browser_tab_by_project.remove(&project_id);
+        self.inactive_browser_tab_browsers
+            .retain(|(pid, _), browser| {
+                if *pid == project_id {
+                    browser.shutdown();
+                    false
+                } else {
+                    true
+                }
+            });
         self.browser_panel_open_projects.remove(&project_id);
         self.browser_design_inspect_enabled_projects
             .remove(&project_id);
@@ -15781,6 +15912,15 @@ impl AdeApp {
 
     /// Set the browser URL for a project and update the draft.
     fn set_project_browser_url(&mut self, project_id: u64, url: String) {
+        let active_tab_id = self.ensure_browser_tab_state(project_id);
+        if let Some(tab) = self.browser_tab_mut(project_id, active_tab_id) {
+            tab.url = Some(url.clone());
+            tab.draft = url.clone();
+            tab.title = browser_tab_title_from_url(&url)
+                .unwrap_or("Page")
+                .to_owned();
+            tab.kind = BrowserTabKind::Page;
+        }
         if let Some(project) = self.projects.get_mut(&project_id) {
             project.browser_last_url = Some(url.clone());
             self.browser_url_draft_by_project.insert(project_id, url);
@@ -15789,27 +15929,326 @@ impl AdeApp {
         }
     }
 
+    fn create_project_browser_instance(&mut self, project_id: u64) -> web_browser::EmbeddedBrowser {
+        let user_data_folder = match config::browser_user_data_dir_path(project_id) {
+            Ok(path) => Some(path),
+            Err(err) => {
+                log::error!(
+                    "Browser profile folder setup failed for project {}: {}",
+                    project_id,
+                    err
+                );
+                self.status_line =
+                    "Browser profile folder could not be prepared; passwords may not persist"
+                        .to_owned();
+                None
+            }
+        };
+        web_browser::EmbeddedBrowser::new_with_user_data_folder(user_data_folder)
+    }
+
+    fn ensure_browser_tab_state(&mut self, project_id: u64) -> u64 {
+        if let Some(active_tab_id) = self.active_browser_tab_by_project.get(&project_id).copied() {
+            if self
+                .browser_tabs_by_project
+                .get(&project_id)
+                .is_some_and(|tabs| tabs.iter().any(|tab| tab.id == active_tab_id))
+            {
+                return active_tab_id;
+            }
+        }
+
+        let initial_url = self
+            .projects
+            .get(&project_id)
+            .and_then(|project| project.browser_last_url.clone());
+        let tab_id = self.next_browser_tab_id;
+        self.next_browser_tab_id = self.next_browser_tab_id.saturating_add(1).max(1);
+        let tab = BrowserTabState::new_page(tab_id, initial_url.clone());
+        self.browser_tabs_by_project.insert(project_id, vec![tab]);
+        self.active_browser_tab_by_project
+            .insert(project_id, tab_id);
+        self.browser_url_draft_by_project
+            .insert(project_id, initial_url.unwrap_or_default());
+        tab_id
+    }
+
+    fn active_browser_tab_id(&self, project_id: u64) -> Option<u64> {
+        self.active_browser_tab_by_project.get(&project_id).copied()
+    }
+
+    fn browser_tab_mut(&mut self, project_id: u64, tab_id: u64) -> Option<&mut BrowserTabState> {
+        self.browser_tabs_by_project
+            .get_mut(&project_id)?
+            .iter_mut()
+            .find(|tab| tab.id == tab_id)
+    }
+
+    fn browser_tab_index(&self, project_id: u64, tab_id: u64) -> Option<usize> {
+        self.browser_tabs_by_project
+            .get(&project_id)?
+            .iter()
+            .position(|tab| tab.id == tab_id)
+    }
+
+    fn browser_tab_summary(&self, project_id: u64) -> Vec<(u64, String, Option<String>, bool)> {
+        let active = self.active_browser_tab_id(project_id);
+        self.browser_tabs_by_project
+            .get(&project_id)
+            .map(|tabs| {
+                tabs.iter()
+                    .map(|tab| {
+                        (
+                            tab.id,
+                            tab.title.clone(),
+                            tab.url.clone(),
+                            active == Some(tab.id),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn browser_tabs_response(&self, project_id: u64) -> BrowserMcpIpcResponse {
+        let active = self.active_browser_tab_id(project_id);
+        let mut lines = Vec::new();
+        let mut data_tabs = Vec::new();
+
+        if let Some(tabs) = self.browser_tabs_by_project.get(&project_id) {
+            for (index, tab) in tabs.iter().enumerate() {
+                let title = if tab.title.trim().is_empty() {
+                    "New Tab"
+                } else {
+                    tab.title.as_str()
+                };
+                let url = tab.url.as_deref().unwrap_or("about:blank");
+                let active_marker = if active == Some(tab.id) {
+                    " (current)"
+                } else {
+                    ""
+                };
+                lines.push(format!(
+                    "- {index}:{active_marker} tabId={} [{title}]({url})",
+                    tab.id
+                ));
+                data_tabs.push(json!({
+                    "index": index,
+                    "tabId": tab.id,
+                    "title": title,
+                    "url": tab.url.clone(),
+                    "active": active == Some(tab.id),
+                    "kind": tab.kind.as_str(),
+                }));
+            }
+        }
+
+        let text = if lines.is_empty() {
+            "No Mergen Browser tabs.".to_owned()
+        } else {
+            format!("Mergen Browser tabs:\n{}", lines.join("\n"))
+        };
+
+        BrowserMcpIpcResponse::ok_with_data(
+            text,
+            json!({
+                "maxTabs": BROWSER_MAX_TABS_PER_PROJECT,
+                "tabs": data_tabs,
+            }),
+        )
+    }
+
+    fn resolve_browser_tab_id_from_params(
+        &self,
+        project_id: u64,
+        params: &serde_json::Value,
+    ) -> Result<u64, String> {
+        if let Some(tab_id) = params.get("tabId").and_then(serde_json::Value::as_u64) {
+            if self
+                .browser_tabs_by_project
+                .get(&project_id)
+                .is_some_and(|tabs| tabs.iter().any(|tab| tab.id == tab_id))
+            {
+                return Ok(tab_id);
+            }
+            return Err(format!("Browser tab does not exist: {tab_id}"));
+        }
+        if let Some(index) = params.get("index").and_then(serde_json::Value::as_u64) {
+            return self
+                .browser_tabs_by_project
+                .get(&project_id)
+                .and_then(|tabs| tabs.get(index as usize))
+                .map(|tab| tab.id)
+                .ok_or_else(|| format!("Browser tab index does not exist: {index}"));
+        }
+        self.active_browser_tab_id(project_id)
+            .ok_or_else(|| "No active browser tab exists".to_owned())
+    }
+
+    fn store_active_browser_for_project(&mut self, project_id: u64) {
+        let Some(active_tab_id) = self.active_browser_tab_id(project_id) else {
+            return;
+        };
+        if let Some(mut browser) = self.embedded_browsers_by_project.remove(&project_id) {
+            browser.hide();
+            self.inactive_browser_tab_browsers
+                .insert((project_id, active_tab_id), browser);
+        }
+        if let Some(draft) = self.browser_url_draft_by_project.get(&project_id).cloned() {
+            if let Some(tab) = self.browser_tab_mut(project_id, active_tab_id) {
+                tab.draft = draft;
+            }
+        }
+    }
+
+    fn activate_browser_tab(&mut self, project_id: u64, tab_id: u64) -> Result<(), String> {
+        if !self
+            .browser_tabs_by_project
+            .get(&project_id)
+            .is_some_and(|tabs| tabs.iter().any(|tab| tab.id == tab_id))
+        {
+            return Err(format!("Browser tab does not exist: {tab_id}"));
+        }
+        if self.active_browser_tab_id(project_id) == Some(tab_id) {
+            return Ok(());
+        }
+
+        self.store_active_browser_for_project(project_id);
+        let existing_browser = self
+            .inactive_browser_tab_browsers
+            .remove(&(project_id, tab_id));
+        let created_browser = existing_browser.is_none();
+        let browser =
+            existing_browser.unwrap_or_else(|| self.create_project_browser_instance(project_id));
+        self.embedded_browsers_by_project
+            .insert(project_id, browser);
+        self.active_browser_tab_by_project
+            .insert(project_id, tab_id);
+        let (draft, url) = self
+            .browser_tabs_by_project
+            .get(&project_id)
+            .and_then(|tabs| tabs.iter().find(|tab| tab.id == tab_id))
+            .map(|tab| (tab.draft.clone(), tab.url.clone()))
+            .unwrap_or_default();
+        self.browser_url_draft_by_project.insert(project_id, draft);
+        if created_browser {
+            if let Some(url) = url {
+                self.project_browser(project_id).navigate(&url);
+            }
+        }
+        Ok(())
+    }
+
+    fn add_browser_tab(
+        &mut self,
+        project_id: u64,
+        url: Option<String>,
+        kind: BrowserTabKind,
+        title: Option<String>,
+    ) -> Result<u64, String> {
+        self.ensure_browser_tab_state(project_id);
+        let tab_count = self
+            .browser_tabs_by_project
+            .get(&project_id)
+            .map(Vec::len)
+            .unwrap_or(0);
+        if tab_count >= BROWSER_MAX_TABS_PER_PROJECT {
+            return Err(format!(
+                "Browser tab limit reached ({BROWSER_MAX_TABS_PER_PROJECT}). Close an existing tab before opening a new one."
+            ));
+        }
+
+        let tab_id = self.next_browser_tab_id;
+        self.next_browser_tab_id = self.next_browser_tab_id.saturating_add(1).max(1);
+        let tab = match kind {
+            BrowserTabKind::Page => BrowserTabState::new_page(tab_id, url),
+            BrowserTabKind::Recording => BrowserTabState::new_recording(
+                tab_id,
+                url.unwrap_or_default(),
+                title.unwrap_or_else(|| "Recording".to_owned()),
+            ),
+        };
+        self.browser_tabs_by_project
+            .entry(project_id)
+            .or_default()
+            .push(tab);
+        self.activate_browser_tab(project_id, tab_id)?;
+        if let Some(url) = self
+            .browser_tabs_by_project
+            .get(&project_id)
+            .and_then(|tabs| tabs.iter().find(|tab| tab.id == tab_id))
+            .and_then(|tab| tab.url.clone())
+        {
+            self.project_browser(project_id).navigate(&url);
+        }
+        Ok(tab_id)
+    }
+
+    fn close_browser_tab(&mut self, project_id: u64, tab_id: u64) -> Result<(), String> {
+        let (index, was_active, replacement_id) = {
+            let Some(tabs) = self.browser_tabs_by_project.get(&project_id) else {
+                return Err("No browser tabs exist for this project".to_owned());
+            };
+            let Some(index) = tabs.iter().position(|tab| tab.id == tab_id) else {
+                return Err(format!("Browser tab does not exist: {tab_id}"));
+            };
+            let was_active = self.active_browser_tab_id(project_id) == Some(tab_id);
+            let replacement_id = if tabs.len() <= 1 {
+                None
+            } else {
+                let replacement_index = if index == 0 { 1 } else { index - 1 };
+                tabs.get(replacement_index).map(|tab| tab.id)
+            };
+            (index, was_active, replacement_id)
+        };
+
+        if was_active {
+            if let Some(mut browser) = self.embedded_browsers_by_project.remove(&project_id) {
+                browser.shutdown();
+            }
+        } else if let Some(mut browser) = self
+            .inactive_browser_tab_browsers
+            .remove(&(project_id, tab_id))
+        {
+            browser.shutdown();
+        }
+
+        if let Some(tabs) = self.browser_tabs_by_project.get_mut(&project_id) {
+            tabs.remove(index);
+        }
+
+        let tabs_empty = self
+            .browser_tabs_by_project
+            .get(&project_id)
+            .map(Vec::is_empty)
+            .unwrap_or(true);
+        if tabs_empty {
+            self.active_browser_tab_by_project.remove(&project_id);
+            self.browser_tabs_by_project.remove(&project_id);
+            self.browser_url_draft_by_project.remove(&project_id);
+            self.ensure_browser_tab_state(project_id);
+            return Ok(());
+        }
+
+        if was_active {
+            self.active_browser_tab_by_project.remove(&project_id);
+            if let Some(replacement_id) = replacement_id {
+                self.activate_browser_tab(project_id, replacement_id)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Get or create the embedded browser for a specific project.
     fn project_browser(&mut self, project_id: u64) -> &mut web_browser::EmbeddedBrowser {
+        let active_tab_id = self.ensure_browser_tab_state(project_id);
         if !self.embedded_browsers_by_project.contains_key(&project_id) {
-            let user_data_folder = match config::browser_user_data_dir_path(project_id) {
-                Ok(path) => Some(path),
-                Err(err) => {
-                    log::error!(
-                        "Browser profile folder setup failed for project {}: {}",
-                        project_id,
-                        err
-                    );
-                    self.status_line =
-                        "Browser profile folder could not be prepared; passwords may not persist"
-                            .to_owned();
-                    None
-                }
-            };
-            self.embedded_browsers_by_project.insert(
-                project_id,
-                web_browser::EmbeddedBrowser::new_with_user_data_folder(user_data_folder),
-            );
+            let browser = self
+                .inactive_browser_tab_browsers
+                .remove(&(project_id, active_tab_id))
+                .unwrap_or_else(|| self.create_project_browser_instance(project_id));
+            self.embedded_browsers_by_project
+                .insert(project_id, browser);
         }
 
         self.embedded_browsers_by_project
@@ -15856,6 +16295,9 @@ impl AdeApp {
         for browser in self.embedded_browsers_by_project.values_mut() {
             browser.hide();
         }
+        for browser in self.inactive_browser_tab_browsers.values_mut() {
+            browser.hide();
+        }
     }
 
     /// Process browser events and update URL state.
@@ -15864,20 +16306,34 @@ impl AdeApp {
         let mut any_changed = false;
 
         // Collect events from all project browsers to avoid borrow issues
-        let browser_events: Vec<(u64, Vec<web_browser::BrowserEvent>)> = self
+        let active_tabs = self.active_browser_tab_by_project.clone();
+        let mut browser_events: Vec<(u64, u64, Vec<web_browser::BrowserEvent>)> = self
             .embedded_browsers_by_project
             .iter_mut()
-            .map(|(project_id, browser)| (*project_id, browser.drain_events()))
+            .map(|(project_id, browser)| {
+                (
+                    *project_id,
+                    active_tabs.get(project_id).copied().unwrap_or(0),
+                    browser.drain_events(),
+                )
+            })
             .collect();
+        browser_events.extend(
+            self.inactive_browser_tab_browsers
+                .iter_mut()
+                .map(|((project_id, tab_id), browser)| {
+                    (*project_id, *tab_id, browser.drain_events())
+                }),
+        );
 
-        for (project_id, events) in browser_events {
+        for (project_id, tab_id, events) in browser_events {
             for event in events {
                 match event {
                     web_browser::BrowserEvent::UrlChanged(url) => {
                         // Only accept http:// or https:// URLs from browser observations
                         let lower = url.to_lowercase();
                         if lower.starts_with("http://") || lower.starts_with("https://") {
-                            if self.apply_browser_observed_url(project_id, url) {
+                            if self.apply_browser_tab_observed_url(project_id, tab_id, url) {
                                 any_changed = true;
                             }
                         }
@@ -15969,6 +16425,9 @@ impl AdeApp {
                 "browser_take_screenshot" => {
                     self.handle_browser_mcp_screenshot_command(ctx, command);
                 }
+                tool if web_browser::browser_mcp_tool_uses_async_script(tool) => {
+                    self.handle_browser_mcp_script_command(ctx, command);
+                }
                 "browser_start_video" => {
                     let response = self.handle_browser_mcp_start_video_request(
                         ctx,
@@ -16021,6 +16480,38 @@ impl AdeApp {
         let start_result = self
             .project_browser(project_id)
             .start_mcp_screenshot_tool(request_id.clone(), &command.request.params);
+        if let Err(err) = start_result {
+            if let Some(respond_to) = self.browser_mcp_pending_responses.remove(&request_id) {
+                let _ = respond_to.send(BrowserMcpIpcResponse::error(err));
+            }
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(BROWSER_MCP_PENDING_POLL_MS));
+        }
+    }
+
+    fn handle_browser_mcp_script_command(
+        &mut self,
+        ctx: &egui::Context,
+        command: BrowserMcpCommand,
+    ) {
+        let project_id =
+            match self.prepare_browser_mcp_tool_project(ctx, &command.request, &command.auth_scope)
+            {
+                Ok(project_id) => project_id,
+                Err(response) => {
+                    let _ = command.respond_to.send(response);
+                    return;
+                }
+            };
+
+        let request_id = self.next_browser_mcp_pending_request_id(&command.request);
+        self.browser_mcp_pending_responses
+            .insert(request_id.clone(), command.respond_to);
+        let start_result = self.project_browser(project_id).start_mcp_script_tool(
+            request_id.clone(),
+            &command.request.tool,
+            &command.request.params,
+        );
         if let Err(err) = start_result {
             if let Some(respond_to) = self.browser_mcp_pending_responses.remove(&request_id) {
                 let _ = respond_to.send(BrowserMcpIpcResponse::error(err));
@@ -16159,39 +16650,122 @@ impl AdeApp {
         let output_path = state.output_path;
         let frames = state.frames;
         let chapters = state.chapters;
+        let encode_events_tx = self.browser_video_encode_events_tx.clone();
+        let repaint_ctx = ctx.clone();
         std::thread::spawn(move || {
-            let response =
-                match encode_browser_video_mp4(output_path, frames, chapters, BROWSER_VIDEO_FPS) {
-                    Ok(result) => {
-                        let chapters = result
-                            .chapters
-                            .iter()
-                            .map(|chapter| {
-                                json!({
-                                    "elapsedMs": chapter.elapsed_ms,
-                                    "label": chapter.label
-                                })
-                            })
-                            .collect::<Vec<_>>();
-                        BrowserMcpIpcResponse::ok_with_data(
-                            format!(
-                                "Saved embedded Mergen browser video: {} ({} frames).",
-                                result.path.display(),
-                                result.frame_count
-                            ),
-                            json!({
-                                "videoPath": result.path.display().to_string(),
-                                "mimeType": "video/mp4",
-                                "frameCount": result.frame_count,
-                                "durationMs": result.duration_ms,
-                                "chapters": chapters
-                            }),
-                        )
-                    }
-                    Err(err) => BrowserMcpIpcResponse::error(err),
-                };
-            let _ = respond_to.send(response);
+            let result = encode_browser_video_mp4(output_path, frames, chapters, BROWSER_VIDEO_FPS);
+            let _ = encode_events_tx.send(BrowserVideoEncodeEvent {
+                project_id,
+                respond_to,
+                result,
+            });
+            repaint_ctx.request_repaint();
         });
+        ctx.request_repaint();
+    }
+
+    fn browser_video_result_data(
+        result: &BrowserVideoEncodeResult,
+        file_url: Option<&str>,
+        tab_id: Option<u64>,
+    ) -> serde_json::Value {
+        let chapters = result
+            .chapters
+            .iter()
+            .map(|chapter| {
+                json!({
+                    "elapsedMs": chapter.elapsed_ms,
+                    "label": chapter.label
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "videoPath": result.path.display().to_string(),
+            "videoUrl": file_url,
+            "mimeType": "video/mp4",
+            "frameCount": result.frame_count,
+            "durationMs": result.duration_ms,
+            "chapters": chapters,
+            "tabId": tab_id,
+        })
+    }
+
+    fn process_browser_video_encode_events(&mut self, ctx: &egui::Context) {
+        let events = self
+            .browser_video_encode_events_rx
+            .try_iter()
+            .collect::<Vec<_>>();
+        if events.is_empty() {
+            return;
+        }
+
+        for event in events {
+            self.handle_browser_video_encode_event(ctx, event);
+        }
+        ctx.request_repaint();
+    }
+
+    fn handle_browser_video_encode_event(
+        &mut self,
+        ctx: &egui::Context,
+        event: BrowserVideoEncodeEvent,
+    ) {
+        let result = match event.result {
+            Ok(result) => result,
+            Err(err) => {
+                let _ = event.respond_to.send(BrowserMcpIpcResponse::error(err));
+                return;
+            }
+        };
+
+        let file_url = browser_recording_file_url(&result.path);
+        let title = result
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| format!("Recording {name}"))
+            .unwrap_or_else(|| "Recording".to_owned());
+        let tab_result = if self.projects.contains_key(&event.project_id) {
+            self.set_browser_panel_open_for_project(event.project_id, true);
+            self.config.ui.checklist_panel_expanded = false;
+            self.add_browser_tab(
+                event.project_id,
+                Some(file_url.clone()),
+                BrowserTabKind::Recording,
+                Some(title),
+            )
+        } else {
+            Err(format!(
+                "Browser MCP target project does not exist: {}",
+                event.project_id
+            ))
+        };
+
+        match tab_result {
+            Ok(tab_id) => {
+                self.project_browser(event.project_id).navigate(&file_url);
+                let data = Self::browser_video_result_data(&result, Some(&file_url), Some(tab_id));
+                let _ = event.respond_to.send(BrowserMcpIpcResponse::ok_with_data(
+                    format!(
+                        "Saved embedded Mergen browser video and opened it in tab {tab_id}: {} ({} frames).",
+                        result.path.display(),
+                        result.frame_count
+                    ),
+                    data,
+                ));
+            }
+            Err(err) => {
+                let data = Self::browser_video_result_data(&result, Some(&file_url), None);
+                let _ = event.respond_to.send(BrowserMcpIpcResponse::error_with_data(
+                    format!(
+                        "Saved embedded Mergen browser video, but could not open it in a new tab: {err}. Video path: {}",
+                        result.path.display()
+                    ),
+                    data,
+                ));
+            }
+        }
+
         ctx.request_repaint();
     }
 
@@ -16352,6 +16926,110 @@ impl AdeApp {
         Ok(dir.join(format!("mergen-browser-project-{project_id}-{millis}.mp4")))
     }
 
+    fn handle_browser_mcp_tabs_request(
+        &mut self,
+        ctx: &egui::Context,
+        project_id: u64,
+        request: &BrowserMcpIpcRequest,
+    ) -> BrowserMcpIpcResponse {
+        self.ensure_browser_tab_state(project_id);
+        let action = request
+            .params
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("list");
+
+        match action {
+            "list" => self.browser_tabs_response(project_id),
+            "new" => {
+                let normalized_url = request
+                    .params
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|url| !url.is_empty())
+                    .map(|url| {
+                        let normalized = normalize_browser_url(url);
+                        if normalized.is_empty() {
+                            Err(format!("Invalid browser URL: {url}"))
+                        } else {
+                            Ok(normalized)
+                        }
+                    })
+                    .transpose();
+                let normalized_url = match normalized_url {
+                    Ok(url) => url,
+                    Err(err) => return BrowserMcpIpcResponse::error(err),
+                };
+
+                let tab_id =
+                    match self.add_browser_tab(project_id, None, BrowserTabKind::Page, None) {
+                        Ok(tab_id) => tab_id,
+                        Err(err) => return BrowserMcpIpcResponse::error(err),
+                    };
+                if let Some(url) = normalized_url {
+                    self.set_project_browser_url(project_id, url.clone());
+                    self.project_browser(project_id).navigate(&url);
+                }
+                ctx.request_repaint();
+                let mut response = self.browser_tabs_response(project_id);
+                response.text = format!("Opened Mergen Browser tab {tab_id}.\n{}", response.text);
+                response
+            }
+            "select" => {
+                let tab_id =
+                    match self.resolve_browser_tab_id_from_params(project_id, &request.params) {
+                        Ok(tab_id) => tab_id,
+                        Err(err) => return BrowserMcpIpcResponse::error(err),
+                    };
+                if let Err(err) = self.activate_browser_tab(project_id, tab_id) {
+                    return BrowserMcpIpcResponse::error(err);
+                }
+                ctx.request_repaint();
+                let mut response = self.browser_tabs_response(project_id);
+                response.text = format!("Selected Mergen Browser tab {tab_id}.\n{}", response.text);
+                response
+            }
+            "close" => {
+                let tab_id =
+                    match self.resolve_browser_tab_id_from_params(project_id, &request.params) {
+                        Ok(tab_id) => tab_id,
+                        Err(err) => return BrowserMcpIpcResponse::error(err),
+                    };
+                if let Err(err) = self.close_browser_tab(project_id, tab_id) {
+                    return BrowserMcpIpcResponse::error(err);
+                }
+                ctx.request_repaint();
+                let mut response = self.browser_tabs_response(project_id);
+                response.text = format!("Closed Mergen Browser tab {tab_id}.\n{}", response.text);
+                response
+            }
+            other => BrowserMcpIpcResponse::error(format!(
+                "Unsupported browser_tabs action: {other}. Use list, new, select, or close."
+            )),
+        }
+    }
+
+    fn handle_browser_mcp_close_request(
+        &mut self,
+        ctx: &egui::Context,
+        project_id: u64,
+        request: &BrowserMcpIpcRequest,
+    ) -> BrowserMcpIpcResponse {
+        self.ensure_browser_tab_state(project_id);
+        let tab_id = match self.resolve_browser_tab_id_from_params(project_id, &request.params) {
+            Ok(tab_id) => tab_id,
+            Err(err) => return BrowserMcpIpcResponse::error(err),
+        };
+        if let Err(err) = self.close_browser_tab(project_id, tab_id) {
+            return BrowserMcpIpcResponse::error(err);
+        }
+        ctx.request_repaint();
+        let mut response = self.browser_tabs_response(project_id);
+        response.text = format!("Closed Mergen Browser tab {tab_id}.\n{}", response.text);
+        response
+    }
+
     fn handle_browser_mcp_request(
         &mut self,
         ctx: &egui::Context,
@@ -16373,6 +17051,8 @@ impl AdeApp {
         ctx.request_repaint();
 
         match request.tool.as_str() {
+            "browser_tabs" => self.handle_browser_mcp_tabs_request(ctx, project_id, &request),
+            "browser_close" => self.handle_browser_mcp_close_request(ctx, project_id, &request),
             "browser_navigate" => {
                 let url = request
                     .params
@@ -16512,7 +17192,31 @@ impl AdeApp {
     /// Apply an observed browser URL to a project.
     /// Returns true if the URL actually changed (for persistence tracking).
     fn apply_browser_observed_url(&mut self, project_id: u64, url: String) -> bool {
+        let tab_id = self.ensure_browser_tab_state(project_id);
+        self.apply_browser_tab_observed_url(project_id, tab_id, url)
+    }
+
+    fn apply_browser_tab_observed_url(
+        &mut self,
+        project_id: u64,
+        tab_id: u64,
+        url: String,
+    ) -> bool {
         let mut changed = false;
+        let is_active_tab = self.active_browser_tab_id(project_id) == Some(tab_id);
+        if let Some(tab) = self.browser_tab_mut(project_id, tab_id) {
+            if tab.url.as_ref() != Some(&url) {
+                tab.url = Some(url.clone());
+                tab.draft = url.clone();
+                tab.title = browser_tab_title_from_url(&url)
+                    .unwrap_or("Page")
+                    .to_owned();
+                changed = true;
+            }
+        }
+        if !is_active_tab {
+            return changed;
+        }
 
         // Update the draft (visible in URL input)
         if let Some(existing) = self.browser_url_draft_by_project.get(&project_id) {
@@ -16749,6 +17453,9 @@ impl AdeApp {
                 browser.hide();
             }
         }
+        for browser in self.inactive_browser_tab_browsers.values_mut() {
+            browser.hide();
+        }
 
         // Show and sync the active project's browser
         if let Some(project_id) = browser_project_id {
@@ -16857,6 +17564,104 @@ impl AdeApp {
                     );
                     ui.add_space(8.0);
 
+                    self.ensure_browser_tab_state(project_id);
+                    let tab_summaries = self.browser_tab_summary(project_id);
+                    let mut tab_to_select = None;
+                    let mut tab_to_close = None;
+                    let mut add_tab_requested = false;
+                    ui.horizontal_wrapped(|ui| {
+                        for (tab_id, title, url, is_active) in &tab_summaries {
+                            let label = capped_hover_text(title, 18);
+                            let fill = if *is_active {
+                                with_alpha(BTN_ICON_HOVER, 130)
+                            } else {
+                                Color32::TRANSPARENT
+                            };
+                            let stroke = if *is_active {
+                                Stroke::new(1.0, with_alpha(TEXT_PRIMARY, 60))
+                            } else {
+                                Stroke::new(1.0, with_alpha(TEXT_PRIMARY, 24))
+                            };
+                            let tab_response = ui
+                                .add_sized(
+                                    [126.0, 26.0],
+                                    egui::Button::new(
+                                        RichText::new(label).size(12.0).color(if *is_active {
+                                            TEXT_PRIMARY
+                                        } else {
+                                            TEXT_MUTED
+                                        }),
+                                    )
+                                    .fill(fill)
+                                    .stroke(stroke),
+                                )
+                                .on_hover_text(
+                                    url.as_deref().unwrap_or(title.as_str()).to_owned(),
+                                )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            if tab_response.clicked() {
+                                tab_to_select = Some(*tab_id);
+                            }
+
+                            let close_response = ui
+                                .add_sized(
+                                    [24.0, 26.0],
+                                    egui::Button::new(
+                                        RichText::new(format!("{}", icons::X))
+                                            .size(11.0)
+                                            .color(TEXT_MUTED),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text("Close tab")
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            if close_response.clicked() {
+                                tab_to_close = Some(*tab_id);
+                            }
+                            ui.add_space(2.0);
+                        }
+
+                        let can_add_tab = tab_summaries.len() < BROWSER_MAX_TABS_PER_PROJECT;
+                        let add_button = egui::Button::new(
+                            RichText::new(format!("{}", icons::PLUS))
+                                .size(13.0)
+                                .color(if can_add_tab { TEXT_PRIMARY } else { TEXT_MUTED }),
+                        )
+                        .frame(false);
+                        let add_response = ui
+                            .add_enabled(can_add_tab, add_button)
+                            .on_hover_text(if can_add_tab {
+                                "New tab"
+                            } else {
+                                "Tab limit reached"
+                            })
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if add_response.clicked() {
+                            add_tab_requested = true;
+                        }
+                    });
+
+                    if let Some(tab_id) = tab_to_close {
+                        if let Err(err) = self.close_browser_tab(project_id, tab_id) {
+                            self.status_line = err;
+                        }
+                        ctx.request_repaint();
+                    } else if let Some(tab_id) = tab_to_select {
+                        if let Err(err) = self.activate_browser_tab(project_id, tab_id) {
+                            self.status_line = err;
+                        }
+                        ctx.request_repaint();
+                    } else if add_tab_requested {
+                        if let Err(err) =
+                            self.add_browser_tab(project_id, None, BrowserTabKind::Page, None)
+                        {
+                            self.status_line = err;
+                        }
+                        ctx.request_repaint();
+                    }
+
+                    ui.add_space(8.0);
+
                     // Get or initialize the URL draft for this project
                     // Initialize from saved URL if draft is empty and URL exists
                     if !self.browser_url_draft_by_project.contains_key(&project_id) {
@@ -16916,11 +17721,24 @@ impl AdeApp {
                             Color32::from_rgb(186, 58, 58),
                             "Clear saved URL",
                         ) {
-                            if let Some(project) = self.projects.get_mut(&browser_project_id) {
-                                project.browser_last_url = None;
+                            if self.projects.contains_key(&browser_project_id) {
+                                if let Some(project) = self.projects.get_mut(&browser_project_id) {
+                                    project.browser_last_url = None;
+                                }
                                 // Also clear the draft
                                 self.browser_url_draft_by_project
                                     .remove(&browser_project_id);
+                                if let Some(tab_id) = self.active_browser_tab_id(browser_project_id)
+                                {
+                                    if let Some(tab) =
+                                        self.browser_tab_mut(browser_project_id, tab_id)
+                                    {
+                                        tab.url = None;
+                                        tab.draft.clear();
+                                        tab.title = "New Tab".to_owned();
+                                        tab.kind = BrowserTabKind::Page;
+                                    }
+                                }
                                 self.note_projects_changed();
                                 self.persist_config();
                             }
@@ -18099,6 +18917,7 @@ impl eframe::App for AdeApp {
         self.process_source_control_events(ctx);
         self.process_directory_index_events(ctx);
         self.process_browser_events(ctx);
+        self.process_browser_video_encode_events(ctx);
         self.process_browser_mcp_commands(ctx);
         self.process_browser_video_recordings(ctx);
         self.schedule_source_control_refresh(ctx);
@@ -23568,18 +24387,19 @@ mod tests {
         terminal_selection_autoscroll_speed, terminal_selection_point_from_pointer,
         terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
         with_minimal_button_chrome, with_settings_text_edit_chrome, AdeApp, AiBadgeModel,
-        AiBadgeVisual, AppIcon, CodexAttentionReason, CodexCliStatusSource, CodexTransportStatus,
-        CtrlCAction, DesignInspectDeliveryState, DirectoryIndexSnapshot,
-        DirectoryIndexTruncationFlags, DirectoryNode, FactoryDroidAttentionReason,
-        FactoryDroidHookInboxEvent, FactoryDroidManagedInstallComponent,
-        FactoryDroidManagedInstallDiagnostics, FactoryDroidStatusSource,
-        FactoryDroidTransportDiagnostics, FileEditorState, OpenCodeAttentionReason,
-        OpenCodeStatusSource, OpenCodeTransportStatus, OpenFileBuffer, PendingConfigChanges,
-        PendingRerunPhase, PendingTerminalLinkClick, SettingsSection, SourceControlBadgeState,
-        SourceControlFile, SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay,
-        TerminalEntry, TerminalManagerDiffSummaryVisual, TerminalNavigationDirection,
-        TerminalNavigationShortcut, TerminalOutputScrollBehavior, TerminalSecondaryClickAction,
-        TerminalSelection, TerminalSelectionPoint, TransientToast, CODEX_NOTIFY_POLL_MS,
+        AiBadgeVisual, AppIcon, BrowserTabKind, BrowserVideoEncodeEvent, CodexAttentionReason,
+        CodexCliStatusSource, CodexTransportStatus, CtrlCAction, DesignInspectDeliveryState,
+        DirectoryIndexSnapshot, DirectoryIndexTruncationFlags, DirectoryNode,
+        FactoryDroidAttentionReason, FactoryDroidHookInboxEvent,
+        FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
+        FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, FileEditorState,
+        OpenCodeAttentionReason, OpenCodeStatusSource, OpenCodeTransportStatus, OpenFileBuffer,
+        PendingConfigChanges, PendingRerunPhase, PendingTerminalLinkClick, SettingsSection,
+        SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
+        SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
+        TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
+        TerminalOutputScrollBehavior, TerminalSecondaryClickAction, TerminalSelection,
+        TerminalSelectionPoint, TransientToast, BROWSER_MAX_TABS_PER_PROJECT, CODEX_NOTIFY_POLL_MS,
         CODEX_PROCESS_POLL_MS, CODEX_STOP_SETTLE_MS, CODEX_TRAILING_OUTPUT_GRACE_MS,
         DESIGN_INSPECT_DELIVERY_DEDUPE_MS, DESIGN_INSPECT_TARGET_SWITCH_QUIET_MS,
         DIRECTORY_INDEX_CHANNEL_CAPACITY, FACTORY_DROID_HOOK_POLL_MS, OPENCODE_PROCESS_POLL_MS,
@@ -23590,6 +24410,7 @@ mod tests {
         TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS, TERMINAL_OUTPUT_BG,
         TEXT_MUTED, TEXT_PRIMARY, TRANSIENT_TOAST_SECS,
     };
+    use crate::browser_video::BrowserVideoEncodeResult;
     use crate::codex::{CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
     use crate::hooks::{
         AiCliSession, AiCliStatus, AiCliTool, AiHookManager, AiHooksConfig, ClaudeAttentionReason,
@@ -33149,6 +33970,8 @@ mod tests {
             crossbeam_channel::bounded(DIRECTORY_INDEX_CHANNEL_CAPACITY);
         let (_directory_index_events_tx, directory_index_events_rx) =
             crossbeam_channel::bounded(DIRECTORY_INDEX_CHANNEL_CAPACITY);
+        let (browser_video_encode_events_tx, browser_video_encode_events_rx) =
+            crossbeam_channel::unbounded();
 
         AdeApp {
             config_path: test_temp_path("mergen-ade-test-config", "toml"),
@@ -33244,6 +34067,10 @@ mod tests {
             file_editor: FileEditorState::default(),
             browser_url_draft_by_project: BTreeMap::new(),
             embedded_browsers_by_project: BTreeMap::new(),
+            browser_tabs_by_project: BTreeMap::new(),
+            active_browser_tab_by_project: BTreeMap::new(),
+            inactive_browser_tab_browsers: BTreeMap::new(),
+            next_browser_tab_id: 1,
             pending_browser_rect: None,
             browser_panel_open_projects: BTreeSet::new(),
             browser_design_inspect_enabled_projects: BTreeSet::new(),
@@ -33251,6 +34078,8 @@ mod tests {
             browser_design_inspect_target_changed_at_by_project: BTreeMap::new(),
             browser_design_inspect_last_delivery_by_destination: BTreeMap::new(),
             browser_video_recordings_by_project: BTreeMap::new(),
+            browser_video_encode_events_tx,
+            browser_video_encode_events_rx,
         }
     }
 
@@ -40803,6 +41632,226 @@ mod tests {
         assert_eq!(response.text, "done");
         assert_eq!(response.data.unwrap()["value"].as_i64(), Some(1));
         assert!(app.browser_mcp_pending_responses.is_empty());
+    }
+
+    #[test]
+    fn browser_mcp_async_script_tool_result_completes_pending_response() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        app.project_browser(1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.browser_mcp_pending_responses
+            .insert("browser-click-1".to_owned(), tx);
+
+        {
+            let browser = app.embedded_browsers_by_project.get(&1).unwrap();
+            browser.send_test_event(web_browser::BrowserEvent::McpToolResult {
+                request_id: "browser-click-1".to_owned(),
+                result: Ok(web_browser::BrowserMcpToolOutput {
+                    text: "Clicked #save".to_owned(),
+                    data: Some(serde_json::json!({ "url": "https://example.com" })),
+                }),
+            });
+        }
+
+        app.process_browser_events(&ctx);
+
+        let response = rx
+            .try_recv()
+            .expect("async script response should complete");
+        assert!(!response.is_error);
+        assert_eq!(response.text, "Clicked #save");
+        assert_eq!(
+            response.data.unwrap()["url"].as_str(),
+            Some("https://example.com")
+        );
+        assert!(app.browser_mcp_pending_responses.is_empty());
+    }
+
+    #[test]
+    fn browser_tabs_limit_rejects_sixth_tab() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        app.ensure_browser_tab_state(1);
+
+        for _ in 1..BROWSER_MAX_TABS_PER_PROJECT {
+            app.add_browser_tab(1, None, BrowserTabKind::Page, None)
+                .expect("tab should open under limit");
+        }
+
+        let err = app
+            .add_browser_tab(1, None, BrowserTabKind::Page, None)
+            .unwrap_err();
+
+        assert!(err.contains("Browser tab limit reached"));
+        assert_eq!(app.browser_tabs_by_project.get(&1).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn closing_last_browser_tab_recreates_empty_tab() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        let first_tab = app.ensure_browser_tab_state(1);
+
+        app.close_browser_tab(1, first_tab)
+            .expect("last tab should close");
+
+        let tabs = app.browser_tabs_by_project.get(&1).unwrap();
+        assert_eq!(tabs.len(), 1);
+        assert_ne!(tabs[0].id, first_tab);
+        assert_eq!(tabs[0].url, None);
+        assert_eq!(app.active_browser_tab_id(1), Some(tabs[0].id));
+    }
+
+    #[test]
+    fn browser_mcp_tabs_new_select_and_close_control_tabs() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
+        let scope = crate::browser_mcp_service::BrowserMcpAuthScope {
+            terminal_id: 1,
+            project_id: Some(7),
+        };
+        let request = |tool: &str, params: serde_json::Value| {
+            crate::browser_mcp_service::BrowserMcpIpcRequest {
+                request_id: "request".to_owned(),
+                terminal_id: Some(1),
+                project_id: Some(7),
+                tool: tool.to_owned(),
+                params,
+            }
+        };
+
+        let response = app.handle_browser_mcp_request(
+            &ctx,
+            request(
+                "browser_tabs",
+                serde_json::json!({ "action": "new", "url": "example.com/path" }),
+            ),
+            scope.clone(),
+        );
+
+        assert!(!response.is_error, "{}", response.text);
+        assert_eq!(app.browser_tabs_by_project.get(&7).unwrap().len(), 2);
+        let new_tab_id = app.active_browser_tab_id(7).unwrap();
+        assert_eq!(
+            app.browser_tab_mut(7, new_tab_id).unwrap().url.as_deref(),
+            Some("https://example.com/path")
+        );
+
+        let response = app.handle_browser_mcp_request(
+            &ctx,
+            request(
+                "browser_tabs",
+                serde_json::json!({ "action": "select", "index": 0 }),
+            ),
+            scope.clone(),
+        );
+
+        assert!(!response.is_error, "{}", response.text);
+        assert_ne!(app.active_browser_tab_id(7), Some(new_tab_id));
+
+        let response = app.handle_browser_mcp_request(
+            &ctx,
+            request(
+                "browser_tabs",
+                serde_json::json!({ "action": "close", "tabId": new_tab_id }),
+            ),
+            scope,
+        );
+
+        assert!(!response.is_error, "{}", response.text);
+        let tabs = app.browser_tabs_by_project.get(&7).unwrap();
+        assert_eq!(tabs.len(), 1);
+        assert!(tabs.iter().all(|tab| tab.id != new_tab_id));
+    }
+
+    #[test]
+    fn browser_video_encode_event_opens_recording_tab() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let result = BrowserVideoEncodeResult {
+            path: PathBuf::from(r"C:\recordings\demo video.mp4"),
+            frame_count: 3,
+            duration_ms: 300,
+            chapters: vec![],
+        };
+
+        app.handle_browser_video_encode_event(
+            &ctx,
+            BrowserVideoEncodeEvent {
+                project_id: 1,
+                respond_to: tx,
+                result: Ok(result),
+            },
+        );
+
+        let response = rx.try_recv().expect("response should be sent");
+        assert!(!response.is_error, "{}", response.text);
+        let data = response.data.unwrap();
+        assert_eq!(data["mimeType"].as_str(), Some("video/mp4"));
+        assert!(data["videoUrl"]
+            .as_str()
+            .unwrap()
+            .ends_with("demo%20video.mp4"));
+        let tab_id = data["tabId"].as_u64().unwrap();
+        let tab = app.browser_tab_mut(1, tab_id).unwrap();
+        assert_eq!(tab.kind, BrowserTabKind::Recording);
+        assert_eq!(app.active_browser_tab_id(1), Some(tab_id));
+    }
+
+    #[test]
+    fn browser_video_encode_event_reports_saved_file_when_tab_limit_is_full() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        app.ensure_browser_tab_state(1);
+        for _ in 1..BROWSER_MAX_TABS_PER_PROJECT {
+            app.add_browser_tab(1, None, BrowserTabKind::Page, None)
+                .expect("tab should open under limit");
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let result = BrowserVideoEncodeResult {
+            path: PathBuf::from(r"C:\recordings\full.mp4"),
+            frame_count: 2,
+            duration_ms: 200,
+            chapters: vec![],
+        };
+
+        app.handle_browser_video_encode_event(
+            &ctx,
+            BrowserVideoEncodeEvent {
+                project_id: 1,
+                respond_to: tx,
+                result: Ok(result),
+            },
+        );
+
+        let response = rx.try_recv().expect("response should be sent");
+        assert!(response.is_error);
+        assert!(response.text.contains("could not open it in a new tab"));
+        assert_eq!(
+            response.data.unwrap()["videoPath"].as_str(),
+            Some(r"C:\recordings\full.mp4")
+        );
+        assert_eq!(app.browser_tabs_by_project.get(&1).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn browser_recording_file_url_encodes_spaces() {
+        let url = super::browser_recording_file_url(&PathBuf::from(r"C:\tmp\my video.mp4"));
+
+        assert!(url.starts_with("file:///"));
+        assert!(url.ends_with("my%20video.mp4"));
     }
 
     #[test]

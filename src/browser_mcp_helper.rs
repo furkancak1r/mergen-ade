@@ -496,10 +496,13 @@ fn core_tools() -> Vec<JsonValue> {
     vec![
         tool(
             "browser_close",
-            "Close the browser. Not supported in Mergen (Mergen never launches external Chrome).",
+            "Close the active Mergen Browser tab. If it is the last tab, an empty replacement tab is created.",
             json!({
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "index": json!({"type": "integer"}),
+                    "tabId": json!({"type": "integer"})
+                },
                 "required": []
             }),
         ),
@@ -656,25 +659,40 @@ fn core_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_tabs",
-            "List browser tabs (Mergen Browser panel only).",
+            "List, create, select, or close tabs in the Mergen Browser panel. At most five tabs can be open per project.",
             json!({
                 "type": "object",
                 "properties": {
-                    "action": json!({"type": "string", "enum": ["list"], "default": "list"})
+                    "action": json!({"type": "string", "enum": ["list", "new", "select", "close"], "default": "list"}),
+                    "index": json!({"type": "integer"}),
+                    "tabId": json!({"type": "integer"}),
+                    "url": json!({"type": "string"})
                 },
                 "required": []
             }),
         ),
         tool(
             "browser_type",
-            "Type text into a focused element",
+            "Type text into an element or the currently focused element",
+            json!({
+                "type": "object",
+                "properties": element_props(json!({
+                    "ref": json!({"type": "string"}),
+                    "text": json!({"type": "string"}),
+                    "submit": json!({"type": "boolean"})
+                })),
+                "required": ["text"]
+            }),
+        ),
+        tool(
+            "browser_press_key",
+            "Press a key in the browser",
             json!({
                 "type": "object",
                 "properties": {
-                    "text": json!({"type": "string"}),
-                    "submit": json!({"type": "boolean"})
+                    "key": json!({"type": "string"})
                 },
-                "required": ["text"]
+                "required": ["key"]
             }),
         ),
     ]
@@ -756,8 +774,125 @@ fn devtools_tools() -> Vec<JsonValue> {
             json!({
                 "type": "object",
                 "properties": element_props(json!({
+                    "ref": json!({"type": "string"}),
+                    "button": json!({"type": "string", "enum": ["left", "middle", "right"], "default": "left"}),
+                    "doubleClick": json!({"type": "boolean"})
+                }))
+            }),
+        ),
+        tool(
+            "browser_hover",
+            "Hover over an element on the page",
+            json!({
+                "type": "object",
+                "properties": element_props(json!({
                     "ref": json!({"type": "string"})
                 }))
+            }),
+        ),
+        tool(
+            "browser_fill_form",
+            "Fill multiple form fields",
+            json!({
+                "type": "object",
+                "properties": {
+                    "fields": json!({
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "target": {"type": "string"},
+                                "ref": {"type": "string"},
+                                "type": {"type": "string", "enum": ["textbox", "checkbox", "radio", "combobox", "slider"]},
+                                "value": {"type": "string"}
+                            },
+                            "required": ["value"]
+                        }
+                    })
+                },
+                "required": ["fields"]
+            }),
+        ),
+        tool(
+            "browser_mouse_move_xy",
+            "Move the visible browser mouse cursor to viewport coordinates",
+            json!({
+                "type": "object",
+                "properties": {
+                    "x": json!({"type": "number"}),
+                    "y": json!({"type": "number"})
+                },
+                "required": ["x", "y"]
+            }),
+        ),
+        tool(
+            "browser_mouse_click_xy",
+            "Click viewport coordinates with the visible browser mouse cursor",
+            json!({
+                "type": "object",
+                "properties": {
+                    "x": json!({"type": "number"}),
+                    "y": json!({"type": "number"}),
+                    "button": json!({"type": "string", "enum": ["left", "middle", "right"], "default": "left"}),
+                    "doubleClick": json!({"type": "boolean"})
+                },
+                "required": ["x", "y"]
+            }),
+        ),
+        tool(
+            "browser_mouse_drag_xy",
+            "Drag from one viewport coordinate to another with the visible browser mouse cursor",
+            json!({
+                "type": "object",
+                "properties": {
+                    "startX": json!({"type": "number"}),
+                    "startY": json!({"type": "number"}),
+                    "endX": json!({"type": "number"}),
+                    "endY": json!({"type": "number"}),
+                    "button": json!({"type": "string", "enum": ["left", "middle", "right"], "default": "left"})
+                },
+                "required": ["startX", "startY", "endX", "endY"]
+            }),
+        ),
+        tool(
+            "browser_mouse_down",
+            "Press a mouse button at optional viewport coordinates",
+            json!({
+                "type": "object",
+                "properties": {
+                    "x": json!({"type": "number"}),
+                    "y": json!({"type": "number"}),
+                    "button": json!({"type": "string", "enum": ["left", "middle", "right"], "default": "left"})
+                },
+                "required": []
+            }),
+        ),
+        tool(
+            "browser_mouse_up",
+            "Release a mouse button at optional viewport coordinates",
+            json!({
+                "type": "object",
+                "properties": {
+                    "x": json!({"type": "number"}),
+                    "y": json!({"type": "number"}),
+                    "button": json!({"type": "string", "enum": ["left", "middle", "right"], "default": "left"})
+                },
+                "required": []
+            }),
+        ),
+        tool(
+            "browser_mouse_wheel",
+            "Scroll the mouse wheel at optional viewport coordinates",
+            json!({
+                "type": "object",
+                "properties": {
+                    "x": json!({"type": "number"}),
+                    "y": json!({"type": "number"}),
+                    "deltaX": json!({"type": "number", "default": 0}),
+                    "deltaY": json!({"type": "number", "default": 0})
+                },
+                "required": []
             }),
         ),
         tool(
@@ -951,7 +1086,75 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"browser_snapshot".to_owned()));
         assert!(names.contains(&"browser_click".to_owned()));
+        assert!(names.contains(&"browser_hover".to_owned()));
+        assert!(names.contains(&"browser_fill_form".to_owned()));
         assert!(names.contains(&"browser_evaluate".to_owned()));
+    }
+
+    #[test]
+    fn devtools_tool_schemas_include_coordinate_mouse_tools() {
+        let tools = devtools_tools();
+        let tool_by_name = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.get("name").and_then(JsonValue::as_str) == Some(name))
+                .unwrap_or_else(|| panic!("missing tool schema: {name}"))
+        };
+        for name in [
+            "browser_mouse_move_xy",
+            "browser_mouse_click_xy",
+            "browser_mouse_drag_xy",
+            "browser_mouse_down",
+            "browser_mouse_up",
+            "browser_mouse_wheel",
+        ] {
+            let schema = &tool_by_name(name)["inputSchema"];
+            assert_eq!(schema["type"].as_str(), Some("object"), "{name}");
+        }
+
+        let move_required = tool_by_name("browser_mouse_move_xy")["inputSchema"]["required"]
+            .as_array()
+            .unwrap();
+        assert!(move_required.contains(&json!("x")));
+        assert!(move_required.contains(&json!("y")));
+
+        let click_required = tool_by_name("browser_mouse_click_xy")["inputSchema"]["required"]
+            .as_array()
+            .unwrap();
+        assert!(click_required.contains(&json!("x")));
+        assert!(click_required.contains(&json!("y")));
+
+        let drag_required = tool_by_name("browser_mouse_drag_xy")["inputSchema"]["required"]
+            .as_array()
+            .unwrap();
+        for field in ["startX", "startY", "endX", "endY"] {
+            assert!(drag_required.contains(&json!(field)));
+        }
+
+        assert_eq!(
+            tool_by_name("browser_mouse_down")["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            tool_by_name("browser_mouse_up")["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            tool_by_name("browser_mouse_wheel")["inputSchema"]["properties"]["deltaX"]["default"]
+                .as_i64(),
+            Some(0)
+        );
+        assert_eq!(
+            tool_by_name("browser_mouse_wheel")["inputSchema"]["properties"]["deltaY"]["default"]
+                .as_i64(),
+            Some(0)
+        );
     }
 
     #[test]

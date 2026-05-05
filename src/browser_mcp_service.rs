@@ -66,6 +66,14 @@ impl BrowserMcpIpcResponse {
             data: None,
         }
     }
+
+    pub fn error_with_data(text: impl Into<String>, data: JsonValue) -> Self {
+        Self {
+            text: text.into(),
+            is_error: true,
+            data: Some(data),
+        }
+    }
 }
 
 pub struct BrowserMcpCommand {

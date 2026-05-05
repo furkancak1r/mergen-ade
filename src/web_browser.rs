@@ -122,6 +122,47 @@ fn screenshot_cdp_params(params: &JsonValue) -> (&'static str, JsonValue) {
     )
 }
 
+pub(crate) fn browser_mcp_tool_uses_async_script(tool: &str) -> bool {
+    matches!(
+        tool,
+        "browser_click"
+            | "browser_hover"
+            | "browser_select_option"
+            | "browser_fill_form"
+            | "browser_press_key"
+            | "browser_type"
+            | "browser_mouse_move_xy"
+            | "browser_mouse_click_xy"
+            | "browser_mouse_drag_xy"
+            | "browser_mouse_down"
+            | "browser_mouse_up"
+            | "browser_mouse_wheel"
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn browser_mcp_script_expression(tool: &str, params: &JsonValue) -> Result<String, String> {
+    let payload = json!({ "tool": tool, "params": params });
+    let payload_json = serde_json::to_string(&payload).map_err(|err| err.to_string())?;
+    Ok(format!(
+        "(() => {{ const __mergenMcpPayload = {payload_json}; {} return window.__mergenMcpRun(__mergenMcpPayload.tool, __mergenMcpPayload.params); }})()",
+        MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn browser_mcp_runtime_evaluate_params(
+    tool: &str,
+    params: &JsonValue,
+) -> Result<JsonValue, String> {
+    Ok(json!({
+        "expression": browser_mcp_script_expression(tool, params)?,
+        "awaitPromise": true,
+        "returnByValue": true,
+        "userGesture": true
+    }))
+}
+
 pub(crate) fn browser_mcp_screenshot_output_from_devtools_raw(
     raw: &str,
     format: &str,
@@ -753,8 +794,6 @@ impl EmbeddedBrowser {
             | "browser_console_messages"
             | "browser_network_requests"
             | "browser_network_request"
-            | "browser_tabs"
-            | "browser_close"
             | "browser_resize"
             | "browser_highlight"
             | "browser_hide_highlight"
@@ -800,12 +839,12 @@ impl EmbeddedBrowser {
     ) -> Result<BrowserMcpToolOutput, String> {
         #[cfg(target_os = "windows")]
         {
-            let payload = json!({ "tool": tool, "params": params });
-            let payload_json = serde_json::to_string(&payload).map_err(|err| err.to_string())?;
-            let script = format!(
-                "(() => {{ const __mergenMcpPayload = {payload_json}; {} return window.__mergenMcpRun(__mergenMcpPayload.tool, __mergenMcpPayload.params); }})()",
-                MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
-            );
+            if browser_mcp_tool_uses_async_script(tool) {
+                let cdp_params = browser_mcp_runtime_evaluate_params(tool, params)?;
+                let raw = self.call_devtools_protocol_method("Runtime.evaluate", &cdp_params)?;
+                return browser_mcp_output_from_devtools_runtime_raw(&raw);
+            }
+            let script = browser_mcp_script_expression(tool, params)?;
             let value = self.execute_script_value(&script)?;
             browser_mcp_output_from_script_value(value)
         }
@@ -813,6 +852,25 @@ impl EmbeddedBrowser {
         #[cfg(not(target_os = "windows"))]
         {
             let _ = (tool, params);
+            Err("Embedded browser automation is currently Windows-only".to_owned())
+        }
+    }
+
+    pub fn start_mcp_script_tool(
+        &mut self,
+        request_id: String,
+        tool: &str,
+        params: &JsonValue,
+    ) -> Result<(), String> {
+        #[cfg(target_os = "windows")]
+        {
+            let cdp_params = browser_mcp_runtime_evaluate_params(tool, params)?;
+            self.call_devtools_protocol_method_for_script_async(request_id, &cdp_params)
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (request_id, tool, params);
             Err("Embedded browser automation is currently Windows-only".to_owned())
         }
     }
@@ -993,6 +1051,47 @@ impl EmbeddedBrowser {
         Ok(())
     }
 
+    #[cfg(target_os = "windows")]
+    fn call_devtools_protocol_method_for_script_async(
+        &mut self,
+        request_id: String,
+        params: &JsonValue,
+    ) -> Result<(), String> {
+        use webview2_com::{CallDevToolsProtocolMethodCompletedHandler, CoTaskMemPWSTR};
+
+        let Some(inner) = &self.inner else {
+            return Err("Embedded browser is not ready".to_owned());
+        };
+        let webview = inner.webview.clone();
+        let event_sender = self.event_sender.clone();
+        let params = serde_json::to_string(params).map_err(|err| err.to_string())?;
+        let callback = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+            move |error_code, result| -> windows::core::Result<()> {
+                let tool_result = match error_code {
+                    Ok(()) => browser_mcp_output_from_devtools_runtime_raw(&result),
+                    Err(err) => Err(format!("WebView2 Runtime.evaluate failed: {err:?}")),
+                };
+                let _ = event_sender.send(BrowserEvent::McpToolResult {
+                    request_id: request_id.clone(),
+                    result: tool_result,
+                });
+                Ok(())
+            },
+        ));
+        let method = CoTaskMemPWSTR::from("Runtime.evaluate");
+        let params = CoTaskMemPWSTR::from(params.as_str());
+        unsafe {
+            webview
+                .CallDevToolsProtocolMethod(
+                    *method.as_ref().as_pcwstr(),
+                    *params.as_ref().as_pcwstr(),
+                    &callback,
+                )
+                .map_err(|err| format!("WebView2 Runtime.evaluate failed: {err:?}"))?;
+        }
+        Ok(())
+    }
+
     /// Drain all pending browser events.
     pub fn drain_events(&mut self) -> Vec<BrowserEvent> {
         let mut events = Vec::new();
@@ -1098,12 +1197,37 @@ fn browser_mcp_output_from_script_value(value: JsonValue) -> Result<BrowserMcpTo
     }
 }
 
+pub(crate) fn browser_mcp_output_from_devtools_runtime_raw(
+    raw: &str,
+) -> Result<BrowserMcpToolOutput, String> {
+    let parsed = serde_json::from_str::<JsonValue>(raw)
+        .map_err(|err| format!("WebView2 Runtime.evaluate returned invalid JSON ({err}): {raw}"))?;
+    if let Some(exception) = parsed.get("exceptionDetails") {
+        let message = exception
+            .get("exception")
+            .and_then(|value| value.get("description").or_else(|| value.get("value")))
+            .and_then(JsonValue::as_str)
+            .or_else(|| exception.get("text").and_then(JsonValue::as_str))
+            .unwrap_or("Browser command failed during page evaluation");
+        return Err(message.to_owned());
+    }
+    let result = parsed
+        .get("result")
+        .ok_or_else(|| format!("WebView2 Runtime.evaluate response missing result: {raw}"))?;
+    let value = result
+        .get("value")
+        .cloned()
+        .ok_or_else(|| format!("WebView2 Runtime.evaluate response missing value: {raw}"))?;
+    browser_mcp_output_from_script_value(value)
+}
+
 #[cfg(target_os = "windows")]
 const MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT: &str = r#"
-if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 2) {
+if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 3) {
   window.__mergenMcpState = window.__mergenMcpState || { refCounter: 1, consoleMessages: [], networkRequests: [], routes: [], highlighted: null };
 
   const state = window.__mergenMcpState;
+  state.cursor = state.cursor || { x: Math.round(window.innerWidth / 2), y: Math.round(window.innerHeight / 2), visible: false, mouseDownButton: null };
   const clean = (value, max = 240) => String(value ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
   const visible = (element) => {
     if (!element || element.nodeType !== Node.ELEMENT_NODE) return false;
@@ -1142,6 +1266,179 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 2) {
     if (!element.dataset.mergenMcpRef) element.dataset.mergenMcpRef = `e${state.refCounter++}`;
     return element.dataset.mergenMcpRef;
   };
+  const nextFrame = () => new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
+  const clampPoint = (x, y) => ({
+    x: clamp(Number(x), 0, Math.max(0, window.innerWidth - 1)),
+    y: clamp(Number(y), 0, Math.max(0, window.innerHeight - 1)),
+  });
+  const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key);
+  const numberParam = (object, key, required = true) => {
+    if (!hasOwn(object, key) || object[key] === null || object[key] === undefined || object[key] === '') {
+      if (required) throw new Error(`${key} is required and must be a finite number`);
+      return null;
+    }
+    const value = Number(object[key]);
+    if (!Number.isFinite(value)) throw new Error(`${key} must be a finite number`);
+    return value;
+  };
+  const requiredPoint = (params, xName = 'x', yName = 'y') => clampPoint(numberParam(params, xName), numberParam(params, yName));
+  const optionalPoint = (params) => {
+    const hasX = hasOwn(params, 'x') && params.x !== null && params.x !== undefined && params.x !== '';
+    const hasY = hasOwn(params, 'y') && params.y !== null && params.y !== undefined && params.y !== '';
+    if (hasX !== hasY) throw new Error('x and y must be supplied together');
+    if (hasX && hasY) return requiredPoint(params);
+    return clampPoint(state.cursor.x, state.cursor.y);
+  };
+  const buttonName = (value) => {
+    const button = String(value || 'left').toLowerCase();
+    if (button === 'left' || button === 'middle' || button === 'right') return button;
+    throw new Error(`Unsupported mouse button: ${value}`);
+  };
+  const buttonCode = (button) => ({ left: 0, middle: 1, right: 2 }[buttonName(button)]);
+  const buttonMask = (button) => ({ left: 1, middle: 4, right: 2 }[buttonName(button)]);
+  const ensureCursorStyle = () => {
+    if (document.querySelector('style[data-mergen-mcp-cursor-style]')) return;
+    const style = document.createElement('style');
+    style.setAttribute('data-mergen-mcp-cursor-style', 'true');
+    style.textContent = '@keyframes mergenMcpCursorPulse { 0% { opacity: 0.95; transform: translate(-50%, -50%) scale(0.25); } 100% { opacity: 0; transform: translate(-50%, -50%) scale(2.4); } }';
+    document.documentElement.appendChild(style);
+  };
+  const ensureCursor = () => {
+    if (state.cursorElement && document.documentElement.contains(state.cursorElement)) return state.cursorElement;
+    ensureCursorStyle();
+    const cursor = document.createElement('div');
+    cursor.setAttribute('data-mergen-mcp-cursor', 'true');
+    Object.assign(cursor.style, {
+      position: 'fixed',
+      left: '0px',
+      top: '0px',
+      width: '22px',
+      height: '28px',
+      pointerEvents: 'none',
+      zIndex: '2147483647',
+      display: 'none',
+      transform: 'translate(0px, 0px)',
+      willChange: 'transform',
+    });
+    const pointer = document.createElement('div');
+    Object.assign(pointer.style, {
+      width: '18px',
+      height: '24px',
+      background: 'rgba(248,250,252,0.98)',
+      clipPath: 'polygon(0 0, 0 22px, 6px 17px, 10px 24px, 14px 22px, 10px 15px, 18px 15px)',
+      filter: 'drop-shadow(0 0 1px rgba(15,23,42,0.95)) drop-shadow(0 2px 5px rgba(0,0,0,0.45))',
+    });
+    cursor.appendChild(pointer);
+    document.documentElement.appendChild(cursor);
+    state.cursorElement = cursor;
+    return cursor;
+  };
+  const setCursorPosition = (x, y) => {
+    const point = clampPoint(x, y);
+    const cursor = ensureCursor();
+    cursor.style.display = 'block';
+    cursor.style.transform = `translate(${point.x.toFixed(1)}px, ${point.y.toFixed(1)}px)`;
+    state.cursor.x = point.x;
+    state.cursor.y = point.y;
+    state.cursor.visible = true;
+    return point;
+  };
+  const moveCursorTo = (x, y, options = {}) => new Promise((resolve) => {
+    const end = clampPoint(x, y);
+    const start = clampPoint(state.cursor.x, state.cursor.y);
+    const distance = Math.hypot(end.x - start.x, end.y - start.y);
+    const duration = options.duration ?? clamp(Math.round(distance * 0.7), 180, 340);
+    setCursorPosition(start.x, start.y);
+    if (duration <= 0 || distance < 1) {
+      const point = setCursorPosition(end.x, end.y);
+      options.onStep?.(point);
+      resolve(point);
+      return;
+    }
+    const started = performance.now();
+    const step = (now) => {
+      const t = clamp((now - started) / duration, 0, 1);
+      const eased = 1 - Math.pow(1 - t, 3);
+      const point = setCursorPosition(start.x + (end.x - start.x) * eased, start.y + (end.y - start.y) * eased);
+      options.onStep?.(point);
+      if (t < 1) requestAnimationFrame(step);
+      else resolve(point);
+    };
+    requestAnimationFrame(step);
+  });
+  const pulseCursor = (point) => {
+    ensureCursorStyle();
+    const pulse = document.createElement('div');
+    pulse.setAttribute('data-mergen-mcp-cursor-pulse', 'true');
+    Object.assign(pulse.style, {
+      position: 'fixed',
+      left: `${point.x}px`,
+      top: `${point.y}px`,
+      width: '24px',
+      height: '24px',
+      border: '2px solid rgba(245,158,11,0.95)',
+      borderRadius: '999px',
+      pointerEvents: 'none',
+      zIndex: '2147483646',
+      animation: 'mergenMcpCursorPulse 420ms ease-out forwards',
+    });
+    document.documentElement.appendChild(pulse);
+    setTimeout(() => pulse.remove(), 500);
+  };
+  const elementCenter = async (element) => {
+    element.scrollIntoView({ block: 'center', inline: 'center' });
+    await nextFrame();
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) throw new Error('Element is not visible after scrolling');
+    return clampPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+  };
+  const targetAt = (point, fallback = null) => document.elementFromPoint(point.x, point.y) || fallback || document.body || document.documentElement;
+  const dispatchMouse = (target, type, point, button = 'left', detail = 0, buttonsOverride = null) => {
+    const activeButton = buttonName(button);
+    const buttons = buttonsOverride ?? (state.cursor.mouseDownButton ? buttonMask(state.cursor.mouseDownButton) : 0);
+    return target.dispatchEvent(new MouseEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX: point.x,
+      clientY: point.y,
+      screenX: window.screenX + point.x,
+      screenY: window.screenY + point.y,
+      button: buttonCode(activeButton),
+      buttons,
+      detail,
+    }));
+  };
+  const dispatchMoveAt = (point, fallback = null) => {
+    const target = targetAt(point, fallback);
+    dispatchMouse(target, 'mouseover', point, 'left', 0, state.cursor.mouseDownButton ? buttonMask(state.cursor.mouseDownButton) : 0);
+    dispatchMouse(target, 'mousemove', point, 'left', 0, state.cursor.mouseDownButton ? buttonMask(state.cursor.mouseDownButton) : 0);
+    return target;
+  };
+  const clickAt = async (point, options = {}) => {
+    const button = buttonName(options.button);
+    const doubleClick = Boolean(options.doubleClick);
+    const target = targetAt(point, options.target || null);
+    dispatchMoveAt(point, target);
+    target.focus?.({ preventScroll: true });
+    dispatchMouse(target, 'mousedown', point, button, 1, buttonMask(button));
+    state.cursor.mouseDownButton = button;
+    dispatchMouse(target, 'mouseup', point, button, 1, 0);
+    state.cursor.mouseDownButton = null;
+    dispatchMouse(target, 'click', point, button, 1, 0);
+    if (doubleClick) {
+      dispatchMouse(target, 'mousedown', point, button, 2, buttonMask(button));
+      state.cursor.mouseDownButton = button;
+      dispatchMouse(target, 'mouseup', point, button, 2, 0);
+      state.cursor.mouseDownButton = null;
+      dispatchMouse(target, 'click', point, button, 2, 0);
+      dispatchMouse(target, 'dblclick', point, button, 2, 0);
+    }
+    if (button === 'right') dispatchMouse(target, 'contextmenu', point, button, 1, 0);
+    pulseCursor(point);
+    return target;
+  };
   const cssEscape = (value) => window.CSS?.escape ? window.CSS.escape(value) : String(value).replace(/[^a-zA-Z0-9_-]/g, '\\$&');
   const resolve = (target) => {
     if (!target) return null;
@@ -1159,9 +1456,15 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 2) {
     return Array.from(document.querySelectorAll('button,a,input,textarea,select,[role],[contenteditable],label,h1,h2,h3,h4,h5,h6'))
       .find((element) => visible(element) && nameOf(element).toLowerCase().includes(needle)) || null;
   };
+  const targetValue = (params = {}) => params.target ?? params.ref ?? params.selector ?? params.element ?? '';
+  const requiredElement = (params, tool) => {
+    const target = targetValue(params);
+    const element = resolve(target);
+    if (!element) throw new Error(`Element not found: ${target || tool}`);
+    return { element, target };
+  };
   const event = (element, name) => element.dispatchEvent(new Event(name, { bubbles: true, cancelable: true }));
   const inputText = (element, text) => {
-    element.scrollIntoView({ block: 'center', inline: 'center' });
     element.focus?.();
     if (element.isContentEditable) {
       element.textContent = text;
@@ -1170,6 +1473,154 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 2) {
     }
     event(element, 'input');
     event(element, 'change');
+  };
+  const fillOneField = async (field) => {
+    const target = field.target ?? field.ref ?? field.selector ?? field.name ?? '';
+    const element = resolve(target);
+    if (!element) throw new Error(`Element not found: ${target}`);
+    const point = await elementCenter(element);
+    await moveCursorTo(point.x, point.y);
+    dispatchMoveAt(point, element);
+    element.focus?.({ preventScroll: true });
+    if (field.type === 'checkbox' || field.type === 'radio') {
+      element.checked = field.value === true || String(field.value).toLowerCase() === 'true';
+      event(element, 'input');
+      event(element, 'change');
+    } else if (field.type === 'combobox') {
+      element.value = String(field.value ?? '');
+      event(element, 'input');
+      event(element, 'change');
+    } else {
+      inputText(element, String(field.value ?? ''));
+    }
+  };
+  const runVisualTool = async (tool, params = {}) => {
+    if (tool === 'browser_click') {
+      const { element, target } = requiredElement(params, tool);
+      const point = await elementCenter(element);
+      await moveCursorTo(point.x, point.y);
+      await clickAt(point, { target: element, button: params.button, doubleClick: params.doubleClick });
+      return ok(`Clicked ${target}`);
+    }
+    if (tool === 'browser_hover') {
+      const { element, target } = requiredElement(params, tool);
+      const point = await elementCenter(element);
+      await moveCursorTo(point.x, point.y);
+      dispatchMoveAt(point, element);
+      return ok(`Hovered ${target}`);
+    }
+    if (tool === 'browser_select_option') {
+      const { element, target } = requiredElement(params, tool);
+      const point = await elementCenter(element);
+      await moveCursorTo(point.x, point.y);
+      dispatchMoveAt(point, element);
+      element.focus?.({ preventScroll: true });
+      const values = Array.isArray(params.values) ? params.values : [params.value ?? ''];
+      element.value = String(values[0] ?? '');
+      event(element, 'input');
+      event(element, 'change');
+      return ok(`Selected option ${element.value || values[0] || ''} in ${target}`);
+    }
+    if (tool === 'browser_type') {
+      const target = targetValue(params);
+      const element = target ? resolve(target) : document.activeElement;
+      if (!element) throw new Error(`Element not found: ${target || 'active element'}`);
+      const point = await elementCenter(element);
+      await moveCursorTo(point.x, point.y);
+      dispatchMoveAt(point, element);
+      inputText(element, String(params.text ?? ''));
+      if (params.submit) {
+        element.form?.requestSubmit?.();
+        element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        element.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+      }
+      return ok(`Typed into ${target || 'active element'}`);
+    }
+    if (tool === 'browser_fill_form') {
+      const fields = Array.isArray(params.fields) ? params.fields : [];
+      for (const field of fields) await fillOneField(field);
+      return ok('Form fields filled');
+    }
+    if (tool === 'browser_press_key') {
+      const active = document.activeElement || document.body || document.documentElement;
+      if (active && active.getBoundingClientRect) {
+        const rect = active.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          const point = clampPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+          await moveCursorTo(point.x, point.y);
+        } else {
+          setCursorPosition(state.cursor.x, state.cursor.y);
+        }
+      } else {
+        setCursorPosition(state.cursor.x, state.cursor.y);
+      }
+      const key = String(params.key || '');
+      active.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
+      if (key === 'Enter' && active.form) active.form.requestSubmit?.();
+      active.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true }));
+      return ok(`Pressed ${key}`);
+    }
+    if (tool === 'browser_mouse_move_xy') {
+      const point = requiredPoint(params);
+      await moveCursorTo(point.x, point.y);
+      dispatchMoveAt(point);
+      return ok(`Moved mouse to ${Math.round(point.x)}, ${Math.round(point.y)}`, { x: point.x, y: point.y });
+    }
+    if (tool === 'browser_mouse_click_xy') {
+      const point = requiredPoint(params);
+      await moveCursorTo(point.x, point.y);
+      await clickAt(point, { button: params.button, doubleClick: params.doubleClick });
+      return ok(`Clicked mouse at ${Math.round(point.x)}, ${Math.round(point.y)}`, { x: point.x, y: point.y });
+    }
+    if (tool === 'browser_mouse_drag_xy') {
+      const start = requiredPoint(params, 'startX', 'startY');
+      const end = requiredPoint(params, 'endX', 'endY');
+      const button = buttonName(params.button);
+      await moveCursorTo(start.x, start.y);
+      let target = targetAt(start);
+      dispatchMoveAt(start, target);
+      target.focus?.({ preventScroll: true });
+      dispatchMouse(target, 'mousedown', start, button, 1, buttonMask(button));
+      state.cursor.mouseDownButton = button;
+      await moveCursorTo(end.x, end.y, {
+        duration: 340,
+        onStep: (point) => {
+          target = targetAt(point, target);
+          dispatchMouse(target, 'mousemove', point, button, 0, buttonMask(button));
+        },
+      });
+      dispatchMouse(targetAt(end, target), 'mouseup', end, button, 1, 0);
+      state.cursor.mouseDownButton = null;
+      return ok(`Dragged mouse from ${Math.round(start.x)}, ${Math.round(start.y)} to ${Math.round(end.x)}, ${Math.round(end.y)}`, { startX: start.x, startY: start.y, endX: end.x, endY: end.y });
+    }
+    if (tool === 'browser_mouse_down') {
+      const point = optionalPoint(params);
+      const button = buttonName(params.button);
+      await moveCursorTo(point.x, point.y);
+      const target = targetAt(point);
+      dispatchMoveAt(point, target);
+      dispatchMouse(target, 'mousedown', point, button, 1, buttonMask(button));
+      state.cursor.mouseDownButton = button;
+      return ok(`Mouse ${button} button down at ${Math.round(point.x)}, ${Math.round(point.y)}`, { x: point.x, y: point.y, button });
+    }
+    if (tool === 'browser_mouse_up') {
+      const point = optionalPoint(params);
+      const button = buttonName(params.button || state.cursor.mouseDownButton || 'left');
+      await moveCursorTo(point.x, point.y);
+      dispatchMouse(targetAt(point), 'mouseup', point, button, 1, 0);
+      state.cursor.mouseDownButton = null;
+      return ok(`Mouse ${button} button up at ${Math.round(point.x)}, ${Math.round(point.y)}`, { x: point.x, y: point.y, button });
+    }
+    if (tool === 'browser_mouse_wheel') {
+      const point = optionalPoint(params);
+      const deltaX = numberParam(params, 'deltaX', false) ?? 0;
+      const deltaY = numberParam(params, 'deltaY', false) ?? 0;
+      await moveCursorTo(point.x, point.y);
+      const target = targetAt(point);
+      target.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, clientX: point.x, clientY: point.y, deltaX, deltaY, deltaMode: 0 }));
+      return ok(`Scrolled mouse wheel at ${Math.round(point.x)}, ${Math.round(point.y)}`, { x: point.x, y: point.y, deltaX, deltaY });
+    }
+    throw new Error(`Unsupported visual browser MCP tool: ${tool}`);
   };
   const snapshot = (params = {}) => {
     const maxDepth = Number(params.depth ?? 8);
@@ -1214,8 +1665,6 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 2) {
       if (tool === 'browser_console_messages') return fail('Console capture is not implemented by Mergen Browser MCP yet.');
       if (tool === 'browser_network_requests') return fail('Network request capture is not implemented by Mergen Browser MCP yet.');
       if (tool === 'browser_network_request') return fail('Detailed network capture is not implemented by Mergen Browser MCP yet.');
-      if (tool === 'browser_tabs') return params.action === 'list' ? ok(`- 0: (current) [${document.title || 'Page'}](${location.href})`) : fail('Mergen Browser MCP supports only browser_tabs action=list.');
-      if (tool === 'browser_close') return fail('Mergen Browser MCP does not destroy the embedded Mergen Browser panel.');
       if (tool === 'browser_resize') return fail('Resize is controlled by the Mergen Browser panel size.');
       if (tool === 'browser_wait_for') {
         const text = params.text ? String(params.text) : '';
@@ -1225,25 +1674,6 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 2) {
         if (text && body.includes(text)) return ok(`Text found: ${text}`);
         if (gone && !body.includes(gone)) return ok(`Text is gone: ${gone}`);
         return fail(text ? `Text not found: ${text}` : `Text is still visible: ${gone}`);
-      }
-      if (tool === 'browser_press_key') {
-        const active = document.activeElement || document.body;
-        const key = String(params.key || '');
-        active.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
-        if (key === 'Enter' && active.form) active.form.requestSubmit?.();
-        active.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true }));
-        return ok(`Pressed ${key}`);
-      }
-      if (tool === 'browser_fill_form') {
-        for (const field of params.fields || []) {
-          const element = resolve(field.target);
-          if (!element) return fail(`Element not found: ${field.target}`);
-          if (field.type === 'checkbox' || field.type === 'radio') element.checked = String(field.value) === 'true';
-          else if (field.type === 'combobox') { element.value = String(field.value); }
-          else inputText(element, String(field.value ?? ''));
-          event(element, 'change');
-        }
-        return ok('Form fields filled');
       }
       if (tool.startsWith('browser_localstorage_') || tool.startsWith('browser_sessionstorage_')) {
         const store = tool.includes('sessionstorage') ? sessionStorage : localStorage;
@@ -1259,18 +1689,15 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 2) {
       if (tool === 'browser_cookie_set') { document.cookie = `${params.name}=${params.value}; path=${params.path || '/'}`; return ok(`Cookie set: ${params.name}`); }
       if (tool === 'browser_cookie_delete') { document.cookie = `${params.name}=; Max-Age=0; path=/`; return ok(`Cookie deleted: ${params.name}`); }
       if (tool === 'browser_cookie_clear') { for (const c of document.cookie.split('; ')) document.cookie = `${c.split('=')[0]}=; Max-Age=0; path=/`; return ok('Visible document cookies cleared'); }
-      if (tool.startsWith('browser_mouse_')) return fail(`${tool} is not implemented by Mergen Browser MCP yet.`);
-      const element = resolve(params.target);
-      if (['browser_click', 'browser_hover', 'browser_select_option', 'browser_type', 'browser_evaluate', 'browser_highlight', 'browser_hide_highlight'].includes(tool) && !element && tool !== 'browser_evaluate' && tool !== 'browser_hide_highlight') return fail(`Element not found: ${params.target}`);
-      if (tool === 'browser_click') { element.scrollIntoView({ block: 'center', inline: 'center' }); element.focus?.(); params.doubleClick ? element.dispatchEvent(new MouseEvent('dblclick', { bubbles: true })) : element.click(); return ok(`Clicked ${params.target}`); }
-      if (tool === 'browser_hover') { element.scrollIntoView({ block: 'center', inline: 'center' }); element.dispatchEvent(new MouseEvent('mouseover', { bubbles: true })); return ok(`Hovered ${params.target}`); }
-      if (tool === 'browser_select_option') { const values = params.values || []; element.value = String(values[0] ?? ''); event(element, 'input'); event(element, 'change'); return ok(`Selected option ${element.value}`); }
-      if (tool === 'browser_type') { inputText(element, String(params.text ?? '')); if (params.submit) { element.form?.requestSubmit?.(); element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); } return ok(`Typed into ${params.target}`); }
+      if (['browser_click', 'browser_hover', 'browser_select_option', 'browser_type', 'browser_fill_form', 'browser_press_key', 'browser_mouse_move_xy', 'browser_mouse_click_xy', 'browser_mouse_drag_xy', 'browser_mouse_down', 'browser_mouse_up', 'browser_mouse_wheel'].includes(tool)) return runVisualTool(tool, params);
+      const element = resolve(targetValue(params));
+      if (['browser_highlight'].includes(tool) && !element) return fail(`Element not found: ${targetValue(params)}`);
       if (tool === 'browser_highlight') { highlight(element, params.style); return ok(`Highlighted ${params.target}`); }
       if (tool === 'browser_hide_highlight') { if (state.highlighted) state.highlighted.style.display = 'none'; return ok('Highlight hidden'); }
       if (tool === 'browser_evaluate') {
-        const expr = String(params.function || '');
-        const value = eval(`(${expr})`);
+        const expr = String(params.function || params.script || '');
+        let value;
+        try { value = eval(`(${expr})`); } catch (_) { value = eval(expr); }
         const result = typeof value === 'function' ? value(element || undefined) : value;
         return ok(JSON.stringify(result, null, 2) ?? 'undefined', { result });
       }
@@ -1279,7 +1706,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 2) {
       return fail(error && error.stack ? String(error.stack) : String(error));
     }
   };
-  window.__mergenMcpRun.version = 2;
+  window.__mergenMcpRun.version = 3;
 }
 "#;
 
@@ -1655,6 +2082,55 @@ mod tests {
     }
 
     #[test]
+    fn browser_mcp_runtime_evaluate_output_extracts_tool_result() {
+        let output = browser_mcp_output_from_devtools_runtime_raw(
+            r#"{"result":{"type":"object","value":{"ok":true,"text":"Moved","data":{"x":12}}}}"#,
+        )
+        .expect("runtime output should parse");
+
+        assert_eq!(output.text, "Moved");
+        assert_eq!(output.data.unwrap()["x"].as_i64(), Some(12));
+    }
+
+    #[test]
+    fn browser_mcp_runtime_evaluate_output_reports_exceptions() {
+        let err = browser_mcp_output_from_devtools_runtime_raw(
+            r#"{"exceptionDetails":{"text":"Uncaught","exception":{"description":"Error: bad coordinates"}}}"#,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("bad coordinates"));
+    }
+
+    #[test]
+    fn browser_mcp_visual_tools_use_async_script_path() {
+        for tool in [
+            "browser_click",
+            "browser_hover",
+            "browser_select_option",
+            "browser_fill_form",
+            "browser_press_key",
+            "browser_type",
+            "browser_mouse_move_xy",
+            "browser_mouse_click_xy",
+            "browser_mouse_drag_xy",
+            "browser_mouse_down",
+            "browser_mouse_up",
+            "browser_mouse_wheel",
+        ] {
+            assert!(
+                browser_mcp_tool_uses_async_script(tool),
+                "{tool} should await page-side cursor motion"
+            );
+        }
+
+        assert!(!browser_mcp_tool_uses_async_script("browser_snapshot"));
+        assert!(!browser_mcp_tool_uses_async_script(
+            "browser_take_screenshot"
+        ));
+    }
+
+    #[test]
     fn parse_design_inspect_ready_message() {
         let event = parse_design_inspect_message(
             r#"{"source":"mergen-ade-design-inspect","token":"test-token","type":"ready"}"#,
@@ -1753,6 +2229,22 @@ mod tests {
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("request accepted"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
             .contains("fixed waits are handled by the MCP helper"));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn browser_mcp_automation_script_includes_visible_cursor_and_mouse_tools() {
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("moveCursorTo"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("browser_mouse_move_xy"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("browser_mouse_click_xy"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("browser_mouse_drag_xy"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("browser_mouse_down"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("browser_mouse_up"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("browser_mouse_wheel"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("browser_mouse_')) return fail"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("is not implemented by Mergen Browser MCP yet.`);"));
     }
 
     #[test]
