@@ -1,5 +1,29 @@
 ### Known Issues & Fix Log
 
+#### Browser MCP screenshots caused WebView flash, black frames, and slow visual loops {#browser-mcp-screenshot-flash-black-slow}
+- Date: 2026-05-05
+- Context: Browser MCP `browser_take_screenshot` and video frame capture using embedded WebView2/CDP.
+- Error signature: `Screenshot looks like page refresh`, `black browser frame`, `AI waits 2-3s around screenshots`.
+- Symptoms/Impact:
+  1. Screenshot requests could make the Browser panel visibly flash or look like it reloaded.
+  2. Some captures returned black/blank frames when WebView2 had not painted a stable surface.
+  3. PNG/default visual capture produced heavier payloads than needed for AI inspection loops.
+- Root cause:
+  1. Screenshot capture reused panel-opening preparation meant for visual interactions.
+  2. `Page.captureScreenshot` used PNG defaults without fast encode parameters or black-frame retry.
+  3. WebView2 navigation/loading events were declared in app types but not emitted from native WebView2 events.
+- Resolution:
+  - Decoupled screenshot preparation from forced panel open for ready browsers.
+  - Changed screenshot defaults to fast JPEG with `optimizeForSpeed`, `quality`, and explicit PNG override support.
+  - Added short paint preflight, near-black frame detection, and one retry using alternate surface capture.
+  - Wired WebView2 navigation/loading events and applied an opaque default browser background.
+- Prevent recurrence:
+  - Keep screenshot capture separate from interaction setup that changes browser panel visibility.
+  - Prefer `browser_page_summary` for action planning and screenshots only for visual verification.
+  - Keep regression tests for screenshot params, blank-frame detection, and panel-open behavior.
+- Files/Commands touched: `src/web_browser.rs`, `src/browser_mcp_helper.rs`, `src/app.rs`, `KNOWN_ISSUES.md`.
+- References: User report on 2026-05-05 that screenshots look like page refreshes, sometimes black out, and make the AI loop too slow.
+
 #### Embedded browser did not persist saved passwords {#embedded-browser-persistent-passwords}
 - Date: 2026-05-04
 - Context: Browser panel WebView2 session, cookie, autofill, and password persistence

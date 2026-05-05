@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Bounds for the browser view in physical pixels.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -93,33 +93,63 @@ struct DesignInspectWireMessage {
 }
 
 const DESIGN_INSPECT_MESSAGE_SOURCE: &str = "mergen-ade-design-inspect";
+const SCREENSHOT_DEFAULT_JPEG_QUALITY: u8 = 74;
 static DESIGN_INSPECT_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn screenshot_format_from_params(params: &JsonValue) -> &'static str {
     let image_type = params
         .get("type")
         .and_then(JsonValue::as_str)
-        .unwrap_or("png");
-    if image_type.eq_ignore_ascii_case("jpeg") || image_type.eq_ignore_ascii_case("jpg") {
+        .unwrap_or("jpeg");
+    if image_type.eq_ignore_ascii_case("png") {
+        "png"
+    } else if image_type.eq_ignore_ascii_case("jpg") || image_type.eq_ignore_ascii_case("jpeg") {
         "jpeg"
     } else {
-        "png"
+        "jpeg"
     }
 }
 
+fn screenshot_quality_from_params(params: &JsonValue) -> u8 {
+    params
+        .get("quality")
+        .and_then(JsonValue::as_i64)
+        .map(|quality| quality.clamp(1, 100) as u8)
+        .unwrap_or(SCREENSHOT_DEFAULT_JPEG_QUALITY)
+}
+
 fn screenshot_cdp_params(params: &JsonValue) -> (&'static str, JsonValue) {
+    screenshot_cdp_params_with_surface(params, true)
+}
+
+fn screenshot_cdp_params_with_surface(
+    params: &JsonValue,
+    from_surface: bool,
+) -> (&'static str, JsonValue) {
     let format = screenshot_format_from_params(params);
     let capture_beyond_viewport = params
         .get("fullPage")
         .and_then(JsonValue::as_bool)
         .unwrap_or(false);
-    (
-        format,
-        json!({
-            "format": format,
-            "captureBeyondViewport": capture_beyond_viewport
-        }),
-    )
+    let mut cdp_params = json!({
+        "format": format,
+        "captureBeyondViewport": capture_beyond_viewport,
+        "fromSurface": from_surface,
+        "optimizeForSpeed": true
+    });
+    if format == "jpeg" {
+        cdp_params["quality"] = json!(screenshot_quality_from_params(params));
+    }
+    (format, cdp_params)
+}
+
+#[cfg(target_os = "windows")]
+fn screenshot_preflight_runtime_params() -> JsonValue {
+    json!({
+        "expression": "(() => new Promise((resolve) => { let done = false; const finish = () => { if (done) return; done = true; resolve({ readyState: document.readyState, visibilityState: document.visibilityState, width: window.innerWidth, height: window.innerHeight, url: location.href }); }; requestAnimationFrame(() => requestAnimationFrame(finish)); setTimeout(finish, 90); }))()",
+        "awaitPromise": true,
+        "returnByValue": true
+    })
 }
 
 pub(crate) fn browser_mcp_tool_uses_async_script(tool: &str) -> bool {
@@ -169,6 +199,15 @@ pub(crate) fn browser_mcp_screenshot_output_from_devtools_raw(
     raw: &str,
     format: &str,
 ) -> Result<BrowserMcpToolOutput, String> {
+    browser_mcp_screenshot_output_from_devtools_raw_with_metadata(raw, format, 0, None)
+}
+
+fn browser_mcp_screenshot_output_from_devtools_raw_with_metadata(
+    raw: &str,
+    format: &str,
+    retry_count: u8,
+    elapsed: Option<std::time::Duration>,
+) -> Result<BrowserMcpToolOutput, String> {
     let parsed = serde_json::from_str::<JsonValue>(&raw).unwrap_or_else(|_| json!({}));
     let data = parsed
         .get("data")
@@ -179,11 +218,87 @@ pub(crate) fn browser_mcp_screenshot_output_from_devtools_raw(
     }
     Ok(BrowserMcpToolOutput {
         text: format!(
-            "Screenshot captured from the embedded Mergen browser ({} base64 bytes).",
-            data.len()
+            "Screenshot captured from the embedded Mergen browser ({} {}, {} base64 bytes, {} retries).",
+            format,
+            elapsed
+                .map(|duration| format!("{}ms", duration.as_millis()))
+                .unwrap_or_else(|| "elapsed unknown".to_owned()),
+            data.len(),
+            retry_count
         ),
-        data: Some(json!({ "imageType": format, "base64": data })),
+        data: Some(json!({
+            "imageType": format,
+            "base64": data,
+            "retryCount": retry_count,
+            "elapsedMs": elapsed.map(|duration| duration.as_millis() as u64)
+        })),
     })
+}
+
+fn browser_mcp_screenshot_retry_reason_from_devtools_raw(raw: &str) -> Option<&'static str> {
+    let parsed = serde_json::from_str::<JsonValue>(raw).ok()?;
+    let data = parsed.get("data").and_then(JsonValue::as_str)?;
+    if screenshot_base64_is_probably_black(data) {
+        Some("near-black frame")
+    } else {
+        None
+    }
+}
+
+fn screenshot_base64_is_probably_black(base64_data: &str) -> bool {
+    use base64::Engine as _;
+
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(base64_data) else {
+        return false;
+    };
+    screenshot_bytes_are_probably_black(bytes.as_slice())
+}
+
+fn screenshot_bytes_are_probably_black(bytes: &[u8]) -> bool {
+    let Ok(image) = image::load_from_memory(bytes) else {
+        return false;
+    };
+    let image = image.to_rgba8();
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return false;
+    }
+
+    let columns = width.min(12);
+    let rows = height.min(8);
+    let mut samples = 0u64;
+    let mut transparent_samples = 0u64;
+    let mut luma_sum = 0u64;
+    let mut luma_sq_sum = 0u64;
+    let mut max_channel = 0u8;
+
+    for row in 0..rows {
+        let y = ((row as u64 * height as u64) / rows as u64).min(height as u64 - 1) as u32;
+        for column in 0..columns {
+            let x = ((column as u64 * width as u64) / columns as u64).min(width as u64 - 1) as u32;
+            let pixel = image.get_pixel(x, y);
+            let [red, green, blue, alpha] = pixel.0;
+            samples += 1;
+            if alpha < 8 {
+                transparent_samples += 1;
+            }
+            max_channel = max_channel.max(red).max(green).max(blue);
+            let luma = (red as u64 * 299 + green as u64 * 587 + blue as u64 * 114) / 1000;
+            luma_sum += luma;
+            luma_sq_sum += luma * luma;
+        }
+    }
+
+    if samples == 0 {
+        return false;
+    }
+    if transparent_samples == samples {
+        return true;
+    }
+
+    let mean = luma_sum as f64 / samples as f64;
+    let variance = (luma_sq_sum as f64 / samples as f64) - (mean * mean);
+    max_channel <= 12 && mean <= 8.0 && variance <= 10.0
 }
 
 fn new_design_inspect_token() -> String {
@@ -520,12 +635,23 @@ impl EmbeddedBrowser {
         );
 
         match result {
-            Ok((controller, webview, source_changed_token, web_message_received_token)) => {
+            Ok((
+                controller,
+                webview,
+                source_changed_token,
+                web_message_received_token,
+                navigation_starting_token,
+                content_loading_token,
+                navigation_completed_token,
+            )) => {
                 self.inner = Some(WindowsWebView {
                     controller,
                     webview,
                     source_changed_token: Some(source_changed_token),
                     web_message_received_token: Some(web_message_received_token),
+                    navigation_starting_token: Some(navigation_starting_token),
+                    content_loading_token: Some(content_loading_token),
+                    navigation_completed_token: Some(navigation_completed_token),
                 });
                 self.status = BrowserStatus::Ready;
                 log::info!("WebView2 created successfully");
@@ -884,9 +1010,37 @@ impl EmbeddedBrowser {
     ) -> Result<BrowserMcpToolOutput, String> {
         #[cfg(target_os = "windows")]
         {
+            let started = Instant::now();
             let (format, cdp_params) = screenshot_cdp_params(params);
+            let (_, retry_cdp_params) = screenshot_cdp_params_with_surface(params, false);
+            self.run_screenshot_preflight();
             let raw = self.call_devtools_protocol_method("Page.captureScreenshot", &cdp_params)?;
-            browser_mcp_screenshot_output_from_devtools_raw(&raw, format)
+            if browser_mcp_screenshot_retry_reason_from_devtools_raw(&raw).is_some() {
+                self.run_screenshot_preflight();
+                let retry_raw = self
+                    .call_devtools_protocol_method("Page.captureScreenshot", &retry_cdp_params)?;
+                if let Some(reason) =
+                    browser_mcp_screenshot_retry_reason_from_devtools_raw(&retry_raw)
+                {
+                    return Err(format!(
+                        "WebView2 screenshot stayed blank after retry ({reason}, {}ms).",
+                        started.elapsed().as_millis()
+                    ));
+                }
+                browser_mcp_screenshot_output_from_devtools_raw_with_metadata(
+                    &retry_raw,
+                    format,
+                    1,
+                    Some(started.elapsed()),
+                )
+            } else {
+                browser_mcp_screenshot_output_from_devtools_raw_with_metadata(
+                    &raw,
+                    format,
+                    0,
+                    Some(started.elapsed()),
+                )
+            }
         }
 
         #[cfg(not(target_os = "windows"))]
@@ -904,11 +1058,12 @@ impl EmbeddedBrowser {
         #[cfg(target_os = "windows")]
         {
             let (format, cdp_params) = screenshot_cdp_params(params);
+            let (_, retry_cdp_params) = screenshot_cdp_params_with_surface(params, false);
             self.call_devtools_protocol_method_for_screenshot_async(
                 request_id,
                 format.to_owned(),
-                "Page.captureScreenshot",
                 &cdp_params,
+                &retry_cdp_params,
             )
         }
 
@@ -916,6 +1071,16 @@ impl EmbeddedBrowser {
         {
             let _ = (request_id, params);
             Err("Embedded browser screenshots are currently Windows-only".to_owned())
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn run_screenshot_preflight(&mut self) {
+        if let Err(err) = self.call_devtools_protocol_method(
+            "Runtime.evaluate",
+            &screenshot_preflight_runtime_params(),
+        ) {
+            log::debug!("WebView2 screenshot preflight failed; continuing capture: {err}");
         }
     }
 
@@ -1015,43 +1180,25 @@ impl EmbeddedBrowser {
         &mut self,
         request_id: String,
         format: String,
-        method: &str,
         params: &JsonValue,
+        retry_params: &JsonValue,
     ) -> Result<(), String> {
-        use webview2_com::{CallDevToolsProtocolMethodCompletedHandler, CoTaskMemPWSTR};
-
         let Some(inner) = &self.inner else {
             return Err("Embedded browser is not ready".to_owned());
         };
         let webview = inner.webview.clone();
         let event_sender = self.event_sender.clone();
-        let method = method.to_owned();
         let params = serde_json::to_string(params).map_err(|err| err.to_string())?;
-        let callback = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
-            move |error_code, result| -> windows::core::Result<()> {
-                let tool_result = match error_code {
-                    Ok(()) => browser_mcp_screenshot_output_from_devtools_raw(&result, &format),
-                    Err(err) => Err(format!("WebView2 DevTools method failed: {err:?}")),
-                };
-                let _ = event_sender.send(BrowserEvent::McpToolResult {
-                    request_id: request_id.clone(),
-                    result: tool_result,
-                });
-                Ok(())
-            },
-        ));
-        let method = CoTaskMemPWSTR::from(method.as_str());
-        let params = CoTaskMemPWSTR::from(params.as_str());
-        unsafe {
-            webview
-                .CallDevToolsProtocolMethod(
-                    *method.as_ref().as_pcwstr(),
-                    *params.as_ref().as_pcwstr(),
-                    &callback,
-                )
-                .map_err(|err| format!("WebView2 DevTools method failed: {err:?}"))?;
-        }
-        Ok(())
+        let retry_params = serde_json::to_string(retry_params).map_err(|err| err.to_string())?;
+        start_screenshot_capture_after_preflight(
+            webview,
+            event_sender,
+            request_id,
+            format,
+            params,
+            retry_params,
+            Instant::now(),
+        )
     }
 
     #[cfg(target_os = "windows")]
@@ -1125,6 +1272,21 @@ impl EmbeddedBrowser {
                         let _ = inner.webview.remove_WebMessageReceived(token);
                     }
                 }
+                if let Some(token) = inner.navigation_starting_token {
+                    unsafe {
+                        let _ = inner.webview.remove_NavigationStarting(token);
+                    }
+                }
+                if let Some(token) = inner.content_loading_token {
+                    unsafe {
+                        let _ = inner.webview.remove_ContentLoading(token);
+                    }
+                }
+                if let Some(token) = inner.navigation_completed_token {
+                    unsafe {
+                        let _ = inner.webview.remove_NavigationCompleted(token);
+                    }
+                }
                 log::info!("WebView2 resources released");
             }
         }
@@ -1148,6 +1310,154 @@ impl EmbeddedBrowser {
     pub(crate) fn send_test_event(&self, event: BrowserEvent) {
         let _ = self.event_sender.send(event);
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_status(&mut self, status: BrowserStatus) {
+        self.status = status;
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn start_screenshot_capture_after_preflight(
+    webview: ICoreWebView2,
+    event_sender: Sender<BrowserEvent>,
+    request_id: String,
+    format: String,
+    params: String,
+    retry_params: String,
+    started: Instant,
+) -> Result<(), String> {
+    use webview2_com::{CallDevToolsProtocolMethodCompletedHandler, CoTaskMemPWSTR};
+
+    let webview_for_capture = webview.clone();
+    let event_sender_for_capture = event_sender.clone();
+    let request_id_for_capture = request_id.clone();
+    let format_for_capture = format.clone();
+    let params_for_capture = params.clone();
+    let retry_params_for_capture = retry_params.clone();
+    let callback = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+        move |_error_code, _result| -> windows::core::Result<()> {
+            if let Err(err) = start_screenshot_cdp_capture(
+                webview_for_capture.clone(),
+                event_sender_for_capture.clone(),
+                request_id_for_capture.clone(),
+                format_for_capture.clone(),
+                params_for_capture.clone(),
+                Some(retry_params_for_capture.clone()),
+                started,
+                0,
+            ) {
+                let _ = event_sender_for_capture.send(BrowserEvent::McpToolResult {
+                    request_id: request_id_for_capture.clone(),
+                    result: Err(err),
+                });
+            }
+            Ok(())
+        },
+    ));
+    let method = CoTaskMemPWSTR::from("Runtime.evaluate");
+    let preflight_params = serde_json::to_string(&screenshot_preflight_runtime_params())
+        .map_err(|err| err.to_string())?;
+    let preflight_params = CoTaskMemPWSTR::from(preflight_params.as_str());
+    let preflight_result = unsafe {
+        webview.CallDevToolsProtocolMethod(
+            *method.as_ref().as_pcwstr(),
+            *preflight_params.as_ref().as_pcwstr(),
+            &callback,
+        )
+    };
+    if let Err(err) = preflight_result {
+        log::debug!("WebView2 screenshot preflight start failed; capturing anyway: {err:?}");
+        start_screenshot_cdp_capture(
+            webview,
+            event_sender,
+            request_id,
+            format,
+            params,
+            Some(retry_params),
+            started,
+            0,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn start_screenshot_cdp_capture(
+    webview: ICoreWebView2,
+    event_sender: Sender<BrowserEvent>,
+    request_id: String,
+    format: String,
+    params: String,
+    retry_params: Option<String>,
+    started: Instant,
+    retry_count: u8,
+) -> Result<(), String> {
+    use webview2_com::{CallDevToolsProtocolMethodCompletedHandler, CoTaskMemPWSTR};
+
+    let webview_for_retry = webview.clone();
+    let callback = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+        move |error_code, result| -> windows::core::Result<()> {
+            let tool_result = match error_code {
+                Ok(()) => {
+                    if let Some(reason) =
+                        browser_mcp_screenshot_retry_reason_from_devtools_raw(&result)
+                    {
+                        if retry_count == 0 {
+                            if let Some(retry_params) = retry_params.clone() {
+                                let retry_result = start_screenshot_cdp_capture(
+                                    webview_for_retry.clone(),
+                                    event_sender.clone(),
+                                    request_id.clone(),
+                                    format.clone(),
+                                    retry_params,
+                                    None,
+                                    started,
+                                    1,
+                                );
+                                if let Err(err) = retry_result {
+                                    let _ = event_sender.send(BrowserEvent::McpToolResult {
+                                        request_id: request_id.clone(),
+                                        result: Err(err),
+                                    });
+                                }
+                                return Ok(());
+                            }
+                        }
+                        Err(format!(
+                            "WebView2 screenshot stayed blank after retry ({reason}, {}ms).",
+                            started.elapsed().as_millis()
+                        ))
+                    } else {
+                        browser_mcp_screenshot_output_from_devtools_raw_with_metadata(
+                            &result,
+                            &format,
+                            retry_count,
+                            Some(started.elapsed()),
+                        )
+                    }
+                }
+                Err(err) => Err(format!("WebView2 DevTools method failed: {err:?}")),
+            };
+            let _ = event_sender.send(BrowserEvent::McpToolResult {
+                request_id: request_id.clone(),
+                result: tool_result,
+            });
+            Ok(())
+        },
+    ));
+    let method = CoTaskMemPWSTR::from("Page.captureScreenshot");
+    let params = CoTaskMemPWSTR::from(params.as_str());
+    unsafe {
+        webview
+            .CallDevToolsProtocolMethod(
+                *method.as_ref().as_pcwstr(),
+                *params.as_ref().as_pcwstr(),
+                &callback,
+            )
+            .map_err(|err| format!("WebView2 DevTools method failed: {err:?}"))?;
+    }
+    Ok(())
 }
 
 impl Default for EmbeddedBrowser {
@@ -1226,7 +1536,7 @@ pub(crate) fn browser_mcp_output_from_devtools_runtime_raw(
 
 #[cfg(target_os = "windows")]
 const MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT: &str = r#"
-if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 5) {
+if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 6) {
   window.__mergenMcpState = window.__mergenMcpState || { refCounter: 1, consoleMessages: [], networkRequests: [], routes: [], highlighted: null };
 
   const state = window.__mergenMcpState;
@@ -1311,55 +1621,139 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 5) {
   const buttonCode = (button) => ({ left: 0, middle: 1, right: 2 }[buttonName(button)]);
   const buttonMask = (button) => ({ left: 1, middle: 4, right: 2 }[buttonName(button)]);
   const ensureCursorStyle = () => {
-    if (document.querySelector('style[data-mergen-mcp-cursor-style]')) return;
+    const existing = document.querySelector('style[data-mergen-mcp-cursor-style]');
+    if (existing?.getAttribute('data-mergen-mcp-cursor-style') === '6') return;
+    existing?.remove();
     const style = document.createElement('style');
-    style.setAttribute('data-mergen-mcp-cursor-style', 'true');
-    style.textContent = '@keyframes mergenMcpCursorPulse { 0% { opacity: 0.95; transform: translate(-50%, -50%) scale(0.25); } 100% { opacity: 0; transform: translate(-50%, -50%) scale(2.4); } }';
+    style.setAttribute('data-mergen-mcp-cursor-style', '6');
+    style.textContent = `
+@keyframes mergenMcpCursorPulse {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(0.55); box-shadow: 0 0 0 0 rgba(56,189,248,0.34), 0 8px 20px rgba(2,6,23,0.26); }
+  22% { opacity: 0.95; }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(1.85); box-shadow: 0 0 0 12px rgba(56,189,248,0), 0 12px 28px rgba(2,6,23,0); }
+}
+@keyframes mergenMcpCursorIdleAura {
+  0%, 100% { opacity: 0.52; transform: translate(-50%, -50%) scale(0.96); }
+  50% { opacity: 0.68; transform: translate(-50%, -50%) scale(1.04); }
+}
+[data-mergen-mcp-cursor] [data-mergen-mcp-cursor-aura],
+[data-mergen-mcp-cursor] [data-mergen-mcp-cursor-focus],
+[data-mergen-mcp-cursor] [data-mergen-mcp-cursor-pointer] {
+  transition: opacity 130ms ease, transform 150ms cubic-bezier(0.16, 1, 0.3, 1), filter 150ms ease;
+}
+[data-mergen-mcp-cursor] [data-mergen-mcp-cursor-aura] {
+  animation: mergenMcpCursorIdleAura 1500ms ease-in-out infinite;
+}
+[data-mergen-mcp-cursor][data-mergen-mcp-cursor-phase="moving"] [data-mergen-mcp-cursor-aura] {
+  opacity: 0.76;
+  transform: translate(-50%, -50%) scale(1.12);
+}
+[data-mergen-mcp-cursor][data-mergen-mcp-cursor-phase="targeting"] [data-mergen-mcp-cursor-aura],
+[data-mergen-mcp-cursor][data-mergen-mcp-cursor-phase="click"] [data-mergen-mcp-cursor-aura] {
+  opacity: 0.9;
+  transform: translate(-50%, -50%) scale(0.82);
+  animation: none;
+}
+[data-mergen-mcp-cursor][data-mergen-mcp-cursor-phase="targeting"] [data-mergen-mcp-cursor-focus],
+[data-mergen-mcp-cursor][data-mergen-mcp-cursor-phase="click"] [data-mergen-mcp-cursor-focus] {
+  opacity: 0.9;
+  transform: translate(-50%, -50%) scale(0.86);
+}
+[data-mergen-mcp-cursor][data-mergen-mcp-cursor-phase="moving"] [data-mergen-mcp-cursor-pointer] {
+  filter: drop-shadow(0 2px 2px rgba(15,23,42,0.82)) drop-shadow(0 13px 22px rgba(2,6,23,0.28));
+}
+`;
     document.documentElement.appendChild(style);
   };
   const ensureCursor = () => {
-    if (state.cursorElement && document.documentElement.contains(state.cursorElement)) return state.cursorElement;
     ensureCursorStyle();
+    if (
+      state.cursorElement &&
+      document.documentElement.contains(state.cursorElement) &&
+      state.cursorElement.querySelector?.('[data-mergen-mcp-cursor-pointer]')
+    ) {
+      return state.cursorElement;
+    }
+    state.cursorElement?.remove?.();
     const cursor = document.createElement('div');
     cursor.setAttribute('data-mergen-mcp-cursor', 'true');
+    cursor.setAttribute('data-mergen-mcp-cursor-phase', state.cursor.phase || 'idle');
     Object.assign(cursor.style, {
       position: 'fixed',
       left: '0px',
       top: '0px',
-      width: '38px',
-      height: '38px',
+      width: '48px',
+      height: '48px',
       pointerEvents: 'none',
       zIndex: '2147483647',
       display: 'none',
       transform: 'translate(0px, 0px)',
+      transformOrigin: '0px 0px',
       willChange: 'transform',
+      contain: 'layout style paint',
     });
-    const halo = document.createElement('div');
-    halo.setAttribute('data-mergen-mcp-cursor-halo', 'true');
-    Object.assign(halo.style, {
+    cursor.style.setProperty('--mergen-mcp-cursor-tilt', '0deg');
+    const aura = document.createElement('div');
+    aura.setAttribute('data-mergen-mcp-cursor-aura', 'true');
+    Object.assign(aura.style, {
       position: 'absolute',
-      left: '0px',
-      top: '0px',
-      width: '34px',
-      height: '34px',
+      left: '12px',
+      top: '14px',
+      width: '42px',
+      height: '42px',
       borderRadius: '999px',
-      background: 'rgba(245,158,11,0.20)',
-      border: '1px solid rgba(245,158,11,0.70)',
-      boxShadow: '0 0 0 4px rgba(245,158,11,0.08), 0 2px 9px rgba(15,23,42,0.35)',
+      background: 'radial-gradient(circle, rgba(15,23,42,0.24) 0%, rgba(15,23,42,0.15) 36%, rgba(56,189,248,0.12) 58%, rgba(56,189,248,0) 72%)',
+      boxShadow: '0 10px 24px rgba(2,6,23,0.22)',
       transform: 'translate(-50%, -50%)',
+      opacity: '0.62',
+      mixBlendMode: 'normal',
     });
-    const pointer = document.createElement('div');
+    const focus = document.createElement('div');
+    focus.setAttribute('data-mergen-mcp-cursor-focus', 'true');
+    Object.assign(focus.style, {
+      position: 'absolute',
+      left: '12px',
+      top: '14px',
+      width: '25px',
+      height: '25px',
+      borderRadius: '999px',
+      border: '1px solid rgba(226,232,240,0.62)',
+      boxShadow: '0 0 0 1px rgba(15,23,42,0.22), 0 8px 20px rgba(2,6,23,0.18)',
+      transform: 'translate(-50%, -50%) scale(0.98)',
+      opacity: '0.42',
+    });
+    const pointer = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    pointer.setAttribute('data-mergen-mcp-cursor-pointer', 'true');
+    pointer.setAttribute('viewBox', '0 0 30 36');
+    pointer.setAttribute('aria-hidden', 'true');
     Object.assign(pointer.style, {
       position: 'absolute',
-      left: '0px',
-      top: '0px',
-      width: '18px',
-      height: '24px',
-      background: 'rgba(248,250,252,0.98)',
-      clipPath: 'polygon(0 0, 0 22px, 6px 17px, 10px 24px, 14px 22px, 10px 15px, 18px 15px)',
-      filter: 'drop-shadow(0 0 1px rgba(15,23,42,0.95)) drop-shadow(0 2px 5px rgba(0,0,0,0.45))',
+      left: '-3px',
+      top: '-3px',
+      width: '30px',
+      height: '36px',
+      overflow: 'visible',
+      transform: 'rotate(var(--mergen-mcp-cursor-tilt))',
+      transformOrigin: '4px 4px',
+      filter: 'drop-shadow(0 1px 1px rgba(15,23,42,0.9)) drop-shadow(0 9px 16px rgba(2,6,23,0.32))',
     });
-    cursor.appendChild(halo);
+    const pointerPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    pointerPath.setAttribute('d', 'M3.8 3.1 3.2 28.4 10.7 21.7 15.9 33.2 21.8 30.4 16.4 19.2 26.7 19.6 3.8 3.1Z');
+    pointerPath.setAttribute('fill', 'rgba(248,250,252,0.98)');
+    pointerPath.setAttribute('stroke', 'rgba(15,23,42,0.9)');
+    pointerPath.setAttribute('stroke-width', '1.45');
+    pointerPath.setAttribute('stroke-linejoin', 'round');
+    const pointerSheen = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    pointerSheen.setAttribute('d', 'M6.7 8.6 6.4 22.1 10.1 18.6 13.5 25.9');
+    pointerSheen.setAttribute('fill', 'none');
+    pointerSheen.setAttribute('stroke', 'rgba(255,255,255,0.72)');
+    pointerSheen.setAttribute('stroke-width', '1.15');
+    pointerSheen.setAttribute('stroke-linecap', 'round');
+    pointerSheen.setAttribute('stroke-linejoin', 'round');
+    pointer.appendChild(pointerPath);
+    pointer.appendChild(pointerSheen);
+    cursor.appendChild(aura);
+    cursor.appendChild(focus);
     cursor.appendChild(pointer);
     document.documentElement.appendChild(cursor);
     state.cursorElement = cursor;
@@ -1376,7 +1770,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 5) {
     if (!state.cursor.visible || !element || !document.documentElement.contains(element) || !visible(element)) return;
     const rect = element.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return;
-    setCursorPosition(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    setCursorPosition(rect.left + rect.width / 2, rect.top + rect.height / 2, { tilt: 0, phase: 'idle' });
   };
   const scheduleCursorAnchorSync = () => {
     if (state.cursorAnchorSyncQueued) return;
@@ -1386,39 +1780,91 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 5) {
       syncCursorToAnchor();
     });
   };
-  const setCursorPosition = (x, y) => {
+  const setCursorPhase = (phase) => {
+    const cursor = ensureCursor();
+    cursor.setAttribute('data-mergen-mcp-cursor-phase', phase);
+    state.cursor.phase = phase;
+    return cursor;
+  };
+  const scheduleCursorIdle = (delay = 190) => {
+    const token = (state.cursor.phaseToken || 0) + 1;
+    state.cursor.phaseToken = token;
+    setTimeout(() => {
+      if (state.cursor.phaseToken === token && state.cursor.visible) setCursorPhase('idle');
+    }, delay);
+  };
+  const setCursorPosition = (x, y, options = {}) => {
     const point = clampPoint(x, y);
     const cursor = ensureCursor();
     cursor.style.display = 'block';
     cursor.style.transform = `translate(${point.x.toFixed(1)}px, ${point.y.toFixed(1)}px)`;
+    if (hasOwn(options, 'tilt')) {
+      const tilt = clamp(Number(options.tilt) || 0, -12, 12);
+      cursor.style.setProperty('--mergen-mcp-cursor-tilt', `${tilt.toFixed(2)}deg`);
+      state.cursor.tilt = tilt;
+    }
+    if (options.phase) {
+      cursor.setAttribute('data-mergen-mcp-cursor-phase', options.phase);
+      state.cursor.phase = options.phase;
+    }
     state.cursor.x = point.x;
     state.cursor.y = point.y;
     state.cursor.visible = true;
     return point;
+  };
+  const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+  const organicCursorPoint = (start, end, t, distance, options = {}) => {
+    const eased = easeOutCubic(t);
+    const baseX = start.x + (end.x - start.x) * eased;
+    const baseY = start.y + (end.y - start.y) * eased;
+    if (options.straight || distance < 18 || t >= 0.995) return { x: baseX, y: baseY, tilt: 0 };
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const length = Math.max(1, distance);
+    const normalX = -dy / length;
+    const normalY = dx / length;
+    const launch = Math.sin(Math.PI * clamp(t / 0.18, 0, 1));
+    const straighten = 1 - clamp((t - 0.72) / 0.28, 0, 1);
+    const amplitude = clamp(distance * 0.045, 4, 18) * launch * straighten;
+    const phase = ((Math.round(start.x + start.y + end.x + end.y) % 31) / 31) * Math.PI;
+    const wave = Math.sin(t * Math.PI * 2.15 + phase) * amplitude;
+    const hover = Math.sin(Math.PI * t) * amplitude * 0.18;
+    const tilt = clamp((wave / Math.max(1, amplitude)) * 7 + Math.sign(dx || 1) * hover * 0.18, -10, 10) * straighten;
+    return { x: baseX + normalX * wave, y: baseY + normalY * wave - hover, tilt };
   };
   const moveCursorTo = (x, y, options = {}) => new Promise((resolve) => {
     const end = clampPoint(x, y);
     const start = state.cursor.visible ? clampPoint(state.cursor.x, state.cursor.y) : clampPoint(end.x - 96, end.y - 64);
     const distance = Math.hypot(end.x - start.x, end.y - start.y);
     const duration = options.duration ?? clamp(Math.round(distance * 1.15), 650, 900);
-    setCursorPosition(start.x, start.y);
+    setCursorPosition(start.x, start.y, { tilt: 0, phase: 'moving' });
     if (duration <= 0 || distance < 1) {
-      const point = setCursorPosition(end.x, end.y);
+      const point = setCursorPosition(end.x, end.y, { tilt: 0, phase: 'idle' });
       options.onStep?.(point);
       resolve(point);
       return;
     }
+    state.cursor.phaseToken = (state.cursor.phaseToken || 0) + 1;
     const started = performance.now();
     const step = (now) => {
       const t = clamp((now - started) / duration, 0, 1);
-      const eased = 1 - Math.pow(1 - t, 3);
-      const point = setCursorPosition(start.x + (end.x - start.x) * eased, start.y + (end.y - start.y) * eased);
+      const visual = organicCursorPoint(start, end, t, distance, options);
+      const phase = t > 0.72 ? 'targeting' : 'moving';
+      const point = setCursorPosition(visual.x, visual.y, { tilt: visual.tilt, phase });
       options.onStep?.(point);
       if (t < 1) requestAnimationFrame(step);
-      else resolve(point);
+      else {
+        const finalPoint = setCursorPosition(end.x, end.y, { tilt: 0, phase: 'idle' });
+        resolve(finalPoint);
+      }
     };
     requestAnimationFrame(step);
   });
+  const steadyCursorForAction = async (point, delay = 70) => {
+    setCursorPosition(point.x, point.y, { tilt: 0, phase: 'targeting' });
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    return setCursorPosition(point.x, point.y, { tilt: 0, phase: 'targeting' });
+  };
   const pulseCursor = (point) => {
     ensureCursorStyle();
     const pulse = document.createElement('div');
@@ -1427,16 +1873,19 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 5) {
       position: 'fixed',
       left: `${point.x}px`,
       top: `${point.y}px`,
-      width: '24px',
-      height: '24px',
-      border: '2px solid rgba(245,158,11,0.95)',
+      width: '18px',
+      height: '18px',
+      border: '1px solid rgba(226,232,240,0.92)',
       borderRadius: '999px',
+      background: 'radial-gradient(circle, rgba(56,189,248,0.22), rgba(56,189,248,0.02) 58%, rgba(56,189,248,0) 70%)',
+      boxShadow: '0 0 0 1px rgba(15,23,42,0.22), 0 8px 20px rgba(2,6,23,0.26)',
       pointerEvents: 'none',
       zIndex: '2147483646',
-      animation: 'mergenMcpCursorPulse 420ms ease-out forwards',
+      transform: 'translate(-50%, -50%)',
+      animation: 'mergenMcpCursorPulse 360ms cubic-bezier(0.16, 1, 0.3, 1) forwards',
     });
     document.documentElement.appendChild(pulse);
-    setTimeout(() => pulse.remove(), 500);
+    setTimeout(() => pulse.remove(), 440);
   };
   const stableElementCenterAfterScroll = async (element) => {
     element.scrollIntoView({ block: 'center', inline: 'center' });
@@ -1477,7 +1926,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 5) {
       }
       await nextFrame();
     }
-    setCursorPosition(point.x, point.y);
+    setCursorPosition(point.x, point.y, { tilt: 0, phase: 'idle' });
     dispatchMoveAt(point, targetAt(point, target));
   };
   const dispatchMouse = (target, type, point, button = 'left', detail = 0, buttonsOverride = null) => {
@@ -1533,6 +1982,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 5) {
     const button = buttonName(options.button);
     const doubleClick = Boolean(options.doubleClick);
     const target = targetAt(point, options.target || null);
+    await steadyCursorForAction(point);
     dispatchMoveAt(point, target);
     target.focus?.({ preventScroll: true });
     dispatchMouse(target, 'mousedown', point, button, 1, buttonMask(button));
@@ -1549,7 +1999,9 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 5) {
       dispatchMouse(target, 'dblclick', point, button, 2, 0);
     }
     if (button === 'right') dispatchMouse(target, 'contextmenu', point, button, 1, 0);
+    setCursorPosition(point.x, point.y, { tilt: 0, phase: 'click' });
     pulseCursor(point);
+    scheduleCursorIdle();
     await settleAfterInteraction();
     return target;
   };
@@ -1801,10 +2253,10 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 5) {
           anchorCursorTo(active);
           await moveCursorTo(point.x, point.y);
         } else {
-          setCursorPosition(state.cursor.x, state.cursor.y);
+          setCursorPosition(state.cursor.x, state.cursor.y, { tilt: 0, phase: 'idle' });
         }
       } else {
-        setCursorPosition(state.cursor.x, state.cursor.y);
+        setCursorPosition(state.cursor.x, state.cursor.y, { tilt: 0, phase: 'idle' });
       }
       const key = String(params.key || '');
       active.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
@@ -2090,20 +2542,22 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 5) {
   };
   window.addEventListener('scroll', scheduleCursorAnchorSync, true);
   window.addEventListener('resize', scheduleCursorAnchorSync);
-  window.__mergenMcpRun.version = 5;
+  window.__mergenMcpRun.version = 6;
 }
 "#;
 
 #[cfg(target_os = "windows")]
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2, ICoreWebView2Controller,
-    ICoreWebView2Profile6, ICoreWebView2WebMessageReceivedEventArgs, ICoreWebView2_13,
+    ICoreWebView2Controller2, ICoreWebView2Profile6, ICoreWebView2WebMessageReceivedEventArgs,
+    ICoreWebView2_13, COREWEBVIEW2_COLOR,
 };
 #[cfg(target_os = "windows")]
 use webview2_com::WebMessageReceivedEventHandler;
 #[cfg(target_os = "windows")]
 use webview2_com::{
-    AddScriptToExecuteOnDocumentCreatedCompletedHandler, SourceChangedEventHandler,
+    AddScriptToExecuteOnDocumentCreatedCompletedHandler, ContentLoadingEventHandler,
+    NavigationCompletedEventHandler, NavigationStartingEventHandler, SourceChangedEventHandler,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::System::WinRT::EventRegistrationToken;
@@ -2114,6 +2568,9 @@ struct WindowsWebView {
     webview: ICoreWebView2,
     source_changed_token: Option<EventRegistrationToken>,
     web_message_received_token: Option<EventRegistrationToken>,
+    navigation_starting_token: Option<EventRegistrationToken>,
+    content_loading_token: Option<EventRegistrationToken>,
+    navigation_completed_token: Option<EventRegistrationToken>,
 }
 
 #[cfg(target_os = "windows")]
@@ -2151,6 +2608,34 @@ fn configure_webview_profile(webview: &ICoreWebView2) {
             err
         );
     }
+}
+
+#[cfg(target_os = "windows")]
+fn configure_webview_controller(controller: &ICoreWebView2Controller) {
+    if let Err(err) = set_default_browser_background(controller) {
+        log::warn!(
+            "WebView2 default background color was not applied: {:?}",
+            err
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn set_default_browser_background(
+    controller: &ICoreWebView2Controller,
+) -> windows::core::Result<()> {
+    use windows::core::Interface as _;
+
+    let controller2: ICoreWebView2Controller2 = controller.cast()?;
+    unsafe {
+        controller2.SetDefaultBackgroundColor(COREWEBVIEW2_COLOR {
+            A: 255,
+            R: 255,
+            G: 255,
+            B: 255,
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -2213,6 +2698,9 @@ fn create_webview_sync(
     (
         ICoreWebView2Controller,
         ICoreWebView2,
+        EventRegistrationToken,
+        EventRegistrationToken,
+        EventRegistrationToken,
         EventRegistrationToken,
         EventRegistrationToken,
     ),
@@ -2326,6 +2814,7 @@ fn create_webview_sync(
     let (controller, webview) = webview2_com::wait_with_pump(ctrl_rx)
         .map_err(|e| std::io::Error::other(e.to_string()))??;
 
+    configure_webview_controller(&controller);
     configure_webview_profile(&webview);
     install_design_inspect_bootstrap(&webview, &design_inspect_token)?;
 
@@ -2385,18 +2874,99 @@ fn create_webview_sync(
             .map_err(|e| format!("Failed to register WebView2 SourceChanged handler: {:?}", e))?;
     }
 
+    let navigation_start_sender = event_sender.clone();
+    let navigation_starting_handler =
+        NavigationStartingEventHandler::create(Box::new(move |webview, _args| {
+            let url = webview
+                .and_then(|webview| current_webview_source(&webview).ok())
+                .unwrap_or_default();
+            let _ = navigation_start_sender.send(BrowserEvent::LoadStarted(url));
+            Ok(())
+        }));
+    let mut navigation_starting_token = EventRegistrationToken::default();
+    unsafe {
+        webview
+            .add_NavigationStarting(&navigation_starting_handler, &mut navigation_starting_token)
+            .map_err(|e| {
+                format!(
+                    "Failed to register WebView2 NavigationStarting handler: {:?}",
+                    e
+                )
+            })?;
+    }
+
+    let content_loading_sender = event_sender.clone();
+    let content_loading_handler =
+        ContentLoadingEventHandler::create(Box::new(move |webview, _args| {
+            let url = webview
+                .and_then(|webview| current_webview_source(&webview).ok())
+                .unwrap_or_default();
+            let _ = content_loading_sender.send(BrowserEvent::LoadStarted(url));
+            Ok(())
+        }));
+    let mut content_loading_token = EventRegistrationToken::default();
+    unsafe {
+        webview
+            .add_ContentLoading(&content_loading_handler, &mut content_loading_token)
+            .map_err(|e| {
+                format!(
+                    "Failed to register WebView2 ContentLoading handler: {:?}",
+                    e
+                )
+            })?;
+    }
+
+    let navigation_completed_sender = event_sender.clone();
+    let navigation_completed_handler =
+        NavigationCompletedEventHandler::create(Box::new(move |webview, _args| {
+            let url = webview
+                .and_then(|webview| current_webview_source(&webview).ok())
+                .unwrap_or_default();
+            let _ = navigation_completed_sender.send(BrowserEvent::LoadFinished(url));
+            Ok(())
+        }));
+    let mut navigation_completed_token = EventRegistrationToken::default();
+    unsafe {
+        webview
+            .add_NavigationCompleted(
+                &navigation_completed_handler,
+                &mut navigation_completed_token,
+            )
+            .map_err(|e| {
+                format!(
+                    "Failed to register WebView2 NavigationCompleted handler: {:?}",
+                    e
+                )
+            })?;
+    }
+
     log::info!("WebView2 environment and controller created successfully");
     Ok((
         controller,
         webview,
         source_changed_token,
         web_message_received_token,
+        navigation_starting_token,
+        content_loading_token,
+        navigation_completed_token,
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_png_bytes(fill: [u8; 4], override_pixel: Option<([u8; 4], u32, u32)>) -> Vec<u8> {
+        let mut image = image::RgbaImage::from_pixel(4, 4, image::Rgba(fill));
+        if let Some((pixel, x, y)) = override_pixel {
+            image.put_pixel(x, y, image::Rgba(pixel));
+        }
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("test png should encode");
+        bytes.into_inner()
+    }
 
     #[test]
     fn browser_bounds_from_egui_rect_uses_pixels_per_point() {
@@ -2463,6 +3033,47 @@ mod tests {
             browser_mcp_screenshot_output_from_devtools_raw(r#"{"data":""}"#, "png").unwrap_err();
 
         assert!(err.contains("did not return screenshot data"));
+    }
+
+    #[test]
+    fn browser_mcp_screenshot_params_default_to_fast_jpeg() {
+        let (format, params) = screenshot_cdp_params(&json!({}));
+
+        assert_eq!(format, "jpeg");
+        assert_eq!(params["format"].as_str(), Some("jpeg"));
+        assert_eq!(params["quality"].as_i64(), Some(74));
+        assert_eq!(params["optimizeForSpeed"].as_bool(), Some(true));
+        assert_eq!(params["captureBeyondViewport"].as_bool(), Some(false));
+        assert_eq!(params["fromSurface"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn browser_mcp_screenshot_params_preserve_explicit_png_and_full_page() {
+        let (format, params) =
+            screenshot_cdp_params(&json!({ "type": "png", "fullPage": true, "quality": 10 }));
+
+        assert_eq!(format, "png");
+        assert_eq!(params["format"].as_str(), Some("png"));
+        assert_eq!(params.get("quality"), None);
+        assert_eq!(params["captureBeyondViewport"].as_bool(), Some(true));
+        assert_eq!(params["fromSurface"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn browser_mcp_screenshot_retry_params_disable_surface_capture() {
+        let (_, params) = screenshot_cdp_params_with_surface(&json!({}), false);
+
+        assert_eq!(params["fromSurface"].as_bool(), Some(false));
+        assert_eq!(params["optimizeForSpeed"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn browser_mcp_screenshot_black_detector_retries_only_near_black_images() {
+        let black_png = test_png_bytes([0, 0, 0, 255], None);
+        let varied_png = test_png_bytes([8, 10, 12, 255], Some(([240, 240, 240, 255], 1, 1)));
+
+        assert!(screenshot_bytes_are_probably_black(&black_png));
+        assert!(!screenshot_bytes_are_probably_black(&varied_png));
     }
 
     #[test]
@@ -2620,14 +3231,29 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn browser_mcp_automation_script_includes_visible_cursor_and_mouse_tools() {
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 5"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 6"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor"));
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-halo"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-aura"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-focus"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-pointer"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("createElementNS('http://www.w3.org/2000/svg', 'svg')"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("moveCursorTo"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("organicCursorPoint"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("steadyCursorForAction"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-phase"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("0.72"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains(
+            "const finalPoint = setCursorPosition(end.x, end.y, { tilt: 0, phase: 'idle' })"
+        ));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
             .contains("state.cursor.visible ? clampPoint(state.cursor.x, state.cursor.y) : clampPoint(end.x - 96, end.y - 64)"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("transform: 'translate(-50%, -50%)'"));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("left: '-13px'"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-halo"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("rgba(245,158,11,0.20)"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("border: '2px solid rgba(245,158,11,0.95)'"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("stableElementCenterAfterScroll"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("anchorCursorTo(element)"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT

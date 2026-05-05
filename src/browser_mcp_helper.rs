@@ -931,13 +931,14 @@ fn vision_tools() -> Vec<JsonValue> {
     vec![
         tool(
             "browser_take_screenshot",
-            "Take a screenshot of the embedded Mergen browser page",
+            "Take a screenshot of the embedded Mergen browser page. Prefer browser_page_summary for deciding where to click; use screenshots for visual verification instead of fixed waits.",
             json!({
                 "type": "object",
                 "properties": element_props(json!({
                     "ref": json!({"type": "string"}),
-                    "type": json!({"type": "string", "enum": ["png", "jpeg"]}),
-                    "fullPage": json!({"type": "boolean"})
+                    "type": json!({"type": "string", "enum": ["png", "jpeg"], "default": "jpeg"}),
+                    "quality": json!({"type": "integer", "default": 74, "description": "JPEG quality from 1 to 100; ignored for PNG"}),
+                    "fullPage": json!({"type": "boolean", "default": false})
                 }))
             }),
         ),
@@ -1306,6 +1307,26 @@ mod tests {
         assert!(names.contains(&"browser_start_video".to_owned()));
         assert!(names.contains(&"browser_stop_video".to_owned()));
         assert!(names.contains(&"browser_video_chapter".to_owned()));
+    }
+
+    #[test]
+    fn vision_tool_schema_defaults_screenshot_to_fast_jpeg() {
+        let tools = vision_tools();
+        let screenshot = tools
+            .iter()
+            .find(|tool| {
+                tool.get("name").and_then(JsonValue::as_str) == Some("browser_take_screenshot")
+            })
+            .expect("browser_take_screenshot schema");
+        let props = &screenshot["inputSchema"]["properties"];
+
+        assert!(screenshot["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Prefer browser_page_summary"));
+        assert_eq!(props["type"]["default"].as_str(), Some("jpeg"));
+        assert_eq!(props["quality"]["default"].as_i64(), Some(74));
+        assert_eq!(props["fullPage"]["default"].as_bool(), Some(false));
     }
 
     #[test]

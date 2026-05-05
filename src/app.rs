@@ -16532,15 +16532,17 @@ impl AdeApp {
         ctx: &egui::Context,
         command: BrowserMcpCommand,
     ) {
-        let project_id =
-            match self.prepare_browser_mcp_tool_project(ctx, &command.request, &command.auth_scope)
-            {
-                Ok(project_id) => project_id,
-                Err(response) => {
-                    let _ = command.respond_to.send(response);
-                    return;
-                }
-            };
+        let project_id = match self.prepare_browser_mcp_screenshot_project(
+            ctx,
+            &command.request,
+            &command.auth_scope,
+        ) {
+            Ok(project_id) => project_id,
+            Err(response) => {
+                let _ = command.respond_to.send(response);
+                return;
+            }
+        };
 
         let request_id = self.next_browser_mcp_pending_request_id(&command.request);
         self.browser_mcp_pending_responses
@@ -16555,6 +16557,40 @@ impl AdeApp {
         } else {
             ctx.request_repaint_after(Duration::from_millis(BROWSER_MCP_PENDING_POLL_MS));
         }
+    }
+
+    fn prepare_browser_mcp_screenshot_project(
+        &mut self,
+        ctx: &egui::Context,
+        request: &BrowserMcpIpcRequest,
+        auth_scope: &BrowserMcpAuthScope,
+    ) -> Result<u64, BrowserMcpIpcResponse> {
+        let project_id = self
+            .resolve_browser_mcp_project_id(request, auth_scope)
+            .map_err(BrowserMcpIpcResponse::error)?;
+        if !self.projects.contains_key(&project_id) {
+            return Err(BrowserMcpIpcResponse::error(format!(
+                "Browser MCP target project does not exist: {project_id}"
+            )));
+        }
+
+        if self.browser_mcp_screenshot_should_open_panel(project_id) {
+            self.set_browser_panel_open_for_project(project_id, true);
+            self.config.ui.checklist_panel_expanded = false;
+            ctx.request_repaint();
+        }
+
+        if let Some(error) = self.prepare_browser_mcp_project(project_id) {
+            return Err(error);
+        }
+        Ok(project_id)
+    }
+
+    fn browser_mcp_screenshot_should_open_panel(&self, project_id: u64) -> bool {
+        self.embedded_browsers_by_project
+            .get(&project_id)
+            .map(|browser| !matches!(browser.status(), BrowserStatus::Ready))
+            .unwrap_or(true)
     }
 
     fn handle_browser_mcp_script_command(
@@ -41782,6 +41818,26 @@ mod tests {
             Some("https://example.com")
         );
         assert!(app.browser_mcp_pending_responses.is_empty());
+    }
+
+    #[test]
+    fn browser_mcp_screenshot_does_not_force_open_ready_browser_panel() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        app.project_browser(1)
+            .set_test_status(web_browser::BrowserStatus::Ready);
+
+        assert!(!app.browser_mcp_screenshot_should_open_panel(1));
+    }
+
+    #[test]
+    fn browser_mcp_screenshot_opens_panel_for_uninitialized_browser() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+
+        assert!(app.browser_mcp_screenshot_should_open_panel(1));
     }
 
     #[test]
