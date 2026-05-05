@@ -673,13 +673,14 @@ fn core_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_type",
-            "Type text into an element or the currently focused element",
+            "Type text into an element or the currently focused element with user-like keyboard/input events. By default commits the field to trigger validation.",
             json!({
                 "type": "object",
                 "properties": element_props(json!({
                     "ref": json!({"type": "string"}),
                     "text": json!({"type": "string"}),
-                    "submit": json!({"type": "boolean"})
+                    "submit": json!({"type": "boolean"}),
+                    "commit": json!({"type": "boolean", "default": true, "description": "When true, dispatch change/focusout/blur after typing so form validation runs."})
                 })),
                 "required": ["text"]
             }),
@@ -707,19 +708,6 @@ fn devtools_tools() -> Vec<JsonValue> {
                 "type": "object",
                 "properties": {},
                 "required": []
-            }),
-        ),
-        tool(
-            "browser_evaluate",
-            "Execute JavaScript in the browser",
-            json!({
-                "type": "object",
-                "properties": {
-                    "script": json!({"type": "string"}),
-                    "frame": json!({"type": "string"}),
-                    "ref": json!({"type": "string"})
-                },
-                "required": ["script"]
             }),
         ),
         tool(
@@ -770,7 +758,7 @@ fn devtools_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_click",
-            "Click an element on the page",
+            "Click an element on the page with the visible browser mouse cursor. Use this for all page clicks; do not click from browser_evaluate.",
             json!({
                 "type": "object",
                 "properties": element_props(json!({
@@ -782,7 +770,7 @@ fn devtools_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_hover",
-            "Hover over an element on the page",
+            "Hover over an element on the page with the visible browser mouse cursor",
             json!({
                 "type": "object",
                 "properties": element_props(json!({
@@ -792,7 +780,7 @@ fn devtools_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_fill_form",
-            "Fill multiple form fields",
+            "Fill multiple form fields after moving the visible browser mouse cursor to each field. Fields commit by default to trigger validation.",
             json!({
                 "type": "object",
                 "properties": {
@@ -805,7 +793,8 @@ fn devtools_tools() -> Vec<JsonValue> {
                                 "target": {"type": "string"},
                                 "ref": {"type": "string"},
                                 "type": {"type": "string", "enum": ["textbox", "checkbox", "radio", "combobox", "slider"]},
-                                "value": {"type": "string"}
+                                "value": {"type": "string"},
+                                "commit": {"type": "boolean", "default": true}
                             },
                             "required": ["value"]
                         }
@@ -828,7 +817,7 @@ fn devtools_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_mouse_click_xy",
-            "Click viewport coordinates with the visible browser mouse cursor",
+            "Click viewport coordinates with the visible browser mouse cursor. Use this for coordinate clicks instead of JavaScript element.click().",
             json!({
                 "type": "object",
                 "properties": {
@@ -893,6 +882,19 @@ fn devtools_tools() -> Vec<JsonValue> {
                     "deltaY": json!({"type": "number", "default": 0})
                 },
                 "required": []
+            }),
+        ),
+        tool(
+            "browser_evaluate",
+            "Read/evaluate JavaScript in the browser. Interactive clicks, mouse events, and form submits are blocked; use browser_click or browser_mouse_click_xy for page interaction.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "script": json!({"type": "string"}),
+                    "frame": json!({"type": "string"}),
+                    "ref": json!({"type": "string"})
+                },
+                "required": ["script"]
             }),
         ),
         tool(
@@ -1075,6 +1077,31 @@ mod tests {
     }
 
     #[test]
+    fn browser_type_schema_exposes_validation_commit_option() {
+        let tools = core_tools();
+        let browser_type = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(JsonValue::as_str) == Some("browser_type"))
+            .expect("browser_type schema");
+
+        assert!(browser_type["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("trigger validation"));
+        assert_eq!(
+            browser_type["inputSchema"]["properties"]["commit"]["default"].as_bool(),
+            Some(true)
+        );
+        assert!(
+            !browser_type["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("commit")),
+            "commit should remain optional"
+        );
+    }
+
+    #[test]
     fn devtools_tool_schemas_include_snapshot_and_click() {
         let names = devtools_tools()
             .into_iter()
@@ -1155,6 +1182,59 @@ mod tests {
                 .as_i64(),
             Some(0)
         );
+
+        let fill_form = tool_by_name("browser_fill_form");
+        assert_eq!(
+            fill_form["inputSchema"]["properties"]["fields"]["items"]["properties"]["commit"]
+                ["default"]
+                .as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn devtools_tool_descriptions_force_visible_mouse_for_interactions() {
+        let tools = devtools_tools();
+        let tool_by_name = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.get("name").and_then(JsonValue::as_str) == Some(name))
+                .unwrap_or_else(|| panic!("missing tool schema: {name}"))
+        };
+        let description = |name: &str| {
+            tool_by_name(name)["description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(JsonValue::as_str))
+            .collect::<Vec<_>>();
+
+        assert!(description("browser_click").contains("visible browser mouse cursor"));
+        assert!(description("browser_click").contains("do not click from browser_evaluate"));
+        assert!(
+            description("browser_mouse_click_xy").contains("instead of JavaScript element.click()")
+        );
+        assert!(description("browser_evaluate").contains("Interactive clicks"));
+        assert!(description("browser_evaluate").contains("blocked"));
+        assert!(description("browser_evaluate").contains("browser_click"));
+
+        let click_index = names
+            .iter()
+            .position(|name| *name == "browser_click")
+            .expect("browser_click should exist");
+        let mouse_click_index = names
+            .iter()
+            .position(|name| *name == "browser_mouse_click_xy")
+            .expect("browser_mouse_click_xy should exist");
+        let evaluate_index = names
+            .iter()
+            .position(|name| *name == "browser_evaluate")
+            .expect("browser_evaluate should exist");
+        assert!(evaluate_index > click_index);
+        assert!(evaluate_index > mouse_click_index);
     }
 
     #[test]

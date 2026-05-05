@@ -125,7 +125,8 @@ fn screenshot_cdp_params(params: &JsonValue) -> (&'static str, JsonValue) {
 pub(crate) fn browser_mcp_tool_uses_async_script(tool: &str) -> bool {
     matches!(
         tool,
-        "browser_click"
+        "browser_evaluate"
+            | "browser_click"
             | "browser_hover"
             | "browser_select_option"
             | "browser_fill_form"
@@ -1223,11 +1224,12 @@ pub(crate) fn browser_mcp_output_from_devtools_runtime_raw(
 
 #[cfg(target_os = "windows")]
 const MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT: &str = r#"
-if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 3) {
+if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 4) {
   window.__mergenMcpState = window.__mergenMcpState || { refCounter: 1, consoleMessages: [], networkRequests: [], routes: [], highlighted: null };
 
   const state = window.__mergenMcpState;
   state.cursor = state.cursor || { x: Math.round(window.innerWidth / 2), y: Math.round(window.innerHeight / 2), visible: false, mouseDownButton: null };
+  state.cursor.anchorElement = state.cursor.anchorElement || null;
   const clean = (value, max = 240) => String(value ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
   const visible = (element) => {
     if (!element || element.nodeType !== Node.ELEMENT_NODE) return false;
@@ -1325,14 +1327,15 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 3) {
     halo.setAttribute('data-mergen-mcp-cursor-halo', 'true');
     Object.assign(halo.style, {
       position: 'absolute',
-      left: '-13px',
-      top: '-13px',
+      left: '0px',
+      top: '0px',
       width: '34px',
       height: '34px',
       borderRadius: '999px',
       background: 'rgba(245,158,11,0.20)',
       border: '1px solid rgba(245,158,11,0.70)',
       boxShadow: '0 0 0 4px rgba(245,158,11,0.08), 0 2px 9px rgba(15,23,42,0.35)',
+      transform: 'translate(-50%, -50%)',
     });
     const pointer = document.createElement('div');
     Object.assign(pointer.style, {
@@ -1351,6 +1354,27 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 3) {
     state.cursorElement = cursor;
     return cursor;
   };
+  const clearCursorAnchor = () => {
+    state.cursor.anchorElement = null;
+  };
+  const anchorCursorTo = (element) => {
+    state.cursor.anchorElement = element || null;
+  };
+  const syncCursorToAnchor = () => {
+    const element = state.cursor.anchorElement;
+    if (!state.cursor.visible || !element || !document.documentElement.contains(element) || !visible(element)) return;
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    setCursorPosition(rect.left + rect.width / 2, rect.top + rect.height / 2);
+  };
+  const scheduleCursorAnchorSync = () => {
+    if (state.cursorAnchorSyncQueued) return;
+    state.cursorAnchorSyncQueued = true;
+    requestAnimationFrame(() => {
+      state.cursorAnchorSyncQueued = false;
+      syncCursorToAnchor();
+    });
+  };
   const setCursorPosition = (x, y) => {
     const point = clampPoint(x, y);
     const cursor = ensureCursor();
@@ -1363,7 +1387,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 3) {
   };
   const moveCursorTo = (x, y, options = {}) => new Promise((resolve) => {
     const end = clampPoint(x, y);
-    const start = clampPoint(state.cursor.x, state.cursor.y);
+    const start = state.cursor.visible ? clampPoint(state.cursor.x, state.cursor.y) : clampPoint(end.x - 96, end.y - 64);
     const distance = Math.hypot(end.x - start.x, end.y - start.y);
     const duration = options.duration ?? clamp(Math.round(distance * 1.15), 650, 900);
     setCursorPosition(start.x, start.y);
@@ -1515,40 +1539,171 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 3) {
     return { element, target };
   };
   const event = (element, name) => element.dispatchEvent(new Event(name, { bubbles: true, cancelable: true }));
-  const inputText = (element, text) => {
-    element.focus?.();
-    if (element.isContentEditable) {
-      element.textContent = text;
-    } else if ('value' in element) {
-      element.value = text;
+  const nativePropertySetter = (element, property) => {
+    const prototypes = [];
+    if (window.HTMLTextAreaElement && element instanceof window.HTMLTextAreaElement) prototypes.push(window.HTMLTextAreaElement.prototype);
+    if (window.HTMLSelectElement && element instanceof window.HTMLSelectElement) prototypes.push(window.HTMLSelectElement.prototype);
+    if (window.HTMLInputElement && element instanceof window.HTMLInputElement) prototypes.push(window.HTMLInputElement.prototype);
+    if (element?.constructor?.prototype) prototypes.push(element.constructor.prototype);
+    const objectPrototype = Object.getPrototypeOf(element);
+    if (objectPrototype) prototypes.push(objectPrototype);
+    for (const prototype of prototypes) {
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, property);
+      if (descriptor?.set) return descriptor.set;
     }
-    event(element, 'input');
+    return null;
+  };
+  const setNativeProperty = (element, property, value) => {
+    const previous = property in element ? element[property] : undefined;
+    const setter = nativePropertySetter(element, property);
+    if (setter) setter.call(element, value);
+    else element[property] = value;
+    const tracker = element._valueTracker;
+    if (tracker && typeof tracker.setValue === 'function') tracker.setValue(String(previous ?? ''));
+  };
+  const dispatchKeyEvent = (element, type, key) => {
+    const textKey = String(key || '');
+    const code = textKey.length === 1 && /[a-z]/i.test(textKey) ? `Key${textKey.toUpperCase()}` : textKey;
+    return element.dispatchEvent(new KeyboardEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      key: textKey,
+      code,
+      charCode: textKey.length === 1 ? textKey.charCodeAt(0) : 0,
+      keyCode: textKey === 'Enter' ? 13 : textKey.length === 1 ? textKey.toUpperCase().charCodeAt(0) : 0,
+      which: textKey === 'Enter' ? 13 : textKey.length === 1 ? textKey.toUpperCase().charCodeAt(0) : 0,
+    }));
+  };
+  const dispatchInputLifecycleEvent = (element, type, inputType = 'insertText', data = null) => {
+    if (window.InputEvent) {
+      return element.dispatchEvent(new InputEvent(type, {
+        bubbles: true,
+        cancelable: type === 'beforeinput',
+        inputType,
+        data,
+      }));
+    }
+    return element.dispatchEvent(new Event(type, { bubbles: true, cancelable: type === 'beforeinput' }));
+  };
+  const dispatchFocusLifecycleEvent = (element, type, bubbles) => {
+    if (window.FocusEvent) {
+      return element.dispatchEvent(new FocusEvent(type, {
+        bubbles,
+        cancelable: false,
+        relatedTarget: null,
+      }));
+    }
+    return element.dispatchEvent(new Event(type, { bubbles, cancelable: false }));
+  };
+  const isTextEditableElement = (element) => Boolean(element?.isContentEditable || ('value' in element));
+  const editableTextValue = (element) => element.isContentEditable ? String(element.textContent ?? '') : String(element.value ?? '');
+  const setEditableTextValue = (element, value) => {
+    if (element.isContentEditable) element.textContent = value;
+    else setNativeProperty(element, 'value', value);
+  };
+  const commitField = async (element, commit = true) => {
+    await nextFrame();
     event(element, 'change');
+    if (!commit) return;
+    dispatchFocusLifecycleEvent(element, 'focusout', true);
+    dispatchFocusLifecycleEvent(element, 'blur', false);
+    element.blur?.();
+    await nextFrame();
+  };
+  const typeTextLikeUser = async (element, text, options = {}) => {
+    const commit = options.commit !== false;
+    const nextText = String(text ?? '');
+    if (!isTextEditableElement(element)) throw new Error('Element is not text-editable');
+    element.focus?.({ preventScroll: true });
+    if (editableTextValue(element) !== '') {
+      dispatchKeyEvent(element, 'keydown', 'Backspace');
+      const clearAllowed = dispatchInputLifecycleEvent(element, 'beforeinput', 'deleteContentBackward', null);
+      if (clearAllowed !== false) {
+        setEditableTextValue(element, '');
+        dispatchInputLifecycleEvent(element, 'input', 'deleteContentBackward', null);
+      }
+      dispatchKeyEvent(element, 'keyup', 'Backspace');
+    }
+    for (const char of Array.from(nextText)) {
+      const key = char === '\n' ? 'Enter' : char;
+      const inputType = char === '\n' ? 'insertLineBreak' : 'insertText';
+      dispatchKeyEvent(element, 'keydown', key);
+      if (char !== '\n') dispatchKeyEvent(element, 'keypress', key);
+      const allowed = dispatchInputLifecycleEvent(element, 'beforeinput', inputType, char);
+      if (allowed !== false) {
+        setEditableTextValue(element, editableTextValue(element) + char);
+        dispatchInputLifecycleEvent(element, 'input', inputType, char);
+      }
+      dispatchKeyEvent(element, 'keyup', key);
+    }
+    if (nextText === '') dispatchInputLifecycleEvent(element, 'input', 'insertReplacementText', null);
+    await commitField(element, commit);
+  };
+  const EVALUATE_INTERACTION_BLOCKED_MESSAGE = 'JavaScript clicks are blocked in Mergen Browser MCP. Use browser_click or browser_mouse_click_xy so the visible mouse moves and clicks.';
+  const INTERACTIVE_EVALUATE_PATTERN = /(?:\.click\s*\(|\[['"]click['"]\]\s*\(|\.dispatchEvent\s*\(\s*new\s+(?:MouseEvent|PointerEvent)\s*\(|\[['"]dispatchEvent['"]\]\s*\(\s*new\s+(?:MouseEvent|PointerEvent)\s*\(|\.dispatchEvent\s*\(\s*new\s+Event\s*\(\s*['"`](?:click|dblclick|mousedown|mouseup|mousemove|mouseover|mouseout|mouseenter|mouseleave|contextmenu|pointerdown|pointerup|pointermove|pointerover|pointerout)['"`]|\[['"]dispatchEvent['"]\]\s*\(\s*new\s+Event\s*\(\s*['"`](?:click|dblclick|mousedown|mouseup|mousemove|mouseover|mouseout|mouseenter|mouseleave|contextmenu|pointerdown|pointerup|pointermove|pointerover|pointerout)['"`]|\.requestSubmit\s*\(|\[['"]requestSubmit['"]\]\s*\(|\.submit\s*\(|\[['"]submit['"]\]\s*\()/i;
+  const assertReadOnlyEvaluateScript = (expr) => {
+    if (INTERACTIVE_EVALUATE_PATTERN.test(expr)) throw new Error(EVALUATE_INTERACTION_BLOCKED_MESSAGE);
+  };
+  const runEvaluateTool = async (params = {}, element = null) => {
+    const expr = String(params.function || params.script || '');
+    assertReadOnlyEvaluateScript(expr);
+    const blockedEventTypes = new Set(['click', 'dblclick', 'mousedown', 'mouseup', 'mousemove', 'mouseover', 'mouseout', 'mouseenter', 'mouseleave', 'contextmenu', 'pointerdown', 'pointerup', 'pointermove', 'pointerover', 'pointerout']);
+    const restore = [];
+    let blockedInteractionAttempt = false;
+    const blockInteraction = () => {
+      blockedInteractionAttempt = true;
+      throw new Error(EVALUATE_INTERACTION_BLOCKED_MESSAGE);
+    };
+    const patchMethod = (prototype, name, replacement) => {
+      if (!prototype || typeof prototype[name] !== 'function') return;
+      const original = prototype[name];
+      prototype[name] = replacement(original);
+      restore.push(() => { prototype[name] = original; });
+    };
+    patchMethod(window.HTMLElement?.prototype, 'click', () => blockInteraction);
+    patchMethod(window.HTMLFormElement?.prototype, 'submit', () => blockInteraction);
+    patchMethod(window.HTMLFormElement?.prototype, 'requestSubmit', () => blockInteraction);
+    patchMethod(window.EventTarget?.prototype, 'dispatchEvent', (original) => function patchedDispatchEvent(event) {
+      if (event && blockedEventTypes.has(String(event.type || '').toLowerCase())) blockInteraction();
+      return original.call(this, event);
+    });
+    try {
+      let value;
+      try { value = eval(`(${expr})`); } catch (_) { value = eval(expr); }
+      const result = await (typeof value === 'function' ? value(element || undefined) : value);
+      if (blockedInteractionAttempt) throw new Error(EVALUATE_INTERACTION_BLOCKED_MESSAGE);
+      return ok(JSON.stringify(result, null, 2) ?? 'undefined', { result });
+    } finally {
+      for (const restoreMethod of restore.reverse()) restoreMethod();
+    }
   };
   const fillOneField = async (field) => {
     const target = field.target ?? field.ref ?? field.selector ?? field.name ?? '';
     const element = resolve(target);
     if (!element) throw new Error(`Element not found: ${target}`);
     const point = await elementCenter(element);
+    anchorCursorTo(element);
     await moveCursorTo(point.x, point.y);
     dispatchMoveAt(point, element);
     element.focus?.({ preventScroll: true });
+    const commit = field.commit !== false;
     if (field.type === 'checkbox' || field.type === 'radio') {
-      element.checked = field.value === true || String(field.value).toLowerCase() === 'true';
+      setNativeProperty(element, 'checked', field.value === true || String(field.value).toLowerCase() === 'true');
       event(element, 'input');
-      event(element, 'change');
+      await commitField(element, commit);
     } else if (field.type === 'combobox') {
-      element.value = String(field.value ?? '');
+      setNativeProperty(element, 'value', String(field.value ?? ''));
       event(element, 'input');
-      event(element, 'change');
+      await commitField(element, commit);
     } else {
-      inputText(element, String(field.value ?? ''));
+      await typeTextLikeUser(element, String(field.value ?? ''), { commit });
     }
   };
   const runVisualTool = async (tool, params = {}) => {
     if (tool === 'browser_click') {
       const { element, target } = requiredElement(params, tool);
       const point = await elementCenter(element);
+      anchorCursorTo(element);
       await moveCursorTo(point.x, point.y);
       await clickAt(point, { target: element, button: params.button, doubleClick: params.doubleClick });
       return ok(`Clicked ${target}`);
@@ -1556,6 +1711,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 3) {
     if (tool === 'browser_hover') {
       const { element, target } = requiredElement(params, tool);
       const point = await elementCenter(element);
+      anchorCursorTo(element);
       await moveCursorTo(point.x, point.y);
       dispatchMoveAt(point, element);
       return ok(`Hovered ${target}`);
@@ -1563,13 +1719,14 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 3) {
     if (tool === 'browser_select_option') {
       const { element, target } = requiredElement(params, tool);
       const point = await elementCenter(element);
+      anchorCursorTo(element);
       await moveCursorTo(point.x, point.y);
       dispatchMoveAt(point, element);
       element.focus?.({ preventScroll: true });
       const values = Array.isArray(params.values) ? params.values : [params.value ?? ''];
-      element.value = String(values[0] ?? '');
+      setNativeProperty(element, 'value', String(values[0] ?? ''));
       event(element, 'input');
-      event(element, 'change');
+      await commitField(element, params.commit !== false);
       return ok(`Selected option ${element.value || values[0] || ''} in ${target}`);
     }
     if (tool === 'browser_type') {
@@ -1577,13 +1734,14 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 3) {
       const element = target ? resolve(target) : document.activeElement;
       if (!element) throw new Error(`Element not found: ${target || 'active element'}`);
       const point = await elementCenter(element);
+      anchorCursorTo(element);
       await moveCursorTo(point.x, point.y);
       dispatchMoveAt(point, element);
-      inputText(element, String(params.text ?? ''));
+      await typeTextLikeUser(element, String(params.text ?? ''), { commit: params.commit !== false });
       if (params.submit) {
         element.form?.requestSubmit?.();
-        element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-        element.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+        dispatchKeyEvent(element, 'keydown', 'Enter');
+        dispatchKeyEvent(element, 'keyup', 'Enter');
       }
       return ok(`Typed into ${target || 'active element'}`);
     }
@@ -1598,6 +1756,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 3) {
         const rect = active.getBoundingClientRect();
         if (rect.width > 0 && rect.height > 0) {
           const point = clampPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+          anchorCursorTo(active);
           await moveCursorTo(point.x, point.y);
         } else {
           setCursorPosition(state.cursor.x, state.cursor.y);
@@ -1612,18 +1771,21 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 3) {
       return ok(`Pressed ${key}`);
     }
     if (tool === 'browser_mouse_move_xy') {
+      clearCursorAnchor();
       const point = requiredPoint(params);
       await moveCursorTo(point.x, point.y);
       dispatchMoveAt(point);
       return ok(`Moved mouse to ${Math.round(point.x)}, ${Math.round(point.y)}`, { x: point.x, y: point.y });
     }
     if (tool === 'browser_mouse_click_xy') {
+      clearCursorAnchor();
       const point = requiredPoint(params);
       await moveCursorTo(point.x, point.y);
       await clickAt(point, { button: params.button, doubleClick: params.doubleClick });
       return ok(`Clicked mouse at ${Math.round(point.x)}, ${Math.round(point.y)}`, { x: point.x, y: point.y });
     }
     if (tool === 'browser_mouse_drag_xy') {
+      clearCursorAnchor();
       const start = requiredPoint(params, 'startX', 'startY');
       const end = requiredPoint(params, 'endX', 'endY');
       const button = buttonName(params.button);
@@ -1645,6 +1807,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 3) {
       return ok(`Dragged mouse from ${Math.round(start.x)}, ${Math.round(start.y)} to ${Math.round(end.x)}, ${Math.round(end.y)}`, { startX: start.x, startY: start.y, endX: end.x, endY: end.y });
     }
     if (tool === 'browser_mouse_down') {
+      clearCursorAnchor();
       const point = optionalPoint(params);
       const button = buttonName(params.button);
       await moveCursorTo(point.x, point.y);
@@ -1655,6 +1818,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 3) {
       return ok(`Mouse ${button} button down at ${Math.round(point.x)}, ${Math.round(point.y)}`, { x: point.x, y: point.y, button });
     }
     if (tool === 'browser_mouse_up') {
+      clearCursorAnchor();
       const point = optionalPoint(params);
       const button = buttonName(params.button || state.cursor.mouseDownButton || 'left');
       await moveCursorTo(point.x, point.y);
@@ -1663,6 +1827,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 3) {
       return ok(`Mouse ${button} button up at ${Math.round(point.x)}, ${Math.round(point.y)}`, { x: point.x, y: point.y, button });
     }
     if (tool === 'browser_mouse_wheel') {
+      clearCursorAnchor();
       const point = optionalPoint(params);
       const deltaX = numberParam(params, 'deltaX', false) ?? 0;
       const deltaY = numberParam(params, 'deltaY', false) ?? 0;
@@ -1746,18 +1911,16 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 3) {
       if (tool === 'browser_highlight') { highlight(element, params.style); return ok(`Highlighted ${params.target}`); }
       if (tool === 'browser_hide_highlight') { if (state.highlighted) state.highlighted.style.display = 'none'; return ok('Highlight hidden'); }
       if (tool === 'browser_evaluate') {
-        const expr = String(params.function || params.script || '');
-        let value;
-        try { value = eval(`(${expr})`); } catch (_) { value = eval(expr); }
-        const result = typeof value === 'function' ? value(element || undefined) : value;
-        return ok(JSON.stringify(result, null, 2) ?? 'undefined', { result });
+        return runEvaluateTool(params, element);
       }
       return fail(`Unsupported browser MCP tool in page script: ${tool}`);
     } catch (error) {
       return fail(error && error.stack ? String(error.stack) : String(error));
     }
   };
-  window.__mergenMcpRun.version = 3;
+  window.addEventListener('scroll', scheduleCursorAnchorSync, true);
+  window.addEventListener('resize', scheduleCursorAnchorSync);
+  window.__mergenMcpRun.version = 4;
 }
 "#;
 
@@ -2156,6 +2319,7 @@ mod tests {
     #[test]
     fn browser_mcp_visual_tools_use_async_script_path() {
         for tool in [
+            "browser_evaluate",
             "browser_click",
             "browser_hover",
             "browser_select_option",
@@ -2285,10 +2449,18 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn browser_mcp_automation_script_includes_visible_cursor_and_mouse_tools() {
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 4"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-halo"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("moveCursorTo"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("state.cursor.visible ? clampPoint(state.cursor.x, state.cursor.y) : clampPoint(end.x - 96, end.y - 64)"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("transform: 'translate(-50%, -50%)'"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("left: '-13px'"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("stableElementCenterAfterScroll"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("anchorCursorTo(element)"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("window.addEventListener('scroll', scheduleCursorAnchorSync, true)"));
         assert!(
             MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("scrollBy({ left: deltaX, top: deltaY")
         );
@@ -2305,6 +2477,47 @@ mod tests {
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("browser_mouse_')) return fail"));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
             .contains("is not implemented by Mergen Browser MCP yet.`);"));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn browser_mcp_automation_script_blocks_javascript_clicks_in_evaluate() {
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("JavaScript clicks are blocked in Mergen Browser MCP"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("INTERACTIVE_EVALUATE_PATTERN"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("\\.click\\s*\\("));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("\\[['\"]click['\"]\\]\\s*\\("));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("patchMethod(window.HTMLElement?.prototype, 'click'"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("patchMethod(window.EventTarget?.prototype, 'dispatchEvent'"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("for (const restoreMethod of restore.reverse()) restoreMethod();"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains(
+            "const result = typeof value === 'function' ? value(element || undefined) : value;"
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn browser_mcp_automation_script_types_like_user_and_commits_fields() {
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("typeTextLikeUser"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("nativePropertySetter"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("setNativeProperty(element, 'value'"));
+        assert!(
+            MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("setNativeProperty(element, 'checked'")
+        );
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("new KeyboardEvent"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("new InputEvent"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("'beforeinput'"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("'input'"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("'change'"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("'focusout'"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("'blur'"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("commitField"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("params.commit !== false"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("const inputText ="));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("element.value = text"));
     }
 
     #[test]
