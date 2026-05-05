@@ -3611,3 +3611,74 @@
 - Files/Commands touched: `src/web_browser.rs`, `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test design_inspect`, `cargo test parse_design_inspect`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc --bin mergen-ade`
 - References: User report on 2026-05-05: "design mode da hover olunca terminale yazıyor hayır ben tıklayayım tıkladığım alanı yazsın sadece".
 
+#### OpenCode was unavailable in Mergen terminals and Browser MCP was not listed {#opencode-path-browser-mcp-runtime-config}
+- Date: 2026-05-05
+- Context: OpenCode launch from Mergen ADE terminals with the embedded Browser MCP integration
+- Error signature: PowerShell reports `opencode : The term 'opencode' is not recognized`, and OpenCode does not show the Mergen-owned Browser MCP server.
+- Symptoms/Impact:
+  1. `opencode` works in a fresh external PowerShell but fails inside an already running Mergen terminal.
+  2. OpenCode starts without the Mergen browser MCP configuration, so browser tools are unavailable.
+  3. Global OpenCode MCP entries can remain visible while the project-scoped Mergen MCP override is missing or stale.
+- Root cause:
+  1. Running Mergen instances inherit the Windows PATH from their startup time; npm-installed `opencode` can appear after Mergen starts and remain missing from child terminal environments.
+  2. Mergen terminal startup only used the process environment PATH and did not refresh Windows registry PATH values or add known user command directories such as `%APPDATA%\npm`.
+  3. The OpenCode runtime config still wrote the legacy `mode.build.model` shape instead of the current `agent.build.model` shape.
+  4. Runtime OpenCode config environment variables were coupled to hook-service setup, so Browser MCP config could be skipped when the config directory still needed to be written.
+- Resolution:
+  - Harden Windows terminal PATH generation by merging process PATH, fresh HKLM/HKCU registry PATH values, and known command directories with case-insensitive de-duplication.
+  - Write OpenCode runtime config using `agent.build.model`.
+  - Keep the Mergen Browser MCP override at root `mcp.mcp-server-playwright` and explicitly allow the MCP server/tool permissions.
+  - Set `OPENCODE_CONFIG_DIR` and `OPENCODE_CONFIG` whenever a runtime config directory is produced, independent of hook-service availability.
+  - Add regression tests for OpenCode runtime config structure and Windows PATH merging.
+- Prevent recurrence:
+  - Keep terminal PATH creation resilient to tools installed after Mergen starts.
+  - Keep OpenCode config tests aligned with current OpenCode schema names.
+  - Keep Browser MCP runtime config tests proving the Mergen-owned `mcp-server-playwright` override is generated.
+- Files/Commands touched: `Cargo.toml`, `src/opencode_config.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report on 2026-05-05: running `opencode` in the desktop Mergen project terminal fails and OpenCode does not show the Mergen browser MCP.
+
+#### Mergen Browser MCP was indistinguishable from global Playwright MCP {#mergen-browser-mcp-name-collision}
+- Date: 2026-05-05
+- Context: OpenCode MCP list inside Mergen-launched terminals
+- Error signature: OpenCode shows `mcp-server-playwright connected Enabled`, but no visibly separate Mergen Browser MCP appears.
+- Symptoms/Impact:
+  1. Users cannot tell whether the connected MCP is the global Playwright server or Mergen's embedded browser bridge.
+  2. A global `mcp-server-playwright` config can start `npx @playwright/mcp` instead of the single-binary Mergen helper.
+  3. Browser MCP looks absent even when Mergen is intended to generate a runtime MCP override.
+- Root cause:
+  1. Mergen wrote its Browser MCP under the same config key as the user's global Playwright MCP: `mcp-server-playwright`.
+  2. The runtime config did not provide a separate Mergen-specific MCP display name.
+- Resolution:
+  - Write Mergen Browser MCP as `mergen-browser`.
+  - Keep the backend single-binary by launching `mergen-ade.exe --browser-mcp-helper`.
+  - Disable `mcp-server-playwright` in Mergen's per-terminal runtime config so the global Playwright server does not mask the Mergen browser bridge in Mergen sessions.
+  - Update permissions/tools to use the `mergen-browser_*` prefix.
+- Prevent recurrence:
+  - Mergen-owned MCP integrations should use Mergen-specific config keys unless intentionally overriding a third-party MCP.
+  - Keep tests proving the runtime config contains `mcp.mergen-browser` and launches through the main executable helper mode.
+- Files/Commands touched: `src/opencode_config.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report on 2026-05-05: MCP list only shows global entries and `mcp-server-playwright`; "mergen browser mcp gelmiyor".
+
+#### Mergen Browser MCP connected but tool calls were rejected as unsupported {#mergen-browser-mcp-helper-tool-name-mismatch}
+- Date: 2026-05-05
+- Context: OpenCode using the Mergen Browser MCP server after it appears as `mergen-browser connected`
+- Error signature: OpenCode can list `mergen-browser`, but calls such as `mergen-browser_browser_tabs` and `mergen-browser_browser_navigate` are reported by the agent as unsupported or unusable.
+- Symptoms/Impact:
+  1. MCP connection succeeds, so the server looks healthy.
+  2. Tool calls do not reach Mergen as `browser_tabs`, `browser_navigate`, or other real browser tool names.
+  3. The agent falls back to saying browser automation is unavailable even though the MCP server is connected.
+- Root cause:
+  1. The helper process wrapped every tool call as a `run_mcp_script` IPC request.
+  2. The Mergen app-side Browser MCP dispatcher expects the top-level IPC `tool` field to be the actual browser tool name.
+  3. `run_mcp_script` is not an app-side Browser MCP tool, so the dispatcher returned an unsupported-tool response.
+- Resolution:
+  - Send the actual MCP tool name in the Browser MCP IPC request's top-level `tool` field.
+  - Pass the original tool arguments directly as `params`.
+  - Keep the app-side WebView script execution responsibility inside `EmbeddedBrowser::run_mcp_tool()`.
+  - Add a regression test proving helper IPC requests use real browser tool names and do not nest payloads under `script`.
+- Prevent recurrence:
+  - Helper-to-app IPC tool names must match `AdeApp::handle_browser_mcp_request()` / `EmbeddedBrowser::run_mcp_tool()` dispatch names.
+  - Do not reintroduce a generic `run_mcp_script` wrapper unless the app dispatcher explicitly supports it.
+- Files/Commands touched: `src/browser_mcp_helper.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test browser_mcp_helper`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report on 2026-05-05: OpenCode says Mergen Browser MCP tools are unsupported even though `mergen-browser connected Enabled` is visible.
+

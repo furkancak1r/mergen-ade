@@ -26,24 +26,23 @@ pub fn global_opencode_config_path() -> io::Result<PathBuf> {
         .join("opencode.json"))
 }
 
-/// Patches the global OpenCode config to set the build mode model.
+/// Patches the global OpenCode config to set the build agent model.
 /// Preserves all other configuration including provider, tools, modes, etc.
 /// Uses JSONC-safe parsing (strips comments before parsing if needed).
 pub fn patch_global_opencode_config(build_model: &str) -> io::Result<OpenCodePatchOutcome> {
     let path = global_opencode_config_path()?;
 
     // Read existing or start with empty object
-    let (existing_text, mut value) = match fs::read_to_string(&path) {
+    let mut value = match fs::read_to_string(&path) {
         Ok(text) => {
             // Strip comments for JSONC compatibility before parsing
             let json_text = strip_jsonc_comments(&text);
-            let value = serde_json::from_str::<JsonValue>(&json_text)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            (text, value)
+            serde_json::from_str::<JsonValue>(&json_text)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             // Create minimal config
-            (String::new(), json!({}))
+            json!({})
         }
         Err(err) => return Err(err),
     };
@@ -56,32 +55,27 @@ pub fn patch_global_opencode_config(build_model: &str) -> io::Result<OpenCodePat
         ));
     }
 
-    // Navigate/create the mode.build.model path
+    // Navigate/create the agent.build.model path used by current OpenCode.
     let root = value.as_object_mut().unwrap();
 
-    // Get or create mode
-    let mode = root
-        .entry("mode")
+    let agent = root
+        .entry("agent")
         .or_insert_with(|| json!({}))
         .as_object_mut()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "mode must be an object"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "agent must be an object"))?;
 
-    // Get or create build
-    let build = mode
+    let build = agent
         .entry("build")
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "mode.build must be an object")
+            io::Error::new(io::ErrorKind::InvalidData, "agent.build must be an object")
         })?;
 
-    // Set model
     let previous_model = build.get("model").cloned();
     build.insert("model".to_owned(), json!(build_model));
 
-    // Check if changed
-    let changed = previous_model.as_ref().and_then(|v| v.as_str()) != Some(build_model)
-        || !existing_text.trim().is_empty();
+    let changed = previous_model.as_ref().and_then(|v| v.as_str()) != Some(build_model);
 
     // Write back with pretty formatting
     let rendered = serde_json::to_string_pretty(&value)
@@ -120,6 +114,9 @@ pub fn write_terminal_runtime_config(
     write_terminal_runtime_config_with_browser_mcp(runtime_dir, terminal_id, build_model, None)
 }
 
+pub const MERGEN_BROWSER_MCP_SERVER_NAME: &str = "mergen-browser";
+const GLOBAL_PLAYWRIGHT_MCP_SERVER_NAME: &str = "mcp-server-playwright";
+
 pub fn write_terminal_runtime_config_with_browser_mcp(
     runtime_dir: &Path,
     terminal_id: u64,
@@ -132,7 +129,8 @@ pub fn write_terminal_runtime_config_with_browser_mcp(
     let config_path = config_dir.join("opencode.json");
 
     let mut config = json!({
-        "mode": {
+        "$schema": "https://opencode.ai/config.json",
+        "agent": {
             "build": {
                 "model": build_model
             }
@@ -148,8 +146,10 @@ pub fn write_terminal_runtime_config_with_browser_mcp(
         if let Some(project_id) = endpoint.project_id {
             environment[MERGEN_BROWSER_MCP_PROJECT_ID_ENV_VAR] = json!(project_id.to_string());
         }
-        config["mcp"] = json!({
-            "mcp-server-playwright": {
+        let mut mcp_servers = serde_json::Map::new();
+        mcp_servers.insert(
+            MERGEN_BROWSER_MCP_SERVER_NAME.to_owned(),
+            json!({
                 "type": "local",
                 "enabled": true,
                 "timeout": DEFAULT_BROWSER_MCP_TIMEOUT_MS,
@@ -159,12 +159,30 @@ pub fn write_terminal_runtime_config_with_browser_mcp(
                     "--caps=devtools,vision,network,storage"
                 ],
                 "environment": environment
-            }
-        });
+            }),
+        );
+        mcp_servers.insert(
+            GLOBAL_PLAYWRIGHT_MCP_SERVER_NAME.to_owned(),
+            json!({
+                "type": "local",
+                "enabled": false,
+                "timeout": DEFAULT_BROWSER_MCP_TIMEOUT_MS,
+                "command": [
+                    "npx",
+                    "-y",
+                    "@playwright/mcp@latest"
+                ]
+            }),
+        );
+        config["mcp"] = JsonValue::Object(mcp_servers);
+
         let mut permissions = serde_json::Map::new();
-        permissions.insert("mcp-server-playwright".to_owned(), json!("allow"));
+        permissions.insert(MERGEN_BROWSER_MCP_SERVER_NAME.to_owned(), json!("allow"));
         for tool_name in BROWSER_MCP_PERMISSION_TOOL_NAMES {
-            permissions.insert(format!("mcp-server-playwright_{tool_name}"), json!("allow"));
+            permissions.insert(
+                format!("{MERGEN_BROWSER_MCP_SERVER_NAME}_{tool_name}"),
+                json!("allow"),
+            );
         }
         config["permission"] = JsonValue::Object(permissions.clone());
         let tools = permissions
@@ -351,16 +369,18 @@ mod tests {
         let parsed: JsonValue = serde_json::from_str(&content).unwrap();
 
         assert_eq!(
-            parsed["mode"]["build"]["model"].as_str(),
+            parsed["agent"]["build"]["model"].as_str(),
             Some("fireworks-ai/k2-turbo")
         );
+        assert!(parsed.get("mode").is_none());
 
         // Cleanup
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
-    fn write_terminal_runtime_config_with_browser_mcp_overrides_playwright_mcp() {
+    fn write_terminal_runtime_config_with_browser_mcp_uses_mergen_browser_name_and_disables_global_playwright(
+    ) {
         let temp_dir = std::env::temp_dir().join(format!(
             "mergen-opencode-browser-mcp-runtime-test-{}",
             SystemTime::now()
@@ -368,7 +388,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let helper_path = temp_dir.join("mergen-browser-mcp.exe");
+        let helper_path = temp_dir.join("mergen-ade.exe");
         let endpoint = BrowserMcpEndpointEnv {
             port: 43210,
             token: "test-token".to_owned(),
@@ -386,8 +406,13 @@ mod tests {
 
         let content = fs::read_to_string(config_dir.join("opencode.json")).unwrap();
         let parsed: JsonValue = serde_json::from_str(&content).unwrap();
-        let mcp = &parsed["mcp"]["mcp-server-playwright"];
+        let mcp = &parsed["mcp"][MERGEN_BROWSER_MCP_SERVER_NAME];
+        let global_playwright = &parsed["mcp"][GLOBAL_PLAYWRIGHT_MCP_SERVER_NAME];
 
+        assert_eq!(
+            parsed["agent"]["build"]["model"].as_str(),
+            Some("fireworks-ai/k2-turbo")
+        );
         assert_eq!(mcp["type"].as_str(), Some("local"));
         assert_eq!(mcp["enabled"].as_bool(), Some(true));
         assert_eq!(
@@ -418,12 +443,17 @@ mod tests {
             mcp["environment"][MERGEN_BROWSER_MCP_PROJECT_ID_ENV_VAR].as_str(),
             Some("7")
         );
+        assert_eq!(global_playwright["enabled"].as_bool(), Some(false));
         assert_eq!(
-            parsed["permission"]["mcp-server-playwright_browser_navigate"].as_str(),
+            parsed["permission"]["mergen-browser_browser_navigate"].as_str(),
             Some("allow")
         );
         assert_eq!(
-            parsed["tools"]["mcp-server-playwright_browser_navigate"].as_bool(),
+            parsed["permission"]["mergen-browser"].as_str(),
+            Some("allow")
+        );
+        assert_eq!(
+            parsed["tools"]["mergen-browser_browser_navigate"].as_bool(),
             Some(true)
         );
 
@@ -458,7 +488,7 @@ mod tests {
 
         let content = fs::read_to_string(config_dir.join("opencode.json")).unwrap();
         let parsed: JsonValue = serde_json::from_str(&content).unwrap();
-        let mcp = &parsed["mcp"]["mcp-server-playwright"];
+        let mcp = &parsed["mcp"][MERGEN_BROWSER_MCP_SERVER_NAME];
         let command = mcp["command"].as_array().unwrap();
 
         // CRITICAL: Command must use main exe + --browser-mcp-helper, not sidecar

@@ -128,15 +128,7 @@ fn call_mergen(env: &HelperEnv, tool: &str, params: JsonValue) -> BrowserMcpIpcR
 }
 
 fn call_mergen_once(env: &HelperEnv, tool: &str, params: JsonValue) -> BrowserMcpIpcResponse {
-    let mut merged_params = params.clone();
-    merged_params["tool"] = json!(tool);
-    let request = BrowserMcpIpcRequest {
-        request_id: request_id(),
-        terminal_id: env.terminal_id,
-        project_id: env.project_id,
-        tool: "run_mcp_script".to_owned(),
-        params: json!({"script": merged_params}),
-    };
+    let request = browser_mcp_ipc_request(env, tool, params);
     match send_ipc_request(env, request) {
         Ok(response) => response,
         Err(err) => BrowserMcpIpcResponse::error(err),
@@ -149,15 +141,7 @@ fn call_mergen_once_with_timeout(
     params: JsonValue,
     timeout: Duration,
 ) -> BrowserMcpIpcResponse {
-    let mut merged_params = params.clone();
-    merged_params["tool"] = json!(tool);
-    let request = BrowserMcpIpcRequest {
-        request_id: request_id(),
-        terminal_id: env.terminal_id,
-        project_id: env.project_id,
-        tool: "run_mcp_script".to_owned(),
-        params: json!({"script": merged_params}),
-    };
+    let request = browser_mcp_ipc_request(env, tool, params);
     match send_ipc_request_with_timeout(env, request, timeout) {
         Ok(response) => response,
         Err(err) => BrowserMcpIpcResponse::error(err),
@@ -188,13 +172,7 @@ fn call_browser_wait_for(env: &HelperEnv, params: JsonValue) -> BrowserMcpIpcRes
                         "Timeout waiting for condition: {description}"
                     ));
                 }
-                let request = BrowserMcpIpcRequest {
-                    request_id: request_id(),
-                    terminal_id: env.terminal_id,
-                    project_id: env.project_id,
-                    tool: "run_mcp_script".to_owned(),
-                    params: json!({"script": poll_params}),
-                };
+                let request = browser_mcp_ipc_request(env, "browser_wait_for", poll_params.clone());
                 let poll_result = send_ipc_request_with_timeout(
                     env,
                     request,
@@ -336,6 +314,16 @@ fn browser_wait_poll_read_timeout(remaining: Duration) -> Duration {
 
 fn browser_wait_error_is_retryable(message: &str) -> bool {
     message.contains("Text not found") || message.contains("Text is still visible")
+}
+
+fn browser_mcp_ipc_request(env: &HelperEnv, tool: &str, params: JsonValue) -> BrowserMcpIpcRequest {
+    BrowserMcpIpcRequest {
+        request_id: request_id(),
+        terminal_id: env.terminal_id,
+        project_id: env.project_id,
+        tool: tool.to_owned(),
+        params,
+    }
 }
 
 fn send_ipc_request(
@@ -946,6 +934,25 @@ mod tests {
         assert_eq!(content[1]["type"].as_str(), Some("image"));
         assert_eq!(content[1]["data"].as_str(), Some("abcd"));
         assert_eq!(content[1]["mimeType"].as_str(), Some("image/png"));
+    }
+
+    #[test]
+    fn ipc_request_uses_actual_browser_tool_name() {
+        let env = HelperEnv {
+            port: None,
+            token: None,
+            terminal_id: Some(42),
+            project_id: Some(7),
+            caps: Vec::new(),
+        };
+
+        let request = browser_mcp_ipc_request(&env, "browser_tabs", json!({ "action": "list" }));
+
+        assert_eq!(request.terminal_id, Some(42));
+        assert_eq!(request.project_id, Some(7));
+        assert_eq!(request.tool, "browser_tabs");
+        assert_eq!(request.params["action"].as_str(), Some("list"));
+        assert!(request.params.get("script").is_none());
     }
 
     #[test]

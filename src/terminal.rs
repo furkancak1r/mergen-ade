@@ -1,8 +1,12 @@
 use std::cell::RefCell;
 use std::cmp::Reverse;
+#[cfg(target_os = "windows")]
+use std::collections::HashSet;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
+#[cfg(target_os = "windows")]
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 #[cfg(target_os = "windows")]
 use std::os::windows::io::RawHandle;
 use std::path::{Path, PathBuf};
@@ -22,7 +26,7 @@ use crate::hooks::{
 };
 use crate::opencode::opencode_env_pairs;
 use crate::opencode_config;
-use crate::opencode_hook_service::OpenCodeHookService;
+use crate::opencode_hook_service::{OpenCodeHookService, OPENCODE_CONFIG_DIR_ENV_VAR};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tattoy_wezterm_surface::{CursorShape, CursorVisibility};
@@ -48,6 +52,11 @@ use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Registry::{
+    RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_VALUE_TYPE,
+    RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Threading::{
@@ -656,6 +665,153 @@ impl Write for SharedWriter {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn apply_terminal_path_hardening(command: &mut CommandBuilder) {
+    if let Some(path) = hardened_terminal_path_env() {
+        command.env("PATH", path);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_terminal_path_hardening(_command: &mut CommandBuilder) {}
+
+#[cfg(target_os = "windows")]
+fn hardened_terminal_path_env() -> Option<OsString> {
+    let path_values = [
+        std::env::var_os("PATH"),
+        fresh_windows_registry_path(
+            HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ),
+        fresh_windows_registry_path(HKEY_CURRENT_USER, "Environment"),
+    ];
+
+    merge_windows_path_values(
+        path_values.into_iter().flatten(),
+        known_windows_command_path_dirs(),
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn known_windows_command_path_dirs() -> Vec<OsString> {
+    let mut dirs = Vec::new();
+
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        dirs.push(PathBuf::from(appdata).join("npm").into_os_string());
+    }
+    if let Some(program_files) = std::env::var_os("ProgramFiles") {
+        dirs.push(PathBuf::from(program_files).join("nodejs").into_os_string());
+    }
+    if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+        dirs.push(
+            PathBuf::from(local_appdata)
+                .join("Microsoft")
+                .join("WindowsApps")
+                .into_os_string(),
+        );
+    }
+
+    dirs
+}
+
+#[cfg(target_os = "windows")]
+fn merge_windows_path_values<I, J>(path_values: I, known_dirs: J) -> Option<OsString>
+where
+    I: IntoIterator<Item = OsString>,
+    J: IntoIterator<Item = OsString>,
+{
+    let mut entries = Vec::new();
+    for value in path_values {
+        entries.extend(
+            std::env::split_paths(&value)
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|path| path.into_os_string()),
+        );
+    }
+    entries.extend(
+        known_dirs
+            .into_iter()
+            .filter(|path| !path.as_os_str().is_empty()),
+    );
+
+    let mut seen = HashSet::new();
+    let unique_entries = entries
+        .into_iter()
+        .filter(|entry| path_dedup_key(entry.as_os_str()).is_some_and(|key| seen.insert(key)))
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+
+    if unique_entries.is_empty() {
+        return None;
+    }
+
+    std::env::join_paths(unique_entries).ok()
+}
+
+#[cfg(target_os = "windows")]
+fn path_dedup_key(path: &OsStr) -> Option<String> {
+    let mut key = path.to_string_lossy().trim().trim_matches('"').to_owned();
+    while key.len() > 3 && (key.ends_with('\\') || key.ends_with('/')) {
+        key.pop();
+    }
+    if key.is_empty() {
+        None
+    } else {
+        Some(key.to_ascii_lowercase())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn fresh_windows_registry_path(root: HKEY, subkey: &str) -> Option<OsString> {
+    let subkey = wide_null(subkey);
+    let value_name = wide_null("Path");
+    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ;
+    let mut value_type: REG_VALUE_TYPE = 0;
+    let mut byte_len = 0u32;
+
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            subkey.as_ptr(),
+            value_name.as_ptr(),
+            flags,
+            &mut value_type,
+            ptr::null_mut(),
+            &mut byte_len,
+        )
+    };
+    if status != 0 || byte_len == 0 {
+        return None;
+    }
+
+    let mut buffer = vec![0u16; (byte_len as usize + 1) / 2];
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            subkey.as_ptr(),
+            value_name.as_ptr(),
+            flags,
+            &mut value_type,
+            buffer.as_mut_ptr().cast(),
+            &mut byte_len,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+
+    let len = buffer
+        .iter()
+        .position(|ch| *ch == 0)
+        .unwrap_or(buffer.len());
+    (len > 0).then(|| OsString::from_wide(&buffer[..len]))
+}
+
+#[cfg(target_os = "windows")]
+fn wide_null(value: &str) -> Vec<u16> {
+    OsStr::new(value).encode_wide().chain(Some(0)).collect()
+}
+
 impl TerminalRuntime {
     pub fn spawn(
         terminal_id: u64,
@@ -685,6 +841,7 @@ impl TerminalRuntime {
         let mut command = CommandBuilder::new(program);
         command.args(args.iter().copied());
         command.cwd(working_directory);
+        apply_terminal_path_hardening(&mut command);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         command.env("CLICOLOR", "1");
@@ -720,8 +877,10 @@ impl TerminalRuntime {
                 command.env(name, value);
             }
         }
-        if let Some(hook_service) = opencode_hook_service {
-            if let Some(opencode_dir) = opencode_runtime_dir.as_deref() {
+        if let Some(opencode_dir) = opencode_runtime_dir.as_deref() {
+            let mut opencode_config_dir = None::<PathBuf>;
+
+            if let Some(hook_service) = opencode_hook_service {
                 let config_dir = crate::opencode_hook_service::write_terminal_plugin_config(
                     opencode_dir,
                     terminal_id,
@@ -729,31 +888,37 @@ impl TerminalRuntime {
                 for (name, value) in hook_service.build_pty_env(terminal_id, &config_dir) {
                     command.env(name, value);
                 }
-                // Also write the runtime config with the build model override
-                if let Some(build_model) = opencode_build_model {
-                    let browser_mcp = browser_mcp_service.and_then(|service| {
-                        std::env::current_exe().ok().map(|current_exe| {
-                            (
-                                current_exe,
-                                service.endpoint_env(terminal_id, Some(project_id)),
-                            )
-                        })
-                    });
-                    let write_result = if let Some((exe_path, endpoint)) = browser_mcp.as_ref() {
-                        opencode_config::write_terminal_runtime_config_with_browser_mcp(
-                            opencode_dir,
-                            terminal_id,
-                            build_model,
-                            Some((exe_path.as_path(), endpoint.clone())),
+                opencode_config_dir = Some(config_dir);
+            }
+
+            if let Some(build_model) = opencode_build_model {
+                let browser_mcp = browser_mcp_service.and_then(|service| {
+                    std::env::current_exe().ok().map(|current_exe| {
+                        (
+                            current_exe,
+                            service.endpoint_env(terminal_id, Some(project_id)),
                         )
-                    } else {
-                        opencode_config::write_terminal_runtime_config(
-                            opencode_dir,
-                            terminal_id,
-                            build_model,
-                        )
-                    };
-                    if let Err(err) = write_result {
+                    })
+                });
+                let write_result = if let Some((exe_path, endpoint)) = browser_mcp.as_ref() {
+                    opencode_config::write_terminal_runtime_config_with_browser_mcp(
+                        opencode_dir,
+                        terminal_id,
+                        build_model,
+                        Some((exe_path.as_path(), endpoint.clone())),
+                    )
+                } else {
+                    opencode_config::write_terminal_runtime_config(
+                        opencode_dir,
+                        terminal_id,
+                        build_model,
+                    )
+                };
+                match write_result {
+                    Ok(config_dir) => {
+                        opencode_config_dir = Some(config_dir);
+                    }
+                    Err(err) => {
                         log::warn!(
                             "Failed to write OpenCode runtime config for terminal {}: {}",
                             terminal_id,
@@ -761,6 +926,14 @@ impl TerminalRuntime {
                         );
                     }
                 }
+            }
+
+            if let Some(config_dir) = opencode_config_dir {
+                command.env(OPENCODE_CONFIG_DIR_ENV_VAR, config_dir.as_os_str());
+                command.env(
+                    "OPENCODE_CONFIG",
+                    config_dir.join("opencode.json").as_os_str(),
+                );
             }
         }
         if let Some(browser_mcp_service) = browser_mcp_service {
@@ -4592,6 +4765,47 @@ mod tests {
         assert_eq!(pairs[3].1, OsString::from(MERGEN_AI_TOOL_HINT_CODEX));
         assert_eq!(pairs[4].0, MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR);
         assert_eq!(pairs[4].1, OsString::from("codex-token-29"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_terminal_path_merge_preserves_order_and_deduplicates() {
+        let merged = super::merge_windows_path_values(
+            [
+                OsString::from(r"C:\Tools;C:\Users\demo\AppData\Roaming\npm"),
+                OsString::from(r"C:\Windows\System32;C:\Tools\"),
+                OsString::from(r"c:\users\demo\appdata\roaming\npm;C:\Extra"),
+            ],
+            [
+                OsString::from(r"C:\Program Files\nodejs"),
+                OsString::from(r"C:\Tools"),
+            ],
+        )
+        .expect("merged PATH");
+
+        let parts = std::env::split_paths(&merged)
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            parts,
+            vec![
+                r"C:\Tools",
+                r"C:\Users\demo\AppData\Roaming\npm",
+                r"C:\Windows\System32",
+                r"C:\Extra",
+                r"C:\Program Files\nodejs",
+            ]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_terminal_path_merge_returns_none_for_empty_input() {
+        assert_eq!(
+            super::merge_windows_path_values(Vec::<OsString>::new(), Vec::<OsString>::new()),
+            None
+        );
     }
 
     #[test]
