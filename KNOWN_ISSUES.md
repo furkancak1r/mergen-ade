@@ -3495,3 +3495,58 @@
 - Files/Commands touched: `src/bin/mergen-browser-mcp.rs`, `src/web_browser.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted `cargo test`, `cargo test`
 - References: Code review finding on 2026-05-04 that `browser_wait_for({time})` reported success without waiting.
 
+#### Browser WebView focus blocked terminal input until switching terminals {#browser-focus-blocked-terminal-input}
+- Date: 2026-05-05
+- Context: Embedded browser panel with WebView2 on Windows, terminal focus management
+- Error signature: `Typing in terminal doesn't work after using browser panel until switching to another terminal and back`
+- Symptoms/Impact:
+  1. User opens the Browser panel and interacts with it (types in URL input or clicks in WebView).
+  2. User then clicks on the terminal or uses Terminal Manager to switch back to terminal.
+  3. Keyboard input doesn't reach the terminal—typed characters don't appear.
+  4. User must switch to a different terminal, then switch back to the original terminal.
+  5. After this workaround, terminal input works normally again.
+- Root cause:
+  1. The Browser panel's URL input (`browser_url_input_id`) and native WebView2 both hold keyboard focus independently from egui's focus system.
+  2. When activating a terminal via Terminal Manager, `set_active_terminal()` was called but UI text focus wasn't surrendered.
+  3. On Windows, native WebView2 also holds separate native window focus that doesn't automatically yield to the main application window.
+  4. The early return in `set_active_terminal()` when re-selecting the same terminal skipped all focus preparation, so browser URL input focus persisted.
+  5. Terminal input capture depends on `ui_owns_keyboard()` returning false, but focused browser URL input made it return true.
+- Resolution:
+  - Added `restore_window_focus_for_terminal_input()` helper that calls `SetFocus(hwnd)` on Windows when a terminal is activated.
+  - Modified `set_active_terminal()` to call `surrender_ui_text_focus()` at the start when activating any terminal, ensuring browser URL input and other text inputs lose egui focus.
+  - Modified `set_active_terminal()` to call `restore_window_focus_for_terminal_input()` to restore native window focus on Windows.
+  - These focus preparations happen before the early return check for same-terminal selection, ensuring they run even when re-selecting the current terminal.
+  - Browser panel state is not destroyed—browser remains open, just focus yields to terminal.
+- Prevent recurrence:
+  - Always clear UI text input focus when switching to terminal input, even if the target terminal is already active.
+  - On Windows with native child windows (WebView2), explicitly restore main window focus when yielding from those surfaces.
+  - Test terminal input after browser interaction in manual QA; don't rely only on terminal-to-terminal switching.
+- Files/Commands touched: `src/app.rs` (`restore_window_focus_for_terminal_input` helper, `set_active_terminal` focus handling), `AGENTS.md` (browser focus guideline), `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report that "browserdan terminale geçiş yaparken geçmiyor hemen önce başka terminale geçip ardından geri browserlı olan terminale geçtiğimde yazı yazabiliyorum yoksa yazmıyor"
+
+
+#### Directory search did not start on initially selected project until switching projects {#directory-search-initial-project-stale-tracking}
+- Date: 2026-05-05
+- Context: Directory panel search, initial selected project, lazy directory indexing
+- Error signature: Search in prosolocal does not work until selecting another Directory project and returning
+- Symptoms/Impact:
+  1. User opens a project such as prosolocal.
+  2. Directory search appears unresponsive or does not produce expected results.
+  3. Selecting another project in the Directory panel and then returning makes the same search work.
+- Root cause:
+  1. Directory search text could be intercepted by active AI attention terminal routing (input stealing).
+  2. Search debounce/query tracking was updated only after a loaded, error-free directory snapshot existed.
+  3. Directory search tracking was global and did not explicitly reset when selected project changed.
+- Resolution:
+  - Prevent AI attention input routing from stealing text while Directory search has focus.
+  - Move Directory search query/debounce tracking before snapshot availability/loading checks.
+  - Reset project-scoped search tracking on selected project changes while preserving the typed query.
+  - Remove duplicate non-Windows pply_initial_window_bounds() definition introduced during browser focus work.
+  - Add project-scoped field directory_search_tracking_project_id and helper eset_directory_search_tracking_for_project().
+- Prevent recurrence:
+  - Keep tests proving Directory search focus owns typed text, even with an attention terminal.
+  - Keep tests proving query tracking starts while indexing is still loading.
+  - Keep tests proving project selection resets tracking without clearing the query.
+- Files/Commands touched: src/app.rs, AGENTS.md, KNOWN_ISSUES.md, cargo fmt, cargo test, cargo build --release --target x86_64-pc-windows-msvc
+- References: User report that Directory search in prosolocal only works after selecting another project and returning.
+

@@ -1076,6 +1076,9 @@ pub struct AdeApp {
     directory_search_last_query: String,
     /// Timestamp when search query last changed (for debounce).
     directory_search_query_changed_at: f64,
+    /// Project ID for which debounce/tracking state is currently valid.
+    /// Used to reset tracking when project selection changes.
+    directory_search_tracking_project_id: Option<u64>,
     directory_pending_tree_open_state_by_project: BTreeMap<u64, bool>,
     status_line: String,
     transient_toast: Option<TransientToast>,
@@ -3460,6 +3463,7 @@ impl AdeApp {
             directory_search_query: String::new(),
             directory_search_last_query: String::new(),
             directory_search_query_changed_at: 0.0,
+            directory_search_tracking_project_id: selected_project,
             directory_pending_tree_open_state_by_project: BTreeMap::new(),
             status_line: config_load_error
                 .map(|err| format!("Config load error: {err}. Existing config preserved."))
@@ -3623,6 +3627,8 @@ impl AdeApp {
 
     fn note_selection_changed(&mut self) {
         self.pending_config_changes.selection = true;
+        // Reset Directory search tracking so the same query re-runs for the new project.
+        self.reset_directory_search_tracking_for_project(self.selected_project);
     }
 
     fn bump_layout_epoch(&mut self) {
@@ -8410,6 +8416,15 @@ impl AdeApp {
         });
     }
 
+    /// Reset Directory search tracking state when selected project changes.
+    /// Preserves the typed query text, but resets debounce/tracking so the
+    /// same query re-runs for the newly selected project.
+    fn reset_directory_search_tracking_for_project(&mut self, project_id: Option<u64>) {
+        self.directory_search_tracking_project_id = project_id;
+        self.directory_search_last_query.clear();
+        self.directory_search_query_changed_at = 0.0;
+    }
+
     /// Execute a terminal shortcut by sending its command to the active terminal.
     /// Returns true if the shortcut was handled (to consume the event).
     fn execute_terminal_shortcut(&mut self, ctx: &egui::Context, command: &str) -> bool {
@@ -8823,6 +8838,12 @@ impl AdeApp {
         }
 
         if !self.text_input_has_focus_extended(ctx) {
+            return false;
+        }
+
+        // Do not steal text input from Directory search field.
+        // User intent: if Directory search is focused, typed text belongs to search.
+        if ctx.memory(|mem| mem.has_focus(Self::directory_search_input_id())) {
             return false;
         }
 
@@ -10012,6 +10033,29 @@ impl AdeApp {
         log::info!("Windows taskbar icon set successfully");
     }
 
+    /// Restore window focus to the main application window on Windows.
+    /// Called when activating a terminal to ensure native WebView2 focus
+    /// yields to terminal input capture.
+    #[cfg(target_os = "windows")]
+    fn restore_window_focus_for_terminal_input(&self) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+
+        let Some(hwnd) = self.window_hwnd else {
+            return;
+        };
+
+        if hwnd == 0 {
+            return;
+        }
+
+        unsafe {
+            let _ = SetFocus(windows::Win32::Foundation::HWND(hwnd as _));
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn restore_window_focus_for_terminal_input(&self) {}
+
     #[cfg(not(target_os = "windows"))]
     fn apply_initial_window_icon(&mut self, _ctx: &egui::Context) {}
 
@@ -10264,6 +10308,15 @@ impl AdeApp {
     }
 
     fn set_active_terminal(&mut self, ctx: &egui::Context, terminal_id: Option<u64>) {
+        // Clear UI text input focus and restore window focus when activating any terminal.
+        // This ensures browser URL input, directory search, and other text inputs yield
+        // keyboard focus to the terminal. Must happen even when re-selecting the same terminal
+        // to handle the case where user switches from browser panel back to terminal.
+        if terminal_id.is_some() {
+            self.surrender_ui_text_focus(ctx);
+            self.restore_window_focus_for_terminal_input();
+        }
+
         // Hide file editor when selecting a terminal (allows switching from editor to terminal)
         // This runs even if the same terminal is already active, to handle the case where
         // the editor is visible and user clicks on the active terminal in Terminal Manager.
@@ -13639,6 +13692,37 @@ impl AdeApp {
                                 let search_query =
                                     (!search_query.is_empty()).then_some(search_query);
                                 if let Some(project_id) = self.selected_project {
+                                    // Update Directory search query tracking before checking snapshot.
+                                    // Tracking must run even while index is loading/error so debounce
+                                    // and deferred search eligibility works immediately.
+                                    let now = ui.ctx().input(|input| input.time);
+                                    if let Some(query) = search_query.as_deref() {
+                                        if query != self.directory_search_last_query {
+                                            self.directory_search_last_query = query.to_owned();
+                                            self.directory_search_query_changed_at = now;
+                                        }
+                                    } else {
+                                        // Clear tracking when search is not active
+                                        self.directory_search_last_query.clear();
+                                        self.directory_search_query_changed_at = 0.0;
+                                    }
+
+                                    // Schedule repaint if waiting for debounce to expire
+                                    let debounce_remaining = search_query
+                                        .as_deref()
+                                        .and_then(|query| {
+                                            directory_search_deferred_load_debounce_remaining(
+                                                query,
+                                                now,
+                                                self.directory_search_query_changed_at,
+                                            )
+                                        });
+                                    if let Some(remaining_secs) = debounce_remaining {
+                                        ui.ctx().request_repaint_after(Duration::from_secs_f64(
+                                            remaining_secs.min(0.25),
+                                        ));
+                                    }
+
                                     if refresh_index {
                                         self.request_directory_index_refresh(project_id, true);
                                     }
@@ -13723,19 +13807,6 @@ impl AdeApp {
                                                 } else {
                                                     "Collapsed all folders".to_owned()
                                                 });
-                                            }
-
-                                            // Track search query changes for debounce logic
-                                            let now = ui.ctx().input(|input| input.time);
-                                            if let Some(query) = search_query.as_deref() {
-                                                if query != self.directory_search_last_query {
-                                                    self.directory_search_last_query = query.to_owned();
-                                                    self.directory_search_query_changed_at = now;
-                                                }
-                                            } else {
-                                                // Clear tracking when search is not active
-                                                self.directory_search_last_query.clear();
-                                                self.directory_search_query_changed_at = 0.0;
                                             }
 
                                             let mut matching_directories = HashSet::new();
@@ -13834,8 +13905,9 @@ impl AdeApp {
                                                 self.open_file_in_editor(project_id, path);
                                             }
 
-                                            // Determine pending work: in-flight subtree loads OR
-                                            // deferred directories still to be loaded for search
+                                            // Determine pending work: in-flight subtree loads,
+                                            // deferred directories still to be loaded for search,
+                                            // OR waiting for debounce to expire
                                             let has_in_flight_loads = self
                                                 .directory_index_subtree_loading_by_project
                                                 .get(&project_id)
@@ -13850,8 +13922,10 @@ impl AdeApp {
                                                     )
                                                 })
                                                 .unwrap_or(true);
-                                            let has_pending_search_work =
-                                                has_in_flight_loads || (has_deferred_dirs_for_search && !query_stable_for_deferred);
+                                            let waiting_for_debounce = debounce_remaining.is_some();
+                                            let has_pending_search_work = has_in_flight_loads
+                                                || waiting_for_debounce
+                                                || (has_deferred_dirs_for_search && !query_stable_for_deferred);
 
                                             // Only show "No matching files or folders" when:
                                             // - query is stable (debounced)
@@ -13860,7 +13934,7 @@ impl AdeApp {
                                             let query_stable = search_query
                                                 .as_deref()
                                                 .map(|q| {
-                                                    q.len() < DIRECTORY_SEARCH_MIN_DEFERRED_QUERY_CHARS
+                                                    q.chars().count() < DIRECTORY_SEARCH_MIN_DEFERRED_QUERY_CHARS
                                                         || directory_search_query_stable(
                                                             now,
                                                             self.directory_search_query_changed_at,
@@ -19180,10 +19254,30 @@ fn directory_search_query_stable(now: f64, changed_at: f64) -> bool {
 /// Returns true if deferred directory loading should be triggered for this query.
 /// Requires stable query and minimum character length to avoid aggressive loading on short queries.
 fn directory_search_should_load_deferred(query: &str, now: f64, changed_at: f64) -> bool {
-    if query.len() < DIRECTORY_SEARCH_MIN_DEFERRED_QUERY_CHARS {
+    if query.chars().count() < DIRECTORY_SEARCH_MIN_DEFERRED_QUERY_CHARS {
         return false;
     }
     directory_search_query_stable(now, changed_at)
+}
+
+/// Returns the remaining debounce duration if a query is waiting to become stable.
+/// Used to schedule a repaint so deferred loading starts promptly after debounce.
+fn directory_search_deferred_load_debounce_remaining(
+    query: &str,
+    now: f64,
+    changed_at: f64,
+) -> Option<f64> {
+    if query.chars().count() < DIRECTORY_SEARCH_MIN_DEFERRED_QUERY_CHARS {
+        return None;
+    }
+    if changed_at == 0.0 {
+        return None;
+    }
+    let elapsed = now - changed_at;
+    if elapsed >= DIRECTORY_SEARCH_DEFERRED_LOAD_DEBOUNCE_SECS {
+        return None;
+    }
+    Some(DIRECTORY_SEARCH_DEFERRED_LOAD_DEBOUNCE_SECS - elapsed)
 }
 
 /// Collects visible directories and files for a directory search result.
@@ -28788,7 +28882,10 @@ mod tests {
     }
 
     #[test]
-    fn raw_input_hook_steals_directory_search_text_for_attention_terminal() {
+    fn raw_input_hook_keeps_directory_search_text_when_attention_terminal_active() {
+        // Regression test: Directory search focus must not have text stolen
+        // by AI attention terminal routing. User intent: if Directory search
+        // is focused, typed text belongs to the search field.
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
         seed_ai_attention(&mut app, 1);
@@ -28801,23 +28898,35 @@ mod tests {
 
         <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
 
-        assert!(raw_input.events.is_empty());
+        // Text should NOT be stolen from Directory search
         assert_eq!(
-            app.buffered_terminal_input,
-            vec![Event::Text("hello".to_owned())]
+            raw_input.events,
+            vec![Event::Text("hello".to_owned())],
+            "Directory search text should not be stolen by attention terminal"
         );
-        assert!(!ctx.memory(|mem| mem.has_focus(AdeApp::directory_search_input_id())));
+        assert!(
+            app.buffered_terminal_input.is_empty(),
+            "No buffered terminal input when Directory search owns focus"
+        );
+        // Directory search should retain focus
+        assert!(
+            ctx.memory(|mem| mem.has_focus(AdeApp::directory_search_input_id())),
+            "Directory search focus should not be surrendered"
+        );
 
-        let buffered_events = app.take_buffered_terminal_input();
-        app.route_active_terminal_input(&ctx, buffered_events);
-
+        // Terminal should still be in Attention state (no change from stealing)
         let terminal = app.terminals.get(&1).expect("terminal 1");
-        assert_eq!(terminal.ai_session.status, AiCliStatus::Inactive);
-        assert_eq!(terminal.pending_line_for_title, "hello");
+        assert_eq!(
+            terminal.ai_session.status,
+            AiCliStatus::Attention,
+            "Terminal attention state should not change"
+        );
     }
 
     #[test]
-    fn raw_input_hook_steals_tab_for_factory_droid_ask_user_terminal() {
+    fn raw_input_hook_keeps_tab_for_directory_search_when_factory_droid_ask_user() {
+        // Regression test: Directory search focus must not be stolen even for
+        // Factory Droid AskUser interactive attention (Tab key).
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
         seed_factory_droid_ask_user_attention(&mut app, 1);
@@ -28837,13 +28946,12 @@ mod tests {
 
         <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
 
-        assert!(raw_input.events.is_empty());
-        assert_eq!(app.buffered_terminal_input, vec![plain_tab.clone()]);
-        assert!(!ctx.memory(|mem| mem.has_focus(AdeApp::directory_search_input_id())));
+        // Directory search should retain focus and events
+        assert_eq!(raw_input.events, vec![plain_tab.clone()]);
+        assert!(app.buffered_terminal_input.is_empty());
+        assert!(ctx.memory(|mem| mem.has_focus(AdeApp::directory_search_input_id())));
 
-        let buffered_events = app.take_buffered_terminal_input();
-        app.route_active_terminal_input(&ctx, buffered_events);
-
+        // Terminal should remain in Attention state
         let terminal = app.terminals.get(&1).expect("terminal 1");
         assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
         assert_eq!(
@@ -28853,7 +28961,9 @@ mod tests {
     }
 
     #[test]
-    fn raw_input_hook_steals_ctrl_g_for_factory_droid_spec_approval_terminal() {
+    fn raw_input_hook_keeps_ctrl_g_for_directory_search_when_factory_droid_spec_approval() {
+        // Regression test: Directory search focus must not be stolen even for
+        // Factory Droid SpecificationApproval interactive attention (Ctrl+G).
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
         seed_factory_droid_spec_approval_attention(&mut app, 1);
@@ -28877,13 +28987,12 @@ mod tests {
 
         <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
 
-        assert!(raw_input.events.is_empty());
-        assert_eq!(app.buffered_terminal_input, vec![ctrl_g.clone()]);
-        assert!(!ctx.memory(|mem| mem.has_focus(AdeApp::directory_search_input_id())));
+        // Directory search should retain focus and events
+        assert_eq!(raw_input.events, vec![ctrl_g.clone()]);
+        assert!(app.buffered_terminal_input.is_empty());
+        assert!(ctx.memory(|mem| mem.has_focus(AdeApp::directory_search_input_id())));
 
-        let buffered_events = app.take_buffered_terminal_input();
-        app.route_active_terminal_input(&ctx, buffered_events);
-
+        // Terminal should remain in Attention state
         let terminal = app.terminals.get(&1).expect("terminal 1");
         assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
         assert_eq!(
@@ -32585,6 +32694,7 @@ mod tests {
             directory_search_query: String::new(),
             directory_search_last_query: String::new(),
             directory_search_query_changed_at: 0.0,
+            directory_search_tracking_project_id: None,
             directory_pending_tree_open_state_by_project: BTreeMap::new(),
             status_line: "Ready".to_owned(),
             transient_toast: None,
@@ -33880,6 +33990,144 @@ mod tests {
         assert!(
             directory_search_should_load_deferred("search", now, fully_stable),
             "Stable query past debounce should trigger deferred loading"
+        );
+    }
+
+    #[test]
+    fn directory_search_deferred_load_debounce_remaining_waits_until_threshold() {
+        // Regression test: Helper should return remaining time during debounce window
+        use super::{
+            directory_search_deferred_load_debounce_remaining,
+            DIRECTORY_SEARCH_DEFERRED_LOAD_DEBOUNCE_SECS,
+        };
+
+        let now = 10.0;
+        let query = "search";
+
+        // Just changed - should have close to full debounce remaining
+        let just_changed = now;
+        let remaining = directory_search_deferred_load_debounce_remaining(query, now, just_changed);
+        assert!(
+            remaining.is_some(),
+            "Should return remaining time immediately after change"
+        );
+        let remaining_secs = remaining.unwrap();
+        assert!(
+            remaining_secs > DIRECTORY_SEARCH_DEFERRED_LOAD_DEBOUNCE_SECS * 0.9,
+            "Remaining time should be close to full debounce duration"
+        );
+
+        // Partially through debounce
+        let partially_elapsed = now - DIRECTORY_SEARCH_DEFERRED_LOAD_DEBOUNCE_SECS / 2.0;
+        let remaining =
+            directory_search_deferred_load_debounce_remaining(query, now, partially_elapsed);
+        assert!(
+            remaining.is_some(),
+            "Should return remaining time during debounce window"
+        );
+        let remaining_secs = remaining.unwrap();
+        assert!(
+            (remaining_secs - DIRECTORY_SEARCH_DEFERRED_LOAD_DEBOUNCE_SECS / 2.0).abs() < 0.01,
+            "Remaining time should be approximately half the debounce duration"
+        );
+    }
+
+    #[test]
+    fn directory_search_deferred_load_debounce_remaining_none_after_threshold() {
+        // Regression test: Helper should return None when debounce has expired
+        use super::directory_search_deferred_load_debounce_remaining;
+
+        let now = 10.0;
+        let query = "search";
+
+        // Past debounce threshold - should return None
+        let past_threshold = now - 0.3; // 300ms ago (debounce is 250ms)
+        let remaining =
+            directory_search_deferred_load_debounce_remaining(query, now, past_threshold);
+        assert!(
+            remaining.is_none(),
+            "Should return None when debounce has expired"
+        );
+
+        // Zero changed_at (no change yet) - should return None
+        let remaining = directory_search_deferred_load_debounce_remaining(query, now, 0.0);
+        assert!(
+            remaining.is_none(),
+            "Should return None when changed_at is 0 (no change yet)"
+        );
+    }
+
+    #[test]
+    fn directory_search_deferred_load_debounce_remaining_ignores_short_queries() {
+        // Regression test: Helper should return None for short queries (below min length)
+        use super::{
+            directory_search_deferred_load_debounce_remaining,
+            DIRECTORY_SEARCH_MIN_DEFERRED_QUERY_CHARS,
+        };
+
+        let now = 10.0;
+        let just_changed = now;
+
+        // Empty query - should return None
+        let remaining = directory_search_deferred_load_debounce_remaining("", now, just_changed);
+        assert!(remaining.is_none(), "Should return None for empty query");
+
+        // Single char query - should return None (below min)
+        let remaining = directory_search_deferred_load_debounce_remaining("a", now, just_changed);
+        assert!(
+            remaining.is_none(),
+            "Should return None for single char query"
+        );
+
+        // Query at minimum length - should return remaining time
+        let min_query = "ab";
+        assert_eq!(
+            min_query.chars().count(),
+            DIRECTORY_SEARCH_MIN_DEFERRED_QUERY_CHARS
+        );
+        let remaining =
+            directory_search_deferred_load_debounce_remaining(min_query, now, just_changed);
+        assert!(
+            remaining.is_some(),
+            "Should return remaining time for query at min length"
+        );
+    }
+
+    #[test]
+    fn directory_search_should_load_deferred_counts_chars_not_bytes() {
+        // Regression test: Unicode queries should use character count, not byte count
+        use super::{
+            directory_search_should_load_deferred, DIRECTORY_SEARCH_MIN_DEFERRED_QUERY_CHARS,
+        };
+
+        let now = 10.0;
+        let stable_time = now - 1.0; // Well past debounce
+
+        // Single Unicode character (2 bytes in UTF-8) - should NOT load (1 char < 2 min)
+        let turkish_char = "ğ";
+        assert_eq!(turkish_char.len(), 2); // 2 bytes
+        assert_eq!(turkish_char.chars().count(), 1); // 1 character
+        assert!(
+            !directory_search_should_load_deferred(turkish_char, now, stable_time),
+            "Single Unicode char should NOT trigger deferred loading (char count < min)"
+        );
+
+        // Two Unicode characters (4 bytes in UTF-8) - should load (2 chars >= 2 min)
+        let turkish_two = "ğü";
+        assert_eq!(turkish_two.len(), 4); // 4 bytes
+        assert_eq!(turkish_two.chars().count(), 2); // 2 characters
+        assert!(
+            directory_search_should_load_deferred(turkish_two, now, stable_time),
+            "Two Unicode chars should trigger deferred loading (char count >= min)"
+        );
+
+        // Mixed ASCII and Unicode
+        let mixed = "ağ"; // 3 bytes, 2 chars
+        assert_eq!(mixed.len(), 3);
+        assert_eq!(mixed.chars().count(), 2);
+        assert!(
+            directory_search_should_load_deferred(mixed, now, stable_time),
+            "Mixed ASCII/Unicode should use char count for threshold"
         );
     }
 
@@ -39356,6 +39604,88 @@ mod tests {
     }
 
     #[test]
+    fn set_active_terminal_clears_browser_url_focus_when_switching_terminals() {
+        // Regression test: Switching terminals must clear browser URL input focus
+        use egui::Context;
+
+        let ctx = Context::default();
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 8)),
+            ],
+            Some(1),
+        );
+        app.projects
+            .insert(7, test_project(7, "Project1", "C:/proj1", &[], &[]));
+        app.projects
+            .insert(8, test_project(8, "Project2", "C:/proj2", &[], &[]));
+
+        // Set focus to browser URL input
+        ctx.memory_mut(|mem| {
+            mem.request_focus(super::AdeApp::browser_url_input_id(7));
+        });
+        assert!(ctx.memory(|mem| mem.has_focus(super::AdeApp::browser_url_input_id(7))));
+
+        // Switch to terminal 2 - should clear browser URL focus
+        app.set_active_terminal(&ctx, Some(2));
+
+        // Browser URL input should no longer have focus
+        assert!(!ctx.memory(|mem| mem.has_focus(super::AdeApp::browser_url_input_id(7))));
+        assert_eq!(app.active_terminal, Some(2));
+    }
+
+    #[test]
+    fn set_active_terminal_clears_browser_url_focus_for_same_terminal() {
+        // Regression test: Re-selecting same terminal must still clear browser URL input focus.
+        // This is the key case for the bug where browser focus persisted when clicking
+        // on the already-active terminal to return from browser panel.
+        use egui::Context;
+
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Project1", "C:/proj1", &[], &[]));
+
+        // Set focus to browser URL input
+        ctx.memory_mut(|mem| {
+            mem.request_focus(super::AdeApp::browser_url_input_id(7));
+        });
+        assert!(ctx.memory(|mem| mem.has_focus(super::AdeApp::browser_url_input_id(7))));
+
+        // Re-select the same terminal (simulates clicking active terminal after browser use)
+        app.set_active_terminal(&ctx, Some(1));
+
+        // Browser URL input should no longer have focus even though terminal didn't change
+        assert!(!ctx.memory(|mem| mem.has_focus(super::AdeApp::browser_url_input_id(7))));
+        assert_eq!(app.active_terminal, Some(1));
+    }
+
+    #[test]
+    fn set_active_terminal_clears_directory_search_focus() {
+        // Regression test: Activating terminal must clear directory search focus
+        use egui::Context;
+
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], None);
+        app.projects
+            .insert(7, test_project(7, "Project1", "C:/proj1", &[], &[]));
+
+        // Set focus to directory search input
+        ctx.memory_mut(|mem| {
+            mem.request_focus(super::AdeApp::directory_search_input_id());
+        });
+        assert!(ctx.memory(|mem| mem.has_focus(super::AdeApp::directory_search_input_id())));
+
+        // Activate terminal
+        app.set_active_terminal(&ctx, Some(1));
+
+        // Directory search should no longer have focus
+        assert!(!ctx.memory(|mem| mem.has_focus(super::AdeApp::directory_search_input_id())));
+        assert_eq!(app.active_terminal, Some(1));
+    }
+
+    #[test]
     fn handle_shortcuts_executes_terminal_shortcut_from_config() {
         let ctx = Context::default();
         let (runtime, capture) = test_terminal_runtime_with_capture();
@@ -40234,5 +40564,143 @@ mod tests {
             !mergen_consumed,
             "horizontal wheel NOT consumed when x != 0"
         );
+    }
+
+    // Directory Search Focus Protection Tests
+
+    #[test]
+    fn directory_search_tracking_resets_on_project_change() {
+        // Regression test: Changing selected project must reset directory search tracking
+        // so the same query re-runs for the new project.
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Project1", "C:/proj1", &[], &[]));
+        app.projects
+            .insert(8, test_project(8, "Project2", "C:/proj2", &[], &[]));
+        app.selected_project = Some(7);
+
+        // Simulate user typing in search
+        app.directory_search_query = "search_term".to_owned();
+        app.directory_search_last_query = "search_term".to_owned();
+        app.directory_search_query_changed_at = 10.0;
+        app.directory_search_tracking_project_id = Some(7);
+
+        // Change selected project
+        app.selected_project = Some(8);
+        app.note_selection_changed();
+
+        // Tracking should reset for new project but query text preserved
+        assert_eq!(
+            app.directory_search_tracking_project_id,
+            Some(8),
+            "Tracking project should update to new project"
+        );
+        assert_eq!(
+            app.directory_search_query, "search_term",
+            "Query text should be preserved"
+        );
+        assert!(
+            app.directory_search_last_query.is_empty(),
+            "last_query should be reset"
+        );
+        assert_eq!(
+            app.directory_search_query_changed_at, 0.0,
+            "changed_at should be reset"
+        );
+    }
+
+    #[test]
+    fn directory_search_query_tracking_starts_before_snapshot_available() {
+        // Regression test: Query tracking must work even while directory index is loading.
+        // This ensures search starts working on the initially selected project without
+        // requiring a project switch to trigger tracking.
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Project1", "C:/proj1", &[], &[]));
+        app.selected_project = Some(7);
+
+        // No directory index snapshot yet (simulates initial startup)
+        assert!(!app.directory_index_state.contains_key(&7));
+
+        // Simulate user typing search query
+        let query = "main";
+        let now = 100.0;
+        if query != app.directory_search_last_query {
+            app.directory_search_last_query = query.to_owned();
+            app.directory_search_query_changed_at = now;
+        }
+
+        // Tracking should be updated even without snapshot
+        assert_eq!(app.directory_search_last_query, "main");
+        assert_eq!(app.directory_search_query_changed_at, 100.0);
+
+        // Debounce check should work
+        assert!(
+            super::directory_search_query_stable(now + 0.5, app.directory_search_query_changed_at),
+            "Query should be stable after debounce"
+        );
+    }
+
+    #[test]
+    fn directory_search_focus_blocks_terminal_capture_with_attention() {
+        // Regression test: Directory search focus must block terminal capture
+        // even when an active terminal is in Attention state.
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Project1", "C:/proj1", &[], &[]));
+
+        // Set terminal to Attention state
+        seed_ai_attention(&mut app, 1);
+
+        // Set focus to directory search
+        ctx.memory_mut(|mem| mem.request_focus(AdeApp::directory_search_input_id()));
+
+        // Test that terminal keyboard capture is blocked
+        let capture_keyboard = app.should_capture_terminal_keyboard(&ctx);
+        assert!(
+            !capture_keyboard,
+            "Terminal should not capture keyboard when Directory search has focus"
+        );
+
+        // Test that attention input stealing is blocked
+        let events = vec![Event::Text("search".to_owned())];
+        let should_steal = app.should_steal_attention_terminal_input(&ctx, &events);
+        assert!(
+            !should_steal,
+            "Attention should not steal text from Directory search"
+        );
+
+        // Directory search should retain focus
+        assert!(
+            ctx.memory(|mem| mem.has_focus(AdeApp::directory_search_input_id())),
+            "Directory search should retain focus"
+        );
+    }
+
+    #[test]
+    fn directory_search_tracking_helper_resets_correctly() {
+        // Test the helper function directly
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Project1", "C:/proj1", &[], &[]));
+        app.selected_project = Some(7);
+
+        // Set up some tracking state
+        app.directory_search_last_query = "old_query".to_owned();
+        app.directory_search_query_changed_at = 50.0;
+        app.directory_search_tracking_project_id = Some(7);
+
+        // Reset for new project
+        app.reset_directory_search_tracking_for_project(Some(8));
+
+        assert_eq!(app.directory_search_tracking_project_id, Some(8));
+        assert!(app.directory_search_last_query.is_empty());
+        assert_eq!(app.directory_search_query_changed_at, 0.0);
+
+        // Reset to None (no project)
+        app.reset_directory_search_tracking_for_project(None);
+        assert_eq!(app.directory_search_tracking_project_id, None);
     }
 }
