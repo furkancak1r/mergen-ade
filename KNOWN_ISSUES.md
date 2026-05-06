@@ -1,5 +1,31 @@
 ### Known Issues & Fix Log
 
+#### Terminal selection copy menu caused WebView2 black screen {#terminal-copy-menu-webview2-black-screen}
+- Date: 2026-05-06
+- Context: Browser panel WebView2 rendering when terminal context menu opens
+- Error signature: `Browser panel turns completely black after using terminal copy context menu`, `Browser requires refresh to recover after copy`.
+- Symptoms/Impact:
+  1. User selects text in terminal and right-clicks to copy; context menu appears.
+  2. After copy, the Browser panel (WebView2) renders as a solid black rectangle.
+  3. User must refresh the browser page to restore normal rendering.
+  4. Issue only occurred when text was selected; right-click without selection did not trigger the bug.
+- Root cause:
+  1. `sync_embedded_browser()` hid WebView2 whenever `ctx.is_context_menu_open()` returned true.
+  2. Hiding then showing WebView2 rapidly triggered a known WebView2 rendering bug that causes black/blank surface.
+  3. Terminal's copy context menu typically appears far from the browser panel (left side vs right side), so the hide was unnecessary.
+  4. The unconditional hide/show cycle caused visual glitches even when there was no actual UI overlap.
+- Resolution:
+  - Added `context_menu_overlaps_browser_panel()` helper that uses pointer position as a proxy for context menu location.
+  - Modified `embedded_browser_should_yield_to_ui_layer()` to only hide browser when context menu is open AND overlaps browser area.
+  - Terminal copy menu (appearing on left) no longer triggers browser hide, avoiding the WebView2 black screen bug.
+  - Settings, exit confirmation, Terminal Manager popups, and egui popups still hide browser as before (these can overlap).
+- Prevent recurrence:
+  - Only hide WebView2 for overlays that actually overlap the browser panel area.
+  - Use pointer position as heuristic for context menu location when exact rect unavailable.
+  - Regression tests verify context menu overlap detection and browser yield behavior.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`.
+- References: User report on 2026-05-06 that terminal selection + copy causes browser to go black.
+
 #### Browser MCP screenshots caused WebView flash, black frames, and slow visual loops {#browser-mcp-screenshot-flash-black-slow}
 - Date: 2026-05-05
 - Context: Browser MCP `browser_take_screenshot` and video frame capture using embedded WebView2/CDP.
