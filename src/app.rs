@@ -1630,6 +1630,30 @@ fn selected_file_editor_text_from_char_range(
     (!selected.is_empty()).then_some(selected)
 }
 
+/// Extracts text from a CCursorRange using character indices.
+/// General-purpose variant for non-file-editor uses (e.g., browser URL input).
+/// Returns None if the range is empty or produces no text.
+fn extract_text_from_char_range(
+    text: &str,
+    range: Option<egui::text::CCursorRange>,
+) -> Option<String> {
+    let range = range?;
+    let [start, end] = range.sorted();
+
+    if start.index >= end.index {
+        return None;
+    }
+
+    let extracted: String = text
+        .chars()
+        .enumerate()
+        .take_while(|(index, _)| *index < end.index)
+        .filter_map(|(index, ch)| (index >= start.index).then_some(ch))
+        .collect();
+
+    (!extracted.is_empty()).then_some(extracted)
+}
+
 /// Determines the effective context menu selection range for the file editor.
 /// Preserves the pre-click selection when secondary-click would collapse it.
 fn file_editor_context_menu_selection_range(
@@ -18341,13 +18365,174 @@ impl AdeApp {
                         .browser_url_draft_by_project
                         .entry(browser_project_id)
                         .or_default();
-                    let url_response = ui.add_sized(
-                        [ui.available_width(), CONTROL_ROW_HEIGHT],
-                        egui::TextEdit::singleline(draft)
-                            .id(Self::browser_url_input_id(browser_project_id))
-                            .hint_text("Enter URL (https://...)")
-                            .vertical_align(egui::Align::Center),
-                    );
+                    let url_input_id = Self::browser_url_input_id(browser_project_id);
+
+                    // Load current selection state before rendering (for context menu)
+                    let pre_click_range =
+                        egui::text_edit::TextEditState::load(ui.ctx(), url_input_id)
+                            .and_then(|state| state.cursor.char_range())
+                            .filter(|range| range.primary != range.secondary);
+
+                    let url_text_edit = egui::TextEdit::singleline(draft)
+                        .id(url_input_id)
+                        .hint_text("Enter URL (https://...)")
+                        .vertical_align(egui::Align::Center);
+
+                    let url_response = ui
+                        .add_sized([ui.available_width(), CONTROL_ROW_HEIGHT], url_text_edit);
+
+                    // Handle double-click to select all URL text
+                    if url_response.double_clicked() {
+                        let total_chars = draft.chars().count();
+                        if total_chars > 0 {
+                            let select_all_range = egui::text::CCursorRange::two(
+                                egui::text::CCursor::new(0),
+                                egui::text::CCursor::new(total_chars),
+                            );
+                            if let Some(mut state) =
+                                egui::text_edit::TextEditState::load(ui.ctx(), url_input_id)
+                            {
+                                state.cursor.set_char_range(Some(select_all_range));
+                                state.store(ui.ctx(), url_input_id);
+                            }
+                        }
+                    }
+
+                    // Get post-render selection state
+                    let post_show_range = egui::text_edit::TextEditState::load(ui.ctx(), url_input_id)
+                        .and_then(|state| state.cursor.char_range())
+                        .filter(|range| range.primary != range.secondary);
+
+                    // Context menu with Copy/Paste
+                    let effective_range = pre_click_range.or(post_show_range);
+                    let has_selection = effective_range.is_some();
+                    let url_for_copy = effective_range
+                        .and_then(|range| extract_text_from_char_range(draft, Some(range)))
+                        .or_else(|| {
+                            // If no selection, offer to copy all text if not empty
+                            if draft.is_empty() {
+                                None
+                            } else {
+                                Some(draft.clone())
+                            }
+                        });
+
+                    // Check clipboard for paste availability (outside closure)
+                    let can_paste = Clipboard::new()
+                        .map_err(|_| false)
+                        .and_then(|mut cb| cb.get_text().map(|_| true).map_err(|_| false))
+                        .unwrap_or(false);
+
+                    // Track actions requested from context menu
+                    let mut copy_requested: Option<String> = None;
+                    let mut paste_requested: Option<String> = None;
+
+                    url_response.context_menu(|ui| {
+                        with_minimal_button_chrome(ui, |ui| {
+                            // Copy button - enabled if there's text to copy
+                            let copy_enabled = url_for_copy.is_some();
+                            let copy_button = ui.add_enabled(
+                                copy_enabled,
+                                egui::Button::new(format!("{} Copy", icons::COPY)),
+                            );
+                            if copy_button.clicked() && copy_enabled {
+                                if let Some(text) = url_for_copy {
+                                    copy_requested = Some(text);
+                                }
+                                ui.close_menu();
+                            }
+
+                            ui.separator();
+
+                            // Paste button
+                            let paste_button = ui.add_enabled(
+                                can_paste,
+                                egui::Button::new(format!("{} Paste", icons::COPY)),
+                            );
+                            if paste_button.clicked() && can_paste {
+                                paste_requested = Some(String::new()); // Will be filled outside closure
+                                ui.close_menu();
+                            }
+                        });
+                    });
+
+                    // Execute copy/paste actions outside the closure to avoid borrow issues
+                    if let Some(text_to_copy) = copy_requested {
+                        ui.ctx().copy_text(text_to_copy);
+                        self.status_line = "Copied to clipboard".to_owned();
+                    }
+
+                    if paste_requested.is_some() && can_paste {
+                        if let Ok(mut clipboard) = Clipboard::new() {
+                            if let Ok(paste_text) = clipboard.get_text() {
+                                // Get current cursor position for insertion
+                                let cursor_pos = egui::text_edit::TextEditState::load(
+                                    ui.ctx(),
+                                    url_input_id,
+                                )
+                                .and_then(|state| {
+                                    state.cursor.char_range().map(|r| r.primary.index)
+                                });
+
+                                match cursor_pos {
+                                    Some(_pos) if has_selection => {
+                                        // Replace selection with pasted text
+                                        if let Some(range) = effective_range {
+                                            let [start, end] = range.sorted();
+                                            let before: String =
+                                                draft.chars().take(start.index).collect();
+                                            let after: String =
+                                                draft.chars().skip(end.index).collect();
+                                            *draft =
+                                                format!("{}{}{}", before, paste_text, after);
+                                            // Update cursor position after paste
+                                            let new_pos =
+                                                start.index + paste_text.chars().count();
+                                            if let Some(mut state) =
+                                                egui::text_edit::TextEditState::load(
+                                                    ui.ctx(),
+                                                    url_input_id,
+                                                )
+                                            {
+                                                let new_range = egui::text::CCursorRange::one(
+                                                    egui::text::CCursor::new(new_pos),
+                                                );
+                                                state.cursor.set_char_range(Some(new_range));
+                                                state.store(ui.ctx(), url_input_id);
+                                            }
+                                        }
+                                    }
+                                    Some(pos) => {
+                                        // Insert at cursor position
+                                        let before: String =
+                                            draft.chars().take(pos).collect();
+                                        let after: String =
+                                            draft.chars().skip(pos).collect();
+                                        *draft = format!("{}{}{}", before, paste_text, after);
+                                        // Update cursor position after paste
+                                        let new_pos = pos + paste_text.chars().count();
+                                        if let Some(mut state) =
+                                            egui::text_edit::TextEditState::load(
+                                                ui.ctx(),
+                                                url_input_id,
+                                            )
+                                        {
+                                            let new_range = egui::text::CCursorRange::one(
+                                                egui::text::CCursor::new(new_pos),
+                                            );
+                                            state.cursor.set_char_range(Some(new_range));
+                                            state.store(ui.ctx(), url_input_id);
+                                        }
+                                    }
+                                    None => {
+                                        // Fallback: replace entire text
+                                        *draft = paste_text;
+                                    }
+                                }
+                                self.status_line = "Pasted from clipboard".to_owned();
+                            }
+                        }
+                    }
 
                     // Navigate on Enter key
                     if url_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -43561,5 +43746,128 @@ mod tests {
         assert!(!normalized.contains('\\'));
         assert!(normalized.contains('/'));
         assert!(normalized.starts_with("C:/"));
+    }
+
+    // Browser URL Input Context Menu Tests
+
+    #[test]
+    fn extract_text_from_char_range_extracts_selected_text() {
+        // Regression test: extract_text_from_char_range extracts correct text
+        use super::extract_text_from_char_range;
+        use egui::text::{CCursor, CCursorRange};
+
+        let text = "https://example.com/path";
+        let range = CCursorRange::two(CCursor::new(8), CCursor::new(19)); // "example.com"
+
+        let result = extract_text_from_char_range(text, Some(range));
+        assert_eq!(
+            result,
+            Some("example.com".to_owned()),
+            "Should extract selected portion of URL"
+        );
+    }
+
+    #[test]
+    fn extract_text_from_char_range_returns_none_for_empty_selection() {
+        // Regression test: empty selection returns None
+        use super::extract_text_from_char_range;
+        use egui::text::{CCursor, CCursorRange};
+
+        let text = "https://example.com";
+        let empty_range = CCursorRange::one(CCursor::new(5)); // collapsed cursor
+
+        let result = extract_text_from_char_range(text, Some(empty_range));
+        assert!(result.is_none(), "Empty selection should return None");
+    }
+
+    #[test]
+    fn extract_text_from_char_range_handles_unicode_url() {
+        // Regression test: Unicode URLs are handled correctly with char indices
+        use super::extract_text_from_char_range;
+        use egui::text::{CCursor, CCursorRange};
+
+        // URL: https://örnek.com (8 protocol chars + 9 domain chars = 17 total)
+        // indices: 0-7 = "https://", 8-16 = "örnek.com"
+        let text = "https://örnek.com";
+        let range = CCursorRange::two(CCursor::new(8), CCursor::new(17)); // "örnek.com"
+
+        let result = extract_text_from_char_range(text, Some(range));
+        assert_eq!(
+            result,
+            Some("örnek.com".to_owned()),
+            "Unicode URL selection should work correctly"
+        );
+    }
+
+    #[test]
+    fn extract_text_from_char_range_handles_reversed_selection() {
+        // Regression test: reversed selection (drag right-to-left) works
+        use super::extract_text_from_char_range;
+        use egui::text::{CCursor, CCursorRange};
+
+        let text = "https://example.com";
+        // Reversed: primary=15 (after .com), secondary=8 (start of example)
+        let range = CCursorRange::two(CCursor::new(19), CCursor::new(8));
+
+        let result = extract_text_from_char_range(text, Some(range));
+        assert_eq!(
+            result,
+            Some("example.com".to_owned()),
+            "Reversed selection should be normalized and extracted"
+        );
+    }
+
+    #[test]
+    fn extract_text_from_char_range_returns_none_for_none_range() {
+        // Regression test: None range returns None
+        use super::extract_text_from_char_range;
+
+        let text = "https://example.com";
+        let result = extract_text_from_char_range(text, None);
+        assert!(result.is_none(), "None range should return None");
+    }
+
+    #[test]
+    fn browser_url_select_all_range_covers_full_text() {
+        // Regression test: double-click select-all creates correct range
+        use egui::text::{CCursor, CCursorRange};
+
+        let text = "https://example.com/path";
+        let total_chars = text.chars().count();
+
+        // Simulate select-all range
+        let select_all_range = CCursorRange::two(CCursor::new(0), CCursor::new(total_chars));
+        let [start, end] = select_all_range.sorted();
+
+        assert_eq!(start.index, 0, "Select-all should start at 0");
+        assert_eq!(
+            end.index, total_chars,
+            "Select-all should end at total character count"
+        );
+        assert_eq!(total_chars, 24, "Character count should be correct");
+    }
+
+    #[test]
+    fn browser_url_select_all_handles_unicode_correctly() {
+        // Regression test: select-all uses char count not byte length
+        use egui::text::{CCursor, CCursorRange};
+
+        let text = "https://örnek.com"; // 17 chars but 19 bytes
+        let total_chars = text.chars().count();
+
+        let select_all_range = CCursorRange::two(CCursor::new(0), CCursor::new(total_chars));
+        let [start, end] = select_all_range.sorted();
+
+        assert_eq!(start.index, 0);
+        assert_eq!(end.index, 17, "Should use character indices, not bytes");
+
+        // Verify extracting with this range gets full text
+        use super::extract_text_from_char_range;
+        let result = extract_text_from_char_range(text, Some(select_all_range));
+        assert_eq!(
+            result,
+            Some(text.to_owned()),
+            "Select-all should extract full URL"
+        );
     }
 }

@@ -463,3 +463,30 @@ When adding an entry:
 - References: User request 2026-05-06: "cursor sitenin temasına göre zıt renk olmalı"
 
 (End of file - total 3872 lines)
+
+---
+
+#### Browser URL input context menu and double-click select all {#browser-url-context-menu}
+- Date: 2026-05-06
+- Context: Browser panel URL input field - user requested right-click Copy/Paste and double-click to select all text
+- Error signature: Browser URL input had no context menu (right-click did nothing) and double-click did not select the entire URL.
+- Symptoms/Impact: Users could not copy or paste URLs via context menu, and selecting the entire URL required manual text selection.
+- Root cause:
+  - The URL TextEdit in draw_browser_panel() used ui.add() directly without context menu handling.
+  - No double-click detection was implemented for the URL input.
+  - Context menus for text inputs require careful handling of selection state and borrow issues.
+- Resolution:
+  - Added context menu with Copy/Paste buttons using with_minimal_button_chrome() styling.
+  - Copy button copies selected text (or entire URL if no selection) to clipboard.
+  - Paste button inserts clipboard text at cursor position, or replaces selected text.
+  - Double-click on URL input selects all text using response.double_clicked() and CCursorRange.
+  - Used TextEditState to set character selection range (Unicode-safe using char indices, not byte indices).
+  - Deferred copy/paste actions outside the context menu closure to avoid Rust borrow issues.
+  - Added extract_text_from_char_range() helper for Unicode-safe text extraction.
+- Prevent recurrence:
+  - Added 7 regression tests for the new functionality.
+- Files/Commands touched: src/app.rs (URL input section, new helper function), KNOWN_ISSUES.md, cargo fmt, cargo test
+- References: User request 2026-05-06: browser linkinde sag tik kopyala gelmiyor kopyala ve yapistir gelsin sag tikta ve cift tiklayinca tum linki secsin
+
+(End of file - total 3872 lines)
+
