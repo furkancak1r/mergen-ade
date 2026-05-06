@@ -712,24 +712,28 @@ fn devtools_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_hide_highlight",
-            "Hide element highlight",
+            "Hide the active browser highlight overlay",
             json!({
                 "type": "object",
-                "properties": {
-                    "ref": json!({"type": "string"})
-                },
+                "properties": {},
                 "required": []
             }),
         ),
         tool(
             "browser_highlight",
-            "Highlight an element on the page",
+            "Move the visible browser mouse to an element or viewport rectangle, then show one polished video-friendly highlight overlay. Defaults to a neutral green feature callout; use red only when explicitly marking an error. Only one highlight can be active; call browser_hide_highlight before creating another.",
             json!({
                 "type": "object",
                 "properties": element_props(json!({
                     "ref": json!({"type": "string"}),
-                    "color": json!({"type": "string"}),
-                    "label": json!({"type": "string"})
+                    "x": json!({"type": "number", "description": "Viewport CSS pixel x coordinate for rectangle highlights"}),
+                    "y": json!({"type": "number", "description": "Viewport CSS pixel y coordinate for rectangle highlights"}),
+                    "width": json!({"type": "number", "description": "Viewport CSS pixel width for rectangle highlights"}),
+                    "height": json!({"type": "number", "description": "Viewport CSS pixel height for rectangle highlights"}),
+                    "color": json!({"type": "string", "default": "#16a34a", "description": "Highlight accent color. Prefer the default green (#16a34a) for neutral feature callouts; use red only when explicitly marking an error."}),
+                    "label": json!({"type": "string", "description": "Optional short label shown above the highlight"}),
+                    "padding": json!({"type": "number", "default": 8}),
+                    "radius": json!({"type": "number", "default": 10})
                 }))
             }),
         ),
@@ -1244,6 +1248,51 @@ mod tests {
                 ["default"]
                 .as_bool(),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn devtools_tool_schemas_include_video_highlight_controls() {
+        let tools = devtools_tools();
+        let tool_by_name = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.get("name").and_then(JsonValue::as_str) == Some(name))
+                .unwrap_or_else(|| panic!("missing tool schema: {name}"))
+        };
+
+        let highlight = tool_by_name("browser_highlight");
+        let props = &highlight["inputSchema"]["properties"];
+        for field in [
+            "type", "ref", "x", "y", "width", "height", "color", "label", "padding", "radius",
+        ] {
+            assert!(
+                props.get(field).is_some(),
+                "missing browser_highlight.{field}"
+            );
+        }
+        assert_eq!(props["color"]["default"].as_str(), Some("#16a34a"));
+        assert!(props["color"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("default green"));
+        assert!(props["color"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("red only"));
+        assert_eq!(props["padding"]["default"].as_i64(), Some(8));
+        assert_eq!(props["radius"]["default"].as_i64(), Some(10));
+        assert!(props.get("style").is_none());
+        assert!(highlight["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Only one highlight can be active"));
+
+        let hide = tool_by_name("browser_hide_highlight");
+        assert_eq!(hide["inputSchema"]["required"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            hide["inputSchema"]["properties"].as_object().unwrap().len(),
+            0
         );
     }
 

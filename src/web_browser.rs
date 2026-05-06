@@ -163,6 +163,7 @@ pub(crate) fn browser_mcp_tool_uses_async_script(tool: &str) -> bool {
             | "browser_fill_form"
             | "browser_press_key"
             | "browser_type"
+            | "browser_highlight"
             | "browser_mouse_move_xy"
             | "browser_mouse_click_xy"
             | "browser_mouse_drag_xy"
@@ -1536,7 +1537,7 @@ pub(crate) fn browser_mcp_output_from_devtools_runtime_raw(
 
 #[cfg(target_os = "windows")]
 const MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT: &str = r#"
-if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
+if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 15) {
   window.__mergenMcpState = window.__mergenMcpState || { refCounter: 1, consoleMessages: [], networkRequests: [], routes: [], highlighted: null };
 
   const state = window.__mergenMcpState;
@@ -1622,13 +1623,35 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
   const buttonMask = (button) => ({ left: 1, middle: 4, right: 2 }[buttonName(button)]);
   const ensureCursorStyle = () => {
     const existing = document.querySelector('style[data-mergen-mcp-cursor-style]');
-    if (existing?.getAttribute('data-mergen-mcp-cursor-style') === '12') return;
+    if (existing?.getAttribute('data-mergen-mcp-cursor-style') === '15') return;
     existing?.remove();
     const style = document.createElement('style');
-    style.setAttribute('data-mergen-mcp-cursor-style', '12');
+    style.setAttribute('data-mergen-mcp-cursor-style', '15');
     style.textContent = `
 [data-mergen-mcp-cursor] [data-mergen-mcp-cursor-pointer] {
   transition: transform 120ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+[data-mergen-mcp-highlight] {
+  box-sizing: border-box;
+  opacity: 0;
+  transform: scale(0.985);
+  transition:
+    opacity 180ms ease,
+    transform 260ms cubic-bezier(0.16, 1, 0.3, 1),
+    left 160ms ease,
+    top 160ms ease,
+    width 160ms ease,
+    height 160ms ease;
+}
+[data-mergen-mcp-highlight][data-mergen-mcp-highlight-state="visible"] {
+  opacity: 1;
+  transform: scale(1);
+}
+[data-mergen-mcp-highlight-label] {
+  white-space: nowrap;
+  max-width: min(360px, 70vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 `;
     document.documentElement.appendChild(style);
@@ -1638,7 +1661,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
     if (
       state.cursorElement &&
       document.documentElement.contains(state.cursorElement) &&
-      state.cursorElement.getAttribute?.('data-mergen-mcp-cursor-version') === '12' &&
+      state.cursorElement.getAttribute?.('data-mergen-mcp-cursor-version') === '15' &&
       state.cursorElement.querySelector?.('[data-mergen-mcp-cursor-pointer]')
     ) {
       return state.cursorElement;
@@ -1646,7 +1669,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
     state.cursorElement?.remove?.();
     const cursor = document.createElement('div');
     cursor.setAttribute('data-mergen-mcp-cursor', 'true');
-    cursor.setAttribute('data-mergen-mcp-cursor-version', '12');
+    cursor.setAttribute('data-mergen-mcp-cursor-version', '15');
     cursor.setAttribute('data-mergen-mcp-cursor-phase', state.cursor.phase || 'idle');
     Object.assign(cursor.style, {
       position: 'fixed',
@@ -1707,6 +1730,18 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
       syncCursorToAnchor();
     });
   };
+  const scheduleHighlightSync = () => {
+    if (state.highlightSyncQueued) return;
+    state.highlightSyncQueued = true;
+    requestAnimationFrame(() => {
+      state.highlightSyncQueued = false;
+      syncHighlightToAnchor();
+    });
+  };
+  const scheduleVisualAnchorSync = () => {
+    scheduleCursorAnchorSync();
+    scheduleHighlightSync();
+  };
   const setCursorPhase = (phase) => {
     const cursor = ensureCursor();
     cursor.setAttribute('data-mergen-mcp-cursor-phase', phase);
@@ -1741,8 +1776,24 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
   };
   const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
   const easeInOutSine = (t) => 0.5 - Math.cos(Math.PI * t) / 2;
+  const motionSeed = (start, end) => ((Math.round(start.x * 3 + start.y * 5 + end.x * 7 + end.y * 11) % 29) / 14) - 1;
+  const cursorMotionProfile = (distance, options = {}) => {
+    const intent = String(options.intent || 'point');
+    if (options.straight || distance < 24) {
+      return { kind: 'micro', duration: clamp(Math.round(distance * 3.4), 90, 180), targetingAt: 0.5 };
+    }
+    if (intent === 'drag') {
+      return { kind: 'drag', duration: clamp(Math.round(distance * 1.0), 520, 900), targetingAt: 0.82 };
+    }
+    if (intent === 'click') {
+      if (distance >= 420) return { kind: 'arc', duration: clamp(Math.round(distance * 0.92), 620, 980), targetingAt: 0.64 };
+      if (distance >= 110) return { kind: 'approach', duration: clamp(Math.round(distance * 0.9), 360, 760), targetingAt: 0.68 };
+      return { kind: 'natural', duration: clamp(Math.round(distance * 1.2), 220, 420), targetingAt: 0.66 };
+    }
+    return { kind: 'natural', duration: clamp(Math.round(distance * 0.85), 340, 720), targetingAt: 0.72 };
+  };
   const flightCursorPoint = (start, end, t, distance, options = {}) => {
-    if (options.straight || distance < 22 || t >= 0.995) {
+    if (options.straight || distance < 420 || t >= 0.995) {
       const eased = easeOutCubic(t);
       return {
         x: start.x + (end.x - start.x) * eased,
@@ -1755,27 +1806,27 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
     const length = Math.max(1, distance);
     const normalX = -dy / length;
     const normalY = dx / length;
-    const arcHeight = clamp(distance * 0.18, 28, 118);
-    const sideDrift = clamp(distance * 0.055, 8, 42) * Math.sign(dx || 1);
+    const arcHeight = clamp(distance * 0.045, 10, 34);
+    const sideDrift = clamp(distance * 0.018, 3, 12) * Math.sign(dx || 1);
     const curvePoint = (progress) => {
       const eased = easeInOutSine(progress);
       const baseX = start.x + dx * eased;
       const baseY = start.y + dy * eased;
       const parabola = Math.sin(Math.PI * progress);
-      const straighten = 1 - clamp((progress - 0.56) / 0.18, 0, 1);
+      const straighten = 1 - clamp((progress - 0.5) / 0.3, 0, 1);
       const lift = -arcHeight * parabola * straighten;
       const drift = sideDrift * parabola * straighten;
-      const tilt = clamp(Math.sign(dx || 1) * 11 * parabola * straighten, -12, 12);
+      const tilt = clamp(Math.sign(dx || 1) * 5 * parabola * straighten, -7, 7);
       return {
         x: baseX + normalX * drift,
         y: baseY + normalY * drift + lift,
         tilt,
       };
     };
-    const straightenAt = 0.74;
-    if (t >= straightenAt) {
-      const approachStart = curvePoint(straightenAt);
-      const approach = easeOutCubic((t - straightenAt) / (1 - straightenAt));
+    const straightenStart = 0.58;
+    if (t >= straightenStart) {
+      const approachStart = curvePoint(straightenStart);
+      const approach = easeOutCubic((t - straightenStart) / (1 - straightenStart));
       return {
         x: approachStart.x + (end.x - approachStart.x) * approach,
         y: approachStart.y + (end.y - approachStart.y) * approach,
@@ -1794,23 +1845,45 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
     const length = Math.max(1, distance);
     const normalX = -dy / length;
     const normalY = dx / length;
-    const launch = Math.sin(Math.PI * clamp(t / 0.18, 0, 1));
-    const straighten = 1 - clamp((t - 0.72) / 0.28, 0, 1);
-    const amplitude = clamp(distance * 0.045, 4, 18) * launch * straighten;
-    const phase = ((Math.round(start.x + start.y + end.x + end.y) % 31) / 31) * Math.PI;
-    const wave = Math.sin(t * Math.PI * 2.15 + phase) * amplitude;
-    const hover = Math.sin(Math.PI * t) * amplitude * 0.18;
-    const tilt = clamp((wave / Math.max(1, amplitude)) * 7 + Math.sign(dx || 1) * hover * 0.18, -10, 10) * straighten;
-    return { x: baseX + normalX * wave, y: baseY + normalY * wave - hover, tilt };
+    const seed = motionSeed(start, end);
+    const settle = 1 - clamp((t - 0.62) / 0.28, 0, 1);
+    const correction = Math.sin(Math.PI * t) * clamp(distance * 0.018, 1.5, options.kind === 'drag' ? 5 : 8) * seed * settle;
+    const hover = Math.sin(Math.PI * t) * clamp(distance * 0.006, 0.3, 2.2) * settle;
+    const tilt = clamp(seed * 4.5 * Math.sin(Math.PI * t) * settle, -5, 5);
+    return { x: baseX + normalX * correction, y: baseY + normalY * correction - hover, tilt };
+  };
+  const approachCursorPoint = (start, end, t, distance, options = {}) => {
+    const eased = easeInOutSine(t);
+    const baseX = start.x + (end.x - start.x) * eased;
+    const baseY = start.y + (end.y - start.y) * eased;
+    if (options.straight || distance < 18 || t >= 0.995) return { x: baseX, y: baseY, tilt: 0 };
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const length = Math.max(1, distance);
+    const normalX = -dy / length;
+    const normalY = dx / length;
+    const seed = motionSeed(start, end);
+    const settle = 1 - clamp((t - 0.54) / 0.28, 0, 1);
+    const correction = Math.sin(Math.PI * t) * clamp(distance * 0.012, 1.5, 6) * seed * settle;
+    const tilt = clamp(seed * 3.5 * Math.sin(Math.PI * t) * settle, -4, 4);
+    return { x: baseX + normalX * correction, y: baseY + normalY * correction, tilt };
+  };
+  const cursorMotionPoint = (start, end, t, distance, profile, options = {}) => {
+    if (profile.kind === 'arc') return flightCursorPoint(start, end, t, distance, options);
+    if (profile.kind === 'approach') return approachCursorPoint(start, end, t, distance, options);
+    if (profile.kind === 'drag') return organicCursorPoint(start, end, t, distance, { ...options, kind: 'drag' });
+    if (profile.kind === 'micro') {
+      const eased = easeOutCubic(t);
+      return { x: start.x + (end.x - start.x) * eased, y: start.y + (end.y - start.y) * eased, tilt: 0 };
+    }
+    return organicCursorPoint(start, end, t, distance, options);
   };
   const moveCursorTo = (x, y, options = {}) => new Promise((resolve) => {
     const end = clampPoint(x, y);
     const start = state.cursor.visible ? clampPoint(state.cursor.x, state.cursor.y) : clampPoint(end.x - 96, end.y - 64);
     const distance = Math.hypot(end.x - start.x, end.y - start.y);
-    const defaultDuration = options.clickFlight
-      ? clamp(Math.round(distance * 1.25), 720, 1050)
-      : clamp(Math.round(distance * 1.15), 650, 900);
-    const duration = options.duration ?? defaultDuration;
+    const profile = cursorMotionProfile(distance, options);
+    const duration = options.duration ?? profile.duration;
     setCursorPosition(start.x, start.y, { tilt: 0, phase: 'moving' });
     if (duration <= 0 || distance < 1) {
       const point = setCursorPosition(end.x, end.y, { tilt: 0, phase: 'idle' });
@@ -1822,10 +1895,8 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
     const started = performance.now();
     const step = (now) => {
       const t = clamp((now - started) / duration, 0, 1);
-      const visual = options.clickFlight
-        ? flightCursorPoint(start, end, t, distance, options)
-        : organicCursorPoint(start, end, t, distance, options);
-      const phase = t > (options.clickFlight ? 0.74 : 0.72) ? 'targeting' : 'moving';
+      const visual = cursorMotionPoint(start, end, t, distance, profile, options);
+      const phase = t > profile.targetingAt ? 'targeting' : 'moving';
       const point = setCursorPosition(visual.x, visual.y, { tilt: visual.tilt, phase });
       options.onStep?.(point);
       if (t < 1) requestAnimationFrame(step);
@@ -2275,7 +2346,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
     if (!element) throw new Error(`Element not found: ${target}`);
     const point = await elementCenter(element);
     anchorCursorTo(element);
-    await moveCursorTo(point.x, point.y);
+    await moveCursorTo(point.x, point.y, { intent: 'point' });
     dispatchMoveAt(point, element);
     element.focus?.({ preventScroll: true });
     const commit = field.commit !== false;
@@ -2296,7 +2367,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
       const { element, target } = requiredElement(params, tool);
       const point = await elementCenter(element);
       anchorCursorTo(element);
-      await moveCursorTo(point.x, point.y, { clickFlight: true });
+      await moveCursorTo(point.x, point.y, { intent: 'click' });
       await clickAt(point, { target: element, button: params.button, doubleClick: params.doubleClick });
       return ok(`Clicked ${target}`);
     }
@@ -2304,7 +2375,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
       const { element, target } = requiredElement(params, tool);
       const point = await elementCenter(element);
       anchorCursorTo(element);
-      await moveCursorTo(point.x, point.y);
+      await moveCursorTo(point.x, point.y, { intent: 'point' });
       dispatchMoveAt(point, element);
       return ok(`Hovered ${target}`);
     }
@@ -2312,7 +2383,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
       const { element, target } = requiredElement(params, tool);
       const point = await elementCenter(element);
       anchorCursorTo(element);
-      await moveCursorTo(point.x, point.y);
+      await moveCursorTo(point.x, point.y, { intent: 'point' });
       dispatchMoveAt(point, element);
       element.focus?.({ preventScroll: true });
       const values = Array.isArray(params.values) ? params.values : [params.value ?? ''];
@@ -2328,7 +2399,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
       if (!element) throw new Error(`Element not found: ${target || 'active element'}`);
       const point = await elementCenter(element);
       anchorCursorTo(element);
-      await moveCursorTo(point.x, point.y);
+      await moveCursorTo(point.x, point.y, { intent: 'point' });
       dispatchMoveAt(point, element);
       await typeTextLikeUser(element, String(params.text ?? ''), { commit: params.commit !== false });
       if (params.submit) {
@@ -2352,7 +2423,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
         if (rect.width > 0 && rect.height > 0) {
           const point = clampPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
           anchorCursorTo(active);
-          await moveCursorTo(point.x, point.y);
+          await moveCursorTo(point.x, point.y, { intent: 'point' });
         } else {
           setCursorPosition(state.cursor.x, state.cursor.y, { tilt: 0, phase: 'idle' });
         }
@@ -2369,14 +2440,14 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
     if (tool === 'browser_mouse_move_xy') {
       clearCursorAnchor();
       const point = requiredPoint(params);
-      await moveCursorTo(point.x, point.y);
+      await moveCursorTo(point.x, point.y, { intent: 'point' });
       dispatchMoveAt(point);
       return ok(`Moved mouse to ${Math.round(point.x)}, ${Math.round(point.y)}`, { x: point.x, y: point.y });
     }
     if (tool === 'browser_mouse_click_xy') {
       clearCursorAnchor();
       const point = requiredPoint(params);
-      await moveCursorTo(point.x, point.y, { clickFlight: true });
+      await moveCursorTo(point.x, point.y, { intent: 'click' });
       await clickAt(point, { button: params.button, doubleClick: params.doubleClick });
       return ok(`Clicked mouse at ${Math.round(point.x)}, ${Math.round(point.y)}`, { x: point.x, y: point.y });
     }
@@ -2385,13 +2456,14 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
       const start = requiredPoint(params, 'startX', 'startY');
       const end = requiredPoint(params, 'endX', 'endY');
       const button = buttonName(params.button);
-      await moveCursorTo(start.x, start.y);
+      await moveCursorTo(start.x, start.y, { intent: 'point' });
       let target = targetAt(start);
       dispatchMoveAt(start, target);
       target.focus?.({ preventScroll: true });
       dispatchMouse(target, 'mousedown', start, button, 1, buttonMask(button));
       state.cursor.mouseDownButton = button;
       await moveCursorTo(end.x, end.y, {
+        intent: 'drag',
         duration: 900,
         onStep: (point) => {
           target = targetAt(point, target);
@@ -2407,7 +2479,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
       clearCursorAnchor();
       const point = optionalPoint(params);
       const button = buttonName(params.button);
-      await moveCursorTo(point.x, point.y);
+      await moveCursorTo(point.x, point.y, { intent: 'point' });
       const target = targetAt(point);
       dispatchMoveAt(point, target);
       dispatchMouse(target, 'mousedown', point, button, 1, buttonMask(button));
@@ -2418,7 +2490,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
       clearCursorAnchor();
       const point = optionalPoint(params);
       const button = buttonName(params.button || state.cursor.mouseDownButton || 'left');
-      await moveCursorTo(point.x, point.y);
+      await moveCursorTo(point.x, point.y, { intent: 'point' });
       dispatchMouse(targetAt(point), 'mouseup', point, button, 1, 0);
       state.cursor.mouseDownButton = null;
       await settleAfterInteraction();
@@ -2429,7 +2501,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
       const point = optionalPoint(params);
       const deltaX = numberParam(params, 'deltaX', false) ?? 0;
       const deltaY = numberParam(params, 'deltaY', false) ?? 0;
-      await moveCursorTo(point.x, point.y);
+      await moveCursorTo(point.x, point.y, { intent: 'point' });
       const target = targetAt(point);
       await applyWheelScrollFallback(target, point, deltaX, deltaY);
       return ok(`Scrolled mouse wheel at ${Math.round(point.x)}, ${Math.round(point.y)}`, { x: point.x, y: point.y, deltaX, deltaY });
@@ -2582,18 +2654,197 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
       semantic,
     });
   };
-  const highlight = (element, style) => {
-    const rect = element.getBoundingClientRect();
-    let overlay = state.highlighted;
-    if (!overlay) {
-      overlay = document.createElement('div');
-      overlay.setAttribute('data-mergen-mcp-highlight', 'true');
-      Object.assign(overlay.style, { position: 'fixed', pointerEvents: 'none', zIndex: 2147483647, border: '2px solid #f59e0b', background: 'rgba(245,158,11,0.12)' });
-      document.documentElement.appendChild(overlay);
-      state.highlighted = overlay;
+  const DEFAULT_HIGHLIGHT_COLOR = '#16a34a';
+  const DEFAULT_HIGHLIGHT_RGB = { r: 22, g: 163, b: 74 };
+  const parseHighlightColor = (value) => {
+    const color = String(value || DEFAULT_HIGHLIGHT_COLOR).trim().slice(0, 32) || DEFAULT_HIGHLIGHT_COLOR;
+    const hex = color.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i)?.[1];
+    if (!hex) return { color, rgb: DEFAULT_HIGHLIGHT_RGB };
+    const full = hex.length === 3 ? hex.split('').map((part) => `${part}${part}`).join('') : hex;
+    return {
+      color,
+      rgb: {
+        r: parseInt(full.slice(0, 2), 16),
+        g: parseInt(full.slice(2, 4), 16),
+        b: parseInt(full.slice(4, 6), 16),
+      },
+    };
+  };
+  const rgba = (rgb, alpha) => `rgba(${rgb.r},${rgb.g},${rgb.b},${alpha})`;
+  const ensureHighlightOverlay = () => {
+    if (state.highlighted?.nodeType === Node.ELEMENT_NODE) {
+      state.highlighted.remove?.();
+      state.highlighted = null;
     }
-    Object.assign(overlay.style, { left: `${Math.round(rect.left)}px`, top: `${Math.round(rect.top)}px`, width: `${Math.round(rect.width)}px`, height: `${Math.round(rect.height)}px`, display: 'block' });
-    if (style) overlay.style.cssText += `;${style}`;
+    if (state.highlighted?.overlay && document.documentElement.contains(state.highlighted.overlay)) {
+      return state.highlighted;
+    }
+    state.highlighted?.overlay?.remove?.();
+    const overlay = document.createElement('div');
+    overlay.setAttribute('data-mergen-mcp-highlight', 'true');
+    overlay.setAttribute('data-mergen-mcp-highlight-state', 'hidden');
+    Object.assign(overlay.style, {
+      position: 'fixed',
+      pointerEvents: 'none',
+      zIndex: '2147483600',
+      display: 'none',
+      border: `2px solid ${DEFAULT_HIGHLIGHT_COLOR}`,
+      background: 'rgba(22,163,74,0.10)',
+      boxShadow: '0 0 0 4px rgba(22,163,74,0.16), 0 18px 45px rgba(15,23,42,0.18)',
+      transformOrigin: 'center',
+    });
+    const label = document.createElement('div');
+    label.setAttribute('data-mergen-mcp-highlight-label', 'true');
+    Object.assign(label.style, {
+      position: 'absolute',
+      left: '10px',
+      top: '-34px',
+      display: 'none',
+      padding: '5px 9px',
+      borderRadius: '999px',
+      background: 'rgba(15,23,42,0.92)',
+      color: 'white',
+      font: '600 12px/1.25 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+      letterSpacing: '0px',
+      boxShadow: '0 8px 22px rgba(15,23,42,0.24)',
+    });
+    overlay.appendChild(label);
+    document.documentElement.appendChild(overlay);
+    state.highlighted = { overlay, label, active: false, anchorElement: null, rect: null, padding: 8, radius: 10 };
+    return state.highlighted;
+  };
+  const activeHighlight = () => Boolean(state.highlighted?.active && state.highlighted?.overlay && document.documentElement.contains(state.highlighted.overlay));
+  const highlightRectFromParams = (params = {}) => {
+    const keys = ['x', 'y', 'width', 'height'];
+    const supplied = keys.some((key) => hasOwn(params, key) && params[key] !== null && params[key] !== undefined && params[key] !== '');
+    if (!supplied) return null;
+    if (!keys.every((key) => hasOwn(params, key) && params[key] !== null && params[key] !== undefined && params[key] !== '')) {
+      throw new Error('x, y, width, and height must be supplied together for rectangle highlights');
+    }
+    const left = numberParam(params, 'x');
+    const top = numberParam(params, 'y');
+    const width = numberParam(params, 'width');
+    const height = numberParam(params, 'height');
+    if (width <= 0 || height <= 0) throw new Error('width and height must be positive for rectangle highlights');
+    return { left, top, width, height };
+  };
+  const highlightStyleFromParams = (params = {}) => {
+    const parsed = parseHighlightColor(params.color);
+    return {
+      color: parsed.color,
+      fill: rgba(parsed.rgb, 0.11),
+      ring: rgba(parsed.rgb, 0.18),
+      shadow: 'rgba(15,23,42,0.18)',
+      label: clean(params.label || '', 80),
+      padding: clamp(numberParam(params, 'padding', false) ?? 8, 0, 40),
+      radius: clamp(numberParam(params, 'radius', false) ?? 10, 0, 32),
+    };
+  };
+  const highlightBaseRect = (highlightState) => {
+    if (highlightState.anchorElement) {
+      if (!document.documentElement.contains(highlightState.anchorElement) || !visible(highlightState.anchorElement)) return null;
+      const rect = highlightState.anchorElement.getBoundingClientRect();
+      return { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+    }
+    return highlightState.rect;
+  };
+  const applyHighlightGeometry = (highlightState) => {
+    const rect = highlightBaseRect(highlightState);
+    if (!rect || rect.width <= 0 || rect.height <= 0) {
+      highlightState.overlay.style.display = 'none';
+      highlightState.active = false;
+      return false;
+    }
+    const padding = highlightState.padding;
+    const left = rect.left - padding;
+    const top = rect.top - padding;
+    const width = rect.width + padding * 2;
+    const height = rect.height + padding * 2;
+    Object.assign(highlightState.overlay.style, {
+      left: `${Math.round(left)}px`,
+      top: `${Math.round(top)}px`,
+      width: `${Math.round(width)}px`,
+      height: `${Math.round(height)}px`,
+      borderColor: highlightState.color,
+      background: highlightState.fill,
+      borderRadius: `${highlightState.radius}px`,
+      boxShadow: `0 0 0 4px ${highlightState.ring}, 0 18px 45px ${highlightState.shadow}`,
+      display: 'block',
+    });
+    if (highlightState.labelText) {
+      highlightState.label.textContent = highlightState.labelText;
+      highlightState.label.style.display = 'block';
+      highlightState.label.style.top = top < 42 ? '8px' : '-34px';
+    } else {
+      highlightState.label.textContent = '';
+      highlightState.label.style.display = 'none';
+    }
+    return true;
+  };
+  const syncHighlightToAnchor = () => {
+    if (!activeHighlight()) return;
+    applyHighlightGeometry(state.highlighted);
+  };
+  const hideHighlight = () => {
+    const highlightState = state.highlighted;
+    if (!highlightState?.overlay) return ok('Highlight hidden');
+    highlightState.active = false;
+    highlightState.anchorElement = null;
+    highlightState.rect = null;
+    highlightState.overlay.setAttribute('data-mergen-mcp-highlight-state', 'hidden');
+    setTimeout(() => {
+      if (!highlightState.active) highlightState.overlay.style.display = 'none';
+    }, 190);
+    return ok('Highlight hidden');
+  };
+  const showHighlight = (target, params = {}) => {
+    const highlightState = ensureHighlightOverlay();
+    const style = highlightStyleFromParams(params);
+    Object.assign(highlightState, {
+      active: true,
+      anchorElement: target.element || null,
+      rect: target.rect || null,
+      color: style.color,
+      fill: style.fill,
+      ring: style.ring,
+      shadow: style.shadow,
+      labelText: style.label,
+      padding: style.padding,
+      radius: style.radius,
+    });
+    highlightState.overlay.setAttribute('data-mergen-mcp-highlight-state', 'hidden');
+    if (!applyHighlightGeometry(highlightState)) throw new Error('Highlight target is not visible');
+    requestAnimationFrame(() => {
+      if (highlightState.active) highlightState.overlay.setAttribute('data-mergen-mcp-highlight-state', 'visible');
+    });
+    return highlightState;
+  };
+  const runHighlightTool = async (params = {}) => {
+    if (activeHighlight()) {
+      return fail('A browser highlight is already active; call browser_hide_highlight first.');
+    }
+    const rect = highlightRectFromParams(params);
+    if (rect) {
+      clearCursorAnchor();
+      const point = clampPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      await moveCursorTo(point.x, point.y, { intent: 'click' });
+      dispatchMoveAt(point);
+      showHighlight({ rect }, params);
+      await nextFrame();
+      await sleep(80);
+      return ok('Highlighted viewport rectangle', { rect, color: params.color || DEFAULT_HIGHLIGHT_COLOR, label: params.label || '' });
+    }
+    const target = targetValue(params);
+    const element = resolve(target);
+    if (!element) throw new Error(`Element not found: ${target}`);
+    const point = await elementCenter(element);
+    anchorCursorTo(element);
+    await moveCursorTo(point.x, point.y, { intent: 'click' });
+    dispatchMoveAt(point, element);
+    showHighlight({ element }, params);
+    await nextFrame();
+    await sleep(80);
+    return ok(`Highlighted ${target}`, { ref: element.dataset.mergenMcpRef || null, color: params.color || DEFAULT_HIGHLIGHT_COLOR, label: params.label || '' });
   };
   const ok = (text, data) => ({ ok: true, text, data: data || { url: location.href, title: document.title || '' } });
   const fail = (message) => ({ ok: false, error: message });
@@ -2629,10 +2880,9 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
       if (tool === 'browser_cookie_delete') { document.cookie = `${params.name}=; Max-Age=0; path=/`; return ok(`Cookie deleted: ${params.name}`); }
       if (tool === 'browser_cookie_clear') { for (const c of document.cookie.split('; ')) document.cookie = `${c.split('=')[0]}=; Max-Age=0; path=/`; return ok('Visible document cookies cleared'); }
       if (['browser_click', 'browser_hover', 'browser_select_option', 'browser_type', 'browser_fill_form', 'browser_press_key', 'browser_mouse_move_xy', 'browser_mouse_click_xy', 'browser_mouse_drag_xy', 'browser_mouse_down', 'browser_mouse_up', 'browser_mouse_wheel'].includes(tool)) return runVisualTool(tool, params);
+      if (tool === 'browser_highlight') return runHighlightTool(params);
+      if (tool === 'browser_hide_highlight') return hideHighlight();
       const element = resolve(targetValue(params));
-      if (['browser_highlight'].includes(tool) && !element) return fail(`Element not found: ${targetValue(params)}`);
-      if (tool === 'browser_highlight') { highlight(element, params.style); return ok(`Highlighted ${params.target}`); }
-      if (tool === 'browser_hide_highlight') { if (state.highlighted) state.highlighted.style.display = 'none'; return ok('Highlight hidden'); }
       if (tool === 'browser_evaluate') {
         return runEvaluateTool(params, element);
       }
@@ -2641,9 +2891,9 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
       return fail(error && error.stack ? String(error.stack) : String(error));
     }
   };
-  window.addEventListener('scroll', scheduleCursorAnchorSync, true);
-  window.addEventListener('resize', scheduleCursorAnchorSync);
-  window.__mergenMcpRun.version = 12;
+  window.addEventListener('scroll', scheduleVisualAnchorSync, true);
+  window.addEventListener('resize', scheduleVisualAnchorSync);
+  window.__mergenMcpRun.version = 15;
 }
 "#;
 
@@ -3209,6 +3459,7 @@ mod tests {
             "browser_fill_form",
             "browser_press_key",
             "browser_type",
+            "browser_highlight",
             "browser_mouse_move_xy",
             "browser_mouse_click_xy",
             "browser_mouse_drag_xy",
@@ -3332,20 +3583,31 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn browser_mcp_automation_script_includes_visible_cursor_and_mouse_tools() {
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 12"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 15"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-version"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-pointer"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
             .contains("createElementNS('http://www.w3.org/2000/svg', 'svg')"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("moveCursorTo"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("motionSeed"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("cursorMotionProfile"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("cursorMotionPoint"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("approachCursorPoint"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("organicCursorPoint"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("flightCursorPoint"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("easeInOutSine"));
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("straightenAt = 0.74"));
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("options.clickFlight"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("straightenStart = 0.58"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("intent === 'click'"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("intent === 'drag'"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
-            .contains("await moveCursorTo(point.x, point.y, { clickFlight: true })"));
+            .contains("await moveCursorTo(point.x, point.y, { intent: 'click' })"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("await moveCursorTo(point.x, point.y, { intent: 'point' })"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("intent: 'drag'"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("clickFlight"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("straightenAt = 0.74"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("distance * 0.18"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("steadyCursorForAction"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-phase"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("0.72"));
@@ -3390,6 +3652,25 @@ mod tests {
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("rgba(245,158,11,0.20)"));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
             .contains("border: '2px solid rgba(245,158,11,0.95)'"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-highlight"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-highlight-label"));
+        assert!(
+            MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("DEFAULT_HIGHLIGHT_COLOR = '#16a34a'")
+        );
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("DEFAULT_HIGHLIGHT_RGB = { r: 22, g: 163, b: 74 }"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("runHighlightTool"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("ensureHighlightOverlay"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("highlightRectFromParams"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("A browser highlight is already active; call browser_hide_highlight first."));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("await moveCursorTo(point.x, point.y, { intent: 'click' })"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("tool === 'browser_highlight'"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("tool === 'browser_hide_highlight'"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("params.style"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("overlay.style.cssText +="));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("highlight(element, params.style)"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("stableElementCenterAfterScroll"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("humanScrollElementIntoView"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("humanScrollBy"));
@@ -3401,7 +3682,7 @@ mod tests {
             .contains("element.scrollIntoView({ block: 'nearest', inline: 'nearest' })"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("anchorCursorTo(element)"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
-            .contains("window.addEventListener('scroll', scheduleCursorAnchorSync, true)"));
+            .contains("window.addEventListener('scroll', scheduleVisualAnchorSync, true)"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("humanWheelSteps"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("Math.ceil(distance / 72)"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("await sleep(66)"));
@@ -3409,7 +3690,7 @@ mod tests {
             MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("scrollBy({ left: deltaX, top: deltaY")
         );
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
-            .contains("clamp(Math.round(distance * 1.15), 650, 900)"));
+            .contains("clamp(Math.round(distance * 0.92), 620, 980)"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("duration: 900"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("browser_mouse_move_xy"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("browser_mouse_click_xy"));

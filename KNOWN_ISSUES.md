@@ -3779,3 +3779,67 @@
 - Files/Commands touched: `src/web_browser.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test browser_mcp`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User report on 2026-05-06: page jumps down and clicks immediately instead of giving a normal scroll feeling.
 
+#### Mergen Browser MCP mouse movement overused parabolic clicks {#mergen-browser-mcp-contextual-mouse-motion}
+- Date: 2026-05-06
+- Context: Browser MCP visible cursor movement after adding click-flight animation.
+- Error signature: Cursor movements look theatrical because click actions repeatedly fly in a clear parabolic arc, even when a normal user would make a mostly direct movement.
+- Symptoms/Impact:
+  1. `browser_click` and coordinate click tools feel less human over repeated interactions.
+  2. The cursor animation draws attention to itself instead of simply showing where the action happens.
+- Root cause:
+  1. Click tools always called `moveCursorTo(..., { clickFlight: true })`.
+  2. The click-flight curve used a high arc amplitude and late straightening, so every click looked like the same exaggerated flight.
+- Resolution:
+  - Replaced the click-flight flag with contextual mouse movement intents for click, point, and drag actions.
+  - Added distance-based movement profiles: micro, natural, approach, drag, and a lighter arc only for far click targets.
+  - Reduced arc amplitude and made the final approach straighten earlier.
+  - Kept visible cursor movement and JavaScript click blocking intact.
+- Prevent recurrence:
+  - Do not force the same animation profile for every click.
+  - Keep tests proving Browser MCP visual tools use contextual movement intents and no longer use `clickFlight`.
+- Files/Commands touched: `src/web_browser.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test browser_mcp`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report on 2026-05-06: parabolic mouse motion was intended to be human-like, but looks strange when it happens constantly.
+
+#### Mergen Browser MCP highlight overlay was too primitive for recordings {#mergen-browser-mcp-video-highlight-overlay}
+- Date: 2026-05-06
+- Context: Browser MCP video recording workflows where the agent needs to call out a newly added area or feature.
+- Error signature: `browser_highlight` draws a basic page overlay without mouse movement, structured styling, or single-active behavior.
+- Symptoms/Impact:
+  1. Highlights in recorded videos look like a rough paint-style box rather than a polished UI callout.
+  2. Agents cannot smoothly move the visible cursor to the target before highlighting it.
+  3. Multiple highlight calls can overwrite state without an actionable instruction to hide the old highlight first.
+- Root cause:
+  1. Highlight was implemented as a synchronous helper that directly mutated one fixed `div`.
+  2. The schema exposed raw color/label only and page script accepted raw style text.
+  3. Highlight tools were not routed through the async visual cursor path.
+- Resolution:
+  - Made `browser_highlight` an async visual Browser MCP tool so cursor movement finishes before the highlight appears.
+  - Added structured element and viewport-rectangle highlight targeting with color, label, padding, and radius options.
+  - Replaced raw CSS style mutation with a polished DOM overlay, label badge, fade/scale transition, and scroll/resize anchoring.
+  - Enforced a single active highlight and return an MCP error until `browser_hide_highlight` is called.
+- Prevent recurrence:
+  - Do not reintroduce raw `style` / `cssText` highlight customization.
+  - Keep tests proving highlight uses visual cursor movement, rejects duplicate active highlights, and remains captured by screenshot/video DOM overlays.
+- Files/Commands touched: `src/browser_mcp_helper.rs`, `src/web_browser.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test browser_mcp`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request on 2026-05-06: add a Browser MCP highlight feature for video recordings with smooth mouse movement and polished UI styling.
+
+#### Mergen Browser MCP highlight default color implied an error {#mergen-browser-mcp-highlight-green-default}
+- Date: 2026-05-06
+- Context: Browser MCP highlight callouts in video recording flows.
+- Error signature: A neutral `browser_highlight` request can appear red/error-like, making the highlighted feature look broken instead of called out.
+- Symptoms/Impact:
+  1. Users may interpret a normal highlighted area as a validation error or bug.
+  2. Agents may choose red because the schema did not clearly bias neutral highlights toward a positive/default color.
+- Root cause:
+  1. Highlight tool guidance did not describe the intended semantic color usage.
+  2. The default accent was not explicitly positioned as a neutral feature callout color.
+- Resolution:
+  - Changed the Browser MCP highlight default accent to green (`#16a34a`).
+  - Updated schema descriptions to prefer green for neutral feature callouts and reserve red for explicit error marking.
+  - Bumped the injected automation script version so existing pages pick up the new default style.
+- Prevent recurrence:
+  - Keep tests asserting the green default and schema guidance.
+  - Avoid red/orange as default Browser MCP callout colors unless the tool is specifically for errors or warnings.
+- Files/Commands touched: `src/browser_mcp_helper.rs`, `src/web_browser.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test browser_mcp`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report on 2026-05-06: trying highlight painted the target red and looked like an error; green should be prioritized.
+
