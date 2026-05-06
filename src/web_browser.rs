@@ -1898,7 +1898,7 @@ pub(crate) fn browser_mcp_output_from_devtools_runtime_raw(
 
 #[cfg(target_os = "windows")]
 const MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT: &str = r#"
-if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 17) {
+if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 18) {
   window.__mergenMcpState = window.__mergenMcpState || { refCounter: 1, consoleMessages: [], networkRequests: [], routes: [], highlighted: null };
 
   const state = window.__mergenMcpState;
@@ -1982,12 +1982,12 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 17) {
   };
   const buttonCode = (button) => ({ left: 0, middle: 1, right: 2 }[buttonName(button)]);
   const buttonMask = (button) => ({ left: 1, middle: 4, right: 2 }[buttonName(button)]);
-  const ensureCursorStyle = () => {
+    const ensureCursorStyle = () => {
     const existing = document.querySelector('style[data-mergen-mcp-cursor-style]');
-    if (existing?.getAttribute('data-mergen-mcp-cursor-style') === '17') return;
+    if (existing?.getAttribute('data-mergen-mcp-cursor-style') === '18') return;
     existing?.remove();
     const style = document.createElement('style');
-    style.setAttribute('data-mergen-mcp-cursor-style', '17');
+    style.setAttribute('data-mergen-mcp-cursor-style', '18');
     style.textContent = `
 [data-mergen-mcp-cursor] [data-mergen-mcp-cursor-pointer] {
   transition: transform 120ms cubic-bezier(0.16, 1, 0.3, 1);
@@ -2022,7 +2022,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 17) {
     if (
       state.cursorElement &&
       document.documentElement.contains(state.cursorElement) &&
-      state.cursorElement.getAttribute?.('data-mergen-mcp-cursor-version') === '17' &&
+      state.cursorElement.getAttribute?.('data-mergen-mcp-cursor-version') === '18' &&
       state.cursorElement.querySelector?.('[data-mergen-mcp-cursor-pointer]')
     ) {
       return state.cursorElement;
@@ -2030,7 +2030,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 17) {
     state.cursorElement?.remove?.();
     const cursor = document.createElement('div');
     cursor.setAttribute('data-mergen-mcp-cursor', 'true');
-    cursor.setAttribute('data-mergen-mcp-cursor-version', '17');
+    cursor.setAttribute('data-mergen-mcp-cursor-version', '18');
     cursor.setAttribute('data-mergen-mcp-cursor-phase', state.cursor.phase || 'idle');
     Object.assign(cursor.style, {
       position: 'fixed',
@@ -2115,6 +2115,15 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 17) {
     setTimeout(() => {
       if (state.cursor.phaseToken === token && state.cursor.visible) setCursorPhase('idle');
     }, delay);
+  };
+  const hideCursorAfterTool = () => {
+    if (state.cursor.mouseDownButton) return;
+    if (!state.cursorElement) return;
+    state.cursorElement.style.display = 'none';
+    state.cursor.visible = false;
+    state.cursor.phase = 'idle';
+    state.cursor.tilt = 0;
+    clearCursorAnchor();
   };
   const setCursorPosition = (x, y, options = {}) => {
     const point = clampPoint(x, y);
@@ -3361,52 +3370,65 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 17) {
   };
   const ok = (text, data) => ({ ok: true, text, data: data || { url: location.href, title: document.title || '' } });
   const fail = (message) => ({ ok: false, error: message });
-  window.__mergenMcpRun = (tool, params = {}) => {
+  const runToolWithCleanup = (runFn) => {
+    const cleanup = () => { hideCursorAfterTool(); };
     try {
-      if (tool === 'browser_snapshot') return snapshot(params);
-      if (tool === 'browser_page_summary') return pageSummary(params);
-      if (tool === 'browser_console_messages') return fail('Console capture is not implemented by Mergen Browser MCP yet.');
-      if (tool === 'browser_network_requests') return fail('Network request capture is not implemented by Mergen Browser MCP yet.');
-      if (tool === 'browser_network_request') return fail('Detailed network capture is not implemented by Mergen Browser MCP yet.');
-      if (tool === 'browser_resize') return fail('Resize is controlled by the Mergen Browser panel size.');
-      if (tool === 'browser_wait_for') {
-        const text = params.text ? String(params.text) : '';
-        const gone = params.textGone ? String(params.textGone) : '';
-        if (!text && !gone) return fail('browser_wait_for requires text or textGone in the embedded page; fixed waits are handled by the MCP helper.');
-        const body = document.body?.innerText || '';
-        if (text && body.includes(text)) return ok(`Text found: ${text}`);
-        if (gone && !body.includes(gone)) return ok(`Text is gone: ${gone}`);
-        return fail(text ? `Text not found: ${text}` : `Text is still visible: ${gone}`);
+      const result = runFn();
+      if (result && typeof result.then === 'function') {
+        return result.then(
+          (value) => { cleanup(); return value; },
+          (err) => { cleanup(); throw err; }
+        );
       }
-      if (tool.startsWith('browser_localstorage_') || tool.startsWith('browser_sessionstorage_')) {
-        const store = tool.includes('sessionstorage') ? sessionStorage : localStorage;
-        const action = tool.split('_').pop();
-        if (action === 'list') return ok(Array.from({ length: store.length }, (_, i) => `${store.key(i)}=${store.getItem(store.key(i))}`).join('\n') || 'Storage is empty');
-        if (action === 'get') return ok(String(store.getItem(params.key) ?? ''));
-        if (action === 'set') { store.setItem(params.key, String(params.value ?? '')); return ok(`Storage item set: ${params.key}`); }
-        if (action === 'delete') { store.removeItem(params.key); return ok(`Storage item deleted: ${params.key}`); }
-        if (action === 'clear') { store.clear(); return ok('Storage cleared'); }
-      }
-      if (tool === 'browser_cookie_list') return ok(document.cookie || 'No document.cookie entries visible to JavaScript');
-      if (tool === 'browser_cookie_get') return ok((document.cookie.split('; ').find((c) => c.startsWith(`${params.name}=`)) || '').split('=').slice(1).join('='));
-      if (tool === 'browser_cookie_set') { document.cookie = `${params.name}=${params.value}; path=${params.path || '/'}`; return ok(`Cookie set: ${params.name}`); }
-      if (tool === 'browser_cookie_delete') { document.cookie = `${params.name}=; Max-Age=0; path=/`; return ok(`Cookie deleted: ${params.name}`); }
-      if (tool === 'browser_cookie_clear') { for (const c of document.cookie.split('; ')) document.cookie = `${c.split('=')[0]}=; Max-Age=0; path=/`; return ok('Visible document cookies cleared'); }
-      if (['browser_click', 'browser_hover', 'browser_select_option', 'browser_type', 'browser_fill_form', 'browser_press_key', 'browser_mouse_move_xy', 'browser_mouse_click_xy', 'browser_mouse_drag_xy', 'browser_mouse_down', 'browser_mouse_up', 'browser_mouse_wheel'].includes(tool)) return runVisualTool(tool, params);
-      if (tool === 'browser_highlight') return runHighlightTool(params);
-      if (tool === 'browser_hide_highlight') return hideHighlight();
-      const element = resolve(targetValue(params));
-      if (tool === 'browser_evaluate') {
-        return runEvaluateTool(params, element);
-      }
-      return fail(`Unsupported browser MCP tool in page script: ${tool}`);
-    } catch (error) {
-      return fail(error && error.stack ? String(error.stack) : String(error));
+      cleanup();
+      return result;
+    } catch (err) {
+      cleanup();
+      throw err;
     }
   };
+  window.__mergenMcpRun = (tool, params = {}) => runToolWithCleanup(() => {
+    if (tool === 'browser_snapshot') return snapshot(params);
+    if (tool === 'browser_page_summary') return pageSummary(params);
+    if (tool === 'browser_console_messages') return fail('Console capture is not implemented by Mergen Browser MCP yet.');
+    if (tool === 'browser_network_requests') return fail('Network request capture is not implemented by Mergen Browser MCP yet.');
+    if (tool === 'browser_network_request') return fail('Detailed network capture is not implemented by Mergen Browser MCP yet.');
+    if (tool === 'browser_resize') return fail('Resize is controlled by the Mergen Browser panel size.');
+    if (tool === 'browser_wait_for') {
+      const text = params.text ? String(params.text) : '';
+      const gone = params.textGone ? String(params.textGone) : '';
+      if (!text && !gone) return fail('browser_wait_for requires text or textGone in the embedded page; fixed waits are handled by the MCP helper.');
+      const body = document.body?.innerText || '';
+      if (text && body.includes(text)) return ok(`Text found: ${text}`);
+      if (gone && !body.includes(gone)) return ok(`Text is gone: ${gone}`);
+      return fail(text ? `Text not found: ${text}` : `Text is still visible: ${gone}`);
+    }
+    if (tool.startsWith('browser_localstorage_') || tool.startsWith('browser_sessionstorage_')) {
+      const store = tool.includes('sessionstorage') ? sessionStorage : localStorage;
+      const action = tool.split('_').pop();
+      if (action === 'list') return ok(Array.from({ length: store.length }, (_, i) => `${store.key(i)}=${store.getItem(store.key(i))}`).join('\n') || 'Storage is empty');
+      if (action === 'get') return ok(String(store.getItem(params.key) ?? ''));
+      if (action === 'set') { store.setItem(params.key, String(params.value ?? '')); return ok(`Storage item set: ${params.key}`); }
+      if (action === 'delete') { store.removeItem(params.key); return ok(`Storage item deleted: ${params.key}`); }
+      if (action === 'clear') { store.clear(); return ok('Storage cleared'); }
+    }
+    if (tool === 'browser_cookie_list') return ok(document.cookie || 'No document.cookie entries visible to JavaScript');
+    if (tool === 'browser_cookie_get') return ok((document.cookie.split('; ').find((c) => c.startsWith(`${params.name}=`)) || '').split('=').slice(1).join('='));
+    if (tool === 'browser_cookie_set') { document.cookie = `${params.name}=${params.value}; path=${params.path || '/'}`; return ok(`Cookie set: ${params.name}`); }
+    if (tool === 'browser_cookie_delete') { document.cookie = `${params.name}=; Max-Age=0; path=/`; return ok(`Cookie deleted: ${params.name}`); }
+    if (tool === 'browser_cookie_clear') { for (const c of document.cookie.split('; ')) document.cookie = `${c.split('=')[0]}=; Max-Age=0; path=/`; return ok('Visible document cookies cleared'); }
+    if (['browser_click', 'browser_hover', 'browser_select_option', 'browser_type', 'browser_fill_form', 'browser_press_key', 'browser_mouse_move_xy', 'browser_mouse_click_xy', 'browser_mouse_drag_xy', 'browser_mouse_down', 'browser_mouse_up', 'browser_mouse_wheel'].includes(tool)) return runVisualTool(tool, params);
+    if (tool === 'browser_highlight') return runHighlightTool(params);
+    if (tool === 'browser_hide_highlight') return hideHighlight();
+    const element = resolve(targetValue(params));
+    if (tool === 'browser_evaluate') {
+      return runEvaluateTool(params, element);
+    }
+    return fail(`Unsupported browser MCP tool in page script: ${tool}`);
+  });
   window.addEventListener('scroll', scheduleVisualAnchorSync, true);
   window.addEventListener('resize', scheduleVisualAnchorSync);
-  window.__mergenMcpRun.version = 17;
+  window.__mergenMcpRun.version = 18;
 }
 "#;
 
@@ -4132,7 +4154,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn browser_mcp_automation_script_includes_visible_cursor_and_mouse_tools() {
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 17"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 18"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-version"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-pointer"));
@@ -4159,6 +4181,8 @@ mod tests {
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("distance * 0.18"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("steadyCursorForAction"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-phase"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("hideCursorAfterTool"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("runToolWithCleanup"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("0.72"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains(
             "const finalPoint = setCursorPosition(end.x, end.y, { tilt: 0, phase: 'idle' })"
@@ -4259,6 +4283,27 @@ mod tests {
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("browser_mouse_')) return fail"));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
             .contains("is not implemented by Mergen Browser MCP yet.`);"));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn browser_mcp_automation_script_hides_cursor_after_tool_completion() {
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("hideCursorAfterTool"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("runToolWithCleanup"));
+        // hideCursorAfterTool should check mouseDownButton and skip if active
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("if (state.cursor.mouseDownButton) return;"));
+        // Should hide cursor and reset state
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("state.cursorElement.style.display = 'none';"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("state.cursor.visible = false;"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("clearCursorAnchor();"));
+        // runToolWithCleanup should handle both sync and async results
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("typeof result.then === 'function'"));
+        // Cleanup should be called after Promise resolves or rejects
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("(value) => { cleanup(); return value; }"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("(err) => { cleanup(); throw err; }"));
     }
 
     #[test]
