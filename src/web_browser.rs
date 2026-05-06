@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Bounds for the browser view in physical pixels.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -22,12 +22,59 @@ pub struct BrowserBounds {
     pub height: i32,
 }
 
+/// Page readiness state for tracking when the page is stable and ready for interaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageReadinessState {
+    /// Page is stable and ready for interaction
+    Ready,
+    /// Navigation or major DOM change is in progress
+    Loading,
+    /// SPA route change or significant dynamic update in progress
+    Transitioning,
+    /// Network requests are pending
+    NetworkPending,
+}
+
+impl Default for PageReadinessState {
+    fn default() -> Self {
+        PageReadinessState::Loading
+    }
+}
+
+/// Page readiness details including state and metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageReadiness {
+    pub state: PageReadinessState,
+    pub url: String,
+    pub title: String,
+    pub document_ready_state: String,
+    pub pending_network_count: u32,
+    pub last_change_reason: String,
+    pub timestamp_ms: u64,
+}
+
+impl Default for PageReadiness {
+    fn default() -> Self {
+        Self {
+            state: PageReadinessState::Loading,
+            url: String::new(),
+            title: String::new(),
+            document_ready_state: "loading".to_owned(),
+            pending_network_count: 0,
+            last_change_reason: "initial".to_owned(),
+            timestamp_ms: 0,
+        }
+    }
+}
+
 /// Events emitted by the embedded browser.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BrowserEvent {
     UrlChanged(String),
     LoadStarted(String),
     LoadFinished(String),
+    /// Page readiness state has changed
+    ReadinessChanged(PageReadiness),
     DesignInspectReady,
     DesignElementClicked(DesignElementInfo),
     McpToolResult {
@@ -311,6 +358,24 @@ fn new_design_inspect_token() -> String {
     format!("mdi-{nanos:x}-{counter:x}")
 }
 
+fn new_readiness_token() -> String {
+    let counter = DESIGN_INSPECT_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("mpr-{nanos:x}-{counter:x}")
+}
+
+fn generate_request_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let counter = DESIGN_INSPECT_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("req-{nanos:x}-{counter:x}")
+}
+
 #[cfg(target_os = "windows")]
 fn design_inspect_bootstrap_script(token: &str) -> String {
     let token_json = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_owned());
@@ -516,6 +581,169 @@ const DESIGN_INSPECT_BOOTSTRAP_SCRIPT_TEMPLATE: &str = r#"
 })();
 "#;
 
+#[cfg(target_os = "windows")]
+fn page_readiness_bootstrap_script(token: &str) -> String {
+    let token_json = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_owned());
+    PAGE_READINESS_BOOTSTRAP_SCRIPT_TEMPLATE.replace("__MERGEN_READINESS_TOKEN__", &token_json)
+}
+
+#[cfg(target_os = "windows")]
+const PAGE_READINESS_BOOTSTRAP_SCRIPT_TEMPLATE: &str = r#"
+(() => {
+  const SOURCE = "mergen-ade-page-readiness";
+  const TOKEN = __MERGEN_READINESS_TOKEN__;
+  const webview = window.chrome?.webview;
+  const postMessage = webview && typeof webview.postMessage === "function" ? webview.postMessage.bind(webview) : null;
+  
+  if (window.__mergenPageReadiness && window.__mergenPageReadiness.version === 1) {
+    postMessage?.(JSON.stringify({ source: SOURCE, token: TOKEN, type: "ready" }));
+    return;
+  }
+
+  const state = {
+    version: 1,
+    readyState: document.readyState,
+    pendingNetwork: 0,
+    isNavigating: false,
+    lastReason: "init",
+    currentUrl: location.href,
+    currentTitle: document.title || "",
+  };
+
+  const postReadiness = (reason) => {
+    state.lastReason = reason;
+    state.currentUrl = location.href;
+    state.currentTitle = document.title || "";
+    
+    let readinessState = "ready";
+    if (state.isNavigating) {
+      readinessState = "loading";
+    } else if (state.pendingNetwork > 0) {
+      readinessState = "networkPending";
+    } else if (document.readyState !== "complete") {
+      readinessState = "loading";
+    }
+
+    postMessage?.(JSON.stringify({
+      source: SOURCE,
+      token: TOKEN,
+      type: "readiness",
+      state: readinessState,
+      url: state.currentUrl,
+      title: state.currentTitle,
+      documentReadyState: document.readyState,
+      pendingNetwork: state.pendingNetwork,
+      reason: reason,
+      timestamp: Date.now(),
+    }));
+  };
+
+  const setNavigating = (value, reason) => {
+    const wasReady = !state.isNavigating && state.pendingNetwork === 0 && document.readyState === "complete";
+    state.isNavigating = value;
+    if (!value) {
+      state.readyState = document.readyState;
+    }
+    postReadiness(reason);
+  };
+
+  // Track network requests
+  const originalFetch = window.fetch;
+  if (originalFetch) {
+    window.fetch = async (...args) => {
+      state.pendingNetwork++;
+      postReadiness("fetchStart");
+      try {
+        const response = await originalFetch.apply(window, args);
+        return response;
+      } finally {
+        state.pendingNetwork--;
+        setTimeout(() => postReadiness("fetchEnd"), 50);
+      }
+    };
+  }
+
+  // Track XMLHttpRequest
+  const originalXhrOpen = XMLHttpRequest.prototype.open;
+  const originalXhrSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function(...args) {
+    this._mergenTracking = true;
+    return originalXhrOpen.apply(this, args);
+  };
+  XMLHttpRequest.prototype.send = function(...args) {
+    if (this._mergenTracking) {
+      state.pendingNetwork++;
+      postReadiness("xhrStart");
+      this.addEventListener("loadend", () => {
+        state.pendingNetwork--;
+        setTimeout(() => postReadiness("xhrEnd"), 50);
+      }, { once: true });
+    }
+    return originalXhrSend.apply(this, args);
+  };
+
+  // Track document readiness
+  const updateReadiness = (reason) => {
+    state.readyState = document.readyState;
+    if (document.readyState === "complete" && state.isNavigating) {
+      setNavigating(false, reason);
+    } else {
+      postReadiness(reason);
+    }
+  };
+
+  document.addEventListener("readystatechange", () => updateReadiness("readystatechange"));
+  window.addEventListener("DOMContentLoaded", () => updateReadiness("DOMContentLoaded"));
+  window.addEventListener("load", () => setNavigating(false, "windowLoad"));
+
+  // Track SPA navigation
+  const originalPushState = history.pushState;
+  const originalReplaceState = history.replaceState;
+  
+  history.pushState = function(...args) {
+    setNavigating(true, "pushState");
+    const result = originalPushState.apply(this, args);
+    setTimeout(() => setNavigating(false, "pushStateComplete"), 100);
+    return result;
+  };
+  
+  history.replaceState = function(...args) {
+    setNavigating(true, "replaceState");
+    const result = originalReplaceState.apply(this, args);
+    setTimeout(() => setNavigating(false, "replaceStateComplete"), 100);
+    return result;
+  };
+
+  window.addEventListener("popstate", () => {
+    setNavigating(true, "popstate");
+    setTimeout(() => setNavigating(false, "popstateComplete"), 100);
+  });
+  window.addEventListener("hashchange", () => {
+    setNavigating(true, "hashchange");
+    setTimeout(() => setNavigating(false, "hashchangeComplete"), 100);
+  });
+
+  // Track mutations to detect dynamic content loading
+  let mutationTimeout = null;
+  const observer = new MutationObserver((mutations) => {
+    if (mutationTimeout) return;
+    mutationTimeout = setTimeout(() => {
+      mutationTimeout = null;
+      if (!state.isNavigating && document.readyState === "complete") {
+        // Briefly mark as transitioning to catch any follow-up changes
+        if (state.pendingNetwork === 0) {
+          postReadiness("mutationSettle");
+        }
+      }
+    }, 150);
+  });
+  observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+
+  window.__mergenPageReadiness = { version: 1, state, postReadiness };
+  postReadiness("bootstrapComplete");
+})();
+"#;
+
 pub(crate) fn parse_design_inspect_message(
     message: &str,
     expected_token: &str,
@@ -547,6 +775,61 @@ pub(crate) fn parse_design_inspect_message(
     }
 }
 
+const PAGE_READINESS_MESSAGE_SOURCE: &str = "mergen-ade-page-readiness";
+
+/// Parse a page readiness message from the browser.
+/// Returns Some(ReadinessChanged) if the message is valid and from the expected token.
+#[cfg(target_os = "windows")]
+pub(crate) fn parse_page_readiness_message(
+    message: &str,
+    expected_token: &str,
+) -> Option<BrowserEvent> {
+    let parsed: JsonValue = serde_json::from_str(message).ok()?;
+    
+    // Validate source and token
+    let source = parsed.get("source")?.as_str()?;
+    let token = parsed.get("token")?.as_str()?;
+    if source != PAGE_READINESS_MESSAGE_SOURCE || token != expected_token {
+        return None;
+    }
+    
+    let msg_type = parsed.get("type")?.as_str()?;
+    if msg_type != "readiness" {
+        return None;
+    }
+    
+    // Parse readiness state
+    let state_str = parsed.get("state")?.as_str()?;
+    let state = match state_str {
+        "ready" => PageReadinessState::Ready,
+        "loading" => PageReadinessState::Loading,
+        "networkPending" => PageReadinessState::NetworkPending,
+        "transitioning" => PageReadinessState::Transitioning,
+        _ => PageReadinessState::Loading,
+    };
+    
+    let readiness = PageReadiness {
+        state,
+        url: parsed.get("url").and_then(JsonValue::as_str).unwrap_or("").to_owned(),
+        title: parsed.get("title").and_then(JsonValue::as_str).unwrap_or("").to_owned(),
+        document_ready_state: parsed.get("documentReadyState").and_then(JsonValue::as_str).unwrap_or("loading").to_owned(),
+        pending_network_count: parsed.get("pendingNetwork").and_then(JsonValue::as_u64).unwrap_or(0) as u32,
+        last_change_reason: parsed.get("reason").and_then(JsonValue::as_str).unwrap_or("unknown").to_owned(),
+        timestamp_ms: parsed.get("timestamp").and_then(JsonValue::as_u64).unwrap_or(0),
+    };
+    
+    Some(BrowserEvent::ReadinessChanged(readiness))
+}
+
+/// Stub for non-Windows platforms.
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn parse_page_readiness_message(
+    _message: &str,
+    _expected_token: &str,
+) -> Option<BrowserEvent> {
+    None
+}
+
 /// Status of the embedded browser.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BrowserStatus {
@@ -568,6 +851,10 @@ pub struct EmbeddedBrowser {
     design_inspect_enabled: bool,
     design_inspect_token: String,
     user_data_folder: Option<PathBuf>,
+    /// Current page readiness state
+    current_readiness: PageReadiness,
+    /// Pending operations waiting for readiness (operation_id -> (tool_name, start_time))
+    pending_operations: BTreeMap<String, (String, Instant)>,
     #[cfg(target_os = "windows")]
     inner: Option<WindowsWebView>,
     #[cfg(target_os = "windows")]
@@ -596,6 +883,8 @@ impl EmbeddedBrowser {
             design_inspect_enabled: false,
             design_inspect_token: new_design_inspect_token(),
             user_data_folder,
+            current_readiness: PageReadiness::default(),
+            pending_operations: BTreeMap::new(),
             #[cfg(target_os = "windows")]
             inner: None,
             #[cfg(target_os = "windows")]
@@ -605,6 +894,55 @@ impl EmbeddedBrowser {
             #[cfg(target_os = "windows")]
             pending_visibility: None,
         }
+    }
+
+    /// Get the current page readiness state.
+    pub fn current_readiness(&self) -> &PageReadiness {
+        &self.current_readiness
+    }
+
+    /// Check if the page is currently ready (stable state).
+    pub fn is_page_ready(&self) -> bool {
+        matches!(self.current_readiness.state, PageReadinessState::Ready)
+    }
+
+    /// Register a pending operation that should complete when the page becomes ready.
+    /// Returns an operation ID that can be used to check completion.
+    pub fn register_pending_operation(&mut self, tool_name: &str) -> String {
+        let op_id = format!("op-{}-{}", tool_name, generate_request_id());
+        self.pending_operations.insert(
+            op_id.clone(),
+            (tool_name.to_owned(), Instant::now()),
+        );
+        op_id
+    }
+
+    /// Complete all pending operations, returning the list of completed operation IDs.
+    pub fn complete_pending_operations(&mut self) -> Vec<String> {
+        let completed: Vec<String> = self.pending_operations.keys().cloned().collect();
+        self.pending_operations.clear();
+        completed
+    }
+
+    /// Get pending operations that have exceeded the timeout (safety check).
+    pub fn get_timed_out_operations(&self, timeout: Duration) -> Vec<(String, String, Duration)> {
+        let now = Instant::now();
+        self.pending_operations
+            .iter()
+            .filter_map(|(id, (tool, start))| {
+                let elapsed = now.duration_since(*start);
+                if elapsed > timeout {
+                    Some((id.clone(), tool.clone(), elapsed))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Update the current page readiness state.
+    pub fn update_readiness(&mut self, readiness: PageReadiness) {
+        self.current_readiness = readiness;
     }
 
     /// Ensure the browser is created with the given parent window handle.
@@ -628,10 +966,12 @@ impl EmbeddedBrowser {
 
         // Create WebView2 environment using synchronous helper
         let hwnd = HWND(hwnd as *mut std::ffi::c_void);
+        let readiness_token = new_readiness_token();
         let result = create_webview_sync(
             hwnd,
             self.event_sender.clone(),
             self.design_inspect_token.clone(),
+            readiness_token.clone(),
             self.user_data_folder.clone(),
         );
 
@@ -653,6 +993,7 @@ impl EmbeddedBrowser {
                     navigation_starting_token: Some(navigation_starting_token),
                     content_loading_token: Some(content_loading_token),
                     navigation_completed_token: Some(navigation_completed_token),
+                    readiness_token,
                 });
                 self.status = BrowserStatus::Ready;
                 log::info!("WebView2 created successfully");
@@ -2980,6 +3321,8 @@ struct WindowsWebView {
     navigation_starting_token: Option<EventRegistrationToken>,
     content_loading_token: Option<EventRegistrationToken>,
     navigation_completed_token: Option<EventRegistrationToken>,
+    /// Token for page readiness state change messages
+    readiness_token: String,
 }
 
 #[cfg(target_os = "windows")]
@@ -3102,6 +3445,7 @@ fn create_webview_sync(
     parent_hwnd: windows::Win32::Foundation::HWND,
     event_sender: Sender<BrowserEvent>,
     design_inspect_token: String,
+    readiness_token: String,
     user_data_folder: Option<PathBuf>,
 ) -> Result<
     (
@@ -3226,16 +3570,22 @@ fn create_webview_sync(
     configure_webview_controller(&controller);
     configure_webview_profile(&webview);
     install_design_inspect_bootstrap(&webview, &design_inspect_token)?;
+    install_page_readiness_bootstrap(&webview, &readiness_token)?;
 
     let web_message_sender = event_sender.clone();
-    let web_message_token = design_inspect_token.clone();
+    let web_message_design_token = design_inspect_token.clone();
+    let web_message_readiness_token = readiness_token.clone();
     let web_message_handler = WebMessageReceivedEventHandler::create(Box::new(
         move |_webview, args| -> windows::core::Result<()> {
             let Some(args) = args else {
                 return Ok(());
             };
             if let Ok(message) = web_message_as_string(&args) {
-                if let Some(event) = parse_design_inspect_message(&message, &web_message_token) {
+                // Try to parse as design inspect message
+                if let Some(event) = parse_design_inspect_message(&message, &web_message_design_token) {
+                    let _ = web_message_sender.send(event);
+                } else if let Some(event) = parse_page_readiness_message(&message, &web_message_readiness_token) {
+                    // Parse as page readiness message
                     let _ = web_message_sender.send(event);
                 }
             }
@@ -3359,6 +3709,29 @@ fn create_webview_sync(
         content_loading_token,
         navigation_completed_token,
     ))
+}
+
+#[cfg(target_os = "windows")]
+fn install_page_readiness_bootstrap(
+    webview: &ICoreWebView2,
+    token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::mpsc;
+
+    let (script_tx, script_rx) = mpsc::channel::<std::result::Result<(), windows::core::Error>>();
+    let script_handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
+        move |result, _script_id| -> windows::core::Result<()> {
+            let _ = script_tx.send(result);
+            Ok(())
+        },
+    ));
+
+    let script = windows::core::HSTRING::from(page_readiness_bootstrap_script(token));
+    unsafe {
+        webview.AddScriptToExecuteOnDocumentCreated(&script, &script_handler)?;
+    }
+    webview2_com::wait_with_pump(script_rx).map_err(|e| std::io::Error::other(e.to_string()))??;
+    Ok(())
 }
 
 #[cfg(test)]

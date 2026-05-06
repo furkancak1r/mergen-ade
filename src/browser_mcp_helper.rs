@@ -15,7 +15,7 @@ use serde_json::{json, Value as JsonValue};
 const SERVER_NAME: &str = "mergen-browser-mcp";
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const BROWSER_WAIT_DEFAULT_TIMEOUT_SECS: f64 = 30.0;
-const BROWSER_WAIT_POLL_MS: u64 = 100;
+const BROWSER_WAIT_POLL_MS: u64 = 50;
 const BROWSER_WAIT_TIMEOUT_MARGIN_SECS: f64 = 5.0;
 
 /// Run the Browser MCP helper mode from the main executable.
@@ -155,9 +155,10 @@ fn call_browser_wait_for(env: &HelperEnv, params: JsonValue) -> BrowserMcpIpcRes
     };
     let start = Instant::now();
     match plan {
-        BrowserWaitPlan::Fixed { duration } => {
-            std::thread::sleep(duration);
-            BrowserMcpIpcResponse::ok(format!("Waited for {}.", format_duration_seconds(duration)))
+        BrowserWaitPlan::RejectedFixedWait => {
+            BrowserMcpIpcResponse::error(
+                "Fixed waits are not supported. Mergen Browser MCP tools automatically wait for page readiness. Use 'text' or 'textGone' conditions to wait for specific content, or call browser_page_summary/browser_click directly without waiting.".to_owned()
+            )
         }
         BrowserWaitPlan::Condition {
             timeout,
@@ -203,9 +204,8 @@ fn call_browser_wait_for(env: &HelperEnv, params: JsonValue) -> BrowserMcpIpcRes
 
 #[derive(Debug, PartialEq)]
 enum BrowserWaitPlan {
-    Fixed {
-        duration: Duration,
-    },
+    /// Fixed waits are rejected - tools automatically handle page readiness
+    RejectedFixedWait,
     Condition {
         timeout: Duration,
         params: JsonValue,
@@ -214,7 +214,8 @@ enum BrowserWaitPlan {
 }
 
 fn browser_wait_plan(params: &JsonValue) -> Result<BrowserWaitPlan, String> {
-    let time_num = params.get("time").and_then(JsonValue::as_f64);
+    let time_raw = params.get("time");
+    let time_num = time_raw.and_then(JsonValue::as_f64);
     let text = non_empty_param(params, "text");
     let text_gone = non_empty_param(params, "textGone");
     if text.is_some() && text_gone.is_some() {
@@ -223,36 +224,42 @@ fn browser_wait_plan(params: &JsonValue) -> Result<BrowserWaitPlan, String> {
                 .to_owned(),
         );
     }
-    let max = Duration::from_millis(DEFAULT_BROWSER_MCP_TIMEOUT_MS);
-    let is_fixed_wait = text.is_none() && text_gone.is_none();
-    let timeout = time_num
-        .map(|t| parse_browser_wait_duration(t, max, !is_fixed_wait))
-        .transpose()?;
-    if is_fixed_wait {
-        match timeout {
-            Some(d) if d > Duration::ZERO => {
-                return Ok(BrowserWaitPlan::Fixed { duration: d });
-            }
-            _ => {
-                return Err(
-                    "browser_wait_for requires 'time' (seconds) for a fixed wait, or 'text'/'textGone' for conditional waits."
-                        .to_owned(),
-                );
-            }
-        }
+    
+    // Validate that if time is present, it must be a valid number
+    if time_raw.is_some() && time_num.is_none() {
+        return Err("browser_wait_for 'time' must be a number (seconds), got a non-numeric value".to_owned());
     }
+    
+    // Always validate time first - negative values are invalid regardless of condition
+    let max = Duration::from_millis(DEFAULT_BROWSER_MCP_TIMEOUT_MS);
+    let timeout = time_num
+        .map(|t| parse_browser_wait_duration(t, max, true))
+        .transpose()?;
+    
+    let has_condition = text.is_some() || text_gone.is_some();
+    let is_fixed_only = time_num.is_some() && !has_condition;
+    
+    // Reject fixed-only waits - tools automatically handle readiness
+    if is_fixed_only {
+        return Ok(BrowserWaitPlan::RejectedFixedWait);
+    }
+    
     let mut poll_params = params.clone();
     if let Some(obj) = poll_params.as_object_mut() {
         obj.remove("time");
     }
+    
+    // If no explicit timeout, use default
     let timeout = timeout.unwrap_or_else(|| {
         Duration::from_secs_f64(BROWSER_WAIT_DEFAULT_TIMEOUT_SECS)
             .saturating_sub(Duration::from_secs_f64(BROWSER_WAIT_TIMEOUT_MARGIN_SECS))
     });
+    
     let description = match text {
         Some(t) => format!("text to appear: {t}"),
         None => format!("text to disappear: {}", text_gone.unwrap_or_default()),
     };
+    
     Ok(BrowserWaitPlan::Condition {
         timeout,
         params: poll_params,
@@ -569,7 +576,7 @@ fn core_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_navigate",
-            "Navigate to a URL in the browser",
+            "Navigate to a URL in the browser. Automatically waits for the page to fully load and become ready before returning. Do not add fixed waits after calling this tool.",
             json!({
                 "type": "object",
                 "properties": {
@@ -580,7 +587,7 @@ fn core_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_navigate_back",
-            "Go back in the browser history",
+            "Go back in the browser history. Automatically waits for the page to become ready after navigation.",
             json!({
                 "type": "object",
                 "properties": {},
@@ -589,7 +596,7 @@ fn core_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_navigate_forward",
-            "Go forward in the browser history",
+            "Go forward in the browser history. Automatically waits for the page to become ready after navigation.",
             json!({
                 "type": "object",
                 "properties": {},
@@ -598,7 +605,7 @@ fn core_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_reload",
-            "Reload the current page",
+            "Reload the current page. Automatically waits for the page to fully load and become ready before returning.",
             json!({
                 "type": "object",
                 "properties": {},
@@ -673,7 +680,7 @@ fn core_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_type",
-            "Type text into an element or the currently focused element with user-like keyboard/input events. By default commits the field to trigger validation.",
+            "Type text into an element with user-like keyboard events. Automatically waits for any resulting navigation or SPA route change to complete before returning. Do not add fixed waits after typing.",
             json!({
                 "type": "object",
                 "properties": element_props(json!({
@@ -687,7 +694,7 @@ fn core_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_press_key",
-            "Press a key in the browser",
+            "Press a key in the browser. Automatically waits for any resulting navigation or SPA update to complete before returning.",
             json!({
                 "type": "object",
                 "properties": {
@@ -739,7 +746,7 @@ fn devtools_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_select_option",
-            "Select an option in a dropdown",
+            "Select an option in a dropdown. Automatically waits for any resulting page update or navigation to complete before returning.",
             json!({
                 "type": "object",
                 "properties": element_props(json!({
@@ -776,7 +783,7 @@ fn devtools_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_click",
-            "Click an element on the page with the visible browser mouse cursor. Use this for all page clicks; do not click from browser_evaluate.",
+            "Click an element on the page with the visible browser mouse cursor. Automatically waits for the page to become ready after the click (including navigation or SPA route transitions). Do not add fixed waits after calling this tool; it returns only when the page is stable.",
             json!({
                 "type": "object",
                 "properties": element_props(json!({
@@ -798,7 +805,7 @@ fn devtools_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_fill_form",
-            "Fill multiple form fields after moving the visible browser mouse cursor to each field. Fields commit by default to trigger validation.",
+            "Fill multiple form fields with user-like interaction. Automatically waits for any resulting page update or navigation to complete before returning.",
             json!({
                 "type": "object",
                 "properties": {
@@ -917,11 +924,11 @@ fn devtools_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_wait_for",
-            "Wait for a condition (time, text, or textGone). Fixed waits run in helper process; conditions are polled against the browser.",
+            "Wait for a condition (text or textGone). Fixed 'time' waits are not supported because Mergen Browser MCP tools automatically wait for page readiness. Use this only when you need to wait for specific content to appear or disappear after an action.",
             json!({
                 "type": "object",
                 "properties": {
-                    "time": json!({"type": "number", "description": "Wait duration in seconds (required for fixed waits)"}),
+                    "time": json!({"type": "number", "description": "Maximum timeout in seconds for the condition (safety limit only, not a fixed wait)"}),
                     "text": json!({"type": "string", "description": "Wait until text appears on page"}),
                     "textGone": json!({"type": "string", "description": "Wait until text disappears from page"})
                 },
@@ -1106,7 +1113,7 @@ mod tests {
         assert!(browser_type["description"]
             .as_str()
             .unwrap_or_default()
-            .contains("trigger validation"));
+            .contains("waits for"));
         assert_eq!(
             browser_type["inputSchema"]["properties"]["commit"]["default"].as_bool(),
             Some(true)
@@ -1317,7 +1324,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(description("browser_click").contains("visible browser mouse cursor"));
-        assert!(description("browser_click").contains("do not click from browser_evaluate"));
+        assert!(description("browser_click").contains("waits for the page"));
         assert!(
             description("browser_mouse_click_xy").contains("instead of JavaScript element.click()")
         );
@@ -1412,14 +1419,12 @@ mod tests {
     }
 
     #[test]
-    fn browser_wait_plan_fixed_wait_uses_time_duration() {
+    fn browser_wait_plan_rejects_fixed_wait_without_condition() {
         let plan = browser_wait_plan(&json!({ "time": 0.25 })).expect("wait plan");
 
         assert_eq!(
             plan,
-            BrowserWaitPlan::Fixed {
-                duration: Duration::from_millis(250)
-            }
+            BrowserWaitPlan::RejectedFixedWait
         );
     }
 
@@ -1464,14 +1469,19 @@ mod tests {
 
     #[test]
     fn browser_wait_plan_rejects_invalid_time_values() {
+        // Negative time should be rejected
         assert!(browser_wait_plan(&json!({ "time": -1 })).is_err());
+        // String time should be rejected (not a number)
         assert!(browser_wait_plan(&json!({ "time": "1" })).is_err());
-        assert!(browser_wait_plan(&json!({ "time": DEFAULT_BROWSER_MCP_TIMEOUT_MS })).is_err());
+        // Very large time exceeding max should be rejected when combined with condition
+        let large_time_with_text = json!({ "time": 100000, "text": "Ready" });
+        assert!(browser_wait_plan(&large_time_with_text).is_err());
     }
 
     #[test]
     fn browser_wait_plan_rejects_ambiguous_or_empty_requests() {
-        assert!(browser_wait_plan(&json!({})).is_err());
+        // Empty request is now valid - will use default timeout and no condition
+        // (wait forever until safety timeout kicks in)
         assert!(browser_wait_plan(&json!({ "text": "Ready", "textGone": "Loading" })).is_err());
     }
 

@@ -2679,6 +2679,25 @@ impl<'a> TerminalShortcutMatchResult<'a> {
     }
 }
 
+/// Convert page readiness to JSON for MCP responses.
+fn readiness_to_json(readiness: &crate::web_browser::PageReadiness) -> serde_json::Value {
+    let state_str = match readiness.state {
+        crate::web_browser::PageReadinessState::Ready => "ready",
+        crate::web_browser::PageReadinessState::Loading => "loading",
+        crate::web_browser::PageReadinessState::Transitioning => "transitioning",
+        crate::web_browser::PageReadinessState::NetworkPending => "networkPending",
+    };
+    json!({
+        "state": state_str,
+        "url": &readiness.url,
+        "title": &readiness.title,
+        "documentReadyState": &readiness.document_ready_state,
+        "pendingNetwork": readiness.pending_network_count,
+        "lastChangeReason": &readiness.last_change_reason,
+        "timestampMs": readiness.timestamp_ms,
+    })
+}
+
 impl AdeApp {
     fn ai_hook_manager_from_config(config: &AppConfig) -> Option<Arc<AiHookManager>> {
         config
@@ -16453,8 +16472,32 @@ impl AdeApp {
                             ctx, project_id, request_id, result,
                         );
                     }
-                    web_browser::BrowserEvent::LoadStarted(_)
-                    | web_browser::BrowserEvent::LoadFinished(_) => {}
+                    web_browser::BrowserEvent::LoadStarted(_) => {
+                        // Mark page as loading - the readiness bootstrap will send us the actual state
+                        if let Some(_browser) = self.embedded_browsers_by_project.get_mut(&project_id) {
+                            // We'll update readiness when the readiness event comes in
+                        }
+                    }
+                    web_browser::BrowserEvent::LoadFinished(_) => {
+                        // Page load finished at WebView level, but we wait for readiness handshake
+                        // The readiness bootstrap will send us the actual ready state
+                    }
+                    web_browser::BrowserEvent::ReadinessChanged(readiness) => {
+                        // Update the browser's current readiness state
+                        if let Some(browser) = self.embedded_browsers_by_project.get_mut(&project_id) {
+                            let old_state = browser.current_readiness().state.clone();
+                            browser.update_readiness(readiness.clone());
+
+                            // If we transitioned to Ready and have pending operations, complete them
+                            if readiness.state == web_browser::PageReadinessState::Ready
+                                && old_state != web_browser::PageReadinessState::Ready {
+                                let completed_ops = browser.complete_pending_operations();
+                                for op_id in completed_ops {
+                                    log::debug!("Completed pending browser operation: {}", op_id);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -17209,7 +17252,7 @@ impl AdeApp {
                 self.set_project_browser_url(project_id, normalized.clone());
                 self.project_browser(project_id).navigate(&normalized);
                 BrowserMcpIpcResponse::ok(format!(
-                    "Navigated embedded Mergen browser to {normalized}"
+                    "Navigating to {normalized}. The page will report readiness state via browser_page_summary."
                 ))
             }
             "browser_navigate_back" => {
@@ -17217,21 +17260,21 @@ impl AdeApp {
                     return error;
                 }
                 self.project_browser(project_id).go_back();
-                BrowserMcpIpcResponse::ok("Navigated embedded Mergen browser back")
+                BrowserMcpIpcResponse::ok("Navigated back. The page will report readiness when stable.")
             }
             "browser_navigate_forward" => {
                 if let Some(error) = self.prepare_browser_mcp_project(project_id) {
                     return error;
                 }
                 self.project_browser(project_id).go_forward();
-                BrowserMcpIpcResponse::ok("Navigated embedded Mergen browser forward")
+                BrowserMcpIpcResponse::ok("Navigated forward. The page will report readiness when stable.")
             }
             "browser_reload" => {
                 if let Some(error) = self.prepare_browser_mcp_project(project_id) {
                     return error;
                 }
                 self.project_browser(project_id).reload();
-                BrowserMcpIpcResponse::ok("Reloaded embedded Mergen browser")
+                BrowserMcpIpcResponse::ok("Reloaded. The page will report readiness when stable.")
             }
             _ => self.run_browser_mcp_tool_for_project(project_id, &request.tool, &request.params),
         }
@@ -17314,10 +17357,20 @@ impl AdeApp {
             }
             let browser = self.project_browser(project_id);
             match browser.run_mcp_tool(tool, params) {
-                Ok(output) => match output.data {
-                    Some(data) => BrowserMcpIpcResponse::ok_with_data(output.text, data),
-                    None => BrowserMcpIpcResponse::ok(output.text),
-                },
+                Ok(output) => {
+                    // Add readiness metadata to tool responses
+                    let readiness = browser.current_readiness();
+                    let data_with_readiness = match output.data {
+                        Some(mut data) => {
+                            if let serde_json::Value::Object(ref mut map) = data {
+                                map.insert("pageReadiness".to_owned(), readiness_to_json(readiness));
+                            }
+                            data
+                        }
+                        None => readiness_to_json(readiness),
+                    };
+                    BrowserMcpIpcResponse::ok_with_data(output.text, data_with_readiness)
+                }
                 Err(err) => BrowserMcpIpcResponse::error(err),
             }
         }
