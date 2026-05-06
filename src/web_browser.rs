@@ -1536,7 +1536,7 @@ pub(crate) fn browser_mcp_output_from_devtools_runtime_raw(
 
 #[cfg(target_os = "windows")]
 const MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT: &str = r#"
-if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 8) {
+if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 11) {
   window.__mergenMcpState = window.__mergenMcpState || { refCounter: 1, consoleMessages: [], networkRequests: [], routes: [], highlighted: null };
 
   const state = window.__mergenMcpState;
@@ -1622,10 +1622,10 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 8) {
   const buttonMask = (button) => ({ left: 1, middle: 4, right: 2 }[buttonName(button)]);
   const ensureCursorStyle = () => {
     const existing = document.querySelector('style[data-mergen-mcp-cursor-style]');
-    if (existing?.getAttribute('data-mergen-mcp-cursor-style') === '8') return;
+    if (existing?.getAttribute('data-mergen-mcp-cursor-style') === '11') return;
     existing?.remove();
     const style = document.createElement('style');
-    style.setAttribute('data-mergen-mcp-cursor-style', '8');
+    style.setAttribute('data-mergen-mcp-cursor-style', '11');
     style.textContent = `
 [data-mergen-mcp-cursor] [data-mergen-mcp-cursor-pointer] {
   transition: transform 120ms cubic-bezier(0.16, 1, 0.3, 1);
@@ -1638,7 +1638,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 8) {
     if (
       state.cursorElement &&
       document.documentElement.contains(state.cursorElement) &&
-      state.cursorElement.getAttribute?.('data-mergen-mcp-cursor-version') === '8' &&
+      state.cursorElement.getAttribute?.('data-mergen-mcp-cursor-version') === '11' &&
       state.cursorElement.querySelector?.('[data-mergen-mcp-cursor-pointer]')
     ) {
       return state.cursorElement;
@@ -1646,14 +1646,14 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 8) {
     state.cursorElement?.remove?.();
     const cursor = document.createElement('div');
     cursor.setAttribute('data-mergen-mcp-cursor', 'true');
-    cursor.setAttribute('data-mergen-mcp-cursor-version', '8');
+    cursor.setAttribute('data-mergen-mcp-cursor-version', '11');
     cursor.setAttribute('data-mergen-mcp-cursor-phase', state.cursor.phase || 'idle');
     Object.assign(cursor.style, {
       position: 'fixed',
       left: '0px',
       top: '0px',
-      width: '30px',
-      height: '38px',
+      width: '22px',
+      height: '22px',
       pointerEvents: 'none',
       zIndex: '2147483647',
       display: 'none',
@@ -1665,24 +1665,21 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 8) {
     cursor.style.setProperty('--mergen-mcp-cursor-tilt', '0deg');
     const pointer = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     pointer.setAttribute('data-mergen-mcp-cursor-pointer', 'true');
-    pointer.setAttribute('viewBox', '-2 -2 30 38');
+    pointer.setAttribute('viewBox', '0 0 28 28');
     pointer.setAttribute('aria-hidden', 'true');
     Object.assign(pointer.style, {
       position: 'absolute',
-      left: '-2px',
-      top: '-2px',
-      width: '30px',
-      height: '38px',
+      left: '-21px',
+      top: '-8px',
+      width: '22px',
+      height: '22px',
       overflow: 'visible',
       transform: 'rotate(var(--mergen-mcp-cursor-tilt))',
-      transformOrigin: '2px 2px',
+      transformOrigin: '21px 8px',
     });
     const pointerPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    pointerPath.setAttribute('d', 'M0 0 0 27.6 7.6 20.4 12.5 32.7 17.7 30.5 12.8 18.9 23.7 18.9 0 0Z');
-    pointerPath.setAttribute('fill', 'rgba(3,7,18,0.98)');
-    pointerPath.setAttribute('stroke', 'rgba(255,255,255,0.98)');
-    pointerPath.setAttribute('stroke-width', '2.05');
-    pointerPath.setAttribute('stroke-linejoin', 'round');
+    pointerPath.setAttribute('d', 'M2.2 1.2 C1.0 0.8 0.1 1.7 0.7 3.6 L7.9 25.3 C8.7 27.7 12.1 27.8 13.0 25.4 L15.0 20.0 C15.5 18.4 16.4 17.4 17.8 16.7 L25.5 12.8 C27.6 11.8 27.5 8.7 25.3 7.8 L2.2 1.2 Z');
+    pointerPath.setAttribute('fill', 'rgba(0,0,0,0.98)');
     pointer.appendChild(pointerPath);
     cursor.appendChild(pointer);
     document.documentElement.appendChild(cursor);
@@ -2530,7 +2527,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 8) {
   };
   window.addEventListener('scroll', scheduleCursorAnchorSync, true);
   window.addEventListener('resize', scheduleCursorAnchorSync);
-  window.__mergenMcpRun.version = 8;
+  window.__mergenMcpRun.version = 11;
 }
 "#;
 
@@ -3219,7 +3216,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn browser_mcp_automation_script_includes_visible_cursor_and_mouse_tools() {
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 8"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 11"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-version"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-pointer"));
@@ -3242,15 +3239,30 @@ mod tests {
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
             .contains("state.cursor.visible ? clampPoint(state.cursor.x, state.cursor.y) : clampPoint(end.x - 96, end.y - 64)"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
-            .contains("pointer.setAttribute('viewBox', '-2 -2 30 38')"));
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("left: '-2px'"));
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("top: '-2px'"));
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("transformOrigin: '2px 2px'"));
+            .contains("pointer.setAttribute('viewBox', '0 0 28 28')"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("width: '22px'"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("height: '22px'"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("left: '-21px'"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("top: '-8px'"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("transformOrigin: '21px 8px'"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
-            .contains("pointerPath.setAttribute('fill', 'rgba(3,7,18,0.98)')"));
+            .contains("M2.2 1.2 C1.0 0.8 0.1 1.7 0.7 3.6 L7.9 25.3 C8.7 27.7 12.1 27.8 13.0 25.4"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
-            .contains("pointerPath.setAttribute('stroke', 'rgba(255,255,255,0.98)')"));
+            .contains("pointerPath.setAttribute('fill', 'rgba(0,0,0,0.98)')"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("pointerPath.setAttribute('stroke'"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("pointerPath.setAttribute('stroke-linejoin'"));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("left: '-13px'"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("height: '28px'"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("width: '30px'"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("height: '38px'"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("'-1 -1 20 24'"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("'-1 -1 22 28'"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("'-2 -2 30 38'"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("M0 0 3.2 21.7 8.2 14.8 12.6 23 16.1 20.8 11.4 12.7 19 11.6 0 0Z"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("M0 0 0 24 6.6 17.6 10.9 27 15.2 25.1 10.7 15.8 20.4 15.8 0 0Z"));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-aura"));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-focus"));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-halo"));
