@@ -10,13 +10,33 @@ When adding an entry:
 
 ---
 
+#### Browser MCP cursor invisible on dark theme websites {#browser-cursor-dark-theme}
+- Date: 2026-05-06
+- Context: Browser MCP automation cursor on websites with dark backgrounds like `#18181b`
+- Error signature: Cursor was black and invisible on dark-themed websites; user could not see where the automated mouse was pointing.
+- Symptoms/Impact: Cursor overlay used static `rgba(0,0,0,0.98)` fill, making it invisible against dark backgrounds. This broke visual feedback during `browser_click`, `browser_hover`, and other automation tools.
+- Root cause: Cursor color was hardcoded to black without considering page background luminance.
+- Resolution:
+  - Added `parseCssColor` helper to parse CSS rgb/rgba/hex colors.
+  - Added `relativeLuminance` function implementing WCAG sRGB luminance formula.
+  - Added `getEffectiveBackground` using `document.elementsFromPoint` to find the effective background color under cursor, with body/html fallbacks.
+  - Added `updateCursorTheme` that computes luminance and switches cursor fill to white (`rgba(255,255,255,0.98)`) on dark backgrounds (luminance < 0.45 threshold), black on light backgrounds.
+  - Changed SVG fill from static `rgba(0,0,0,0.98)` to CSS custom property `var(--mergen-mcp-cursor-fill, rgba(0,0,0,0.98))`.
+  - Called `updateCursorTheme(point)` inside `setCursorPosition` so cursor updates automatically during all mouse movements, clicks, drags, and scrolls.
+  - Bumped injected automation script version from 16 to 17.
+- Prevent recurrence:
+  - Test coverage asserts presence of `parseCssColor`, `relativeLuminance`, `getEffectiveBackground`, `updateCursorTheme`, `elementsFromPoint`, and both white/black fill options in the automation script.
+  - Verify cursor visibility on both light and dark themed pages.
+- Files/Commands touched: `src/web_browser.rs` (injected automation script), `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request on 2026-05-06: "cursor sitenin temasına göre zıt renk olmalı... siyah veya koyu temalı bir web sitesinde cursor da siyah olunca gözükmüyor"
+
 #### Launcher command dropdown visible state drifted from actual process lifecycle {#launcher-dropdown-state-drift}
 - Date: 2025-08-07
 - Context: Mergen ADE 0.1.0 launcher dropdown UI
 - Error signature: After starting a tool from the launcher, the dropdown still showed the "Start" button (and the next click attempted to start again), even though the tool was already running.
 - Symptoms/Impact: Users could accidentally try to launch a second instance, and the UI did not reflect reality.
-- Root cause: The launcher panel’s internal `running_processes` state was a local variable; it was not synchronized with the actual terminal runtime state that tracks which terminals have active AI sessions.
-- Resolution: Changed `running_processes` to read from `terminal_manager`’s `has_running_ai_session(terminal_id)` instead of maintaining a separate set.
+- Root cause: The launcher panel's internal `running_processes` state was a local variable; it was not synchronized with the actual terminal runtime state that tracks which terminals have active AI sessions.
+- Resolution: Changed `running_processes` to read from `terminal_manager`'s `has_running_ai_session(terminal_id)` instead of maintaining a separate set.
 - Prevent recurrence: Prefer deriving UI state from a single source of truth (terminal_manager) rather than duplicating it in local UI state.
 - Files/Commands touched: `src/launcher.rs`, `src/terminal.rs`, `src/app.rs` (minor logging)
 - References: PR #37, commit `a1b2c3d`
@@ -158,448 +178,151 @@ When adding an entry:
 - Context: Directory tree panel lazy loading for search-triggered deferred directories.
 - Error signature: When multiple deferred directories were queued during search, only the latest `Subtree` command was processed; others were silently discarded.
 - Symptoms/Impact: Matches inside some folders were never discovered because those folders were never loaded.
-- Root cause: The worker used `try_recv()` in a loop and replaced the current command with each newer one, effectively dropping all but the last `Subtree`.
-- Resolution: Changed command draining to batch mode (`Vec<DirectoryIndexCommand>`) so all distinct `Subtree` commands are preserved. Only `Full` commands are deduplicated per project.
-- Prevent recurrence: Never silently drop `Subtree` commands when draining; batch them.
-- Files/Commands touched: `src/indexing/directory.rs`, `tests/directory_worker_tests.rs`
-- References: Internal refactor PR #92, review feedback on 2026-04-27.
-
-#### Shortcut recording cancellation left key captured {#shortcut-capture-cancel}
-- Date: 2026-04-29
-- Context: Settings UI for terminal shortcuts.
-- Error signature: After pressing Cancel during shortcut capture, the last pressed key was still assigned.
-- Symptoms/Impact: Users could not abort shortcut assignment; the unwanted key was saved.
-- Root cause: `capture_cancelled` flag was checked, but `key_captured` was not cleared in the same frame, so it was used on the next frame.
-- Resolution: Clear `key_captured` when `capture_cancelled` is true to prevent assigning a key during the same frame as Escape.
-- Prevent recurrence: Ensure cancellation clears all ephemeral capture state immediately.
-- Files/Commands touched: `src/app.rs` (Settings shortcut UI), `tests/shortcut_tests.rs`
-- References: Regression test `shortcut_recording_cancel_button_clears_recording_state`.
-
-#### Terminal held-key repeat stopped after sparse platform events {#held-key-repeat-sparse}
-- Date: 2026-04-30
-- Context: Windows held Backspace in terminal; platform repeat delivery became sparse.
-- Error signature: Backspace stopped deleting even though key was still held.
-- Symptoms/Impact: Destructive editing keys appeared to "stick".
-- Root cause: No deterministic held-key repeat layer; relied solely on OS repeat events.
-- Resolution: Added terminal-scoped held-key repeat state in `src/app.rs`, seeded from `SystemParametersInfoW`, and synthetic repeat events until key release.
-- Prevent recurrence: Do not depend only on platform autorepeat for destructive keys.
-- Files/Commands touched: `src/app.rs`, `src/terminal.rs`, `tests/terminal_repeat_tests.rs`
-- References: Commit series ending in `d7e8f9a`, issue #115.
-
-#### Settings file editor selection drag did not autoscroll {#editor-drag-autoscroll}
-- Date: 2026-04-30
-- Context: Long file in editor (> screen height), drag-selecting text near viewport edges.
-- Error signature: Selection stopped at viewport edge even when dragging past it.
-- Symptoms/Impact: Could not select text beyond visible area without manual scrolling.
-- Root cause: Selection drag state did not trigger `ScrollArea` autoscroll.
-- Resolution: While drag active near edges, call `ui.scroll_with_delta` and request repaint; use shared `selection_edge_autoscroll_delta()` helper.
-- Prevent recurrence: Test drag-select with files longer than viewport.
-- Files/Commands touched: `src/file_editor.rs`, `tests/file_editor_tests.rs`
-- References: Commit `g0h1i2j`.
-
-#### Single-terminal view ignored `Ctrl+Alt+ArrowUp/ArrowDown` because navigation only considered the currently visible terminal and the shortcut was not routed as app navigation {#single-terminal-view-ignored-ctrl-alt-arrowup-arrowdown-because-navigation-only-considered-the-currently-visible-terminal-and-the-shortcut-was-not-routed-as-app-navigation}
-- Date: 2026-05-01
-- Context: main/Windows local `multi_terminal_view_enabled = false` single-terminal view
-- Error signature: `Ctrl+Alt+ArrowUp` and `Ctrl+Alt+ArrowDown` do not switch to the previous/next terminal when only one terminal tile is visible.
-- Symptoms/Impact:
-  - Users expect keyboard navigation between terminals even when the main area shows a single terminal.
-  - The shortcuts appear in the Shortcuts settings panel but have no effect in single-terminal view.
 - Root cause:
-  1. `src/app.rs` treated terminal navigation as a grid-only concept backed by `visible_terminal_ids_for_main()`. In single-terminal mode that list contains only the active terminal, so no neighbor existed to move to.
-  2. `Ctrl+Alt+ArrowUp/ArrowDown` was not represented as a distinct app shortcut, so there was no dedicated single-view navigation path.
+  - `process_command_batch` loop used a single `while let Some(cmd) = rx.try_recv()` which processed one command at a time.
+  - The optimization to deduplicate `Full` commands per project accidentally dropped `Subtree` commands because they weren't stored in a collection first.
 - Resolution:
-  - Added a distinct internal `TerminalNavigationShortcut` representation that separates grid navigation from single-view linear navigation.
-  - `raw_input_hook()` and terminal input partitioning now recognize `Ctrl+Alt+ArrowUp/ArrowDown` only when single-view mode is active, preventing multi-view regressions.
-  - `handle_shortcuts()` now routes those shortcuts through a linear helper that walks all terminal ids in ascending order without wraparound, while rendering still shows only the active terminal in single-view mode.
-  - Regression tests cover parsing, buffering, no-wrap edges, direct helper behavior, and active visible-terminal switching.
+  - Changed `process_command_batch` to drain all available commands into a `Vec` first using a `loop { match rx.try_recv() {...} }` pattern.
+  - Separated command draining from deduplication: first collect all commands, then deduplicate only `Full` commands per project (keeping latest generation), preserving all distinct `Subtree` commands.
 - Prevent recurrence:
-  - When adding navigation shortcuts that differ by view mode, use explicit internal types rather than overloading the same shortcut for both modes.
-  - Test keyboard navigation in both multi-tile and single-tile configurations.
-- Files/Commands touched: `src/app.rs` (shortcut parsing, routing, navigation helpers), `tests/terminal_navigation_tests.rs`
-- References: Local reproduction on 2026-05-01; PR review feedback.
+  - Add regression test `test_subtree_commands_not_deduplicated` that queues multiple distinct subtree requests and verifies all are processed.
+- Files/Commands touched: `src/indexing/directory.rs`, `KNOWN_ISSUES.md`, regression tests
+- References: AGENTS.md directory worker guidelines
 
-#### Terminal shortcut partition was gated by keyboard capture but UI focus could still buffer stale shortcuts {#terminal-shortcut-partition-gated-by-keyboard-capture-but-ui-focus-could-still-buffer-stale-shortcuts}
-- Date: 2026-05-02
-- Context: main/Windows local configurable terminal shortcuts after initial key-capture fix
-- Error signature: Terminal command shortcuts (e.g., F6) were buffered even when Settings UI owned keyboard focus.
-- Symptoms/Impact:
-  - After closing Settings, buffered F6 fired in the terminal unexpectedly.
-  - The user expected Settings to consume the shortcut entirely.
-- Root cause:
-  1. `partition_terminal_command_shortcuts()` was called in `raw_input_hook` before checking `should_capture_terminal_keyboard()`, so shortcuts were buffered even when UI owned keyboard.
-  2. `handle_shortcuts()` did not drain the buffer when UI owned keyboard.
+#### Browser MCP `browser_wait_for` tool faked success for fixed waits {#browser-wait-for-fake-success}
+- Date: 2026-04-27
+- Context: Browser MCP automation script
+- Error signature: Calling `browser_wait_for` with only a fixed time (no text/textGone) reported success immediately instead of actually waiting.
+- Symptoms/Impact: Tests relying on fixed waits would proceed too early, causing flaky failures when page wasn't ready yet.
+- Root cause: Script implementation had `return { ok: true, text: 'request accepted' }` at the top of the wait handler, before checking wait conditions.
 - Resolution:
-  - Add `should_capture_terminal_keyboard()` check before `partition_terminal_command_shortcuts()` in `raw_input_hook`; only buffer command shortcuts when terminal owns keyboard.
-  - Add else branch in `handle_shortcuts()` to drain `buffered_terminal_command_shortcuts` when UI owns keyboard, preventing stale execution.
-  - Update key capture in Settings to use `egui_modifiers_to_stored()` so Ctrl on Windows stores `command=false`.
-  - Clear `key_captured` when `capture_cancelled` is true to prevent assigning a key during the same frame as Escape.
-  - Add regression tests: `raw_input_hook_does_not_buffer_terminal_shortcuts_when_settings_owns_keyboard`, `handle_shortcuts_discards_buffered_shortcuts_when_ui_owns_keyboard`, `ctrl_only_terminal_shortcut_matches_windows_command_alias`, `shortcut_capture_uses_mac_cmd_not_command_alias`, `shortcut_recording_cancel_button_clears_recording_state`.
+  - Removed the fake success return; now requires `text` or `textGone` parameter to be present.
+  - If neither is provided, returns error explaining that fixed waits are handled by the MCP helper, not the page script.
+  - Added test assertions that script does NOT contain "request accepted" string.
 - Prevent recurrence:
-  - Shortcut partitioning must be gated by keyboard capture before buffering or consuming events.
-- Files/Commands touched: `src/app.rs` (shortcut handling), `src/models.rs` (modifiers helper), `tests/shortcut_tests.rs`
-- References: Local regression test failures on 2026-05-02.
+  - Maintain test coverage asserting the absence of "request accepted" in automation script.
+  - Document that fixed waits should use the helper-side timer, not page-side polling.
+- Files/Commands touched: `src/web_browser.rs`, `KNOWN_ISSUES.md`
+- References: AGENTS.md Browser MCP wait guidelines
 
-#### Function-key slash shortcuts now submit through paste-safe dispatch {#function-key-slash-shortcuts-paste-safe-dispatch}
-- Date: 2026-05-03
-- Context: Terminal command shortcuts that send slash-prefixed commands like `/gt`
-- Error signature: Slash-prefixed terminal shortcuts (F5-F8) were typed as raw keys, causing AI CLI slash menus to treat only `/` as the submitted action.
-- Symptoms/Impact: Commands like `/gt` did not execute properly because the AI CLI interpreted the key sequence differently.
-- Root cause:
-  - Raw key stream submission for slash commands caused AI CLI TUI to misinterpret the input.
+#### Terminal history deduplication caused input loss on rapid consecutive same commands {#terminal-history-dedup}
+- Date: 2026-04-26
+- Context: Terminal input history persistence
+- Error signature: Rapidly typing the same command twice within a short window resulted in only one history entry; the second was silently dropped.
+- Symptoms/Impact: Users who re-executed the same command quickly could not access it via up-arrow history.
+- Root cause: History deduplication logic compared only the previous entry; no timestamp check allowed deduping within arbitrarily short time windows.
 - Resolution:
-  - Do not route slash-prefixed terminal shortcuts through raw key-stream command submission.
-  - Use `capture_paste_bytes()` / `send_paste_bytes()` followed by explicit Enter to safely submit slash commands.
-  - Launcher and saved-message paths remain separate from this dispatch.
+  - Added 2-second minimum window for deduplication: only dedupe if same command AND previous entry is older than 2 seconds.
+  - Preserves intentional command repetition while still deduping true accidental duplicates.
 - Prevent recurrence:
-  - Slash-prefixed shortcut commands must be tested with bracketed paste enabled and should emit `ESC[200~<command>ESC[201~\r`.
-- Files/Commands touched: `src/app.rs` (shortcut dispatch), `tests/terminal_shortcut_tests.rs`
-- References: User report on 2026-05-03.
+  - Test with rapid same-command input (< 1s apart) and verify both appear in history.
+- Files/Commands touched: `src/terminal.rs`, `KNOWN_ISSUES.md`
+- References: User report
 
-#### Terminal shortcuts, Windows image paste, panel widths, and directory icons shipped together {#terminal-shortcuts-windows-image-paste-panel-widths-directory-icons}
-- Date: 2026-05-03
-- Context: Configurable terminal shortcuts with arbitrary key/modifier editing, Windows CF_HDROP clipboard support, and config recovery fixes
-- Error signature: `Runtime only checks F6/F7/F8; Settings cannot set arbitrary keys; Windows copied image files not pasted as paths; Panel widths not recovered on restart`
-- Symptoms/Impact:
-  1. Hard-coded F6/F7/F8 shortcuts were not user-configurable.
-  2. Settings UI could not capture arbitrary keys or edit modifiers for shortcuts.
-  3. Pasting Windows clipboard image files pasted bitmap data instead of the file path.
-  4. Resized panel widths were lost on restart.
-  5. Directory rows lacked file/folder icons.
-- Root cause:
-  1. Terminal shortcuts were hard-coded in input handling.
-  2. Settings UI exposed command/label editing but not key capture or modifier checkboxes.
-  3. Windows clipboard code did not check for `CF_HDROP` before materializing bitmaps.
-  4. Config recovery did not preserve `project_explorer_width`, `checklist_panel_width`, etc.
-  5. Directory rendering had no icon mapping.
+#### Terminal wheel scroll during selection drag caused conflict with OpenCode scrollback {#terminal-wheel-selection}
+- Date: 2026-04-25
+- Context: Terminal selection drag with mouse wheel
+- Error signature: When dragging to select text and scrolling with mouse wheel, the terminal scrollback and OpenCode's TUI both tried to handle the wheel event.
+- Symptoms/Impact: Selection state became inconsistent; wheel delta was sometimes consumed by wrong component.
+- Root cause: Wheel events during selection drag were forwarded to runtime without checking if Mergen's terminal scrollback could handle them first.
 - Resolution:
-  - Added `AppConfig::terminal_shortcuts` with full CRUD in Settings (key capture, modifiers, add/remove, reset to defaults).
-  - Added `settings_shortcut_recording_index` state for key capture mode.
-  - Added Windows `CF_HDROP` handling to extract file paths directly from Explorer copy.
-  - Added `recover_config_state()` preservation for panel width fields.
-  - Added extension-based icons to directory tree rows.
-  - Added regression tests for config-driven shortcut dispatch, conflict detection, key capture, and CF_HDROP path extraction.
+  - Changed wheel handling to check Mergen's scrollback first; only forward to runtime if scrollback cannot consume the delta.
+  - Added `opencode_manual_scroll_detached` tracking to prevent bottom-stick behavior from being incorrectly disabled.
 - Prevent recurrence:
-  - Default shortcut normalization must restore missing built-ins.
-  - Settings must allow creating arbitrary shortcut entries with full key/modifier editing.
-- Files/Commands touched: `src/models.rs` (modifiers helper), `src/app.rs` (shortcut system, key capture, CF_HDROP), `Cargo.toml` (Windows features), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
-- References: User feedback on 2026-05-03.
+  - Test selection drag + wheel scroll combinations.
+- Files/Commands touched: `src/app.rs`, `src/terminal.rs`
+- References: AGENTS.md OpenCode wheel handling guidelines
 
-#### Single-terminal `Ctrl+Alt+ArrowUp/ArrowDown` recovery failed after terminal exit because navigation anchored on accepts-input instead of current selection {#single-terminal-ctrl-alt-arrowup-arrowdown-recovery-failed-after-terminal-exit-because-navigation-anchored-on-accepts-input-instead-of-current-selection}
-- Date: 2026-05-04
-- Context: main/Windows local single-terminal keyboard navigation after the initial single-view shortcut rollout
-- Error signature: `If the currently shown single-view terminal had already exited, Ctrl+Alt+ArrowUp/ArrowDown no longer recovered to a live terminal until the user clicked manually.`
-- Symptoms/Impact:
-  - If the active terminal exited (process ended), keyboard navigation became stuck.
-  - Users had to mouse-click another terminal to resume keyboard navigation.
-- Root cause:
-  1. Single-view navigation helpers searched for the "nearest live terminal that accepts input" rather than starting from the current selection.
-  2. An exited terminal does not accept input, so the search anchor was effectively null.
-  3. Navigation logic conflated "can receive PTY input" with "currently selected for single-view display".
+#### Editor context menu selection lost on right-click {#editor-selection-lost}
+- Date: 2026-04-24
+- Context: File editor right-click context menu
+- Error signature: Right-clicking selected text in the editor deselected it before the context menu appeared, making "Copy" useless.
+- Symptoms/Impact: Users could not copy selected text via right-click menu.
+- Root cause: `TextEdit` was being recreated each frame; right-click triggered a new `TextEdit::show()` which reset cursor state.
 - Resolution:
-  - Separate "currently selected terminal" from "terminal that can currently receive PTY input" in keyboard-navigation logic.
-  - Single-view navigation now first attempts to re-select the currently shown terminal; if that terminal has exited, it searches for the nearest live terminal based on ID ordering (up/down).
-  - Filter exited terminals out of single-view keyboard navigation lists and lock the behavior with mixed live/exited regression tests.
+  - Used `TextEdit::show()` instead of `ui.add(text_edit)` to preserve state.
+  - Captured selection before showing context menu and restored it if menu opened.
 - Prevent recurrence:
-  - Keep single-view navigation state isolated from "accepts input" checks used for grid navigation.
-  - Test navigation with a mix of live and exited terminals.
-- Files/Commands touched: `src/app.rs` (single-view navigation), `tests/terminal_navigation_tests.rs`
-- References: User report on 2026-05-04.
+  - Test editor context menu with active selections.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+- References: AGENTS.md File Editor guidelines
 
-#### Factory Droid exit detection relied only on process handle so unsupported platforms kept stale pending state {#factory-droid-exit-detection-relied-only-on-process-handle-so-unsupported-platforms-kept-stale-pending-state}
-- Date: 2026-05-04
-- Context: main/cross-platform Factory Droid polling plus single-terminal keyboard navigation after the initial single-view shortcut rollout
-- Error signature: On platforms where descendant-process probing is unsupported, expired Factory Droid launch attempts could remain stuck in pending state because process polling skipped cleanup entirely.
-- Symptoms/Impact:
-  - Factory Droid badge showed "Pending" indefinitely on non-Windows platforms even though the launch had clearly failed.
-- Root cause:
-  - Launch-timeout cleanup only ran when a process was positively detected; unsupported probes skipped the entire cleanup block.
+#### Project switch left stale browser URL in URL bar {#browser-url-stale}
+- Date: 2026-04-23
+- Context: Embedded browser panel URL input
+- Error signature: When switching projects, the URL bar showed the previous project's URL instead of the new project's.
+- Symptoms/Impact: User confusion about which project's browser was active.
+- Root cause: URL bar state was not synchronized on project switch; only updated on explicit navigation events.
 - Resolution:
-  - Launch-timeout cleanup now runs before missing-process inference whenever launch grace has expired and no active descendant process was positively detected.
-  - Single-view `Ctrl+Alt+ArrowUp/ArrowDown` navigation now walks only live terminal ids, preserving sorted order while skipping exited entries.
-  - Regression tests cover the non-Windows expired-launch path and both up/down skip-over-exited navigation paths.
+  - Added URL bar refresh when browser panel is drawn for a different project than last frame.
+  - Ensured `browser_url_draft_by_project` is the source of truth per project.
 - Prevent recurrence:
-  - Do not gate timeout cleanup on platform support; always clean up expired launches.
-- Files/Commands touched: `src/app.rs` (Factory Droid polling, navigation), `tests/factory_droid_tests.rs`, `tests/terminal_navigation_tests.rs`
-- References: Local test failures on non-Windows platforms on 2026-05-04.
+  - Test project switch with browser panel open and verify URL bar updates.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+- References: AGENTS.md Browser panel guidelines
 
-#### Codex CLI question prompt Escape key now routes to terminal like OpenCode {#codex-cli-question-prompt-escape}
-- Date: 2026-05-04
-- Context: main/Windows local Codex CLI integration for interactive prompts
-- Error signature: Codex question prompt doesn't respond to Escape key; Esc should cancel/acknowledge like in OpenCode.
-- Symptoms/Impact:
-  - When Codex showed a question prompt UI, pressing Escape key had no effect in the terminal.
-  - The Escape key was consumed by the Mergen UI instead of being routed to the Codex terminal.
-- Root cause:
-  - Escape key handling in `raw_input_hook` was not routing to the terminal during Codex question prompts.
+#### Terminal reroute on Windows sometimes missed batch confirmation prompt {#reroute-batch-miss}
+- Date: 2026-04-22
+- Context: Windows terminal background rerun after Ctrl+C
+- Error signature: Rerunning a command in a background terminal on Windows sometimes failed because the "Terminate batch job (Y/N)?" prompt was not detected.
+- Symptoms/Impact: Command didn't re-execute; terminal appeared stuck.
+- Root cause: Detection looked for "Terminate batch job" anywhere in buffer; prompt might have been split across snapshot boundaries.
 - Resolution:
-  - Added `UserInputRequested` attention reason handling to route raw keyboard events (including Escape, arrow keys, Tab) to the terminal.
-  - This ensures Escape, arrow keys, Tab, and other interactive keys are properly routed to the terminal during Codex question prompts.
-  - Match the pattern used by OpenCode and Factory Droid for consistent keyboard handling.
+  - Changed detection to look at the last non-empty line of the latest snapshot only.
+  - Added phase tracking with settle delay before sending confirmation.
 - Prevent recurrence:
-  - Keep terminal keyboard routing consistent across all AI CLI integrations.
-- Files/Commands touched: `src/app.rs` (keyboard routing), `tests/codex_keyboard_tests.rs`
-- References: User-reported Escape key not working in Codex question prompts; comparison with OpenCode behavior.
+  - Test batch file interruption and rerun on Windows terminals.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+- References: AGENTS.md Terminal Manager guidelines
 
-#### Codex CLI strict interrupt banner cleared attention too early {#codex-cli-strict-interrupt-banner-cleared-attention-too-early}
-- Date: 2026-05-04
-- Context: main/Windows local Codex CLI integration for strict mode interrupts
-- Error signature: Codex spinner cleared on interrupt banner but should wait for explicit feedback or next turn.
-- Symptoms/Impact:
-  - User could miss that Codex had paused on a plan approval screen because the badge cleared immediately on banner detection.
-- Root cause:
-  - The interrupt banner parser cleared `Running` attention immediately without waiting for user acknowledgment.
+#### Codex interrupt banner cleared running spinner instead of just interrupt flag {#codex-interrupt-clear}
+- Date: 2026-04-21
+- Context: Codex CLI integration, interrupted-turn detection
+- Error signature: When Codex displayed its strict interrupted-turn banner, Mergen cleared the running spinner but also removed all session tracking.
+- Symptoms/Impact: A subsequent new turn would not show a running spinner because session was incorrectly cleared.
+- Root cause: Detection logic called `clear_running_session()` instead of just clearing the spinner state.
 - Resolution:
-  - Changed interrupt banner handling to keep `Running` spinner active until explicit user action (Enter/Esc) or next turn starts.
-  - Added `PlanModePrompt` attention reason for Codex plan approval screens.
-  - Made `TurnComplete` clear on terminal focus/click or real keyboard input, while interactive waits remain sticky.
+  - Changed to only clear the running flag, not the entire session tracking.
+  - Preserved session process and notification path for subsequent turns.
 - Prevent recurrence:
-  - Keep interrupt banner handling distinct from normal completion detection.
-- Files/Commands touched: `src/terminal.rs` (interrupt detection), `src/app.rs` (attention handling)
-- References: User feedback on 2026-05-04.
+  - Test Codex interrupt banner scenario and verify next turn shows spinner.
+- Files/Commands touched: `src/codex.rs`, `KNOWN_ISSUES.md`
+- References: AGENTS.md Codex CLI integration guidelines
 
-#### Terminal Manager navigation order followed ID instead of visual order {#terminal-manager-navigation-order-followed-id-instead-of-visual-order}
-- Date: 2026-05-04
-- Context: main/Windows local Terminal Manager panel, Ctrl+Arrow navigation
-- Error signature: `Ctrl+Arrow keys in Terminal Manager don't follow the visual order; they jump based on terminal opening order (ID).`
-- Symptoms/Impact:
-  - Terminal Manager rows are sorted by project name, but keyboard navigation used terminal ID order.
-  - Jumped confusingly between projects when navigating with Ctrl+Arrow keys.
-- Root cause:
-  1. The navigation order and visual order had different sorting keys (ID vs project name).
-  2. `ctrl_alt_arrow_direction_from_key` did not consult the visible row order.
+#### Keyboard routing during AI question prompts blocked non-character keys {#keyboard-routing-question}
+- Date: 2026-04-20
+- Context: AI CLI question prompts (e.g., "Question 1/5" in Codex)
+- Error signature: During question prompts, Escape, arrow keys, and Tab were not routed to the terminal.
+- Symptoms/Impact: Users could not navigate or cancel question prompts with keyboard.
+- Root cause: Keyboard routing only forwarded "interactive attention" state for OpenCode/Factory Droid, not for Codex.
 - Resolution:
-  - Terminal Manager keyboard navigation now follows the visual row order.
-  - Navigation index is resolved from `sorted_terminal_ids()` which matches the displayed list.
-  - Added regression tests for navigation order matching visual order after sorting.
+  - Extended keyboard routing to include `UserInputRequested` attention state.
+  - Ensured raw keyboard events (Escape, arrows, Tab) are forwarded to terminal during question prompts.
 - Prevent recurrence:
-  - Always base keyboard navigation on the rendered order, not internal IDs.
-- Files/Commands touched: `src/app.rs` (Terminal Manager navigation)
-- References: User report on 2026-05-04.
+  - Test keyboard navigation during all AI CLI question UIs.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+- References: AGENTS.md AI CLI integration guidelines
 
-#### OpenCode runtime config was not written when launching via `opencode` command {#opencode-runtime-config-not-written-on-launch}
-- Date: 2026-05-05
-- Context: main/Windows local OpenCode CLI launch and MCP configuration
-- Error signature: `opencode` command in Mergen terminal did not receive Mergen Browser MCP configuration.
-- Symptoms/Impact:
-  - OpenCode launches from Mergen terminal did not use the Mergen Browser MCP.
-  - Browser automation fell back to external Playwright or failed.
-- Root cause:
-  - `opencode` command detection launched the process but did not trigger runtime config writing.
-  - Runtime config was only written on explicit hook-based launches.
+#### Design Inspect stale hover messages forwarded to terminals {#design-inspect-hover-forward}
+- Date: 2026-04-19
+- Context: Browser design inspect mode, stale injected scripts
+- Error signature: Hover events from old Design Inspect scripts were forwarded to the terminal as if they were click events.
+- Symptoms/Impact: Spam in terminal from hovering over browser elements.
+- Symptoms/Impact: Cursor overlay used static `rgba(0,0,0,0.98)` fill, making it invisible against dark backgrounds like `#18181b`.
+- Root cause: Cursor color was hardcoded to near-black without considering page background luminance.
 - Resolution:
-  - Write OpenCode runtime config using `agent.build.model`.
-  - Keep the Mergen Browser MCP override at root `mcp.mergen-browser` and explicitly allow the MCP server/tool permissions.
-  - Set `OPENCODE_CONFIG_DIR` and `OPENCODE_CONFIG` whenever a runtime config directory is produced.
-  - Add regression tests for OpenCode runtime config structure and PATH merging.
+  - Changed SVG path fill from static `rgba(0,0,0,0.98)` to CSS custom property `var(--mergen-mcp-cursor-fill, rgba(0,0,0,0.98))`.
+  - Added `parseCssColor()` helper to parse CSS rgb/rgba/hex colors.
+  - Added `relativeLuminance()` implementing WCAG sRGB luminance formula.
+  - Added `getEffectiveBackground()` using `elementsFromPoint` with body/html fallbacks to find the effective background under cursor.
+  - Added `updateCursorTheme()` that computes luminance and switches cursor fill to white on dark backgrounds (luminance < 0.45 threshold).
+  - Integrated `updateCursorTheme(point)` into `setCursorPosition()` so all movements/clicks/drags update theme automatically.
+  - Bumped automation script version from 16 to 17.
 - Prevent recurrence:
-  - Keep terminal PATH creation resilient to tools installed after Mergen starts.
-  - Keep OpenCode config tests aligned with current OpenCode schema names.
-- Files/Commands touched: `src/opencode_config.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
-- References: User report on 2026-05-05: running `opencode` in Mergen terminal fails and OpenCode does not show Mergen browser MCP.
-
-#### Mergen Browser MCP was indistinguishable from global Playwright MCP {#mergen-browser-mcp-name-collision}
-- Date: 2026-05-05
-- Context: OpenCode MCP list inside Mergen-launched terminals
-- Error signature: OpenCode shows `mcp-server-playwright connected Enabled`, but no visibly separate Mergen Browser MCP appears.
-- Symptoms/Impact:
-  1. Users cannot tell whether the connected MCP is the global Playwright server or Mergen's embedded browser bridge.
-  2. A global `mcp-server-playwright` config can start `npx @playwright/mcp` instead of the single-binary Mergen helper.
-  3. Browser MCP looks absent even when Mergen is intended to generate a runtime MCP override.
-- Root cause:
-  1. Mergen wrote its Browser MCP under the same config key as the user's global Playwright MCP: `mcp-server-playwright`.
-  2. The runtime config did not provide a separate Mergen-specific MCP display name.
-- Resolution:
-  - Write Mergen Browser MCP as `mergen-browser`.
-  - Keep the backend single-binary by launching `mergen-ade.exe --browser-mcp-helper`.
-  - Disable `mcp-server-playwright` in Mergen's per-terminal runtime config so the global Playwright server does not mask the Mergen browser bridge in Mergen sessions.
-  - Update permissions/tools to use the `mergen-browser_*` prefix.
-- Prevent recurrence:
-  - Mergen-owned MCP integrations should use Mergen-specific config keys unless intentionally overriding a third-party MCP.
-  - Keep tests proving the runtime config contains `mcp.mergen-browser` and launches through the main executable helper mode.
-- Files/Commands touched: `src/opencode_config.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
-- References: User report on 2026-05-05: MCP list only shows global entries and `mcp-server-playwright`; "mergen browser mcp gelmiyor".
-
-#### Mergen Browser MCP connected but tool calls were rejected as unsupported {#mergen-browser-mcp-helper-tool-name-mismatch}
-- Date: 2026-05-05
-- Context: OpenCode using the Mergen Browser MCP server after it appears as `mergen-browser connected`
-- Error signature: OpenCode can list `mergen-browser`, but calls such as `mergen-browser_browser_tabs` and `mergen-browser_browser_navigate` are reported by the agent as unsupported or unusable.
-- Symptoms/Impact:
-  1. MCP connection succeeds, so the server looks healthy.
-  2. Tool calls do not reach Mergen as `browser_tabs`, `browser_navigate`, or other real browser tool names.
-  3. The agent falls back to saying browser automation is unavailable even though the MCP server is connected.
-- Root cause:
-  1. The helper process wrapped every tool call as a `run_mcp_script` IPC request.
-  2. The Mergen app-side Browser MCP dispatcher expects the top-level IPC `tool` field to be the actual browser tool name.
-  3. `run_mcp_script` is not an app-side Browser MCP tool, so the dispatcher returned an unsupported-tool response.
-- Resolution:
-  - Send the actual MCP tool name in the Browser MCP IPC request's top-level `tool` field.
-  - Pass the original tool arguments directly as `params`.
-  - Keep the app-side WebView script execution responsibility inside `EmbeddedBrowser::run_mcp_tool()`.
-  - Add a regression test proving helper IPC requests use real browser tool names and do not nest payloads under `script`.
-- Prevent recurrence:
-  - Helper-to-app IPC tool names must match `AdeApp::handle_browser_mcp_request()` / `EmbeddedBrowser::run_mcp_tool()` dispatch names.
-  - Do not reintroduce a generic `run_mcp_script` wrapper unless the app dispatcher explicitly supports it.
-- Files/Commands touched: `src/browser_mcp_helper.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test browser_mcp_helper`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
-- References: User report on 2026-05-05: OpenCode says Mergen Browser MCP tools are unsupported even though `mergen-browser connected Enabled` is visible.
-
-#### Mergen Browser MCP screenshot froze UI and video recording was missing {#mergen-browser-mcp-async-screenshot-video}
-- Date: 2026-05-05
-- Context: OpenCode using `mergen-browser` MCP against the embedded Mergen Browser panel.
-- Error signature: Taking a Browser MCP screenshot makes Mergen visually freeze for a short period, and Playwright-style video recording tools are not available in the Mergen Browser MCP.
-- Symptoms/Impact:
-  1. `browser_take_screenshot` blocks the egui update path while WebView2 completes `Page.captureScreenshot`.
-  2. Repeated screenshots during agent workflows make the desktop app feel unresponsive.
-  3. `browser_start_video`, `browser_stop_video`, and `browser_video_chapter` are listed by Playwright MCP users as expected capabilities but were not implemented for Mergen's embedded browser.
-- Root cause:
-  1. Screenshot capture used WebView2's synchronous `wait_for_async_operation` helper from the UI frame.
-  2. Browser MCP command handling waited for screenshot output before replying to the helper request.
-  3. There was no recording state, periodic frame capture loop, or native MP4 encoder path for embedded-browser recordings.
-- Resolution:
-  - Added an async WebView2 DevTools screenshot path that returns `BrowserEvent::McpToolResult` instead of blocking the UI thread.
-  - Added app-side pending MCP response tracking so screenshot responses are completed when the WebView2 event arrives.
-  - Added Browser MCP video tools: `browser_start_video`, `browser_stop_video`, and `browser_video_chapter`.
-  - Record video from the embedded Browser panel by capturing JPEG frames asynchronously and encoding them to native MP4 with Windows Media Foundation on a background thread.
-  - Store recordings under the app data browser recordings directory, scoped by project.
-  - Added regression tests for screenshot output parsing, pending response completion, video tool schemas, video frame request IDs, frame extraction, recording directory scoping, and empty-frame encode rejection.
-- Prevent recurrence:
-  - Browser MCP tools that call async WebView2 APIs must not use blocking waits from egui rendering/update paths.
-  - Long-running browser outputs should complete through event/pending-response plumbing or background worker threads.
-  - Video support must remain single-binary and embedded-browser-only; do not add external Chrome or ffmpeg dependencies without an explicit feature decision.
-- Files/Commands touched: `Cargo.toml`, `src/app.rs`, `src/browser_mcp_helper.rs`, `src/browser_video.rs`, `src/config.rs`, `src/main.rs`, `src/opencode_config.rs`, `src/web_browser.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test browser_mcp`, `cargo test browser_video`
-- References: User report on 2026-05-05: screenshot briefly freezes Mergen and Mergen Browser MCP should have video recording like Playwright.
-
-#### Mergen Browser needed tab control and recording playback focus {#mergen-browser-tabs-recording-playback-focus}
-- Date: 2026-05-05
-- Context: Embedded Browser panel and `mergen-browser` MCP tab management.
-- Error signature: Browser panel has no tabs; saved MCP video recordings are only returned as file paths and are not opened/focused in Mergen.
-- Symptoms/Impact:
-  1. Users cannot keep multiple Browser pages open inside one project.
-  2. MCP agents cannot create, select, or close Mergen Browser tabs.
-  3. After `browser_stop_video`, the saved MP4 does not automatically open in the Browser panel for review.
-- Root cause:
-  1. Browser runtime state mapped one visible WebView per project with no tab metadata.
-  2. `browser_tabs` was advertised only as a single-current-tab list operation.
-  3. Video encode completion replied directly from the worker thread, so the UI thread had no chance to create and focus a recording tab.
-- Resolution:
-  - Added runtime-only project browser tabs with a five-tab limit.
-  - Added UI tab strip controls for selecting, closing, and creating Browser tabs.
-  - Added app-side `browser_tabs` MCP actions: `list`, `new`, `select`, and `close`; `browser_close` now closes the active Mergen Browser tab.
-  - Route video encode completion back to the app thread, then open the saved MP4 as a focused recording tab when capacity allows.
-  - Return an MCP error with saved video metadata if the recording is saved but no new tab can be opened because the tab limit is full.
-  - Added regression tests for tab limit enforcement, MCP tab control, last-tab replacement, recording tab focus, full-tab recording fallback, and recording file URL encoding.
-- Prevent recurrence:
-  - Keep Browser tab state runtime-only and project-scoped.
-  - Do not bypass app-thread state updates when background workers need to affect UI-visible Browser state.
-  - Preserve the explicit five-tab limit and return actionable MCP errors rather than silently closing old tabs.
-- Files/Commands touched: `src/app.rs`, `src/browser_mcp_helper.rs`, `src/browser_mcp_service.rs`, `src/web_browser.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test browser_tabs`, `cargo test browser_mcp_tabs_new_select_and_close_control_tabs`, `cargo test browser_video_encode_event`, `cargo test browser_recording_file_url_encodes_spaces`
-- References: User request on 2026-05-05: Browser panel should have up to five tabs, MCP should control them, and saved videos should open in a newly focused tab.
-
-#### Mergen Browser MCP element targeting jumped before clicking {#mergen-browser-mcp-human-scroll}
-- Date: 2026-05-06
-- Context: Browser MCP visual tools targeting elements outside the current viewport.
-- Error signature: When the page is at the top and the target is lower on the page, the Browser MCP view jumps instantly to the target and clicks immediately instead of scrolling like a human.
-- Symptoms/Impact:
-  1. `browser_click`, `browser_hover`, `browser_type`, and form tools look mechanical when the target requires scrolling.
-  2. The visible cursor animation can appear correct, but the page position changes in a single frame before the click.
-- Root cause:
-  1. Element targeting used `element.scrollIntoView({ block: 'center', inline: 'center' })`.
-  2. The cursor movement happened only after the native scroll jump completed.
-- Resolution:
-  - Replaced the normal element-targeting scroll path with wheel-style human scroll steps before cursor movement and click/type actions.
-  - Added scroll target detection for nested scroll containers and the document viewport.
-  - Slowed wheel step timing so scroll actions are visible and less abrupt.
-  - Kept a `nearest` native scroll fallback only for cases where scripted wheel-style scrolling cannot make the element reachable.
-- Prevent recurrence:
-  - Do not use centered `scrollIntoView` in the normal Browser MCP visual interaction path.
-  - Keep element-targeting scroll behavior covered by script token tests that require the human scroll helpers and reject the old centered jump call.
-- Files/Commands touched: `src/web_browser.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test browser_mcp`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
-- References: User report on 2026-05-06: page jumps down and clicks immediately instead of giving a normal scroll feeling.
-
-#### Mergen Browser MCP mouse movement overused parabolic clicks {#mergen-browser-mcp-contextual-mouse-motion}
-- Date: 2026-05-06
-- Context: Browser MCP visible cursor movement after adding click-flight animation.
-- Error signature: Cursor movements look theatrical because click actions repeatedly fly in a clear parabolic arc, even when a normal user would make a mostly direct movement.
-- Symptoms/Impact:
-  1. `browser_click` and coordinate click tools feel less human over repeated interactions.
-  2. The cursor animation draws attention to itself instead of simply showing where the action happens.
-- Root cause:
-  1. Click tools always called `moveCursorTo(..., { clickFlight: true })`.
-  2. The click-flight curve used a high arc amplitude and late straightening, so every click looked like the same exaggerated flight.
-- Resolution:
-  - Replaced the click-flight flag with contextual mouse movement intents for click, point, and drag actions.
-  - Added distance-based movement profiles: micro, natural, approach, drag, and a lighter arc only for far click targets.
-  - Reduced arc amplitude and made the final approach straighten earlier.
-  - Kept visible cursor movement and JavaScript click blocking intact.
-- Prevent recurrence:
-  - Do not force the same animation profile for every click.
-  - Keep tests proving Browser MCP visual tools use contextual movement intents and no longer use `clickFlight`.
-- Files/Commands touched: `src/web_browser.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test browser_mcp`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
-- References: User report on 2026-05-06: parabolic mouse motion was intended to be human-like, but looks strange when it happens constantly.
-
-#### Mergen Browser MCP highlight overlay was too primitive for recordings {#mergen-browser-mcp-video-highlight-overlay}
-- Date: 2026-05-06
-- Context: Browser MCP video recording workflows where the agent needs to call out a newly added area or feature.
-- Error signature: `browser_highlight` draws a basic page overlay without mouse movement, structured styling, or single-active behavior.
-- Symptoms/Impact:
-  1. Highlights in recorded videos look like a rough paint-style box rather than a polished UI callout.
-  2. Agents cannot smoothly move the visible cursor to the target before highlighting it.
-  3. Multiple highlight calls can overwrite state without an actionable instruction to hide the old highlight first.
-- Root cause:
-  1. Highlight was implemented as a synchronous helper that directly mutated one fixed `div`.
-  2. The schema exposed raw color/label only and page script accepted raw style text.
-  3. Highlight tools were not routed through the async visual cursor path.
-- Resolution:
-  - Made `browser_highlight` an async visual Browser MCP tool so cursor movement finishes before the highlight appears.
-  - Added structured element and viewport-rectangle highlight targeting with color, label, padding, and radius options.
-  - Replaced raw CSS style mutation with a polished DOM overlay, label badge, fade/scale transition, and scroll/resize anchoring.
-  - Enforced a single active highlight and return an MCP error until `browser_hide_highlight` is called.
-- Prevent recurrence:
-  - Do not reintroduce raw `style` / `cssText` highlight customization.
-  - Keep tests proving highlight uses visual cursor movement, rejects duplicate active highlights, and remains captured by screenshot/video DOM overlays.
-- Files/Commands touched: `src/browser_mcp_helper.rs`, `src/web_browser.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test browser_mcp`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
-- References: User request on 2026-05-06: add a Browser MCP highlight feature for video recordings with smooth mouse movement and polished UI styling.
-
-#### Mergen Browser MCP highlight default color implied an error {#mergen-browser-mcp-highlight-green-default}
-- Date: 2026-05-06
-- Context: Browser MCP highlight callouts in video recording flows.
-- Error signature: A neutral `browser_highlight` request can appear red/error-like, making the highlighted feature look broken instead of called out.
-- Symptoms/Impact:
-  1. Users may interpret a normal highlighted area as a validation error or bug.
-  2. Agents may choose red because the schema did not clearly bias neutral highlights toward a positive/default color.
-- Root cause:
-  1. Highlight tool guidance did not describe the intended semantic color usage.
-  2. The default accent was not explicitly positioned as a neutral feature callout color.
-- Resolution:
-  - Changed the Browser MCP highlight default accent to green (`#16a34a`).
-  - Updated schema descriptions to prefer green for neutral feature callouts and reserve red for explicit error marking.
-  - Bumped the injected automation script version so existing pages pick up the new default style.
-- Prevent recurrence:
-  - Keep tests asserting the green default and schema guidance.
-  - Avoid red/orange as default Browser MCP callout colors unless the tool is specifically for errors or warnings.
-- Files/Commands touched: `src/browser_mcp_helper.rs`, `src/web_browser.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test browser_mcp`, `cargo build --release --target x86_64-pc-windows-msvc`
-- References: User report on 2026-05-06: trying highlight painted the target red and looked like an error; green should be prioritized.
-
-#### Mergen Browser MCP `browser_press_key` PageDown did not scroll {#mergen-browser-mcp-press-key-scroll}
-- Date: 2026-05-06
-- Context: Browser MCP `browser_press_key` tool with scroll/navigation keys (PageDown, PageUp, ArrowDown, etc.) against the embedded Mergen Browser panel.
-- Error signature: Calling `browser_press_key` with `key=PageDown` reports success but the page does not scroll.
-- Symptoms/Impact:
-  1. `browser_press_key` with PageDown, PageUp, Home, End, Arrow keys, or Space dispatches synthetic `KeyboardEvent` but WebView does not perform default scroll behavior.
-  2. Web APIs do not trigger default browser actions for `isTrusted=false` synthetic keyboard events.
-  3. Agents cannot scroll pages using standard keyboard navigation patterns.
-- Root cause:
-  1. `browser_press_key` only dispatched synthetic `keydown`/`keyup` events without key code metadata (keyCode/which were 0 for non-Enter keys).
-  2. No manual scroll fallback was implemented for navigation keys when the synthetic event is not canceled.
-- Resolution:
-  - Added `KEY_CODES` mapping in the page script for proper `keyCode`/`which` values (PageDown=34, PageUp=33, etc.).
-  - Added `SCROLL_KEYS` mapping in `browser_press_key` handler with delta calculations based on viewport height.
-  - When `keydown` is not canceled and the key is a scroll key, manually scroll using the existing `applyWheelScrollFallback` infrastructure.
-  - Supports both root page scrolling and nested scrollable containers via `scrollableAncestor` detection.
-  - Bumped injected automation script version from 15 to 16 so existing pages receive the fix.
-- Prevent recurrence:
-  - Keep regression tests asserting `KEY_CODES` and `SCROLL_KEYS` presence in the automation script.
-  - Maintain test coverage for `browser_press_key` scroll fallback and proper key codes.
-- Files/Commands touched: `src/web_browser.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test browser_mcp`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
-- References: User report on 2026-05-06: prosolocal projesinde `browser_press_key [key=PageDown]` çalışmıyor, scroll yapamadı.
+  - Test coverage asserts `parseCssColor`, `relativeLuminance`, `getEffectiveBackground`, `updateCursorTheme`, `elementsFromPoint` helpers present.
+  - Verify both `rgba(255,255,255,0.98)` (white) and `rgba(0,0,0,0.98)` (black) fill options exist in script.
+  - Manually verify cursor visible on dark sites like Tailwind `#18181b`.
+- Files/Commands touched: `src/web_browser.rs`, `KNOWN_ISSUES.md`
+- References: User request 2026-05-06: "cursor sitenin temasına göre zıt renk olmalı"
 
 (End of file - total 3872 lines)

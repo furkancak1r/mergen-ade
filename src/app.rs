@@ -16474,7 +16474,9 @@ impl AdeApp {
                     }
                     web_browser::BrowserEvent::LoadStarted(_) => {
                         // Mark page as loading - the readiness bootstrap will send us the actual state
-                        if let Some(_browser) = self.embedded_browsers_by_project.get_mut(&project_id) {
+                        if let Some(_browser) =
+                            self.embedded_browsers_by_project.get_mut(&project_id)
+                        {
                             // We'll update readiness when the readiness event comes in
                         }
                     }
@@ -16484,13 +16486,16 @@ impl AdeApp {
                     }
                     web_browser::BrowserEvent::ReadinessChanged(readiness) => {
                         // Update the browser's current readiness state
-                        if let Some(browser) = self.embedded_browsers_by_project.get_mut(&project_id) {
+                        if let Some(browser) =
+                            self.embedded_browsers_by_project.get_mut(&project_id)
+                        {
                             let old_state = browser.current_readiness().state.clone();
                             browser.update_readiness(readiness.clone());
 
                             // If we transitioned to Ready and have pending operations, complete them
                             if readiness.state == web_browser::PageReadinessState::Ready
-                                && old_state != web_browser::PageReadinessState::Ready {
+                                && old_state != web_browser::PageReadinessState::Ready
+                            {
                                 let completed_ops = browser.complete_pending_operations();
                                 for op_id in completed_ops {
                                     log::debug!("Completed pending browser operation: {}", op_id);
@@ -17260,14 +17265,18 @@ impl AdeApp {
                     return error;
                 }
                 self.project_browser(project_id).go_back();
-                BrowserMcpIpcResponse::ok("Navigated back. The page will report readiness when stable.")
+                BrowserMcpIpcResponse::ok(
+                    "Navigated back. The page will report readiness when stable.",
+                )
             }
             "browser_navigate_forward" => {
                 if let Some(error) = self.prepare_browser_mcp_project(project_id) {
                     return error;
                 }
                 self.project_browser(project_id).go_forward();
-                BrowserMcpIpcResponse::ok("Navigated forward. The page will report readiness when stable.")
+                BrowserMcpIpcResponse::ok(
+                    "Navigated forward. The page will report readiness when stable.",
+                )
             }
             "browser_reload" => {
                 if let Some(error) = self.prepare_browser_mcp_project(project_id) {
@@ -17363,7 +17372,10 @@ impl AdeApp {
                     let data_with_readiness = match output.data {
                         Some(mut data) => {
                             if let serde_json::Value::Object(ref mut map) = data {
-                                map.insert("pageReadiness".to_owned(), readiness_to_json(readiness));
+                                map.insert(
+                                    "pageReadiness".to_owned(),
+                                    readiness_to_json(readiness),
+                                );
                             }
                             data
                         }

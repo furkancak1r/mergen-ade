@@ -224,42 +224,45 @@ fn browser_wait_plan(params: &JsonValue) -> Result<BrowserWaitPlan, String> {
                 .to_owned(),
         );
     }
-    
+
     // Validate that if time is present, it must be a valid number
     if time_raw.is_some() && time_num.is_none() {
-        return Err("browser_wait_for 'time' must be a number (seconds), got a non-numeric value".to_owned());
+        return Err(
+            "browser_wait_for 'time' must be a number (seconds), got a non-numeric value"
+                .to_owned(),
+        );
     }
-    
+
     // Always validate time first - negative values are invalid regardless of condition
     let max = Duration::from_millis(DEFAULT_BROWSER_MCP_TIMEOUT_MS);
     let timeout = time_num
         .map(|t| parse_browser_wait_duration(t, max, true))
         .transpose()?;
-    
+
     let has_condition = text.is_some() || text_gone.is_some();
     let is_fixed_only = time_num.is_some() && !has_condition;
-    
+
     // Reject fixed-only waits - tools automatically handle readiness
     if is_fixed_only {
         return Ok(BrowserWaitPlan::RejectedFixedWait);
     }
-    
+
     let mut poll_params = params.clone();
     if let Some(obj) = poll_params.as_object_mut() {
         obj.remove("time");
     }
-    
+
     // If no explicit timeout, use default
     let timeout = timeout.unwrap_or_else(|| {
         Duration::from_secs_f64(BROWSER_WAIT_DEFAULT_TIMEOUT_SECS)
             .saturating_sub(Duration::from_secs_f64(BROWSER_WAIT_TIMEOUT_MARGIN_SECS))
     });
-    
+
     let description = match text {
         Some(t) => format!("text to appear: {t}"),
         None => format!("text to disappear: {}", text_gone.unwrap_or_default()),
     };
-    
+
     Ok(BrowserWaitPlan::Condition {
         timeout,
         params: poll_params,
@@ -1422,10 +1425,7 @@ mod tests {
     fn browser_wait_plan_rejects_fixed_wait_without_condition() {
         let plan = browser_wait_plan(&json!({ "time": 0.25 })).expect("wait plan");
 
-        assert_eq!(
-            plan,
-            BrowserWaitPlan::RejectedFixedWait
-        );
+        assert_eq!(plan, BrowserWaitPlan::RejectedFixedWait);
     }
 
     #[test]

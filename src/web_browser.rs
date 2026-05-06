@@ -785,19 +785,19 @@ pub(crate) fn parse_page_readiness_message(
     expected_token: &str,
 ) -> Option<BrowserEvent> {
     let parsed: JsonValue = serde_json::from_str(message).ok()?;
-    
+
     // Validate source and token
     let source = parsed.get("source")?.as_str()?;
     let token = parsed.get("token")?.as_str()?;
     if source != PAGE_READINESS_MESSAGE_SOURCE || token != expected_token {
         return None;
     }
-    
+
     let msg_type = parsed.get("type")?.as_str()?;
     if msg_type != "readiness" {
         return None;
     }
-    
+
     // Parse readiness state
     let state_str = parsed.get("state")?.as_str()?;
     let state = match state_str {
@@ -807,17 +807,39 @@ pub(crate) fn parse_page_readiness_message(
         "transitioning" => PageReadinessState::Transitioning,
         _ => PageReadinessState::Loading,
     };
-    
+
     let readiness = PageReadiness {
         state,
-        url: parsed.get("url").and_then(JsonValue::as_str).unwrap_or("").to_owned(),
-        title: parsed.get("title").and_then(JsonValue::as_str).unwrap_or("").to_owned(),
-        document_ready_state: parsed.get("documentReadyState").and_then(JsonValue::as_str).unwrap_or("loading").to_owned(),
-        pending_network_count: parsed.get("pendingNetwork").and_then(JsonValue::as_u64).unwrap_or(0) as u32,
-        last_change_reason: parsed.get("reason").and_then(JsonValue::as_str).unwrap_or("unknown").to_owned(),
-        timestamp_ms: parsed.get("timestamp").and_then(JsonValue::as_u64).unwrap_or(0),
+        url: parsed
+            .get("url")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        title: parsed
+            .get("title")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        document_ready_state: parsed
+            .get("documentReadyState")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("loading")
+            .to_owned(),
+        pending_network_count: parsed
+            .get("pendingNetwork")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0) as u32,
+        last_change_reason: parsed
+            .get("reason")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("unknown")
+            .to_owned(),
+        timestamp_ms: parsed
+            .get("timestamp")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0),
     };
-    
+
     Some(BrowserEvent::ReadinessChanged(readiness))
 }
 
@@ -910,10 +932,8 @@ impl EmbeddedBrowser {
     /// Returns an operation ID that can be used to check completion.
     pub fn register_pending_operation(&mut self, tool_name: &str) -> String {
         let op_id = format!("op-{}-{}", tool_name, generate_request_id());
-        self.pending_operations.insert(
-            op_id.clone(),
-            (tool_name.to_owned(), Instant::now()),
-        );
+        self.pending_operations
+            .insert(op_id.clone(), (tool_name.to_owned(), Instant::now()));
         op_id
     }
 
@@ -1878,7 +1898,7 @@ pub(crate) fn browser_mcp_output_from_devtools_runtime_raw(
 
 #[cfg(target_os = "windows")]
 const MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT: &str = r#"
-if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 15) {
+if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 17) {
   window.__mergenMcpState = window.__mergenMcpState || { refCounter: 1, consoleMessages: [], networkRequests: [], routes: [], highlighted: null };
 
   const state = window.__mergenMcpState;
@@ -1964,10 +1984,10 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 15) {
   const buttonMask = (button) => ({ left: 1, middle: 4, right: 2 }[buttonName(button)]);
   const ensureCursorStyle = () => {
     const existing = document.querySelector('style[data-mergen-mcp-cursor-style]');
-    if (existing?.getAttribute('data-mergen-mcp-cursor-style') === '15') return;
+    if (existing?.getAttribute('data-mergen-mcp-cursor-style') === '17') return;
     existing?.remove();
     const style = document.createElement('style');
-    style.setAttribute('data-mergen-mcp-cursor-style', '15');
+    style.setAttribute('data-mergen-mcp-cursor-style', '17');
     style.textContent = `
 [data-mergen-mcp-cursor] [data-mergen-mcp-cursor-pointer] {
   transition: transform 120ms cubic-bezier(0.16, 1, 0.3, 1);
@@ -2002,7 +2022,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 15) {
     if (
       state.cursorElement &&
       document.documentElement.contains(state.cursorElement) &&
-      state.cursorElement.getAttribute?.('data-mergen-mcp-cursor-version') === '15' &&
+      state.cursorElement.getAttribute?.('data-mergen-mcp-cursor-version') === '17' &&
       state.cursorElement.querySelector?.('[data-mergen-mcp-cursor-pointer]')
     ) {
       return state.cursorElement;
@@ -2010,7 +2030,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 15) {
     state.cursorElement?.remove?.();
     const cursor = document.createElement('div');
     cursor.setAttribute('data-mergen-mcp-cursor', 'true');
-    cursor.setAttribute('data-mergen-mcp-cursor-version', '15');
+    cursor.setAttribute('data-mergen-mcp-cursor-version', '17');
     cursor.setAttribute('data-mergen-mcp-cursor-phase', state.cursor.phase || 'idle');
     Object.assign(cursor.style, {
       position: 'fixed',
@@ -2043,7 +2063,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 15) {
     });
     const pointerPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
     pointerPath.setAttribute('d', 'M2.2 1.2 C1.0 0.8 0.1 1.7 0.7 3.6 L7.9 25.3 C8.7 27.7 12.1 27.8 13.0 25.4 L15.0 20.0 C15.5 18.4 16.4 17.4 17.8 16.7 L25.5 12.8 C27.6 11.8 27.5 8.7 25.3 7.8 L2.2 1.2 Z');
-    pointerPath.setAttribute('fill', 'rgba(0,0,0,0.98)');
+    pointerPath.setAttribute('fill', 'var(--mergen-mcp-cursor-fill, rgba(0,0,0,0.98))');
     pointer.appendChild(pointerPath);
     cursor.appendChild(pointer);
     document.documentElement.appendChild(cursor);
@@ -2113,7 +2133,101 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 15) {
     state.cursor.x = point.x;
     state.cursor.y = point.y;
     state.cursor.visible = true;
+    updateCursorTheme(point);
     return point;
+  };
+  const parseCssColor = (colorStr) => {
+    if (!colorStr || colorStr === 'transparent' || colorStr === 'rgba(0, 0, 0, 0)') return null;
+    const hexMatch = colorStr.match(/^#([0-9a-fA-F]{3,8})$/);
+    if (hexMatch) {
+      const hex = hexMatch[1];
+      if (hex.length === 3) {
+        const r = parseInt(hex[0] + hex[0], 16);
+        const g = parseInt(hex[1] + hex[1], 16);
+        const b = parseInt(hex[2] + hex[2], 16);
+        return { r, g, b, a: 1 };
+      }
+      if (hex.length === 4) {
+        const r = parseInt(hex[0] + hex[0], 16);
+        const g = parseInt(hex[1] + hex[1], 16);
+        const b = parseInt(hex[2] + hex[2], 16);
+        const a = parseInt(hex[3] + hex[3], 16) / 255;
+        return { r, g, b, a };
+      }
+      if (hex.length === 6) {
+        const r = parseInt(hex.slice(0, 2), 16);
+        const g = parseInt(hex.slice(2, 4), 16);
+        const b = parseInt(hex.slice(4, 6), 16);
+        return { r, g, b, a: 1 };
+      }
+      if (hex.length === 8) {
+        const r = parseInt(hex.slice(0, 2), 16);
+        const g = parseInt(hex.slice(2, 4), 16);
+        const b = parseInt(hex.slice(4, 6), 16);
+        const a = parseInt(hex.slice(6, 8), 16) / 255;
+        return { r, g, b, a };
+      }
+    }
+    const rgbMatch = colorStr.match(/rgba?\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+)\s*)?\)/);
+    if (rgbMatch) {
+      const r = parseInt(rgbMatch[1], 10);
+      const g = parseInt(rgbMatch[2], 10);
+      const b = parseInt(rgbMatch[3], 10);
+      const a = rgbMatch[4] !== undefined ? parseFloat(rgbMatch[4]) : 1;
+      return { r, g, b, a: isNaN(a) ? 1 : a };
+    }
+    return null;
+  };
+  const relativeLuminance = (rgb) => {
+    const toLinear = (c) => {
+      const s = c / 255;
+      return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+    };
+    const r = toLinear(rgb.r);
+    const g = toLinear(rgb.g);
+    const b = toLinear(rgb.b);
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  const getEffectiveBackground = (point) => {
+    const fallback = { r: 255, g: 255, b: 255 };
+    try {
+      const elements = document.elementsFromPoint(point.x, point.y);
+      for (const el of elements) {
+        if (el === state.cursorElement || el.closest?.('[data-mergen-mcp-cursor]')) continue;
+        const style = window.getComputedStyle(el);
+        const bg = parseCssColor(style.backgroundColor);
+        if (bg && bg.a > 0.01) {
+          if (bg.a < 0.99) {
+            const parentBg = el.parentElement ? parseCssColor(window.getComputedStyle(el.parentElement).backgroundColor) : fallback;
+            const base = parentBg || fallback;
+            const alpha = bg.a;
+            const r = Math.round(bg.r * alpha + base.r * (1 - alpha));
+            const g = Math.round(bg.g * alpha + base.g * (1 - alpha));
+            const b = Math.round(bg.b * alpha + base.b * (1 - alpha));
+            return { r, g, b };
+          }
+          return { r: bg.r, g: bg.g, b: bg.b };
+        }
+      }
+      const bodyBg = parseCssColor(window.getComputedStyle(document.body).backgroundColor);
+      if (bodyBg) return { r: bodyBg.r, g: bodyBg.g, b: bodyBg.b };
+      const htmlBg = parseCssColor(window.getComputedStyle(document.documentElement).backgroundColor);
+      if (htmlBg) return { r: htmlBg.r, g: htmlBg.g, b: htmlBg.b };
+    } catch (_) {}
+    return fallback;
+  };
+  const updateCursorTheme = (point) => {
+    try {
+      const bg = getEffectiveBackground(point);
+      const lum = relativeLuminance(bg);
+      const threshold = 0.45;
+      const isDark = lum < threshold;
+      const fillColor = isDark ? 'rgba(255,255,255,0.98)' : 'rgba(0,0,0,0.98)';
+      const cursor = state.cursorElement;
+      if (cursor) {
+        cursor.style.setProperty('--mergen-mcp-cursor-fill', fillColor);
+      }
+    } catch (_) {}
   };
   const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
   const easeInOutSine = (t) => 0.5 - Math.cos(Math.PI * t) / 2;
@@ -3292,7 +3406,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 15) {
   };
   window.addEventListener('scroll', scheduleVisualAnchorSync, true);
   window.addEventListener('resize', scheduleVisualAnchorSync);
-  window.__mergenMcpRun.version = 16;
+  window.__mergenMcpRun.version = 17;
 }
 "#;
 
@@ -3582,9 +3696,13 @@ fn create_webview_sync(
             };
             if let Ok(message) = web_message_as_string(&args) {
                 // Try to parse as design inspect message
-                if let Some(event) = parse_design_inspect_message(&message, &web_message_design_token) {
+                if let Some(event) =
+                    parse_design_inspect_message(&message, &web_message_design_token)
+                {
                     let _ = web_message_sender.send(event);
-                } else if let Some(event) = parse_page_readiness_message(&message, &web_message_readiness_token) {
+                } else if let Some(event) =
+                    parse_page_readiness_message(&message, &web_message_readiness_token)
+                {
                     // Parse as page readiness message
                     let _ = web_message_sender.send(event);
                 }
@@ -4014,7 +4132,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn browser_mcp_automation_script_includes_visible_cursor_and_mouse_tools() {
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 16"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 17"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-version"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-pointer"));
@@ -4056,8 +4174,16 @@ mod tests {
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("transformOrigin: '21px 8px'"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
             .contains("M2.2 1.2 C1.0 0.8 0.1 1.7 0.7 3.6 L7.9 25.3 C8.7 27.7 12.1 27.8 13.0 25.4"));
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
-            .contains("pointerPath.setAttribute('fill', 'rgba(0,0,0,0.98)')"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains(
+            "pointerPath.setAttribute('fill', 'var(--mergen-mcp-cursor-fill, rgba(0,0,0,0.98))')"
+        ));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("parseCssColor"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("relativeLuminance"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("getEffectiveBackground"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("updateCursorTheme"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("elementsFromPoint"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("rgba(255,255,255,0.98)"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("threshold = 0.45"));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("pointerPath.setAttribute('stroke'"));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
             .contains("pointerPath.setAttribute('stroke-linejoin'"));
