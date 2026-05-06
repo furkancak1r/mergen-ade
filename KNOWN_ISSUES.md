@@ -10,6 +10,29 @@ When adding an entry:
 
 ---
 
+#### Browser panel dropdown menus hidden behind native WebView {#browser-dropdown-webview-z-order}
+- Date: 2026-05-06
+- Context: Browser panel screenshot dropdown button and other toolbar menus
+- Error signature: Clicking the screenshot camera icon opened a dropdown menu, but it appeared behind the embedded browser content and could not be clicked.
+- Symptoms/Impact: Users could not access dropdown menus in the browser panel toolbar because the native WebView was rendering on top of the egui menu.
+- Root cause:
+  - Native WebView2 renders as a child window above egui's immediate-mode rendering.
+  - The `menu_button` dropdown is tracked via `BarState` (not `Memory.popup`), so `ctx.memory().any_popup_open()` did not detect it.
+  - The existing `should_hide_embedded_browser_for_ui_layer()` function relied on `any_popup_open()`, missing menu dropdowns.
+- Resolution:
+  - Added `browser_panel_dropdown_open: bool` runtime flag to `AdeApp`.
+  - Modified `draw_browser_screenshot_button()` to return `bool` indicating if menu is open (via `InnerResponse.inner.is_some()`).
+  - Reset `browser_panel_dropdown_open` at the start of `draw_browser_panel()` each frame.
+  - Set `browser_panel_dropdown_open = true` when any dropdown is open.
+  - Updated `embedded_browser_should_yield_to_ui_layer()` to accept and check the new `browser_dropdown_open` parameter.
+  - Updated `should_hide_embedded_browser_for_ui_layer()` to pass the flag.
+  - When `browser_panel_dropdown_open` is true, `sync_embedded_browser()` hides the WebView via `browser.hide()`, allowing the menu to appear on top.
+- Prevent recurrence:
+  - Added test `sync_embedded_browser_hides_while_dropdown_open` verifying the browser is hidden when `browser_panel_dropdown_open` is true.
+  - Updated existing test `embedded_browser_yields_to_ui_overlay_layers` to include the new parameter.
+- Files/Commands touched: `src/app.rs` (AdeApp struct, `draw_browser_panel()`, `draw_browser_screenshot_button()`, `embedded_browser_should_yield_to_ui_layer()`, `should_hide_embedded_browser_for_ui_layer()`, `sync_embedded_browser()`, tests), `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-05-06: "ekran görüntüsü almak için tıklıyorum dropdown browserın arkasında kalıyor ve tıklanmıyor düzelt"
+
 #### Design Inspect failed on disabled HTML buttons and icon did not toggle {#design-inspect-disabled-button}
 - Date: 2026-05-06
 - Context: Browser panel Design Inspect mode on pages with disabled buttons/inputs

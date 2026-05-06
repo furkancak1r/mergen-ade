@@ -1355,6 +1355,9 @@ pub struct AdeApp {
     /// Pending UI-initiated screenshot requests waiting for browser visibility.
     /// Key: request_id, Value: (project_id, full_page, timestamp)
     browser_pending_screenshot_requests: BTreeMap<String, (u64, bool, Instant)>,
+    /// Whether a dropdown menu in the browser panel is currently open.
+    /// Used to hide the native WebView so the menu appears above it.
+    browser_panel_dropdown_open: bool,
     /// Active embedded-browser video recordings per project.
     browser_video_recordings_by_project: BTreeMap<u64, BrowserVideoRecordingState>,
     browser_video_encode_events_tx: Sender<BrowserVideoEncodeEvent>,
@@ -3777,6 +3780,7 @@ impl AdeApp {
             browser_design_inspect_target_changed_at_by_project: BTreeMap::new(),
             browser_design_inspect_last_delivery_by_destination: BTreeMap::new(),
             browser_pending_screenshot_requests: BTreeMap::new(),
+            browser_panel_dropdown_open: false,
             browser_video_recordings_by_project: BTreeMap::new(),
             browser_video_encode_events_tx,
             browser_video_encode_events_rx,
@@ -8995,12 +8999,14 @@ fn embedded_browser_should_yield_to_ui_layer(
     egui_popup_open: bool,
     context_menu_open: bool,
     context_menu_overlaps_browser: bool,
+    browser_dropdown_open: bool,
 ) -> bool {
     show_settings_popup
         || show_exit_confirm_popup
         || terminal_history_popup_open
         || egui_popup_open
         || (context_menu_open && context_menu_overlaps_browser)
+        || browser_dropdown_open
 }
 
 fn ui_owns_keyboard_state(
@@ -16434,6 +16440,7 @@ impl AdeApp {
             ctx.memory(|mem| mem.any_popup_open()),
             ctx.is_context_menu_open(),
             context_menu_overlaps_browser,
+            self.browser_panel_dropdown_open,
         )
     }
 
@@ -17913,12 +17920,13 @@ impl AdeApp {
     }
 
     /// Draw the browser screenshot dropdown button.
+    /// Returns true if the dropdown menu is currently open.
     fn draw_browser_screenshot_button(
         &mut self,
         ui: &mut Ui,
         ctx: &egui::Context,
         project_id: u64,
-    ) {
+    ) -> bool {
         let screenshot_menu = with_minimal_button_chrome(ui, |ui| {
             ui.menu_button(format!("{}", icons::CAMERA), |ui| {
                 with_minimal_button_chrome(ui, |ui| {
@@ -17958,6 +17966,9 @@ impl AdeApp {
         if response.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
+
+        // Return true if the menu is open (inner is Some)
+        screenshot_menu.inner.is_some()
     }
 
     /// Queue a browser screenshot request. The actual capture happens when the browser
@@ -18123,6 +18134,10 @@ impl AdeApp {
         if !self.is_active_browser_panel_open() {
             return None;
         }
+
+        // Reset the dropdown open flag at the start of each frame.
+        // It will be set to true if any dropdown is open during rendering.
+        self.browser_panel_dropdown_open = false;
 
         // Determine which project's browser to show
         let browser_project_id = self.active_browser_project_id()?;
@@ -18434,7 +18449,10 @@ impl AdeApp {
                         ui.add_space(8.0);
 
                         // Screenshot dropdown button
-                        self.draw_browser_screenshot_button(ui, ctx, browser_project_id);
+                        let screenshot_menu_open =
+                            self.draw_browser_screenshot_button(ui, ctx, browser_project_id);
+                        self.browser_panel_dropdown_open =
+                            self.browser_panel_dropdown_open || screenshot_menu_open;
                     });
 
                     ui.add_space(16.0);
@@ -34743,6 +34761,7 @@ mod tests {
             browser_design_inspect_target_changed_at_by_project: BTreeMap::new(),
             browser_design_inspect_last_delivery_by_destination: BTreeMap::new(),
             browser_pending_screenshot_requests: BTreeMap::new(),
+            browser_panel_dropdown_open: false,
             browser_video_recordings_by_project: BTreeMap::new(),
             browser_video_encode_events_tx,
             browser_video_encode_events_rx,
@@ -42163,30 +42182,34 @@ mod tests {
     #[test]
     fn embedded_browser_yields_to_ui_overlay_layers() {
         // Test the pure predicate for all overlay sources
-        // Parameters: settings, exit_confirm, terminal_history_popup, egui_popup, context_menu_open, context_menu_overlaps_browser
+        // Parameters: settings, exit_confirm, terminal_history_popup, egui_popup, context_menu_open, context_menu_overlaps_browser, browser_dropdown_open
         assert!(embedded_browser_should_yield_to_ui_layer(
-            true, false, false, false, false, false
+            true, false, false, false, false, false, false
         ));
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, true, false, false, false, false
+            false, true, false, false, false, false, false
         ));
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, true, false, false, false
+            false, false, true, false, false, false, false
         ));
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, false, true, false, false
+            false, false, false, true, false, false, false
         ));
         // Context menu only yields when it overlaps with browser
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, true, true
+            false, false, false, false, true, true, false
         ));
         // Context menu does NOT yield when it doesn't overlap
         assert!(!embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, true, false
+            false, false, false, false, true, false, false
         ));
         // No overlays at all
         assert!(!embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, false, false
+            false, false, false, false, false, false, false
+        ));
+        // Browser dropdown open should cause yield
+        assert!(embedded_browser_should_yield_to_ui_layer(
+            false, false, false, false, false, false, true
         ));
     }
 
@@ -42277,6 +42300,43 @@ mod tests {
         app.sync_embedded_browser(&ctx);
 
         assert!(!app.embedded_browsers_by_project.contains_key(&1));
+    }
+
+    #[test]
+    fn sync_embedded_browser_hides_while_dropdown_open() {
+        // Regression test: Browser panel dropdown menus (like screenshot)
+        // should hide the native WebView so they appear above it.
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        app.selected_project = Some(1);
+        app.set_browser_panel_open_for_project(1, true);
+
+        // Show the browser and simulate it being ready
+        app.project_browser(1).show();
+        app.pending_browser_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(800.0, 100.0),
+            egui::vec2(400.0, 600.0),
+        ));
+        assert!(app
+            .embedded_browsers_by_project
+            .get(&1)
+            .unwrap()
+            .requested_visible());
+
+        // Simulate dropdown being open (e.g., screenshot menu)
+        app.browser_panel_dropdown_open = true;
+
+        // Sync should hide the browser while dropdown is open
+        app.sync_embedded_browser(&ctx);
+
+        assert!(!app
+            .embedded_browsers_by_project
+            .get(&1)
+            .unwrap()
+            .requested_visible());
     }
 
     #[test]
