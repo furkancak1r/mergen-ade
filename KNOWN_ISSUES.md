@@ -10,6 +10,27 @@ When adding an entry:
 
 ---
 
+#### Design Inspect failed on disabled HTML buttons and icon did not toggle {#design-inspect-disabled-button}
+- Date: 2026-05-06
+- Context: Browser panel Design Inspect mode on pages with disabled buttons/inputs
+- Error signature: Clicking a disabled button (e.g., `<button disabled>`) while Design Inspect was enabled did not send element info to terminal. Also, the Design Inspect toggle button always showed the same icon regardless of on/off state.
+- Symptoms/Impact: Users could not inspect disabled UI elements; could not visually tell if Design Inspect was enabled from the button icon alone.
+- Root cause:
+  - Disabled HTML form elements (button, input, select, etc.) do not dispatch `click` events, so the Design Inspect `click` listener never fired.
+  - The Design Inspect button in the UI always used `icons::EYE` regardless of the `design_inspect_enabled` state.
+- Resolution:
+  - Added `pointerdown` capture listener that fires before the disabled control swallows the event. Uses `elementFromPoint` with a temporary CSS override to hit-test disabled elements.
+  - Added `isDisabled()` helper to detect disabled/aria-disabled/fieldset[disabled] elements.
+  - Added `hitTestElementFromPoint()` helper that injects temporary CSS (`pointer-events: auto !important`) for disabled elements, calls `document.elementFromPoint()`, then removes the style.
+  - Added `pointerDownDelivered` flag to prevent duplicate selection delivery when `click` fires after `pointerdown`.
+  - Changed Design Inspect button icon to use `icons::EYE` when enabled and `icons::EYE_OFF` when disabled, matching the pattern used in other toggle buttons.
+  - Bumped Design Inspect script version from 3 to 4 to force script refresh in existing WebView sessions.
+- Prevent recurrence:
+  - Added test `design_inspect_script_uses_version_4_and_pointerdown_for_disabled_elements` asserting presence of `pointerdown`, `isDisabled`, `hitTestElementFromPoint`, and `pointerDownDelivered` in the script.
+  - Added test `design_inspect_icon_changes_based_on_state` verifying EYE/EYE_OFF constants.
+- Files/Commands touched: `src/web_browser.rs` (Design Inspect script), `src/app.rs` (icon toggle), `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-05-06: "design mode disable olan butonlarda çalışmıyor ama çalışması lazım düzelt", "design mode açık kapalı iken simgesi de değişmiyor değişmesi lazım"
+
 #### Browser MCP page_summary failed to find sidebar close button with icon-only design {#browser-mcp-sidebar-close-discovery}
 - Date: 2026-05-06
 - Context: Browser MCP `browser_page_summary` query for "sidebar kapat / X / close" on ProsoLocal mobile overlay sidebar

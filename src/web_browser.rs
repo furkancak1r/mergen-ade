@@ -395,7 +395,7 @@ const DESIGN_INSPECT_BOOTSTRAP_SCRIPT_TEMPLATE: &str = r#"
   const webview = window.chrome?.webview;
   const postMessage = webview && typeof webview.postMessage === "function" ? webview.postMessage.bind(webview) : null;
   const addWebMessageListener = webview && typeof webview.addEventListener === "function" ? webview.addEventListener.bind(webview) : null;
-  if (window.__mergenDesignInspect && window.__mergenDesignInspect.version === 3) {
+  if (window.__mergenDesignInspect && window.__mergenDesignInspect.version === 4) {
     postMessage?.(JSON.stringify({ source: SOURCE, token: TOKEN, type: "ready" }));
     return;
   }
@@ -411,10 +411,11 @@ const DESIGN_INSPECT_BOOTSTRAP_SCRIPT_TEMPLATE: &str = r#"
   };
 
   const state = {
-    version: 3,
+    version: 4,
     enabled: false,
     current: null,
     overlay: null,
+    pointerDownDelivered: false,
   };
 
   const importantStyleKeys = [
@@ -540,12 +541,55 @@ const DESIGN_INSPECT_BOOTSTRAP_SCRIPT_TEMPLATE: &str = r#"
     postMessage(JSON.stringify(elementPayload(element, "click")));
   }
 
+  function isDisabled(element) {
+    if (!element || element.nodeType !== Node.ELEMENT_NODE) return false;
+    const tag = element.tagName;
+    if (tag === "BUTTON" || tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || tag === "OPTION" || tag === "OPTGROUP") {
+      if (element.disabled) return true;
+    }
+    if (element.getAttribute?.("aria-disabled") === "true") return true;
+    if (element.closest?.("fieldset[disabled]") && tag !== "FIELDSET") return true;
+    return false;
+  }
+
+  function hitTestElementFromPoint(x, y) {
+    // Temporarily disable pointer-events on disabled elements so they can be hit-tested
+    const disabledStyle = document.createElement("style");
+    disabledStyle.textContent = `
+      button:disabled, input:disabled, select:disabled, textarea:disabled,
+      option:disabled, optgroup:disabled,
+      [aria-disabled="true"],
+      fieldset[disabled] * { pointer-events: auto !important; }
+    `;
+    document.documentElement.appendChild(disabledStyle);
+    const element = document.elementFromPoint(x, y);
+    disabledStyle.remove();
+    return element;
+  }
+
   function onPointerMove(event) {
     if (!state.enabled) return;
     const element = event.target;
     if (!element || element === state.overlay || element.nodeType !== Node.ELEMENT_NODE) return;
     state.current = element;
     updateOverlay(element);
+  }
+
+  function onInspectPointerDown(event) {
+    if (!state.enabled) return;
+    // Only handle primary button (left click)
+    if (event.button !== 0) return;
+    // Prevent page actions (navigation, button handlers, form submission)
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+
+    // Use hit-test to find element including disabled controls
+    const element = hitTestElementFromPoint(event.clientX, event.clientY);
+    if (!element || element === state.overlay || element.nodeType !== Node.ELEMENT_NODE) return;
+
+    postSelection(element);
+    state.pointerDownDelivered = true;
   }
 
   function onInspectClick(event) {
@@ -556,6 +600,13 @@ const DESIGN_INSPECT_BOOTSTRAP_SCRIPT_TEMPLATE: &str = r#"
     event.preventDefault();
     event.stopPropagation();
     if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+
+    // If pointerdown already delivered this selection, skip duplicate
+    if (state.pointerDownDelivered) {
+      state.pointerDownDelivered = false;
+      return;
+    }
+
     // Use event.target if available, otherwise fallback to tracked current element
     const element = event.target || state.current;
     if (!element || element === state.overlay || element.nodeType !== Node.ELEMENT_NODE) return;
@@ -574,15 +625,18 @@ const DESIGN_INSPECT_BOOTSTRAP_SCRIPT_TEMPLATE: &str = r#"
     state.enabled = Boolean(enabled);
     if (state.enabled) {
       document.addEventListener("pointermove", onPointerMove, true);
+      document.addEventListener("pointerdown", onInspectPointerDown, true);
       document.addEventListener("click", onInspectClick, true);
       window.addEventListener("scroll", refreshOverlay, true);
       window.addEventListener("resize", refreshOverlay, true);
     } else {
       document.removeEventListener("pointermove", onPointerMove, true);
+      document.removeEventListener("pointerdown", onInspectPointerDown, true);
       document.removeEventListener("click", onInspectClick, true);
       window.removeEventListener("scroll", refreshOverlay, true);
       window.removeEventListener("resize", refreshOverlay, true);
       state.current = null;
+      state.pointerDownDelivered = false;
       hideOverlay();
     }
   }
@@ -593,7 +647,7 @@ const DESIGN_INSPECT_BOOTSTRAP_SCRIPT_TEMPLATE: &str = r#"
     setEnabled(data.enabled);
   });
 
-  window.__mergenDesignInspect = { version: 3, setEnabled };
+  window.__mergenDesignInspect = { version: 4, setEnabled };
   postMessage?.(JSON.stringify({ source: SOURCE, token: TOKEN, type: "ready" }));
 })();
 "#;
@@ -4334,6 +4388,37 @@ mod tests {
 
         browser.set_design_inspect_enabled(false);
         assert!(!browser.design_inspect_enabled());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn design_inspect_script_uses_version_4_and_pointerdown_for_disabled_elements() {
+        // Design Inspect v4 uses pointerdown capture to detect clicks on disabled elements
+        assert!(
+            DESIGN_INSPECT_BOOTSTRAP_SCRIPT_TEMPLATE.contains("version: 4"),
+            "Design Inspect script should be version 4"
+        );
+        assert!(
+            DESIGN_INSPECT_BOOTSTRAP_SCRIPT_TEMPLATE
+                .contains("window.__mergenDesignInspect.version === 4"),
+            "Design Inspect script should check for version 4"
+        );
+        assert!(
+            DESIGN_INSPECT_BOOTSTRAP_SCRIPT_TEMPLATE.contains("pointerdown"),
+            "Design Inspect script should listen for pointerdown events"
+        );
+        assert!(
+            DESIGN_INSPECT_BOOTSTRAP_SCRIPT_TEMPLATE.contains("isDisabled"),
+            "Design Inspect script should include isDisabled helper"
+        );
+        assert!(
+            DESIGN_INSPECT_BOOTSTRAP_SCRIPT_TEMPLATE.contains("hitTestElementFromPoint"),
+            "Design Inspect script should include hitTestElementFromPoint for disabled elements"
+        );
+        assert!(
+            DESIGN_INSPECT_BOOTSTRAP_SCRIPT_TEMPLATE.contains("pointerDownDelivered"),
+            "Design Inspect script should track pointerdown delivery to prevent duplicates"
+        );
     }
 
     #[test]

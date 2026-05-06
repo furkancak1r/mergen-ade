@@ -18107,10 +18107,15 @@ impl AdeApp {
                         } else {
                             "Enable Design Inspect"
                         };
+                        let inspect_icon = if design_inspect_enabled {
+                            icons::EYE
+                        } else {
+                            icons::EYE_OFF
+                        };
                         if activity_rail_icon_button(
                             ui,
                             design_inspect_enabled,
-                            icons::EYE,
+                            inspect_icon,
                             inspect_tooltip,
                         )
                         .clicked()
