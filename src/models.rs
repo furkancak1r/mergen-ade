@@ -553,8 +553,8 @@ impl Default for TerminalShortcutEntry {
 pub fn default_terminal_shortcuts() -> Vec<TerminalShortcutEntry> {
     vec![
         TerminalShortcutEntry {
-            id: "semgrep-check".to_owned(),
-            label: "Semgrep Check".to_owned(),
+            id: "github-push".to_owned(),
+            label: "GitHub Push".to_owned(),
             key: "F5".to_owned(),
             modifiers: ShortcutModifiers::default(),
             command: "/gt".to_owned(),
@@ -571,7 +571,7 @@ pub fn default_terminal_shortcuts() -> Vec<TerminalShortcutEntry> {
         TerminalShortcutEntry {
             id: "implement-plan".to_owned(),
             label: "Implement Plan".to_owned(),
-            key: "F7".to_owned(),
+            key: "F11".to_owned(),
             modifiers: ShortcutModifiers::default(),
             command: "/implement-plan".to_owned(),
             enabled: true,
@@ -579,7 +579,7 @@ pub fn default_terminal_shortcuts() -> Vec<TerminalShortcutEntry> {
         TerminalShortcutEntry {
             id: "review-guard".to_owned(),
             label: "Review Guard".to_owned(),
-            key: "F8".to_owned(),
+            key: "F7".to_owned(),
             modifiers: ShortcutModifiers::default(),
             command: "/review-guard".to_owned(),
             enabled: true,
@@ -587,9 +587,38 @@ pub fn default_terminal_shortcuts() -> Vec<TerminalShortcutEntry> {
     ]
 }
 
+/// Migrates old shortcut IDs and keys to new defaults when the entry matches legacy defaults.
+/// This ensures users with old configs get updated key bindings without losing customizations.
+fn migrate_legacy_shortcut(entry: &mut TerminalShortcutEntry) {
+    // Migrate old "semgrep-check" ID to "github-push"
+    if entry.id == "semgrep-check" {
+        entry.id = "github-push".to_owned();
+        // Update label if it was the old default "Semgrep Check"
+        if entry.label == "Semgrep Check" {
+            entry.label = "GitHub Push".to_owned();
+        }
+    }
+
+    // Migrate implement-plan key from F7 to F11 if it matches old default
+    if entry.id == "implement-plan" && entry.key == "F7" {
+        entry.key = "F11".to_owned();
+    }
+
+    // Migrate review-guard key from F8 to F7 if it matches old default
+    if entry.id == "review-guard" && entry.key == "F8" {
+        entry.key = "F7".to_owned();
+    }
+}
+
 pub fn normalize_terminal_shortcut_entries(entries: &mut Vec<TerminalShortcutEntry>) {
-    let existing_entries = std::mem::take(entries);
+    let mut existing_entries = std::mem::take(entries);
     let defaults = default_terminal_shortcuts();
+
+    // First, migrate legacy shortcut IDs and keys
+    for entry in &mut existing_entries {
+        migrate_legacy_shortcut(entry);
+    }
+
     let mut normalized = Vec::new();
 
     for default in &defaults {
@@ -729,8 +758,8 @@ mod tests {
         let shortcuts = default_terminal_shortcuts();
 
         assert_eq!(shortcuts.len(), 4);
-        assert_eq!(shortcuts[0].id, "semgrep-check");
-        assert_eq!(shortcuts[0].label, "Semgrep Check");
+        assert_eq!(shortcuts[0].id, "github-push");
+        assert_eq!(shortcuts[0].label, "GitHub Push");
         assert_eq!(shortcuts[0].key, "F5");
         assert_eq!(shortcuts[0].command, "/gt");
         assert_eq!(shortcuts[0].modifiers, ShortcutModifiers::default());
@@ -741,11 +770,13 @@ mod tests {
         assert_eq!(shortcuts[1].command, "/prepare-fix-plan");
         assert_eq!(shortcuts[1].modifiers, ShortcutModifiers::default());
         assert_eq!(shortcuts[2].id, "implement-plan");
-        assert_eq!(shortcuts[2].key, "F7");
+        assert_eq!(shortcuts[2].label, "Implement Plan");
+        assert_eq!(shortcuts[2].key, "F11");
         assert_eq!(shortcuts[2].command, "/implement-plan");
         assert_eq!(shortcuts[2].modifiers, ShortcutModifiers::default());
         assert_eq!(shortcuts[3].id, "review-guard");
-        assert_eq!(shortcuts[3].key, "F8");
+        assert_eq!(shortcuts[3].label, "Review Guard");
+        assert_eq!(shortcuts[3].key, "F7");
         assert_eq!(shortcuts[3].command, "/review-guard");
         assert_eq!(shortcuts[3].modifiers, ShortcutModifiers::default());
     }
@@ -773,13 +804,13 @@ mod tests {
     fn normalize_terminal_shortcuts_restores_missing_defaults() {
         let mut shortcuts = default_terminal_shortcuts()
             .into_iter()
-            .filter(|shortcut| shortcut.id != "semgrep-check")
+            .filter(|shortcut| shortcut.id != "github-push")
             .collect::<Vec<_>>();
 
         normalize_terminal_shortcut_entries(&mut shortcuts);
 
         assert_eq!(shortcuts.len(), 4);
-        assert_eq!(shortcuts[0].id, "semgrep-check");
+        assert_eq!(shortcuts[0].id, "github-push");
         assert_eq!(shortcuts[0].key, "F5");
         assert_eq!(shortcuts[0].command, "/gt");
     }
@@ -819,6 +850,101 @@ mod tests {
         assert!(shortcuts
             .iter()
             .any(|shortcut| shortcut.id == "custom-extra" && shortcut.command == "cargo test"));
+    }
+
+    #[test]
+    fn normalize_terminal_shortcuts_migrates_legacy_defaults() {
+        // Simulate old config with legacy IDs and keys
+        let mut shortcuts = vec![
+            TerminalShortcutEntry {
+                id: "semgrep-check".to_owned(),
+                label: "Semgrep Check".to_owned(),
+                key: "F5".to_owned(),
+                modifiers: ShortcutModifiers::default(),
+                command: "/gt".to_owned(),
+                enabled: true,
+            },
+            TerminalShortcutEntry {
+                id: "implement-plan".to_owned(),
+                label: "Implement Plan".to_owned(),
+                key: "F7".to_owned(), // Old F7 key
+                modifiers: ShortcutModifiers::default(),
+                command: "/implement-plan".to_owned(),
+                enabled: true,
+            },
+            TerminalShortcutEntry {
+                id: "review-guard".to_owned(),
+                label: "Review Guard".to_owned(),
+                key: "F8".to_owned(), // Old F8 key
+                modifiers: ShortcutModifiers::default(),
+                command: "/review-guard".to_owned(),
+                enabled: true,
+            },
+        ];
+
+        normalize_terminal_shortcut_entries(&mut shortcuts);
+
+        // Check that legacy IDs were migrated
+        let github_push = shortcuts
+            .iter()
+            .find(|shortcut| shortcut.id == "github-push")
+            .expect("github-push shortcut should exist");
+        assert_eq!(github_push.label, "GitHub Push");
+        assert_eq!(github_push.key, "F5");
+
+        // Check that implement-plan key was migrated from F7 to F11
+        let implement = shortcuts
+            .iter()
+            .find(|shortcut| shortcut.id == "implement-plan")
+            .expect("implement-plan shortcut should exist");
+        assert_eq!(implement.key, "F11");
+
+        // Check that review-guard key was migrated from F8 to F7
+        let review = shortcuts
+            .iter()
+            .find(|shortcut| shortcut.id == "review-guard")
+            .expect("review-guard shortcut should exist");
+        assert_eq!(review.key, "F7");
+    }
+
+    #[test]
+    fn normalize_terminal_shortcuts_preserves_user_customizations_during_migration() {
+        // User customized the old shortcut - should NOT be migrated
+        let mut shortcuts = vec![
+            TerminalShortcutEntry {
+                id: "semgrep-check".to_owned(),
+                label: "My Custom Label".to_owned(), // Custom label
+                key: "F5".to_owned(),
+                modifiers: ShortcutModifiers::default(),
+                command: "/gt".to_owned(),
+                enabled: true,
+            },
+            TerminalShortcutEntry {
+                id: "implement-plan".to_owned(),
+                label: "Implement Plan".to_owned(),
+                key: "F9".to_owned(), // User customized to F9, not old default F7
+                modifiers: ShortcutModifiers::default(),
+                command: "/implement-plan".to_owned(),
+                enabled: true,
+            },
+        ];
+
+        normalize_terminal_shortcut_entries(&mut shortcuts);
+
+        // ID should still migrate
+        let github_push = shortcuts
+            .iter()
+            .find(|shortcut| shortcut.id == "github-push")
+            .expect("github-push shortcut should exist");
+        // But custom label should be preserved
+        assert_eq!(github_push.label, "My Custom Label");
+
+        // User customized key to F9, not old F7, so should NOT migrate to F11
+        let implement = shortcuts
+            .iter()
+            .find(|shortcut| shortcut.id == "implement-plan")
+            .expect("implement-plan shortcut should exist");
+        assert_eq!(implement.key, "F9"); // Preserved user customization
     }
 
     #[cfg(not(target_os = "macos"))]

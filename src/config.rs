@@ -531,6 +531,72 @@ command = false
 [[terminal_shortcuts]]
 id = "implement-plan"
 label = "Implement Plan"
+key = "F11"
+command = "/implement-plan"
+enabled = true
+
+[terminal_shortcuts.modifiers]
+ctrl = false
+alt = false
+shift = false
+command = false
+
+[[terminal_shortcuts]]
+id = "review-guard"
+label = "Review Guard"
+key = "F7"
+command = "/review-guard"
+enabled = true
+
+[terminal_shortcuts.modifiers]
+ctrl = false
+alt = false
+shift = false
+command = false
+"#,
+        )
+        .expect("should write config");
+
+        let config = load_config(&path).expect("should load config");
+
+        assert_eq!(config.terminal_shortcuts.len(), 4);
+        assert_eq!(config.terminal_shortcuts[0].id, "github-push");
+        assert_eq!(config.terminal_shortcuts[0].key, "F5");
+        assert_eq!(config.terminal_shortcuts[0].command, "/gt");
+        assert!(config
+            .terminal_shortcuts
+            .iter()
+            .any(|shortcut| shortcut.id == "prepare-fix-plan"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_config_migrates_legacy_shortcut_ids_and_keys() {
+        // Test that old config files with legacy IDs and keys are migrated
+        let path = unique_temp_path("migrate-legacy-shortcuts");
+        fs::write(
+            &path,
+            r#"
+version = 1
+default_shell = "powershell"
+
+[[terminal_shortcuts]]
+id = "semgrep-check"
+label = "Semgrep Check"
+key = "F5"
+command = "/gt"
+enabled = true
+
+[terminal_shortcuts.modifiers]
+ctrl = false
+alt = false
+shift = false
+command = false
+
+[[terminal_shortcuts]]
+id = "implement-plan"
+label = "Implement Plan"
 key = "F7"
 command = "/implement-plan"
 enabled = true
@@ -559,14 +625,31 @@ command = false
 
         let config = load_config(&path).expect("should load config");
 
-        assert_eq!(config.terminal_shortcuts.len(), 4);
-        assert_eq!(config.terminal_shortcuts[0].id, "semgrep-check");
-        assert_eq!(config.terminal_shortcuts[0].key, "F5");
-        assert_eq!(config.terminal_shortcuts[0].command, "/gt");
+        // Verify legacy ID "semgrep-check" was migrated to "github-push"
         assert!(config
             .terminal_shortcuts
             .iter()
-            .any(|shortcut| shortcut.id == "prepare-fix-plan"));
+            .any(|shortcut| shortcut.id == "github-push" && shortcut.label == "GitHub Push"));
+        assert!(!config
+            .terminal_shortcuts
+            .iter()
+            .any(|shortcut| shortcut.id == "semgrep-check"));
+
+        // Verify implement-plan key was migrated from F7 to F11
+        let implement = config
+            .terminal_shortcuts
+            .iter()
+            .find(|shortcut| shortcut.id == "implement-plan")
+            .expect("implement-plan should exist");
+        assert_eq!(implement.key, "F11");
+
+        // Verify review-guard key was migrated from F8 to F7
+        let review = config
+            .terminal_shortcuts
+            .iter()
+            .find(|shortcut| shortcut.id == "review-guard")
+            .expect("review-guard should exist");
+        assert_eq!(review.key, "F7");
 
         let _ = fs::remove_file(path);
     }

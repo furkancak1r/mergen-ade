@@ -10,6 +10,34 @@ When adding an entry:
 
 ---
 
+#### Terminal shortcut keys reorganized for better workflow {#terminal-shortcut-reorganization}
+- Date: 2026-05-06
+- Context: Default terminal command shortcuts for AI CLI tools
+- Error signature: User requested changes to default shortcut keys: F7 -> /implement-plan moved to F11, F8 -> /review-guard moved to F7, and /gt labeled as "GitHub Push" instead of "Semgrep Check".
+- Symptoms/Impact: Existing users with old configs would have outdated shortcut key bindings that don't match the new defaults.
+- Root cause:
+  - Old default shortcuts had `implement-plan` on F7 and `review-guard` on F8.
+  - The `/gt` command was labeled as "Semgrep Check" but user wanted "GitHub Push".
+- Resolution:
+  - Changed default shortcuts:
+    - F5 -> /gt (GitHub Push) - label changed from "Semgrep Check"
+    - F6 -> /prepare-fix-plan (unchanged)
+    - F11 -> /implement-plan (moved from F7)
+    - F7 -> /review-guard (moved from F8)
+  - Added `migrate_legacy_shortcut()` function to automatically migrate old configs:
+    - ID "semgrep-check" migrated to "github-push" with label update
+    - implement-plan key F7 migrated to F11
+    - review-guard key F8 migrated to F7
+  - User customizations are preserved: if user changed key from old default, migration is skipped for that shortcut.
+  - Updated shortcut ID from "semgrep-check" to "github-push" for consistency.
+- Prevent recurrence:
+  - Added tests `normalize_terminal_shortcuts_migrates_legacy_defaults` and `normalize_terminal_shortcuts_preserves_user_customizations_during_migration`.
+  - Updated `AGENTS.md` shortcut guidelines with new defaults.
+- Files/Commands touched: `src/models.rs` (defaults and migration), `src/config.rs` (tests), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-05-06: "shortcutda f7 yi f11 e taşı, f8 i de f7 ye taşı ve /gt için github push adını ver"
+
+---
+
 #### Browser panel dropdown menus hidden behind native WebView {#browser-dropdown-webview-z-order}
 - Date: 2026-05-06
 - Context: Browser panel screenshot dropdown button and other toolbar menus
