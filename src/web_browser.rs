@@ -1916,7 +1916,7 @@ pub(crate) fn browser_mcp_output_from_devtools_runtime_raw(
 
 #[cfg(target_os = "windows")]
 const MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT: &str = r#"
-if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 20) {
+if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 21) {
   window.__mergenMcpState = window.__mergenMcpState || { refCounter: 1, consoleMessages: [], networkRequests: [], routes: [], highlighted: null };
 
   const state = window.__mergenMcpState;
@@ -2042,7 +2042,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 20) {
     if (
       state.cursorElement &&
       document.documentElement.contains(state.cursorElement) &&
-      state.cursorElement.getAttribute?.('data-mergen-mcp-cursor-version') === '20' &&
+      state.cursorElement.getAttribute?.('data-mergen-mcp-cursor-version') === '21' &&
       state.cursorElement.querySelector?.('[data-mergen-mcp-cursor-pointer]')
     ) {
       return state.cursorElement;
@@ -2050,7 +2050,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 20) {
     state.cursorElement?.remove?.();
     const cursor = document.createElement('div');
     cursor.setAttribute('data-mergen-mcp-cursor', 'true');
-    cursor.setAttribute('data-mergen-mcp-cursor-version', '20');
+    cursor.setAttribute('data-mergen-mcp-cursor-version', '21');
     cursor.setAttribute('data-mergen-mcp-cursor-phase', state.cursor.phase || 'idle');
     Object.assign(cursor.style, {
       position: 'fixed',
@@ -3135,6 +3135,58 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 20) {
       'div[role="button"]',
       'span[role="button"]',
     ].join(',');
+    // Turkish character normalization for better search matching
+    const normalizeForSearch = (text) => {
+      if (!text) return '';
+      return text
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '') // Remove diacritics
+        .replace(/ı/g, 'i')
+        .replace(/İ/g, 'i')
+        .replace(/ş/g, 's')
+        .replace(/Ş/g, 's')
+        .replace(/ğ/g, 'g')
+        .replace(/Ğ/g, 'g')
+        .replace(/ü/g, 'u')
+        .replace(/Ü/g, 'u')
+        .replace(/ö/g, 'o')
+        .replace(/Ö/g, 'o')
+        .replace(/ç/g, 'c')
+        .replace(/Ç/g, 'c');
+    };
+    // Query tokenization with alias expansion for multilingual support
+    const expandQueryTerms = (rawQuery) => {
+      if (!rawQuery) return [];
+      // Split by whitespace and common punctuation, filter short terms
+      const terms = rawQuery
+        .split(/[\s,;!?()\[\]{}<>"'|\\/]+/)
+        .map(t => t.trim())
+        .filter(t => t.length >= 1);
+      if (terms.length === 0) return [];
+      // Aliases for common UI actions (Turkish ↔ English)
+      const aliases = {
+        'kapat': ['close', 'x', 'carp', 'carpi', 'exit', 'quit'],
+        'close': ['kapat', 'x', 'carp', 'carpi', 'exit', 'quit'],
+        'x': ['close', 'kapat', 'carp', 'carpi'],
+        'carp': ['close', 'kapat', 'x'],
+        'carpi': ['close', 'kapat', 'x'],
+        'sidebar': ['menu', 'drawer', 'panel', 'navigation', 'nav'],
+        'menu': ['sidebar', 'drawer', 'navigation', 'nav'],
+        'sidebarı': ['sidebar', 'menu'],
+        'sidebari': ['sidebar', 'menu'],
+      };
+      const expanded = new Set();
+      for (const term of terms) {
+        const normalized = normalizeForSearch(term);
+        expanded.add(normalized);
+        if (aliases[normalized]) {
+          aliases[normalized].forEach(a => expanded.add(a));
+        }
+      }
+      return Array.from(expanded);
+    };
+    const queryTerms = expandQueryTerms(query);
     const uniqueElements = [];
     const seen = new Set();
     for (const element of Array.from(document.querySelectorAll(selector)).slice(0, 1600)) {
@@ -3154,14 +3206,60 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 20) {
       uniqueElements.push(element);
       if (uniqueElements.length >= 500) break;
     }
+    // Extract icon information from child elements (for icon-only buttons)
+    const extractIconHints = (element) => {
+      const hints = [];
+      // Check for lucide icons or other SVG icons in children
+      const svgs = element.querySelectorAll('svg');
+      for (const svg of svgs) {
+        const svgClass = svg.getAttribute('class') || '';
+        // Lucide icons typically have class like "lucide lucide-x"
+        const lucideMatch = svgClass.match(/lucide-(\w+)/);
+        if (lucideMatch) {
+          hints.push(lucideMatch[1]);
+        }
+        // Check data-testid for icon names
+        const testId = svg.getAttribute('data-testid') || '';
+        if (testId) hints.push(testId);
+      }
+      // Check for icon classes on element itself
+      const classList = Array.from(element.classList || []);
+      for (const cls of classList) {
+        if (cls.includes('icon') || cls.includes('Icon')) {
+          hints.push(cls);
+        }
+      }
+      return hints.join(' ');
+    };
     const scoreItem = (item) => {
-      if (!query) return item.inViewport ? 10 : 0;
-      // Expanded haystack includes aria-label, title, id, class, data-testid for better icon/button matching
-      const haystack = `${item.role} ${item.name} ${item.ariaLabel} ${item.title} ${item.id} ${item.classHint} ${item.value} ${item.placeholder}`.toLowerCase();
-      if (haystack === query) return 120;
-      if (haystack.startsWith(query)) return 100;
-      if (haystack.includes(query)) return 80;
-      return item.inViewport ? 5 : 0;
+      if (!query || queryTerms.length === 0) return item.inViewport ? 10 : 0;
+      // Build normalized haystack for token matching
+      const rawHaystack = `${item.role} ${item.name} ${item.ariaLabel} ${item.title} ${item.id} ${item.classHint} ${item.iconHint} ${item.value} ${item.placeholder}`;
+      const haystack = normalizeForSearch(rawHaystack);
+      let score = 0;
+      // Score based on individual query term matches
+      for (const term of queryTerms) {
+        if (term.length < 2) continue; // Skip very short terms unless exact match
+        if (haystack === term) score += 60;
+        else if (haystack.startsWith(term + ' ')) score += 50;
+        else if (haystack.includes(' ' + term + ' ')) score += 40;
+        else if (haystack.includes(term)) score += 25;
+      }
+      // Bonus for exact phrase match (if query has multiple terms)
+      if (queryTerms.length > 1) {
+        const phrase = queryTerms.join(' ');
+        if (haystack === phrase) score += 30;
+        else if (haystack.includes(phrase)) score += 20;
+      }
+      // Bonus for action roles when searching for actions
+      if (item.role === 'button' && queryTerms.some(t => ['button', 'buton', 'click', 'tikla', 'tik'].includes(t))) {
+        score += 15;
+      }
+      // Penalty for disabled items
+      if (item.disabled) score -= 30;
+      // Bonus for viewport visibility
+      if (item.inViewport) score += 5;
+      return score;
     };
     const describe = (element) => {
       const role = roleOf(element);
@@ -3176,6 +3274,8 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 20) {
       const disabled = isDisabled(element);
       const style = window.getComputedStyle(element);
       const isClickable = element.onclick || style.cursor === 'pointer' || element.getAttribute('role') === 'button';
+      // Extract icon hints from children for better icon-only button detection
+      const iconHint = extractIconHints(element);
       const item = {
         ref: ensureRef(element),
         role,
@@ -3184,6 +3284,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 20) {
         title,
         id,
         classHint: classes,
+        iconHint,
         enabled: !disabled,
         disabled,
         visible: true,
@@ -3224,6 +3325,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 20) {
       if (item.title && item.title !== name) metaParts.push(`title="${item.title.replace(/"/g, '\\"')}"`);
       if (item.id) metaParts.push(`id=${item.id}`);
       if (item.classHint) metaParts.push(`class=${item.classHint.replace(/\s+/g, '.')}`);
+      if (item.iconHint) metaParts.push(`icon=${item.iconHint.replace(/\s+/g, '.')}`);
       if (item.clickable) metaParts.push('clickable');
       const flags = [
         item.enabled ? 'enabled' : 'disabled',
@@ -3517,7 +3619,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 20) {
   });
   window.addEventListener('scroll', scheduleVisualAnchorSync, true);
   window.addEventListener('resize', scheduleVisualAnchorSync);
-  window.__mergenMcpRun.version = 20;
+  window.__mergenMcpRun.version = 21;
 }
 "#;
 
@@ -4245,7 +4347,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn browser_mcp_automation_script_includes_visible_cursor_and_mouse_tools() {
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 20"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 21"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-version"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-pointer"));

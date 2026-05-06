@@ -10,6 +10,30 @@ When adding an entry:
 
 ---
 
+#### Browser MCP page_summary failed to find sidebar close button with icon-only design {#browser-mcp-sidebar-close-discovery}
+- Date: 2026-05-06
+- Context: Browser MCP `browser_page_summary` query for "sidebar kapat / X / close" on ProsoLocal mobile overlay sidebar
+- Error signature: Query `browser_page_summary({ query: "X close kapat çarpı Tümünü Kapat sidebar" })` returned refs like `e108` (avatar) instead of the actual close button. Icon-only buttons without `aria-label` were not matched because the query was treated as a single phrase rather than tokenized terms.
+- Symptoms/Impact: AI could not reliably locate and click the mobile sidebar close button, leading to wrong-element clicks on sidebar content instead of closing the overlay.
+- Root cause:
+  - `pageSummary` scoring used simple substring matching: `haystack.includes(query)` treated multi-word queries as single phrases.
+  - No Turkish/English alias expansion (e.g., "kapat" ↔ "close", "çarpı" ↔ "x").
+  - Icon-only buttons with Lucide icons (class `lucide-x`) had no accessible name and child SVG class hints were not bubbled up to the button's searchable metadata.
+  - No Turkish character normalization (ı→i, ş→s, etc.) causing mismatches.
+- Resolution:
+  - Added `normalizeForSearch()` helper with Turkish diacritic removal and character mapping (ı→i, ş→s, ğ→g, ü→u, ö→o, ç→c).
+  - Implemented `expandQueryTerms()` with tokenization and multilingual aliases: `kapat`↔`close`↔`x`, `çarpı`↔`carp`↔`x`, `sidebar`↔`menu`, etc.
+  - Added `extractIconHints()` to capture Lucide icon names (e.g., `lucide-x`) from child SVGs and expose as `iconHint` metadata on parent elements.
+  - Rewrote `scoreItem()` to use per-token scoring with bonuses for exact matches, accessible labels, action roles, and penalties for disabled/offscreen items.
+  - Updated `describe()` to include `iconHint` field; updated `formatItem()` to output `icon=` metadata for debugging.
+  - Bumped injected automation script version from 20 to 21 to force script refresh in existing WebView sessions.
+- Prevent recurrence:
+  - Test `browser_mcp_automation_script_includes_visible_cursor_and_mouse_tools` updated to assert version 21.
+  - Test coverage for Turkish normalization and alias expansion patterns should be added to `web_browser.rs` tests.
+  - Future icon-only buttons should include `aria-label` in the source web app (ProsoLocal fix applied separately).
+- Files/Commands touched: `src/web_browser.rs` (injected `MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT`), `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-05-06: "browser mcp ile sidebarı kapat... bulduğu referans yanlış bir referans"
+
 #### Browser MCP cursor auto-hide timeout changed from immediate to 30 seconds {#browser-cursor-auto-hide-30s}
 - Date: 2026-05-06
 - Context: Browser MCP automation cursor visibility after tool completion
