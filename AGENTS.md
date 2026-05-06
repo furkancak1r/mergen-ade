@@ -291,6 +291,7 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Normalize captured modifiers using `egui_modifiers_to_stored()`.** Convert egui modifiers to stored representation using `mac_cmd` for the `command` field to ensure Ctrl on Windows/Linux doesn't incorrectly set `command=true`.
 - **Backward compatibility for stored shortcuts on non-macOS.** When matching on Windows/Linux, treat `ctrl=true, command=true` as legacy Ctrl-only state because old captures may have set `command=true` due to the egui alias bug. Do not degrade `command=true, ctrl=false` entries to plain-key shortcuts; those command-only shortcuts are unpressable on non-macOS and must not execute.
 - **Shortcut recording cancellation must clear runtime state immediately.** Both Escape key and Cancel button must set `settings_shortcut_recording_index = None` in the same frame. When cancelling, discard any key captured during that frame to prevent unwanted assignment.
+- **Shortcuts send a second Enter after a short delay for confirmation.** After sending the command with the first Enter, schedule a second Enter after `SHORTCUT_SECOND_ENTER_DELAY_MS` (50ms) via `pending_shortcut_second_enter`. This ensures AI CLI tools and shells process the command and any confirmation prompts that may appear. Use `process_pending_shortcut_second_enters()` in the update loop to handle the delayed sends.
 
 ## Clipboard Paste Guidelines
 - **Terminal paste should preserve text fallback.** Text clipboard paste must continue to use the existing queued paste path.

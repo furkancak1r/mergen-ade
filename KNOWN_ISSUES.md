@@ -10,6 +10,30 @@ When adding an entry:
 
 ---
 
+#### Terminal shortcuts send double Enter for confirmation {#terminal-shortcut-double-enter}
+- Date: 2026-05-06
+- Context: Terminal command shortcuts (F5, F6, F7, F11) for AI CLI tools
+- Error signature: User requested that all terminal shortcuts send the command followed by two Enter presses, with a short delay between them, to ensure commands are confirmed and processed.
+- Symptoms/Impact: AI CLI tools like Codex, OpenCode, and Factory Droid sometimes require explicit confirmation after receiving a command. A single Enter might not always trigger immediate execution.
+- Root cause:
+  - Terminal shortcuts previously sent only one Enter after the command.
+  - Some AI CLI tools or shell prompts require an additional Enter press to confirm the action.
+- Resolution:
+  - Added `SHORTCUT_SECOND_ENTER_DELAY_MS` constant (50ms) to define the delay between Enter presses.
+  - Added `pending_shortcut_second_enter: Vec<(u64, Instant)>` field to `AdeApp` to track scheduled second Enter presses per terminal.
+  - Modified `execute_terminal_shortcut()` to schedule a second Enter after successfully sending the first command+Enter.
+  - Added `process_pending_shortcut_second_enters()` function to handle the delayed second Enter sends in the update loop.
+  - Called the new processor in `update()` after `process_pending_reruns()` (Phase 3c).
+  - Initialized the new field in both production and test app constructors.
+  - Added regression test `handle_shortcuts_sends_double_enter_with_delay` to verify the behavior.
+- Prevent recurrence:
+  - Added regression test that verifies initial output contains `command + \r` and total output after delay contains `command + \r\r`.
+  - Updated `AGENTS.md` Terminal Shortcut Guidelines with the new rule about double Enter.
+- Files/Commands touched: `src/app.rs` (constants, struct, methods, test), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-05-06: "shortcuts da hepsinde yazdıktan sonra 2 kere entera tıklasın enter tıklamaları arasında çok az beklesin"
+
+---
+
 #### Terminal shortcut keys reorganized for better workflow {#terminal-shortcut-reorganization}
 - Date: 2026-05-06
 - Context: Default terminal command shortcuts for AI CLI tools

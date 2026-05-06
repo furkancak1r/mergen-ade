@@ -145,6 +145,9 @@ const DESIGN_INSPECT_MAX_FIELD_CHARS: usize = 280;
 const DESIGN_INSPECT_MAX_TEXT_CHARS: usize = 180;
 /// Polling interval while waiting for batch prompt or settle durations.
 const PENDING_RERUN_POLL_MS: u64 = 50;
+/// Delay before sending the second Enter after a terminal shortcut command.
+/// Ensures the first Enter is processed before the confirmation Enter is sent.
+const SHORTCUT_SECOND_ENTER_DELAY_MS: u64 = 50;
 
 // Embedded Nerd Font for terminal icon support (Windows-only)
 #[cfg(target_os = "windows")]
@@ -1264,6 +1267,10 @@ pub struct AdeApp {
     buffered_terminal_navigation: Vec<TerminalNavigationShortcut>,
     /// Buffered terminal command shortcuts (key, modifiers, command) captured in raw_input_hook
     buffered_terminal_command_shortcuts: Vec<(egui::Key, egui::Modifiers, String)>,
+    /// Pending second Enter presses for terminal shortcuts (terminal_id, due_at).
+    /// When a shortcut is executed, the first Enter is sent immediately and a second
+    /// Enter is scheduled after a short delay for confirmation.
+    pending_shortcut_second_enter: Vec<(u64, Instant)>,
     terminal_held_key_repeat: Option<TerminalHeldKeyRepeat>,
     allow_attention_terminal_input_routing_once: bool,
     pending_terminal_pastes: Vec<PendingTerminalPaste>,
@@ -3725,6 +3732,7 @@ impl AdeApp {
             buffered_terminal_input: Vec::new(),
             buffered_terminal_navigation: Vec::new(),
             buffered_terminal_command_shortcuts: Vec::new(),
+            pending_shortcut_second_enter: Vec::new(),
             terminal_held_key_repeat: None,
             allow_attention_terminal_input_routing_once: false,
             pending_terminal_pastes: Vec::new(),
@@ -8804,6 +8812,8 @@ impl AdeApp {
 
     /// Execute a terminal shortcut by sending its command to the active terminal.
     /// Returns true if the shortcut was handled (to consume the event).
+    /// Sends the command with bracketed paste, then sends Enter immediately,
+    /// and schedules a second Enter after a short delay for confirmation.
     fn execute_terminal_shortcut(&mut self, ctx: &egui::Context, command: &str) -> bool {
         // Only execute if we have an active terminal that accepts input
         let Some(terminal_id) = self.active_terminal_accepts_input() else {
@@ -8821,6 +8831,11 @@ impl AdeApp {
         // Shortcut commands are delivered through paste bytes so slash-prefixed
         // AI CLI commands are not interpreted as an interactive slash-menu key stream.
         if Self::send_shortcut_command_to_terminal(terminal, command, ctx) {
+            // Schedule a second Enter after a short delay for confirmation
+            let due_at = Instant::now() + Duration::from_millis(SHORTCUT_SECOND_ENTER_DELAY_MS);
+            self.pending_shortcut_second_enter
+                .push((terminal_id, due_at));
+            ctx.request_repaint_after(Duration::from_millis(SHORTCUT_SECOND_ENTER_DELAY_MS));
             self.show_status_feedback(ctx, &format!("Sent: {command}"));
             true
         } else {
@@ -11803,6 +11818,45 @@ impl AdeApp {
 
         if needs_repaint {
             ctx.request_repaint_after(poll_interval);
+        }
+    }
+
+    /// Process pending second Enter presses for terminal shortcuts.
+    /// After the initial command+Enter is sent, a second Enter is scheduled
+    /// after a short delay to confirm the command execution.
+    fn process_pending_shortcut_second_enters(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let delay = Duration::from_millis(SHORTCUT_SECOND_ENTER_DELAY_MS);
+
+        let mut to_send: Vec<u64> = Vec::new();
+        let mut still_pending: Vec<(u64, Instant)> = Vec::new();
+        let mut needs_repaint = false;
+
+        // Drain the pending list and partition into ready/still-pending
+        for (terminal_id, due_at) in std::mem::take(&mut self.pending_shortcut_second_enter) {
+            if now >= due_at {
+                to_send.push(terminal_id);
+            } else {
+                still_pending.push((terminal_id, due_at));
+                needs_repaint = true;
+            }
+        }
+
+        self.pending_shortcut_second_enter = still_pending;
+
+        // Send the second Enter to ready terminals
+        for terminal_id in to_send {
+            if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                if terminal.exited {
+                    continue;
+                }
+                terminal.runtime.send_bytes(vec![b'\r']);
+                terminal.dirty = true;
+            }
+        }
+
+        if needs_repaint {
+            ctx.request_repaint_after(delay);
         }
     }
 
@@ -20044,6 +20098,9 @@ impl eframe::App for AdeApp {
 
         // Phase 3b: Process pending background reruns after settle duration.
         self.process_pending_reruns(ctx);
+
+        // Phase 3c: Process pending second Enter presses for terminal shortcuts.
+        self.process_pending_shortcut_second_enters(ctx);
 
         self.process_source_control_events(ctx);
         self.process_directory_index_events(ctx);
@@ -35250,6 +35307,7 @@ mod tests {
             buffered_terminal_input: Vec::new(),
             buffered_terminal_navigation: Vec::new(),
             buffered_terminal_command_shortcuts: Vec::new(),
+            pending_shortcut_second_enter: Vec::new(),
             terminal_held_key_repeat: None,
             allow_attention_terminal_input_routing_once: false,
             pending_terminal_pastes: Vec::new(),
@@ -42395,6 +42453,52 @@ mod tests {
         assert!(app.terminals.get(&1).is_some_and(|terminal| {
             terminal.recent_inputs.len() == 1 && terminal.recent_inputs[0] == "cargo test"
         }));
+    }
+
+    #[test]
+    fn handle_shortcuts_sends_double_enter_with_delay() {
+        // Regression test: Terminal shortcuts should send command+Enter immediately,
+        // then a second Enter after a short delay (50ms) for confirmation.
+        let ctx = Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+
+        app.buffered_terminal_command_shortcuts = vec![(
+            egui::Key::F6,
+            egui::Modifiers::default(),
+            "/prepare-fix-plan".to_string(),
+        )];
+
+        // Phase 1: Execute shortcut - should send command + first Enter immediately
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+        capture.drain();
+
+        // Verify initial output: command + \r (no bracketed paste in this test)
+        let initial_bytes = capture.bytes();
+        assert_eq!(initial_bytes, b"/prepare-fix-plan\r".to_vec());
+
+        // Verify pending state is set for second Enter
+        assert_eq!(app.pending_shortcut_second_enter.len(), 1);
+        let (pending_terminal_id, _) = app.pending_shortcut_second_enter[0];
+        assert_eq!(pending_terminal_id, 1);
+
+        // Phase 2: Manually advance time to simulate delay passing
+        // Set the pending entry's due time to the past so it fires immediately
+        app.pending_shortcut_second_enter[0].1 = Instant::now() - Duration::from_millis(1);
+
+        // Process pending second enters
+        app.process_pending_shortcut_second_enters(&ctx);
+        capture.drain();
+
+        // Verify total output: command + \r + \r (two Enters)
+        let total_bytes = capture.bytes();
+        assert_eq!(total_bytes, b"/prepare-fix-plan\r\r".to_vec());
+
+        // Verify pending state is cleared
+        assert!(app.pending_shortcut_second_enter.is_empty());
     }
 
     #[test]
