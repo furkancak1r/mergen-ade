@@ -10,6 +10,24 @@ When adding an entry:
 
 ---
 
+#### Browser MCP cursor auto-hide timeout changed from immediate to 30 seconds {#browser-cursor-auto-hide-30s}
+- Date: 2026-05-06
+- Context: Browser MCP automation cursor visibility after tool completion
+- Error signature: Cursor immediately disappeared after each MCP tool action, then reappeared for the next action, creating a jarring visual effect. User requested cursor stay visible for a grace period so the user can see where the last action occurred.
+- Symptoms/Impact: Users could not track where the automated cursor had just interacted because it vanished instantly after each click/type/move.
+- Root cause: `hideCursorAfterTool()` was called immediately at tool completion via `runToolWithCleanup()`, unconditionally hiding the cursor element.
+- Resolution:
+  - Added `CURSOR_AUTO_HIDE_MS = 30000` constant (30 seconds) to the injected Browser MCP script.
+  - Changed `hideCursorAfterTool()` to schedule a `setTimeout` hide instead of immediate hide. The AI/MCP helper does not block on this timer; it returns immediately.
+  - Added `cancelCursorAutoHide()` helper to clear pending hide timers.
+  - `setCursorPosition()` now calls `cancelCursorAutoHide()` so any new cursor movement cancels the previous hide schedule and the 30-second countdown restarts after the latest tool completes.
+  - Bumped injected automation script version from 19 to 20.
+- Prevent recurrence:
+  - Updated test `browser_mcp_automation_script_hides_cursor_after_tool_completion` to assert presence of `CURSOR_AUTO_HIDE_MS = 30000`, `cancelCursorAutoHide`, `setTimeout`, and `clearTimeout`.
+  - Verified that cleanup is still called synchronously after promise resolution/rejection.
+- Files/Commands touched: `src/web_browser.rs` (injected automation script), `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request on 2026-05-06: "işlem bittikten sonra cursor ekranda sabit kalıyor kalmasın kaybolsun... 30 saniyelik bi geri sayım sonrası kendisi kaybolsun"
+
 #### Browser MCP only allowed single session, causing "inaccessible" errors with multiple projects {#browser-mcp-multi-session}
 - Date: 2026-05-06
 - Context: Browser MCP with 4+ concurrent OpenCode sessions across different projects

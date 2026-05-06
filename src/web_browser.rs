@@ -1916,11 +1916,13 @@ pub(crate) fn browser_mcp_output_from_devtools_runtime_raw(
 
 #[cfg(target_os = "windows")]
 const MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT: &str = r#"
-if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 19) {
+if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 20) {
   window.__mergenMcpState = window.__mergenMcpState || { refCounter: 1, consoleMessages: [], networkRequests: [], routes: [], highlighted: null };
 
   const state = window.__mergenMcpState;
   state.cursor = state.cursor || { x: Math.round(window.innerWidth / 2), y: Math.round(window.innerHeight / 2), visible: false, mouseDownButton: null };
+  // Auto-hide timer: cursor stays visible 30 seconds after last MCP tool completes
+  const CURSOR_AUTO_HIDE_MS = 30000;
   state.cursor.anchorElement = state.cursor.anchorElement || null;
   const clean = (value, max = 240) => String(value ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
   const visible = (element) => {
@@ -2002,10 +2004,10 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 19) {
   const buttonMask = (button) => ({ left: 1, middle: 4, right: 2 }[buttonName(button)]);
     const ensureCursorStyle = () => {
     const existing = document.querySelector('style[data-mergen-mcp-cursor-style]');
-    if (existing?.getAttribute('data-mergen-mcp-cursor-style') === '19') return;
+    if (existing?.getAttribute('data-mergen-mcp-cursor-style') === '20') return;
     existing?.remove();
     const style = document.createElement('style');
-    style.setAttribute('data-mergen-mcp-cursor-style', '19');
+    style.setAttribute('data-mergen-mcp-cursor-style', '20');
     style.textContent = `
 [data-mergen-mcp-cursor] [data-mergen-mcp-cursor-pointer] {
   transition: transform 120ms cubic-bezier(0.16, 1, 0.3, 1);
@@ -2040,7 +2042,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 19) {
     if (
       state.cursorElement &&
       document.documentElement.contains(state.cursorElement) &&
-      state.cursorElement.getAttribute?.('data-mergen-mcp-cursor-version') === '19' &&
+      state.cursorElement.getAttribute?.('data-mergen-mcp-cursor-version') === '20' &&
       state.cursorElement.querySelector?.('[data-mergen-mcp-cursor-pointer]')
     ) {
       return state.cursorElement;
@@ -2048,7 +2050,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 19) {
     state.cursorElement?.remove?.();
     const cursor = document.createElement('div');
     cursor.setAttribute('data-mergen-mcp-cursor', 'true');
-    cursor.setAttribute('data-mergen-mcp-cursor-version', '19');
+    cursor.setAttribute('data-mergen-mcp-cursor-version', '20');
     cursor.setAttribute('data-mergen-mcp-cursor-phase', state.cursor.phase || 'idle');
     Object.assign(cursor.style, {
       position: 'fixed',
@@ -2134,14 +2136,26 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 19) {
       if (state.cursor.phaseToken === token && state.cursor.visible) setCursorPhase('idle');
     }, delay);
   };
+  const cancelCursorAutoHide = () => {
+    if (state.cursorAutoHideTimer) {
+      clearTimeout(state.cursorAutoHideTimer);
+      state.cursorAutoHideTimer = null;
+    }
+  };
   const hideCursorAfterTool = () => {
     if (state.cursor.mouseDownButton) return;
-    if (!state.cursorElement) return;
-    state.cursorElement.style.display = 'none';
-    state.cursor.visible = false;
-    state.cursor.phase = 'idle';
-    state.cursor.tilt = 0;
-    clearCursorAnchor();
+    // Cancel any existing hide timer to avoid duplicate scheduling
+    cancelCursorAutoHide();
+    // Schedule auto-hide after 30 seconds; AI does not wait/block for this
+    state.cursorAutoHideTimer = setTimeout(() => {
+      if (!state.cursorElement) return;
+      state.cursorElement.style.display = 'none';
+      state.cursor.visible = false;
+      state.cursor.phase = 'idle';
+      state.cursor.tilt = 0;
+      clearCursorAnchor();
+      state.cursorAutoHideTimer = null;
+    }, CURSOR_AUTO_HIDE_MS);
   };
   const setCursorPosition = (x, y, options = {}) => {
     const point = clampPoint(x, y);
@@ -2160,6 +2174,8 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 19) {
     state.cursor.x = point.x;
     state.cursor.y = point.y;
     state.cursor.visible = true;
+    // Cancel any pending auto-hide when cursor becomes active
+    cancelCursorAutoHide();
     updateCursorTheme(point);
     return point;
   };
@@ -3501,7 +3517,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 19) {
   });
   window.addEventListener('scroll', scheduleVisualAnchorSync, true);
   window.addEventListener('resize', scheduleVisualAnchorSync);
-  window.__mergenMcpRun.version = 19;
+  window.__mergenMcpRun.version = 20;
 }
 "#;
 
@@ -4229,7 +4245,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn browser_mcp_automation_script_includes_visible_cursor_and_mouse_tools() {
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 19"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 20"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-version"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-pointer"));
@@ -4368,7 +4384,12 @@ mod tests {
         // hideCursorAfterTool should check mouseDownButton and skip if active
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
             .contains("if (state.cursor.mouseDownButton) return;"));
-        // Should hide cursor and reset state
+        // Auto-hide uses setTimeout with 30 second delay; AI does not wait
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("CURSOR_AUTO_HIDE_MS = 30000"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("cancelCursorAutoHide"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("setTimeout"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("clearTimeout"));
+        // Should hide cursor and reset state (inside the setTimeout callback)
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
             .contains("state.cursorElement.style.display = 'none';"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("state.cursor.visible = false;"));
@@ -4379,6 +4400,8 @@ mod tests {
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
             .contains("(value) => { cleanup(); return value; }"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("(err) => { cleanup(); throw err; }"));
+        // Cancel auto-hide when cursor becomes visible again
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("cancelCursorAutoHide();"));
     }
 
     #[test]
