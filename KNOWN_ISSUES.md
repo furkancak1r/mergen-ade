@@ -490,3 +490,36 @@ When adding an entry:
 
 (End of file - total 3872 lines)
 
+---
+
+#### Browser panel compact UI - vertical space optimization {#browser-panel-compact-ui}
+- Date: 2026-05-06
+- Context: Browser panel UX - user requested more vertical space for the web view
+- Error signature: The browser panel header, project name, wrapping tabs, URL input, and action buttons were consuming ~170-190px of vertical space, leaving less room for the actual embedded browser content.
+- Symptoms/Impact: On smaller screens, the web view was cramped; tabs could wrap to multiple lines taking even more space; browser panel felt cluttered with excessive chrome.
+- Root cause:
+  - Separate header row with "Browser" title and separator.
+  - Separate project name display row.
+  - Tabs used `horizontal_wrapped` which could consume multiple rows when the panel was narrow.
+  - URL input was full-width on its own row.
+  - Action buttons (Go, Clear, Design Inspect, Screenshot) were on a separate row.
+  - Inner margins were 10px on all sides, and spacing between elements was 8-16px.
+- Resolution:
+  - Removed separate "Browser" header and project name rows - the active project is implicit via the activity rail and terminal context.
+  - Changed tabs from `horizontal_wrapped` to single-row `horizontal` with `ScrollArea::horizontal()` for overflow handling - tabs never wrap, always stay on one line.
+  - Combined URL input and all action buttons into a single compact toolbar row:
+    - URL input takes available width minus button area.
+    - Go (arrow), Clear (trash), Design Inspect (eye), and Screenshot (camera) buttons are inline after the URL field.
+  - Reduced inner margins from 10px to 6px symmetric.
+  - Reduced spacing between UI elements from 8-16px to 4-6px.
+  - Reduced tab height from 26px to 22px, tab close size from 18px to 16px, and adjusted padding/margins proportionally.
+  - Reduced font size in tabs from 12px to 11px.
+  - Vertical space saved: approximately 110-130px (from ~170-190px to ~60-80px of chrome).
+- Prevent recurrence:
+  - The compact layout should be tested with 5 tabs (max) to ensure horizontal scrolling works properly.
+  - Test with very narrow panel widths to verify the URL field remains usable (minimum 100px).
+  - Updated test `browser_tab_close_rect_stays_inside_tab_top_right` to use dynamic top calculation based on centered close button.
+- Files/Commands touched: `src/app.rs` (constants BROWSER_TAB_HEIGHT, BROWSER_TAB_CLOSE_SIZE, BROWSER_TAB_CLOSE_MARGIN, BROWSER_TAB_LABEL_LEFT_PADDING, BROWSER_TAB_LABEL_RIGHT_GAP; `draw_browser_panel()` function), `KNOWN_ISSUES.md`
+- References: User request 2026-05-06: browser kismi dikeyde browser disindaki ogeler linkler butonlar filan cok yer kapliyor orayi modifiye etmeni istiyorum amacim browserin dikeyde daha cok yere yayilmasi ux odakli ilerle
+
+(End of file - total 3872 lines)

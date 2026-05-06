@@ -93,11 +93,11 @@ const BROWSER_SCREENSHOT_REQUEST_PREFIX: &str = "browser-ui-screenshot";
 const BROWSER_RECORDING_PLAYBACK_RATE: f64 = 2.0;
 const BROWSER_MAX_TABS_PER_PROJECT: usize = 5;
 const BROWSER_TAB_WIDTH: f32 = 126.0;
-const BROWSER_TAB_HEIGHT: f32 = 26.0;
-const BROWSER_TAB_CLOSE_SIZE: f32 = 18.0;
-const BROWSER_TAB_CLOSE_MARGIN: f32 = 4.0;
-const BROWSER_TAB_LABEL_LEFT_PADDING: f32 = 10.0;
-const BROWSER_TAB_LABEL_RIGHT_GAP: f32 = 4.0;
+const BROWSER_TAB_HEIGHT: f32 = 22.0; // Compact tab height for more vertical space
+const BROWSER_TAB_CLOSE_SIZE: f32 = 16.0;
+const BROWSER_TAB_CLOSE_MARGIN: f32 = 3.0;
+const BROWSER_TAB_LABEL_LEFT_PADDING: f32 = 8.0;
+const BROWSER_TAB_LABEL_RIGHT_GAP: f32 = 3.0;
 const TERMINAL_SNAPSHOT_BUDGET_PER_FRAME: usize = 2;
 const REPAINT_DEBOUNCE_MS: u64 = 5;
 const INPUT_ROUTING_GATE_MS: u64 = 75;
@@ -18177,21 +18177,10 @@ impl AdeApp {
                     .fill(SURFACE_BG)
                     .stroke(Stroke::new(1.0, BORDER_COLOR))
                     .rounding(8.0)
-                    .inner_margin(egui::Margin::same(10.0)),
+                    .inner_margin(egui::Margin::symmetric(6.0, 6.0)), // Reduced margins
             )
             .show(ctx, |ui| {
                 ui.set_width(ui.max_rect().width());
-
-                // Header
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Browser")
-                            .strong()
-                            .size(15.0)
-                            .color(TEXT_PRIMARY),
-                    );
-                });
-                ui.separator();
 
                 // Get browser project info
                 let selected_project_info = self.projects.get(&browser_project_id).map(|p| {
@@ -18202,119 +18191,122 @@ impl AdeApp {
                     )
                 });
 
-                if let Some((project_id, project_name, browser_last_url)) = selected_project_info {
+                if let Some((project_id, _project_name, browser_last_url)) = selected_project_info {
                     let browser_status = self
                         .embedded_browsers_by_project
                         .get(&browser_project_id)
                         .map(|browser| browser.status())
                         .unwrap_or(BrowserStatus::Uninitialized);
 
-                    // Project name display
-                    ui.label(
-                        RichText::new(format!("{}", project_name))
-                            .color(TEXT_MUTED)
-                            .size(12.0),
-                    );
-                    ui.add_space(8.0);
-
                     self.ensure_browser_tab_state(project_id);
                     let tab_summaries = self.browser_tab_summary(project_id);
                     let mut tab_to_select = None;
                     let mut tab_to_close = None;
                     let mut add_tab_requested = false;
-                    ui.horizontal_wrapped(|ui| {
-                        for (tab_id, title, url, is_active) in &tab_summaries {
-                            let fill = if *is_active {
-                                with_alpha(BTN_ICON_HOVER, 130)
-                            } else {
-                                Color32::TRANSPARENT
-                            };
-                            let stroke = if *is_active {
-                                Stroke::new(1.0, with_alpha(TEXT_PRIMARY, 60))
-                            } else {
-                                Stroke::new(1.0, with_alpha(TEXT_PRIMARY, 24))
-                            };
 
-                            let (tab_rect, tab_response) = ui.allocate_exact_size(
-                                egui::vec2(BROWSER_TAB_WIDTH, BROWSER_TAB_HEIGHT),
-                                Sense::click(),
-                            );
-                            let close_rect = browser_tab_close_rect(tab_rect);
-                            let label_rect = browser_tab_label_rect(tab_rect);
-                            let close_response = ui
-                                .interact(
-                                    close_rect,
-                                    ui.make_persistent_id(("browser-tab-close", project_id, tab_id)),
-                                    Sense::click(),
-                                )
-                                .on_hover_text("Close tab")
-                                .on_hover_cursor(egui::CursorIcon::PointingHand);
-                            let tab_response = tab_response
-                                .on_hover_text(
-                                    url.as_deref().unwrap_or(title.as_str()).to_owned(),
-                                )
-                                .on_hover_cursor(egui::CursorIcon::PointingHand);
-                            let tab_hovered = tab_response.hovered() || close_response.hovered();
-                            let painted_fill = if *is_active {
-                                fill
-                            } else if tab_hovered {
-                                with_alpha(BTN_ICON_HOVER, 54)
-                            } else {
-                                fill
-                            };
+                    // Compact tab strip - single row, non-wrapping
+                    ui.horizontal(|ui| {
+                        // Scrollable tab area
+                        egui::ScrollArea::horizontal()
+                            .id_salt("browser_tabs_scroll")
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    for (tab_id, title, url, is_active) in &tab_summaries {
+                                        let fill = if *is_active {
+                                            with_alpha(BTN_ICON_HOVER, 130)
+                                        } else {
+                                            Color32::TRANSPARENT
+                                        };
+                                        let stroke = if *is_active {
+                                            Stroke::new(1.0, with_alpha(TEXT_PRIMARY, 60))
+                                        } else {
+                                            Stroke::new(1.0, with_alpha(TEXT_PRIMARY, 24))
+                                        };
 
-                            ui.painter()
-                                .rect_filled(tab_rect.shrink(0.5), 6.0, painted_fill);
-                            ui.painter()
-                                .rect_stroke(tab_rect.shrink(0.5), 6.0, stroke);
+                                        let (tab_rect, tab_response) = ui.allocate_exact_size(
+                                            egui::vec2(BROWSER_TAB_WIDTH, BROWSER_TAB_HEIGHT),
+                                            Sense::click(),
+                                        );
+                                        let close_rect = browser_tab_close_rect(tab_rect);
+                                        let label_rect = browser_tab_label_rect(tab_rect);
+                                        let close_response = ui
+                                            .interact(
+                                                close_rect,
+                                                ui.make_persistent_id(("browser-tab-close", project_id, tab_id)),
+                                                Sense::click(),
+                                            )
+                                            .on_hover_text("Close tab")
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                        let tab_response = tab_response
+                                            .on_hover_text(
+                                                url.as_deref().unwrap_or(title.as_str()).to_owned(),
+                                            )
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                        let tab_hovered = tab_response.hovered() || close_response.hovered();
+                                        let painted_fill = if *is_active {
+                                            fill
+                                        } else if tab_hovered {
+                                            with_alpha(BTN_ICON_HOVER, 54)
+                                        } else {
+                                            fill
+                                        };
 
-                            let mut label_ui = ui.new_child(
-                                egui::UiBuilder::new()
-                                    .max_rect(label_rect)
-                                    .layout(Layout::left_to_right(Align::Center)),
-                            );
-                            label_ui.set_clip_rect(label_rect);
-                            label_ui.add(
-                                egui::Label::new(
-                                    RichText::new(capped_hover_text(title, 18))
-                                        .size(12.0)
-                                        .color(if *is_active { TEXT_PRIMARY } else { TEXT_MUTED }),
-                                )
-                                .truncate()
-                                .selectable(false),
-                            );
+                                        ui.painter()
+                                            .rect_filled(tab_rect.shrink(0.5), 4.0, painted_fill);
+                                        ui.painter()
+                                            .rect_stroke(tab_rect.shrink(0.5), 4.0, stroke);
 
-                            if close_response.hovered() {
-                                ui.painter().rect_filled(
-                                    close_rect.shrink(1.0),
-                                    4.0,
-                                    with_alpha(BTN_ICON_HOVER, 115),
-                                );
-                            }
-                            ui.painter().text(
-                                close_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                format!("{}", icons::X),
-                                FontId::proportional(11.0),
-                                if close_response.hovered() {
-                                    TEXT_PRIMARY
-                                } else {
-                                    TEXT_MUTED
-                                },
-                            );
+                                        let mut label_ui = ui.new_child(
+                                            egui::UiBuilder::new()
+                                                .max_rect(label_rect)
+                                                .layout(Layout::left_to_right(Align::Center)),
+                                        );
+                                        label_ui.set_clip_rect(label_rect);
+                                        label_ui.add(
+                                            egui::Label::new(
+                                                RichText::new(capped_hover_text(title, 18))
+                                                    .size(11.0)
+                                                    .color(if *is_active { TEXT_PRIMARY } else { TEXT_MUTED }),
+                                            )
+                                            .truncate()
+                                            .selectable(false),
+                                        );
 
-                            if close_response.clicked() {
-                                tab_to_close = Some(*tab_id);
-                            } else if tab_response.clicked() {
-                                tab_to_select = Some(*tab_id);
-                            }
-                            ui.add_space(2.0);
-                        }
+                                        if close_response.hovered() {
+                                            ui.painter().rect_filled(
+                                                close_rect.shrink(1.0),
+                                                3.0,
+                                                with_alpha(BTN_ICON_HOVER, 115),
+                                            );
+                                        }
+                                        ui.painter().text(
+                                            close_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            format!("{}", icons::X),
+                                            FontId::proportional(10.0),
+                                            if close_response.hovered() {
+                                                TEXT_PRIMARY
+                                            } else {
+                                                TEXT_MUTED
+                                            },
+                                        );
 
+                                        if close_response.clicked() {
+                                            tab_to_close = Some(*tab_id);
+                                        } else if tab_response.clicked() {
+                                            tab_to_select = Some(*tab_id);
+                                        }
+                                        ui.add_space(2.0);
+                                    }
+                                });
+                            });
+
+                        // Add tab button inline with tabs
                         let can_add_tab = tab_summaries.len() < BROWSER_MAX_TABS_PER_PROJECT;
                         let add_button = egui::Button::new(
                             RichText::new(format!("{}", icons::PLUS))
-                                .size(13.0)
+                                .size(12.0)
                                 .color(if can_add_tab { TEXT_PRIMARY } else { TEXT_MUTED }),
                         )
                         .frame(false);
@@ -18350,21 +18342,22 @@ impl AdeApp {
                         ctx.request_repaint();
                     }
 
-                    ui.add_space(8.0);
+                    ui.add_space(4.0);
 
                     // Get or initialize the URL draft for this project
-                    // Initialize from saved URL if draft is empty and URL exists
                     if !self.browser_url_draft_by_project.contains_key(&project_id) {
                         let initial_draft = browser_last_url.clone().unwrap_or_default();
                         self.browser_url_draft_by_project
                             .insert(project_id, initial_draft);
                     }
 
-                    // URL input with navigation - uses persistent draft state
-                    let draft = self
+                    // Compact toolbar: URL input + action buttons in one row
+                    // Get draft as a cloned value to avoid borrow issues
+                    let mut draft = self
                         .browser_url_draft_by_project
-                        .entry(browser_project_id)
-                        .or_default();
+                        .get(&browser_project_id)
+                        .cloned()
+                        .unwrap_or_default();
                     let url_input_id = Self::browser_url_input_id(browser_project_id);
 
                     // Load current selection state before rendering (for context menu)
@@ -18373,16 +18366,163 @@ impl AdeApp {
                             .and_then(|state| state.cursor.char_range())
                             .filter(|range| range.primary != range.secondary);
 
-                    let url_text_edit = egui::TextEdit::singleline(draft)
-                        .id(url_input_id)
-                        .hint_text("Enter URL (https://...)")
-                        .vertical_align(egui::Align::Center);
+                    // Collect UI action results to avoid closure borrowing issues
+                    let mut go_requested = false;
+                    let mut clear_requested = false;
+                    let mut inspect_toggle_requested = false;
+                    let mut url_enter_pressed = false;
+                    let mut copy_requested: Option<String> = None;
+                    let mut paste_requested: Option<String> = None;
+                    let mut context_menu_range: Option<egui::text::CCursorRange> = None;
+                    let mut double_clicked = false;
 
-                    let url_response = ui
-                        .add_sized([ui.available_width(), CONTROL_ROW_HEIGHT], url_text_edit);
+                    ui.horizontal(|ui| {
+                        // URL input takes most of the space
+                        let available_width = ui.available_width();
+                        let button_count = 4.0; // Go, Clear, Inspect, Screenshot
+                        let button_spacing = 4.0 * (button_count - 1.0);
+                        let button_width = CONTROL_ROW_HEIGHT * button_count;
+                        let url_width = (available_width - button_width - button_spacing - 8.0).max(100.0);
+
+                        let url_text_edit = egui::TextEdit::singleline(&mut draft)
+                            .id(url_input_id)
+                            .hint_text("Enter URL...")
+                            .vertical_align(egui::Align::Center);
+
+                        let url_response = ui.add_sized(
+                            [url_width, CONTROL_ROW_HEIGHT],
+                            url_text_edit
+                        );
+
+                        // Capture input events for processing after the borrow ends
+                        if url_response.double_clicked() {
+                            double_clicked = true;
+                        }
+                        if url_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            url_enter_pressed = true;
+                        }
+
+                        // Get post-render selection state for context menu
+                        let post_show_range = egui::text_edit::TextEditState::load(ui.ctx(), url_input_id)
+                            .and_then(|state| state.cursor.char_range())
+                            .filter(|range| range.primary != range.secondary);
+
+                        let effective_range = pre_click_range.or(post_show_range);
+                        let has_selection = effective_range.is_some();
+                        let url_for_copy = effective_range
+                            .as_ref()
+                            .and_then(|range| extract_text_from_char_range(&draft, Some(*range)))
+                            .or_else(|| {
+                                if draft.is_empty() { None } else { Some(draft.clone()) }
+                            });
+
+                        let can_paste = Clipboard::new()
+                            .map_err(|_| false)
+                            .and_then(|mut cb| cb.get_text().map(|_| true).map_err(|_| false))
+                            .unwrap_or(false);
+
+                        url_response.context_menu(|ui| {
+                            with_minimal_button_chrome(ui, |ui| {
+                                let copy_enabled = url_for_copy.is_some();
+                                let copy_button = ui.add_enabled(
+                                    copy_enabled,
+                                    egui::Button::new(format!("{} Copy", icons::COPY)),
+                                );
+                                if copy_button.clicked() && copy_enabled {
+                                    if let Some(text) = url_for_copy {
+                                        copy_requested = Some(text);
+                                    }
+                                    ui.close_menu();
+                                }
+
+                                ui.separator();
+
+                                let paste_button = ui.add_enabled(
+                                    can_paste,
+                                    egui::Button::new(format!("{} Paste", icons::COPY)),
+                                );
+                                if paste_button.clicked() && can_paste {
+                                    paste_requested = Some(String::new());
+                                    ui.close_menu();
+                                }
+                            });
+                        });
+
+                        // Store context for paste processing
+                        if paste_requested.is_some() {
+                            context_menu_range = effective_range;
+                        }
+
+                        ui.add_space(4.0);
+
+                        // Go button
+                        if styled_icon_button(
+                            ui,
+                            icons::ARROW_RIGHT,
+                            BTN_TEAL,
+                            BTN_TEAL_HOVER,
+                            BTN_ICON_ACTIVE,
+                            "Go to URL",
+                        ) {
+                            go_requested = true;
+                        }
+
+                        ui.add_space(4.0);
+
+                        // Clear URL button
+                        if styled_icon_button(
+                            ui,
+                            icons::TRASH,
+                            BTN_RED,
+                            BTN_RED_HOVER,
+                            Color32::from_rgb(186, 58, 58),
+                            "Clear URL",
+                        ) {
+                            clear_requested = true;
+                        }
+
+                        ui.add_space(4.0);
+
+                        // Design Inspect toggle
+                        let design_inspect_enabled =
+                            self.is_browser_design_inspect_enabled_for_project(browser_project_id);
+                        let inspect_tooltip = if design_inspect_enabled {
+                            "Design Inspect: ON (click to disable)"
+                        } else {
+                            "Design Inspect: OFF (click to enable)"
+                        };
+                        let inspect_icon = if design_inspect_enabled {
+                            icons::EYE
+                        } else {
+                            icons::EYE_OFF
+                        };
+                        if activity_rail_icon_button(
+                            ui,
+                            design_inspect_enabled,
+                            inspect_icon,
+                            inspect_tooltip,
+                        )
+                        .clicked()
+                        {
+                            inspect_toggle_requested = true;
+                        }
+
+                        ui.add_space(4.0);
+
+                        // Screenshot dropdown button
+                        let screenshot_menu_open =
+                            self.draw_browser_screenshot_button(ui, ctx, browser_project_id);
+                        self.browser_panel_dropdown_open =
+                            self.browser_panel_dropdown_open || screenshot_menu_open;
+                    });
+
+                    // Process actions after the UI borrow ends
+                    // First, update the draft back to storage
+                    self.browser_url_draft_by_project
+                        .insert(browser_project_id, draft.clone());
 
                     // Handle double-click to select all URL text
-                    if url_response.double_clicked() {
+                    if double_clicked {
                         let total_chars = draft.chars().count();
                         if total_chars > 0 {
                             let select_all_range = egui::text::CCursorRange::two(
@@ -18398,74 +18538,16 @@ impl AdeApp {
                         }
                     }
 
-                    // Get post-render selection state
-                    let post_show_range = egui::text_edit::TextEditState::load(ui.ctx(), url_input_id)
-                        .and_then(|state| state.cursor.char_range())
-                        .filter(|range| range.primary != range.secondary);
-
-                    // Context menu with Copy/Paste
-                    let effective_range = pre_click_range.or(post_show_range);
-                    let has_selection = effective_range.is_some();
-                    let url_for_copy = effective_range
-                        .and_then(|range| extract_text_from_char_range(draft, Some(range)))
-                        .or_else(|| {
-                            // If no selection, offer to copy all text if not empty
-                            if draft.is_empty() {
-                                None
-                            } else {
-                                Some(draft.clone())
-                            }
-                        });
-
-                    // Check clipboard for paste availability (outside closure)
-                    let can_paste = Clipboard::new()
-                        .map_err(|_| false)
-                        .and_then(|mut cb| cb.get_text().map(|_| true).map_err(|_| false))
-                        .unwrap_or(false);
-
-                    // Track actions requested from context menu
-                    let mut copy_requested: Option<String> = None;
-                    let mut paste_requested: Option<String> = None;
-
-                    url_response.context_menu(|ui| {
-                        with_minimal_button_chrome(ui, |ui| {
-                            // Copy button - enabled if there's text to copy
-                            let copy_enabled = url_for_copy.is_some();
-                            let copy_button = ui.add_enabled(
-                                copy_enabled,
-                                egui::Button::new(format!("{} Copy", icons::COPY)),
-                            );
-                            if copy_button.clicked() && copy_enabled {
-                                if let Some(text) = url_for_copy {
-                                    copy_requested = Some(text);
-                                }
-                                ui.close_menu();
-                            }
-
-                            ui.separator();
-
-                            // Paste button
-                            let paste_button = ui.add_enabled(
-                                can_paste,
-                                egui::Button::new(format!("{} Paste", icons::COPY)),
-                            );
-                            if paste_button.clicked() && can_paste {
-                                paste_requested = Some(String::new()); // Will be filled outside closure
-                                ui.close_menu();
-                            }
-                        });
-                    });
-
-                    // Execute copy/paste actions outside the closure to avoid borrow issues
+                    // Handle copy from context menu
                     if let Some(text_to_copy) = copy_requested {
                         ui.ctx().copy_text(text_to_copy);
                         self.status_line = "Copied to clipboard".to_owned();
                     }
 
-                    if paste_requested.is_some() && can_paste {
+                    // Handle paste from context menu
+                    if paste_requested.is_some() {
                         if let Ok(mut clipboard) = Clipboard::new() {
                             if let Ok(paste_text) = clipboard.get_text() {
-                                // Get current cursor position for insertion
                                 let cursor_pos = egui::text_edit::TextEditState::load(
                                     ui.ctx(),
                                     url_input_id,
@@ -18474,20 +18556,18 @@ impl AdeApp {
                                     state.cursor.char_range().map(|r| r.primary.index)
                                 });
 
-                                match cursor_pos {
-                                    Some(_pos) if has_selection => {
-                                        // Replace selection with pasted text
+                                let effective_range = context_menu_range;
+                                let has_selection = effective_range.is_some();
+
+                                let new_draft = if let Some(pos) = cursor_pos {
+                                    if has_selection {
                                         if let Some(range) = effective_range {
                                             let [start, end] = range.sorted();
                                             let before: String =
                                                 draft.chars().take(start.index).collect();
                                             let after: String =
                                                 draft.chars().skip(end.index).collect();
-                                            *draft =
-                                                format!("{}{}{}", before, paste_text, after);
-                                            // Update cursor position after paste
-                                            let new_pos =
-                                                start.index + paste_text.chars().count();
+                                            let new_pos = start.index + paste_text.chars().count();
                                             if let Some(mut state) =
                                                 egui::text_edit::TextEditState::load(
                                                     ui.ctx(),
@@ -18500,16 +18580,15 @@ impl AdeApp {
                                                 state.cursor.set_char_range(Some(new_range));
                                                 state.store(ui.ctx(), url_input_id);
                                             }
+                                            Some(format!("{}{}{}", before, paste_text, after))
+                                        } else {
+                                            None
                                         }
-                                    }
-                                    Some(pos) => {
-                                        // Insert at cursor position
+                                    } else {
                                         let before: String =
                                             draft.chars().take(pos).collect();
                                         let after: String =
                                             draft.chars().skip(pos).collect();
-                                        *draft = format!("{}{}{}", before, paste_text, after);
-                                        // Update cursor position after paste
                                         let new_pos = pos + paste_text.chars().count();
                                         if let Some(mut state) =
                                             egui::text_edit::TextEditState::load(
@@ -18523,124 +18602,68 @@ impl AdeApp {
                                             state.cursor.set_char_range(Some(new_range));
                                             state.store(ui.ctx(), url_input_id);
                                         }
+                                        Some(format!("{}{}{}", before, paste_text, after))
                                     }
-                                    None => {
-                                        // Fallback: replace entire text
-                                        *draft = paste_text;
-                                    }
+                                } else {
+                                    Some(paste_text)
+                                };
+                                if let Some(new_draft) = new_draft {
+                                    self.browser_url_draft_by_project
+                                        .insert(browser_project_id, new_draft);
                                 }
                                 self.status_line = "Pasted from clipboard".to_owned();
                             }
                         }
                     }
 
-                    // Navigate on Enter key
-                    if url_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        let url_to_submit = draft.clone();
-                        self.submit_browser_url(ctx, browser_project_id, &url_to_submit);
+                    // Handle Go button
+                    if go_requested || url_enter_pressed {
+                        self.submit_browser_url(ctx, browser_project_id, &draft);
                     }
 
-                    ui.add_space(8.0);
-
-                    // Action buttons row
-                    ui.horizontal(|ui| {
-                        // Go button (submits the URL)
-                        if styled_icon_button(
-                            ui,
-                            icons::ARROW_RIGHT,
-                            BTN_TEAL,
-                            BTN_TEAL_HOVER,
-                            BTN_ICON_ACTIVE,
-                            "Go to URL",
-                        ) {
-                            let url_to_submit = self
-                                .browser_url_draft_by_project
-                                .get(&browser_project_id)
-                                .cloned()
-                                .unwrap_or_default();
-                            self.submit_browser_url(ctx, browser_project_id, &url_to_submit);
-                        }
-
-                        ui.add_space(8.0);
-
-                        // Clear URL button
-                        if styled_icon_button(
-                            ui,
-                            icons::TRASH,
-                            BTN_RED,
-                            BTN_RED_HOVER,
-                            Color32::from_rgb(186, 58, 58),
-                            "Clear saved URL",
-                        ) {
-                            if self.projects.contains_key(&browser_project_id) {
-                                if let Some(project) = self.projects.get_mut(&browser_project_id) {
-                                    project.browser_last_url = None;
-                                }
-                                // Also clear the draft
-                                self.browser_url_draft_by_project
-                                    .remove(&browser_project_id);
-                                if let Some(tab_id) = self.active_browser_tab_id(browser_project_id)
-                                {
-                                    if let Some(tab) =
-                                        self.browser_tab_mut(browser_project_id, tab_id)
-                                    {
-                                        tab.url = None;
-                                        tab.draft.clear();
-                                        tab.title = "New Tab".to_owned();
-                                        tab.kind = BrowserTabKind::Page;
-                                    }
-                                }
-                                self.note_projects_changed();
-                                self.persist_config();
+                    // Handle Clear URL button
+                    if clear_requested {
+                        if self.projects.contains_key(&browser_project_id) {
+                            if let Some(project) = self.projects.get_mut(&browser_project_id) {
+                                project.browser_last_url = None;
                             }
+                            self.browser_url_draft_by_project
+                                .remove(&browser_project_id);
+                            if let Some(tab_id) = self.active_browser_tab_id(browser_project_id)
+                            {
+                                if let Some(tab) =
+                                    self.browser_tab_mut(browser_project_id, tab_id)
+                                {
+                                    tab.url = None;
+                                    tab.draft.clear();
+                                    tab.title = "New Tab".to_owned();
+                                    tab.kind = BrowserTabKind::Page;
+                                }
+                            }
+                            self.note_projects_changed();
+                            self.persist_config();
                         }
+                    }
 
-                        ui.add_space(8.0);
-
+                    // Handle Design Inspect toggle
+                    if inspect_toggle_requested {
                         let design_inspect_enabled =
                             self.is_browser_design_inspect_enabled_for_project(browser_project_id);
-                        let inspect_tooltip = if design_inspect_enabled {
-                            "Disable Design Inspect"
+                        let enabled = !design_inspect_enabled;
+                        self.set_browser_design_inspect_enabled_for_project(
+                            browser_project_id,
+                            enabled,
+                        );
+                        self.status_line = if enabled {
+                            "Design inspect enabled: click a page element to send context to the active terminal"
+                                .to_owned()
                         } else {
-                            "Enable Design Inspect"
+                            "Design inspect disabled".to_owned()
                         };
-                        let inspect_icon = if design_inspect_enabled {
-                            icons::EYE
-                        } else {
-                            icons::EYE_OFF
-                        };
-                        if activity_rail_icon_button(
-                            ui,
-                            design_inspect_enabled,
-                            inspect_icon,
-                            inspect_tooltip,
-                        )
-                        .clicked()
-                        {
-                            let enabled = !design_inspect_enabled;
-                            self.set_browser_design_inspect_enabled_for_project(
-                                browser_project_id,
-                                enabled,
-                            );
-                            self.status_line = if enabled {
-                                "Design inspect enabled: click a page element to send context to the active terminal; page click actions are blocked while inspecting"
-                                    .to_owned()
-                            } else {
-                                "Design inspect disabled".to_owned()
-                            };
-                            ctx.request_repaint();
-                        }
+                        ctx.request_repaint();
+                    }
 
-                        ui.add_space(8.0);
-
-                        // Screenshot dropdown button
-                        let screenshot_menu_open =
-                            self.draw_browser_screenshot_button(ui, ctx, browser_project_id);
-                        self.browser_panel_dropdown_open =
-                            self.browser_panel_dropdown_open || screenshot_menu_open;
-                    });
-
-                    ui.add_space(16.0);
+                    ui.add_space(6.0);
 
                     // Allocate space for the embedded WebView
                     let available_height = ui.available_height();
@@ -43102,7 +43125,10 @@ mod tests {
             close_rect.right(),
             tab_rect.right() - super::BROWSER_TAB_CLOSE_MARGIN
         );
-        assert_eq!(close_rect.top(), tab_rect.top() + 4.0);
+        // Close button is centered vertically: top = tab_rect.top() + ((tab_rect.height() - close_size) / 2)
+        let expected_top = tab_rect.top()
+            + ((tab_rect.height() - super::BROWSER_TAB_CLOSE_SIZE.min(tab_rect.height())) / 2.0).max(0.0);
+        assert_eq!(close_rect.top(), expected_top);
         assert!(label_rect.right() <= close_rect.left() - super::BROWSER_TAB_LABEL_RIGHT_GAP);
         assert!(!label_rect.intersects(close_rect));
     }

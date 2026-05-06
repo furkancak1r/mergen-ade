@@ -238,6 +238,17 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Browser MCP waits must not block egui update paths.** Fixed waits and polling should run in the MCP helper or another non-UI pending flow, not inside `AdeApp::process_browser_mcp_commands()` or WebView script execution that blocks the UI frame.
 - **Native WebView focus must yield to terminal activation.** When a terminal is activated—including re-selecting the same terminal—clear app text-input focus via `surrender_ui_text_focus()` and restore the host window focus via `SetFocus(hwnd)` on Windows. This ensures browser URL input and native WebView2 keyboard focus do not block terminal input capture.
 
+## Browser Panel Compact UI Guidelines
+- **Browser panel UI must minimize vertical chrome to maximize WebView space.** The panel should allocate ~60-80px total for all UI chrome (tabs + toolbar), leaving the rest for the embedded browser content.
+- **Avoid separate header rows for titles or project names.** The browser panel header should not have a dedicated "Browser" title row or separate project name display; use the activity rail and terminal context to indicate the active project.
+- **Tabs must stay on a single row using horizontal scroll.** Use `ScrollArea::horizontal()` around the tab strip to prevent tabs from wrapping to multiple lines. This keeps tab height predictable (22px) regardless of panel width.
+- **Combine URL input and action buttons into one compact toolbar row.** Place the URL input field on the left taking available width, followed by icon-only buttons (Go, Clear, Design Inspect, Screenshot) on the same row with minimal 4px spacing.
+- **Use reduced padding and margins throughout.** Inner margins should be 6px (not 10px); spacing between UI sections should be 4-6px (not 8-16px).
+- **Reduce tab dimensions for compactness.** Tab height should be 22px (not 26px); tab close button should be 16px (not 18px); tab font should be 11px (not 12px).
+- **Preserve all functionality in compact layout.** URL editing with context menu (Copy/Paste), double-click to select all, tab switching/closing, and all toolbar buttons must remain fully functional.
+- **Maintain minimum URL input width.** The URL field should have a minimum width of 100px to remain usable even at narrow panel widths.
+- **Use scrollable tabs at max tab limit.** With 5 tabs (BROWSER_MAX_TABS_PER_PROJECT), horizontal scrolling must work smoothly without clipping tab content.
+
 ## Browser MCP Single-Binary Guidelines
 - **Browser MCP helper runs inside the main executable.** Browser MCP functionality must run via `mergen-ade(.exe) --browser-mcp-helper`, not as a separate sidecar binary.
 - **Do not ship a separate `mergen-browser-mcp(.exe)` binary.** Release ZIP/DMG must contain only the main Mergen executable; sidecar binaries are unsupported and must be removed.
