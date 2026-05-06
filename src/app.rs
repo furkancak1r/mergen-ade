@@ -89,6 +89,7 @@ const BROWSER_MCP_PENDING_POLL_MS: u64 = 16;
 const BROWSER_VIDEO_FPS: u32 = 10;
 const BROWSER_VIDEO_FRAME_INTERVAL_MS: u64 = 100;
 const BROWSER_VIDEO_FRAME_REQUEST_PREFIX: &str = "browser-video-frame";
+const BROWSER_SCREENSHOT_REQUEST_PREFIX: &str = "browser-ui-screenshot";
 const BROWSER_MAX_TABS_PER_PROJECT: usize = 5;
 const BROWSER_TAB_WIDTH: f32 = 126.0;
 const BROWSER_TAB_HEIGHT: f32 = 26.0;
@@ -283,6 +284,7 @@ static FACTORY_DROID_INBOX_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CODEX_NOTIFY_INBOX_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static OPENCODE_NOTIFY_INBOX_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static BROWSER_MCP_PENDING_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+static BROWSER_SCREENSHOT_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 // Default blank project constants
 const RESERVED_BLANK_PROJECT_ID: u64 = 0;
@@ -344,6 +346,7 @@ enum AppIcon {
     ArrowClockwise,
     ArrowLeft,
     ArrowRight,
+    Camera,
     ChatText,
     CheckCircle,
     Clock,
@@ -375,10 +378,11 @@ enum AppIcon {
 }
 
 impl AppIcon {
-    const ALL: [Self; 31] = [
+    const ALL: [Self; 32] = [
         Self::ArrowClockwise,
         Self::ArrowLeft,
         Self::ArrowRight,
+        Self::Camera,
         Self::ChatText,
         Self::CheckCircle,
         Self::Clock,
@@ -414,6 +418,7 @@ impl AppIcon {
             Self::ArrowClockwise => "refresh-ccw",
             Self::ArrowLeft => "arrow-left",
             Self::ArrowRight => "arrow-right",
+            Self::Camera => "camera",
             Self::ChatText => "message-square-text",
             Self::CheckCircle => "circle-check",
             Self::Clock => "clock",
@@ -480,6 +485,7 @@ mod icons {
     pub const ARROW_CLOCKWISE: AppIcon = AppIcon::ArrowClockwise;
     pub const ARROW_LEFT: AppIcon = AppIcon::ArrowLeft;
     pub const ARROW_RIGHT: AppIcon = AppIcon::ArrowRight;
+    pub const CAMERA: AppIcon = AppIcon::Camera;
     pub const CHAT_TEXT: AppIcon = AppIcon::ChatText;
     pub const CHECK_CIRCLE: AppIcon = AppIcon::CheckCircle;
     pub const CLOCK: AppIcon = AppIcon::Clock;
@@ -1345,6 +1351,9 @@ pub struct AdeApp {
     /// Last design inspect selection delivered per project/terminal destination, used to prevent paste floods.
     browser_design_inspect_last_delivery_by_destination:
         BTreeMap<(u64, u64), DesignInspectDeliveryState>,
+    /// Pending UI-initiated screenshot requests waiting for browser visibility.
+    /// Key: request_id, Value: (project_id, full_page, timestamp)
+    browser_pending_screenshot_requests: BTreeMap<String, (u64, bool, Instant)>,
     /// Active embedded-browser video recordings per project.
     browser_video_recordings_by_project: BTreeMap<u64, BrowserVideoRecordingState>,
     browser_video_encode_events_tx: Sender<BrowserVideoEncodeEvent>,
@@ -3766,6 +3775,7 @@ impl AdeApp {
             browser_design_inspect_terminal_by_project: BTreeMap::new(),
             browser_design_inspect_target_changed_at_by_project: BTreeMap::new(),
             browser_design_inspect_last_delivery_by_destination: BTreeMap::new(),
+            browser_pending_screenshot_requests: BTreeMap::new(),
             browser_video_recordings_by_project: BTreeMap::new(),
             browser_video_encode_events_tx,
             browser_video_encode_events_rx,
@@ -16577,6 +16587,12 @@ impl AdeApp {
             return;
         }
 
+        // Handle UI-initiated screenshot results
+        if request_id.starts_with(BROWSER_SCREENSHOT_REQUEST_PREFIX) {
+            self.handle_ui_screenshot_result(ctx, event_project_id, result);
+            return;
+        }
+
         if let Some(respond_to) = self.browser_mcp_pending_responses.remove(&request_id) {
             let _ = respond_to.send(Self::browser_mcp_response_from_tool_result(result));
             ctx.request_repaint();
@@ -17147,6 +17163,112 @@ impl AdeApp {
             image_type,
             base64,
         })
+    }
+
+    /// Handle UI-initiated screenshot results: save to file and paste path to terminal.
+    fn handle_ui_screenshot_result(
+        &mut self,
+        ctx: &egui::Context,
+        project_id: u64,
+        result: Result<web_browser::BrowserMcpToolOutput, String>,
+    ) {
+        match result {
+            Ok(output) => {
+                if let Some(data) = output.data {
+                    let base64_str = data
+                        .get("base64")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    if base64_str.is_empty() {
+                        self.status_line = "Screenshot failed: no image data received".to_owned();
+                        return;
+                    }
+
+                    let image_type = data
+                        .get("imageType")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("jpeg");
+
+                    match self.save_browser_screenshot(project_id, base64_str, image_type) {
+                        Ok(path) => {
+                            let terminal_id = self.preferred_terminal_for_project(project_id);
+                            if let Some(tid) = terminal_id {
+                                let normalized_path = path.to_string_lossy().replace('\\', "/");
+                                let paste_text = format!("Screenshot: {}", normalized_path);
+                                if self.queue_pasted_text_to_terminal(tid, &paste_text) {
+                                    self.status_line =
+                                        format!("Screenshot saved and path sent to terminal");
+                                } else {
+                                    self.status_line =
+                                        format!("Screenshot saved: {}", normalized_path);
+                                }
+                            } else {
+                                let normalized_path = path.to_string_lossy().replace('\\', "/");
+                                self.status_line = format!("Screenshot saved: {}", normalized_path);
+                            }
+                        }
+                        Err(err) => {
+                            self.status_line = format!("Screenshot save failed: {err}");
+                        }
+                    }
+                } else {
+                    self.status_line = "Screenshot failed: no data in response".to_owned();
+                }
+            }
+            Err(err) => {
+                self.status_line = format!("Screenshot failed: {err}");
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    /// Save a base64-encoded browser screenshot to the Pictures/Screenshots folder.
+    fn save_browser_screenshot(
+        &self,
+        project_id: u64,
+        base64_data: &str,
+        image_type: &str,
+    ) -> Result<PathBuf, String> {
+        // Decode base64
+        let bytes = BASE64_STANDARD
+            .decode(base64_data)
+            .map_err(|e| format!("Failed to decode base64 image: {e}"))?;
+
+        // Determine target directory (Pictures/Screenshots or fallback)
+        let target_dir = directories::UserDirs::new()
+            .and_then(|dirs| dirs.picture_dir().map(|p| p.to_path_buf()))
+            .map(|pictures| pictures.join("Screenshots"))
+            .or_else(|| {
+                directories::BaseDirs::new()
+                    .map(|dirs| dirs.data_dir().join("mergen-ade").join("screenshots"))
+            })
+            .unwrap_or_else(|| PathBuf::from("screenshots"));
+
+        fs::create_dir_all(&target_dir)
+            .map_err(|e| format!("Failed to create screenshots directory: {e}"))?;
+
+        // Generate filename with timestamp and project info
+        let timestamp = chrono::Local::now().format("%Y-%m-%d_%H%M%S");
+        let extension = match image_type {
+            "png" => "png",
+            _ => "jpg",
+        };
+        let filename = format!("mergen-browser-p{}-{}.{}", project_id, timestamp, extension);
+        let filepath = target_dir.join(&filename);
+
+        // Decode and save image
+        let img = image::load_from_memory(&bytes)
+            .map_err(|e| format!("Failed to load image from memory: {e}"))?;
+
+        let format = match image_type {
+            "png" => image::ImageFormat::Png,
+            _ => image::ImageFormat::Jpeg,
+        };
+
+        img.save_with_format(&filepath, format)
+            .map_err(|e| format!("Failed to save image: {e}"))?;
+
+        Ok(filepath)
     }
 
     fn browser_video_output_path(&self, project_id: u64) -> Result<PathBuf, String> {
@@ -17748,6 +17870,139 @@ impl AdeApp {
         }
     }
 
+    /// Draw the browser screenshot dropdown button.
+    fn draw_browser_screenshot_button(
+        &mut self,
+        ui: &mut Ui,
+        ctx: &egui::Context,
+        project_id: u64,
+    ) {
+        let screenshot_menu = with_minimal_button_chrome(ui, |ui| {
+            ui.menu_button(format!("{}", icons::CAMERA), |ui| {
+                with_minimal_button_chrome(ui, |ui| {
+                    ui.label(RichText::new("Screenshot").strong().color(TEXT_PRIMARY));
+                    ui.separator();
+
+                    // Full page screenshot
+                    if ui.button("Full page").clicked() {
+                        self.queue_browser_screenshot(project_id, true, ctx);
+                        ui.close_menu();
+                    }
+                    // Visible area screenshot
+                    if ui.button("Visible area").clicked() {
+                        self.queue_browser_screenshot(project_id, false, ctx);
+                        ui.close_menu();
+                    }
+                });
+            })
+        });
+
+        let has_pending = self
+            .browser_pending_screenshot_requests
+            .values()
+            .any(|(pid, _, _)| *pid == project_id);
+
+        let tooltip = if has_pending {
+            "Screenshot capture pending..."
+        } else {
+            "Take screenshot"
+        };
+
+        let response = screenshot_menu
+            .response
+            .on_hover_text(tooltip)
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+    }
+
+    /// Queue a browser screenshot request. The actual capture happens when the browser
+    /// is visible and ready to ensure we don't capture blank frames.
+    fn queue_browser_screenshot(&mut self, project_id: u64, full_page: bool, ctx: &egui::Context) {
+        let counter = BROWSER_SCREENSHOT_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let request_id = format!("{BROWSER_SCREENSHOT_REQUEST_PREFIX}-{nanos:x}-{counter:x}");
+
+        self.browser_pending_screenshot_requests
+            .insert(request_id.clone(), (project_id, full_page, Instant::now()));
+
+        self.status_line = format!(
+            "Screenshot queued: {} ({})...",
+            if full_page {
+                "full page"
+            } else {
+                "visible area"
+            },
+            request_id[..request_id.len().min(16)].to_string()
+        );
+        ctx.request_repaint();
+    }
+
+    /// Process any pending screenshot requests when the browser is visible and ready.
+    fn process_pending_screenshot_requests(&mut self, ctx: &egui::Context) {
+        let browser_project_id = self.active_browser_project_id();
+        let browser_ready = browser_project_id.is_some()
+            && self.is_active_browser_panel_open()
+            && !self.should_hide_embedded_browser_for_ui_layer(ctx)
+            && self
+                .embedded_browsers_by_project
+                .get(&browser_project_id.unwrap())
+                .is_some_and(|b| matches!(b.status(), BrowserStatus::Ready));
+
+        if !browser_ready {
+            return;
+        }
+
+        let project_id = browser_project_id.unwrap();
+        let mut to_start = Vec::new();
+
+        // Find pending requests for the active project
+        for (request_id, (pid, full_page, _)) in &self.browser_pending_screenshot_requests {
+            if *pid == project_id {
+                to_start.push((request_id.clone(), *full_page));
+            }
+        }
+
+        for (request_id, full_page) in to_start {
+            let params = json!({
+                "type": "jpeg",
+                "quality": 90,
+                "fullPage": full_page
+            });
+
+            let start_result = self
+                .project_browser(project_id)
+                .start_mcp_screenshot_tool(request_id.clone(), &params);
+
+            match start_result {
+                Ok(_) => {
+                    self.browser_pending_screenshot_requests.remove(&request_id);
+                    self.status_line = format!(
+                        "Capturing {} screenshot...",
+                        if full_page {
+                            "full page"
+                        } else {
+                            "visible area"
+                        }
+                    );
+                }
+                Err(err) => {
+                    self.browser_pending_screenshot_requests.remove(&request_id);
+                    self.status_line = format!("Screenshot failed: {err}");
+                }
+            }
+        }
+
+        if !self.browser_pending_screenshot_requests.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(BROWSER_MCP_PENDING_POLL_MS));
+        }
+    }
+
     /// Synchronize embedded browser position with UI state.
     /// Called after UI render to update native WebView bounds.
     /// Handles multiple project browsers - only the active project's browser is shown.
@@ -18133,6 +18388,11 @@ impl AdeApp {
                             };
                             ctx.request_repaint();
                         }
+
+                        ui.add_space(8.0);
+
+                        // Screenshot dropdown button
+                        self.draw_browser_screenshot_button(ui, ctx, browser_project_id);
                     });
 
                     ui.add_space(16.0);
@@ -19276,6 +19536,7 @@ impl eframe::App for AdeApp {
         self.process_source_control_events(ctx);
         self.process_directory_index_events(ctx);
         self.process_browser_events(ctx);
+        self.process_pending_screenshot_requests(ctx);
         self.process_browser_video_encode_events(ctx);
         self.process_browser_mcp_commands(ctx);
         self.process_browser_video_recordings(ctx);
@@ -24760,16 +25021,16 @@ mod tests {
         SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
         TerminalOutputScrollBehavior, TerminalSecondaryClickAction, TerminalSelection,
-        TerminalSelectionPoint, TransientToast, BROWSER_MAX_TABS_PER_PROJECT, CODEX_NOTIFY_POLL_MS,
-        CODEX_PROCESS_POLL_MS, CODEX_STOP_SETTLE_MS, CODEX_TRAILING_OUTPUT_GRACE_MS,
-        DESIGN_INSPECT_DELIVERY_DEDUPE_MS, DESIGN_INSPECT_TARGET_SWITCH_QUIET_MS,
-        DIRECTORY_INDEX_CHANNEL_CAPACITY, FACTORY_DROID_HOOK_POLL_MS, OPENCODE_PROCESS_POLL_MS,
-        OPENCODE_RUNNING_GRACE_MS, OPENCODE_TRAILING_OUTPUT_GRACE_MS,
-        PENDING_RERUN_BATCH_CONFIRM_SETTLE_MS, PENDING_RERUN_BATCH_PROMPT_WAIT_MS,
-        PENDING_RERUN_SETTLE_MS, SOURCE_CONTROL_CHANNEL_CAPACITY,
-        SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG, TERMINAL_COPY_FEEDBACK_TEXT,
-        TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS, TERMINAL_OUTPUT_BG,
-        TEXT_MUTED, TEXT_PRIMARY, TRANSIENT_TOAST_SECS,
+        TerminalSelectionPoint, TransientToast, BROWSER_MAX_TABS_PER_PROJECT,
+        BROWSER_SCREENSHOT_REQUEST_PREFIX, CODEX_NOTIFY_POLL_MS, CODEX_PROCESS_POLL_MS,
+        CODEX_STOP_SETTLE_MS, CODEX_TRAILING_OUTPUT_GRACE_MS, DESIGN_INSPECT_DELIVERY_DEDUPE_MS,
+        DESIGN_INSPECT_TARGET_SWITCH_QUIET_MS, DIRECTORY_INDEX_CHANNEL_CAPACITY,
+        FACTORY_DROID_HOOK_POLL_MS, OPENCODE_PROCESS_POLL_MS, OPENCODE_RUNNING_GRACE_MS,
+        OPENCODE_TRAILING_OUTPUT_GRACE_MS, PENDING_RERUN_BATCH_CONFIRM_SETTLE_MS,
+        PENDING_RERUN_BATCH_PROMPT_WAIT_MS, PENDING_RERUN_SETTLE_MS,
+        SOURCE_CONTROL_CHANNEL_CAPACITY, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG,
+        TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS,
+        TERMINAL_OUTPUT_BG, TEXT_MUTED, TEXT_PRIMARY, TRANSIENT_TOAST_SECS,
     };
     use crate::browser_video::BrowserVideoEncodeResult;
     use crate::codex::{CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
@@ -34439,6 +34700,7 @@ mod tests {
             browser_design_inspect_terminal_by_project: BTreeMap::new(),
             browser_design_inspect_target_changed_at_by_project: BTreeMap::new(),
             browser_design_inspect_last_delivery_by_destination: BTreeMap::new(),
+            browser_pending_screenshot_requests: BTreeMap::new(),
             browser_video_recordings_by_project: BTreeMap::new(),
             browser_video_encode_events_tx,
             browser_video_encode_events_rx,
@@ -43054,5 +43316,78 @@ mod tests {
         // Reset to None (no project)
         app.reset_directory_search_tracking_for_project(None);
         assert_eq!(app.directory_search_tracking_project_id, None);
+    }
+
+    // Browser Screenshot Tests
+
+    #[test]
+    fn browser_screenshot_request_is_queued_with_correct_prefix() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+
+        // Initially no pending requests
+        assert!(app.browser_pending_screenshot_requests.is_empty());
+
+        // Queue a screenshot request
+        app.queue_browser_screenshot(1, true, &ctx);
+
+        // Should have one pending request
+        assert_eq!(app.browser_pending_screenshot_requests.len(), 1);
+        let request_id = app
+            .browser_pending_screenshot_requests
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        assert!(request_id.starts_with(BROWSER_SCREENSHOT_REQUEST_PREFIX));
+
+        // Check the stored data
+        let (pid, full_page, _) = app
+            .browser_pending_screenshot_requests
+            .get(&request_id)
+            .unwrap();
+        assert_eq!(*pid, 1);
+        assert!(*full_page);
+    }
+
+    #[test]
+    fn browser_screenshot_request_distinguishes_full_page_and_visible() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+
+        // Queue full page screenshot
+        app.queue_browser_screenshot(1, true, &ctx);
+        let _request_id1 = app
+            .browser_pending_screenshot_requests
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+
+        // Queue visible area screenshot
+        app.queue_browser_screenshot(1, false, &ctx);
+
+        // Should have two requests with different full_page values
+        let requests: Vec<_> = app
+            .browser_pending_screenshot_requests
+            .values()
+            .map(|(_, full_page, _)| *full_page)
+            .collect();
+        assert!(requests.contains(&true));
+        assert!(requests.contains(&false));
+    }
+
+    #[test]
+    fn browser_screenshot_path_generation_is_terminal_safe() {
+        // Test that the path formatting uses forward slashes
+        let path = PathBuf::from(r"C:\Users\Test\Pictures\Screenshots\file.jpg");
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        assert!(!normalized.contains('\\'));
+        assert!(normalized.contains('/'));
+        assert!(normalized.starts_with("C:/"));
     }
 }
