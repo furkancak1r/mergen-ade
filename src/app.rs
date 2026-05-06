@@ -16596,6 +16596,15 @@ impl AdeApp {
 
         for command in commands {
             let tool = command.request.tool.clone();
+            // Server-side validation: reject tools not in public schema
+            if !Self::is_browser_mcp_tool_allowed(&tool) {
+                let _ = command
+                    .respond_to
+                    .send(BrowserMcpIpcResponse::error(format!(
+                        "Tool not found: {tool}. Use tools from tools/list only."
+                    )));
+                continue;
+            }
             match tool.as_str() {
                 "browser_take_screenshot" => {
                     self.handle_browser_mcp_screenshot_command(ctx, command);
@@ -17383,6 +17392,64 @@ impl AdeApp {
         }
 
         Ok(project_id)
+    }
+
+    /// Returns true if the tool name is in the public advertised schema.
+    /// This prevents hidden/internal tools (e.g., coordinate mouse tools) from being called
+    /// even if the client knows the tool name.
+    fn is_browser_mcp_tool_allowed(tool: &str) -> bool {
+        const ALLOWED: &[&str] = &[
+            // Navigation
+            "browser_navigate",
+            "browser_navigate_back",
+            "browser_navigate_forward",
+            "browser_reload",
+            "browser_close",
+            "browser_tabs",
+            // Interaction
+            "browser_click",
+            "browser_hover",
+            "browser_select_option",
+            "browser_type",
+            "browser_fill_form",
+            "browser_press_key",
+            "browser_evaluate",
+            "browser_wait_for",
+            // Discovery
+            "browser_snapshot",
+            "browser_page_summary",
+            "browser_highlight",
+            "browser_hide_highlight",
+            // Media
+            "browser_take_screenshot",
+            "browser_start_video",
+            "browser_stop_video",
+            "browser_video_chapter",
+            // Storage
+            "browser_localstorage_list",
+            "browser_localstorage_get",
+            "browser_localstorage_set",
+            "browser_localstorage_delete",
+            "browser_localstorage_clear",
+            "browser_sessionstorage_list",
+            "browser_sessionstorage_get",
+            "browser_sessionstorage_set",
+            "browser_sessionstorage_delete",
+            "browser_sessionstorage_clear",
+            "browser_cookie_list",
+            "browser_cookie_get",
+            "browser_cookie_set",
+            "browser_cookie_delete",
+            "browser_cookie_clear",
+            // Network (not yet implemented but advertised)
+            "browser_network_requests",
+            "browser_network_request",
+            // Console (not yet implemented but advertised)
+            "browser_console_messages",
+            // Legacy resize (returns error but advertised)
+            "browser_resize",
+        ];
+        ALLOWED.contains(&tool)
     }
 
     fn run_browser_mcp_tool_for_project(
@@ -23403,16 +23470,13 @@ fn design_inspect_styles_text(styles: &BTreeMap<String, String>) -> String {
 }
 
 fn design_inspect_delivery_signature(info: &web_browser::DesignElementInfo) -> String {
-    format!(
-        "{}|{}|{}|{}|{}|{}|{}",
-        info.page_url,
-        info.url,
-        info.selector,
-        info.rect.x,
-        info.rect.y,
-        info.rect.width,
-        info.rect.height
-    )
+    // Use mcp_ref for deduplication when available, otherwise fall back to selector
+    let unique_key = if info.mcp_ref.is_empty() {
+        &info.selector
+    } else {
+        &info.mcp_ref
+    };
+    format!("{}|{}|{}", info.page_url, info.url, unique_key)
 }
 
 fn design_inspect_matches_current_page(
@@ -23451,10 +23515,15 @@ fn format_design_inspect_terminal_text(info: &web_browser::DesignElementInfo) ->
     } else {
         url
     };
+    // Use MCP ref if available, otherwise indicate selector should be used
+    let ref_hint = if info.mcp_ref.is_empty() {
+        format!("selector=\"{selector}\"")
+    } else {
+        format!("ref=\"{}\"", info.mcp_ref)
+    };
 
     format!(
-        "Design inspect: element=\"{element}\" selector=\"{selector}\" text=\"{text}\" rect=\"x={} y={} w={} h={}\" styles=\"{styles}\" url=\"{url}\" | Change request: ",
-        info.rect.x, info.rect.y, info.rect.width, info.rect.height
+        "Design inspect: element=\"{element}\" {ref_hint} text=\"{text}\" styles=\"{styles}\" url=\"{url}\" | Use browser_click {ref_hint} | Change request: ",
     )
 }
 
@@ -40535,6 +40604,7 @@ mod tests {
             classes: vec!["primary".to_owned(), "wide".to_owned()],
             text: "Save changes".to_owned(),
             selector: selector.to_owned(),
+            mcp_ref: "e1".to_owned(),
             rect: web_browser::DesignElementRect {
                 x: 12,
                 y: 24,
@@ -40654,10 +40724,13 @@ mod tests {
         let text = format_design_inspect_terminal_text(&info);
 
         assert!(text.starts_with("Design inspect: element=\"button#save.primary.wide\""));
-        assert!(text.contains("selector=\"main > button#save.primary\""));
+        // Should show ref (not selector) when mcp_ref is available
+        assert!(text.contains("ref=\"e1\""));
         assert!(text.contains("text=\"Save changes now\""));
-        assert!(text.contains("rect=\"x=12 y=24 w=160 h=40\""));
+        // Should NOT contain rect coordinates
+        assert!(!text.contains("rect=\"x="));
         assert!(text.contains("background-color: rgb(24, 118, 172)"));
+        assert!(text.contains("| Use browser_click ref=\"e1\" |"));
         assert!(text.ends_with("| Change request: "));
         assert!(!text.contains('\n'));
         assert!(!text.contains('\r'));
@@ -40875,9 +40948,11 @@ mod tests {
     }
 
     #[test]
-    fn design_inspect_delivery_signature_changes_by_selector() {
-        let first = test_design_element_info("main > button#save.primary");
-        let second = test_design_element_info("main > button#cancel.secondary");
+    fn design_inspect_delivery_signature_changes_by_ref() {
+        let mut first = test_design_element_info("main > button#save.primary");
+        first.mcp_ref = "e1".to_owned();
+        let mut second = test_design_element_info("main > button#cancel.secondary");
+        second.mcp_ref = "e2".to_owned();
 
         assert_ne!(
             design_inspect_delivery_signature(&first),
@@ -40903,6 +40978,33 @@ mod tests {
         };
 
         assert_eq!(app.resolve_browser_mcp_project_id(&request, &scope), Ok(7));
+    }
+
+    #[test]
+    fn browser_mcp_tool_allowlist_rejects_hidden_coordinate_tools() {
+        // Public tools should be allowed
+        assert!(AdeApp::is_browser_mcp_tool_allowed("browser_click"));
+        assert!(AdeApp::is_browser_mcp_tool_allowed("browser_page_summary"));
+        assert!(AdeApp::is_browser_mcp_tool_allowed("browser_evaluate"));
+        assert!(AdeApp::is_browser_mcp_tool_allowed("browser_navigate"));
+        // Hidden coordinate tools should be rejected even if client knows the name
+        assert!(!AdeApp::is_browser_mcp_tool_allowed(
+            "browser_mouse_click_xy"
+        ));
+        assert!(!AdeApp::is_browser_mcp_tool_allowed(
+            "browser_mouse_move_xy"
+        ));
+        assert!(!AdeApp::is_browser_mcp_tool_allowed(
+            "browser_mouse_drag_xy"
+        ));
+        assert!(!AdeApp::is_browser_mcp_tool_allowed("browser_mouse_down"));
+        assert!(!AdeApp::is_browser_mcp_tool_allowed("browser_mouse_up"));
+        assert!(!AdeApp::is_browser_mcp_tool_allowed("browser_mouse_wheel"));
+        // Unknown tools should also be rejected
+        assert!(!AdeApp::is_browser_mcp_tool_allowed("browser_hack"));
+        assert!(!AdeApp::is_browser_mcp_tool_allowed(
+            "browser_run_code_unsafe"
+        ));
     }
 
     #[test]

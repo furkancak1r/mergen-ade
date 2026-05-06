@@ -82,6 +82,17 @@ fn handle_jsonrpc_message(env: &HelperEnv, message: JsonValue) -> Option<JsonVal
             let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
             let name = params.get("name").and_then(JsonValue::as_str).unwrap_or_default();
             let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            // Reject tools not advertised in tools/list (e.g., hidden coordinate tools)
+            if !is_tool_allowed(name, env) {
+                return json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32601,
+                        "message": format!("Tool not found: {name}. Use tools from tools/list only.")
+                    }
+                });
+            }
             let result = call_mergen(env, name, arguments);
             let is_error = result.is_error;
             let content = mcp_content(result);
@@ -498,6 +509,16 @@ fn has_cap(caps: &[String], cap: &str) -> bool {
     caps.is_empty() || caps.binary_search(&cap.to_owned()).is_ok()
 }
 
+/// Check if a tool name is in the public advertised schema for the given caps.
+/// This prevents clients from calling hidden/internal tools (e.g., coordinate mouse tools)
+/// even if they know the tool name.
+fn is_tool_allowed(name: &str, env: &HelperEnv) -> bool {
+    let schemas = tool_schemas(env.caps.as_slice());
+    schemas
+        .iter()
+        .any(|t| t.get("name").and_then(JsonValue::as_str) == Some(name))
+}
+
 fn tool(name: &str, description: &str, input_schema: JsonValue) -> JsonValue {
     let mut map = BTreeMap::<String, JsonValue>::new();
     map.insert("name".to_owned(), json!(name));
@@ -735,13 +756,13 @@ fn devtools_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_highlight",
-            "Move the visible browser mouse to an element or viewport rectangle, then show one polished video-friendly highlight overlay. Defaults to a neutral green feature callout; use red only when explicitly marking an error. Only one highlight can be active; call browser_hide_highlight before creating another.",
+            "Move the visible browser mouse to an element (by ref) and show a highlight overlay. Use a ref from browser_page_summary. Defaults to a neutral green feature callout; use red only when explicitly marking an error. Only one highlight can be active; call browser_hide_highlight before creating another.",
             json!({
                 "type": "object",
                 "properties": element_props(json!({
-                    "ref": json!({"type": "string"}),
-                    "x": json!({"type": "number", "description": "Viewport CSS pixel x coordinate for rectangle highlights"}),
-                    "y": json!({"type": "number", "description": "Viewport CSS pixel y coordinate for rectangle highlights"}),
+                    "ref": json!({"type": "string", "description": "Element ref from browser_page_summary (e.g., e42). Preferred over coordinates."}),
+                    "x": json!({"type": "number", "description": "Viewport CSS pixel x coordinate (only if ref unavailable)"}),
+                    "y": json!({"type": "number", "description": "Viewport CSS pixel y coordinate (only if ref unavailable)"}),
                     "width": json!({"type": "number", "description": "Viewport CSS pixel width for rectangle highlights"}),
                     "height": json!({"type": "number", "description": "Viewport CSS pixel height for rectangle highlights"}),
                     "color": json!({"type": "string", "default": "#16a34a", "description": "Highlight accent color. Prefer the default green (#16a34a) for neutral feature callouts; use red only when explicitly marking an error."}),
@@ -753,23 +774,23 @@ fn devtools_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_select_option",
-            "Select an option in a dropdown. Automatically waits for any resulting page update or navigation to complete before returning.",
+            "Select an option in a dropdown using a ref from browser_page_summary. Automatically waits for any resulting page update or navigation to complete before returning.",
             json!({
                 "type": "object",
                 "properties": element_props(json!({
-                    "ref": json!({"type": "string"}),
+                    "ref": json!({"type": "string", "description": "Element ref from browser_page_summary (e.g., e42)"}),
                     "value": json!({"type": "string"})
                 })),
-                "required": ["value"]
+                "required": ["ref", "value"]
             }),
         ),
         tool(
             "browser_page_summary",
-            "Fast page map for deciding what to click or type next. Use this before browser_click/screenshot to get prioritized refs, enabled/disabled state, form fields, and top query matches.",
+            "Fast page map for discovering clickable elements, buttons, links, icons, and form fields. Always use this before browser_click to obtain a ref (e.g., e42). Includes aria-label, title, id, class, data-testid, and visual indicators like cursor:pointer to help locate icon-only buttons and sidebar controls.",
             json!({
                 "type": "object",
                 "properties": {
-                    "query": json!({"type": "string", "description": "Optional target text such as a button or tab label to rank first"}),
+                    "query": json!({"type": "string", "description": "Optional target text such as a button label, aria-label, title, or icon name to rank first"}),
                     "roles": json!({"type": "array", "items": {"type": "string"}, "description": "Optional role filter such as button, link, textbox, combobox"}),
                     "includeBoxes": json!({"type": "boolean", "default": false}),
                     "maxItems": json!({"type": "integer", "default": 40})
@@ -790,24 +811,26 @@ fn devtools_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_click",
-            "Click an element on the page with the visible browser mouse cursor. Automatically waits for the page to become ready after the click (including navigation or SPA route transitions). Do not add fixed waits after calling this tool; it returns only when the page is stable.",
+            "Click an element on the page with the visible browser mouse cursor using a ref from browser_page_summary or Design Inspect. Automatically waits for the page to become ready after the click (including navigation or SPA route transitions). Do not use coordinates; always use refs.",
             json!({
                 "type": "object",
                 "properties": element_props(json!({
-                    "ref": json!({"type": "string"}),
+                    "ref": json!({"type": "string", "description": "Element ref from browser_page_summary (e.g., e42)"}),
                     "button": json!({"type": "string", "enum": ["left", "middle", "right"], "default": "left"}),
                     "doubleClick": json!({"type": "boolean"})
-                }))
+                })),
+                "required": ["ref"]
             }),
         ),
         tool(
             "browser_hover",
-            "Hover over an element on the page with the visible browser mouse cursor",
+            "Hover over an element on the page with the visible browser mouse cursor using a ref from browser_page_summary.",
             json!({
                 "type": "object",
                 "properties": element_props(json!({
-                    "ref": json!({"type": "string"})
-                }))
+                    "ref": json!({"type": "string", "description": "Element ref from browser_page_summary (e.g., e42)"})
+                })),
+                "required": ["ref"]
             }),
         ),
         tool(
@@ -836,89 +859,8 @@ fn devtools_tools() -> Vec<JsonValue> {
             }),
         ),
         tool(
-            "browser_mouse_move_xy",
-            "Move the visible browser mouse cursor to viewport coordinates",
-            json!({
-                "type": "object",
-                "properties": {
-                    "x": json!({"type": "number"}),
-                    "y": json!({"type": "number"})
-                },
-                "required": ["x", "y"]
-            }),
-        ),
-        tool(
-            "browser_mouse_click_xy",
-            "Click viewport coordinates with the visible browser mouse cursor. Use this for coordinate clicks instead of JavaScript element.click().",
-            json!({
-                "type": "object",
-                "properties": {
-                    "x": json!({"type": "number"}),
-                    "y": json!({"type": "number"}),
-                    "button": json!({"type": "string", "enum": ["left", "middle", "right"], "default": "left"}),
-                    "doubleClick": json!({"type": "boolean"})
-                },
-                "required": ["x", "y"]
-            }),
-        ),
-        tool(
-            "browser_mouse_drag_xy",
-            "Drag from one viewport coordinate to another with the visible browser mouse cursor",
-            json!({
-                "type": "object",
-                "properties": {
-                    "startX": json!({"type": "number"}),
-                    "startY": json!({"type": "number"}),
-                    "endX": json!({"type": "number"}),
-                    "endY": json!({"type": "number"}),
-                    "button": json!({"type": "string", "enum": ["left", "middle", "right"], "default": "left"})
-                },
-                "required": ["startX", "startY", "endX", "endY"]
-            }),
-        ),
-        tool(
-            "browser_mouse_down",
-            "Press a mouse button at optional viewport coordinates",
-            json!({
-                "type": "object",
-                "properties": {
-                    "x": json!({"type": "number"}),
-                    "y": json!({"type": "number"}),
-                    "button": json!({"type": "string", "enum": ["left", "middle", "right"], "default": "left"})
-                },
-                "required": []
-            }),
-        ),
-        tool(
-            "browser_mouse_up",
-            "Release a mouse button at optional viewport coordinates",
-            json!({
-                "type": "object",
-                "properties": {
-                    "x": json!({"type": "number"}),
-                    "y": json!({"type": "number"}),
-                    "button": json!({"type": "string", "enum": ["left", "middle", "right"], "default": "left"})
-                },
-                "required": []
-            }),
-        ),
-        tool(
-            "browser_mouse_wheel",
-            "Scroll the mouse wheel at optional viewport coordinates",
-            json!({
-                "type": "object",
-                "properties": {
-                    "x": json!({"type": "number"}),
-                    "y": json!({"type": "number"}),
-                    "deltaX": json!({"type": "number", "default": 0}),
-                    "deltaY": json!({"type": "number", "default": 0})
-                },
-                "required": []
-            }),
-        ),
-        tool(
             "browser_evaluate",
-            "Read/evaluate JavaScript in the browser. Interactive clicks, mouse events, and form submits are blocked; use browser_click or browser_mouse_click_xy for page interaction.",
+            "Read/evaluate JavaScript in the browser. Interactive clicks, mouse events, and form submits are blocked; use browser_click with a ref for page interaction.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1192,77 +1134,57 @@ mod tests {
     }
 
     #[test]
-    fn devtools_tool_schemas_include_coordinate_mouse_tools() {
+    fn devtools_tool_schemas_exclude_coordinate_click_tools() {
+        // Coordinate mouse click tools are intentionally not advertised to AI
+        // They remain available at runtime for internal use but are not in devtools_tools()
         let tools = devtools_tools();
-        let tool_by_name = |name: &str| {
-            tools
-                .iter()
-                .find(|tool| tool.get("name").and_then(JsonValue::as_str) == Some(name))
-                .unwrap_or_else(|| panic!("missing tool schema: {name}"))
+        let tool_names: Vec<_> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(JsonValue::as_str))
+            .collect();
+
+        // These coordinate tools should NOT be in the AI-facing schema
+        assert!(!tool_names.contains(&"browser_mouse_move_xy"));
+        assert!(!tool_names.contains(&"browser_mouse_click_xy"));
+        assert!(!tool_names.contains(&"browser_mouse_drag_xy"));
+        assert!(!tool_names.contains(&"browser_mouse_down"));
+        assert!(!tool_names.contains(&"browser_mouse_up"));
+        assert!(!tool_names.contains(&"browser_mouse_wheel"));
+
+        // browser_click should require ref
+        let click_tool = tools
+            .iter()
+            .find(|t| t.get("name").and_then(JsonValue::as_str) == Some("browser_click"))
+            .expect("browser_click should exist");
+        let required = click_tool["inputSchema"]["required"]
+            .as_array()
+            .expect("required should be array");
+        assert!(required.contains(&json!("ref")));
+    }
+
+    #[test]
+    fn is_tool_allowed_rejects_hidden_coordinate_tools() {
+        let env = HelperEnv {
+            port: Some(12345),
+            token: Some("test".to_owned()),
+            terminal_id: Some(1),
+            project_id: Some(1),
+            session_id: None,
+            caps: vec!["devtools".to_owned()],
         };
-        for name in [
-            "browser_mouse_move_xy",
-            "browser_mouse_click_xy",
-            "browser_mouse_drag_xy",
-            "browser_mouse_down",
-            "browser_mouse_up",
-            "browser_mouse_wheel",
-        ] {
-            let schema = &tool_by_name(name)["inputSchema"];
-            assert_eq!(schema["type"].as_str(), Some("object"), "{name}");
-        }
-
-        let move_required = tool_by_name("browser_mouse_move_xy")["inputSchema"]["required"]
-            .as_array()
-            .unwrap();
-        assert!(move_required.contains(&json!("x")));
-        assert!(move_required.contains(&json!("y")));
-
-        let click_required = tool_by_name("browser_mouse_click_xy")["inputSchema"]["required"]
-            .as_array()
-            .unwrap();
-        assert!(click_required.contains(&json!("x")));
-        assert!(click_required.contains(&json!("y")));
-
-        let drag_required = tool_by_name("browser_mouse_drag_xy")["inputSchema"]["required"]
-            .as_array()
-            .unwrap();
-        for field in ["startX", "startY", "endX", "endY"] {
-            assert!(drag_required.contains(&json!(field)));
-        }
-
-        assert_eq!(
-            tool_by_name("browser_mouse_down")["inputSchema"]["required"]
-                .as_array()
-                .unwrap()
-                .len(),
-            0
-        );
-        assert_eq!(
-            tool_by_name("browser_mouse_up")["inputSchema"]["required"]
-                .as_array()
-                .unwrap()
-                .len(),
-            0
-        );
-        assert_eq!(
-            tool_by_name("browser_mouse_wheel")["inputSchema"]["properties"]["deltaX"]["default"]
-                .as_i64(),
-            Some(0)
-        );
-        assert_eq!(
-            tool_by_name("browser_mouse_wheel")["inputSchema"]["properties"]["deltaY"]["default"]
-                .as_i64(),
-            Some(0)
-        );
-
-        let fill_form = tool_by_name("browser_fill_form");
-        assert_eq!(
-            fill_form["inputSchema"]["properties"]["fields"]["items"]["properties"]["commit"]
-                ["default"]
-                .as_bool(),
-            Some(true)
-        );
+        // Public tools should be allowed
+        assert!(is_tool_allowed("browser_click", &env));
+        assert!(is_tool_allowed("browser_page_summary", &env));
+        assert!(is_tool_allowed("browser_evaluate", &env));
+        // Hidden coordinate tools should be rejected even if client knows the name
+        assert!(!is_tool_allowed("browser_mouse_click_xy", &env));
+        assert!(!is_tool_allowed("browser_mouse_move_xy", &env));
+        assert!(!is_tool_allowed("browser_mouse_drag_xy", &env));
+        assert!(!is_tool_allowed("browser_mouse_down", &env));
+        assert!(!is_tool_allowed("browser_mouse_up", &env));
+        assert!(!is_tool_allowed("browser_mouse_wheel", &env));
+        // Unknown tools should also be rejected
+        assert!(!is_tool_allowed("browser_hack", &env));
     }
 
     #[test]
@@ -1331,10 +1253,9 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(description("browser_click").contains("visible browser mouse cursor"));
-        assert!(description("browser_click").contains("waits for the page"));
-        assert!(
-            description("browser_mouse_click_xy").contains("instead of JavaScript element.click()")
-        );
+        assert!(description("browser_click").contains("ref"));
+        // Coordinate click tools are intentionally not advertised to AI
+        assert!(!names.contains(&"browser_mouse_click_xy"));
         assert!(description("browser_evaluate").contains("Interactive clicks"));
         assert!(description("browser_evaluate").contains("blocked"));
         assert!(description("browser_evaluate").contains("browser_click"));
@@ -1343,16 +1264,11 @@ mod tests {
             .iter()
             .position(|name| *name == "browser_click")
             .expect("browser_click should exist");
-        let mouse_click_index = names
-            .iter()
-            .position(|name| *name == "browser_mouse_click_xy")
-            .expect("browser_mouse_click_xy should exist");
         let evaluate_index = names
             .iter()
             .position(|name| *name == "browser_evaluate")
             .expect("browser_evaluate should exist");
         assert!(evaluate_index > click_index);
-        assert!(evaluate_index > mouse_click_index);
     }
 
     #[test]

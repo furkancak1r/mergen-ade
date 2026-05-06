@@ -741,7 +741,7 @@ mod tests {
     #[test]
     fn revoke_session_removes_all_tokens_with_session_id_globally() {
         let service = test_service();
-        
+
         let session_a_terminal_1 = service.endpoint_env(1, Some(7), Some("session-a"));
         let session_b = service.endpoint_env(1, Some(7), Some("session-b"));
         let session_a_terminal_2 = service.endpoint_env(2, Some(8), Some("session-a"));
