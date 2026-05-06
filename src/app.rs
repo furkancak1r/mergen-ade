@@ -9166,6 +9166,19 @@ impl AdeApp {
             return false;
         }
 
+        // Do not steal text input from Browser URL input field.
+        // User intent: if Browser URL input is focused, typed text belongs to URL.
+        // Check all projects since browser panel is project-scoped.
+        for project_id in self.projects.keys() {
+            if ctx.memory(|mem| mem.has_focus(Self::browser_url_input_id(*project_id))) {
+                return false;
+            }
+        }
+
+        if ctx.memory(|mem| mem.any_popup_open()) || ctx.is_context_menu_open() {
+            return false;
+        }
+
         if ctx.memory(|mem| mem.any_popup_open()) || ctx.is_context_menu_open() {
             return false;
         }
@@ -42921,6 +42934,95 @@ mod tests {
         assert!(
             ctx.memory(|mem| mem.has_focus(AdeApp::directory_search_input_id())),
             "Directory search should retain focus"
+        );
+    }
+
+    #[test]
+    fn browser_url_focus_blocks_attention_stealing_when_terminal_attention() {
+        // Regression test: Browser URL input focus must block terminal attention input stealing.
+        // When user is typing in browser URL field, text must stay there even if active terminal
+        // is in Attention state waiting for user input.
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Project1", "C:/proj1", &[], &[]));
+
+        // Set terminal to Attention state
+        seed_ai_attention(&mut app, 1);
+
+        // Set focus to browser URL input
+        ctx.memory_mut(|mem| mem.request_focus(AdeApp::browser_url_input_id(7)));
+
+        // Test that terminal keyboard capture is blocked
+        let capture_keyboard = app.should_capture_terminal_keyboard(&ctx);
+        assert!(
+            !capture_keyboard,
+            "Terminal should not capture keyboard when Browser URL input has focus"
+        );
+
+        // Test that attention input stealing is blocked
+        let events = vec![Event::Text("https://example.com".to_owned())];
+        let should_steal = app.should_steal_attention_terminal_input(&ctx, &events);
+        assert!(
+            !should_steal,
+            "Attention should not steal text from Browser URL input"
+        );
+
+        // Browser URL input should retain focus (surrender should not be called)
+        assert!(
+            ctx.memory(|mem| mem.has_focus(AdeApp::browser_url_input_id(7))),
+            "Browser URL input should retain focus"
+        );
+    }
+
+    #[test]
+    fn raw_input_hook_keeps_browser_url_text_when_attention_terminal_active() {
+        // Regression test: raw_input_hook must not steal text from Browser URL input
+        // even when active terminal is in Attention state.
+        use egui::{Event, RawInput};
+
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Project1", "C:/proj1", &[], &[]));
+
+        // Set terminal to Attention state
+        seed_ai_attention(&mut app, 1);
+
+        // Set focus to browser URL input
+        ctx.memory_mut(|mem| mem.request_focus(AdeApp::browser_url_input_id(7)));
+
+        // Simulate typing in browser URL field
+        let mut raw_input = RawInput {
+            events: vec![Event::Text("https://example.com".to_owned())],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        // Text should NOT be stolen from Browser URL input
+        assert_eq!(
+            raw_input.events,
+            vec![Event::Text("https://example.com".to_owned())],
+            "Browser URL text should not be stolen by attention terminal"
+        );
+        assert!(
+            app.buffered_terminal_input.is_empty(),
+            "No buffered terminal input when Browser URL owns focus"
+        );
+
+        // Browser URL input should retain focus
+        assert!(
+            ctx.memory(|mem| mem.has_focus(AdeApp::browser_url_input_id(7))),
+            "Browser URL input should not lose focus"
+        );
+
+        // Terminal should still be in Attention state
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.ai_session.status,
+            AiCliStatus::Attention,
+            "Terminal attention state should not change"
         );
     }
 
