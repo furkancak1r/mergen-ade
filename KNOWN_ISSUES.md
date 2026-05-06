@@ -3758,3 +3758,24 @@
 - Files/Commands touched: `src/app.rs`, `src/browser_mcp_helper.rs`, `src/browser_mcp_service.rs`, `src/web_browser.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test browser_tabs`, `cargo test browser_mcp_tabs_new_select_and_close_control_tabs`, `cargo test browser_video_encode_event`, `cargo test browser_recording_file_url_encodes_spaces`
 - References: User request on 2026-05-05: Browser panel should have up to five tabs, MCP should control them, and saved videos should open in a newly focused tab.
 
+#### Mergen Browser MCP element targeting jumped before clicking {#mergen-browser-mcp-human-scroll}
+- Date: 2026-05-06
+- Context: Browser MCP visual tools targeting elements outside the current viewport.
+- Error signature: When the page is at the top and the target is lower on the page, the Browser MCP view jumps instantly to the target and clicks immediately instead of scrolling like a human.
+- Symptoms/Impact:
+  1. `browser_click`, `browser_hover`, `browser_type`, and form tools look mechanical when the target requires scrolling.
+  2. The visible cursor animation can appear correct, but the page position changes in a single frame before the click.
+- Root cause:
+  1. Element targeting used `element.scrollIntoView({ block: 'center', inline: 'center' })`.
+  2. The cursor movement happened only after the native scroll jump completed.
+- Resolution:
+  - Replaced the normal element-targeting scroll path with wheel-style human scroll steps before cursor movement and click/type actions.
+  - Added scroll target detection for nested scroll containers and the document viewport.
+  - Slowed wheel step timing so scroll actions are visible and less abrupt.
+  - Kept a `nearest` native scroll fallback only for cases where scripted wheel-style scrolling cannot make the element reachable.
+- Prevent recurrence:
+  - Do not use centered `scrollIntoView` in the normal Browser MCP visual interaction path.
+  - Keep element-targeting scroll behavior covered by script token tests that require the human scroll helpers and reject the old centered jump call.
+- Files/Commands touched: `src/web_browser.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test browser_mcp`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User report on 2026-05-06: page jumps down and clicks immediately instead of giving a normal scroll feeling.
+

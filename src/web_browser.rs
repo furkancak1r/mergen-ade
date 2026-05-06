@@ -1536,7 +1536,7 @@ pub(crate) fn browser_mcp_output_from_devtools_runtime_raw(
 
 #[cfg(target_os = "windows")]
 const MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT: &str = r#"
-if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 11) {
+if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 12) {
   window.__mergenMcpState = window.__mergenMcpState || { refCounter: 1, consoleMessages: [], networkRequests: [], routes: [], highlighted: null };
 
   const state = window.__mergenMcpState;
@@ -1622,10 +1622,10 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 11) {
   const buttonMask = (button) => ({ left: 1, middle: 4, right: 2 }[buttonName(button)]);
   const ensureCursorStyle = () => {
     const existing = document.querySelector('style[data-mergen-mcp-cursor-style]');
-    if (existing?.getAttribute('data-mergen-mcp-cursor-style') === '11') return;
+    if (existing?.getAttribute('data-mergen-mcp-cursor-style') === '12') return;
     existing?.remove();
     const style = document.createElement('style');
-    style.setAttribute('data-mergen-mcp-cursor-style', '11');
+    style.setAttribute('data-mergen-mcp-cursor-style', '12');
     style.textContent = `
 [data-mergen-mcp-cursor] [data-mergen-mcp-cursor-pointer] {
   transition: transform 120ms cubic-bezier(0.16, 1, 0.3, 1);
@@ -1638,7 +1638,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 11) {
     if (
       state.cursorElement &&
       document.documentElement.contains(state.cursorElement) &&
-      state.cursorElement.getAttribute?.('data-mergen-mcp-cursor-version') === '11' &&
+      state.cursorElement.getAttribute?.('data-mergen-mcp-cursor-version') === '12' &&
       state.cursorElement.querySelector?.('[data-mergen-mcp-cursor-pointer]')
     ) {
       return state.cursorElement;
@@ -1646,7 +1646,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 11) {
     state.cursorElement?.remove?.();
     const cursor = document.createElement('div');
     cursor.setAttribute('data-mergen-mcp-cursor', 'true');
-    cursor.setAttribute('data-mergen-mcp-cursor-version', '11');
+    cursor.setAttribute('data-mergen-mcp-cursor-version', '12');
     cursor.setAttribute('data-mergen-mcp-cursor-phase', state.cursor.phase || 'idle');
     Object.assign(cursor.style, {
       position: 'fixed',
@@ -1841,8 +1841,126 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 11) {
     await new Promise((resolve) => setTimeout(resolve, delay));
     return setCursorPosition(point.x, point.y, { tilt: 0, phase: 'targeting' });
   };
+  const targetAt = (point, fallback = null) => document.elementFromPoint(point.x, point.y) || fallback || document.body || document.documentElement;
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const rootScrollElement = () => document.scrollingElement || document.documentElement;
+  const isRootScrollTarget = (target) => {
+    const root = rootScrollElement();
+    return !target || target === window || target === document || target === root || target === document.documentElement || target === document.body;
+  };
+  const scrollTargetViewport = (target) => {
+    if (isRootScrollTarget(target)) {
+      return { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight, width: window.innerWidth, height: window.innerHeight };
+    }
+    const rect = target.getBoundingClientRect();
+    return { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom, width: rect.width, height: rect.height };
+  };
+  const scrollableTargetsForElement = (element) => {
+    const targets = [];
+    let node = element?.parentElement;
+    while (node && node !== document.documentElement) {
+      const style = window.getComputedStyle(node);
+      const canScrollY = node.scrollHeight > node.clientHeight + 1 && /(auto|scroll|overlay)/.test(style.overflowY);
+      const canScrollX = node.scrollWidth > node.clientWidth + 1 && /(auto|scroll|overlay)/.test(style.overflowX);
+      if (canScrollY || canScrollX) targets.push(node);
+      node = node.parentElement;
+    }
+    const root = rootScrollElement();
+    if (root && !targets.includes(root)) targets.push(root);
+    return targets;
+  };
+  const scrollDeltaForElement = (element, target) => {
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) throw new Error('Element is not visible after scrolling');
+    const viewport = scrollTargetViewport(target);
+    const safeX = Math.min(120, Math.max(32, viewport.width * 0.18));
+    const safeY = Math.min(140, Math.max(48, viewport.height * 0.22));
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+    const desiredX = viewport.left + viewport.width / 2;
+    const desiredY = viewport.top + viewport.height / 2;
+    let deltaX = (rect.left < viewport.left + safeX || rect.right > viewport.right - safeX) ? centerX - desiredX : 0;
+    let deltaY = (rect.top < viewport.top + safeY || rect.bottom > viewport.bottom - safeY) ? centerY - desiredY : 0;
+    const scrollTarget = isRootScrollTarget(target) ? rootScrollElement() : target;
+    const currentX = isRootScrollTarget(target) ? window.scrollX : (scrollTarget?.scrollLeft ?? 0);
+    const currentY = isRootScrollTarget(target) ? window.scrollY : (scrollTarget?.scrollTop ?? 0);
+    const maxX = isRootScrollTarget(target)
+      ? Math.max(0, (scrollTarget?.scrollWidth ?? document.documentElement.scrollWidth) - window.innerWidth)
+      : Math.max(0, (scrollTarget?.scrollWidth ?? 0) - (scrollTarget?.clientWidth ?? 0));
+    const maxY = isRootScrollTarget(target)
+      ? Math.max(0, (scrollTarget?.scrollHeight ?? document.documentElement.scrollHeight) - window.innerHeight)
+      : Math.max(0, (scrollTarget?.scrollHeight ?? 0) - (scrollTarget?.clientHeight ?? 0));
+    deltaX = clamp(deltaX, -currentX, maxX - currentX);
+    deltaY = clamp(deltaY, -currentY, maxY - currentY);
+    return { deltaX, deltaY };
+  };
+  const scrollGesturePoint = (element, target) => {
+    const rect = element.getBoundingClientRect();
+    const viewport = scrollTargetViewport(target);
+    const insetX = Math.min(80, Math.max(8, viewport.width * 0.12), Math.max(0, viewport.width / 2 - 1));
+    const insetY = Math.min(96, Math.max(8, viewport.height * 0.14), Math.max(0, viewport.height / 2 - 1));
+    return clampPoint(
+      clamp(rect.left + rect.width / 2, viewport.left + insetX, viewport.right - insetX),
+      clamp(rect.top + rect.height / 2, viewport.top + insetY, viewport.bottom - insetY),
+    );
+  };
+  const elementCenterIsTouchable = (element, margin = 0) => {
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0 || !inViewport(rect)) return false;
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+    return centerX >= margin && centerX <= window.innerWidth - 1 - margin && centerY >= margin && centerY <= window.innerHeight - 1 - margin;
+  };
+  const applyHumanScrollStep = (scrollTarget, point, deltaX, deltaY) => {
+    const eventTarget = targetAt(point, isRootScrollTarget(scrollTarget) ? document.body : scrollTarget);
+    eventTarget.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, clientX: point.x, clientY: point.y, deltaX, deltaY, deltaMode: 0 }));
+    if (isRootScrollTarget(scrollTarget)) {
+      window.scrollBy({ left: deltaX, top: deltaY, behavior: 'auto' });
+    } else {
+      scrollTarget.scrollBy({ left: deltaX, top: deltaY, behavior: 'auto' });
+    }
+  };
+  const humanScrollBy = async (scrollTarget, point, deltaX, deltaY) => {
+    const steps = humanWheelSteps(deltaX, deltaY);
+    if (!steps.length) return false;
+    setCursorPosition(point.x, point.y, { tilt: 0, phase: 'targeting' });
+    dispatchMoveAt(point, targetAt(point, scrollTarget));
+    for (const step of steps) {
+      applyHumanScrollStep(scrollTarget, point, step.deltaX, step.deltaY);
+      await nextFrame();
+      await sleep(66);
+    }
+    setCursorPosition(point.x, point.y, { tilt: 0, phase: 'idle' });
+    return true;
+  };
+  const humanScrollElementIntoView = async (element) => {
+    clearCursorAnchor();
+    const targets = scrollableTargetsForElement(element);
+    let moved = false;
+    for (let pass = 0; pass < 4; pass++) {
+      let movedThisPass = false;
+      for (const target of targets) {
+        const { deltaX, deltaY } = scrollDeltaForElement(element, target);
+        if (Math.abs(deltaX) < 1 && Math.abs(deltaY) < 1) continue;
+        const point = scrollGesturePoint(element, target);
+        const scrolled = await humanScrollBy(target, point, deltaX, deltaY);
+        moved = moved || scrolled;
+        movedThisPass = movedThisPass || scrolled;
+      }
+      await nextFrame();
+      if (elementCenterIsTouchable(element, 8)) break;
+      if (!movedThisPass) break;
+    }
+    if (!elementCenterIsTouchable(element, 0)) {
+      element.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      await nextFrame();
+      await sleep(80);
+    } else if (moved) {
+      await sleep(90);
+    }
+  };
   const stableElementCenterAfterScroll = async (element) => {
-    element.scrollIntoView({ block: 'center', inline: 'center' });
+    await humanScrollElementIntoView(element);
     let previous = null;
     let latest = null;
     for (let frame = 0; frame < 5; frame++) {
@@ -1856,8 +1974,6 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 11) {
     return latest;
   };
   const elementCenter = async (element) => stableElementCenterAfterScroll(element);
-  const targetAt = (point, fallback = null) => document.elementFromPoint(point.x, point.y) || fallback || document.body || document.documentElement;
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const scrollableAncestor = (element, deltaX, deltaY) => {
     let node = element && element.nodeType === Node.ELEMENT_NODE ? element : element?.parentElement;
     while (node && node !== document.documentElement) {
@@ -1885,7 +2001,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 11) {
   const humanWheelSteps = (deltaX, deltaY) => {
     const distance = Math.max(Math.abs(deltaX), Math.abs(deltaY));
     if (distance <= 0) return [];
-    const count = clamp(Math.ceil(distance / 90), 3, 14);
+    const count = clamp(Math.ceil(distance / 72), 5, 24);
     const steps = [];
     let previous = 0;
     for (let index = 1; index <= count; index++) {
@@ -1910,7 +2026,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 11) {
       const currentTarget = targetAt(point, target);
       applyWheelStep(currentTarget, point, step.deltaX, step.deltaY);
       await nextFrame();
-      await sleep(42);
+      await sleep(66);
     }
     setCursorPosition(point.x, point.y, { tilt: 0, phase: 'idle' });
     dispatchMoveAt(point, targetAt(point, target));
@@ -2527,7 +2643,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 11) {
   };
   window.addEventListener('scroll', scheduleCursorAnchorSync, true);
   window.addEventListener('resize', scheduleCursorAnchorSync);
-  window.__mergenMcpRun.version = 11;
+  window.__mergenMcpRun.version = 12;
 }
 "#;
 
@@ -3216,7 +3332,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn browser_mcp_automation_script_includes_visible_cursor_and_mouse_tools() {
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 11"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 12"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-version"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-pointer"));
@@ -3275,12 +3391,20 @@ mod tests {
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
             .contains("border: '2px solid rgba(245,158,11,0.95)'"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("stableElementCenterAfterScroll"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("humanScrollElementIntoView"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("humanScrollBy"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("applyHumanScrollStep"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("elementCenterIsTouchable"));
+        assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("element.scrollIntoView({ block: 'center', inline: 'center' })"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("element.scrollIntoView({ block: 'nearest', inline: 'nearest' })"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("anchorCursorTo(element)"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
             .contains("window.addEventListener('scroll', scheduleCursorAnchorSync, true)"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("humanWheelSteps"));
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("Math.ceil(distance / 90)"));
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("await sleep(42)"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("Math.ceil(distance / 72)"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("await sleep(66)"));
         assert!(
             MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("scrollBy({ left: deltaX, top: deltaY")
         );
