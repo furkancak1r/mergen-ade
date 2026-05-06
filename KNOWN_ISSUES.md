@@ -10,6 +10,29 @@ When adding an entry:
 
 ---
 
+#### Browser MCP only allowed single session, causing "inaccessible" errors with multiple projects {#browser-mcp-multi-session}
+- Date: 2026-05-06
+- Context: Browser MCP with 4+ concurrent OpenCode sessions across different projects
+- Error signature: "Erişilemedi" (inaccessible) error when using Browser MCP from multiple terminals simultaneously. Only 1 session could work at a time.
+- Symptoms/Impact: Users working on multiple projects simultaneously could not use Browser MCP from all sessions. Stale tokens from terminated sessions could interfere with new sessions.
+- Root cause: Token registry only used `(terminal_id, project_id)` as the scope key. All OpenCode sessions for the same terminal/project shared the same token, and session restart did not rotate tokens.
+- Resolution:
+  - Added `session_id` field to `BrowserMcpAuthScope` and `BrowserMcpIpcRequest`.
+  - Changed token registry key from `(u64, Option<u64>)` to `(u64, Option<u64>, Option<String>)` to include session_id.
+  - Added `MERGEN_BROWSER_MCP_SESSION_ID_ENV_VAR` constant for passing session ID via environment.
+  - Updated `BrowserMcpService::endpoint_env()` and `build_pty_env()` to accept optional session_id.
+  - Added `revoke_session()` method to invalidate all tokens for a specific session (called on OpenCode restart/exit).
+  - Added `opencode_browser_mcp_session_id` field to `TerminalEntry` to track per-terminal session IDs.
+  - Updated `mark_opencode_launch_pending()` to generate new session ID on each OpenCode launch.
+  - Updated `clear_opencode_state()` to revoke session tokens when clearing OpenCode state.
+  - Updated OpenCode runtime config generation to include session_id in environment variables.
+  - Updated browser_mcp_helper to read session_id from env and include it in IPC requests.
+- Prevent recurrence:
+  - Added regression tests: `endpoint_env_uses_session_scoped_tokens`, `revoke_session_removes_only_session_tokens`, `revoke_terminal_removes_all_session_tokens_for_terminal`, `build_pty_env_includes_session_id_when_provided`.
+  - Test multi-project workflow: open 4 terminals in 4 different projects, run Browser MCP commands from all simultaneously.
+- Files/Commands touched: `src/browser_mcp_service.rs`, `src/browser_mcp_helper.rs`, `src/opencode_config.rs`, `src/app.rs`, `src/terminal.rs`, `KNOWN_ISSUES.md`
+- References: User request 2026-05-06: "4 farklı projede çalışıyorum, 4 farklı browser açık, her terminalin kendi mcpsi var gibi düşün"
+
 #### Browser MCP cursor invisible on dark theme websites {#browser-cursor-dark-theme}
 - Date: 2026-05-06
 - Context: Browser MCP automation cursor on websites with dark backgrounds like `#18181b`

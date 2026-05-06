@@ -1699,6 +1699,9 @@ struct TerminalEntry {
     codex_hooks_runtime_verified: bool,
     opencode_launch_pending_since: Option<Instant>,
     opencode_launch_process_baseline: Option<Vec<TrackedProcessIdentity>>,
+    /// OpenCode Browser MCP session ID for multi-session isolation.
+    /// Rotated on each new OpenCode launch to invalidate stale Browser MCP tokens.
+    opencode_browser_mcp_session_id: Option<String>,
     opencode_session_active: bool,
     opencode_process_identity: Option<TrackedProcessIdentity>,
     opencode_last_process_seen_at: Option<Instant>,
@@ -4203,6 +4206,7 @@ impl AdeApp {
             codex_hooks_runtime_verified: false,
             opencode_launch_pending_since: None,
             opencode_launch_process_baseline: None,
+            opencode_browser_mcp_session_id: None,
             opencode_session_active: false,
             opencode_process_identity: None,
             opencode_last_process_seen_at: None,
@@ -5653,6 +5657,19 @@ impl AdeApp {
         entry.opencode_attention_reason = None;
         entry.dirty = true;
 
+        // Rotate Browser MCP session ID for multi-session isolation.
+        // This invalidates any stale Browser MCP tokens from previous sessions.
+        let new_session_id = format!(
+            "{}-{:x}",
+            terminal_id,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+        entry.opencode_browser_mcp_session_id = Some(new_session_id.clone());
+        changed = true;
+
         // Safeguard: Ensure runtime config is up-to-date with current Browser MCP settings
         // before OpenCode launches. This handles stale sidecar paths from old binaries.
         if let Some(ref opencode_runtime_dir) = self.opencode_cli_runtime_dir {
@@ -5660,7 +5677,11 @@ impl AdeApp {
             let browser_mcp = self.browser_mcp_service.as_ref().map(|service| {
                 (
                     self.current_executable_path.clone(),
-                    service.endpoint_env(terminal_id, Some(entry.project_id)),
+                    service.endpoint_env(
+                        terminal_id,
+                        Some(entry.project_id),
+                        Some(&new_session_id),
+                    ),
                 )
             });
             let write_result = if let Some((exe_path, endpoint)) = browser_mcp.as_ref() {
@@ -5698,6 +5719,14 @@ impl AdeApp {
             return false;
         };
 
+        // Revoke Browser MCP session tokens when clearing OpenCode state.
+        if let (Some(session_id), Some(service)) = (
+            &entry.opencode_browser_mcp_session_id,
+            self.browser_mcp_service.as_ref(),
+        ) {
+            service.revoke_session(session_id);
+        }
+
         let changed = entry.ai_session.tool == Some(AiCliTool::OpenCode)
             || entry.opencode_launch_pending_since.is_some()
             || entry.opencode_launch_process_baseline.is_some()
@@ -5715,6 +5744,7 @@ impl AdeApp {
         entry.runtime.set_active_ai_tool(None);
         entry.opencode_launch_pending_since = None;
         entry.opencode_launch_process_baseline = None;
+        entry.opencode_browser_mcp_session_id = None;
         entry.opencode_session_active = false;
         entry.opencode_process_identity = None;
         entry.opencode_last_process_seen_at = None;
@@ -10563,6 +10593,8 @@ impl AdeApp {
         self.reset_factory_droid_hook_inbox(terminal_id);
         self.clear_codex_state(terminal_id);
         self.reset_codex_notify_inbox(terminal_id);
+        self.clear_opencode_state(terminal_id);
+        self.reset_opencode_notify_inbox(terminal_id);
         if let Some(service) = self.browser_mcp_service.as_ref() {
             service.revoke_terminal(terminal_id);
         }
@@ -12528,7 +12560,7 @@ impl AdeApp {
             let browser_mcp = self.browser_mcp_service.as_ref().map(|service| {
                 (
                     self.current_executable_path.clone(),
-                    service.endpoint_env(*terminal_id, Some(terminal.project_id)),
+                    service.endpoint_env(*terminal_id, Some(terminal.project_id), None),
                 )
             });
             let write_result = if let Some((exe_path, endpoint)) = browser_mcp.as_ref() {
@@ -34153,6 +34185,7 @@ mod tests {
             codex_hooks_runtime_verified: false,
             opencode_launch_pending_since: None,
             opencode_launch_process_baseline: None,
+            opencode_browser_mcp_session_id: None,
             opencode_session_active: false,
             opencode_process_identity: None,
             opencode_last_process_seen_at: None,
@@ -40859,12 +40892,14 @@ mod tests {
             request_id: "request".to_owned(),
             terminal_id: None,
             project_id: None,
+            session_id: None,
             tool: "browser_snapshot".to_owned(),
             params: serde_json::json!({}),
         };
         let scope = crate::browser_mcp_service::BrowserMcpAuthScope {
             terminal_id: 1,
             project_id: Some(7),
+            session_id: None,
         };
 
         assert_eq!(app.resolve_browser_mcp_project_id(&request, &scope), Ok(7));
@@ -40883,12 +40918,14 @@ mod tests {
             request_id: "request".to_owned(),
             terminal_id: Some(1),
             project_id: Some(8),
+            session_id: None,
             tool: "browser_navigate".to_owned(),
             params: serde_json::json!({ "url": "https://blocked.example" }),
         };
         let scope = crate::browser_mcp_service::BrowserMcpAuthScope {
             terminal_id: 1,
             project_id: Some(7),
+            session_id: None,
         };
 
         let response = app.handle_browser_mcp_request(&ctx, request, scope);
@@ -40912,12 +40949,14 @@ mod tests {
             request_id: "request".to_owned(),
             terminal_id: None,
             project_id: None,
+            session_id: None,
             tool: "browser_navigate".to_owned(),
             params: serde_json::json!({ "url": "https://active.example" }),
         };
         let scope = crate::browser_mcp_service::BrowserMcpAuthScope {
             terminal_id: 99,
             project_id: Some(7),
+            session_id: None,
         };
 
         let response = app.handle_browser_mcp_request(&ctx, request, scope);
@@ -42027,12 +42066,14 @@ mod tests {
         let scope = crate::browser_mcp_service::BrowserMcpAuthScope {
             terminal_id: 1,
             project_id: Some(7),
+            session_id: None,
         };
         let request = |tool: &str, params: serde_json::Value| {
             crate::browser_mcp_service::BrowserMcpIpcRequest {
                 request_id: "request".to_owned(),
                 terminal_id: Some(1),
                 project_id: Some(7),
+                session_id: None,
                 tool: tool.to_owned(),
                 params,
             }
@@ -42091,12 +42132,14 @@ mod tests {
         let scope = crate::browser_mcp_service::BrowserMcpAuthScope {
             terminal_id: 1,
             project_id: Some(7),
+            session_id: None,
         };
         let request = |tool: &str, params: serde_json::Value| {
             crate::browser_mcp_service::BrowserMcpIpcRequest {
                 request_id: "request".to_owned(),
                 terminal_id: Some(1),
                 project_id: Some(7),
+                session_id: None,
                 tool: tool.to_owned(),
                 params,
             }
@@ -42158,12 +42201,14 @@ mod tests {
         let scope = crate::browser_mcp_service::BrowserMcpAuthScope {
             terminal_id: 1,
             project_id: Some(7),
+            session_id: None,
         };
         let request =
             |params: serde_json::Value| crate::browser_mcp_service::BrowserMcpIpcRequest {
                 request_id: "request".to_owned(),
                 terminal_id: Some(1),
                 project_id: Some(7),
+                session_id: None,
                 tool: "browser_tabs".to_owned(),
                 params,
             };
@@ -42195,11 +42240,13 @@ mod tests {
         let scope = crate::browser_mcp_service::BrowserMcpAuthScope {
             terminal_id: 1,
             project_id: Some(7),
+            session_id: None,
         };
         let request = |url: &str| crate::browser_mcp_service::BrowserMcpIpcRequest {
             request_id: "request".to_owned(),
             terminal_id: Some(1),
             project_id: Some(7),
+            session_id: None,
             tool: "browser_tabs".to_owned(),
             params: serde_json::json!({ "action": "new", "url": url }),
         };

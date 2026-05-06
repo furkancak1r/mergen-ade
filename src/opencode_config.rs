@@ -8,7 +8,8 @@ use serde_json::{json, Value as JsonValue};
 use crate::browser_mcp_service::{
     BrowserMcpEndpointEnv, DEFAULT_BROWSER_MCP_TIMEOUT_MS, MERGEN_BROWSER_MCP_HELPER_ARG,
     MERGEN_BROWSER_MCP_PORT_ENV_VAR, MERGEN_BROWSER_MCP_PROJECT_ID_ENV_VAR,
-    MERGEN_BROWSER_MCP_TERMINAL_ID_ENV_VAR, MERGEN_BROWSER_MCP_TOKEN_ENV_VAR,
+    MERGEN_BROWSER_MCP_SESSION_ID_ENV_VAR, MERGEN_BROWSER_MCP_TERMINAL_ID_ENV_VAR,
+    MERGEN_BROWSER_MCP_TOKEN_ENV_VAR,
 };
 
 /// Returns the global OpenCode config path (~/.config/opencode/opencode.json).
@@ -145,6 +146,9 @@ pub fn write_terminal_runtime_config_with_browser_mcp(
         });
         if let Some(project_id) = endpoint.project_id {
             environment[MERGEN_BROWSER_MCP_PROJECT_ID_ENV_VAR] = json!(project_id.to_string());
+        }
+        if let Some(session_id) = &endpoint.session_id {
+            environment[MERGEN_BROWSER_MCP_SESSION_ID_ENV_VAR] = json!(session_id);
         }
         let mut mcp_servers = serde_json::Map::new();
         mcp_servers.insert(
@@ -398,6 +402,7 @@ mod tests {
             token: "test-token".to_owned(),
             terminal_id: 42,
             project_id: Some(7),
+            session_id: None,
         };
 
         let config_dir = write_terminal_runtime_config_with_browser_mcp(
@@ -484,6 +489,7 @@ mod tests {
             token: "single-binary-token".to_owned(),
             terminal_id: 99,
             project_id: Some(1),
+            session_id: None,
         };
 
         let config_dir = write_terminal_runtime_config_with_browser_mcp(

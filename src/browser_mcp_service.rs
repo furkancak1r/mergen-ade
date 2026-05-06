@@ -13,6 +13,8 @@ pub const MERGEN_BROWSER_MCP_PORT_ENV_VAR: &str = "MERGEN_BROWSER_MCP_PORT";
 pub const MERGEN_BROWSER_MCP_TOKEN_ENV_VAR: &str = "MERGEN_BROWSER_MCP_TOKEN";
 pub const MERGEN_BROWSER_MCP_TERMINAL_ID_ENV_VAR: &str = "MERGEN_BROWSER_MCP_TERMINAL_ID";
 pub const MERGEN_BROWSER_MCP_PROJECT_ID_ENV_VAR: &str = "MERGEN_BROWSER_MCP_PROJECT_ID";
+/// Session ID to distinguish concurrent OpenCode/browser sessions for the same terminal/project.
+pub const MERGEN_BROWSER_MCP_SESSION_ID_ENV_VAR: &str = "MERGEN_BROWSER_MCP_SESSION_ID";
 pub const MERGEN_BROWSER_MCP_ENDPOINT_PATH: &str = "/browser-mcp";
 /// CLI argument to run Browser MCP helper mode from the main executable.
 pub const MERGEN_BROWSER_MCP_HELPER_ARG: &str = "--browser-mcp-helper";
@@ -28,6 +30,9 @@ pub struct BrowserMcpIpcRequest {
     pub terminal_id: Option<u64>,
     #[serde(default)]
     pub project_id: Option<u64>,
+    /// Session ID for multi-session isolation (concurrent OpenCode sessions).
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub tool: String,
     #[serde(default)]
     pub params: JsonValue,
@@ -86,6 +91,8 @@ pub struct BrowserMcpCommand {
 pub struct BrowserMcpAuthScope {
     pub terminal_id: u64,
     pub project_id: Option<u64>,
+    /// Session ID for multi-session isolation.
+    pub session_id: Option<String>,
 }
 
 pub struct BrowserMcpService {
@@ -98,12 +105,17 @@ pub struct BrowserMcpService {
 #[derive(Debug, Default)]
 struct BrowserMcpTokenRegistry {
     scopes_by_token: BTreeMap<String, BrowserMcpAuthScope>,
-    token_by_scope: BTreeMap<(u64, Option<u64>), String>,
+    /// Key: (terminal_id, project_id, session_id) for multi-session isolation.
+    token_by_scope: BTreeMap<(u64, Option<u64>, Option<String>), String>,
 }
 
 impl BrowserMcpTokenRegistry {
     fn token_for_scope(&mut self, scope: BrowserMcpAuthScope) -> String {
-        let key = (scope.terminal_id, scope.project_id);
+        let key = (
+            scope.terminal_id,
+            scope.project_id,
+            scope.session_id.clone(),
+        );
         if let Some(token) = self.token_by_scope.get(&key) {
             return token.clone();
         }
@@ -122,11 +134,11 @@ impl BrowserMcpTokenRegistry {
         let revoked = self
             .token_by_scope
             .iter()
-            .filter(|((tid, _), _)| *tid == terminal_id)
+            .filter(|((tid, _, _), _)| *tid == terminal_id)
             .map(|(_, token)| token.clone())
             .collect::<Vec<_>>();
         self.token_by_scope
-            .retain(|(tid, _), _| *tid != terminal_id);
+            .retain(|(tid, _, _), _| *tid != terminal_id);
         for token in revoked {
             self.scopes_by_token.remove(&token);
         }
@@ -136,11 +148,26 @@ impl BrowserMcpTokenRegistry {
         let revoked = self
             .token_by_scope
             .iter()
-            .filter(|((_, pid), _)| *pid == Some(project_id))
+            .filter(|((_, pid, _), _)| *pid == Some(project_id))
             .map(|(_, token)| token.clone())
             .collect::<Vec<_>>();
         self.token_by_scope
-            .retain(|(_, pid), _| *pid != Some(project_id));
+            .retain(|(_, pid, _), _| *pid != Some(project_id));
+        for token in revoked {
+            self.scopes_by_token.remove(&token);
+        }
+    }
+
+    /// Revoke all tokens for a specific session (e.g., when OpenCode restarts).
+    fn revoke_session(&mut self, session_id: &str) {
+        let revoked = self
+            .token_by_scope
+            .iter()
+            .filter(|((_, _, sid), _)| sid.as_deref() == Some(session_id))
+            .map(|(_, token)| token.clone())
+            .collect::<Vec<_>>();
+        self.token_by_scope
+            .retain(|(_, _, sid), _| sid.as_deref() != Some(session_id));
         for token in revoked {
             self.scopes_by_token.remove(&token);
         }
@@ -178,8 +205,9 @@ impl BrowserMcpService {
         &self,
         terminal_id: u64,
         project_id: Option<u64>,
+        session_id: Option<&str>,
     ) -> Vec<(String, String)> {
-        let token = self.token_for_scope(terminal_id, project_id);
+        let token = self.token_for_scope(terminal_id, project_id, session_id);
         let mut env = vec![
             (
                 MERGEN_BROWSER_MCP_PORT_ENV_VAR.to_owned(),
@@ -197,15 +225,27 @@ impl BrowserMcpService {
                 project_id.to_string(),
             ));
         }
+        if let Some(session_id) = session_id {
+            env.push((
+                MERGEN_BROWSER_MCP_SESSION_ID_ENV_VAR.to_owned(),
+                session_id.to_owned(),
+            ));
+        }
         env
     }
 
-    pub fn endpoint_env(&self, terminal_id: u64, project_id: Option<u64>) -> BrowserMcpEndpointEnv {
+    pub fn endpoint_env(
+        &self,
+        terminal_id: u64,
+        project_id: Option<u64>,
+        session_id: Option<&str>,
+    ) -> BrowserMcpEndpointEnv {
         BrowserMcpEndpointEnv {
             port: self.port,
-            token: self.token_for_scope(terminal_id, project_id),
+            token: self.token_for_scope(terminal_id, project_id, session_id),
             terminal_id,
             project_id,
+            session_id: session_id.map(|s| s.to_owned()),
         }
     }
 
@@ -225,16 +265,29 @@ impl BrowserMcpService {
         }
     }
 
-    fn token_for_scope(&self, terminal_id: u64, project_id: Option<u64>) -> String {
+    fn token_for_scope(
+        &self,
+        terminal_id: u64,
+        project_id: Option<u64>,
+        session_id: Option<&str>,
+    ) -> String {
         self.token_registry
             .lock()
             .map(|mut registry| {
                 registry.token_for_scope(BrowserMcpAuthScope {
                     terminal_id,
                     project_id,
+                    session_id: session_id.map(|s| s.to_owned()),
                 })
             })
             .unwrap_or_else(|_| generate_token())
+    }
+
+    /// Revoke all tokens for a specific session (e.g., when OpenCode restarts).
+    pub fn revoke_session(&self, session_id: &str) {
+        if let Ok(mut registry) = self.token_registry.lock() {
+            registry.revoke_session(session_id);
+        }
     }
 }
 
@@ -244,6 +297,8 @@ pub struct BrowserMcpEndpointEnv {
     pub token: String,
     pub terminal_id: u64,
     pub project_id: Option<u64>,
+    /// Session ID for multi-session isolation.
+    pub session_id: Option<String>,
 }
 
 fn run_listener(
@@ -547,7 +602,7 @@ mod tests {
     fn build_pty_env_includes_endpoint_and_project() {
         let service = test_service();
 
-        let env = service.build_pty_env(42, Some(7));
+        let env = service.build_pty_env(42, Some(7), None);
         assert_eq!(
             env[0],
             (
@@ -582,12 +637,48 @@ mod tests {
     }
 
     #[test]
+    fn build_pty_env_includes_session_id_when_provided() {
+        let service = test_service();
+
+        let env = service.build_pty_env(42, Some(7), Some("session-abc-123"));
+        assert_eq!(
+            env[0],
+            (
+                MERGEN_BROWSER_MCP_PORT_ENV_VAR.to_owned(),
+                "1234".to_owned()
+            )
+        );
+        assert_eq!(env[1].0, MERGEN_BROWSER_MCP_TOKEN_ENV_VAR.to_owned());
+        assert!(!env[1].1.is_empty());
+
+        // Find the session_id entry
+        let session_entry = env
+            .iter()
+            .find(|(k, _)| k == MERGEN_BROWSER_MCP_SESSION_ID_ENV_VAR);
+        assert!(
+            session_entry.is_some(),
+            "SESSION_ID env var should be present"
+        );
+        assert_eq!(session_entry.unwrap().1, "session-abc-123");
+
+        let scope = service
+            .token_registry
+            .lock()
+            .expect("token registry")
+            .scope_for_token(&env[1].1)
+            .expect("token should be registered");
+        assert_eq!(scope.terminal_id, 42);
+        assert_eq!(scope.project_id, Some(7));
+        assert_eq!(scope.session_id, Some("session-abc-123".to_owned()));
+    }
+
+    #[test]
     fn endpoint_env_uses_terminal_scoped_tokens() {
         let service = test_service();
 
-        let first = service.endpoint_env(1, Some(7));
-        let second = service.endpoint_env(2, Some(8));
-        let first_again = service.endpoint_env(1, Some(7));
+        let first = service.endpoint_env(1, Some(7), None);
+        let second = service.endpoint_env(2, Some(8), None);
+        let first_again = service.endpoint_env(1, Some(7), None);
 
         assert_ne!(first.token, second.token);
         assert_eq!(first.token, first_again.token);
@@ -596,23 +687,95 @@ mod tests {
             registry.scope_for_token(&first.token),
             Some(BrowserMcpAuthScope {
                 terminal_id: 1,
-                project_id: Some(7)
+                project_id: Some(7),
+                session_id: None,
             })
         );
         assert_eq!(
             registry.scope_for_token(&second.token),
             Some(BrowserMcpAuthScope {
                 terminal_id: 2,
-                project_id: Some(8)
+                project_id: Some(8),
+                session_id: None,
             })
+        );
+    }
+
+    #[test]
+    fn endpoint_env_uses_session_scoped_tokens() {
+        let service = test_service();
+
+        // Same terminal and project, but different sessions should get different tokens
+        let session_a = service.endpoint_env(1, Some(7), Some("session-a"));
+        let session_b = service.endpoint_env(1, Some(7), Some("session-b"));
+        let session_a_again = service.endpoint_env(1, Some(7), Some("session-a"));
+
+        assert_ne!(
+            session_a.token, session_b.token,
+            "Different sessions should have different tokens"
+        );
+        assert_eq!(
+            session_a.token, session_a_again.token,
+            "Same session should have same token"
+        );
+
+        let registry = service.token_registry.lock().expect("token registry");
+        assert_eq!(
+            registry.scope_for_token(&session_a.token),
+            Some(BrowserMcpAuthScope {
+                terminal_id: 1,
+                project_id: Some(7),
+                session_id: Some("session-a".to_owned()),
+            })
+        );
+        assert_eq!(
+            registry.scope_for_token(&session_b.token),
+            Some(BrowserMcpAuthScope {
+                terminal_id: 1,
+                project_id: Some(7),
+                session_id: Some("session-b".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn revoke_session_removes_all_tokens_with_session_id_globally() {
+        let service = test_service();
+        
+        let session_a_terminal_1 = service.endpoint_env(1, Some(7), Some("session-a"));
+        let session_b = service.endpoint_env(1, Some(7), Some("session-b"));
+        let session_a_terminal_2 = service.endpoint_env(2, Some(8), Some("session-a"));
+
+        service.revoke_session("session-a");
+
+        let registry = service.token_registry.lock().expect("token registry");
+        assert_eq!(
+            registry.scope_for_token(&session_a_terminal_1.token),
+            None,
+            "session-a token for terminal 1 should be revoked"
+        );
+        assert_eq!(
+            registry.scope_for_token(&session_b.token),
+            Some(BrowserMcpAuthScope {
+                terminal_id: 1,
+                project_id: Some(7),
+                session_id: Some("session-b".to_owned()),
+            }),
+            "session-b token should remain"
+        );
+        // Session IDs are global - revoking "session-a" should revoke it everywhere
+        assert_eq!(
+            registry.scope_for_token(&session_a_terminal_2.token),
+            None,
+            "session-a token for terminal 2 should also be revoked (session IDs are global)"
         );
     }
 
     #[test]
     fn revoke_terminal_removes_terminal_tokens() {
         let service = test_service();
-        let terminal_token = service.endpoint_env(1, Some(7)).token;
-        let other_token = service.endpoint_env(2, Some(8)).token;
+        let terminal_token = service.endpoint_env(1, Some(7), None).token;
+        let other_token = service.endpoint_env(2, Some(8), None).token;
 
         service.revoke_terminal(1);
 
@@ -622,8 +785,40 @@ mod tests {
             registry.scope_for_token(&other_token),
             Some(BrowserMcpAuthScope {
                 terminal_id: 2,
-                project_id: Some(8)
+                project_id: Some(8),
+                session_id: None,
             })
+        );
+    }
+
+    #[test]
+    fn revoke_terminal_removes_all_session_tokens_for_terminal() {
+        let service = test_service();
+        let session_a = service.endpoint_env(1, Some(7), Some("session-a"));
+        let session_b = service.endpoint_env(1, Some(7), Some("session-b"));
+        let other_terminal = service.endpoint_env(2, Some(8), Some("session-a"));
+
+        service.revoke_terminal(1);
+
+        let registry = service.token_registry.lock().expect("token registry");
+        assert_eq!(
+            registry.scope_for_token(&session_a.token),
+            None,
+            "session-a token should be revoked"
+        );
+        assert_eq!(
+            registry.scope_for_token(&session_b.token),
+            None,
+            "session-b token should be revoked"
+        );
+        assert_eq!(
+            registry.scope_for_token(&other_terminal.token),
+            Some(BrowserMcpAuthScope {
+                terminal_id: 2,
+                project_id: Some(8),
+                session_id: Some("session-a".to_owned()),
+            }),
+            "Other terminal should remain"
         );
     }
 
