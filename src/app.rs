@@ -41692,7 +41692,10 @@ mod tests {
         // When no pointer position is set (None), we assume overlap for safety
         // (return true) - this is conservative behavior to avoid glitches
         let overlaps = app.context_menu_overlaps_browser_panel(&ctx);
-        assert!(overlaps, "When no pointer position available, assume overlap for safety");
+        assert!(
+            overlaps,
+            "When no pointer position available, assume overlap for safety"
+        );
 
         // Test the actual non-overlap case: when pointer is at terminal location (left side)
         // and browser is on right side, overlap should be false

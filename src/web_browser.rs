@@ -2224,17 +2224,40 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 15) {
     const tracker = element._valueTracker;
     if (tracker && typeof tracker.setValue === 'function') tracker.setValue(String(previous ?? ''));
   };
+  const KEY_CODES = {
+    Enter: 13,
+    Escape: 27,
+    Tab: 9,
+    Space: 32,
+    Backspace: 8,
+    Delete: 46,
+    ArrowUp: 38,
+    ArrowDown: 40,
+    ArrowLeft: 37,
+    ArrowRight: 39,
+    PageUp: 33,
+    PageDown: 34,
+    Home: 36,
+    End: 35,
+    Shift: 16,
+    Control: 17,
+    Alt: 18,
+    Meta: 91,
+    CapsLock: 20,
+    NumLock: 144,
+  };
   const dispatchKeyEvent = (element, type, key) => {
     const textKey = String(key || '');
     const code = textKey.length === 1 && /[a-z]/i.test(textKey) ? `Key${textKey.toUpperCase()}` : textKey;
+    const keyCode = KEY_CODES[textKey] || (textKey === 'Enter' ? 13 : textKey.length === 1 ? textKey.toUpperCase().charCodeAt(0) : 0);
     return element.dispatchEvent(new KeyboardEvent(type, {
       bubbles: true,
       cancelable: true,
       key: textKey,
       code,
       charCode: textKey.length === 1 ? textKey.charCodeAt(0) : 0,
-      keyCode: textKey === 'Enter' ? 13 : textKey.length === 1 ? textKey.toUpperCase().charCodeAt(0) : 0,
-      which: textKey === 'Enter' ? 13 : textKey.length === 1 ? textKey.toUpperCase().charCodeAt(0) : 0,
+      keyCode,
+      which: keyCode,
     }));
   };
   const dispatchInputLifecycleEvent = (element, type, inputType = 'insertText', data = null) => {
@@ -2418,12 +2441,13 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 15) {
     }
     if (tool === 'browser_press_key') {
       const active = document.activeElement || document.body || document.documentElement;
+      let cursorPoint = clampPoint(state.cursor.x, state.cursor.y);
       if (active && active.getBoundingClientRect) {
         const rect = active.getBoundingClientRect();
         if (rect.width > 0 && rect.height > 0) {
-          const point = clampPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+          cursorPoint = clampPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
           anchorCursorTo(active);
-          await moveCursorTo(point.x, point.y, { intent: 'point' });
+          await moveCursorTo(cursorPoint.x, cursorPoint.y, { intent: 'point' });
         } else {
           setCursorPosition(state.cursor.x, state.cursor.y, { tilt: 0, phase: 'idle' });
         }
@@ -2431,9 +2455,43 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 15) {
         setCursorPosition(state.cursor.x, state.cursor.y, { tilt: 0, phase: 'idle' });
       }
       const key = String(params.key || '');
-      active.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
+      const keydownAllowed = active.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+      // Apply scroll fallback for navigation keys when event is not canceled
+      if (keydownAllowed) {
+        const SCROLL_KEYS = {
+          PageDown: { deltaX: 0, deltaY: Math.round(window.innerHeight * 0.85) },
+          PageUp: { deltaX: 0, deltaY: -Math.round(window.innerHeight * 0.85) },
+          Home: { deltaX: 0, deltaY: -999999 },
+          End: { deltaX: 0, deltaY: 999999 },
+          ArrowDown: { deltaX: 0, deltaY: 40 },
+          ArrowUp: { deltaX: 0, deltaY: -40 },
+          ArrowLeft: { deltaX: -40, deltaY: 0 },
+          ArrowRight: { deltaX: 40, deltaY: 0 },
+          Space: { deltaX: 0, deltaY: Math.round(window.innerHeight * 0.85) },
+        };
+        const scrollDelta = SCROLL_KEYS[key];
+        if (scrollDelta) {
+          const scrollTarget = scrollableAncestor(targetAt(cursorPoint), scrollDelta.deltaX, scrollDelta.deltaY);
+          const isRoot = isRootScrollTarget(scrollTarget);
+          const maxScrollY = isRoot
+            ? Math.max(0, (scrollTarget?.scrollHeight ?? document.documentElement.scrollHeight) - window.innerHeight)
+            : Math.max(0, (scrollTarget?.scrollHeight ?? 0) - (scrollTarget?.clientHeight ?? 0));
+          const maxScrollX = isRoot
+            ? Math.max(0, (scrollTarget?.scrollWidth ?? document.documentElement.scrollWidth) - window.innerWidth)
+            : Math.max(0, (scrollTarget?.scrollWidth ?? 0) - (scrollTarget?.clientWidth ?? 0));
+          const currentY = isRoot ? window.scrollY : (scrollTarget?.scrollTop ?? 0);
+          const currentX = isRoot ? window.scrollX : (scrollTarget?.scrollLeft ?? 0);
+          const targetY = clamp(currentY + scrollDelta.deltaY, 0, maxScrollY);
+          const targetX = clamp(currentX + scrollDelta.deltaX, 0, maxScrollX);
+          const actualDeltaY = targetY - currentY;
+          const actualDeltaX = targetX - currentX;
+          if (Math.abs(actualDeltaY) > 0 || Math.abs(actualDeltaX) > 0) {
+            await applyWheelScrollFallback(scrollTarget, cursorPoint, actualDeltaX, actualDeltaY);
+          }
+        }
+      }
       if (key === 'Enter' && active.form) active.form.requestSubmit?.();
-      active.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true }));
+      active.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true, cancelable: true }));
       await settleAfterInteraction();
       return ok(`Pressed ${key}`);
     }
@@ -2893,7 +2951,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 15) {
   };
   window.addEventListener('scroll', scheduleVisualAnchorSync, true);
   window.addEventListener('resize', scheduleVisualAnchorSync);
-  window.__mergenMcpRun.version = 15;
+  window.__mergenMcpRun.version = 16;
 }
 "#;
 
@@ -3583,7 +3641,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn browser_mcp_automation_script_includes_visible_cursor_and_mouse_tools() {
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 15"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 16"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-version"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-pointer"));
@@ -3743,6 +3801,32 @@ mod tests {
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("params.commit !== false"));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("const inputText ="));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("element.value = text"));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn browser_mcp_automation_script_includes_keyboard_scroll_fallback() {
+        // KEY_CODES mapping for proper key codes
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("PageDown: 34"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("PageUp: 33"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("Home: 36"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("End: 35"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("ArrowDown: 40"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("ArrowUp: 38"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("ArrowLeft: 37"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("ArrowRight: 39"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("Space: 32"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("Enter: 13"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("Escape: 27"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("Tab: 9"));
+        // SCROLL_KEYS mapping in browser_press_key
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("SCROLL_KEYS = {"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("PageDown: { deltaX: 0, deltaY:"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("PageUp: { deltaX: 0, deltaY:"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("applyWheelScrollFallback"));
+        // Scroll fallback uses proper scrollable ancestor detection
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("scrollableAncestor(targetAt(cursorPoint)"));
     }
 
     #[test]
