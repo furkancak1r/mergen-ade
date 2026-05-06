@@ -413,6 +413,7 @@ pub struct ProjectRecord {
     pub id: u64,
     pub name: String,
     pub path: PathBuf,
+    /// Saved messages for background terminals (reusable snippets).
     #[serde(default)]
     pub saved_messages: Vec<String>,
     #[serde(default)]
@@ -424,6 +425,10 @@ pub struct ProjectRecord {
     /// Last browser URL for this project (project-scoped browsing).
     #[serde(default)]
     pub browser_last_url: Option<String>,
+    /// Foreground saved messages (dynamic task queue).
+    /// Sent to foreground terminals and removed from queue upon sending.
+    #[serde(default)]
+    pub foreground_saved_messages: Vec<String>,
 }
 
 /// A single recorded terminal input.

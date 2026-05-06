@@ -243,6 +243,7 @@ const SOURCE_CONTROL_FILE_ICON_GAP: f32 = 6.0;
 const DIRECTORY_SEARCH_INPUT_ID: &str = "directory-search-input";
 const SAVED_MESSAGE_DRAFT_INPUT_ID: &str = "saved-message-draft-input";
 const BROWSER_URL_INPUT_ID: &str = "browser-url-input";
+const FOREGROUND_MESSAGE_INPUT_ID: &str = "foreground-message-input";
 const SETTINGS_NAV_WIDTH: f32 = 144.0;
 const SETTINGS_WINDOW_DEFAULT_WIDTH: f32 = 760.0;
 const SETTINGS_WINDOW_DEFAULT_HEIGHT: f32 = 520.0;
@@ -1277,6 +1278,10 @@ pub struct AdeApp {
     /// Which shortcut index is currently recording a key (None if not recording)
     settings_shortcut_recording_index: Option<usize>,
     saved_message_drafts: BTreeMap<u64, String>,
+    /// Foreground saved messages popup state
+    foreground_message_popup_open: Option<u64>, // project_id if popup is open
+    foreground_message_popup_editing_index: Option<usize>, // None for add, Some(index) for edit
+    foreground_message_popup_draft: String,
     launcher_draft: LauncherDraftState,
     launcher_icon_textures: BTreeMap<LauncherIconKey, TextureHandle>,
     launcher_icon_failures: BTreeSet<LauncherIconKey>,
@@ -3592,6 +3597,7 @@ impl AdeApp {
                     ai_config: crate::hooks::ProjectAiConfig::default(),
                     checklist: Vec::new(),
                     browser_last_url: None,
+                    foreground_saved_messages: Vec::new(),
                 });
             }
         }
@@ -3732,6 +3738,9 @@ impl AdeApp {
             settings_diagnostics_expanded: false,
             settings_shortcut_recording_index: None,
             saved_message_drafts: BTreeMap::new(),
+            foreground_message_popup_open: None,
+            foreground_message_popup_editing_index: None,
+            foreground_message_popup_draft: String::new(),
             launcher_draft: LauncherDraftState::default(),
             launcher_icon_textures: BTreeMap::new(),
             launcher_icon_failures: std::collections::BTreeSet::new(),
@@ -3963,6 +3972,7 @@ impl AdeApp {
             ai_config: crate::hooks::ProjectAiConfig::default(),
             checklist: Vec::new(),
             browser_last_url: None,
+            foreground_saved_messages: Vec::new(),
         };
 
         let new_project_id = project.id;
@@ -8753,6 +8763,10 @@ impl AdeApp {
         if self.show_settings_popup {
             return true;
         }
+        // Check if foreground message popup is open (it has text input)
+        if self.foreground_message_popup_open.is_some() {
+            return true;
+        }
         false
     }
 
@@ -8770,7 +8784,13 @@ impl AdeApp {
             for project_id in self.projects.keys() {
                 mem.surrender_focus(Self::browser_url_input_id(*project_id));
             }
+            // Surrender foreground message popup input focus
+            mem.surrender_focus(Self::foreground_message_input_id());
         });
+    }
+
+    fn foreground_message_input_id() -> Id {
+        Id::new(FOREGROUND_MESSAGE_INPUT_ID)
     }
 
     /// Reset Directory search tracking state when selected project changes.
@@ -9024,6 +9044,7 @@ fn embedded_browser_should_yield_to_ui_layer(
     context_menu_open: bool,
     context_menu_overlaps_browser: bool,
     browser_dropdown_open: bool,
+    foreground_message_popup_open: bool,
 ) -> bool {
     show_settings_popup
         || show_exit_confirm_popup
@@ -9031,6 +9052,7 @@ fn embedded_browser_should_yield_to_ui_layer(
         || egui_popup_open
         || (context_menu_open && context_menu_overlaps_browser)
         || browser_dropdown_open
+        || foreground_message_popup_open
 }
 
 fn ui_owns_keyboard_state(
@@ -14961,10 +14983,15 @@ impl AdeApp {
         max_tooltip_right: f32,
     ) {
         let ids = terminal_ids_for_project_kind(&self.terminals, project_id, kind);
-        let saved_messages = self
+        let (saved_messages, foreground_messages) = self
             .projects
             .get(&project_id)
-            .map(|project| project.saved_messages.clone())
+            .map(|project| {
+                (
+                    project.saved_messages.clone(),
+                    project.foreground_saved_messages.clone(),
+                )
+            })
             .unwrap_or_default();
         let current_active = self.active_terminal;
         let show_visibility_toggle = self.config.ui.multi_terminal_view_enabled;
@@ -14974,6 +15001,9 @@ impl AdeApp {
             let mut close_terminal = false;
             let mut visibility_changed = false;
             let mut send_message: Option<String> = None;
+            let mut edit_foreground_index: Option<usize> = None;
+            let mut delete_foreground_index: Option<usize> = None;
+            let mut add_foreground_new = false;
             // Track which message was clicked for copying (use Cell for interior mutability)
             let copied_message: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
             // Store row_rect for popup positioning
@@ -15163,12 +15193,34 @@ impl AdeApp {
                             }
                         }
 
-                        let message_response = draw_terminal_saved_message_menu_button(
-                            ui,
-                            &saved_messages,
-                            &mut send_message,
-                        );
-                        action_clicked |= message_response.clicked();
+                        // Show different message menus based on terminal kind
+                        if kind == TerminalKind::Background {
+                            let message_response = draw_terminal_saved_message_menu_button(
+                                ui,
+                                &saved_messages,
+                                &mut send_message,
+                            );
+                            action_clicked |= message_response.clicked();
+                        } else {
+                            let (fg_send, fg_edit, fg_delete, fg_add) =
+                                draw_terminal_foreground_message_menu_button(
+                                    ui,
+                                    &foreground_messages,
+                                );
+                            if fg_send.is_some() {
+                                send_message = fg_send;
+                            }
+                            if fg_edit.is_some() {
+                                edit_foreground_index = fg_edit;
+                            }
+                            if fg_delete.is_some() {
+                                delete_foreground_index = fg_delete;
+                            }
+                            if fg_add {
+                                add_foreground_new = true;
+                            }
+                            // Menu button itself is part of the function, so no additional click tracking needed
+                        }
 
                         // For background terminals: show rerun/interrupt button (runtime-only)
                         // For foreground terminals: show history button (persisted + runtime)
@@ -15261,6 +15313,47 @@ impl AdeApp {
 
             if let Some(message) = send_message {
                 self.send_saved_message_to_terminal(ctx, terminal_entry_id, &message);
+
+                // If this was a foreground terminal, remove the message from the queue
+                if kind == TerminalKind::Foreground {
+                    if let Some(project) = self.projects.get_mut(&project_id) {
+                        // Find and remove the sent message from foreground queue
+                        if let Some(pos) = project
+                            .foreground_saved_messages
+                            .iter()
+                            .position(|m| m == &message)
+                        {
+                            project.foreground_saved_messages.remove(pos);
+                            self.note_projects_changed();
+                            self.persist_config();
+                        }
+                    }
+                }
+            }
+
+            // Handle foreground message queue edits/deletes/adds
+            if let Some(index) = edit_foreground_index {
+                if let Some(project) = self.projects.get(&project_id) {
+                    if let Some(message) = project.foreground_saved_messages.get(index) {
+                        self.foreground_message_popup_open = Some(project_id);
+                        self.foreground_message_popup_editing_index = Some(index);
+                        self.foreground_message_popup_draft = message.clone();
+                    }
+                }
+            }
+            if let Some(index) = delete_foreground_index {
+                if let Some(project) = self.projects.get_mut(&project_id) {
+                    if index < project.foreground_saved_messages.len() {
+                        project.foreground_saved_messages.remove(index);
+                        self.note_projects_changed();
+                        self.persist_config();
+                    }
+                }
+            }
+            if add_foreground_new {
+                self.foreground_message_popup_open = Some(project_id);
+                self.foreground_message_popup_editing_index = None;
+                self.foreground_message_popup_draft.clear();
             }
 
             if visibility_changed {
@@ -16465,6 +16558,7 @@ impl AdeApp {
             ctx.is_context_menu_open(),
             context_menu_overlaps_browser,
             self.browser_panel_dropdown_open,
+            self.foreground_message_popup_open.is_some(),
         )
     }
 
@@ -19638,6 +19732,156 @@ impl AdeApp {
             self.persist_config();
         }
     }
+
+    /// Draw the foreground saved message popup (add/edit).
+    fn draw_foreground_message_popup(&mut self, ctx: &egui::Context) {
+        let Some(project_id) = self.foreground_message_popup_open else {
+            return;
+        };
+
+        let is_editing = self.foreground_message_popup_editing_index.is_some();
+        let title = if is_editing {
+            format!("{} Edit Task", icons::CODE)
+        } else {
+            format!("{} Add New Task", icons::PLUS)
+        };
+
+        // Dark overlay backdrop
+        egui::Area::new("foreground_message_overlay".into())
+            .fixed_pos(egui::pos2(0.0, 0.0))
+            .order(egui::Order::Foreground)
+            .interactable(true)
+            .show(ctx, |ui| {
+                let screen = ctx.screen_rect();
+                let response = ui.allocate_rect(screen, Sense::click());
+                ui.painter().rect_filled(
+                    screen,
+                    0.0,
+                    Color32::from_rgba_premultiplied(0, 0, 0, 140),
+                );
+                if response.clicked() {
+                    self.foreground_message_popup_open = None;
+                    self.foreground_message_popup_draft.clear();
+                }
+            });
+
+        let mut open = self.foreground_message_popup_open.is_some();
+        if !open {
+            return;
+        }
+
+        let window_size = egui::vec2(520.0, 320.0);
+
+        egui::Window::new(title)
+            .id(egui::Id::new("foreground_message_popup"))
+            .open(&mut open)
+            .order(egui::Order::Foreground)
+            .resizable(false)
+            .collapsible(false)
+            .movable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size(window_size)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("Task command/prompt:")
+                        .small()
+                        .color(TEXT_MUTED),
+                );
+                ui.add_space(8.0);
+
+                // Multiline text input
+                let input_id = Self::foreground_message_input_id();
+                let available_width = ui.available_width().max(0.0);
+                let text_height = 160.0;
+
+                with_settings_text_edit_chrome(ui, |ui| {
+                    let text_edit =
+                        egui::TextEdit::multiline(&mut self.foreground_message_popup_draft)
+                            .id(input_id)
+                            .desired_width(available_width)
+                            .min_size(egui::vec2(available_width, text_height))
+                            .hint_text("Enter command or prompt here...");
+                    ui.add(text_edit);
+                });
+
+                // Request focus on first open
+                ctx.memory_mut(|mem| {
+                    if !mem.has_focus(input_id) {
+                        mem.request_focus(input_id);
+                    }
+                });
+
+                ui.add_space(16.0);
+
+                // Buttons
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // Cancel button
+                    if ui.button("Cancel").clicked() {
+                        self.foreground_message_popup_open = None;
+                        self.foreground_message_popup_draft.clear();
+                    }
+
+                    ui.add_space(8.0);
+
+                    // Save button
+                    let draft_trimmed = self.foreground_message_popup_draft.trim();
+                    let can_save = !draft_trimmed.is_empty();
+                    ui.add_enabled_ui(can_save, |ui| {
+                        let save_label = if is_editing {
+                            "Save Changes"
+                        } else {
+                            "Add Task"
+                        };
+                        if ui.button(save_label).clicked() {
+                            if let Some(project) = self.projects.get_mut(&project_id) {
+                                if let Some(index) = self.foreground_message_popup_editing_index {
+                                    // Editing existing
+                                    if index < project.foreground_saved_messages.len() {
+                                        project.foreground_saved_messages[index] =
+                                            self.foreground_message_popup_draft.clone();
+                                    }
+                                } else {
+                                    // Adding new
+                                    project
+                                        .foreground_saved_messages
+                                        .push(self.foreground_message_popup_draft.clone());
+                                }
+                                self.note_projects_changed();
+                                self.persist_config();
+                            }
+                            self.foreground_message_popup_open = None;
+                            self.foreground_message_popup_draft.clear();
+                        }
+                    });
+
+                    // Delete button when editing
+                    if is_editing {
+                        ui.add_space(8.0);
+                        if ui
+                            .button(RichText::new("Delete").color(Color32::from_rgb(232, 100, 100)))
+                            .clicked()
+                        {
+                            if let Some(project) = self.projects.get_mut(&project_id) {
+                                if let Some(index) = self.foreground_message_popup_editing_index {
+                                    if index < project.foreground_saved_messages.len() {
+                                        project.foreground_saved_messages.remove(index);
+                                        self.note_projects_changed();
+                                        self.persist_config();
+                                    }
+                                }
+                            }
+                            self.foreground_message_popup_open = None;
+                            self.foreground_message_popup_draft.clear();
+                        }
+                    }
+                });
+            });
+
+        if !open {
+            self.foreground_message_popup_open = None;
+            self.foreground_message_popup_draft.clear();
+        }
+    }
 }
 
 impl eframe::App for AdeApp {
@@ -19830,6 +20074,7 @@ impl eframe::App for AdeApp {
             self.draw_sidebar_seam_fix(ctx, activity_rect, explorer_rect);
         }
         self.draw_settings_popup(ctx);
+        self.draw_foreground_message_popup(ctx);
         self.draw_exit_confirm_popup(ctx);
 
         self.draw_transient_toast(ctx);
@@ -19977,6 +20222,11 @@ fn recover_project_records(
             if current_project.browser_last_url.is_some() {
                 merged_project.browser_last_url = current_project.browser_last_url.clone();
             }
+            // Merge foreground saved messages
+            merged_project.foreground_saved_messages = merge_saved_messages(
+                &merged_project.foreground_saved_messages,
+                &current_project.foreground_saved_messages,
+            );
             projects.insert(loaded_id, merged_project);
             project_id_remap.insert(current_project.id, loaded_id);
             continue;
@@ -22845,6 +23095,100 @@ fn draw_terminal_saved_message_menu_button(
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     response
+}
+
+/// Draw the foreground message menu button with queue management.
+/// Returns (send_message, edit_index, delete_index, add_new_clicked)
+fn draw_terminal_foreground_message_menu_button(
+    ui: &mut Ui,
+    foreground_messages: &[String],
+) -> (Option<String>, Option<usize>, Option<usize>, bool) {
+    let mut send_message: Option<String> = None;
+    let mut edit_index: Option<usize> = None;
+    let mut delete_index: Option<usize> = None;
+    let mut add_new_clicked = false;
+
+    let message_menu = with_minimal_button_chrome(ui, |ui| {
+        ui.menu_button(format!("{}", icons::CHAT_TEXT), |ui| {
+            with_minimal_button_chrome(ui, |ui| {
+                if foreground_messages.is_empty() {
+                    ui.label(RichText::new("No tasks in queue").color(TEXT_MUTED));
+                } else {
+                    ui.label(
+                        RichText::new("Click to send (removes from queue)")
+                            .small()
+                            .color(TEXT_MUTED),
+                    );
+                    ui.add_space(4.0);
+
+                    for (index, message) in foreground_messages.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            // Message button - sends and removes from queue
+                            let msg_button = ui
+                                .button(RichText::new(capped_hover_text(message, 40)))
+                                .on_hover_text(message)
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            if msg_button.clicked() {
+                                send_message = Some(message.clone());
+                                ui.close_menu();
+                            }
+
+                            // Edit button
+                            if styled_icon_button(
+                                ui,
+                                AppIcon::Code,
+                                BTN_SUBTLE,
+                                BTN_BLUE_HOVER,
+                                BTN_ICON_ACTIVE,
+                                "Edit",
+                            ) {
+                                edit_index = Some(index);
+                                ui.close_menu();
+                            }
+
+                            // Delete button
+                            if styled_icon_button(
+                                ui,
+                                AppIcon::Trash,
+                                BTN_SUBTLE,
+                                BTN_RED_HOVER,
+                                Color32::from_rgb(186, 58, 58),
+                                "Delete",
+                            ) {
+                                delete_index = Some(index);
+                                ui.close_menu();
+                            }
+                        });
+                    }
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                // Add new button
+                if ui
+                    .button(format!("{} Add New", icons::PLUS))
+                    .on_hover_text("Add new task to queue")
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    add_new_clicked = true;
+                    ui.close_menu();
+                }
+            });
+        })
+    });
+
+    let response = message_menu
+        .response
+        .on_hover_text("Foreground tasks")
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    (send_message, edit_index, delete_index, add_new_clicked)
 }
 
 fn project_group_header_actions_width(_section_gap: f32) -> f32 {
@@ -34696,6 +35040,7 @@ mod tests {
             ai_config: ProjectAiConfig::default(),
             checklist: checklist.iter().map(|item| (*item).to_owned()).collect(),
             browser_last_url: None,
+            foreground_saved_messages: Vec::new(),
         }
     }
 
@@ -34917,6 +35262,9 @@ mod tests {
             settings_diagnostics_expanded: false,
             settings_shortcut_recording_index: None,
             saved_message_drafts: BTreeMap::new(),
+            foreground_message_popup_open: None,
+            foreground_message_popup_editing_index: None,
+            foreground_message_popup_draft: String::new(),
             launcher_draft: super::LauncherDraftState::default(),
             launcher_icon_textures: BTreeMap::new(),
             launcher_icon_failures: std::collections::BTreeSet::new(),
@@ -39217,6 +39565,7 @@ mod tests {
                 ai_config: crate::hooks::ProjectAiConfig::default(),
                 checklist: vec!["item1".to_owned()],
                 browser_last_url: None,
+                foreground_saved_messages: Vec::new(),
             }],
             ..AppConfig::default()
         };
@@ -41682,6 +42031,7 @@ mod tests {
             ai_config: crate::hooks::ProjectAiConfig::default(),
             checklist: vec![],
             browser_last_url: Some("https://loaded.com".to_owned()),
+            foreground_saved_messages: Vec::new(),
         }];
 
         // Current (in-memory) project has different URL
@@ -41696,6 +42046,7 @@ mod tests {
                 ai_config: crate::hooks::ProjectAiConfig::default(),
                 checklist: vec![],
                 browser_last_url: Some("https://current.com".to_owned()),
+                foreground_saved_messages: Vec::new(),
             },
         );
 
@@ -41726,6 +42077,7 @@ mod tests {
             ai_config: crate::hooks::ProjectAiConfig::default(),
             checklist: vec![],
             browser_last_url: Some("https://loaded.com".to_owned()),
+            foreground_saved_messages: Vec::new(),
         }];
 
         // Current (in-memory) project has no URL
@@ -41740,6 +42092,7 @@ mod tests {
                 ai_config: crate::hooks::ProjectAiConfig::default(),
                 checklist: vec![],
                 browser_last_url: None,
+                foreground_saved_messages: Vec::new(),
             },
         );
 
@@ -42390,34 +42743,38 @@ mod tests {
     #[test]
     fn embedded_browser_yields_to_ui_overlay_layers() {
         // Test the pure predicate for all overlay sources
-        // Parameters: settings, exit_confirm, terminal_history_popup, egui_popup, context_menu_open, context_menu_overlaps_browser, browser_dropdown_open
+        // Parameters: settings, exit_confirm, terminal_history_popup, egui_popup, context_menu_open, context_menu_overlaps_browser, browser_dropdown_open, foreground_message_popup_open
         assert!(embedded_browser_should_yield_to_ui_layer(
-            true, false, false, false, false, false, false
+            true, false, false, false, false, false, false, false
         ));
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, true, false, false, false, false, false
+            false, true, false, false, false, false, false, false
         ));
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, true, false, false, false, false
+            false, false, true, false, false, false, false, false
         ));
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, false, true, false, false, false
+            false, false, false, true, false, false, false, false
         ));
         // Context menu only yields when it overlaps with browser
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, true, true, false
+            false, false, false, false, true, true, false, false
         ));
         // Context menu does NOT yield when it doesn't overlap
         assert!(!embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, true, false, false
+            false, false, false, false, true, false, false, false
         ));
         // No overlays at all
         assert!(!embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, false, false, false
+            false, false, false, false, false, false, false, false
         ));
         // Browser dropdown open should cause yield
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, false, false, true
+            false, false, false, false, false, false, true, false
+        ));
+        // Foreground message popup open should cause yield
+        assert!(embedded_browser_should_yield_to_ui_layer(
+            false, false, false, false, false, false, false, true
         ));
     }
 
@@ -43127,7 +43484,8 @@ mod tests {
         );
         // Close button is centered vertically: top = tab_rect.top() + ((tab_rect.height() - close_size) / 2)
         let expected_top = tab_rect.top()
-            + ((tab_rect.height() - super::BROWSER_TAB_CLOSE_SIZE.min(tab_rect.height())) / 2.0).max(0.0);
+            + ((tab_rect.height() - super::BROWSER_TAB_CLOSE_SIZE.min(tab_rect.height())) / 2.0)
+                .max(0.0);
         assert_eq!(close_rect.top(), expected_top);
         assert!(label_rect.right() <= close_rect.left() - super::BROWSER_TAB_LABEL_RIGHT_GAP);
         assert!(!label_rect.intersects(close_rect));

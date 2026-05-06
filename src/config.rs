@@ -255,6 +255,7 @@ impl From<LegacyAppConfig> for AppConfig {
                     ai_config: crate::hooks::ProjectAiConfig::default(),
                     checklist: Vec::new(),
                     browser_last_url: None,
+                    foreground_saved_messages: Vec::new(),
                 }
             })
             .collect();
@@ -728,6 +729,7 @@ command = false
             ai_config: crate::hooks::ProjectAiConfig::default(),
             checklist: vec!["item1".to_owned(), "item2".to_owned()],
             browser_last_url: None,
+            foreground_saved_messages: Vec::new(),
         });
 
         save_config(&path, &config).expect("should save config");

@@ -191,6 +191,19 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Internal confirmation input must not be recorded**: The automatic `y` sent to confirm batch termination is internal control input and must never be added to `recent_inputs` or persisted history.
 - **Do not interpolate GitHub contexts directly**: In workflow `run:` steps, use environment variables instead of direct `${{ github.ref_name }}` interpolation to avoid shell injection risks (per Semgrep findings).
 
+## Terminal Manager Saved Messages Guidelines
+- **Two separate message systems**: Terminal Manager has distinct saved message systems for foreground and background terminals:
+  - **Background saved messages** (`ProjectRecord::saved_messages`): Reusable snippets that persist across sessions. Sent via the message button in Terminal Manager rows for background terminals.
+  - **Foreground saved messages** (`ProjectRecord::foreground_saved_messages`): Dynamic task queue for foreground terminals. Clicking a message sends it to the terminal AND removes it from the queue.
+- **Foreground message queue UI**: The foreground message menu shows the current queue with edit/delete actions for each item, plus an "Add New" button at the bottom.
+- **Add/Edit popup**: Clicking "Add New" or the edit button opens a popup with a multiline `TextEdit::multiline` input. The popup uses `Order::Foreground` to render above other UI layers.
+- **Focus management**: The popup input automatically requests focus on open. Terminal keyboard capture is disabled while the popup is open (via `text_input_has_focus_extended()` check).
+- **Browser overlay yield**: The foreground message popup is included in `embedded_browser_should_yield_to_ui_layer()` to ensure native WebView is hidden while the popup is open.
+- **Persistence**: Foreground saved messages are persisted to config TOML in `ProjectRecord::foreground_saved_messages` and survive application restarts and version updates.
+- **Send-and-remove behavior**: When a foreground message is sent to a terminal, it is automatically removed from the queue. This makes the foreground queue work as a task list that depletes as tasks are executed.
+- **Edit/Delete actions**: Each foreground queue item has edit (pencil) and delete (trash) buttons. Edit opens the popup pre-filled with the message content. Delete removes immediately without confirmation.
+- **Empty queue handling**: When the foreground queue is empty, the menu shows "No tasks in queue" text and only the "Add New" button is available.
+
 ## Window Close Confirmation Guidelines
 - **Window close confirmation must not early-return before rendering.** When intercepting a close request (`ViewportCommand::CancelClose`), do not use `return` to exit the update function early. The confirmation popup should be rendered in the same frame by setting the state flag and allowing the normal render path to continue.
 - **Avoid `request_repaint()` after showing the confirmation popup.** Since the popup will be drawn later in the same update cycle by `draw_exit_confirm_popup()`, an explicit repaint request is unnecessary and can cause visual flicker.

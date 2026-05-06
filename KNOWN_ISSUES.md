@@ -523,3 +523,44 @@ When adding an entry:
 - References: User request 2026-05-06: browser kismi dikeyde browser disindaki ogeler linkler butonlar filan cok yer kapliyor orayi modifiye etmeni istiyorum amacim browserin dikeyde daha cok yere yayilmasi ux odakli ilerle
 
 (End of file - total 3872 lines)
+
+---
+
+#### Terminal Manager foreground/background saved messages separation {#terminal-manager-saved-messages-split}
+- Date: 2026-05-06
+- Context: Terminal Manager saved messages feature - user requested different behavior for foreground vs background terminals
+- Error signature: User wanted saved messages to work differently for foreground (dynamic task queue) vs background (reusable snippets) terminals. Foreground messages should be removed from queue when sent, and have add/edit/delete functionality.
+- Symptoms/Impact: Previously both foreground and background terminals used the same saved messages from `ProjectRecord::saved_messages`, which didn'"'"'t support the dynamic queue workflow the user wanted for foreground terminals.
+- Root cause: Single `saved_messages` field was used for both terminal kinds without distinguishing their different use cases.
+- Resolution:
+  - Added new `ProjectRecord::foreground_saved_messages: Vec<String>` field for foreground task queue.
+  - Existing `ProjectRecord::saved_messages` now used exclusively for background terminals (reusable snippets).
+  - Terminal Manager shows different message menus based on terminal kind:
+    - Background: traditional saved messages menu (unchanged behavior)
+    - Foreground: task queue with send (removes from queue), edit, delete actions per message
+  - Added "+ Add New" button at bottom of foreground menu to open popup for adding tasks.
+  - Created `draw_foreground_message_popup()` with multiline `TextEdit::multiline` input, supporting both add and edit modes.
+  - Popup uses `Order::Foreground` layer to render above other UI elements (same as Settings popup).
+  - Focus automatically set to text input when popup opens; terminal keyboard capture disabled while popup is open.
+  - Edit mode pre-fills text input with existing message; Save button updates in place.
+  - Delete button (red) available in edit mode for removing tasks.
+  - Cancel button closes popup without saving.
+  - Empty or whitespace-only messages are rejected (not saved).
+  - Multi-line content preserved for complex commands/prompts.
+  - When foreground message is sent to terminal, it'"'"'s automatically removed from queue (depleted task list behavior).
+  - Added popup state fields to `AdeApp`: `foreground_message_popup_open: Option<u64>`, `foreground_message_popup_editing_index: Option<usize>`, `foreground_message_popup_draft: String`.
+  - Updated `embedded_browser_should_yield_to_ui_layer()` to accept new `foreground_message_popup_open` parameter to hide native WebView while popup is open.
+  - Updated `text_input_has_focus_extended()` to return true when foreground popup is open.
+  - Updated `surrender_ui_text_focus()` to clear foreground message input focus.
+  - Added constant `FOREGROUND_MESSAGE_INPUT_ID` for input focus management.
+  - Config persistence: foreground messages saved to TOML config in `ProjectRecord::foreground_saved_messages`.
+  - Config migration: legacy configs without the field default to empty queue; recovery merge logic updated to preserve foreground messages.
+  - Updated `test_project()` helper and all test fixtures to include new field.
+  - Updated `embedded_browser_yields_to_ui_overlay_layers` test to include 8th parameter.
+- Prevent recurrence:
+  - Added tests for foreground message popup in overlay yield logic.
+  - Test config roundtrip with foreground messages to ensure persistence works.
+  - Test that sending foreground message removes it from queue.
+  - Test add/edit/delete operations via popup.
+- Files/Commands touched: `src/models.rs` (ProjectRecord), `src/config.rs` (migration), `src/app.rs` (state fields, popup drawing, Terminal Manager UI, focus handling, tests), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-05-06: "terminal managerda her terminal icin send saved messages var ya foreground da farkli background da farkli calismasini istiyorum... foreground daha dinamik olacak... popup acilinca focus inputta olmali... yine buradaki mesajlar da proje bazli kayit olacak"
