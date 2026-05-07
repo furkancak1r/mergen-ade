@@ -942,6 +942,10 @@ pub struct EmbeddedBrowser {
     event_receiver: Receiver<BrowserEvent>,
     /// Last requested visibility state (for testability and state tracking)
     requested_visible: bool,
+    /// Cached last applied native visibility to avoid redundant SetIsVisible calls
+    cached_visible: Option<bool>,
+    /// Cached last applied native bounds to avoid redundant SetBounds calls
+    cached_bounds: Option<BrowserBounds>,
     design_inspect_enabled: bool,
     design_inspect_token: String,
     user_data_folder: Option<PathBuf>,
@@ -974,6 +978,8 @@ impl EmbeddedBrowser {
             event_sender,
             event_receiver,
             requested_visible: false,
+            cached_visible: None,
+            cached_bounds: None,
             design_inspect_enabled: false,
             design_inspect_token: new_design_inspect_token(),
             user_data_folder,
@@ -1138,8 +1144,13 @@ impl EmbeddedBrowser {
     }
 
     #[cfg(target_os = "windows")]
-    fn sync_position_internal(&self, bounds: &BrowserBounds) {
+    fn sync_position_internal(&mut self, bounds: &BrowserBounds) {
         use windows::Win32::Foundation::RECT;
+
+        // Skip redundant SetBounds calls to prevent flicker during scroll
+        if self.cached_bounds.as_ref() == Some(bounds) {
+            return;
+        }
 
         if let Some(inner) = &self.inner {
             let rect = RECT {
@@ -1151,6 +1162,7 @@ impl EmbeddedBrowser {
             unsafe {
                 let _ = inner.controller.SetBounds(rect);
             }
+            self.cached_bounds = Some(*bounds);
             log::debug!(
                 "WebView2 bounds synced: x={}, y={}, w={}, h={}",
                 bounds.x,
@@ -1221,13 +1233,19 @@ impl EmbeddedBrowser {
     }
 
     #[cfg(target_os = "windows")]
-    fn set_visible_internal(&self, visible: bool) {
+    fn set_visible_internal(&mut self, visible: bool) {
         use windows::Win32::Foundation::BOOL;
+
+        // Skip redundant SetIsVisible calls to prevent flicker
+        if self.cached_visible == Some(visible) {
+            return;
+        }
 
         if let Some(inner) = &self.inner {
             unsafe {
                 let _ = inner.controller.SetIsVisible(BOOL::from(visible));
             }
+            self.cached_visible = Some(visible);
             log::debug!("WebView2 visibility set to: {}", visible);
         }
     }
@@ -1769,6 +1787,8 @@ impl EmbeddedBrowser {
         }
         self.status = BrowserStatus::Uninitialized;
         self.requested_visible = false;
+        self.cached_visible = None;
+        self.cached_bounds = None;
         self.design_inspect_enabled = false;
     }
 

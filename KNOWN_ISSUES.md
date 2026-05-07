@@ -753,3 +753,51 @@ When adding an entry:
   - Regression test `handle_shortcuts_sends_double_enter_with_delay` continues to verify double Enter behavior.
 - Files/Commands touched: `src/app.rs` (constant, test comment), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: User request 2026-05-07: "shortcutda 2 kere enter çalışmıyor bekleme süresini arttır"
+
+---
+
+#### Browser panel add tab button not visible {#browser-add-tab-button}
+- Date: 2026-05-07
+- Context: Browser panel tab strip UI with 5-tab support and add button
+- Error signature: User reported: "browser 5 sekme destekliyor ama yeni sekme aç butonu yok ekle" - The add tab (+) button was not visible in the browser panel despite supporting up to 5 tabs.
+- Symptoms/Impact: Users could not add new browser tabs via the UI; the button was being pushed off-screen or hidden by the horizontal ScrollArea for tabs.
+- Root cause:
+  - The `ScrollArea::horizontal()` for tabs was consuming all available width in the horizontal layout, leaving no space for the add button.
+  - The add button was rendered after the ScrollArea but was clipped out of view due to the layout flow.
+- Resolution:
+  - Changed layout to reserve fixed width for the add button before allocating space for the ScrollArea.
+  - Added `BROWSER_ADD_TAB_BUTTON_WIDTH` constant (28px) for the button area.
+  - Calculated `scroll_width = available_width - BROWSER_ADD_TAB_BUTTON_WIDTH - 4px` to ensure scrollable tabs only take remaining space.
+  - Used `ui.allocate_ui_with_layout()` to explicitly size the ScrollArea container.
+  - Changed button from `ui.add_enabled()` to `ui.add_sized()` with fixed dimensions for consistent sizing.
+  - Increased plus icon size from 12px to 14px for better visibility.
+  - Added `&& can_add_tab` check on click handler to prevent tab creation when limit is reached.
+- Prevent recurrence:
+  - Updated AGENTS.md Browser Panel Compact UI Guidelines with new rule: "Reserve fixed width for add tab button in tab strip layout."
+- Files/Commands touched: `src/app.rs` (`draw_browser_panel()` tab strip layout, constants), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-07: "browser 5 sekme destekliyor ama yeni sekme aç butonu yok ekle"
+
+
+---
+
+#### Browser panel white screen flicker during scroll {#browser-scroll-white-flicker}
+- Date: 2026-05-07
+- Context: Embedded WebView2 browser panel showing white/blank areas during mouse wheel scroll
+- Error signature: User reported: "scroll yapıyorum bazen böyle beyaz ekran filan geliyor" - White screen/blank areas appear randomly during scrolling in the browser panel.
+- Symptoms/Impact: During scroll operations, the browser content would flicker with white/blank areas, making the page content temporarily invisible and creating a jarring user experience.
+- Root cause:
+  - sync_embedded_browser() was calling rowser.show() and rowser.sync_position() every UI frame (60+ times per second).
+  - WebView2 native SetIsVisible(true) and SetBounds() were being invoked repeatedly even when visibility and bounds hadn't changed.
+  - This caused the WebView2 child window to invalidate and repaint unnecessarily during scroll, producing white flicker artifacts.
+  - Additionally, bounds were synced AFTER show() was called, meaning the browser could become visible at wrong/old dimensions for a brief moment.
+- Resolution:
+  - Added cached_visible: Option<bool> and cached_bounds: Option<BrowserBounds> fields to EmbeddedBrowser struct to track last applied native state.
+  - Modified set_visible_internal() to skip SetIsVisible() calls when visibility hasn't changed.
+  - Modified sync_position_internal() to skip SetBounds() calls when bounds haven't changed.
+  - Changed sync_embedded_browser() to call sync_position() BEFORE show(), ensuring correct bounds are set before the browser becomes visible.
+  - Reset cached state in shutdown() to ensure clean state on browser restart.
+- Prevent recurrence:
+  - Added regression test sync_embedded_browser_syncs_bounds_before_show verifying bounds are set before visibility.
+  - The idempotent native sync prevents redundant COM calls to WebView2, reducing both flicker and CPU overhead.
+- Files/Commands touched: src/web_browser.rs (struct fields, set_visible_internal(), sync_position_internal(), shutdown()), src/app.rs (sync_embedded_browser() order), KNOWN_ISSUES.md, cargo fmt, cargo test, cargo build --release --target x86_64-pc-windows-msvc`n- References: User request 2026-05-07: "scroll yapıyorum bazen böyle beyaz ekran filan geliyor"
+

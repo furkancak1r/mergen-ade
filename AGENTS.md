@@ -264,10 +264,17 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Use grace period for smooth hover transitions.** When overlay closes, keep WebView hidden briefly (150ms via `BROWSER_OVERLAY_GRACE_PERIOD_MS`) to prevent flickering when moving mouse between controls.
 - **No per-project menu state needed.** With inline buttons instead of togglable menus, no runtime state tracking (like `browser_screenshot_menu_open_by_project`) is required—buttons are always visible and clickable.
 
+## Browser Panel Performance Guidelines
+- **Cache native WebView2 state to avoid redundant COM calls.** The `EmbeddedBrowser` struct maintains `cached_visible: Option<bool>` and `cached_bounds: Option<BrowserBounds>` to track the last applied native state. `set_visible_internal()` and `sync_position_internal()` check these caches before calling WebView2's `SetIsVisible()` or `SetBounds()`.
+- **Sync bounds before showing the browser.** In `sync_embedded_browser()`, always call `browser.sync_position(&bounds)` before `browser.show()`. This prevents the browser from becoming visible at wrong/old dimensions, which can cause white flicker.
+- **Reset cached state on shutdown.** The `shutdown()` method must clear `cached_visible` and `cached_bounds` to ensure clean state when the browser is recreated.
+- **Idempotent native operations prevent scroll flicker.** During scroll operations, egui may re-layout the browser panel every frame. Without caching, repeated `SetBounds()` calls to WebView2 cause the child window to invalidate and repaint, producing white/blank flicker artifacts.
+
 ## Browser Panel Compact UI Guidelines
 - **Browser panel UI must minimize vertical chrome to maximize WebView space.** The panel should allocate ~60-80px total for all UI chrome (tabs + toolbar), leaving the rest for the embedded browser content.
 - **Avoid separate header rows for titles or project names.** The browser panel header should not have a dedicated "Browser" title row or separate project name display; use the activity rail and terminal context to indicate the active project.
 - **Tabs must stay on a single row using horizontal scroll.** Use `ScrollArea::horizontal()` around the tab strip to prevent tabs from wrapping to multiple lines. This keeps tab height predictable (22px) regardless of panel width.
+- **Reserve fixed width for add tab button in tab strip layout.** The add tab (+) button must always be visible. Calculate scrollable tab area as `available_width - add_button_width - spacing` and use `allocate_ui_with_layout()` to constrain the ScrollArea. Button width should be ~28px with 14px icon.
 - **Combine URL input and action buttons into one compact toolbar row.** Place the URL input field on the left taking available width, followed by icon-only buttons (Go, Clear, Design Inspect, Screenshot) on the same row with minimal 4px spacing.
 - **Use reduced padding and margins throughout.** Inner margins should be 6px (not 10px); spacing between UI sections should be 4-6px (not 8-16px).
 - **Reduce tab dimensions for compactness.** Tab height should be 22px (not 26px); tab close button should be 16px (not 18px); tab font should be 11px (not 12px).
