@@ -114,6 +114,34 @@ When adding an entry:
 - Files/Commands touched: `src/app.rs` (AdeApp struct, `draw_browser_panel()`, `draw_browser_screenshot_button()`, `embedded_browser_should_yield_to_ui_layer()`, `should_hide_embedded_browser_for_ui_layer()`, `sync_embedded_browser()`, tests), `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: User request 2026-05-06: "ekran görüntüsü almak için tıklıyorum dropdown browserın arkasında kalıyor ve tıklanmıyor düzelt"
 
+#### Browser panel hover tooltips hidden behind native WebView {#browser-tooltip-webview-z-order}
+- Date: 2026-05-07
+- Context: Browser panel toolbar buttons (Go, Clear, Design Inspect, Screenshot, tabs, Add tab) showing hover tooltips
+- Error signature: Hovering over browser toolbar buttons showed tooltips (e.g., "Take screenshot", "Go to URL", "Close tab") behind the embedded browser content, making them unreadable.
+- Symptoms/Impact: Users could not see hover tooltips on browser panel toolbar buttons because the native WebView was rendering on top of egui tooltips. This affected all toolbar buttons including screenshot dropdown, URL actions, Design Inspect toggle, and tab controls.
+- Root cause:
+  - Native WebView2 renders as a child window above egui's immediate-mode rendering.
+  - Hover tooltips from `on_hover_text()` are rendered via egui's tooltip system, appearing below the WebView z-order.
+  - The existing `browser_panel_dropdown_open` flag only tracked dropdown menu state, not hover tooltip state.
+  - Toolbar buttons like Go, Clear URL, and Screenshot use `on_hover_text()` which displays tooltips that get obscured.
+- Resolution:
+  - Renamed `browser_panel_dropdown_open` to `browser_panel_overlay_active` to reflect broader purpose covering dropdowns, tooltips, and other overlays.
+  - Created `styled_icon_button_response()` helper that returns full `Response` (instead of just `bool`) to enable hover detection.
+  - Modified toolbar buttons (Go, Clear URL) to use the new helper and capture hover state.
+  - Design Inspect button already returned `Response` from `activity_rail_icon_button()`, so hover tracking was added directly.
+  - Modified `draw_browser_screenshot_button()` to return `(menu_open, hovered)` tuple tracking both dropdown and hover states.
+  - Updated tab strip rendering to track hover on tabs, close buttons, and Add tab button via `any_tab_strip_hovered` flag.
+  - Aggregated all hover states in `browser_panel_overlay_active` flag within `draw_browser_panel()`.
+  - Updated `embedded_browser_should_yield_to_ui_layer()` to use the renamed parameter `browser_overlay_active`.
+  - Updated `should_hide_embedded_browser_for_ui_layer()` to pass the renamed field.
+  - When `browser_panel_overlay_active` is true (dropdown OR hover), `sync_embedded_browser()` hides the WebView, allowing tooltips and menus to appear on top.
+- Prevent recurrence:
+  - Added test `sync_embedded_browser_hides_while_hover_tooltip_active` verifying browser is hidden when overlay flag is true (simulating hover state).
+  - Updated existing test `sync_embedded_browser_hides_while_dropdown_open` to use renamed field.
+  - Updated existing test `embedded_browser_yields_to_ui_overlay_layers` with renamed parameter and updated comments.
+- Files/Commands touched: `src/app.rs` (AdeApp struct field rename, new `styled_icon_button_response()` helper, modified `draw_browser_panel()`, `draw_browser_screenshot_button()` signature change, tab strip hover tracking, `embedded_browser_should_yield_to_ui_layer()` parameter rename, `should_hide_embedded_browser_for_ui_layer()` update, new and updated tests), `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-05-07: "browserın altında kalıyor açılan dropdownlar hoverlar"
+
 #### Design Inspect failed on disabled HTML buttons and icon did not toggle {#design-inspect-disabled-button}
 - Date: 2026-05-06
 - Context: Browser panel Design Inspect mode on pages with disabled buttons/inputs

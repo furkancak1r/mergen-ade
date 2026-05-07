@@ -1367,9 +1367,9 @@ pub struct AdeApp {
     /// Pending UI-initiated screenshot requests waiting for browser visibility.
     /// Key: request_id, Value: (project_id, full_page, timestamp)
     browser_pending_screenshot_requests: BTreeMap<String, (u64, bool, Instant)>,
-    /// Whether a dropdown menu in the browser panel is currently open.
-    /// Used to hide the native WebView so the menu appears above it.
-    browser_panel_dropdown_open: bool,
+    /// Whether any overlay (dropdown, tooltip, context menu) in the browser panel is active.
+    /// Used to hide the native WebView so overlays appear above it.
+    browser_panel_overlay_active: bool,
     /// Active embedded-browser video recordings per project.
     browser_video_recordings_by_project: BTreeMap<u64, BrowserVideoRecordingState>,
     browser_video_encode_events_tx: Sender<BrowserVideoEncodeEvent>,
@@ -3821,7 +3821,7 @@ impl AdeApp {
             browser_design_inspect_target_changed_at_by_project: BTreeMap::new(),
             browser_design_inspect_last_delivery_by_destination: BTreeMap::new(),
             browser_pending_screenshot_requests: BTreeMap::new(),
-            browser_panel_dropdown_open: false,
+            browser_panel_overlay_active: false,
             browser_video_recordings_by_project: BTreeMap::new(),
             browser_video_encode_events_tx,
             browser_video_encode_events_rx,
@@ -9049,8 +9049,7 @@ fn format_modifiers(mods: crate::models::ShortcutModifiers) -> String {
 }
 
 /// Determine if the embedded browser should yield to UI overlay layers.
-/// Returns true when any modal, popup, or context menu is active that should
-/// appear above the native WebView.
+/// Returns true when any modal, popup, context menu, or browser panel overlay is active.
 fn embedded_browser_should_yield_to_ui_layer(
     show_settings_popup: bool,
     show_exit_confirm_popup: bool,
@@ -9058,7 +9057,7 @@ fn embedded_browser_should_yield_to_ui_layer(
     egui_popup_open: bool,
     context_menu_open: bool,
     context_menu_overlaps_browser: bool,
-    browser_dropdown_open: bool,
+    browser_overlay_active: bool,
     foreground_message_popup_open: bool,
 ) -> bool {
     show_settings_popup
@@ -9066,7 +9065,7 @@ fn embedded_browser_should_yield_to_ui_layer(
         || terminal_history_popup_open
         || egui_popup_open
         || (context_menu_open && context_menu_overlaps_browser)
-        || browser_dropdown_open
+        || browser_overlay_active
         || foreground_message_popup_open
 }
 
@@ -16626,7 +16625,7 @@ impl AdeApp {
             ctx.memory(|mem| mem.any_popup_open()),
             ctx.is_context_menu_open(),
             context_menu_overlaps_browser,
-            self.browser_panel_dropdown_open,
+            self.browser_panel_overlay_active,
             self.foreground_message_popup_open.is_some(),
         )
     }
@@ -18107,13 +18106,13 @@ impl AdeApp {
     }
 
     /// Draw the browser screenshot dropdown button.
-    /// Returns true if the dropdown menu is currently open.
+    /// Returns (menu_open, hovered) tuple to allow parent to track overlay state.
     fn draw_browser_screenshot_button(
         &mut self,
         ui: &mut Ui,
         ctx: &egui::Context,
         project_id: u64,
-    ) -> bool {
+    ) -> (bool, bool) {
         let screenshot_menu = with_minimal_button_chrome(ui, |ui| {
             ui.menu_button(format!("{}", icons::CAMERA), |ui| {
                 with_minimal_button_chrome(ui, |ui| {
@@ -18154,8 +18153,8 @@ impl AdeApp {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
 
-        // Return true if the menu is open (inner is Some)
-        screenshot_menu.inner.is_some()
+        // Return (menu_open, hovered) tuple
+        (screenshot_menu.inner.is_some(), response.hovered())
     }
 
     /// Queue a browser screenshot request. The actual capture happens when the browser
@@ -18322,9 +18321,9 @@ impl AdeApp {
             return None;
         }
 
-        // Reset the dropdown open flag at the start of each frame.
-        // It will be set to true if any dropdown is open during rendering.
-        self.browser_panel_dropdown_open = false;
+        // Reset the overlay active flag at the start of each frame.
+        // It will be set to true if any overlay (dropdown, tooltip, menu) is active.
+        self.browser_panel_overlay_active = false;
 
         // Determine which project's browser to show
         let browser_project_id = self.active_browser_project_id()?;
@@ -18367,6 +18366,9 @@ impl AdeApp {
                     let mut tab_to_close = None;
                     let mut add_tab_requested = false;
 
+                    // Track if any tab strip element is hovered for overlay detection
+                    let mut any_tab_strip_hovered = false;
+
                     // Compact tab strip - single row, non-wrapping
                     ui.horizontal(|ui| {
                         // Scrollable tab area
@@ -18407,6 +18409,9 @@ impl AdeApp {
                                             )
                                             .on_hover_cursor(egui::CursorIcon::PointingHand);
                                         let tab_hovered = tab_response.hovered() || close_response.hovered();
+                                        if tab_hovered {
+                                            any_tab_strip_hovered = true;
+                                        }
                                         let painted_fill = if *is_active {
                                             fill
                                         } else if tab_hovered {
@@ -18481,10 +18486,17 @@ impl AdeApp {
                                 "Tab limit reached"
                             })
                             .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if add_response.hovered() {
+                            any_tab_strip_hovered = true;
+                        }
                         if add_response.clicked() {
                             add_tab_requested = true;
                         }
                     });
+
+                    // Include tab strip hover in overlay state
+                    self.browser_panel_overlay_active =
+                        self.browser_panel_overlay_active || any_tab_strip_hovered;
 
                     if let Some(tab_id) = tab_to_close {
                         if let Err(err) = self.close_browser_tab(project_id, tab_id) {
@@ -18618,35 +18630,39 @@ impl AdeApp {
 
                         ui.add_space(4.0);
 
-                        // Go button
-                        if styled_icon_button(
+                        // Go button (track hover for overlay)
+                        let go_response = styled_icon_button_response(
                             ui,
                             icons::ARROW_RIGHT,
                             BTN_TEAL,
                             BTN_TEAL_HOVER,
                             BTN_ICON_ACTIVE,
                             "Go to URL",
-                        ) {
+                        );
+                        if go_response.clicked() {
                             go_requested = true;
                         }
+                        let go_hovered = go_response.hovered();
 
                         ui.add_space(4.0);
 
-                        // Clear URL button
-                        if styled_icon_button(
+                        // Clear URL button (track hover for overlay)
+                        let clear_response = styled_icon_button_response(
                             ui,
                             icons::TRASH,
                             BTN_RED,
                             BTN_RED_HOVER,
                             Color32::from_rgb(186, 58, 58),
                             "Clear URL",
-                        ) {
+                        );
+                        if clear_response.clicked() {
                             clear_requested = true;
                         }
+                        let clear_hovered = clear_response.hovered();
 
                         ui.add_space(4.0);
 
-                        // Design Inspect toggle
+                        // Design Inspect toggle (track hover for overlay)
                         let design_inspect_enabled =
                             self.is_browser_design_inspect_enabled_for_project(browser_project_id);
                         let inspect_tooltip = if design_inspect_enabled {
@@ -18659,24 +18675,30 @@ impl AdeApp {
                         } else {
                             icons::EYE_OFF
                         };
-                        if activity_rail_icon_button(
+                        let inspect_response = activity_rail_icon_button(
                             ui,
                             design_inspect_enabled,
                             inspect_icon,
                             inspect_tooltip,
-                        )
-                        .clicked()
-                        {
+                        );
+                        if inspect_response.clicked() {
                             inspect_toggle_requested = true;
                         }
+                        let inspect_hovered = inspect_response.hovered();
 
                         ui.add_space(4.0);
 
-                        // Screenshot dropdown button
-                        let screenshot_menu_open =
+                        // Screenshot dropdown button (already tracks menu and hover)
+                        let (screenshot_menu_open, screenshot_hovered) =
                             self.draw_browser_screenshot_button(ui, ctx, browser_project_id);
-                        self.browser_panel_dropdown_open =
-                            self.browser_panel_dropdown_open || screenshot_menu_open;
+
+                        // Aggregate overlay state from all toolbar buttons
+                        self.browser_panel_overlay_active = self.browser_panel_overlay_active
+                            || go_hovered
+                            || clear_hovered
+                            || inspect_hovered
+                            || screenshot_menu_open
+                            || screenshot_hovered;
                     });
 
                     // Process actions after the UI borrow ends
@@ -23744,6 +23766,44 @@ fn styled_icon_button(
     );
 
     response.clicked()
+}
+
+/// Variant of `styled_icon_button` that returns the full Response for hover tracking.
+fn styled_icon_button_response(
+    ui: &mut Ui,
+    icon: AppIcon,
+    _bg: Color32,
+    _hover_bg: Color32,
+    _active_bg: Color32,
+    tooltip: &str,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT),
+        Sense::click(),
+    );
+    let response = response
+        .on_hover_text(tooltip)
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect.shrink(1.0), 8.0, with_alpha(BTN_ICON_HOVER, 110));
+    }
+
+    let icon_color = if response.is_pointer_button_down_on() || response.hovered() {
+        Color32::from_rgb(255, 255, 255)
+    } else {
+        with_alpha(TEXT_PRIMARY, 178)
+    };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        format!("{icon}"),
+        egui::FontId::proportional(15.0),
+        icon_color,
+    );
+
+    response
 }
 
 /// Draws an icon button specifically for the editor header with high contrast.
@@ -35414,7 +35474,7 @@ mod tests {
             browser_design_inspect_target_changed_at_by_project: BTreeMap::new(),
             browser_design_inspect_last_delivery_by_destination: BTreeMap::new(),
             browser_pending_screenshot_requests: BTreeMap::new(),
-            browser_panel_dropdown_open: false,
+            browser_panel_overlay_active: false,
             browser_video_recordings_by_project: BTreeMap::new(),
             browser_video_encode_events_tx,
             browser_video_encode_events_rx,
@@ -42886,7 +42946,7 @@ mod tests {
     #[test]
     fn embedded_browser_yields_to_ui_overlay_layers() {
         // Test the pure predicate for all overlay sources
-        // Parameters: settings, exit_confirm, terminal_history_popup, egui_popup, context_menu_open, context_menu_overlaps_browser, browser_dropdown_open, foreground_message_popup_open
+        // Parameters: settings, exit_confirm, terminal_history_popup, egui_popup, context_menu_open, context_menu_overlaps_browser, browser_overlay_active, foreground_message_popup_open
         assert!(embedded_browser_should_yield_to_ui_layer(
             true, false, false, false, false, false, false, false
         ));
@@ -42911,7 +42971,7 @@ mod tests {
         assert!(!embedded_browser_should_yield_to_ui_layer(
             false, false, false, false, false, false, false, false
         ));
-        // Browser dropdown open should cause yield
+        // Browser overlay active (dropdown, tooltip, hover) should cause yield
         assert!(embedded_browser_should_yield_to_ui_layer(
             false, false, false, false, false, false, true, false
         ));
@@ -43035,9 +43095,46 @@ mod tests {
             .requested_visible());
 
         // Simulate dropdown being open (e.g., screenshot menu)
-        app.browser_panel_dropdown_open = true;
+        app.browser_panel_overlay_active = true;
 
-        // Sync should hide the browser while dropdown is open
+        // Sync should hide the browser while overlay is active
+        app.sync_embedded_browser(&ctx);
+
+        assert!(!app
+            .embedded_browsers_by_project
+            .get(&1)
+            .unwrap()
+            .requested_visible());
+    }
+
+    #[test]
+    fn sync_embedded_browser_hides_while_hover_tooltip_active() {
+        // Regression test: Browser panel toolbar button hover tooltips
+        // should hide the native WebView so tooltips appear above it.
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        app.selected_project = Some(1);
+        app.set_browser_panel_open_for_project(1, true);
+
+        // Show the browser and simulate it being ready
+        app.project_browser(1).show();
+        app.pending_browser_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(800.0, 100.0),
+            egui::vec2(400.0, 600.0),
+        ));
+        assert!(app
+            .embedded_browsers_by_project
+            .get(&1)
+            .unwrap()
+            .requested_visible());
+
+        // Simulate hover tooltip being active (e.g., user hovering over toolbar button)
+        app.browser_panel_overlay_active = true;
+
+        // Sync should hide the browser while hover overlay is active
         app.sync_embedded_browser(&ctx);
 
         assert!(!app
