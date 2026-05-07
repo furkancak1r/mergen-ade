@@ -380,13 +380,15 @@ enum AppIcon {
     Database,
     Terminal,
     TerminalWindow,
+    Scan,
+    ScanLine,
     Trash,
     TreeView,
     X,
 }
 
 impl AppIcon {
-    const ALL: [Self; 32] = [
+    const ALL: [Self; 34] = [
         Self::ArrowClockwise,
         Self::ArrowLeft,
         Self::ArrowRight,
@@ -414,6 +416,8 @@ impl AppIcon {
         Self::FileImage,
         Self::FileArchive,
         Self::Database,
+        Self::Scan,
+        Self::ScanLine,
         Self::Terminal,
         Self::TerminalWindow,
         Self::Trash,
@@ -450,6 +454,8 @@ impl AppIcon {
             Self::FileImage => "file-image",
             Self::FileArchive => "file-archive",
             Self::Database => "database",
+            Self::Scan => "scan",
+            Self::ScanLine => "scan-line",
             Self::Terminal => "terminal",
             Self::TerminalWindow => "app-window",
             Self::Trash => "trash-2",
@@ -510,6 +516,8 @@ mod icons {
     pub const GLOBE: AppIcon = AppIcon::Globe;
     pub const LIST: AppIcon = AppIcon::List;
     pub const PLUS: AppIcon = AppIcon::Plus;
+    pub const SCAN: AppIcon = AppIcon::Scan;
+    pub const SCAN_LINE: AppIcon = AppIcon::ScanLine;
     pub const TERMINAL: AppIcon = AppIcon::Terminal;
     pub const TERMINAL_WINDOW: AppIcon = AppIcon::TerminalWindow;
     pub const TRASH: AppIcon = AppIcon::Trash;
@@ -18144,7 +18152,7 @@ impl AdeApp {
             .inner_margin(egui::Margin::symmetric(4.0, 4.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    // Full page button
+                    // Full page button (scan icon)
                     let full_page_tooltip = if has_pending {
                         "Full page screenshot (pending...)"
                     } else {
@@ -18152,7 +18160,7 @@ impl AdeApp {
                     };
                     let full_page_btn = ui
                         .add(
-                            egui::Button::new(RichText::new("Full page").color(TEXT_PRIMARY))
+                            egui::Button::new(format!("{}", icons::SCAN))
                                 .fill(Color32::TRANSPARENT)
                                 .frame(false),
                         )
@@ -18173,7 +18181,7 @@ impl AdeApp {
 
                     ui.add_space(4.0);
 
-                    // Visible area button
+                    // Visible area button (scan-line icon)
                     let visible_tooltip = if has_pending {
                         "Visible area screenshot (pending...)"
                     } else {
@@ -18181,7 +18189,7 @@ impl AdeApp {
                     };
                     let visible_btn = ui
                         .add(
-                            egui::Button::new(RichText::new("Visible area").color(TEXT_PRIMARY))
+                            egui::Button::new(format!("{}", icons::SCAN_LINE))
                                 .fill(Color32::TRANSPARENT)
                                 .frame(false),
                         )
