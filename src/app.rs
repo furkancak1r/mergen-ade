@@ -18667,9 +18667,6 @@ impl AdeApp {
                     let mut tab_to_close = None;
                     let mut add_tab_requested = false;
 
-                    // Track if any tab strip element is hovered for overlay detection
-                    let mut any_tab_strip_hovered = false;
-
                     // Compact tab strip - single row, non-wrapping
                     // Add tab button is inside ScrollArea so it stays next to last tab
                     const BROWSER_ADD_TAB_BUTTON_WIDTH: f32 = 28.0;
@@ -18713,9 +18710,6 @@ impl AdeApp {
                                             )
                                             .on_hover_cursor(egui::CursorIcon::PointingHand);
                                         let tab_hovered = tab_response.hovered() || close_response.hovered();
-                                        if tab_hovered {
-                                            any_tab_strip_hovered = true;
-                                        }
                                         let painted_fill = if *is_active {
                                             fill
                                         } else if tab_hovered {
@@ -18792,9 +18786,6 @@ impl AdeApp {
                                             "Tab limit reached"
                                         })
                                         .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                    if add_response.hovered() {
-                                        any_tab_strip_hovered = true;
-                                    }
                                     if add_response.clicked() && can_add_tab {
                                         add_tab_requested = true;
                                     }
@@ -18802,9 +18793,8 @@ impl AdeApp {
                             });
                     });
 
-                    // Include tab strip hover in overlay state
-                    self.browser_panel_overlay_active =
-                        self.browser_panel_overlay_active || any_tab_strip_hovered;
+                    // Tab strip hover does NOT trigger WebView hide; tooltips are safe
+                    // because toolbar renders above WebView in egui layer.
 
                     if let Some(tab_id) = tab_to_close {
                         if let Err(err) = self.close_browser_tab(browser_scope, tab_id) {
@@ -18878,7 +18868,7 @@ impl AdeApp {
 
                         ui.add_space(4.0);
 
-                        // Go button (track hover for overlay)
+                        // Go button
                         let go_response = styled_icon_button_response(
                             ui,
                             icons::ARROW_RIGHT,
@@ -18890,11 +18880,10 @@ impl AdeApp {
                         if go_response.clicked() {
                             go_requested = true;
                         }
-                        let go_hovered = go_response.hovered();
 
                         ui.add_space(4.0);
 
-                        // Clear URL button (track hover for overlay)
+                        // Clear URL button
                         let clear_response = styled_icon_button_response(
                             ui,
                             icons::TRASH,
@@ -18906,11 +18895,10 @@ impl AdeApp {
                         if clear_response.clicked() {
                             clear_requested = true;
                         }
-                        let clear_hovered = clear_response.hovered();
 
                         ui.add_space(4.0);
 
-                        // Design Inspect toggle (track hover for overlay)
+                        // Design Inspect toggle
                         let design_inspect_enabled =
                             self.is_browser_design_inspect_enabled_for_scope(browser_scope);
                         let inspect_tooltip = if design_inspect_enabled {
@@ -18932,20 +18920,15 @@ impl AdeApp {
                         if inspect_response.clicked() {
                             inspect_toggle_requested = true;
                         }
-                        let inspect_hovered = inspect_response.hovered();
 
                         ui.add_space(4.0);
 
                         // Screenshot dual buttons in single frame (no popup, avoids WebView z-order issues)
-                        let screenshot_hovered =
+                        let _screenshot_hovered =
                             self.draw_browser_screenshot_buttons(ui, ctx, browser_project_id);
 
-                        // Aggregate overlay state from all toolbar buttons
-                        self.browser_panel_overlay_active = self.browser_panel_overlay_active
-                            || go_hovered
-                            || clear_hovered
-                            || inspect_hovered
-                            || screenshot_hovered;
+                        // Toolbar hover does NOT trigger WebView hide; toolbar buttons/tooltips
+                        // render above WebView in egui layer without needing WebView to be hidden.
                     });
 
                     // Process actions after the UI borrow ends
@@ -43443,9 +43426,12 @@ mod tests {
     }
 
     #[test]
-    fn sync_embedded_browser_hides_while_hover_tooltip_active() {
-        // Regression test: Browser panel toolbar button hover tooltips
-        // should hide the native WebView so tooltips appear above it.
+    fn sync_embedded_browser_hides_while_browser_overlay_active() {
+        // Regression test: Only actual modal overlays (dropdowns, menus, popups)
+        // should hide the native WebView. Simple hover tooltips on toolbar buttons
+        // do NOT trigger WebView hide because toolbar renders above WebView in egui layer.
+        // This test verifies that when browser_panel_overlay_active is true
+        // (set by actual modals like dropdowns), WebView IS hidden.
         let ctx = egui::Context::default();
         let mut app = test_app([], None);
 
@@ -43466,12 +43452,14 @@ mod tests {
             .unwrap()
             .requested_visible());
 
-        // Simulate hover tooltip being active (e.g., user hovering over toolbar button)
+        // Simulate an actual modal overlay being active (e.g., dropdown menu open)
+        // browser_panel_overlay_active is now only set by real popups/menus, not hover
         app.browser_panel_overlay_active = true;
 
-        // Sync should hide the browser while hover overlay is active
+        // Sync SHOULD hide the browser when actual modal overlay is active
         app.sync_embedded_browser(&ctx);
 
+        // WebView is hidden because modal overlay (not just hover) is active
         assert!(!app
             .embedded_browsers_by_scope
             .get(&BrowserScopeKey::Project(1))

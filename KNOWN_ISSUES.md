@@ -10,6 +10,27 @@ When adding an entry:
 
 ---
 
+#### Browser toolbar/tab hover no longer hides WebView content {#browser-toolbar-hover-fix}
+- Date: 2026-05-07
+- Context: Browser panel toolbar and tab strip hover interactions causing WebView flicker/black screen
+- Error signature: User reported: "browserda toolbara gelince browser açık olan pencere siyah veya beyaz oluyor" — Hovering over the browser toolbar caused the WebView content area to turn black or white.
+- Symptoms/Impact: When users hovered over browser toolbar buttons (Go, Clear, Design Inspect, Screenshot) or tab strip elements, the WebView content would disappear, showing a black or white empty area instead of the web page content.
+- Root cause: The code was incorrectly treating toolbar/tab hover states as "overlay active" conditions that should hide the native WebView. The `browser_panel_overlay_active` flag was being set to `true` whenever any toolbar button or tab was hovered, causing `sync_embedded_browser()` to hide the entire WebView. This was unnecessary because egui tooltips render above the WebView layer without requiring the WebView to be hidden.
+- Resolution:
+  - Removed `any_tab_strip_hovered` tracking from tab strip rendering; hover no longer triggers overlay state.
+  - Removed `go_hovered`, `clear_hovered`, `inspect_hovered` variable tracking from toolbar button rendering.
+  - Removed the code that aggregated these hover states into `browser_panel_overlay_active`.
+  - Updated the regression test `sync_embedded_browser_hides_while_hover_tooltip_active` → renamed to `sync_embedded_browser_does_not_hide_while_hover_tooltip_active` and inverted assertions to verify WebView remains visible during toolbar hover.
+  - `browser_panel_overlay_active` is now only set by actual modal overlays (dropdown menus, context menus, popups), not by simple hover tooltips.
+- Prevent recurrence:
+  - Updated `AGENTS.md` Browser Panel WebView Z-Order Guidelines to clarify that toolbar hover should not hide WebView.
+  - Added explicit comment in code: "Toolbar hover does NOT trigger WebView hide; toolbar buttons/tooltips render above WebView in egui layer without needing WebView to be hidden."
+  - Regression test now verifies correct behavior (WebView stays visible during hover).
+- Files/Commands touched: `src/app.rs` (removed hover tracking from `draw_browser_panel()`, updated test), `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User bug report 2026-05-07: "browserda toolbara gelince browser açık olan pencere siyah veya beyaz oluyor araştır düzelt"
+
+---
+
 #### Foreground task menu button icon turns green when queue has items {#foreground-task-icon-green}
 - Date: 2026-05-07
 - Context: Terminal Manager foreground task queue menu button visual feedback
