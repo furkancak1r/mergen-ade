@@ -18194,7 +18194,12 @@ impl AdeApp {
                         delivered_at: now,
                     },
                 );
-            self.show_status_feedback(ctx, "Design inspect info sent to terminal");
+            // Disable design inspect after successful delivery to prevent accidental re-clicks
+            self.set_browser_design_inspect_enabled_for_scope(scope, false);
+            self.show_status_feedback(
+                ctx,
+                "Design inspect info sent to terminal; design inspect disabled",
+            );
             ctx.request_repaint();
         }
     }
@@ -42088,6 +42093,35 @@ mod tests {
         let bytes = capture.bytes();
         assert!(bytes.starts_with(b"\x1b[200~Design inspect:"));
         assert!(bytes.ends_with(b"| Change request: \x1b[201~"));
+    }
+
+    #[test]
+    fn design_inspect_auto_disables_after_successful_delivery() {
+        let ctx = Context::default();
+        let (runtime, _capture) = test_terminal_runtime_with_capture();
+        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
+        let mut app = test_app(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        app.projects
+            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
+        app.selected_project = Some(7);
+        app.set_browser_panel_open_for_project(7, true);
+        app.set_browser_design_inspect_enabled_for_scope(7, true);
+
+        assert!(app.is_browser_design_inspect_enabled_for_scope(7));
+
+        let info = test_design_element_info("main > button#save.primary");
+        app.forward_design_inspect_click_to_terminal(&ctx, 7, info.clone());
+
+        // Design inspect should be auto-disabled after successful delivery
+        assert!(!app.is_browser_design_inspect_enabled_for_scope(7));
+        assert_eq!(app.pending_terminal_pastes.len(), 1);
+
+        // Second click should not produce a paste since design inspect is disabled
+        app.forward_design_inspect_click_to_terminal(&ctx, 7, info);
+        assert_eq!(app.pending_terminal_pastes.len(), 1); // Still only 1
     }
 
     #[test]

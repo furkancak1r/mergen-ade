@@ -10,6 +10,27 @@ When adding an entry:
 
 ---
 
+#### Design Inspect auto-disables after successful element delivery {#design-inspect-auto-disable}
+- Date: 2026-05-07
+- Context: Browser panel Design Inspect mode UX improvement
+- Error signature: User requested that Design Inspect mode automatically turns off after an element is successfully sent to the terminal, to prevent accidental duplicate clicks.
+- Symptoms/Impact: Previously, Design Inspect remained enabled after sending element info to the terminal, causing potential duplicate clicks if the user clicked the same element again.
+- Root cause: Design Inspect mode was intentionally persistent (manual toggle on/off), but this led to accidental re-clicks before the user had a chance to disable it.
+- Resolution:
+  - Modified `forward_design_inspect_click_to_terminal()` in `src/app.rs` to automatically disable Design Inspect mode after `queue_pasted_text_to_terminal()` returns true (successful paste queue).
+  - Updated status message from "Design inspect info sent to terminal" to "Design inspect info sent to terminal; design inspect disabled" for clearer user feedback.
+  - The auto-disable behavior prevents duplicate deliveries because the second click will find `is_browser_design_inspect_enabled_for_scope()` returning false.
+- Prevent recurrence:
+  - Added regression test `design_inspect_auto_disables_after_successful_delivery` that verifies:
+    - Design Inspect starts enabled
+    - First click queues one paste and disables the mode
+    - Second click (duplicate) does not produce a second paste because mode is now disabled
+  - Updated `AGENTS.md` Browser Design Inspect Guidelines with the new rule: "Design Inspect auto-disables after successful delivery."
+- Files/Commands touched: `src/app.rs` (auto-disable logic in `forward_design_inspect_click_to_terminal()`, new regression test), `AGENTS.md` (updated Design Inspect guidelines), `KNOWN_ISSUES.md`
+- References: User request 2026-05-07: "design mode da bir tane öge terminale yazıldıktan sonra design mode kapansın"
+
+---
+
 #### Browser MCP multi-terminal isolation for same-project sessions {#browser-mcp-terminal-isolation}
 - Date: 2026-05-07
 - Context: Browser MCP with multiple terminals in the same project using the browser simultaneously

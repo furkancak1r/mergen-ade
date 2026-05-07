@@ -350,9 +350,11 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Directory search highlighting must remain char-safe with icons.** Adding icons must not alter UTF-8-safe match highlighting or split multi-byte characters.
 
 ## Browser Design Inspect Guidelines
+
 - **Design Inspect delivery is click-only.** Hover and pointer movement may update the highlight overlay but must never send context to the terminal.
 - **Design Inspect clicks must block page actions.** While inspect mode is enabled, selecting an element must prevent normal page click behavior such as link navigation, button handlers, and form submission.
+- **Design Inspect auto-disables after successful delivery.** When a user clicks a page element and the design inspect info is successfully queued to the terminal, the mode is automatically disabled to prevent accidental duplicate clicks. Users must re-enable design inspect via the toolbar button to select another element.
 - **Browser events must use selection semantics.** Use click/selection event names such as `DesignElementClicked`; do not reintroduce terminal forwarding from hover events.
 - **Stale hover messages must fail closed.** Ignore `type: "hover"` design-inspect messages from old injected scripts instead of forwarding them to terminals.
 - **Bump the injected script version when Design Inspect behavior changes.** This prevents an existing `window.__mergenDesignInspect` implementation from short-circuiting around newer behavior.
-- **Add regression tests for Design Inspect behavior.** Cover click parsing, hover rejection, duplicate click dedupe, stale URL gating, iframe page URL gating, and user-facing enable/status copy.
+- **Add regression tests for Design Inspect behavior.** Cover click parsing, hover rejection, duplicate click dedupe, stale URL gating, iframe page URL gating, auto-disable after delivery, and user-facing enable/status copy.
