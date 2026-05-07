@@ -617,3 +617,23 @@ When adding an entry:
   - Test add/edit/delete operations via popup.
 - Files/Commands touched: `src/models.rs` (ProjectRecord), `src/config.rs` (migration), `src/app.rs` (state fields, popup drawing, Terminal Manager UI, focus handling, tests), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: User request 2026-05-06: "terminal managerda her terminal icin send saved messages var ya foreground da farkli background da farkli calismasini istiyorum... foreground daha dinamik olacak... popup acilinca focus inputta olmali... yine buradaki mesajlar da proje bazli kayit olacak"
+
+---
+
+#### Shortcut second Enter delay increased from 50ms to 250ms {#shortcut-second-enter-delay-increase}
+- Date: 2026-05-07
+- Context: Terminal command shortcuts (F5, F6, F7, F11) sending double Enter for AI CLI confirmation
+- Error signature: User reported that the second Enter press was not working properly with the 50ms delay, requiring a longer wait time for reliable command confirmation.
+- Symptoms/Impact: AI CLI tools like Codex, OpenCode, and Factory Droid were not receiving the confirmation Enter consistently, causing commands to hang or require manual Enter press by user.
+- Root cause:
+  - The original 50ms delay between first and second Enter was too short for slower terminals or AI CLI tools that need more processing time before accepting the confirmation.
+  - Some shell environments and AI CLI interactive prompts require additional settle time before processing subsequent Enter keys.
+- Resolution:
+  - Increased `SHORTCUT_SECOND_ENTER_DELAY_MS` constant from 50ms to 250ms in `src/app.rs`.
+  - Updated test comment in `handle_shortcuts_sends_double_enter_with_delay` to reflect new 250ms duration.
+  - Updated `AGENTS.md` Terminal Shortcut Guidelines to document 250ms delay instead of 50ms.
+- Prevent recurrence:
+  - The longer 250ms delay provides sufficient buffer for various terminal speeds and AI CLI response times.
+  - Regression test `handle_shortcuts_sends_double_enter_with_delay` continues to verify double Enter behavior.
+- Files/Commands touched: `src/app.rs` (constant, test comment), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-05-07: "shortcutda 2 kere enter çalışmıyor bekleme süresini arttır"

@@ -147,7 +147,7 @@ const DESIGN_INSPECT_MAX_TEXT_CHARS: usize = 180;
 const PENDING_RERUN_POLL_MS: u64 = 50;
 /// Delay before sending the second Enter after a terminal shortcut command.
 /// Ensures the first Enter is processed before the confirmation Enter is sent.
-const SHORTCUT_SECOND_ENTER_DELAY_MS: u64 = 50;
+const SHORTCUT_SECOND_ENTER_DELAY_MS: u64 = 250;
 
 // Embedded Nerd Font for terminal icon support (Windows-only)
 #[cfg(target_os = "windows")]
@@ -42497,7 +42497,7 @@ mod tests {
     #[test]
     fn handle_shortcuts_sends_double_enter_with_delay() {
         // Regression test: Terminal shortcuts should send command+Enter immediately,
-        // then a second Enter after a short delay (50ms) for confirmation.
+        // then a second Enter after a short delay (250ms) for confirmation.
         let ctx = Context::default();
         let (runtime, capture) = test_terminal_runtime_with_capture();
         let mut app = test_app(
