@@ -18545,7 +18545,7 @@ impl AdeApp {
                         let button_count = 4.0; // Go, Clear, Inspect, Screenshot
                         let button_spacing = 4.0 * (button_count - 1.0);
                         let button_width = CONTROL_ROW_HEIGHT * button_count;
-                        let url_width = (available_width - button_width - button_spacing - 8.0).max(100.0);
+                        let url_width = ((available_width - button_width - button_spacing - 8.0) * 0.70).max(100.0);
 
                         let url_text_edit = egui::TextEdit::singleline(&mut draft)
                             .id(url_input_id)
