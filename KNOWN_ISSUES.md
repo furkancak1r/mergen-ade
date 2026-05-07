@@ -164,6 +164,51 @@ When adding an entry:
 - Files/Commands touched: `src/app.rs` (dual buttons implementation, removed menu state), `AGENTS.md` (updated z-order guidelines), `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: User request 2026-05-07: "hala düzelmedi screenshot almaya çalışıyorum dropdowna geliyorum ama browsera gelmişim gibi davranıyor kayboluyor arkaya geçiyor", "tamam siktir et yan yana 2 tane ekran görüntüsü alma butonu ekle ikisini de bir dikdörtgen içinde göster öyle çözelim"
 
+#### Foreground task popup text input routing and Enter key behavior {#foreground-popup-enter-behavior}
+- Date: 2026-05-07 (updated 2026-05-07)
+- Context: Foreground "Add New Task" popup input field interaction with AI attention terminals
+- Error signature: User reported issues:
+  1. "terminal açıkken text alanına yazamıyorum gidip terminale yazıyor" - When the foreground task popup is open and a terminal is in "attention" state (waiting for user input), typed text is stolen by the terminal instead of going to the popup.
+  2. "metin alanı daha büyük olabilir popupda butonlar daha aşağıda olabilir" - The text area is too small and buttons are too close.
+  3. "ctrl enter yapınca alt satıra geçsin sadece entera basınca kaydetsin" - Want Ctrl+Enter for newline, Enter alone to save.
+  4. "enter da çalışmıyor amk arka arkaya 2 kere basacak 1 saniye beklesin gerekiyorsa shortcuts" - Enter wasn't working reliably, need double Enter with 1 second delay like shortcuts.
+- Symptoms/Impact:
+  1. Users couldn't type task commands in the popup when a terminal was waiting for AI input (e.g., Codex question prompt). The text would be routed to the terminal instead.
+  2. Small text area made it hard to edit multi-line commands/prompts.
+  3. Default multiline behavior (Enter=newline, Shift+Enter=submit) was the opposite of user preference.
+  4. Initial Enter handling in UI response wasn't reliable due to egui focus issues. Also, saved messages needed double Enter like shortcuts do.
+- Root cause:
+  1. The `should_steal_attention_terminal_input()` function only checked Directory search, Browser URL, and Settings popup focus, but did not check for foreground message popup focus.
+  2. Window size was 520x320 with 160px text height; insufficient for comfortable editing.
+  3. `TextEdit::multiline` default `return_key` is Enter alone for newline; no custom handling for Enter-to-submit.
+  4. Initial approach detected Enter in `draw_foreground_message_popup()` via `ui.input()` which wasn't reliable due to response focus state. Also, `send_saved_message_to_terminal()` only sent single Enter while shortcuts send double Enter.
+- Resolution (Part 1 - Initial fixes):
+  1. Added early `return false` check in `should_steal_attention_terminal_input()` when `foreground_message_popup_open.is_some()`. This ensures the popup's text input focus blocks attention-stealing even when terminals are in Attention state.
+  2. Increased window size from 520x320 to 600x440 and text area height from 160px to 260px. Added extra 24px spacing before buttons.
+  3. Changed `TextEdit::multiline` to use `Ctrl+Enter` as return key for newline. Added Enter key detection in `draw_foreground_message_popup()` to trigger save.
+- Resolution (Part 2 - Reliable Enter handling and double Enter):
+  1. Moved Enter detection from `draw_foreground_message_popup()` to `raw_input_hook()` for reliable early capture before egui consumes the event.
+  2. Added `partition_foreground_message_popup_submit()` helper that detects plain Enter (no modifiers) in event stream and removes it from events passed to UI.
+  3. Plain Enter triggers `execute_foreground_message_popup_save()` immediately and consumes the event. Ctrl+Enter passes through to TextEdit for newline insertion.
+  4. Changed delay constant from `SHORTCUT_SECOND_ENTER_DELAY_MS` (250ms) to `SECOND_ENTER_DELAY_MS` (1000ms) as requested.
+  5. Renamed `pending_shortcut_second_enter` to `pending_second_enter` to support both shortcuts and saved messages.
+  6. Added `schedule_second_enter_for_terminal()` helper used by both shortcuts and saved messages.
+  7. Modified `send_saved_message_to_terminal()` to call `schedule_second_enter_for_terminal()` after sending the first Enter.
+  8. Renamed `process_pending_shortcut_second_enters()` to `process_pending_second_enters()` to handle both cases.
+- Prevent recurrence:
+  - Added regression tests:
+    - `foreground_message_popup_blocks_attention_stealing` - attention stealing blocked when popup open
+    - `foreground_message_popup_execute_save_adds_new_task` - adding new task works
+    - `foreground_message_popup_execute_save_edits_existing_task` - editing existing task works
+    - `foreground_message_popup_execute_save_skips_empty_draft` - empty draft doesn't close popup
+    - `foreground_message_popup_execute_delete_removes_task` - delete operation works
+    - `foreground_message_popup_enter_triggers_save_via_raw_input_hook` - plain Enter triggers save
+    - `foreground_message_popup_ctrl_enter_does_not_submit` - Ctrl+Enter doesn't submit
+    - `send_saved_message_schedules_second_enter` - saved message sends double Enter
+    - `handle_shortcuts_sends_double_enter_with_delay` - shortcuts send double Enter (updated for 1000ms)
+- Files/Commands touched: `src/app.rs` (attention check, popup sizing, Ctrl+Enter handling, raw_input_hook Enter handling, helper methods, double Enter scheduling, 8 regression tests), `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-05-07: "foreground add new task da yaşadığım sorunlar , ilki terminal açıkken text alanına yazamıyorum gidip terminale yazıyor, ikincisi metin alanı daha büyük olabilir popupda butonlar daha aşağıda olabilir, ctrl enter yapınca alt satıra geçsin sadece entera basınca kaydetsin", "enter da çalışmıyor amk arka arkaya 2 kere basacak 1 saniye beklesin gerekiyorsa shortcuts"
+
 #### Design Inspect failed on disabled HTML buttons and icon did not toggle {#design-inspect-disabled-button}
 - Date: 2026-05-06
 - Context: Browser panel Design Inspect mode on pages with disabled buttons/inputs

@@ -148,9 +148,10 @@ const DESIGN_INSPECT_MAX_FIELD_CHARS: usize = 280;
 const DESIGN_INSPECT_MAX_TEXT_CHARS: usize = 180;
 /// Polling interval while waiting for batch prompt or settle durations.
 const PENDING_RERUN_POLL_MS: u64 = 50;
-/// Delay before sending the second Enter after a terminal shortcut command.
+/// Delay before sending the second Enter after a terminal shortcut or saved message command.
 /// Ensures the first Enter is processed before the confirmation Enter is sent.
-const SHORTCUT_SECOND_ENTER_DELAY_MS: u64 = 250;
+/// Set to 0.5 seconds as requested by user for faster confirmation.
+const SECOND_ENTER_DELAY_MS: u64 = 500;
 
 // Embedded Nerd Font for terminal icon support (Windows-only)
 #[cfg(target_os = "windows")]
@@ -1281,7 +1282,8 @@ pub struct AdeApp {
     /// Pending second Enter presses for terminal shortcuts (terminal_id, due_at).
     /// When a shortcut is executed, the first Enter is sent immediately and a second
     /// Enter is scheduled after a short delay for confirmation.
-    pending_shortcut_second_enter: Vec<(u64, Instant)>,
+    /// Pending second Enter presses for terminals (scheduled after shortcuts and saved messages).
+    pending_second_enter: Vec<(u64, Instant)>,
     terminal_held_key_repeat: Option<TerminalHeldKeyRepeat>,
     allow_attention_terminal_input_routing_once: bool,
     pending_terminal_pastes: Vec<PendingTerminalPaste>,
@@ -3746,7 +3748,7 @@ impl AdeApp {
             buffered_terminal_input: Vec::new(),
             buffered_terminal_navigation: Vec::new(),
             buffered_terminal_command_shortcuts: Vec::new(),
-            pending_shortcut_second_enter: Vec::new(),
+            pending_second_enter: Vec::new(),
             terminal_held_key_repeat: None,
             allow_attention_terminal_input_routing_once: false,
             pending_terminal_pastes: Vec::new(),
@@ -8827,8 +8829,8 @@ impl AdeApp {
 
     /// Execute a terminal shortcut by sending its command to the active terminal.
     /// Returns true if the shortcut was handled (to consume the event).
-    /// Sends the command with bracketed paste, then sends Enter immediately,
-    /// and schedules a second Enter after a short delay for confirmation.
+    /// Sends the command with bracketed paste, waits 0.5 seconds, sends Enter,
+    /// waits 0.5 more seconds, then sends a second Enter for confirmation.
     fn execute_terminal_shortcut(&mut self, ctx: &egui::Context, command: &str) -> bool {
         // Only execute if we have an active terminal that accepts input
         let Some(terminal_id) = self.active_terminal_accepts_input() else {
@@ -8846,16 +8848,35 @@ impl AdeApp {
         // Shortcut commands are delivered through paste bytes so slash-prefixed
         // AI CLI commands are not interpreted as an interactive slash-menu key stream.
         if Self::send_shortcut_command_to_terminal(terminal, command, ctx) {
-            // Schedule a second Enter after a short delay for confirmation
-            let due_at = Instant::now() + Duration::from_millis(SHORTCUT_SECOND_ENTER_DELAY_MS);
-            self.pending_shortcut_second_enter
-                .push((terminal_id, due_at));
-            ctx.request_repaint_after(Duration::from_millis(SHORTCUT_SECOND_ENTER_DELAY_MS));
+            // Schedule two delayed Enter presses:
+            // First Enter at 0.5 seconds, second Enter at 1 second
+            self.schedule_delayed_enters_for_terminal(terminal_id, 2, ctx);
             self.show_status_feedback(ctx, &format!("Sent: {command}"));
             true
         } else {
             false
         }
+    }
+
+    /// Schedule delayed Enter presses for a terminal.
+    /// count: number of Enter presses to schedule
+    /// interval_ms: milliseconds between each Enter (uses SECOND_ENTER_DELAY_MS if None)
+    fn schedule_delayed_enters_for_terminal(
+        &mut self,
+        terminal_id: u64,
+        count: usize,
+        ctx: &egui::Context,
+    ) {
+        let now = Instant::now();
+        let interval = Duration::from_millis(SECOND_ENTER_DELAY_MS);
+
+        for i in 0..count {
+            let due_at = now + interval * (i as u32 + 1);
+            self.pending_second_enter.push((terminal_id, due_at));
+        }
+
+        // Request repaint for the furthest delay
+        ctx.request_repaint_after(interval * count as u32);
     }
 
     /// Check if a key event matches any enabled terminal shortcut.
@@ -9282,7 +9303,9 @@ impl AdeApp {
             }
         }
 
-        if ctx.memory(|mem| mem.any_popup_open()) || ctx.is_context_menu_open() {
+        // Do not steal text input from foreground message popup.
+        // User intent: if foreground task popup is open, typed text belongs to the task input.
+        if self.foreground_message_popup_open.is_some() {
             return false;
         }
 
@@ -9428,6 +9451,42 @@ impl AdeApp {
         }
 
         (alt_m_events, remaining_events)
+    }
+
+    /// Partition events for foreground message popup submit detection.
+    /// Returns (true, remaining_events) if plain Enter was pressed (submit),
+    /// or (false, original_events) if no submit key was detected.
+    fn partition_foreground_message_popup_submit(events: Vec<Event>) -> (bool, Vec<Event>) {
+        for event in &events {
+            if let Event::Key {
+                key: Key::Enter,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            {
+                // Plain Enter (no modifiers) triggers submit
+                // Ctrl+Enter, Shift+Enter, etc. pass through for TextEdit to handle as newline
+                if !modifiers.ctrl && !modifiers.shift && !modifiers.alt && !modifiers.command {
+                    // Remove this Enter event from the stream so TextEdit doesn't get it
+                    let remaining: Vec<Event> = events
+                        .into_iter()
+                        .filter(|e| {
+                            !matches!(
+                                e,
+                                Event::Key {
+                                    key: Key::Enter,
+                                    pressed: true,
+                                    ..
+                                }
+                            )
+                        })
+                        .collect();
+                    return (true, remaining);
+                }
+            }
+        }
+        (false, events)
     }
 
     fn partition_terminal_input_events(
@@ -11401,8 +11460,9 @@ impl AdeApp {
             }
 
             let destination_title = terminal.title.clone();
-            let mut outbound = message.as_bytes().to_vec();
-            outbound.push(b'\r');
+            // Send only the message text (no immediate Enter)
+            // Both Enter presses will be sent after delays (0.5s and 1s)
+            let outbound = message.as_bytes().to_vec();
             reset_terminal_prompt_scroll_anchor(terminal);
             terminal.runtime.send_bytes(outbound);
             reset_opencode_manual_scroll_detached(terminal);
@@ -11439,6 +11499,12 @@ impl AdeApp {
             terminal.dirty = true;
             destination_title
         };
+
+        // Schedule two delayed Enter presses after the borrow is released:
+        // First Enter at 0.5 seconds, second Enter at 1 second
+        if !message.trim().is_empty() {
+            self.schedule_delayed_enters_for_terminal(terminal_id, 2, ctx);
+        }
 
         // Record to persistent history after the mutable borrow is released
         if !message.trim().is_empty() {
@@ -11651,8 +11717,9 @@ impl AdeApp {
         };
 
         reset_terminal_prompt_scroll_anchor(terminal);
+        // Send only the command text (no immediate Enter)
+        // Both Enter presses will be sent after delays (0.5s and 1s)
         terminal.runtime.send_paste_bytes(paste_bytes);
-        terminal.runtime.send_bytes(vec![b'\r']);
         reset_opencode_manual_scroll_detached(terminal);
         Self::clear_terminal_selection(terminal);
         terminal.pending_line_for_title.clear();
@@ -11850,19 +11917,19 @@ impl AdeApp {
         }
     }
 
-    /// Process pending second Enter presses for terminal shortcuts.
+    /// Process pending second Enter presses for terminal shortcuts and saved messages.
     /// After the initial command+Enter is sent, a second Enter is scheduled
     /// after a short delay to confirm the command execution.
-    fn process_pending_shortcut_second_enters(&mut self, ctx: &egui::Context) {
+    fn process_pending_second_enters(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
-        let delay = Duration::from_millis(SHORTCUT_SECOND_ENTER_DELAY_MS);
+        let delay = Duration::from_millis(SECOND_ENTER_DELAY_MS);
 
         let mut to_send: Vec<u64> = Vec::new();
         let mut still_pending: Vec<(u64, Instant)> = Vec::new();
         let mut needs_repaint = false;
 
         // Drain the pending list and partition into ready/still-pending
-        for (terminal_id, due_at) in std::mem::take(&mut self.pending_shortcut_second_enter) {
+        for (terminal_id, due_at) in std::mem::take(&mut self.pending_second_enter) {
             if now >= due_at {
                 to_send.push(terminal_id);
             } else {
@@ -11871,7 +11938,7 @@ impl AdeApp {
             }
         }
 
-        self.pending_shortcut_second_enter = still_pending;
+        self.pending_second_enter = still_pending;
 
         // Send the second Enter to ready terminals
         for terminal_id in to_send {
@@ -19904,6 +19971,56 @@ impl AdeApp {
         }
     }
 
+    /// Execute the save/add operation for the foreground message popup.
+    fn execute_foreground_message_popup_save(&mut self) {
+        let Some(project_id) = self.foreground_message_popup_open else {
+            return;
+        };
+
+        let draft_trimmed = self.foreground_message_popup_draft.trim();
+        if draft_trimmed.is_empty() {
+            return;
+        }
+
+        if let Some(project) = self.projects.get_mut(&project_id) {
+            if let Some(index) = self.foreground_message_popup_editing_index {
+                // Editing existing
+                if index < project.foreground_saved_messages.len() {
+                    project.foreground_saved_messages[index] =
+                        self.foreground_message_popup_draft.clone();
+                }
+            } else {
+                // Adding new
+                project
+                    .foreground_saved_messages
+                    .push(self.foreground_message_popup_draft.clone());
+            }
+            self.note_projects_changed();
+            self.persist_config();
+        }
+        self.foreground_message_popup_open = None;
+        self.foreground_message_popup_draft.clear();
+    }
+
+    /// Execute the delete operation for the foreground message popup.
+    fn execute_foreground_message_popup_delete(&mut self) {
+        let Some(project_id) = self.foreground_message_popup_open else {
+            return;
+        };
+
+        if let Some(project) = self.projects.get_mut(&project_id) {
+            if let Some(index) = self.foreground_message_popup_editing_index {
+                if index < project.foreground_saved_messages.len() {
+                    project.foreground_saved_messages.remove(index);
+                    self.note_projects_changed();
+                    self.persist_config();
+                }
+            }
+        }
+        self.foreground_message_popup_open = None;
+        self.foreground_message_popup_draft.clear();
+    }
+
     /// Draw the foreground saved message popup (add/edit).
     fn draw_foreground_message_popup(&mut self, ctx: &egui::Context) {
         let Some(project_id) = self.foreground_message_popup_open else {
@@ -19941,7 +20058,7 @@ impl AdeApp {
             return;
         }
 
-        let window_size = egui::vec2(520.0, 320.0);
+        let window_size = egui::vec2(600.0, 440.0);
 
         egui::Window::new(title)
             .id(egui::Id::new("foreground_message_popup"))
@@ -19963,16 +20080,21 @@ impl AdeApp {
                 // Multiline text input
                 let input_id = Self::foreground_message_input_id();
                 let available_width = ui.available_width().max(0.0);
-                let text_height = 160.0;
+                let text_height = 260.0;
 
-                with_settings_text_edit_chrome(ui, |ui| {
+                let text_edit_response = with_settings_text_edit_chrome(ui, |ui| {
                     let text_edit =
                         egui::TextEdit::multiline(&mut self.foreground_message_popup_draft)
                             .id(input_id)
                             .desired_width(available_width)
                             .min_size(egui::vec2(available_width, text_height))
-                            .hint_text("Enter command or prompt here...");
-                    ui.add(text_edit);
+                            .hint_text("Enter command or prompt here...")
+                            // Ctrl+Enter inserts newline, plain Enter triggers save
+                            .return_key(egui::KeyboardShortcut::new(
+                                egui::Modifiers::CTRL,
+                                egui::Key::Enter,
+                            ));
+                    ui.add(text_edit)
                 });
 
                 // Request focus on first open
@@ -19982,7 +20104,7 @@ impl AdeApp {
                     }
                 });
 
-                ui.add_space(16.0);
+                ui.add_space(24.0);
 
                 // Buttons
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -20004,24 +20126,7 @@ impl AdeApp {
                             "Add Task"
                         };
                         if ui.button(save_label).clicked() {
-                            if let Some(project) = self.projects.get_mut(&project_id) {
-                                if let Some(index) = self.foreground_message_popup_editing_index {
-                                    // Editing existing
-                                    if index < project.foreground_saved_messages.len() {
-                                        project.foreground_saved_messages[index] =
-                                            self.foreground_message_popup_draft.clone();
-                                    }
-                                } else {
-                                    // Adding new
-                                    project
-                                        .foreground_saved_messages
-                                        .push(self.foreground_message_popup_draft.clone());
-                                }
-                                self.note_projects_changed();
-                                self.persist_config();
-                            }
-                            self.foreground_message_popup_open = None;
-                            self.foreground_message_popup_draft.clear();
+                            self.execute_foreground_message_popup_save();
                         }
                     });
 
@@ -20032,17 +20137,7 @@ impl AdeApp {
                             .button(RichText::new("Delete").color(Color32::from_rgb(232, 100, 100)))
                             .clicked()
                         {
-                            if let Some(project) = self.projects.get_mut(&project_id) {
-                                if let Some(index) = self.foreground_message_popup_editing_index {
-                                    if index < project.foreground_saved_messages.len() {
-                                        project.foreground_saved_messages.remove(index);
-                                        self.note_projects_changed();
-                                        self.persist_config();
-                                    }
-                                }
-                            }
-                            self.foreground_message_popup_open = None;
-                            self.foreground_message_popup_draft.clear();
+                            self.execute_foreground_message_popup_delete();
                         }
                     }
                 });
@@ -20082,6 +20177,23 @@ impl eframe::App for AdeApp {
 
         // Only handle Alt+M shortcut when terminal is NOT capturing keyboard
         if !capture_keyboard {
+            // Handle Enter key in foreground message popup to trigger save.
+            // This is done early in raw_input_hook to ensure reliable detection
+            // before egui's TextEdit consumes the event.
+            if self.foreground_message_popup_open.is_some() {
+                let draft_trimmed = self.foreground_message_popup_draft.trim();
+                if !draft_trimmed.is_empty() {
+                    let (popup_submit, remaining_events) =
+                        Self::partition_foreground_message_popup_submit(events);
+                    if popup_submit {
+                        self.execute_foreground_message_popup_save();
+                        raw_input.events = remaining_events;
+                        return;
+                    }
+                    events = remaining_events;
+                }
+            }
+
             let (alt_m_events, remaining_events) =
                 Self::partition_alt_m_shortcut(events, global_modifiers);
             if !alt_m_events.is_empty() {
@@ -20217,7 +20329,7 @@ impl eframe::App for AdeApp {
         self.process_pending_reruns(ctx);
 
         // Phase 3c: Process pending second Enter presses for terminal shortcuts.
-        self.process_pending_shortcut_second_enters(ctx);
+        self.process_pending_second_enters(ctx);
 
         self.process_source_control_events(ctx);
         self.process_directory_index_events(ctx);
@@ -35463,7 +35575,7 @@ mod tests {
             buffered_terminal_input: Vec::new(),
             buffered_terminal_navigation: Vec::new(),
             buffered_terminal_command_shortcuts: Vec::new(),
-            pending_shortcut_second_enter: Vec::new(),
+            pending_second_enter: Vec::new(),
             terminal_held_key_repeat: None,
             allow_attention_terminal_input_routing_once: false,
             pending_terminal_pastes: Vec::new(),
@@ -42549,7 +42661,9 @@ mod tests {
         app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
         capture.drain();
 
-        assert_eq!(capture.bytes(), b"/prepare-fix-plan\r".to_vec());
+        // Verify command sent WITHOUT immediate Enter
+        // Enters will be sent after delays (0.5s and 1s)
+        assert_eq!(capture.bytes(), b"/prepare-fix-plan".to_vec());
         assert_eq!(app.status_line, "Sent: /prepare-fix-plan");
         assert!(app
             .terminals
@@ -42576,9 +42690,11 @@ mod tests {
         app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
         capture.drain();
 
+        // Verify command sent via bracketed paste WITHOUT immediate Enter
+        // Enters will be sent after delays (0.5s and 1s)
         assert_eq!(
             capture.bytes(),
-            b"\x1b[200~/prepare-fix-plan\x1b[201~\r".to_vec()
+            b"\x1b[200~/prepare-fix-plan\x1b[201~".to_vec()
         );
         assert_eq!(app.status_line, "Sent: /prepare-fix-plan");
         assert!(app
@@ -42588,34 +42704,9 @@ mod tests {
     }
 
     #[test]
-    fn handle_shortcuts_preserves_recent_inputs_for_non_slash_shortcut() {
-        let ctx = Context::default();
-        let (runtime, capture) = test_terminal_runtime_with_capture();
-        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
-        let mut app = test_app(
-            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
-            Some(1),
-        );
-
-        app.buffered_terminal_command_shortcuts = vec![(
-            egui::Key::F9,
-            egui::Modifiers::default(),
-            "cargo test".to_string(),
-        )];
-
-        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
-        capture.drain();
-
-        assert_eq!(capture.bytes(), b"\x1b[200~cargo test\x1b[201~\r".to_vec());
-        assert!(app.terminals.get(&1).is_some_and(|terminal| {
-            terminal.recent_inputs.len() == 1 && terminal.recent_inputs[0] == "cargo test"
-        }));
-    }
-
-    #[test]
     fn handle_shortcuts_sends_double_enter_with_delay() {
-        // Regression test: Terminal shortcuts should send command+Enter immediately,
-        // then a second Enter after a short delay (250ms) for confirmation.
+        // Regression test: Terminal shortcuts should send command immediately (no Enter),
+        // wait 0.5 seconds, send Enter, wait 0.5 more seconds, then send second Enter.
         let ctx = Context::default();
         let (runtime, capture) = test_terminal_runtime_with_capture();
         let mut app = test_app(
@@ -42629,33 +42720,41 @@ mod tests {
             "/prepare-fix-plan".to_string(),
         )];
 
-        // Phase 1: Execute shortcut - should send command + first Enter immediately
+        // Phase 1: Execute shortcut - should send command only (no immediate Enter)
         app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
         capture.drain();
 
-        // Verify initial output: command + \r (no bracketed paste in this test)
-        let initial_bytes = capture.bytes();
-        assert_eq!(initial_bytes, b"/prepare-fix-plan\r".to_vec());
+        // Verify initial output: command only (no Enter yet)
+        assert_eq!(capture.bytes(), b"/prepare-fix-plan".to_vec());
 
-        // Verify pending state is set for second Enter
-        assert_eq!(app.pending_shortcut_second_enter.len(), 1);
-        let (pending_terminal_id, _) = app.pending_shortcut_second_enter[0];
-        assert_eq!(pending_terminal_id, 1);
+        // Verify pending state is set for TWO delayed Enters at 0.5s and 1s
+        assert_eq!(app.pending_second_enter.len(), 2);
+        let (pending_terminal_id_0, _) = app.pending_second_enter[0];
+        let (pending_terminal_id_1, _) = app.pending_second_enter[1];
+        assert_eq!(pending_terminal_id_0, 1);
+        assert_eq!(pending_terminal_id_1, 1);
 
-        // Phase 2: Manually advance time to simulate delay passing
-        // Set the pending entry's due time to the past so it fires immediately
-        app.pending_shortcut_second_enter[0].1 = Instant::now() - Duration::from_millis(1);
-
-        // Process pending second enters
-        app.process_pending_shortcut_second_enters(&ctx);
+        // Phase 2: Process first delayed Enter (at 0.5 seconds)
+        app.pending_second_enter[0].1 = Instant::now() - Duration::from_millis(1);
+        app.process_pending_second_enters(&ctx);
         capture.drain();
 
-        // Verify total output: command + \r + \r (two Enters)
-        let total_bytes = capture.bytes();
-        assert_eq!(total_bytes, b"/prepare-fix-plan\r\r".to_vec());
+        // Verify output after first Enter (cumulative)
+        assert_eq!(capture.bytes(), b"/prepare-fix-plan\r".to_vec());
+
+        // Should still have 1 pending Enter
+        assert_eq!(app.pending_second_enter.len(), 1);
+
+        // Phase 3: Process second delayed Enter (at 1 second)
+        app.pending_second_enter[0].1 = Instant::now() - Duration::from_millis(1);
+        app.process_pending_second_enters(&ctx);
+        capture.drain();
+
+        // Verify total output: command + \r + \r (two delayed Enters)
+        assert_eq!(capture.bytes(), b"/prepare-fix-plan\r\r".to_vec());
 
         // Verify pending state is cleared
-        assert!(app.pending_shortcut_second_enter.is_empty());
+        assert!(app.pending_second_enter.is_empty());
     }
 
     #[test]
@@ -44606,5 +44705,284 @@ mod tests {
             Some(text.to_owned()),
             "Select-all should extract full URL"
         );
+    }
+
+    #[test]
+    fn foreground_message_popup_blocks_attention_stealing() {
+        // Regression test: When foreground task popup is open, text input
+        // should not be stolen by attention-terminal even when terminal
+        // is waiting for user input.
+        use egui::Context;
+
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "TestProject", "C:/test", &[], &[]));
+        seed_ai_attention(&mut app, 1);
+
+        // Open foreground message popup
+        app.foreground_message_popup_open = Some(7);
+        app.foreground_message_popup_draft.clear();
+
+        // Request focus for the popup input
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::foreground_message_input_id());
+        });
+
+        // Test that terminal keyboard capture is blocked
+        let capture_keyboard = app.should_capture_terminal_keyboard(&ctx);
+        assert!(
+            !capture_keyboard,
+            "Terminal should not capture keyboard when foreground popup is open"
+        );
+
+        // Test that attention input stealing is blocked
+        let events = vec![Event::Text("task command".to_owned())];
+        let should_steal = app.should_steal_attention_terminal_input(&ctx, &events);
+        assert!(
+            !should_steal,
+            "Attention should not steal text from foreground popup"
+        );
+
+        // Foreground popup input should retain focus
+        assert!(
+            ctx.memory(|mem| mem.has_focus(AdeApp::foreground_message_input_id())),
+            "Foreground popup input should retain focus"
+        );
+    }
+
+    #[test]
+    fn foreground_message_popup_execute_save_adds_new_task() {
+        // Test that execute_foreground_message_popup_save adds a new task
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(7, test_project(7, "TestProject", "C:/test", &[], &[]));
+
+        // Setup: Open popup for adding new task
+        app.foreground_message_popup_open = Some(7);
+        app.foreground_message_popup_editing_index = None;
+        app.foreground_message_popup_draft = "echo hello".to_owned();
+
+        // Execute save
+        app.execute_foreground_message_popup_save();
+
+        // Verify task was added
+        let project = app.projects.get(&7).expect("project should exist");
+        assert_eq!(project.foreground_saved_messages.len(), 1);
+        assert_eq!(project.foreground_saved_messages[0], "echo hello");
+
+        // Verify popup was closed
+        assert!(app.foreground_message_popup_open.is_none());
+        assert!(app.foreground_message_popup_draft.is_empty());
+    }
+
+    #[test]
+    fn foreground_message_popup_execute_save_edits_existing_task() {
+        // Test that execute_foreground_message_popup_save edits an existing task
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        let mut project = test_project(7, "TestProject", "C:/test", &[], &[]);
+        project
+            .foreground_saved_messages
+            .push("old command".to_owned());
+        app.projects.insert(7, project);
+
+        // Setup: Open popup for editing task at index 0
+        app.foreground_message_popup_open = Some(7);
+        app.foreground_message_popup_editing_index = Some(0);
+        app.foreground_message_popup_draft = "new command".to_owned();
+
+        // Execute save
+        app.execute_foreground_message_popup_save();
+
+        // Verify task was updated
+        let project = app.projects.get(&7).expect("project should exist");
+        assert_eq!(project.foreground_saved_messages.len(), 1);
+        assert_eq!(project.foreground_saved_messages[0], "new command");
+
+        // Verify popup was closed
+        assert!(app.foreground_message_popup_open.is_none());
+    }
+
+    #[test]
+    fn foreground_message_popup_execute_save_skips_empty_draft() {
+        // Test that execute_foreground_message_popup_save does nothing with empty draft
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(7, test_project(7, "TestProject", "C:/test", &[], &[]));
+
+        // Setup: Open popup with empty draft
+        app.foreground_message_popup_open = Some(7);
+        app.foreground_message_popup_editing_index = None;
+        app.foreground_message_popup_draft = "   ".to_owned(); // whitespace only
+
+        // Execute save
+        app.execute_foreground_message_popup_save();
+
+        // Verify no task was added (draft was empty after trim)
+        let project = app.projects.get(&7).expect("project should exist");
+        assert!(project.foreground_saved_messages.is_empty());
+
+        // Verify popup was NOT closed (empty draft doesn't save)
+        assert!(app.foreground_message_popup_open.is_some());
+    }
+
+    #[test]
+    fn foreground_message_popup_execute_delete_removes_task() {
+        // Test that execute_foreground_message_popup_delete removes the task
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        let mut project = test_project(7, "TestProject", "C:/test", &[], &[]);
+        project
+            .foreground_saved_messages
+            .push("task to delete".to_owned());
+        app.projects.insert(7, project);
+
+        // Setup: Open popup for editing task at index 0
+        app.foreground_message_popup_open = Some(7);
+        app.foreground_message_popup_editing_index = Some(0);
+        app.foreground_message_popup_draft = "task to delete".to_owned();
+
+        // Execute delete
+        app.execute_foreground_message_popup_delete();
+
+        // Verify task was removed
+        let project = app.projects.get(&7).expect("project should exist");
+        assert!(project.foreground_saved_messages.is_empty());
+
+        // Verify popup was closed
+        assert!(app.foreground_message_popup_open.is_none());
+    }
+
+    #[test]
+    fn foreground_message_popup_enter_triggers_save_via_raw_input_hook() {
+        // Regression test: Plain Enter key in raw_input_hook should trigger save
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(7, test_project(7, "TestProject", "C:/test", &[], &[]));
+
+        // Setup: Open popup with draft
+        app.foreground_message_popup_open = Some(7);
+        app.foreground_message_popup_editing_index = None;
+        app.foreground_message_popup_draft = "echo test".to_owned();
+
+        // Simulate plain Enter key event through raw_input_hook
+        let mut raw_input = RawInput {
+            events: vec![Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(), // No modifiers = plain Enter
+            }],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        // Verify task was added
+        let project = app.projects.get(&7).expect("project should exist");
+        assert_eq!(project.foreground_saved_messages.len(), 1);
+        assert_eq!(project.foreground_saved_messages[0], "echo test");
+
+        // Verify popup was closed
+        assert!(app.foreground_message_popup_open.is_none());
+        assert!(app.foreground_message_popup_draft.is_empty());
+
+        // Verify Enter event was consumed (not passed to UI)
+        assert!(raw_input.events.is_empty());
+    }
+
+    #[test]
+    fn foreground_message_popup_ctrl_enter_does_not_submit() {
+        // Regression test: Ctrl+Enter should NOT trigger save, should pass to TextEdit as newline
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(7, test_project(7, "TestProject", "C:/test", &[], &[]));
+
+        // Setup: Open popup with draft
+        app.foreground_message_popup_open = Some(7);
+        app.foreground_message_popup_editing_index = None;
+        app.foreground_message_popup_draft = "echo test".to_owned();
+
+        // Simulate Ctrl+Enter key event through raw_input_hook
+        let mut raw_input = RawInput {
+            events: vec![Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        // Verify task was NOT added (Ctrl+Enter should not submit)
+        let project = app.projects.get(&7).expect("project should exist");
+        assert!(project.foreground_saved_messages.is_empty());
+
+        // Verify popup is still open
+        assert!(app.foreground_message_popup_open.is_some());
+
+        // Verify Ctrl+Enter event was NOT consumed (passed to TextEdit for newline)
+        assert_eq!(raw_input.events.len(), 1);
+    }
+
+    #[test]
+    fn send_saved_message_schedules_two_delayed_enters() {
+        // Regression test: Sending a saved message should send message immediately,
+        // wait 0.5 seconds, send Enter, wait 0.5 more seconds, then send second Enter.
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+
+        // Send a saved message
+        app.send_saved_message_to_terminal(&ctx, 1, "echo hello");
+        capture.drain();
+
+        // Verify initial output: message only (no Enter yet)
+        assert_eq!(capture.bytes(), b"echo hello".to_vec());
+
+        // Verify pending state is set for TWO delayed Enters at 0.5s and 1s
+        assert_eq!(app.pending_second_enter.len(), 2);
+        let (pending_terminal_id_0, _) = app.pending_second_enter[0];
+        let (pending_terminal_id_1, _) = app.pending_second_enter[1];
+        assert_eq!(pending_terminal_id_0, 1);
+        assert_eq!(pending_terminal_id_1, 1);
+
+        // Phase 1: Process first delayed Enter (at 0.5 seconds)
+        app.pending_second_enter[0].1 = Instant::now() - Duration::from_millis(1);
+        app.process_pending_second_enters(&ctx);
+        capture.drain();
+
+        // Verify output after first Enter (cumulative)
+        assert_eq!(capture.bytes(), b"echo hello\r".to_vec());
+
+        // Should still have 1 pending Enter
+        assert_eq!(app.pending_second_enter.len(), 1);
+
+        // Phase 2: Process second delayed Enter (at 1 second)
+        app.pending_second_enter[0].1 = Instant::now() - Duration::from_millis(1);
+        app.process_pending_second_enters(&ctx);
+        capture.drain();
+
+        // Verify total output: message + \r + \r (two delayed Enters)
+        assert_eq!(capture.bytes(), b"echo hello\r\r".to_vec());
+
+        // Verify pending state is cleared
+        assert!(app.pending_second_enter.is_empty());
     }
 }
