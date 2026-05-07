@@ -9070,6 +9070,21 @@ fn embedded_browser_should_yield_to_ui_layer(
         || foreground_message_popup_open
 }
 
+/// Determine if terminal output mouse wheel events should be processed.
+/// Returns false when any modal, popup, or overlay is active that would
+/// consume wheel events before they reach the terminal ScrollArea.
+fn terminal_output_mouse_wheel_enabled(
+    show_settings_popup: bool,
+    show_exit_confirm_popup: bool,
+    terminal_history_popup_open: bool,
+    foreground_message_popup_open: bool,
+) -> bool {
+    !(show_settings_popup
+        || show_exit_confirm_popup
+        || terminal_history_popup_open
+        || foreground_message_popup_open)
+}
+
 fn ui_owns_keyboard_state(
     text_input_has_focus: bool,
     popup_open: bool,
@@ -19219,6 +19234,14 @@ impl AdeApp {
                 let mut opencode_pending_wheel: Option<(WheelDirection, egui::Pos2, usize, usize)> =
                     None;
 
+                // Determine if wheel handling should be enabled (disabled when UI overlays open)
+                let wheel_enabled = terminal_output_mouse_wheel_enabled(
+                    self.show_settings_popup,
+                    self.show_exit_confirm_popup,
+                    self.terminal_history_popup_open.is_some(),
+                    self.foreground_message_popup_open.is_some(),
+                );
+
                 let _scroll_area_output = scroll_area.show(&mut output_ui, |ui| {
                     ui.set_width(output_size.x);
                     ui.set_min_width(output_size.x);
@@ -19481,70 +19504,78 @@ impl AdeApp {
                         }
 
                         // Wheel handling: capture wheel data for OpenCode deferral
-                        let wheel_delta = ui.ctx().input(|input| input.smooth_scroll_delta);
-                        if wheel_delta != Vec2::ZERO {
-                            let pointer_pos = ui.ctx().input(|input| {
-                                input.pointer.hover_pos().or(input.pointer.interact_pos())
-                            });
-                            if let Some(pointer_pos) = pointer_pos {
-                                if rect.contains(pointer_pos) {
-                                    let mouse_reporting_active =
-                                        terminal.runtime.is_mouse_reporting_active();
-                                    let is_opencode =
-                                        terminal.ai_session.tool == Some(AiCliTool::OpenCode);
-                                    let is_selection_drag = terminal.selection_drag_active;
+                        // Skip when UI overlays (Settings, exit confirm, etc.) are open
+                        // so wheel events reach the overlay's ScrollArea instead.
+                        if wheel_enabled {
+                            let wheel_delta = ui.ctx().input(|input| input.smooth_scroll_delta);
+                            if wheel_delta != Vec2::ZERO {
+                                let pointer_pos = ui.ctx().input(|input| {
+                                    input.pointer.hover_pos().or(input.pointer.interact_pos())
+                                });
+                                if let Some(pointer_pos) = pointer_pos {
+                                    if rect.contains(pointer_pos) {
+                                        let mouse_reporting_active =
+                                            terminal.runtime.is_mouse_reporting_active();
+                                        let is_opencode =
+                                            terminal.ai_session.tool == Some(AiCliTool::OpenCode);
+                                        let is_selection_drag = terminal.selection_drag_active;
 
-                                    // Non-OpenCode mouse-reporting apps: send wheel immediately
-                                    if mouse_reporting_active && !is_opencode && !is_selection_drag
-                                    {
-                                        let direction = if wheel_delta.y > 0.0 {
-                                            WheelDirection::Up
-                                        } else if wheel_delta.y < 0.0 {
-                                            WheelDirection::Down
-                                        } else if wheel_delta.x > 0.0 {
-                                            WheelDirection::Right
-                                        } else {
-                                            WheelDirection::Left
-                                        };
-                                        let cell_x = ((pointer_pos.x - rect.min.x) / char_width)
-                                            .floor()
-                                            as usize;
-                                        let cell_y = ((pointer_pos.y - rect.min.y) / line_height)
-                                            .floor()
-                                            as usize;
-                                        terminal.runtime.send_mouse_wheel(TerminalWheelEvent {
-                                            direction,
-                                            x: cell_x,
-                                            y: cell_y,
-                                            x_pixel_offset: 0,
-                                            y_pixel_offset: 0,
-                                        });
-                                        ui.ctx().input_mut(|input| {
-                                            input.smooth_scroll_delta = Vec2::ZERO;
-                                        });
-                                    } else if is_opencode && !is_selection_drag {
-                                        // OpenCode: capture wheel data for deferred handling
-                                        let direction = if wheel_delta.y > 0.0 {
-                                            WheelDirection::Up
-                                        } else if wheel_delta.y < 0.0 {
-                                            WheelDirection::Down
-                                        } else if wheel_delta.x > 0.0 {
-                                            WheelDirection::Right
-                                        } else {
-                                            WheelDirection::Left
-                                        };
-                                        let cell_x = ((pointer_pos.x - rect.min.x) / char_width)
-                                            .floor()
-                                            as usize;
-                                        let cell_y = ((pointer_pos.y - rect.min.y) / line_height)
-                                            .floor()
-                                            as usize;
-                                        opencode_pending_wheel =
-                                            Some((direction, pointer_pos, cell_x, cell_y));
-                                        // Detach prompt anchor for manual scroll behavior
-                                        detach_terminal_prompt_scroll_anchor_on_manual_scroll(
-                                            terminal,
-                                        );
+                                        // Non-OpenCode mouse-reporting apps: send wheel immediately
+                                        if mouse_reporting_active
+                                            && !is_opencode
+                                            && !is_selection_drag
+                                        {
+                                            let direction = if wheel_delta.y > 0.0 {
+                                                WheelDirection::Up
+                                            } else if wheel_delta.y < 0.0 {
+                                                WheelDirection::Down
+                                            } else if wheel_delta.x > 0.0 {
+                                                WheelDirection::Right
+                                            } else {
+                                                WheelDirection::Left
+                                            };
+                                            let cell_x = ((pointer_pos.x - rect.min.x) / char_width)
+                                                .floor()
+                                                as usize;
+                                            let cell_y = ((pointer_pos.y - rect.min.y)
+                                                / line_height)
+                                                .floor()
+                                                as usize;
+                                            terminal.runtime.send_mouse_wheel(TerminalWheelEvent {
+                                                direction,
+                                                x: cell_x,
+                                                y: cell_y,
+                                                x_pixel_offset: 0,
+                                                y_pixel_offset: 0,
+                                            });
+                                            ui.ctx().input_mut(|input| {
+                                                input.smooth_scroll_delta = Vec2::ZERO;
+                                            });
+                                        } else if is_opencode && !is_selection_drag {
+                                            // OpenCode: capture wheel data for deferred handling
+                                            let direction = if wheel_delta.y > 0.0 {
+                                                WheelDirection::Up
+                                            } else if wheel_delta.y < 0.0 {
+                                                WheelDirection::Down
+                                            } else if wheel_delta.x > 0.0 {
+                                                WheelDirection::Right
+                                            } else {
+                                                WheelDirection::Left
+                                            };
+                                            let cell_x = ((pointer_pos.x - rect.min.x) / char_width)
+                                                .floor()
+                                                as usize;
+                                            let cell_y = ((pointer_pos.y - rect.min.y)
+                                                / line_height)
+                                                .floor()
+                                                as usize;
+                                            opencode_pending_wheel =
+                                                Some((direction, pointer_pos, cell_x, cell_y));
+                                            // Detach prompt anchor for manual scroll behavior
+                                            detach_terminal_prompt_scroll_anchor_on_manual_scroll(
+                                                terminal,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -19553,37 +19584,44 @@ impl AdeApp {
                 });
 
                 // After ScrollArea processes wheel, decide OpenCode fallback
-                if let Some((direction, _pointer_pos, cell_x, cell_y)) = opencode_pending_wheel {
-                    let remaining_delta = ui.ctx().input(|input| input.smooth_scroll_delta);
-                    // Determine if Mergen consumed the wheel based on the scroll axis:
-                    // Vertical ScrollArea consumes y; horizontal wheel would leave x.
-                    // Diagonal touchpad can leave x while y is consumed - do not forward then.
-                    let mergen_consumed = match direction {
-                        WheelDirection::Up | WheelDirection::Down => remaining_delta.y == 0.0,
-                        WheelDirection::Left | WheelDirection::Right => remaining_delta.x == 0.0,
-                    };
-                    if mergen_consumed {
-                        // Mergen ScrollArea consumed the wheel on the relevant axis:
-                        // mark manual scroll and clear any leftover diagonal delta
-                        terminal.opencode_manual_scroll_detached = true;
-                        ui.ctx().input_mut(|input| {
-                            input.smooth_scroll_delta = Vec2::ZERO;
-                        });
-                    } else {
-                        // Mergen could not scroll on the relevant axis:
-                        // forward to OpenCode runtime as fallback
-                        let mouse_reporting_active = terminal.runtime.is_mouse_reporting_active();
-                        if mouse_reporting_active {
-                            terminal.runtime.send_mouse_wheel(TerminalWheelEvent {
-                                direction,
-                                x: cell_x,
-                                y: cell_y,
-                                x_pixel_offset: 0,
-                                y_pixel_offset: 0,
-                            });
+                // Only process if wheel handling is enabled (no UI overlays open)
+                if wheel_enabled {
+                    if let Some((direction, _pointer_pos, cell_x, cell_y)) = opencode_pending_wheel
+                    {
+                        let remaining_delta = ui.ctx().input(|input| input.smooth_scroll_delta);
+                        // Determine if Mergen consumed the wheel based on the scroll axis:
+                        // Vertical ScrollArea consumes y; horizontal wheel would leave x.
+                        // Diagonal touchpad can leave x while y is consumed - do not forward then.
+                        let mergen_consumed = match direction {
+                            WheelDirection::Up | WheelDirection::Down => remaining_delta.y == 0.0,
+                            WheelDirection::Left | WheelDirection::Right => {
+                                remaining_delta.x == 0.0
+                            }
+                        };
+                        if mergen_consumed {
+                            // Mergen ScrollArea consumed the wheel on the relevant axis:
+                            // mark manual scroll and clear any leftover diagonal delta
+                            terminal.opencode_manual_scroll_detached = true;
                             ui.ctx().input_mut(|input| {
                                 input.smooth_scroll_delta = Vec2::ZERO;
                             });
+                        } else {
+                            // Mergen could not scroll on the relevant axis:
+                            // forward to OpenCode runtime as fallback
+                            let mouse_reporting_active =
+                                terminal.runtime.is_mouse_reporting_active();
+                            if mouse_reporting_active {
+                                terminal.runtime.send_mouse_wheel(TerminalWheelEvent {
+                                    direction,
+                                    x: cell_x,
+                                    y: cell_y,
+                                    x_pixel_offset: 0,
+                                    y_pixel_offset: 0,
+                                });
+                                ui.ctx().input_mut(|input| {
+                                    input.smooth_scroll_delta = Vec2::ZERO;
+                                });
+                            }
                         }
                     }
                 }
@@ -25672,7 +25710,8 @@ mod tests {
         terminal_line_height, terminal_link_activation_modifiers, terminal_link_at_point,
         terminal_logical_line, terminal_logical_line_byte_index, terminal_manager_actions_width,
         terminal_manager_diff_summary_model, terminal_manager_diff_summary_visual,
-        terminal_manager_row_chrome, terminal_manager_row_widths, terminal_output_scroll_behavior,
+        terminal_manager_row_chrome, terminal_manager_row_widths,
+        terminal_output_mouse_wheel_enabled, terminal_output_scroll_behavior,
         terminal_output_surface_size, terminal_output_viewport_size,
         terminal_secondary_click_action, terminal_selection_autoscroll_delta,
         terminal_selection_autoscroll_speed, terminal_selection_point_from_pointer,
@@ -43006,6 +43045,61 @@ mod tests {
             .get(&1)
             .unwrap()
             .requested_visible());
+    }
+
+    #[test]
+    fn terminal_output_mouse_wheel_enabled_returns_true_when_no_overlays() {
+        // When no UI overlays are open, wheel handling should be enabled
+        assert!(terminal_output_mouse_wheel_enabled(
+            false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn terminal_output_mouse_wheel_enabled_returns_false_when_settings_open() {
+        // Settings popup should disable terminal wheel handling
+        assert!(!terminal_output_mouse_wheel_enabled(
+            true, false, false, false
+        ));
+    }
+
+    #[test]
+    fn terminal_output_mouse_wheel_enabled_returns_false_when_exit_confirm_open() {
+        // Exit confirmation popup should disable terminal wheel handling
+        assert!(!terminal_output_mouse_wheel_enabled(
+            false, true, false, false
+        ));
+    }
+
+    #[test]
+    fn terminal_output_mouse_wheel_enabled_returns_false_when_terminal_history_open() {
+        // Terminal history popup should disable terminal wheel handling
+        assert!(!terminal_output_mouse_wheel_enabled(
+            false, false, true, false
+        ));
+    }
+
+    #[test]
+    fn terminal_output_mouse_wheel_enabled_returns_false_when_foreground_message_open() {
+        // Foreground message popup should disable terminal wheel handling
+        assert!(!terminal_output_mouse_wheel_enabled(
+            false, false, false, true
+        ));
+    }
+
+    #[test]
+    fn terminal_output_mouse_wheel_enabled_returns_false_when_multiple_overlays() {
+        // Any combination of overlays should disable wheel handling
+        assert!(!terminal_output_mouse_wheel_enabled(
+            true, true, false, false
+        ));
+        assert!(!terminal_output_mouse_wheel_enabled(
+            true, false, true, false
+        ));
+        assert!(!terminal_output_mouse_wheel_enabled(
+            false, true, true, true
+        ));
+        assert!(!terminal_output_mouse_wheel_enabled(true, true, true, true));
     }
 
     #[test]

@@ -118,6 +118,7 @@ If `cargo` is not on PATH in PowerShell, use:
 - **OpenCode wheel handling must not affect other TUIs.** Preserve runtime mouse-wheel forwarding for non-OpenCode mouse-reporting applications.
 - **Wheel hit-testing must use hover fallback.** Terminal wheel handling should use hover position before falling back to interaction position so passive wheel scrolling works.
 - **OpenCode manual scroll detach must reflect actual Mergen scroll.** Set `opencode_manual_scroll_detached` only after Mergen consumes the wheel scroll; runtime fallback wheel events must not disable bottom-stick behavior.
+- **Terminal wheel handling must yield to UI overlays.** When Settings popup, exit confirmation popup, Terminal Manager history popup, or foreground message popup is open, terminal wheel handling must be disabled to allow wheel events to reach the overlay's ScrollArea. Use `terminal_output_mouse_wheel_enabled()` helper to check overlay state before processing wheel events in `draw_terminal_pane()`.
 - **Codex CLI integration:** Codex uses strict hook-only integration with narrow visible-state exceptions. Mergen configures `hooks.json` with `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, and `Stop` events that route to the Mergen bridge. The status transitions are:
   - `UserPromptSubmit`, `PreToolUse`, and `PostToolUse` hooks → Running (gray spinner)
   - `PermissionRequest` hook → `ApprovalRequested` / amber pulse (waiting for user)

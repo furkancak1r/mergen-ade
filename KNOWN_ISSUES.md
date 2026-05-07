@@ -10,6 +10,35 @@ When adding an entry:
 
 ---
 
+#### Settings panel scroll wheel not working {#settings-scroll-wheel}
+- Date: 2026-05-06
+- Context: Settings popup and Shortcuts section scroll behavior with mouse wheel
+- Error signature: User reported that mouse scroll wheel did not work in Settings panel (including Shortcuts section), but dragging the scrollbar manually worked.
+- Symptoms/Impact: Users could not scroll through Settings content using mouse wheel; only scrollbar drag worked. This affected all Settings sections with overflow content.
+- Root cause:
+  - Terminal output mouse wheel handling code was consuming `smooth_scroll_delta` from the global input state before Settings popup's ScrollArea could process it.
+  - The terminal wheel handling code runs inside `draw_terminal_pane()` which is called for all visible terminals even when UI overlays (Settings, exit confirm, etc.) are open.
+  - When the terminal has mouse reporting enabled (especially with OpenCode active), it would consume wheel events that should have been handled by the overlay's ScrollArea.
+- Resolution:
+  - Added `terminal_output_mouse_wheel_enabled()` helper function that checks if any UI overlay is open (Settings popup, exit confirm popup, terminal history popup, foreground message popup).
+  - Modified `draw_terminal_pane()` to skip terminal wheel handling when any overlay is active, allowing wheel events to reach the overlay's ScrollArea instead.
+  - The guard is applied both inside the terminal ScrollArea closure (for immediate wheel capture) and after the ScrollArea (for OpenCode fallback handling).
+  - Added 6 regression tests covering all overlay scenarios:
+    - `terminal_output_mouse_wheel_enabled_returns_true_when_no_overlays`
+    - `terminal_output_mouse_wheel_enabled_returns_false_when_settings_open`
+    - `terminal_output_mouse_wheel_enabled_returns_false_when_exit_confirm_open`
+    - `terminal_output_mouse_wheel_enabled_returns_false_when_terminal_history_open`
+    - `terminal_output_mouse_wheel_enabled_returns_false_when_foreground_message_open`
+    - `terminal_output_mouse_wheel_enabled_returns_false_when_multiple_overlays`
+- Prevent recurrence:
+  - The regression tests ensure the helper function correctly returns false for each overlay type and true when no overlays are open.
+  - Future UI overlays should be added to `terminal_output_mouse_wheel_enabled()` check.
+  - The pattern is consistent with `embedded_browser_should_yield_to_ui_layer()` which already handles similar overlay detection.
+- Files/Commands touched: `src/app.rs` (new helper function, wheel handling guard in `draw_terminal_pane()`, 6 regression tests), `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-05-06: "settingsde scroll çalışmıyor shortcuts da denedim Mouse scrollu tekerlek çalışmadı kendim yandaki scrollu tutup çektiğimde geliyor"
+
+---
+
 #### Terminal shortcuts send double Enter for confirmation {#terminal-shortcut-double-enter}
 - Date: 2026-05-06
 - Context: Terminal command shortcuts (F5, F6, F7, F11) for AI CLI tools
