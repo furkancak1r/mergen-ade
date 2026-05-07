@@ -23443,95 +23443,105 @@ fn draw_terminal_foreground_message_menu_button(
     let mut delete_index: Option<usize> = None;
     let mut add_new_clicked = false;
 
+    let icon_color = if foreground_messages.is_empty() {
+        with_alpha(TEXT_PRIMARY, 190)
+    } else {
+        Color32::from_rgb(100, 200, 100)
+    };
+
     let message_menu = with_minimal_button_chrome(ui, |ui| {
-        ui.menu_button(format!("{}", icons::CHAT_TEXT), |ui| {
-            with_minimal_button_chrome(ui, |ui| {
-                if foreground_messages.is_empty() {
-                    ui.label(RichText::new("No tasks in queue").color(TEXT_MUTED));
-                } else {
-                    ui.label(
-                        RichText::new("Click to send (removes from queue)")
-                            .small()
-                            .color(TEXT_MUTED),
-                    );
+        ui.menu_button(
+            RichText::new(format!("{}", icons::CHAT_TEXT)).color(icon_color),
+            |ui| {
+                with_minimal_button_chrome(ui, |ui| {
+                    if foreground_messages.is_empty() {
+                        ui.label(RichText::new("No tasks in queue").color(TEXT_MUTED));
+                    } else {
+                        ui.label(
+                            RichText::new("Click to send (removes from queue)")
+                                .small()
+                                .color(TEXT_MUTED),
+                        );
+                        ui.add_space(4.0);
+
+                        // Fixed menu width to prevent infinite expansion
+                        // Use set_min_width on the menu button wrapper to constrain layout
+                        let menu_fixed_width = 160.0f32;
+                        // Fixed width for action buttons area (2 icon buttons + gap)
+                        let action_button_width = CONTROL_ROW_HEIGHT * 2.0 + 4.0;
+                        let message_width =
+                            (menu_fixed_width - action_button_width - 8.0).max(80.0);
+
+                        for (index, message) in foreground_messages.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                // Constrain horizontal layout to fixed width
+                                ui.set_min_width(menu_fixed_width);
+                                ui.set_max_width(menu_fixed_width);
+
+                                // Message button - sends and removes from queue (fixed width)
+                                let msg_button = ui
+                                    .add_sized(
+                                        egui::vec2(message_width, CONTROL_ROW_HEIGHT),
+                                        egui::Button::new(RichText::new(capped_hover_text(
+                                            message, 35,
+                                        )))
+                                        .sense(egui::Sense::click()),
+                                    )
+                                    .on_hover_text(message)
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if msg_button.clicked() {
+                                    send_message = Some(message.clone());
+                                    ui.close_menu();
+                                }
+
+                                ui.add_space(4.0);
+
+                                // Edit button (fixed position on right)
+                                if styled_icon_button(
+                                    ui,
+                                    AppIcon::Code,
+                                    BTN_SUBTLE,
+                                    BTN_BLUE_HOVER,
+                                    BTN_ICON_ACTIVE,
+                                    "Edit",
+                                ) {
+                                    edit_index = Some(index);
+                                    ui.close_menu();
+                                }
+
+                                // Delete button (fixed position on right)
+                                if styled_icon_button(
+                                    ui,
+                                    AppIcon::Trash,
+                                    BTN_SUBTLE,
+                                    BTN_RED_HOVER,
+                                    Color32::from_rgb(186, 58, 58),
+                                    "Delete",
+                                ) {
+                                    delete_index = Some(index);
+                                    ui.close_menu();
+                                }
+                            });
+                        }
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
                     ui.add_space(4.0);
 
-                    // Fixed menu width to prevent infinite expansion
-                    // Use set_min_width on the menu button wrapper to constrain layout
-                    let menu_fixed_width = 160.0f32;
-                    // Fixed width for action buttons area (2 icon buttons + gap)
-                    let action_button_width = CONTROL_ROW_HEIGHT * 2.0 + 4.0;
-                    let message_width = (menu_fixed_width - action_button_width - 8.0).max(80.0);
-
-                    for (index, message) in foreground_messages.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            // Constrain horizontal layout to fixed width
-                            ui.set_min_width(menu_fixed_width);
-                            ui.set_max_width(menu_fixed_width);
-
-                            // Message button - sends and removes from queue (fixed width)
-                            let msg_button = ui
-                                .add_sized(
-                                    egui::vec2(message_width, CONTROL_ROW_HEIGHT),
-                                    egui::Button::new(RichText::new(capped_hover_text(
-                                        message, 35,
-                                    )))
-                                    .sense(egui::Sense::click()),
-                                )
-                                .on_hover_text(message)
-                                .on_hover_cursor(egui::CursorIcon::PointingHand);
-                            if msg_button.clicked() {
-                                send_message = Some(message.clone());
-                                ui.close_menu();
-                            }
-
-                            ui.add_space(4.0);
-
-                            // Edit button (fixed position on right)
-                            if styled_icon_button(
-                                ui,
-                                AppIcon::Code,
-                                BTN_SUBTLE,
-                                BTN_BLUE_HOVER,
-                                BTN_ICON_ACTIVE,
-                                "Edit",
-                            ) {
-                                edit_index = Some(index);
-                                ui.close_menu();
-                            }
-
-                            // Delete button (fixed position on right)
-                            if styled_icon_button(
-                                ui,
-                                AppIcon::Trash,
-                                BTN_SUBTLE,
-                                BTN_RED_HOVER,
-                                Color32::from_rgb(186, 58, 58),
-                                "Delete",
-                            ) {
-                                delete_index = Some(index);
-                                ui.close_menu();
-                            }
-                        });
+                    // Add new button
+                    if ui
+                        .button(format!("{} Add New", icons::PLUS))
+                        .on_hover_text("Add new task to queue")
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        add_new_clicked = true;
+                        ui.close_menu();
                     }
-                }
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
-
-                // Add new button
-                if ui
-                    .button(format!("{} Add New", icons::PLUS))
-                    .on_hover_text("Add new task to queue")
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
-                    add_new_clicked = true;
-                    ui.close_menu();
-                }
-            });
-        })
+                });
+            },
+        )
     });
 
     let response = message_menu

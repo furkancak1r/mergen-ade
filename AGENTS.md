@@ -197,6 +197,10 @@ If `cargo` is not on PATH in PowerShell, use:
   - **Background saved messages** (`ProjectRecord::saved_messages`): Reusable snippets that persist across sessions. Sent via the message button in Terminal Manager rows for background terminals.
   - **Foreground saved messages** (`ProjectRecord::foreground_saved_messages`): Dynamic task queue for foreground terminals. Clicking a message sends it to the terminal AND removes it from the queue.
 - **Foreground message queue UI**: The foreground message menu shows the current queue with edit/delete actions for each item, plus an "Add New" button at the bottom.
+- **Foreground task menu icon color indicates queue state**: The CHAT_TEXT icon in the Terminal Manager row for foreground terminals must change color based on queue state:
+  - Empty queue: `with_alpha(TEXT_PRIMARY, 190)` (white/gray muted)
+  - Has items: `Color32::from_rgb(100, 200, 100)` (green)
+  - Only the icon text color changes; button background remains transparent.
 - **Fixed action button positioning**: Message row layout must reserve fixed width for action buttons (edit/delete) on the right side so they don't shift based on prompt text length. Use a fixed menu width (e.g., 160px) - do NOT use `ui.available_width()` inside egui menus as it can be unbounded. Calculate `action_button_width = CONTROL_ROW_HEIGHT * 2 + 4px gap`. Message button width = `menu_width - action_button_width - spacing`. Set `ui.set_min_width()` and `ui.set_max_width()` on each row to enforce the fixed width. This ensures consistent right-aligned action buttons regardless of message content length.
 - **Add/Edit popup**: Clicking "Add New" or the edit button opens a popup with a multiline `TextEdit::multiline` input. The popup uses `Order::Foreground` to render above other UI layers.
 - **Popup layout**: Text area should fill available space dynamically with minimum 280px height. Calculate as `available_height - button_row_height - 16px`. Buttons positioned at bottom with 8px gap (not 24px) to maximize text editing area and minimize unused space below buttons.

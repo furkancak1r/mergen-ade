@@ -10,6 +10,26 @@ When adding an entry:
 
 ---
 
+#### Foreground task menu button icon turns green when queue has items {#foreground-task-icon-green}
+- Date: 2026-05-07
+- Context: Terminal Manager foreground task queue menu button visual feedback
+- Error signature: User requested: "foreground task içinde öge varsa beyaz yerine yeşil olsun, arka plan rengi değil kendi rengi" - The foreground task menu button should show a green icon when there are tasks in the queue, not just white.
+- Symptoms/Impact: Users could not quickly distinguish whether a foreground terminal had pending tasks in its queue without opening the menu. The white icon looked the same regardless of queue state.
+- Root cause: The `draw_terminal_foreground_message_menu_button()` function used a static white/normal color for the `icons::CHAT_TEXT` icon without checking if `foreground_messages` was empty.
+- Resolution:
+  - Added conditional icon color selection based on queue state:
+    - If `foreground_messages.is_empty()`: use `with_alpha(TEXT_PRIMARY, 190)` (white/gray)
+    - If queue has items: use `Color32::from_rgb(100, 200, 100)` (green)
+  - Changed `ui.menu_button()` call to use `RichText::new(format!("{}", icons::CHAT_TEXT)).color(icon_color)` instead of plain `format!()` string.
+  - Only the icon text color changes; button background remains unchanged as requested.
+- Prevent recurrence:
+  - Documented in AGENTS.md Terminal Manager section with explicit guideline: "Foreground task menu icon color indicates queue state."
+  - Color constant `Color32::from_rgb(100, 200, 100)` is the same green used for other "active/completed" states in the codebase (e.g., `TurnComplete` pulse, checklist done state).
+- Files/Commands touched: `src/app.rs` (`draw_terminal_foreground_message_menu_button()` icon color logic), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-07: "foreground task içinde öge varsa beyaz yerine yeşil olsun, arka plan rengi değil kendi rengi"
+
+---
+
 #### Design Inspect auto-disables after successful element delivery {#design-inspect-auto-disable}
 - Date: 2026-05-07
 - Context: Browser panel Design Inspect mode UX improvement
