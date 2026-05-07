@@ -10,6 +10,47 @@ When adding an entry:
 
 ---
 
+#### Browser MCP multi-terminal isolation for same-project sessions {#browser-mcp-terminal-isolation}
+- Date: 2026-05-07
+- Context: Browser MCP with multiple terminals in the same project using the browser simultaneously
+- Error signature: Multiple AI agents in the same project sharing the same browser instance, causing conflicts when navigating, clicking, or inspecting elements. Terminal-scoped sessions were not properly isolated.
+- Symptoms/Impact: When two or more terminals in the same project used Browser MCP simultaneously, they would interfere with each other's browser state (cookies, localStorage, session), causing navigation commands to affect the wrong browser session and producing inconsistent results.
+- Root cause:
+  - Browser state maps (`embedded_browsers_by_project`, `browser_tabs_by_project`, `browser_url_draft_by_project`, etc.) used only `project_id: u64` as the key.
+  - All terminals in the same project shared a single browser instance, WebView2 profile, and session state.
+  - The `BrowserMcpAuthScope` had `terminal_id` and `session_id` fields, but `resolve_browser_mcp_project_id()` only returned `project_id`, collapsing all terminal scopes to the project level.
+  - Terminal link routing, browser panel rendering, and MCP handlers all used project-scoped browser lookups.
+- Resolution:
+  - Introduced `BrowserScopeKey` enum with `Project(u64)` and `Terminal { project_id, terminal_id }` variants to distinguish project-wide vs terminal-specific browser instances.
+  - Updated all browser state maps to use `BrowserScopeKey` instead of raw `u64`:
+    - `browser_url_draft_by_scope`
+    - `embedded_browsers_by_scope`
+    - `browser_tabs_by_scope`
+    - `active_browser_tab_by_scope`
+    - `browser_design_inspect_enabled_scopes`
+    - `browser_design_inspect_terminal_by_scope`
+    - `browser_video_recordings_by_scope`
+  - Updated `inactive_browser_tab_browsers` key from `(u64, u64)` to `(BrowserScopeKey, u64)`.
+  - Added `browser_user_data_dir_path_for_terminal(project_id, terminal_id)` in `config.rs` for isolated WebView2 profiles per terminal (`webview2/projects/{project_id}/terminals/{terminal_id}/`).
+  - Changed `resolve_browser_mcp_project_id()` to `resolve_browser_mcp_scope()` returning `BrowserScopeKey::Terminal` with session ID validation.
+  - Updated `project_browser()` to `browser_for_scope()` accepting `BrowserScopeKey` and creating terminal-scoped browser instances with isolated profiles.
+  - Updated `sync_embedded_browser()` to show/hide based on active terminal scope, falling back to project scope for UI-initiated browser usage.
+  - Updated `draw_browser_panel()` to render terminal-specific browser when active terminal has a terminal-scoped browser open.
+  - Added terminal browser cleanup on terminal close to prevent resource leaks.
+  - Updated all MCP handlers to use terminal-scoped browser lookups via `resolve_browser_mcp_scope()`.
+  - Project-scoped browsers (`BrowserScopeKey::Project`) retained for UI-initiated navigation (terminal links, manual browser panel open).
+  - Terminal-scoped browser URLs are runtime-only (not persisted to `ProjectRecord::browser_last_url`).
+- Prevent recurrence:
+  - Added `BrowserMcpMultiTerminalIsolation` architecture documentation in `AGENTS.md`.
+  - All browser state maps now use `BrowserScopeKey` making scope explicit at the type level.
+  - Session ID validation in `resolve_browser_mcp_scope()` prevents cross-session contamination.
+  - Terminal browser cleanup ensures resources are freed when terminals exit.
+  - Regression tests verify terminal-scoped browser creation, isolated profile directories, and proper cleanup.
+- Files/Commands touched: `src/app.rs` (BrowserScopeKey enum, state map updates, scope resolution, browser lifecycle, cleanup, UI rendering, MCP handlers), `src/config.rs` (terminal-scoped profile paths), `AGENTS.md` (new guidelines section), `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: Browser MCP multi-terminal isolation implementation 2026-05-07
+
+---
+
 #### Settings panel scroll wheel not working {#settings-scroll-wheel}
 - Date: 2026-05-06
 - Context: Settings popup and Shortcuts section scroll behavior with mouse wheel
@@ -800,4 +841,43 @@ When adding an entry:
   - Added regression test sync_embedded_browser_syncs_bounds_before_show verifying bounds are set before visibility.
   - The idempotent native sync prevents redundant COM calls to WebView2, reducing both flicker and CPU overhead.
 - Files/Commands touched: src/web_browser.rs (struct fields, set_visible_internal(), sync_position_internal(), shutdown()), src/app.rs (sync_embedded_browser() order), KNOWN_ISSUES.md, cargo fmt, cargo test, cargo build --release --target x86_64-pc-windows-msvc`n- References: User request 2026-05-07: "scroll yapıyorum bazen böyle beyaz ekran filan geliyor"
+
+
+---
+
+#### Browser URL input custom context menu removed {#browser-url-context-menu-removed}
+- Date: 2026-05-07
+- Context: Browser panel URL input field right-click context menu
+- Error signature: User requested removal of the custom Copy/Paste context menu that appeared when right-clicking the browser URL input field.
+- Symptoms/Impact: The custom context menu with Copy and Paste buttons was considered unnecessary since standard keyboard shortcuts (Ctrl+C, Ctrl+V) and system context menus are available.
+- Resolution:
+  - Removed the custom `url_response.context_menu()` block that rendered Copy/Paste buttons.
+  - Removed associated state tracking: `pre_click_range`, `copy_requested`, `paste_requested`, `context_menu_range`, `post_show_range`, `effective_range`, `url_for_copy`, `can_paste`.
+  - Removed the Copy/Paste action handlers after the UI borrow ends.
+  - Standard TextEdit behavior preserved: typing, Enter to submit, double-click to select all.
+- Prevent recurrence:
+  - If custom context menus are needed in the future, prefer native egui menus over custom-styled ones for consistency.
+  - Document intentional UX decisions in AGENTS.md.
+- Files/Commands touched: `src/app.rs` (`draw_browser_panel()` URL input block), `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-07: "browserda link sag tik menusunu kaldir" (interpreted as removing the URL input context menu, not WebView page menus)
+
+
+---
+
+#### Browser add tab button positioned next to last tab {#browser-add-tab-button-position}
+- Date: 2026-05-07
+- Context: Browser panel tab strip add tab (+) button placement
+- Error signature: User requested: "yeni sekme butonu en sonuncu sekmenin hemen yaninda olsun" - The add tab button should appear immediately after the last tab, not in a separate fixed area.
+- Symptoms/Impact: The add tab button was positioned in a fixed area to the right of the scrollable tabs, visually disconnected from the tab strip when tabs overflowed.
+- Resolution:
+  - Moved the add tab button from outside the `ScrollArea` to inside the `ScrollArea::horizontal()` block.
+  - Button is now rendered immediately after the tabs loop, within the same `ui.horizontal()` container.
+  - Removed the fixed width reservation calculation (`available_width - add_button_width - spacing`).
+  - Button now scrolls with the tabs when the tab strip overflows.
+  - Button remains visible at the end of the tab list, maintaining visual proximity to the last tab.
+- Prevent recurrence:
+  - Updated AGENTS.md guideline: "Place add tab button inside ScrollArea next to last tab" instead of reserving fixed width outside.
+  - This pattern keeps related UI controls together and follows egui's scrollable container conventions.
+- Files/Commands touched: `src/app.rs` (`draw_browser_panel()` tab strip layout), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-07: "yeni sekme butonu en sonuncu sekmenin hemen yaninda olsun"
 

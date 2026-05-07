@@ -1237,6 +1237,45 @@ fn percent_encode_file_url_path(value: &str) -> String {
     encoded
 }
 
+/// Key for scoping browser instances - either project-wide or terminal-specific.
+/// Terminal-scoped browsers provide isolation between multiple MCP sessions in the same project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum BrowserScopeKey {
+    /// Project-scoped browser (legacy behavior) - shared across all terminals in the project.
+    Project(u64),
+    /// Terminal-scoped browser - isolated instance for a specific terminal.
+    Terminal { project_id: u64, terminal_id: u64 },
+}
+
+impl BrowserScopeKey {
+    /// Returns the project_id associated with this scope.
+    fn project_id(&self) -> u64 {
+        match self {
+            BrowserScopeKey::Project(pid) => *pid,
+            BrowserScopeKey::Terminal { project_id, .. } => *project_id,
+        }
+    }
+
+    /// Returns the terminal_id if this is a terminal scope, None otherwise.
+    fn terminal_id(&self) -> Option<u64> {
+        match self {
+            BrowserScopeKey::Project(_) => None,
+            BrowserScopeKey::Terminal { terminal_id, .. } => Some(*terminal_id),
+        }
+    }
+
+    /// Returns true if this is a terminal-scoped key.
+    fn is_terminal(&self) -> bool {
+        matches!(self, BrowserScopeKey::Terminal { .. })
+    }
+}
+
+impl From<u64> for BrowserScopeKey {
+    fn from(project_id: u64) -> Self {
+        BrowserScopeKey::Project(project_id)
+    }
+}
+
 pub struct AdeApp {
     config_path: PathBuf,
     current_executable_path: PathBuf,
@@ -1350,44 +1389,45 @@ pub struct AdeApp {
     checklist_collapsed_by_project: BTreeMap<u64, bool>,
     /// File editor state (runtime only, not persisted)
     file_editor: FileEditorState,
-    /// Browser URL draft input per project (runtime only, not persisted).
+    /// Browser URL draft input per scope (runtime only, not persisted).
     /// Holds the text being typed in the browser panel URL input before submission.
-    browser_url_draft_by_project: BTreeMap<u64, String>,
-    /// Embedded browsers per project for in-app web rendering (runtime only, not persisted).
-    /// Each project has its own browser instance so switching projects preserves browser state.
-    embedded_browsers_by_project: BTreeMap<u64, web_browser::EmbeddedBrowser>,
-    /// Browser tab metadata per project (runtime only, not persisted).
-    browser_tabs_by_project: BTreeMap<u64, Vec<BrowserTabState>>,
-    /// Active browser tab per project (runtime only, not persisted).
-    active_browser_tab_by_project: BTreeMap<u64, u64>,
+    browser_url_draft_by_scope: BTreeMap<BrowserScopeKey, String>,
+    /// Embedded browsers per scope for in-app web rendering (runtime only, not persisted).
+    /// Each scope (project or terminal) has its own browser instance for proper isolation.
+    embedded_browsers_by_scope: BTreeMap<BrowserScopeKey, web_browser::EmbeddedBrowser>,
+    /// Browser tab metadata per scope (runtime only, not persisted).
+    browser_tabs_by_scope: BTreeMap<BrowserScopeKey, Vec<BrowserTabState>>,
+    /// Active browser tab per scope (runtime only, not persisted).
+    active_browser_tab_by_scope: BTreeMap<BrowserScopeKey, u64>,
     /// Inactive browser tab WebViews, stored off the visible active browser map.
-    inactive_browser_tab_browsers: BTreeMap<(u64, u64), web_browser::EmbeddedBrowser>,
+    /// Key: (scope_key_serializable, tab_id) where scope_key_serializable is (is_terminal, project_id, terminal_id_or_0)
+    inactive_browser_tab_browsers: BTreeMap<(BrowserScopeKey, u64), web_browser::EmbeddedBrowser>,
     next_browser_tab_id: u64,
     /// Reserved browser content area for native WebView bounds sync (runtime only)
     pending_browser_rect: Option<egui::Rect>,
     /// Browser panel open state per project (runtime only, not persisted).
     /// Tracks which projects have the Browser panel open; the visible panel follows the active terminal project.
     browser_panel_open_projects: BTreeSet<u64>,
-    /// Browser design inspect mode open state per project (runtime only, not persisted).
-    browser_design_inspect_enabled_projects: BTreeSet<u64>,
-    /// Terminal selected as design inspect destination per project (runtime only, not persisted).
-    browser_design_inspect_terminal_by_project: BTreeMap<u64, u64>,
-    /// Last time the design inspect target terminal changed per project.
-    browser_design_inspect_target_changed_at_by_project: BTreeMap<u64, Instant>,
-    /// Last design inspect selection delivered per project/terminal destination, used to prevent paste floods.
+    /// Browser design inspect mode open state per scope (runtime only, not persisted).
+    browser_design_inspect_enabled_scopes: BTreeSet<BrowserScopeKey>,
+    /// Terminal selected as design inspect destination per scope (runtime only, not persisted).
+    browser_design_inspect_terminal_by_scope: BTreeMap<BrowserScopeKey, u64>,
+    /// Last time the design inspect target terminal changed per scope.
+    browser_design_inspect_target_changed_at_by_scope: BTreeMap<BrowserScopeKey, Instant>,
+    /// Last design inspect selection delivered per scope/terminal destination, used to prevent paste floods.
     browser_design_inspect_last_delivery_by_destination:
-        BTreeMap<(u64, u64), DesignInspectDeliveryState>,
+        BTreeMap<(BrowserScopeKey, u64), DesignInspectDeliveryState>,
     /// Pending UI-initiated screenshot requests waiting for browser visibility.
-    /// Key: request_id, Value: (project_id, full_page, timestamp)
-    browser_pending_screenshot_requests: BTreeMap<String, (u64, bool, Instant)>,
+    /// Key: request_id, Value: (scope_key, full_page, timestamp)
+    browser_pending_screenshot_requests: BTreeMap<String, (BrowserScopeKey, bool, Instant)>,
     /// Whether any overlay (dropdown, tooltip, context menu) in the browser panel is active.
     /// Used to hide the native WebView so overlays appear above it.
     browser_panel_overlay_active: bool,
     /// Grace period timestamp until which WebView should remain hidden after overlay closes.
     /// Prevents flickering when moving mouse from button to dropdown/tooltip.
     browser_overlay_grace_until: Option<Instant>,
-    /// Active embedded-browser video recordings per project.
-    browser_video_recordings_by_project: BTreeMap<u64, BrowserVideoRecordingState>,
+    /// Active embedded-browser video recordings per scope.
+    browser_video_recordings_by_scope: BTreeMap<BrowserScopeKey, BrowserVideoRecordingState>,
     browser_video_encode_events_tx: Sender<BrowserVideoEncodeEvent>,
     browser_video_encode_events_rx: Receiver<BrowserVideoEncodeEvent>,
 }
@@ -3824,22 +3864,22 @@ impl AdeApp {
             terminal_history_popup_just_opened: false,
             checklist_collapsed_by_project: BTreeMap::new(),
             file_editor: FileEditorState::default(),
-            browser_url_draft_by_project: BTreeMap::new(),
-            embedded_browsers_by_project: BTreeMap::new(),
-            browser_tabs_by_project: BTreeMap::new(),
-            active_browser_tab_by_project: BTreeMap::new(),
+            browser_url_draft_by_scope: BTreeMap::new(),
+            embedded_browsers_by_scope: BTreeMap::new(),
+            browser_tabs_by_scope: BTreeMap::new(),
+            active_browser_tab_by_scope: BTreeMap::new(),
             inactive_browser_tab_browsers: BTreeMap::new(),
             next_browser_tab_id: 1,
             pending_browser_rect: None,
             browser_panel_open_projects: BTreeSet::new(),
-            browser_design_inspect_enabled_projects: BTreeSet::new(),
-            browser_design_inspect_terminal_by_project: BTreeMap::new(),
-            browser_design_inspect_target_changed_at_by_project: BTreeMap::new(),
+            browser_design_inspect_enabled_scopes: BTreeSet::new(),
+            browser_design_inspect_terminal_by_scope: BTreeMap::new(),
+            browser_design_inspect_target_changed_at_by_scope: BTreeMap::new(),
             browser_design_inspect_last_delivery_by_destination: BTreeMap::new(),
             browser_pending_screenshot_requests: BTreeMap::new(),
             browser_panel_overlay_active: false,
             browser_overlay_grace_until: None,
-            browser_video_recordings_by_project: BTreeMap::new(),
+            browser_video_recordings_by_scope: BTreeMap::new(),
             browser_video_encode_events_tx,
             browser_video_encode_events_rx,
         };
@@ -4074,12 +4114,17 @@ impl AdeApp {
         self.directory_pending_tree_open_state_by_project
             .remove(&project_id);
         // Clean up browser state for the removed project
-        self.browser_url_draft_by_project.remove(&project_id);
-        self.browser_tabs_by_project.remove(&project_id);
-        self.active_browser_tab_by_project.remove(&project_id);
+        self.browser_pending_screenshot_requests
+            .retain(|_, (scope, _, _)| scope.project_id() != project_id);
+        self.browser_url_draft_by_scope
+            .retain(|scope, _| scope.project_id() != project_id);
+        self.browser_tabs_by_scope
+            .retain(|scope, _| scope.project_id() != project_id);
+        self.active_browser_tab_by_scope
+            .retain(|scope, _| scope.project_id() != project_id);
         self.inactive_browser_tab_browsers
-            .retain(|(pid, _), browser| {
-                if *pid == project_id {
+            .retain(|(scope, _), browser| {
+                if scope.project_id() == project_id {
                     browser.shutdown();
                     false
                 } else {
@@ -4087,21 +4132,27 @@ impl AdeApp {
                 }
             });
         self.browser_panel_open_projects.remove(&project_id);
-        self.browser_design_inspect_enabled_projects
-            .remove(&project_id);
-        self.browser_design_inspect_terminal_by_project
-            .remove(&project_id);
-        self.browser_design_inspect_target_changed_at_by_project
-            .remove(&project_id);
+        self.browser_design_inspect_enabled_scopes
+            .retain(|scope| scope.project_id() != project_id);
+        self.browser_design_inspect_terminal_by_scope
+            .retain(|scope, _| scope.project_id() != project_id);
+        self.browser_design_inspect_target_changed_at_by_scope
+            .retain(|scope, _| scope.project_id() != project_id);
         self.browser_design_inspect_last_delivery_by_destination
-            .retain(|(pid, _), _| *pid != project_id);
-        self.browser_video_recordings_by_project.remove(&project_id);
+            .retain(|(scope, _), _| scope.project_id() != project_id);
+        self.browser_video_recordings_by_scope
+            .retain(|scope, _| scope.project_id() != project_id);
         if let Some(service) = self.browser_mcp_service.as_ref() {
             service.revoke_project(project_id);
         }
-        if let Some(mut browser) = self.embedded_browsers_by_project.remove(&project_id) {
-            browser.shutdown();
-        }
+        self.embedded_browsers_by_scope.retain(|scope, browser| {
+            if scope.project_id() == project_id {
+                browser.shutdown();
+                false
+            } else {
+                true
+            }
+        });
 
         // Remove project from input history and clear selection if needed
         let project_path_str = project.path.display().to_string();
@@ -10778,17 +10829,50 @@ impl AdeApp {
             service.revoke_terminal(terminal_id);
         }
         self.terminals.remove(&terminal_id);
-        self.browser_design_inspect_terminal_by_project
+        self.browser_pending_screenshot_requests
+            .retain(|_, (scope, _, _)| scope.terminal_id() != Some(terminal_id));
+        self.browser_url_draft_by_scope
+            .retain(|scope, _| scope.terminal_id() != Some(terminal_id));
+        self.active_browser_tab_by_scope
+            .retain(|scope, _| scope.terminal_id() != Some(terminal_id));
+        self.browser_tabs_by_scope
+            .retain(|scope, _| scope.terminal_id() != Some(terminal_id));
+        self.inactive_browser_tab_browsers
+            .retain(|(scope, _), browser| {
+                if scope.terminal_id() == Some(terminal_id) {
+                    browser.shutdown();
+                    false
+                } else {
+                    true
+                }
+            });
+        self.embedded_browsers_by_scope.retain(|scope, browser| {
+            if scope.terminal_id() == Some(terminal_id) {
+                browser.shutdown();
+                false
+            } else {
+                true
+            }
+        });
+        self.browser_video_recordings_by_scope
+            .retain(|scope, _| scope.terminal_id() != Some(terminal_id));
+        let removed_design_inspect_scopes: BTreeSet<BrowserScopeKey> = self
+            .browser_design_inspect_terminal_by_scope
+            .iter()
+            .filter_map(|(scope, target_terminal_id)| {
+                (*target_terminal_id == terminal_id).then_some(*scope)
+            })
+            .collect();
+        self.browser_design_inspect_enabled_scopes
+            .retain(|scope| scope.terminal_id() != Some(terminal_id));
+        self.browser_design_inspect_terminal_by_scope
             .retain(|_, target_terminal_id| *target_terminal_id != terminal_id);
-        if !self
-            .browser_design_inspect_terminal_by_project
-            .contains_key(&project_id)
-        {
-            self.browser_design_inspect_target_changed_at_by_project
-                .remove(&project_id);
-        }
+        self.browser_design_inspect_target_changed_at_by_scope
+            .retain(|scope, _| !removed_design_inspect_scopes.contains(scope));
         self.browser_design_inspect_last_delivery_by_destination
-            .retain(|(_, target_terminal_id), _| *target_terminal_id != terminal_id);
+            .retain(|(scope, target_terminal_id), _| {
+                scope.terminal_id() != Some(terminal_id) && *target_terminal_id != terminal_id
+            });
         self.status_line = match close_result {
             Ok(()) => format!("Closed {title}"),
             Err(err) => format!("Closed {title} (cleanup failed: {err})"),
@@ -10842,8 +10926,8 @@ impl AdeApp {
                 .map(|terminal| (terminal.project_id, terminal_id))
         });
         if let Some((project_id, terminal_id)) = design_inspect_binding {
-            if self.is_browser_design_inspect_enabled_for_project(project_id) {
-                self.bind_browser_design_inspect_terminal_for_project(project_id, terminal_id);
+            if self.is_browser_design_inspect_enabled_for_scope(project_id) {
+                self.bind_browser_design_inspect_terminal_for_scope(project_id, terminal_id);
             }
         }
 
@@ -16299,10 +16383,12 @@ impl AdeApp {
         Some(response.response.rect)
     }
 
-    /// Set the browser URL for a project and update the draft.
-    fn set_project_browser_url(&mut self, project_id: u64, url: String) {
-        let active_tab_id = self.ensure_browser_tab_state(project_id);
-        if let Some(tab) = self.browser_tab_mut(project_id, active_tab_id) {
+    /// Set the browser URL for a scope and update the draft.
+    fn set_browser_url_for_scope(&mut self, scope: impl Into<BrowserScopeKey>, url: String) {
+        let scope = scope.into();
+        let project_id = scope.project_id();
+        let active_tab_id = self.ensure_browser_tab_state(scope);
+        if let Some(tab) = self.browser_tab_mut(scope, active_tab_id) {
             tab.url = Some(url.clone());
             tab.draft = url.clone();
             tab.title = browser_tab_title_from_url(&url)
@@ -16312,35 +16398,80 @@ impl AdeApp {
         }
         if let Some(project) = self.projects.get_mut(&project_id) {
             project.browser_last_url = Some(url.clone());
-            self.browser_url_draft_by_project.insert(project_id, url);
+            self.browser_url_draft_by_scope.insert(scope, url);
             self.note_projects_changed();
             self.persist_config();
         }
     }
 
-    fn create_project_browser_instance(&mut self, project_id: u64) -> web_browser::EmbeddedBrowser {
-        let user_data_folder = match config::browser_user_data_dir_path(project_id) {
-            Ok(path) => Some(path),
-            Err(err) => {
-                log::error!(
-                    "Browser profile folder setup failed for project {}: {}",
-                    project_id,
-                    err
-                );
-                self.status_line =
-                    "Browser profile folder could not be prepared; passwords may not persist"
-                        .to_owned();
-                None
+    /// Submit the browser URL for a project.
+    /// Normalizes the URL, opens the browser panel, persists the URL, and navigates the browser.
+    fn submit_browser_url(&mut self, ctx: &egui::Context, project_id: u64, url: &str) {
+        let normalized = normalize_browser_url(url);
+        if normalized.is_empty() {
+            return;
+        }
+
+        let scope = BrowserScopeKey::Project(project_id);
+        self.set_browser_panel_open_for_project(project_id, true);
+        self.config.ui.checklist_panel_expanded = false;
+        self.note_ui_config_changed();
+        self.set_browser_url_for_scope(scope, normalized.clone());
+        self.browser_for_scope(scope).navigate(&normalized);
+        ctx.request_repaint();
+    }
+
+    fn create_browser_instance_for_scope(
+        &mut self,
+        scope: impl Into<BrowserScopeKey>,
+    ) -> web_browser::EmbeddedBrowser {
+        let scope = scope.into();
+        let user_data_folder = match scope {
+            BrowserScopeKey::Project(project_id) => {
+                match config::browser_user_data_dir_path(project_id) {
+                    Ok(path) => Some(path),
+                    Err(err) => {
+                        log::error!(
+                            "Browser profile folder setup failed for project {}: {}",
+                            project_id,
+                            err
+                        );
+                        self.status_line =
+                        "Browser profile folder could not be prepared; passwords may not persist"
+                            .to_owned();
+                        None
+                    }
+                }
             }
+            BrowserScopeKey::Terminal {
+                project_id,
+                terminal_id,
+            } => match config::browser_user_data_dir_path_for_terminal(project_id, terminal_id) {
+                Ok(path) => Some(path),
+                Err(err) => {
+                    log::error!(
+                        "Browser profile folder setup failed for project {} terminal {}: {}",
+                        project_id,
+                        terminal_id,
+                        err
+                    );
+                    self.status_line =
+                        "Browser profile folder could not be prepared; passwords may not persist"
+                            .to_owned();
+                    None
+                }
+            },
         };
         web_browser::EmbeddedBrowser::new_with_user_data_folder(user_data_folder)
     }
 
-    fn ensure_browser_tab_state(&mut self, project_id: u64) -> u64 {
-        if let Some(active_tab_id) = self.active_browser_tab_by_project.get(&project_id).copied() {
+    fn ensure_browser_tab_state(&mut self, scope: impl Into<BrowserScopeKey>) -> u64 {
+        let scope = scope.into();
+        let project_id = scope.project_id();
+        if let Some(active_tab_id) = self.active_browser_tab_by_scope.get(&scope).copied() {
             if self
-                .browser_tabs_by_project
-                .get(&project_id)
+                .browser_tabs_by_scope
+                .get(&scope)
                 .is_some_and(|tabs| tabs.iter().any(|tab| tab.id == active_tab_id))
             {
                 return active_tab_id;
@@ -16354,40 +16485,47 @@ impl AdeApp {
         let tab_id = self.next_browser_tab_id;
         self.next_browser_tab_id = self.next_browser_tab_id.saturating_add(1).max(1);
         let tab = BrowserTabState::new_page(tab_id, initial_url.clone());
-        self.browser_tabs_by_project.insert(project_id, vec![tab]);
-        self.active_browser_tab_by_project
-            .insert(project_id, tab_id);
-        self.browser_url_draft_by_project
-            .insert(project_id, initial_url.unwrap_or_default());
+        self.browser_tabs_by_scope.insert(scope, vec![tab]);
+        self.active_browser_tab_by_scope.insert(scope, tab_id);
+        self.browser_url_draft_by_scope
+            .insert(scope, initial_url.unwrap_or_default());
         tab_id
     }
 
-    fn active_browser_tab_id(&self, project_id: u64) -> Option<u64> {
-        self.active_browser_tab_by_project.get(&project_id).copied()
+    fn active_browser_tab_id(&self, scope: impl Into<BrowserScopeKey>) -> Option<u64> {
+        let scope = scope.into();
+        self.active_browser_tab_by_scope.get(&scope).copied()
     }
 
-    fn browser_tab_mut(&mut self, project_id: u64, tab_id: u64) -> Option<&mut BrowserTabState> {
-        self.browser_tabs_by_project
-            .get_mut(&project_id)?
+    fn browser_tab_mut(
+        &mut self,
+        scope: impl Into<BrowserScopeKey>,
+        tab_id: u64,
+    ) -> Option<&mut BrowserTabState> {
+        let scope = scope.into();
+        self.browser_tabs_by_scope
+            .get_mut(&scope)?
             .iter_mut()
             .find(|tab| tab.id == tab_id)
     }
 
-    fn browser_tab_index(&self, project_id: u64, tab_id: u64) -> Option<usize> {
-        self.browser_tabs_by_project
-            .get(&project_id)?
+    fn browser_tab_index(&self, scope: impl Into<BrowserScopeKey>, tab_id: u64) -> Option<usize> {
+        let scope = scope.into();
+        self.browser_tabs_by_scope
+            .get(&scope)?
             .iter()
             .position(|tab| tab.id == tab_id)
     }
 
     fn find_browser_tab_by_url(
         &self,
-        project_id: u64,
+        scope: impl Into<BrowserScopeKey>,
         normalized_url: &str,
     ) -> Option<BrowserTabUrlMatch> {
-        let active_tab_id = self.active_browser_tab_id(project_id);
-        self.browser_tabs_by_project
-            .get(&project_id)?
+        let scope = scope.into();
+        let active_tab_id = self.active_browser_tab_id(scope);
+        self.browser_tabs_by_scope
+            .get(&scope)?
             .iter()
             .enumerate()
             .find_map(|(index, tab)| {
@@ -16408,10 +16546,14 @@ impl AdeApp {
             })
     }
 
-    fn browser_tab_summary(&self, project_id: u64) -> Vec<(u64, String, Option<String>, bool)> {
-        let active = self.active_browser_tab_id(project_id);
-        self.browser_tabs_by_project
-            .get(&project_id)
+    fn browser_tab_summary(
+        &self,
+        scope: impl Into<BrowserScopeKey>,
+    ) -> Vec<(u64, String, Option<String>, bool)> {
+        let scope = scope.into();
+        let active = self.active_browser_tab_id(scope);
+        self.browser_tabs_by_scope
+            .get(&scope)
             .map(|tabs| {
                 tabs.iter()
                     .map(|tab| {
@@ -16427,12 +16569,13 @@ impl AdeApp {
             .unwrap_or_default()
     }
 
-    fn browser_tabs_response(&self, project_id: u64) -> BrowserMcpIpcResponse {
-        let active = self.active_browser_tab_id(project_id);
+    fn browser_tabs_response(&self, scope: impl Into<BrowserScopeKey>) -> BrowserMcpIpcResponse {
+        let scope = scope.into();
+        let active = self.active_browser_tab_id(scope);
         let mut lines = Vec::new();
         let mut data_tabs = Vec::new();
 
-        if let Some(tabs) = self.browser_tabs_by_project.get(&project_id) {
+        if let Some(tabs) = self.browser_tabs_by_scope.get(&scope) {
             for (index, tab) in tabs.iter().enumerate() {
                 let title = if tab.title.trim().is_empty() {
                     "New Tab"
@@ -16477,13 +16620,14 @@ impl AdeApp {
 
     fn resolve_browser_tab_id_from_params(
         &self,
-        project_id: u64,
+        scope: impl Into<BrowserScopeKey>,
         params: &serde_json::Value,
     ) -> Result<u64, String> {
+        let scope = scope.into();
         if let Some(tab_id) = params.get("tabId").and_then(serde_json::Value::as_u64) {
             if self
-                .browser_tabs_by_project
-                .get(&project_id)
+                .browser_tabs_by_scope
+                .get(&scope)
                 .is_some_and(|tabs| tabs.iter().any(|tab| tab.id == tab_id))
             {
                 return Ok(tab_id);
@@ -16492,65 +16636,67 @@ impl AdeApp {
         }
         if let Some(index) = params.get("index").and_then(serde_json::Value::as_u64) {
             return self
-                .browser_tabs_by_project
-                .get(&project_id)
+                .browser_tabs_by_scope
+                .get(&scope)
                 .and_then(|tabs| tabs.get(index as usize))
                 .map(|tab| tab.id)
                 .ok_or_else(|| format!("Browser tab index does not exist: {index}"));
         }
-        self.active_browser_tab_id(project_id)
+        self.active_browser_tab_id(scope)
             .ok_or_else(|| "No active browser tab exists".to_owned())
     }
 
-    fn store_active_browser_for_project(&mut self, project_id: u64) {
-        let Some(active_tab_id) = self.active_browser_tab_id(project_id) else {
+    fn store_active_browser_for_scope(&mut self, scope: impl Into<BrowserScopeKey>) {
+        let scope = scope.into();
+        let Some(active_tab_id) = self.active_browser_tab_id(scope) else {
             return;
         };
-        if let Some(mut browser) = self.embedded_browsers_by_project.remove(&project_id) {
+        if let Some(mut browser) = self.embedded_browsers_by_scope.remove(&scope) {
             browser.hide();
             self.inactive_browser_tab_browsers
-                .insert((project_id, active_tab_id), browser);
+                .insert((scope, active_tab_id), browser);
         }
-        if let Some(draft) = self.browser_url_draft_by_project.get(&project_id).cloned() {
-            if let Some(tab) = self.browser_tab_mut(project_id, active_tab_id) {
+        if let Some(draft) = self.browser_url_draft_by_scope.get(&scope).cloned() {
+            if let Some(tab) = self.browser_tab_mut(scope, active_tab_id) {
                 tab.draft = draft;
             }
         }
     }
 
-    fn activate_browser_tab(&mut self, project_id: u64, tab_id: u64) -> Result<(), String> {
+    fn activate_browser_tab(
+        &mut self,
+        scope: impl Into<BrowserScopeKey>,
+        tab_id: u64,
+    ) -> Result<(), String> {
+        let scope = scope.into();
         if !self
-            .browser_tabs_by_project
-            .get(&project_id)
+            .browser_tabs_by_scope
+            .get(&scope)
             .is_some_and(|tabs| tabs.iter().any(|tab| tab.id == tab_id))
         {
             return Err(format!("Browser tab does not exist: {tab_id}"));
         }
-        if self.active_browser_tab_id(project_id) == Some(tab_id) {
+        if self.active_browser_tab_id(scope) == Some(tab_id) {
             return Ok(());
         }
 
-        self.store_active_browser_for_project(project_id);
-        let existing_browser = self
-            .inactive_browser_tab_browsers
-            .remove(&(project_id, tab_id));
+        self.store_active_browser_for_scope(scope);
+        let existing_browser = self.inactive_browser_tab_browsers.remove(&(scope, tab_id));
         let created_browser = existing_browser.is_none();
         let browser =
-            existing_browser.unwrap_or_else(|| self.create_project_browser_instance(project_id));
-        self.embedded_browsers_by_project
-            .insert(project_id, browser);
-        self.active_browser_tab_by_project
-            .insert(project_id, tab_id);
+            existing_browser.unwrap_or_else(|| self.create_browser_instance_for_scope(scope));
+        self.embedded_browsers_by_scope.insert(scope, browser);
+        self.active_browser_tab_by_scope.insert(scope, tab_id);
         let (draft, url) = self
-            .browser_tabs_by_project
-            .get(&project_id)
+            .browser_tabs_by_scope
+            .get(&scope)
             .and_then(|tabs| tabs.iter().find(|tab| tab.id == tab_id))
             .map(|tab| (tab.draft.clone(), tab.url.clone()))
             .unwrap_or_default();
-        self.browser_url_draft_by_project.insert(project_id, draft);
+        self.browser_url_draft_by_scope.insert(scope, draft);
         if created_browser {
             if let Some(url) = url {
-                self.project_browser(project_id).navigate(&url);
+                self.browser_for_scope(scope).navigate(&url);
             }
         }
         Ok(())
@@ -16558,15 +16704,16 @@ impl AdeApp {
 
     fn add_browser_tab(
         &mut self,
-        project_id: u64,
+        scope: impl Into<BrowserScopeKey>,
         url: Option<String>,
         kind: BrowserTabKind,
         title: Option<String>,
     ) -> Result<u64, String> {
-        self.ensure_browser_tab_state(project_id);
+        let scope = scope.into();
+        self.ensure_browser_tab_state(scope);
         let tab_count = self
-            .browser_tabs_by_project
-            .get(&project_id)
+            .browser_tabs_by_scope
+            .get(&scope)
             .map(Vec::len)
             .unwrap_or(0);
         if tab_count >= BROWSER_MAX_TABS_PER_PROJECT {
@@ -16585,31 +16732,36 @@ impl AdeApp {
                 title.unwrap_or_else(|| "Recording".to_owned()),
             ),
         };
-        self.browser_tabs_by_project
-            .entry(project_id)
+        self.browser_tabs_by_scope
+            .entry(scope)
             .or_default()
             .push(tab);
-        self.activate_browser_tab(project_id, tab_id)?;
+        self.activate_browser_tab(scope, tab_id)?;
         if let Some(url) = self
-            .browser_tabs_by_project
-            .get(&project_id)
+            .browser_tabs_by_scope
+            .get(&scope)
             .and_then(|tabs| tabs.iter().find(|tab| tab.id == tab_id))
             .and_then(|tab| tab.url.clone())
         {
-            self.project_browser(project_id).navigate(&url);
+            self.browser_for_scope(scope).navigate(&url);
         }
         Ok(tab_id)
     }
 
-    fn close_browser_tab(&mut self, project_id: u64, tab_id: u64) -> Result<(), String> {
+    fn close_browser_tab(
+        &mut self,
+        scope: impl Into<BrowserScopeKey>,
+        tab_id: u64,
+    ) -> Result<(), String> {
+        let scope = scope.into();
         let (index, was_active, replacement_id) = {
-            let Some(tabs) = self.browser_tabs_by_project.get(&project_id) else {
-                return Err("No browser tabs exist for this project".to_owned());
+            let Some(tabs) = self.browser_tabs_by_scope.get(&scope) else {
+                return Err("No browser tabs exist for this scope".to_owned());
             };
             let Some(index) = tabs.iter().position(|tab| tab.id == tab_id) else {
                 return Err(format!("Browser tab does not exist: {tab_id}"));
             };
-            let was_active = self.active_browser_tab_id(project_id) == Some(tab_id);
+            let was_active = self.active_browser_tab_id(scope) == Some(tab_id);
             let replacement_id = if tabs.len() <= 1 {
                 None
             } else {
@@ -16620,132 +16772,64 @@ impl AdeApp {
         };
 
         if was_active {
-            if let Some(mut browser) = self.embedded_browsers_by_project.remove(&project_id) {
+            if let Some(mut browser) = self.embedded_browsers_by_scope.remove(&scope) {
                 browser.shutdown();
             }
-        } else if let Some(mut browser) = self
-            .inactive_browser_tab_browsers
-            .remove(&(project_id, tab_id))
+        } else if let Some(mut browser) =
+            self.inactive_browser_tab_browsers.remove(&(scope, tab_id))
         {
             browser.shutdown();
         }
 
-        if let Some(tabs) = self.browser_tabs_by_project.get_mut(&project_id) {
+        if let Some(tabs) = self.browser_tabs_by_scope.get_mut(&scope) {
             tabs.remove(index);
         }
 
         let tabs_empty = self
-            .browser_tabs_by_project
-            .get(&project_id)
+            .browser_tabs_by_scope
+            .get(&scope)
             .map(Vec::is_empty)
             .unwrap_or(true);
         if tabs_empty {
-            self.active_browser_tab_by_project.remove(&project_id);
-            self.browser_tabs_by_project.remove(&project_id);
-            self.browser_url_draft_by_project.remove(&project_id);
-            self.ensure_browser_tab_state(project_id);
+            self.active_browser_tab_by_scope.remove(&scope);
+            self.browser_tabs_by_scope.remove(&scope);
+            self.browser_url_draft_by_scope.remove(&scope);
+            self.ensure_browser_tab_state(scope);
             return Ok(());
         }
 
         if was_active {
-            self.active_browser_tab_by_project.remove(&project_id);
+            self.active_browser_tab_by_scope.remove(&scope);
             if let Some(replacement_id) = replacement_id {
-                self.activate_browser_tab(project_id, replacement_id)?;
+                self.activate_browser_tab(scope, replacement_id)?;
             }
         }
         Ok(())
     }
 
-    /// Get or create the embedded browser for a specific project.
-    fn project_browser(&mut self, project_id: u64) -> &mut web_browser::EmbeddedBrowser {
-        let active_tab_id = self.ensure_browser_tab_state(project_id);
-        if !self.embedded_browsers_by_project.contains_key(&project_id) {
+    /// Get or create the embedded browser for a specific scope.
+    fn browser_for_scope(
+        &mut self,
+        scope: impl Into<BrowserScopeKey>,
+    ) -> &mut web_browser::EmbeddedBrowser {
+        let scope = scope.into();
+        let active_tab_id = self.ensure_browser_tab_state(scope);
+        if !self.embedded_browsers_by_scope.contains_key(&scope) {
             let browser = self
                 .inactive_browser_tab_browsers
-                .remove(&(project_id, active_tab_id))
-                .unwrap_or_else(|| self.create_project_browser_instance(project_id));
-            self.embedded_browsers_by_project
-                .insert(project_id, browser);
+                .remove(&(scope, active_tab_id))
+                .unwrap_or_else(|| self.create_browser_instance_for_scope(scope));
+            self.embedded_browsers_by_scope.insert(scope, browser);
         }
 
-        self.embedded_browsers_by_project
-            .get_mut(&project_id)
-            .expect("browser was inserted for project")
-    }
-
-    /// Submit the browser URL for a project.
-    /// Normalizes the URL, persists it, and navigates the embedded browser.
-    fn submit_browser_url(&mut self, ctx: &egui::Context, project_id: u64, url: &str) {
-        let normalized = normalize_browser_url(url);
-        if normalized.is_empty() {
-            return;
-        }
-
-        // Store URL and update draft
-        self.set_project_browser_url(project_id, normalized.clone());
-
-        // Ensure browser panel is open for this project and checklist is closed
-        self.set_browser_panel_open_for_project(project_id, true);
-        self.config.ui.checklist_panel_expanded = false;
-        ctx.request_repaint();
-        self.note_ui_config_changed();
-        self.persist_config();
-
-        // Navigate the embedded browser for this specific project
-        self.project_browser(project_id).navigate(&normalized);
-    }
-
-    /// Check if the embedded browser should be hidden due to UI overlays.
-    /// Returns true when Settings, exit confirmation, popups, context menus are open,
-    /// or when the grace period after an overlay is still active.
-    fn should_hide_embedded_browser_for_ui_layer(&self, ctx: &egui::Context) -> bool {
-        // Check if context menu overlaps with browser panel area
-        let context_menu_overlaps_browser = self.context_menu_overlaps_browser_panel(ctx);
-        let overlay_active = embedded_browser_should_yield_to_ui_layer(
-            self.show_settings_popup,
-            self.show_exit_confirm_popup,
-            self.terminal_history_popup_open.is_some(),
-            ctx.memory(|mem| mem.any_popup_open()),
-            ctx.is_context_menu_open(),
-            context_menu_overlaps_browser,
-            self.browser_panel_overlay_active,
-            self.foreground_message_popup_open.is_some(),
-        );
-
-        // Check if grace period is still active (prevents flickering during hover transitions)
-        let grace_active = self
-            .browser_overlay_grace_until
-            .is_some_and(|until| Instant::now() < until);
-
-        overlay_active || grace_active
-    }
-
-    /// Check if the active context menu overlaps with the browser panel area.
-    /// Uses pointer position as a proxy for context menu location since the exact
-    /// menu rect is not directly exposed by egui's public API.
-    fn context_menu_overlaps_browser_panel(&self, ctx: &egui::Context) -> bool {
-        // If there's no browser panel rect, assume no overlap
-        let Some(browser_rect) = self.pending_browser_rect else {
-            return false;
-        };
-
-        // Get pointer position as proxy for where context menu appeared
-        let pointer_pos = ctx
-            .pointer_interact_pos()
-            .or_else(|| ctx.pointer_hover_pos());
-
-        let Some(pos) = pointer_pos else {
-            // No pointer position, assume overlap to be safe
-            return true;
-        };
-
-        // Check if pointer (and thus likely the context menu) is within browser panel
-        browser_rect.contains(pos)
+        self.embedded_browsers_by_scope
+            .get_mut(&scope)
+            .expect("browser was inserted for scope")
     }
 
     /// Hide all embedded browsers.
     fn hide_embedded_browsers(&mut self) {
-        for browser in self.embedded_browsers_by_project.values_mut() {
+        for browser in self.embedded_browsers_by_scope.values_mut() {
             browser.hide();
         }
         for browser in self.inactive_browser_tab_browsers.values_mut() {
@@ -16754,19 +16838,19 @@ impl AdeApp {
     }
 
     /// Process browser events and update URL state.
-    /// Drains events from all project browsers and updates draft/persisted URLs.
+    /// Drains events from all browser scopes and updates draft/persisted URLs.
     fn process_browser_events(&mut self, ctx: &egui::Context) {
         let mut any_changed = false;
 
-        // Collect events from all project browsers to avoid borrow issues
-        let active_tabs = self.active_browser_tab_by_project.clone();
-        let mut browser_events: Vec<(u64, u64, Vec<web_browser::BrowserEvent>)> = self
-            .embedded_browsers_by_project
+        // Collect events from all browsers to avoid borrow issues
+        let active_tabs = self.active_browser_tab_by_scope.clone();
+        let mut browser_events: Vec<(BrowserScopeKey, u64, Vec<web_browser::BrowserEvent>)> = self
+            .embedded_browsers_by_scope
             .iter_mut()
-            .map(|(project_id, browser)| {
+            .map(|(scope, browser)| {
                 (
-                    *project_id,
-                    active_tabs.get(project_id).copied().unwrap_or(0),
+                    *scope,
+                    active_tabs.get(scope).copied().unwrap_or(0),
                     browser.drain_events(),
                 )
             })
@@ -16774,37 +16858,33 @@ impl AdeApp {
         browser_events.extend(
             self.inactive_browser_tab_browsers
                 .iter_mut()
-                .map(|((project_id, tab_id), browser)| {
-                    (*project_id, *tab_id, browser.drain_events())
-                }),
+                .map(|((scope, tab_id), browser)| (*scope, *tab_id, browser.drain_events())),
         );
 
-        for (project_id, tab_id, events) in browser_events {
+        for (scope, tab_id, events) in browser_events {
+            let project_id = scope.project_id();
             for event in events {
                 match event {
                     web_browser::BrowserEvent::UrlChanged(url) => {
                         // Only accept http:// or https:// URLs from browser observations
                         let lower = url.to_lowercase();
                         if lower.starts_with("http://") || lower.starts_with("https://") {
-                            if self.apply_browser_tab_observed_url(project_id, tab_id, url) {
+                            if self.apply_browser_tab_observed_url(scope, tab_id, url) {
                                 any_changed = true;
                             }
                         }
                     }
                     web_browser::BrowserEvent::Error(msg) => {
-                        log::error!("Browser error for project {}: {}", project_id, msg);
+                        log::error!("Browser error for scope {:?}: {}", scope, msg);
                     }
                     web_browser::BrowserEvent::DesignInspectReady => {
-                        let enabled =
-                            self.is_browser_design_inspect_enabled_for_project(project_id);
-                        if let Some(browser) =
-                            self.embedded_browsers_by_project.get_mut(&project_id)
-                        {
+                        let enabled = self.is_browser_design_inspect_enabled_for_scope(scope);
+                        if let Some(browser) = self.embedded_browsers_by_scope.get_mut(&scope) {
                             browser.set_design_inspect_enabled(enabled);
                         }
                     }
                     web_browser::BrowserEvent::DesignElementClicked(element) => {
-                        self.forward_design_inspect_click_to_terminal(ctx, project_id, element);
+                        self.forward_design_inspect_click_to_terminal(ctx, scope, element);
                     }
                     web_browser::BrowserEvent::McpToolResult { request_id, result } => {
                         self.handle_browser_mcp_tool_result_event(
@@ -16813,9 +16893,7 @@ impl AdeApp {
                     }
                     web_browser::BrowserEvent::LoadStarted(_) => {
                         // Mark page as loading - the readiness bootstrap will send us the actual state
-                        if let Some(_browser) =
-                            self.embedded_browsers_by_project.get_mut(&project_id)
-                        {
+                        if let Some(_browser) = self.embedded_browsers_by_scope.get_mut(&scope) {
                             // We'll update readiness when the readiness event comes in
                         }
                     }
@@ -16823,13 +16901,11 @@ impl AdeApp {
                         // Page load finished at WebView level, but we wait for readiness handshake
                         // The readiness bootstrap will send us the actual ready state
                         // For recording tabs (MP4 videos), apply 2x playback speed
-                        self.apply_recording_playback_rate_if_needed(project_id, tab_id, url);
+                        self.apply_recording_playback_rate_if_needed(scope, tab_id, url);
                     }
                     web_browser::BrowserEvent::ReadinessChanged(readiness) => {
                         // Update the browser's current readiness state
-                        if let Some(browser) =
-                            self.embedded_browsers_by_project.get_mut(&project_id)
-                        {
+                        if let Some(browser) = self.embedded_browsers_by_scope.get_mut(&scope) {
                             let old_state = browser.current_readiness().state.clone();
                             browser.update_readiness(readiness.clone());
 
@@ -16963,12 +17039,12 @@ impl AdeApp {
         ctx: &egui::Context,
         command: BrowserMcpCommand,
     ) {
-        let project_id = match self.prepare_browser_mcp_screenshot_project(
+        let scope = match self.prepare_browser_mcp_screenshot_scope(
             ctx,
             &command.request,
             &command.auth_scope,
         ) {
-            Ok(project_id) => project_id,
+            Ok(scope) => scope,
             Err(response) => {
                 let _ = command.respond_to.send(response);
                 return;
@@ -16979,7 +17055,7 @@ impl AdeApp {
         self.browser_mcp_pending_responses
             .insert(request_id.clone(), command.respond_to);
         let start_result = self
-            .project_browser(project_id)
+            .browser_for_scope(scope)
             .start_mcp_screenshot_tool(request_id.clone(), &command.request.params);
         if let Err(err) = start_result {
             if let Some(respond_to) = self.browser_mcp_pending_responses.remove(&request_id) {
@@ -16990,15 +17066,19 @@ impl AdeApp {
         }
     }
 
-    fn prepare_browser_mcp_screenshot_project(
+    fn prepare_browser_mcp_screenshot_scope(
         &mut self,
         ctx: &egui::Context,
         request: &BrowserMcpIpcRequest,
         auth_scope: &BrowserMcpAuthScope,
-    ) -> Result<u64, BrowserMcpIpcResponse> {
+    ) -> Result<BrowserScopeKey, BrowserMcpIpcResponse> {
         let project_id = self
             .resolve_browser_mcp_project_id(request, auth_scope)
             .map_err(BrowserMcpIpcResponse::error)?;
+        let scope = BrowserScopeKey::Terminal {
+            project_id,
+            terminal_id: auth_scope.terminal_id,
+        };
         if !self.projects.contains_key(&project_id) {
             return Err(BrowserMcpIpcResponse::error(format!(
                 "Browser MCP target project does not exist: {project_id}"
@@ -17011,15 +17091,16 @@ impl AdeApp {
             ctx.request_repaint();
         }
 
-        if let Some(error) = self.prepare_browser_mcp_project(project_id) {
+        if let Some(error) = self.prepare_browser_mcp_scope(scope) {
             return Err(error);
         }
-        Ok(project_id)
+        Ok(scope)
     }
 
     fn browser_mcp_screenshot_should_open_panel(&self, project_id: u64) -> bool {
-        self.embedded_browsers_by_project
-            .get(&project_id)
+        let browser_scope = BrowserScopeKey::Project(project_id);
+        self.embedded_browsers_by_scope
+            .get(&browser_scope)
             .map(|browser| !matches!(browser.status(), BrowserStatus::Ready))
             .unwrap_or(true)
     }
@@ -17029,10 +17110,9 @@ impl AdeApp {
         ctx: &egui::Context,
         command: BrowserMcpCommand,
     ) {
-        let project_id =
-            match self.prepare_browser_mcp_tool_project(ctx, &command.request, &command.auth_scope)
-            {
-                Ok(project_id) => project_id,
+        let scope =
+            match self.prepare_browser_mcp_tool_scope(ctx, &command.request, &command.auth_scope) {
+                Ok(scope) => scope,
                 Err(response) => {
                     let _ = command.respond_to.send(response);
                     return;
@@ -17042,7 +17122,7 @@ impl AdeApp {
         let request_id = self.next_browser_mcp_pending_request_id(&command.request);
         self.browser_mcp_pending_responses
             .insert(request_id.clone(), command.respond_to);
-        let start_result = self.project_browser(project_id).start_mcp_script_tool(
+        let start_result = self.browser_for_scope(scope).start_mcp_script_tool(
             request_id.clone(),
             &command.request.tool,
             &command.request.params,
@@ -17056,15 +17136,19 @@ impl AdeApp {
         }
     }
 
-    fn prepare_browser_mcp_tool_project(
+    fn prepare_browser_mcp_tool_scope(
         &mut self,
         ctx: &egui::Context,
         request: &BrowserMcpIpcRequest,
         auth_scope: &BrowserMcpAuthScope,
-    ) -> Result<u64, BrowserMcpIpcResponse> {
+    ) -> Result<BrowserScopeKey, BrowserMcpIpcResponse> {
         let project_id = self
             .resolve_browser_mcp_project_id(request, auth_scope)
             .map_err(BrowserMcpIpcResponse::error)?;
+        let scope = BrowserScopeKey::Terminal {
+            project_id,
+            terminal_id: auth_scope.terminal_id,
+        };
         if !self.projects.contains_key(&project_id) {
             return Err(BrowserMcpIpcResponse::error(format!(
                 "Browser MCP target project does not exist: {project_id}"
@@ -17075,10 +17159,10 @@ impl AdeApp {
         self.config.ui.checklist_panel_expanded = false;
         ctx.request_repaint();
 
-        if let Some(error) = self.prepare_browser_mcp_project(project_id) {
+        if let Some(error) = self.prepare_browser_mcp_scope(scope) {
             return Err(error);
         }
-        Ok(project_id)
+        Ok(scope)
     }
 
     fn next_browser_mcp_pending_request_id(&self, request: &BrowserMcpIpcRequest) -> String {
@@ -17101,13 +17185,15 @@ impl AdeApp {
         request: BrowserMcpIpcRequest,
         auth_scope: BrowserMcpAuthScope,
     ) -> BrowserMcpIpcResponse {
-        let project_id = match self.prepare_browser_mcp_tool_project(ctx, &request, &auth_scope) {
-            Ok(project_id) => project_id,
+        let scope = match self.prepare_browser_mcp_tool_scope(ctx, &request, &auth_scope) {
+            Ok(scope) => scope,
             Err(response) => return response,
         };
+        let project_id = scope.project_id();
         if self
-            .browser_video_recordings_by_project
-            .contains_key(&project_id)
+            .browser_video_recordings_by_scope
+            .values()
+            .any(|state| state.project_id == project_id)
         {
             return BrowserMcpIpcResponse::error(
                 "Browser video recording is already running for this project",
@@ -17120,8 +17206,7 @@ impl AdeApp {
         };
         let state =
             BrowserVideoRecordingState::new(project_id, output_path.clone(), Instant::now());
-        self.browser_video_recordings_by_project
-            .insert(project_id, state);
+        self.browser_video_recordings_by_scope.insert(scope, state);
         ctx.request_repaint_after(Duration::from_millis(BROWSER_MCP_PENDING_POLL_MS));
 
         BrowserMcpIpcResponse::ok_with_data(
@@ -17160,7 +17245,12 @@ impl AdeApp {
             return;
         }
 
-        let Some(state) = self.browser_video_recordings_by_project.remove(&project_id) else {
+        let scope = BrowserScopeKey::Terminal {
+            project_id,
+            terminal_id: command.auth_scope.terminal_id,
+        };
+
+        let Some(state) = self.browser_video_recordings_by_scope.remove(&scope) else {
             let _ = command.respond_to.send(BrowserMcpIpcResponse::error(
                 "Browser video recording is not running for this project",
             ));
@@ -17278,7 +17368,7 @@ impl AdeApp {
 
         match tab_result {
             Ok(tab_id) => {
-                self.project_browser(event.project_id).navigate(&file_url);
+                self.browser_for_scope(event.project_id).navigate(&file_url);
                 let data = Self::browser_video_result_data(&result, Some(&file_url), Some(tab_id));
                 let _ = event.respond_to.send(BrowserMcpIpcResponse::ok_with_data(
                     format!(
@@ -17313,16 +17403,17 @@ impl AdeApp {
             Ok(project_id) => project_id,
             Err(message) => return BrowserMcpIpcResponse::error(message),
         };
+        let scope = BrowserScopeKey::Terminal {
+            project_id,
+            terminal_id: auth_scope.terminal_id,
+        };
         if !self.projects.contains_key(&project_id) {
             return BrowserMcpIpcResponse::error(format!(
                 "Browser MCP target project does not exist: {project_id}"
             ));
         }
 
-        let Some(state) = self
-            .browser_video_recordings_by_project
-            .get_mut(&project_id)
-        else {
+        let Some(state) = self.browser_video_recordings_by_scope.get_mut(&scope) else {
             return BrowserMcpIpcResponse::error(
                 "Browser video recording is not running for this project",
             );
@@ -17350,13 +17441,13 @@ impl AdeApp {
     }
 
     fn process_browser_video_recordings(&mut self, ctx: &egui::Context) {
-        if self.browser_video_recordings_by_project.is_empty() {
+        if self.browser_video_recordings_by_scope.is_empty() {
             return;
         }
 
         let now = Instant::now();
         let mut captures = Vec::new();
-        for (project_id, state) in self.browser_video_recordings_by_project.iter_mut() {
+        for (scope, state) in self.browser_video_recordings_by_scope.iter_mut() {
             if state.capture_in_flight {
                 continue;
             }
@@ -17369,27 +17460,24 @@ impl AdeApp {
                 state.next_frame_index += 1;
                 state.capture_in_flight = true;
                 state.last_frame_started_at = Some(now);
-                captures.push((*project_id, frame_index));
+                captures.push((*scope, frame_index));
             }
         }
 
-        for (project_id, frame_index) in captures {
-            let request_id = browser_video_frame_request_id(project_id, frame_index);
+        for (scope, frame_index) in captures {
+            let request_id = browser_video_frame_request_id(scope.project_id(), frame_index);
             let params = json!({
                 "type": "jpeg",
                 "fullPage": false
             });
-            let start_result = if let Some(error) = self.prepare_browser_mcp_project(project_id) {
+            let start_result = if let Some(error) = self.prepare_browser_mcp_scope(scope) {
                 Err(error.text)
             } else {
-                self.project_browser(project_id)
+                self.browser_for_scope(scope)
                     .start_mcp_screenshot_tool(request_id, &params)
             };
             if let Err(err) = start_result {
-                if let Some(state) = self
-                    .browser_video_recordings_by_project
-                    .get_mut(&project_id)
-                {
+                if let Some(state) = self.browser_video_recordings_by_scope.get_mut(&scope) {
                     state.capture_in_flight = false;
                     state.last_error = Some(err);
                 }
@@ -17405,9 +17493,10 @@ impl AdeApp {
         project_id: u64,
         result: Result<web_browser::BrowserMcpToolOutput, String>,
     ) {
-        let Some(state) = self
-            .browser_video_recordings_by_project
-            .get_mut(&project_id)
+        let Some((_, state)) = self
+            .browser_video_recordings_by_scope
+            .iter_mut()
+            .find(|(scope, _)| scope.project_id() == project_id)
         else {
             return;
         };
@@ -17570,10 +17659,11 @@ impl AdeApp {
     fn handle_browser_mcp_tabs_request(
         &mut self,
         ctx: &egui::Context,
-        project_id: u64,
+        scope: impl Into<BrowserScopeKey>,
         request: &BrowserMcpIpcRequest,
     ) -> BrowserMcpIpcResponse {
-        self.ensure_browser_tab_state(project_id);
+        let scope = scope.into();
+        self.ensure_browser_tab_state(scope);
         let action = request
             .params
             .get("action")
@@ -17581,7 +17671,7 @@ impl AdeApp {
             .unwrap_or("list");
 
         match action {
-            "list" => self.browser_tabs_response(project_id),
+            "list" => self.browser_tabs_response(scope),
             "new" => {
                 let normalized_url = request
                     .params
@@ -17604,7 +17694,7 @@ impl AdeApp {
                 };
 
                 if let Some(url) = normalized_url.as_deref() {
-                    if let Some(existing) = self.find_browser_tab_by_url(project_id, url) {
+                    if let Some(existing) = self.find_browser_tab_by_url(scope, url) {
                         return BrowserMcpIpcResponse::error(format!(
                             "Bu sekme zaten {} numaralı sekmede açık (index {}). Orayı kullan: browser_tabs action=select tabId={}.",
                             existing.tab_id, existing.index, existing.tab_id
@@ -17612,45 +17702,42 @@ impl AdeApp {
                     }
                 }
 
-                let tab_id =
-                    match self.add_browser_tab(project_id, None, BrowserTabKind::Page, None) {
-                        Ok(tab_id) => tab_id,
-                        Err(err) => return BrowserMcpIpcResponse::error(err),
-                    };
+                let tab_id = match self.add_browser_tab(scope, None, BrowserTabKind::Page, None) {
+                    Ok(tab_id) => tab_id,
+                    Err(err) => return BrowserMcpIpcResponse::error(err),
+                };
                 if let Some(url) = normalized_url {
-                    self.set_project_browser_url(project_id, url.clone());
-                    self.project_browser(project_id).navigate(&url);
+                    self.set_browser_url_for_scope(scope, url.clone());
+                    self.browser_for_scope(scope).navigate(&url);
                 }
                 ctx.request_repaint();
-                let mut response = self.browser_tabs_response(project_id);
+                let mut response = self.browser_tabs_response(scope);
                 response.text = format!("Opened Mergen Browser tab {tab_id}.\n{}", response.text);
                 response
             }
             "select" => {
-                let tab_id =
-                    match self.resolve_browser_tab_id_from_params(project_id, &request.params) {
-                        Ok(tab_id) => tab_id,
-                        Err(err) => return BrowserMcpIpcResponse::error(err),
-                    };
-                if let Err(err) = self.activate_browser_tab(project_id, tab_id) {
+                let tab_id = match self.resolve_browser_tab_id_from_params(scope, &request.params) {
+                    Ok(tab_id) => tab_id,
+                    Err(err) => return BrowserMcpIpcResponse::error(err),
+                };
+                if let Err(err) = self.activate_browser_tab(scope, tab_id) {
                     return BrowserMcpIpcResponse::error(err);
                 }
                 ctx.request_repaint();
-                let mut response = self.browser_tabs_response(project_id);
+                let mut response = self.browser_tabs_response(scope);
                 response.text = format!("Selected Mergen Browser tab {tab_id}.\n{}", response.text);
                 response
             }
             "close" => {
-                let tab_id =
-                    match self.resolve_browser_tab_id_from_params(project_id, &request.params) {
-                        Ok(tab_id) => tab_id,
-                        Err(err) => return BrowserMcpIpcResponse::error(err),
-                    };
-                if let Err(err) = self.close_browser_tab(project_id, tab_id) {
+                let tab_id = match self.resolve_browser_tab_id_from_params(scope, &request.params) {
+                    Ok(tab_id) => tab_id,
+                    Err(err) => return BrowserMcpIpcResponse::error(err),
+                };
+                if let Err(err) = self.close_browser_tab(scope, tab_id) {
                     return BrowserMcpIpcResponse::error(err);
                 }
                 ctx.request_repaint();
-                let mut response = self.browser_tabs_response(project_id);
+                let mut response = self.browser_tabs_response(scope);
                 response.text = format!("Closed Mergen Browser tab {tab_id}.\n{}", response.text);
                 response
             }
@@ -17663,19 +17750,20 @@ impl AdeApp {
     fn handle_browser_mcp_close_request(
         &mut self,
         ctx: &egui::Context,
-        project_id: u64,
+        scope: impl Into<BrowserScopeKey>,
         request: &BrowserMcpIpcRequest,
     ) -> BrowserMcpIpcResponse {
-        self.ensure_browser_tab_state(project_id);
-        let tab_id = match self.resolve_browser_tab_id_from_params(project_id, &request.params) {
+        let scope = scope.into();
+        self.ensure_browser_tab_state(scope);
+        let tab_id = match self.resolve_browser_tab_id_from_params(scope, &request.params) {
             Ok(tab_id) => tab_id,
             Err(err) => return BrowserMcpIpcResponse::error(err),
         };
-        if let Err(err) = self.close_browser_tab(project_id, tab_id) {
+        if let Err(err) = self.close_browser_tab(scope, tab_id) {
             return BrowserMcpIpcResponse::error(err);
         }
         ctx.request_repaint();
-        let mut response = self.browser_tabs_response(project_id);
+        let mut response = self.browser_tabs_response(scope);
         response.text = format!("Closed Mergen Browser tab {tab_id}.\n{}", response.text);
         response
     }
@@ -17690,6 +17778,10 @@ impl AdeApp {
             Ok(project_id) => project_id,
             Err(message) => return BrowserMcpIpcResponse::error(message),
         };
+        let scope = BrowserScopeKey::Terminal {
+            project_id,
+            terminal_id: auth_scope.terminal_id,
+        };
         if !self.projects.contains_key(&project_id) {
             return BrowserMcpIpcResponse::error(format!(
                 "Browser MCP target project does not exist: {project_id}"
@@ -17701,8 +17793,8 @@ impl AdeApp {
         ctx.request_repaint();
 
         match request.tool.as_str() {
-            "browser_tabs" => self.handle_browser_mcp_tabs_request(ctx, project_id, &request),
-            "browser_close" => self.handle_browser_mcp_close_request(ctx, project_id, &request),
+            "browser_tabs" => self.handle_browser_mcp_tabs_request(ctx, scope, &request),
+            "browser_close" => self.handle_browser_mcp_close_request(ctx, scope, &request),
             "browser_navigate" => {
                 let url = request
                     .params
@@ -17713,51 +17805,55 @@ impl AdeApp {
                 if normalized.is_empty() {
                     return BrowserMcpIpcResponse::error(format!("Invalid browser URL: {url}"));
                 }
-                if let Some(error) = self.prepare_browser_mcp_project(project_id) {
+                if let Some(error) = self.prepare_browser_mcp_scope(scope) {
                     return error;
                 }
-                self.set_project_browser_url(project_id, normalized.clone());
-                self.project_browser(project_id).navigate(&normalized);
+                self.set_browser_url_for_scope(scope, normalized.clone());
+                self.browser_for_scope(scope).navigate(&normalized);
                 BrowserMcpIpcResponse::ok(format!(
                     "Navigating to {normalized}. The page will report readiness state via browser_page_summary."
                 ))
             }
             "browser_navigate_back" => {
-                if let Some(error) = self.prepare_browser_mcp_project(project_id) {
+                if let Some(error) = self.prepare_browser_mcp_scope(scope) {
                     return error;
                 }
-                self.project_browser(project_id).go_back();
+                self.browser_for_scope(scope).go_back();
                 BrowserMcpIpcResponse::ok(
                     "Navigated back. The page will report readiness when stable.",
                 )
             }
             "browser_navigate_forward" => {
-                if let Some(error) = self.prepare_browser_mcp_project(project_id) {
+                if let Some(error) = self.prepare_browser_mcp_scope(scope) {
                     return error;
                 }
-                self.project_browser(project_id).go_forward();
+                self.browser_for_scope(scope).go_forward();
                 BrowserMcpIpcResponse::ok(
                     "Navigated forward. The page will report readiness when stable.",
                 )
             }
             "browser_reload" => {
-                if let Some(error) = self.prepare_browser_mcp_project(project_id) {
+                if let Some(error) = self.prepare_browser_mcp_scope(scope) {
                     return error;
                 }
-                self.project_browser(project_id).reload();
+                self.browser_for_scope(scope).reload();
                 BrowserMcpIpcResponse::ok("Reloaded. The page will report readiness when stable.")
             }
-            _ => self.run_browser_mcp_tool_for_project(project_id, &request.tool, &request.params),
+            _ => self.run_browser_mcp_tool_for_scope(scope, &request.tool, &request.params),
         }
     }
 
-    fn prepare_browser_mcp_project(&mut self, project_id: u64) -> Option<BrowserMcpIpcResponse> {
+    fn prepare_browser_mcp_scope(
+        &mut self,
+        scope: impl Into<BrowserScopeKey>,
+    ) -> Option<BrowserMcpIpcResponse> {
+        let scope = scope.into();
+        let project_id = scope.project_id();
         #[cfg(target_os = "windows")]
         {
             let window_hwnd = self.window_hwnd;
-            let design_inspect_enabled =
-                self.is_browser_design_inspect_enabled_for_project(project_id);
-            let browser = self.project_browser(project_id);
+            let design_inspect_enabled = self.is_browser_design_inspect_enabled_for_scope(scope);
+            let browser = self.browser_for_scope(scope);
             browser.set_design_inspect_enabled(design_inspect_enabled);
             match browser.ensure_created(window_hwnd) {
                 BrowserStatus::Ready => None,
@@ -17771,7 +17867,7 @@ impl AdeApp {
 
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = project_id;
+            let _ = (project_id, scope);
             Some(BrowserMcpIpcResponse::error(
                 "Embedded browser MCP is currently Windows-only",
             ))
@@ -17873,18 +17969,19 @@ impl AdeApp {
         ALLOWED.contains(&tool)
     }
 
-    fn run_browser_mcp_tool_for_project(
+    fn run_browser_mcp_tool_for_scope(
         &mut self,
-        project_id: u64,
+        scope: impl Into<BrowserScopeKey>,
         tool: &str,
         params: &serde_json::Value,
     ) -> BrowserMcpIpcResponse {
+        let scope = scope.into();
         #[cfg(target_os = "windows")]
         {
-            if let Some(error) = self.prepare_browser_mcp_project(project_id) {
+            if let Some(error) = self.prepare_browser_mcp_scope(scope) {
                 return error;
             }
-            let browser = self.project_browser(project_id);
+            let browser = self.browser_for_scope(scope);
             match browser.run_mcp_tool(tool, params) {
                 Ok(output) => {
                     // Add readiness metadata to tool responses
@@ -17909,7 +18006,7 @@ impl AdeApp {
 
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (project_id, tool, params);
+            let _ = (scope, tool, params);
             BrowserMcpIpcResponse::error("Embedded browser MCP is currently Windows-only")
         }
     }
@@ -17917,19 +18014,22 @@ impl AdeApp {
     /// Apply an observed browser URL to a project.
     /// Returns true if the URL actually changed (for persistence tracking).
     fn apply_browser_observed_url(&mut self, project_id: u64, url: String) -> bool {
-        let tab_id = self.ensure_browser_tab_state(project_id);
-        self.apply_browser_tab_observed_url(project_id, tab_id, url)
+        let scope = BrowserScopeKey::Project(project_id);
+        let tab_id = self.ensure_browser_tab_state(scope);
+        self.apply_browser_tab_observed_url(scope, tab_id, url)
     }
 
     fn apply_browser_tab_observed_url(
         &mut self,
-        project_id: u64,
+        scope: impl Into<BrowserScopeKey>,
         tab_id: u64,
         url: String,
     ) -> bool {
+        let scope = scope.into();
+        let project_id = scope.project_id();
         let mut changed = false;
-        let is_active_tab = self.active_browser_tab_id(project_id) == Some(tab_id);
-        if let Some(tab) = self.browser_tab_mut(project_id, tab_id) {
+        let is_active_tab = self.active_browser_tab_id(scope) == Some(tab_id);
+        if let Some(tab) = self.browser_tab_mut(scope, tab_id) {
             if tab.url.as_ref() != Some(&url) {
                 tab.url = Some(url.clone());
                 tab.draft = url.clone();
@@ -17944,15 +18044,13 @@ impl AdeApp {
         }
 
         // Update the draft (visible in URL input)
-        if let Some(existing) = self.browser_url_draft_by_project.get(&project_id) {
+        if let Some(existing) = self.browser_url_draft_by_scope.get(&scope) {
             if existing != &url {
-                self.browser_url_draft_by_project
-                    .insert(project_id, url.clone());
+                self.browser_url_draft_by_scope.insert(scope, url.clone());
                 changed = true;
             }
         } else {
-            self.browser_url_draft_by_project
-                .insert(project_id, url.clone());
+            self.browser_url_draft_by_scope.insert(scope, url.clone());
             changed = true;
         }
 
@@ -17977,11 +18075,17 @@ impl AdeApp {
 
     /// Apply 2x playback rate to recording tab videos when loaded.
     /// This is called when a LoadFinished event is received for a browser tab.
-    fn apply_recording_playback_rate_if_needed(&mut self, project_id: u64, tab_id: u64, url: &str) {
+    fn apply_recording_playback_rate_if_needed(
+        &mut self,
+        scope: impl Into<BrowserScopeKey>,
+        tab_id: u64,
+        url: &str,
+    ) {
+        let scope = scope.into();
         // Check if this is a recording tab
         let is_recording_tab = self
-            .browser_tabs_by_project
-            .get(&project_id)
+            .browser_tabs_by_scope
+            .get(&scope)
             .and_then(|tabs| tabs.iter().find(|tab| tab.id == tab_id))
             .map(|tab| tab.kind == BrowserTabKind::Recording)
             .unwrap_or(false);
@@ -17997,7 +18101,7 @@ impl AdeApp {
         }
 
         // Apply playback rate via the browser
-        if let Some(browser) = self.embedded_browsers_by_project.get_mut(&project_id) {
+        if let Some(browser) = self.embedded_browsers_by_scope.get_mut(&scope) {
             if let Err(err) = browser.set_video_playback_rate(BROWSER_RECORDING_PLAYBACK_RATE) {
                 log::debug!(
                     "Could not set playback rate for recording tab {}: {}",
@@ -18017,10 +18121,12 @@ impl AdeApp {
     fn forward_design_inspect_click_to_terminal(
         &mut self,
         ctx: &egui::Context,
-        project_id: u64,
+        scope: impl Into<BrowserScopeKey>,
         element: web_browser::DesignElementInfo,
     ) {
-        if !self.is_browser_design_inspect_enabled_for_project(project_id)
+        let scope = scope.into();
+        let project_id = scope.project_id();
+        if !self.is_browser_design_inspect_enabled_for_scope(scope)
             || self.active_browser_project_id() != Some(project_id)
         {
             return;
@@ -18036,8 +18142,8 @@ impl AdeApp {
         }
 
         let Some(terminal_id) = self
-            .browser_design_inspect_terminal_by_project
-            .get(&project_id)
+            .browser_design_inspect_terminal_by_scope
+            .get(&scope)
             .copied()
         else {
             self.status_line = "No active terminal for design inspect".to_owned();
@@ -18049,17 +18155,16 @@ impl AdeApp {
             .get(&terminal_id)
             .is_some_and(|terminal| terminal.project_id == project_id && !terminal.exited)
         {
-            self.browser_design_inspect_terminal_by_project
-                .remove(&project_id);
+            self.browser_design_inspect_terminal_by_scope.remove(&scope);
             self.browser_design_inspect_last_delivery_by_destination
-                .retain(|(_, target_terminal_id), _| *target_terminal_id != terminal_id);
+                .retain(|(pid, _), _| *pid != scope);
             self.status_line = "Design inspect target terminal is unavailable".to_owned();
             return;
         }
 
         if self
-            .browser_design_inspect_target_changed_at_by_project
-            .get(&project_id)
+            .browser_design_inspect_target_changed_at_by_scope
+            .get(&scope)
             .is_some_and(|changed_at| {
                 changed_at.elapsed() < Duration::from_millis(DESIGN_INSPECT_TARGET_SWITCH_QUIET_MS)
             })
@@ -18069,7 +18174,7 @@ impl AdeApp {
 
         let signature = design_inspect_delivery_signature(&element);
         let now = Instant::now();
-        let delivery_key = (project_id, terminal_id);
+        let delivery_key = (scope, terminal_id);
         if !design_inspect_should_deliver(
             self.browser_design_inspect_last_delivery_by_destination
                 .get(&delivery_key),
@@ -18130,68 +18235,88 @@ impl AdeApp {
         }
     }
 
-    fn is_browser_design_inspect_enabled_for_project(&self, project_id: u64) -> bool {
-        self.browser_design_inspect_enabled_projects
-            .contains(&project_id)
+    fn is_browser_design_inspect_enabled_for_scope(
+        &self,
+        scope: impl Into<BrowserScopeKey>,
+    ) -> bool {
+        let scope = scope.into();
+        self.browser_design_inspect_enabled_scopes.contains(&scope)
     }
 
     fn is_active_browser_design_inspect_enabled(&self) -> bool {
         self.active_browser_project_id()
-            .map(|pid| self.is_browser_design_inspect_enabled_for_project(pid))
+            .map(|pid| self.is_browser_design_inspect_enabled_for_scope(pid))
             .unwrap_or(false)
     }
 
-    fn bind_browser_design_inspect_terminal_for_project(
+    fn bind_browser_design_inspect_terminal_for_scope(
         &mut self,
-        project_id: u64,
+        scope: impl Into<BrowserScopeKey>,
         terminal_id: u64,
     ) {
+        let scope = scope.into();
         let previous = self
-            .browser_design_inspect_terminal_by_project
-            .insert(project_id, terminal_id);
+            .browser_design_inspect_terminal_by_scope
+            .insert(scope, terminal_id);
         if previous.is_some_and(|previous| previous != terminal_id) {
-            self.browser_design_inspect_target_changed_at_by_project
-                .insert(project_id, Instant::now());
+            self.browser_design_inspect_target_changed_at_by_scope
+                .insert(scope, Instant::now());
             self.browser_design_inspect_last_delivery_by_destination
-                .retain(|(pid, _), _| *pid != project_id);
+                .retain(|(pid, _), _| *pid != scope);
         }
     }
 
-    fn set_browser_design_inspect_enabled_for_project(&mut self, project_id: u64, enabled: bool) {
+    fn set_browser_design_inspect_enabled_for_scope(
+        &mut self,
+        scope: impl Into<BrowserScopeKey>,
+        enabled: bool,
+    ) {
+        let scope = scope.into();
+        let project_id = scope.project_id();
         if enabled {
-            self.browser_design_inspect_enabled_projects
-                .insert(project_id);
-            if let Some(terminal_id) = self.active_terminal.filter(|terminal_id| {
-                self.terminals
-                    .get(terminal_id)
-                    .is_some_and(|terminal| terminal.project_id == project_id && !terminal.exited)
-            }) {
-                self.bind_browser_design_inspect_terminal_for_project(project_id, terminal_id);
+            self.browser_design_inspect_enabled_scopes.insert(scope);
+            if scope.is_terminal() {
+                if let Some(terminal_id) = scope.terminal_id().filter(|terminal_id| {
+                    self.terminals.get(terminal_id).is_some_and(|terminal| {
+                        terminal.project_id == project_id && !terminal.exited
+                    })
+                }) {
+                    self.bind_browser_design_inspect_terminal_for_scope(scope, terminal_id);
+                } else {
+                    self.browser_design_inspect_terminal_by_scope.remove(&scope);
+                    self.browser_design_inspect_target_changed_at_by_scope
+                        .remove(&scope);
+                }
             } else {
-                self.browser_design_inspect_terminal_by_project
-                    .remove(&project_id);
-                self.browser_design_inspect_target_changed_at_by_project
-                    .remove(&project_id);
+                if let Some(terminal_id) = self.active_terminal.filter(|terminal_id| {
+                    self.terminals.get(terminal_id).is_some_and(|terminal| {
+                        terminal.project_id == project_id && !terminal.exited
+                    })
+                }) {
+                    self.bind_browser_design_inspect_terminal_for_scope(scope, terminal_id);
+                } else {
+                    self.browser_design_inspect_terminal_by_scope.remove(&scope);
+                    self.browser_design_inspect_target_changed_at_by_scope
+                        .remove(&scope);
+                }
             }
         } else {
-            self.browser_design_inspect_enabled_projects
-                .remove(&project_id);
-            self.browser_design_inspect_terminal_by_project
-                .remove(&project_id);
-            self.browser_design_inspect_target_changed_at_by_project
-                .remove(&project_id);
+            self.browser_design_inspect_enabled_scopes.remove(&scope);
+            self.browser_design_inspect_terminal_by_scope.remove(&scope);
+            self.browser_design_inspect_target_changed_at_by_scope
+                .remove(&scope);
         }
         self.browser_design_inspect_last_delivery_by_destination
-            .retain(|(pid, _), _| *pid != project_id);
+            .retain(|(pid, _), _| *pid != scope);
 
-        if let Some(browser) = self.embedded_browsers_by_project.get_mut(&project_id) {
+        if let Some(browser) = self.embedded_browsers_by_scope.get_mut(&scope) {
             browser.set_design_inspect_enabled(enabled);
         }
     }
 
     fn set_active_browser_design_inspect_enabled(&mut self, enabled: bool) {
         if let Some(project_id) = self.active_browser_project_id() {
-            self.set_browser_design_inspect_enabled_for_project(project_id, enabled);
+            self.set_browser_design_inspect_enabled_for_scope(project_id, enabled);
         }
     }
 
@@ -18207,7 +18332,7 @@ impl AdeApp {
         let has_pending = self
             .browser_pending_screenshot_requests
             .values()
-            .any(|(pid, _, _)| *pid == project_id);
+            .any(|(scope, _, _)| scope.project_id() == project_id);
 
         // Container frame with border holding both buttons side by side
         let mut any_hovered = false;
@@ -18285,8 +18410,14 @@ impl AdeApp {
             .unwrap_or(0);
         let request_id = format!("{BROWSER_SCREENSHOT_REQUEST_PREFIX}-{nanos:x}-{counter:x}");
 
-        self.browser_pending_screenshot_requests
-            .insert(request_id.clone(), (project_id, full_page, Instant::now()));
+        self.browser_pending_screenshot_requests.insert(
+            request_id.clone(),
+            (
+                BrowserScopeKey::Project(project_id),
+                full_page,
+                Instant::now(),
+            ),
+        );
 
         self.status_line = format!(
             "Screenshot queued: {} ({})...",
@@ -18300,27 +18431,63 @@ impl AdeApp {
         ctx.request_repaint();
     }
 
+    /// Check if the embedded browser should be hidden due to UI overlays.
+    /// Returns true when Settings, exit confirmation, popups, or context menus are open.
+    fn should_hide_embedded_browser_for_ui_layer(&self, ctx: &egui::Context) -> bool {
+        let context_menu_overlaps_browser = self.context_menu_overlaps_browser_panel(ctx);
+        embedded_browser_should_yield_to_ui_layer(
+            self.show_settings_popup,
+            self.show_exit_confirm_popup,
+            self.terminal_history_popup_open.is_some(),
+            ctx.memory(|mem| mem.any_popup_open()),
+            ctx.is_context_menu_open(),
+            context_menu_overlaps_browser,
+            self.browser_panel_overlay_active,
+            self.foreground_message_popup_open.is_some(),
+        )
+    }
+
+    /// Check if the active context menu overlaps with the browser panel area.
+    /// Uses pointer position as a proxy for context menu location since the exact
+    /// menu rect is not directly exposed by egui's public API.
+    fn context_menu_overlaps_browser_panel(&self, ctx: &egui::Context) -> bool {
+        let Some(browser_rect) = self.pending_browser_rect else {
+            return false;
+        };
+
+        let pointer_pos = ctx
+            .pointer_interact_pos()
+            .or_else(|| ctx.pointer_hover_pos());
+
+        let Some(pos) = pointer_pos else {
+            return true;
+        };
+
+        browser_rect.contains(pos)
+    }
+
     /// Process any pending screenshot requests when the browser is visible and ready.
     fn process_pending_screenshot_requests(&mut self, ctx: &egui::Context) {
         let browser_project_id = self.active_browser_project_id();
+        let browser_scope = browser_project_id.map(BrowserScopeKey::Project);
         let browser_ready = browser_project_id.is_some()
             && self.is_active_browser_panel_open()
             && !self.should_hide_embedded_browser_for_ui_layer(ctx)
             && self
-                .embedded_browsers_by_project
-                .get(&browser_project_id.unwrap())
+                .embedded_browsers_by_scope
+                .get(&browser_scope.unwrap())
                 .is_some_and(|b| matches!(b.status(), BrowserStatus::Ready));
 
         if !browser_ready {
             return;
         }
 
-        let project_id = browser_project_id.unwrap();
+        let browser_scope = browser_scope.unwrap();
         let mut to_start = Vec::new();
 
         // Find pending requests for the active project
-        for (request_id, (pid, full_page, _)) in &self.browser_pending_screenshot_requests {
-            if *pid == project_id {
+        for (request_id, (scope, full_page, _)) in &self.browser_pending_screenshot_requests {
+            if *scope == browser_scope {
                 to_start.push((request_id.clone(), *full_page));
             }
         }
@@ -18333,7 +18500,7 @@ impl AdeApp {
             });
 
             let start_result = self
-                .project_browser(project_id)
+                .browser_for_scope(browser_scope)
                 .start_mcp_screenshot_tool(request_id.clone(), &params);
 
             match start_result {
@@ -18366,6 +18533,7 @@ impl AdeApp {
     fn sync_embedded_browser(&mut self, ctx: &egui::Context) {
         // Determine which project's browser should be visible
         let browser_project_id = self.active_browser_project_id();
+        let browser_scope = browser_project_id.map(BrowserScopeKey::Project);
 
         // Hide all browsers when panel is closed or a UI overlay is active
         if !self.is_active_browser_panel_open()
@@ -18377,8 +18545,8 @@ impl AdeApp {
         }
 
         // Hide browsers for all projects except the active one
-        for (pid, browser) in &mut self.embedded_browsers_by_project {
-            if Some(*pid) != browser_project_id {
+        for (pid, browser) in &mut self.embedded_browsers_by_scope {
+            if Some(*pid) != browser_scope {
                 browser.hide();
             }
         }
@@ -18388,25 +18556,26 @@ impl AdeApp {
 
         // Show and sync the active project's browser
         if let Some(project_id) = browser_project_id {
+            let browser_scope = BrowserScopeKey::Project(project_id);
             let window_hwnd = self.window_hwnd;
 
             let browser_status = self
-                .embedded_browsers_by_project
-                .get(&project_id)
+                .embedded_browsers_by_scope
+                .get(&browser_scope)
                 .map(|browser| browser.status())
                 .unwrap_or(BrowserStatus::Uninitialized);
 
             if matches!(browser_status, BrowserStatus::Uninitialized) {
                 let design_inspect_enabled =
-                    self.is_browser_design_inspect_enabled_for_project(project_id);
-                let browser = self.project_browser(project_id);
+                    self.is_browser_design_inspect_enabled_for_scope(browser_scope);
+                let browser = self.browser_for_scope(browser_scope);
                 browser.set_design_inspect_enabled(design_inspect_enabled);
                 browser.ensure_created(window_hwnd);
             }
 
             let browser_status = self
-                .embedded_browsers_by_project
-                .get(&project_id)
+                .embedded_browsers_by_scope
+                .get(&browser_scope)
                 .map(|browser| browser.status())
                 .unwrap_or(BrowserStatus::Uninitialized);
 
@@ -18417,14 +18586,14 @@ impl AdeApp {
                             rect,
                             ctx.pixels_per_point(),
                         );
-                        let browser = self.project_browser(project_id);
+                        let browser = self.browser_for_scope(browser_scope);
                         // Sync bounds before showing to avoid white flicker from wrong-sized surface
                         browser.sync_position(&bounds);
                         browser.show();
                     }
                 }
                 BrowserStatus::Failed(_) | BrowserStatus::Unsupported(_) => {
-                    if let Some(browser) = self.embedded_browsers_by_project.get_mut(&project_id) {
+                    if let Some(browser) = self.embedded_browsers_by_scope.get_mut(&browser_scope) {
                         browser.hide();
                     }
                 }
@@ -18453,6 +18622,7 @@ impl AdeApp {
 
         // Determine which project's browser to show
         let browser_project_id = self.active_browser_project_id()?;
+        let browser_scope = BrowserScopeKey::Project(browser_project_id);
 
         let response = egui::SidePanel::right("browser_panel")
             .resizable(true)
@@ -18481,13 +18651,13 @@ impl AdeApp {
 
                 if let Some((project_id, _project_name, browser_last_url)) = selected_project_info {
                     let browser_status = self
-                        .embedded_browsers_by_project
-                        .get(&browser_project_id)
+                        .embedded_browsers_by_scope
+                        .get(&browser_scope)
                         .map(|browser| browser.status())
                         .unwrap_or(BrowserStatus::Uninitialized);
 
-                    self.ensure_browser_tab_state(project_id);
-                    let tab_summaries = self.browser_tab_summary(project_id);
+                    self.ensure_browser_tab_state(browser_scope);
+                    let tab_summaries = self.browser_tab_summary(browser_scope);
                     let mut tab_to_select = None;
                     let mut tab_to_close = None;
                     let mut add_tab_requested = false;
@@ -18496,144 +18666,135 @@ impl AdeApp {
                     let mut any_tab_strip_hovered = false;
 
                     // Compact tab strip - single row, non-wrapping
-                    // Reserve fixed width for add button, scrollable area takes remaining space
+                    // Add tab button is inside ScrollArea so it stays next to last tab
                     const BROWSER_ADD_TAB_BUTTON_WIDTH: f32 = 28.0;
-                    let available_width = ui.available_width();
-                    let scroll_width = (available_width - BROWSER_ADD_TAB_BUTTON_WIDTH - 4.0).max(0.0);
 
                     ui.horizontal(|ui| {
-                        // Scrollable tab area (takes remaining width)
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(scroll_width, BROWSER_TAB_HEIGHT),
-                            Layout::left_to_right(Align::Center),
-                            |ui| {
-                                egui::ScrollArea::horizontal()
-                                    .id_salt("browser_tabs_scroll")
-                                    .auto_shrink([false, true])
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            for (tab_id, title, url, is_active) in &tab_summaries {
-                                                let fill = if *is_active {
-                                                    with_alpha(BTN_ICON_HOVER, 130)
-                                                } else {
-                                                    Color32::TRANSPARENT
-                                                };
-                                                let stroke = if *is_active {
-                                                    Stroke::new(1.0, with_alpha(TEXT_PRIMARY, 60))
-                                                } else {
-                                                    Stroke::new(1.0, with_alpha(TEXT_PRIMARY, 24))
-                                                };
+                        // Scrollable tab area including add button
+                        egui::ScrollArea::horizontal()
+                            .id_salt("browser_tabs_scroll")
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    for (tab_id, title, url, is_active) in &tab_summaries {
+                                        let fill = if *is_active {
+                                            with_alpha(BTN_ICON_HOVER, 130)
+                                        } else {
+                                            Color32::TRANSPARENT
+                                        };
+                                        let stroke = if *is_active {
+                                            Stroke::new(1.0, with_alpha(TEXT_PRIMARY, 60))
+                                        } else {
+                                            Stroke::new(1.0, with_alpha(TEXT_PRIMARY, 24))
+                                        };
 
-                                                let (tab_rect, tab_response) = ui.allocate_exact_size(
-                                                    egui::vec2(BROWSER_TAB_WIDTH, BROWSER_TAB_HEIGHT),
-                                                    Sense::click(),
-                                                );
-                                                let close_rect = browser_tab_close_rect(tab_rect);
-                                                let label_rect = browser_tab_label_rect(tab_rect);
-                                                let close_response = ui
-                                                    .interact(
-                                                        close_rect,
-                                                        ui.make_persistent_id(("browser-tab-close", project_id, tab_id)),
-                                                        Sense::click(),
-                                                    )
-                                                    .on_hover_text("Close tab")
-                                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                                let tab_response = tab_response
-                                                    .on_hover_text(
-                                                        url.as_deref().unwrap_or(title.as_str()).to_owned(),
-                                                    )
-                                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                                let tab_hovered = tab_response.hovered() || close_response.hovered();
-                                                if tab_hovered {
-                                                    any_tab_strip_hovered = true;
-                                                }
-                                                let painted_fill = if *is_active {
-                                                    fill
-                                                } else if tab_hovered {
-                                                    with_alpha(BTN_ICON_HOVER, 54)
-                                                } else {
-                                                    fill
-                                                };
+                                        let (tab_rect, tab_response) = ui.allocate_exact_size(
+                                            egui::vec2(BROWSER_TAB_WIDTH, BROWSER_TAB_HEIGHT),
+                                            Sense::click(),
+                                        );
+                                        let close_rect = browser_tab_close_rect(tab_rect);
+                                        let label_rect = browser_tab_label_rect(tab_rect);
+                                        let close_response = ui
+                                            .interact(
+                                                close_rect,
+                                                ui.make_persistent_id(("browser-tab-close", project_id, tab_id)),
+                                                Sense::click(),
+                                            )
+                                            .on_hover_text("Close tab")
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                        let tab_response = tab_response
+                                            .on_hover_text(
+                                                url.as_deref().unwrap_or(title.as_str()).to_owned(),
+                                            )
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                        let tab_hovered = tab_response.hovered() || close_response.hovered();
+                                        if tab_hovered {
+                                            any_tab_strip_hovered = true;
+                                        }
+                                        let painted_fill = if *is_active {
+                                            fill
+                                        } else if tab_hovered {
+                                            with_alpha(BTN_ICON_HOVER, 54)
+                                        } else {
+                                            fill
+                                        };
 
-                                                ui.painter()
-                                                    .rect_filled(tab_rect.shrink(0.5), 4.0, painted_fill);
-                                                ui.painter()
-                                                    .rect_stroke(tab_rect.shrink(0.5), 4.0, stroke);
+                                        ui.painter()
+                                            .rect_filled(tab_rect.shrink(0.5), 4.0, painted_fill);
+                                        ui.painter()
+                                            .rect_stroke(tab_rect.shrink(0.5), 4.0, stroke);
 
-                                                let mut label_ui = ui.new_child(
-                                                    egui::UiBuilder::new()
-                                                        .max_rect(label_rect)
-                                                        .layout(Layout::left_to_right(Align::Center)),
-                                                );
-                                                label_ui.set_clip_rect(label_rect);
-                                                label_ui.add(
-                                                    egui::Label::new(
-                                                        RichText::new(capped_hover_text(title, 18))
-                                                            .size(11.0)
-                                                            .color(if *is_active { TEXT_PRIMARY } else { TEXT_MUTED }),
-                                                    )
-                                                    .truncate()
-                                                    .selectable(false),
-                                                );
+                                        let mut label_ui = ui.new_child(
+                                            egui::UiBuilder::new()
+                                                .max_rect(label_rect)
+                                                .layout(Layout::left_to_right(Align::Center)),
+                                        );
+                                        label_ui.set_clip_rect(label_rect);
+                                        label_ui.add(
+                                            egui::Label::new(
+                                                RichText::new(capped_hover_text(title, 18))
+                                                    .size(11.0)
+                                                    .color(if *is_active { TEXT_PRIMARY } else { TEXT_MUTED }),
+                                            )
+                                            .truncate()
+                                            .selectable(false),
+                                        );
 
-                                                if close_response.hovered() {
-                                                    ui.painter().rect_filled(
-                                                        close_rect.shrink(1.0),
-                                                        3.0,
-                                                        with_alpha(BTN_ICON_HOVER, 115),
-                                                    );
-                                                }
-                                                ui.painter().text(
-                                                    close_rect.center(),
-                                                    egui::Align2::CENTER_CENTER,
-                                                    format!("{}", icons::X),
-                                                    FontId::proportional(10.0),
-                                                    if close_response.hovered() {
-                                                        TEXT_PRIMARY
-                                                    } else {
-                                                        TEXT_MUTED
-                                                    },
-                                                );
+                                        if close_response.hovered() {
+                                            ui.painter().rect_filled(
+                                                close_rect.shrink(1.0),
+                                                3.0,
+                                                with_alpha(BTN_ICON_HOVER, 115),
+                                            );
+                                        }
+                                        ui.painter().text(
+                                            close_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            format!("{}", icons::X),
+                                            FontId::proportional(10.0),
+                                            if close_response.hovered() {
+                                                TEXT_PRIMARY
+                                            } else {
+                                                TEXT_MUTED
+                                            },
+                                        );
 
-                                                if close_response.clicked() {
-                                                    tab_to_close = Some(*tab_id);
-                                                } else if tab_response.clicked() {
-                                                    tab_to_select = Some(*tab_id);
-                                                }
-                                                ui.add_space(2.0);
-                                            }
-                                        });
-                                    });
-                            },
-                        );
+                                        if close_response.clicked() {
+                                            tab_to_close = Some(*tab_id);
+                                        } else if tab_response.clicked() {
+                                            tab_to_select = Some(*tab_id);
+                                        }
+                                        ui.add_space(2.0);
+                                    }
 
-                        ui.add_space(4.0);
-
-                        // Add tab button (always visible, fixed width)
-                        let can_add_tab = tab_summaries.len() < BROWSER_MAX_TABS_PER_PROJECT;
-                        let add_button = egui::Button::new(
-                            RichText::new(format!("{}", icons::PLUS))
-                                .size(14.0)
-                                .color(if can_add_tab { TEXT_PRIMARY } else { TEXT_MUTED }),
-                        )
-                        .frame(false);
-                        let add_response = ui
-                            .add_sized(
-                                [BROWSER_ADD_TAB_BUTTON_WIDTH, BROWSER_TAB_HEIGHT],
-                                add_button,
-                            )
-                            .on_hover_text(if can_add_tab {
-                                "New tab"
-                            } else {
-                                "Tab limit reached"
-                            })
-                            .on_hover_cursor(egui::CursorIcon::PointingHand);
-                        if add_response.hovered() {
-                            any_tab_strip_hovered = true;
-                        }
-                        if add_response.clicked() && can_add_tab {
-                            add_tab_requested = true;
-                        }
+                                    // Add tab button inside ScrollArea, right after last tab
+                                    ui.add_space(4.0);
+                                    let can_add_tab = tab_summaries.len() < BROWSER_MAX_TABS_PER_PROJECT;
+                                    let add_button = egui::Button::new(
+                                        RichText::new(format!("{}", icons::PLUS))
+                                            .size(14.0)
+                                            .color(if can_add_tab { TEXT_PRIMARY } else { TEXT_MUTED }),
+                                    )
+                                    .frame(false);
+                                    let add_response = ui
+                                        .add_sized(
+                                            [BROWSER_ADD_TAB_BUTTON_WIDTH, BROWSER_TAB_HEIGHT],
+                                            add_button,
+                                        )
+                                        .on_hover_text(if can_add_tab {
+                                            "New tab"
+                                        } else {
+                                            "Tab limit reached"
+                                        })
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                    if add_response.hovered() {
+                                        any_tab_strip_hovered = true;
+                                    }
+                                    if add_response.clicked() && can_add_tab {
+                                        add_tab_requested = true;
+                                    }
+                                });
+                            });
                     });
 
                     // Include tab strip hover in overlay state
@@ -18641,18 +18802,18 @@ impl AdeApp {
                         self.browser_panel_overlay_active || any_tab_strip_hovered;
 
                     if let Some(tab_id) = tab_to_close {
-                        if let Err(err) = self.close_browser_tab(project_id, tab_id) {
+                        if let Err(err) = self.close_browser_tab(browser_scope, tab_id) {
                             self.status_line = err;
                         }
                         ctx.request_repaint();
                     } else if let Some(tab_id) = tab_to_select {
-                        if let Err(err) = self.activate_browser_tab(project_id, tab_id) {
+                        if let Err(err) = self.activate_browser_tab(browser_scope, tab_id) {
                             self.status_line = err;
                         }
                         ctx.request_repaint();
                     } else if add_tab_requested {
                         if let Err(err) =
-                            self.add_browser_tab(project_id, None, BrowserTabKind::Page, None)
+                            self.add_browser_tab(browser_scope, None, BrowserTabKind::Page, None)
                         {
                             self.status_line = err;
                         }
@@ -18662,35 +18823,26 @@ impl AdeApp {
                     ui.add_space(4.0);
 
                     // Get or initialize the URL draft for this project
-                    if !self.browser_url_draft_by_project.contains_key(&project_id) {
+                    if !self.browser_url_draft_by_scope.contains_key(&browser_scope) {
                         let initial_draft = browser_last_url.clone().unwrap_or_default();
-                        self.browser_url_draft_by_project
-                            .insert(project_id, initial_draft);
+                        self.browser_url_draft_by_scope
+                            .insert(browser_scope, initial_draft);
                     }
 
                     // Compact toolbar: URL input + action buttons in one row
                     // Get draft as a cloned value to avoid borrow issues
                     let mut draft = self
-                        .browser_url_draft_by_project
-                        .get(&browser_project_id)
+                        .browser_url_draft_by_scope
+                        .get(&browser_scope)
                         .cloned()
                         .unwrap_or_default();
                     let url_input_id = Self::browser_url_input_id(browser_project_id);
-
-                    // Load current selection state before rendering (for context menu)
-                    let pre_click_range =
-                        egui::text_edit::TextEditState::load(ui.ctx(), url_input_id)
-                            .and_then(|state| state.cursor.char_range())
-                            .filter(|range| range.primary != range.secondary);
 
                     // Collect UI action results to avoid closure borrowing issues
                     let mut go_requested = false;
                     let mut clear_requested = false;
                     let mut inspect_toggle_requested = false;
                     let mut url_enter_pressed = false;
-                    let mut copy_requested: Option<String> = None;
-                    let mut paste_requested: Option<String> = None;
-                    let mut context_menu_range: Option<egui::text::CCursorRange> = None;
                     let mut double_clicked = false;
 
                     ui.horizontal(|ui| {
@@ -18717,57 +18869,6 @@ impl AdeApp {
                         }
                         if url_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             url_enter_pressed = true;
-                        }
-
-                        // Get post-render selection state for context menu
-                        let post_show_range = egui::text_edit::TextEditState::load(ui.ctx(), url_input_id)
-                            .and_then(|state| state.cursor.char_range())
-                            .filter(|range| range.primary != range.secondary);
-
-                        let effective_range = pre_click_range.or(post_show_range);
-                        let has_selection = effective_range.is_some();
-                        let url_for_copy = effective_range
-                            .as_ref()
-                            .and_then(|range| extract_text_from_char_range(&draft, Some(*range)))
-                            .or_else(|| {
-                                if draft.is_empty() { None } else { Some(draft.clone()) }
-                            });
-
-                        let can_paste = Clipboard::new()
-                            .map_err(|_| false)
-                            .and_then(|mut cb| cb.get_text().map(|_| true).map_err(|_| false))
-                            .unwrap_or(false);
-
-                        url_response.context_menu(|ui| {
-                            with_minimal_button_chrome(ui, |ui| {
-                                let copy_enabled = url_for_copy.is_some();
-                                let copy_button = ui.add_enabled(
-                                    copy_enabled,
-                                    egui::Button::new(format!("{} Copy", icons::COPY)),
-                                );
-                                if copy_button.clicked() && copy_enabled {
-                                    if let Some(text) = url_for_copy {
-                                        copy_requested = Some(text);
-                                    }
-                                    ui.close_menu();
-                                }
-
-                                ui.separator();
-
-                                let paste_button = ui.add_enabled(
-                                    can_paste,
-                                    egui::Button::new(format!("{} Paste", icons::COPY)),
-                                );
-                                if paste_button.clicked() && can_paste {
-                                    paste_requested = Some(String::new());
-                                    ui.close_menu();
-                                }
-                            });
-                        });
-
-                        // Store context for paste processing
-                        if paste_requested.is_some() {
-                            context_menu_range = effective_range;
                         }
 
                         ui.add_space(4.0);
@@ -18806,7 +18907,7 @@ impl AdeApp {
 
                         // Design Inspect toggle (track hover for overlay)
                         let design_inspect_enabled =
-                            self.is_browser_design_inspect_enabled_for_project(browser_project_id);
+                            self.is_browser_design_inspect_enabled_for_scope(browser_scope);
                         let inspect_tooltip = if design_inspect_enabled {
                             "Design Inspect: ON (click to disable)"
                         } else {
@@ -18844,8 +18945,8 @@ impl AdeApp {
 
                     // Process actions after the UI borrow ends
                     // First, update the draft back to storage
-                    self.browser_url_draft_by_project
-                        .insert(browser_project_id, draft.clone());
+                    self.browser_url_draft_by_scope
+                        .insert(browser_scope, draft.clone());
 
                     // Handle double-click to select all URL text
                     if double_clicked {
@@ -18864,84 +18965,6 @@ impl AdeApp {
                         }
                     }
 
-                    // Handle copy from context menu
-                    if let Some(text_to_copy) = copy_requested {
-                        ui.ctx().copy_text(text_to_copy);
-                        self.status_line = "Copied to clipboard".to_owned();
-                    }
-
-                    // Handle paste from context menu
-                    if paste_requested.is_some() {
-                        if let Ok(mut clipboard) = Clipboard::new() {
-                            if let Ok(paste_text) = clipboard.get_text() {
-                                let cursor_pos = egui::text_edit::TextEditState::load(
-                                    ui.ctx(),
-                                    url_input_id,
-                                )
-                                .and_then(|state| {
-                                    state.cursor.char_range().map(|r| r.primary.index)
-                                });
-
-                                let effective_range = context_menu_range;
-                                let has_selection = effective_range.is_some();
-
-                                let new_draft = if let Some(pos) = cursor_pos {
-                                    if has_selection {
-                                        if let Some(range) = effective_range {
-                                            let [start, end] = range.sorted();
-                                            let before: String =
-                                                draft.chars().take(start.index).collect();
-                                            let after: String =
-                                                draft.chars().skip(end.index).collect();
-                                            let new_pos = start.index + paste_text.chars().count();
-                                            if let Some(mut state) =
-                                                egui::text_edit::TextEditState::load(
-                                                    ui.ctx(),
-                                                    url_input_id,
-                                                )
-                                            {
-                                                let new_range = egui::text::CCursorRange::one(
-                                                    egui::text::CCursor::new(new_pos),
-                                                );
-                                                state.cursor.set_char_range(Some(new_range));
-                                                state.store(ui.ctx(), url_input_id);
-                                            }
-                                            Some(format!("{}{}{}", before, paste_text, after))
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        let before: String =
-                                            draft.chars().take(pos).collect();
-                                        let after: String =
-                                            draft.chars().skip(pos).collect();
-                                        let new_pos = pos + paste_text.chars().count();
-                                        if let Some(mut state) =
-                                            egui::text_edit::TextEditState::load(
-                                                ui.ctx(),
-                                                url_input_id,
-                                            )
-                                        {
-                                            let new_range = egui::text::CCursorRange::one(
-                                                egui::text::CCursor::new(new_pos),
-                                            );
-                                            state.cursor.set_char_range(Some(new_range));
-                                            state.store(ui.ctx(), url_input_id);
-                                        }
-                                        Some(format!("{}{}{}", before, paste_text, after))
-                                    }
-                                } else {
-                                    Some(paste_text)
-                                };
-                                if let Some(new_draft) = new_draft {
-                                    self.browser_url_draft_by_project
-                                        .insert(browser_project_id, new_draft);
-                                }
-                                self.status_line = "Pasted from clipboard".to_owned();
-                            }
-                        }
-                    }
-
                     // Handle Go button
                     if go_requested || url_enter_pressed {
                         self.submit_browser_url(ctx, browser_project_id, &draft);
@@ -18953,12 +18976,12 @@ impl AdeApp {
                             if let Some(project) = self.projects.get_mut(&browser_project_id) {
                                 project.browser_last_url = None;
                             }
-                            self.browser_url_draft_by_project
-                                .remove(&browser_project_id);
-                            if let Some(tab_id) = self.active_browser_tab_id(browser_project_id)
+                            self.browser_url_draft_by_scope
+                                .remove(&browser_scope);
+                            if let Some(tab_id) = self.active_browser_tab_id(browser_scope)
                             {
                                 if let Some(tab) =
-                                    self.browser_tab_mut(browser_project_id, tab_id)
+                                    self.browser_tab_mut(browser_scope, tab_id)
                                 {
                                     tab.url = None;
                                     tab.draft.clear();
@@ -18974,10 +18997,10 @@ impl AdeApp {
                     // Handle Design Inspect toggle
                     if inspect_toggle_requested {
                         let design_inspect_enabled =
-                            self.is_browser_design_inspect_enabled_for_project(browser_project_id);
+                            self.is_browser_design_inspect_enabled_for_scope(browser_scope);
                         let enabled = !design_inspect_enabled;
-                        self.set_browser_design_inspect_enabled_for_project(
-                            browser_project_id,
+                        self.set_browser_design_inspect_enabled_for_scope(
+                            browser_scope,
                             enabled,
                         );
                         self.status_line = if enabled {
@@ -20405,7 +20428,7 @@ impl eframe::App for AdeApp {
         }
 
         // Shutdown all embedded browsers to release native resources
-        for (_, browser) in &mut self.embedded_browsers_by_project {
+        for (_, browser) in &mut self.embedded_browsers_by_scope {
             browser.shutdown();
         }
 
@@ -25986,10 +26009,10 @@ mod tests {
         terminal_selection_autoscroll_speed, terminal_selection_point_from_pointer,
         terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
         with_minimal_button_chrome, with_settings_text_edit_chrome, AdeApp, AiBadgeModel,
-        AiBadgeVisual, AppIcon, BrowserTabKind, BrowserVideoEncodeEvent, CodexAttentionReason,
-        CodexCliStatusSource, CodexTransportStatus, CtrlCAction, DesignInspectDeliveryState,
-        DirectoryIndexSnapshot, DirectoryIndexTruncationFlags, DirectoryNode,
-        FactoryDroidAttentionReason, FactoryDroidHookInboxEvent,
+        AiBadgeVisual, AppIcon, BrowserScopeKey, BrowserTabKind, BrowserVideoEncodeEvent,
+        CodexAttentionReason, CodexCliStatusSource, CodexTransportStatus, CtrlCAction,
+        DesignInspectDeliveryState, DirectoryIndexSnapshot, DirectoryIndexTruncationFlags,
+        DirectoryNode, FactoryDroidAttentionReason, FactoryDroidHookInboxEvent,
         FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
         FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, FileEditorState,
         OpenCodeAttentionReason, OpenCodeStatusSource, OpenCodeTransportStatus, OpenFileBuffer,
@@ -35670,22 +35693,22 @@ mod tests {
             terminal_history_popup_just_opened: false,
             ai_hook_manager: None,
             file_editor: FileEditorState::default(),
-            browser_url_draft_by_project: BTreeMap::new(),
-            embedded_browsers_by_project: BTreeMap::new(),
-            browser_tabs_by_project: BTreeMap::new(),
-            active_browser_tab_by_project: BTreeMap::new(),
+            browser_url_draft_by_scope: BTreeMap::new(),
+            embedded_browsers_by_scope: BTreeMap::new(),
+            browser_tabs_by_scope: BTreeMap::new(),
+            active_browser_tab_by_scope: BTreeMap::new(),
             inactive_browser_tab_browsers: BTreeMap::new(),
             next_browser_tab_id: 1,
             pending_browser_rect: None,
             browser_panel_open_projects: BTreeSet::new(),
-            browser_design_inspect_enabled_projects: BTreeSet::new(),
-            browser_design_inspect_terminal_by_project: BTreeMap::new(),
-            browser_design_inspect_target_changed_at_by_project: BTreeMap::new(),
+            browser_design_inspect_enabled_scopes: BTreeSet::new(),
+            browser_design_inspect_terminal_by_scope: BTreeMap::new(),
+            browser_design_inspect_target_changed_at_by_scope: BTreeMap::new(),
             browser_design_inspect_last_delivery_by_destination: BTreeMap::new(),
             browser_pending_screenshot_requests: BTreeMap::new(),
             browser_panel_overlay_active: false,
             browser_overlay_grace_until: None,
-            browser_video_recordings_by_project: BTreeMap::new(),
+            browser_video_recordings_by_scope: BTreeMap::new(),
             browser_video_encode_events_tx,
             browser_video_encode_events_rx,
         }
@@ -42032,10 +42055,10 @@ mod tests {
         app.projects
             .insert(2, test_project(2, "Other", "C:/other", &[], &[]));
 
-        app.set_browser_design_inspect_enabled_for_project(1, true);
+        app.set_browser_design_inspect_enabled_for_scope(1, true);
 
-        assert!(app.is_browser_design_inspect_enabled_for_project(1));
-        assert!(!app.is_browser_design_inspect_enabled_for_project(2));
+        assert!(app.is_browser_design_inspect_enabled_for_scope(1));
+        assert!(!app.is_browser_design_inspect_enabled_for_scope(2));
         assert!(!app.config.ui.browser_panel_expanded);
     }
 
@@ -42052,7 +42075,7 @@ mod tests {
             .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
         app.selected_project = Some(7);
         app.set_browser_panel_open_for_project(7, true);
-        app.set_browser_design_inspect_enabled_for_project(7, true);
+        app.set_browser_design_inspect_enabled_for_scope(7, true);
 
         let info = test_design_element_info("main > button#save.primary");
         app.forward_design_inspect_click_to_terminal(&ctx, 7, info.clone());
@@ -42083,15 +42106,15 @@ mod tests {
             .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
         app.selected_project = Some(7);
         app.set_browser_panel_open_for_project(7, true);
-        app.set_browser_design_inspect_enabled_for_project(7, true);
+        app.set_browser_design_inspect_enabled_for_scope(7, true);
 
         let info = test_design_element_info("main > button#save.primary");
         app.forward_design_inspect_click_to_terminal(&ctx, 7, info.clone());
         app.active_terminal = Some(2);
-        app.set_browser_design_inspect_enabled_for_project(7, true);
-        app.browser_design_inspect_target_changed_at_by_project
+        app.set_browser_design_inspect_enabled_for_scope(7, true);
+        app.browser_design_inspect_target_changed_at_by_scope
             .insert(
-                7,
+                BrowserScopeKey::Project(7),
                 Instant::now() - Duration::from_millis(DESIGN_INSPECT_TARGET_SWITCH_QUIET_MS + 1),
             );
         app.forward_design_inspect_click_to_terminal(&ctx, 7, info);
@@ -42115,11 +42138,12 @@ mod tests {
             .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
         app.selected_project = Some(7);
         app.set_browser_panel_open_for_project(7, true);
-        app.set_browser_design_inspect_enabled_for_project(7, true);
+        app.set_browser_design_inspect_enabled_for_scope(7, true);
 
         app.set_active_terminal(&ctx, Some(2));
         assert_eq!(
-            app.browser_design_inspect_terminal_by_project.get(&7),
+            app.browser_design_inspect_terminal_by_scope
+                .get(&BrowserScopeKey::Project(7)),
             Some(&2)
         );
 
@@ -42127,9 +42151,9 @@ mod tests {
         app.forward_design_inspect_click_to_terminal(&ctx, 7, info.clone());
         assert!(app.pending_terminal_pastes.is_empty());
 
-        app.browser_design_inspect_target_changed_at_by_project
+        app.browser_design_inspect_target_changed_at_by_scope
             .insert(
-                7,
+                BrowserScopeKey::Project(7),
                 Instant::now() - Duration::from_millis(DESIGN_INSPECT_TARGET_SWITCH_QUIET_MS + 1),
             );
         app.forward_design_inspect_click_to_terminal(&ctx, 7, info);
@@ -42151,7 +42175,7 @@ mod tests {
         app.projects.insert(7, project);
         app.selected_project = Some(7);
         app.set_browser_panel_open_for_project(7, true);
-        app.set_browser_design_inspect_enabled_for_project(7, true);
+        app.set_browser_design_inspect_enabled_for_scope(7, true);
 
         let mut info = test_design_element_info("main > button#save.primary");
         info.url = "https://example.com/previous".to_owned();
@@ -42174,7 +42198,7 @@ mod tests {
         app.projects.insert(7, project);
         app.selected_project = Some(7);
         app.set_browser_panel_open_for_project(7, true);
-        app.set_browser_design_inspect_enabled_for_project(7, true);
+        app.set_browser_design_inspect_enabled_for_scope(7, true);
 
         let mut info = test_design_element_info("iframe > button#save.primary");
         info.page_url = "https://example.com/current".to_owned();
@@ -42191,10 +42215,10 @@ mod tests {
         app.projects
             .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
         app.selected_project = Some(7);
-        app.set_browser_design_inspect_enabled_for_project(7, true);
+        app.set_browser_design_inspect_enabled_for_scope(7, true);
         app.browser_design_inspect_last_delivery_by_destination
             .insert(
-                (7, 1),
+                (BrowserScopeKey::Project(7), 1),
                 DesignInspectDeliveryState {
                     signature: "same".to_owned(),
                     delivered_at: Instant::now(),
@@ -42203,9 +42227,9 @@ mod tests {
 
         app.close_terminal(&ctx, 1);
 
-        assert!(app.browser_design_inspect_terminal_by_project.is_empty());
+        assert!(app.browser_design_inspect_terminal_by_scope.is_empty());
         assert!(app
-            .browser_design_inspect_target_changed_at_by_project
+            .browser_design_inspect_target_changed_at_by_scope
             .is_empty());
         assert!(app
             .browser_design_inspect_last_delivery_by_destination
@@ -42301,7 +42325,9 @@ mod tests {
         assert_eq!(response.text, "Browser MCP project authorization mismatch");
         assert!(app.config.ui.checklist_panel_expanded);
         assert!(!app.browser_panel_open_projects.contains(&8));
-        assert!(!app.embedded_browsers_by_project.contains_key(&8));
+        assert!(!app
+            .embedded_browsers_by_scope
+            .contains_key(&BrowserScopeKey::Project(8)));
         assert_eq!(app.projects.get(&8).unwrap().browser_last_url, None);
     }
 
@@ -42331,7 +42357,7 @@ mod tests {
         assert!(response.is_error);
         assert_eq!(response.text, "Browser MCP target terminal does not exist");
         assert!(app.browser_panel_open_projects.is_empty());
-        assert!(app.embedded_browsers_by_project.is_empty());
+        assert!(app.embedded_browsers_by_scope.is_empty());
     }
 
     #[test]
@@ -42360,7 +42386,7 @@ mod tests {
     }
 
     #[test]
-    fn project_browser_last_url_persists_in_config() {
+    fn browser_for_scope_last_url_persists_in_config() {
         let mut app = test_app([], None);
 
         // Add a project with browser URL
@@ -42487,22 +42513,27 @@ mod tests {
         app.selected_project = Some(1);
 
         // Simulate typing by setting draft directly
-        app.browser_url_draft_by_project
-            .insert(1, "localhost:3000".to_owned());
+        app.browser_url_draft_by_scope
+            .insert(BrowserScopeKey::Project(1), "localhost:3000".to_owned());
 
         // Verify draft persists
         assert_eq!(
-            app.browser_url_draft_by_project.get(&1),
+            app.browser_url_draft_by_scope
+                .get(&BrowserScopeKey::Project(1)),
             Some(&"localhost:3000".to_owned())
         );
 
         // Update draft (simulating more typing)
-        if let Some(draft) = app.browser_url_draft_by_project.get_mut(&1) {
+        if let Some(draft) = app
+            .browser_url_draft_by_scope
+            .get_mut(&BrowserScopeKey::Project(1))
+        {
             *draft = "https://example.com/path".to_owned();
         }
 
         assert_eq!(
-            app.browser_url_draft_by_project.get(&1),
+            app.browser_url_draft_by_scope
+                .get(&BrowserScopeKey::Project(1)),
             Some(&"https://example.com/path".to_owned())
         );
     }
@@ -42816,15 +42847,19 @@ mod tests {
             .browser_last_url
             .clone();
 
-        if !app.browser_url_draft_by_project.contains_key(&project_id) {
+        if !app
+            .browser_url_draft_by_scope
+            .contains_key(&BrowserScopeKey::Project(project_id))
+        {
             let initial_draft = browser_last_url.clone().unwrap_or_default();
-            app.browser_url_draft_by_project
-                .insert(project_id, initial_draft);
+            app.browser_url_draft_by_scope
+                .insert(BrowserScopeKey::Project(project_id), initial_draft);
         }
 
         // Draft should contain the saved URL
         assert_eq!(
-            app.browser_url_draft_by_project.get(&1),
+            app.browser_url_draft_by_scope
+                .get(&BrowserScopeKey::Project(1)),
             Some(&"https://saved.example.com".to_owned())
         );
     }
@@ -42836,14 +42871,17 @@ mod tests {
         // Add a project with draft
         let project = test_project(1, "Demo", "C:/demo", &[], &[]);
         app.projects.insert(1, project);
-        app.browser_url_draft_by_project
-            .insert(1, "localhost:3000".to_owned());
+        app.browser_url_draft_by_scope
+            .insert(BrowserScopeKey::Project(1), "localhost:3000".to_owned());
 
         // Remove the draft (simulating cleanup)
-        app.browser_url_draft_by_project.remove(&1);
+        app.browser_url_draft_by_scope
+            .remove(&BrowserScopeKey::Project(1));
 
         // Draft should be gone
-        assert!(!app.browser_url_draft_by_project.contains_key(&1));
+        assert!(!app
+            .browser_url_draft_by_scope
+            .contains_key(&BrowserScopeKey::Project(1)));
     }
 
     #[test]
@@ -42928,7 +42966,9 @@ mod tests {
         app.projects.insert(1, project);
 
         // Before submit, the project should not have an embedded browser yet.
-        assert!(!app.embedded_browsers_by_project.contains_key(&1));
+        assert!(!app
+            .embedded_browsers_by_scope
+            .contains_key(&BrowserScopeKey::Project(1)));
 
         // Submit a URL
         app.submit_browser_url(&ctx, 1, "example.com");
@@ -42941,15 +42981,18 @@ mod tests {
 
         // Draft should be updated
         assert_eq!(
-            app.browser_url_draft_by_project.get(&1),
+            app.browser_url_draft_by_scope
+                .get(&BrowserScopeKey::Project(1)),
             Some(&"https://example.com".to_owned())
         );
 
         // Submitting a URL should create a browser instance for that project.
-        assert!(app.embedded_browsers_by_project.contains_key(&1));
+        assert!(app
+            .embedded_browsers_by_scope
+            .contains_key(&BrowserScopeKey::Project(1)));
         assert!(matches!(
-            app.embedded_browsers_by_project
-                .get(&1)
+            app.embedded_browsers_by_scope
+                .get(&BrowserScopeKey::Project(1))
                 .map(|browser| browser.status()),
             Some(web_browser::BrowserStatus::Uninitialized)
         ));
@@ -42967,7 +43010,7 @@ mod tests {
         app.sync_embedded_browser(&ctx);
 
         assert!(app.pending_browser_rect.is_none());
-        assert!(app.embedded_browsers_by_project.is_empty());
+        assert!(app.embedded_browsers_by_scope.is_empty());
     }
 
     #[test]
@@ -43076,34 +43119,42 @@ mod tests {
         // Synchronize the embedded browser state; it should target project 2
         app.sync_embedded_browser(&ctx);
 
-        assert!(!app.embedded_browsers_by_project.contains_key(&1));
-        assert!(app.embedded_browsers_by_project.contains_key(&2));
+        assert!(!app
+            .embedded_browsers_by_scope
+            .contains_key(&BrowserScopeKey::Project(1)));
+        assert!(app
+            .embedded_browsers_by_scope
+            .contains_key(&BrowserScopeKey::Project(2)));
     }
 
     #[test]
-    fn project_browser_creates_per_project_instances() {
+    fn browser_for_scope_creates_per_project_instances() {
         let mut app = test_app([], None);
 
         // Initially no browsers
-        assert!(app.embedded_browsers_by_project.is_empty());
+        assert!(app.embedded_browsers_by_scope.is_empty());
 
         // Get browser for project 1
-        let _ = app.project_browser(1);
-        assert!(app.embedded_browsers_by_project.contains_key(&1));
-        assert_eq!(app.embedded_browsers_by_project.len(), 1);
+        let _ = app.browser_for_scope(1);
+        assert!(app
+            .embedded_browsers_by_scope
+            .contains_key(&BrowserScopeKey::Project(1)));
+        assert_eq!(app.embedded_browsers_by_scope.len(), 1);
 
         // Get browser for project 2
-        let _ = app.project_browser(2);
-        assert!(app.embedded_browsers_by_project.contains_key(&2));
-        assert_eq!(app.embedded_browsers_by_project.len(), 2);
+        let _ = app.browser_for_scope(2);
+        assert!(app
+            .embedded_browsers_by_scope
+            .contains_key(&BrowserScopeKey::Project(2)));
+        assert_eq!(app.embedded_browsers_by_scope.len(), 2);
 
         // Getting browser for project 1 again returns same instance
-        let _ = app.project_browser(1);
-        assert_eq!(app.embedded_browsers_by_project.len(), 2);
+        let _ = app.browser_for_scope(1);
+        assert_eq!(app.embedded_browsers_by_scope.len(), 2);
     }
 
     #[test]
-    fn submit_browser_url_navigates_per_project_browser() {
+    fn submit_browser_url_navigates_per_browser_for_scope() {
         let mut app = test_app([], None);
         let ctx = egui::Context::default();
 
@@ -43117,16 +43168,22 @@ mod tests {
         app.submit_browser_url(&ctx, 1, "https://project1.com");
 
         // Verify project 1's browser was created and has pending navigation
-        assert!(app.embedded_browsers_by_project.contains_key(&1));
+        assert!(app
+            .embedded_browsers_by_scope
+            .contains_key(&BrowserScopeKey::Project(1)));
 
         // Project 2 should not have a browser yet
-        assert!(!app.embedded_browsers_by_project.contains_key(&2));
+        assert!(!app
+            .embedded_browsers_by_scope
+            .contains_key(&BrowserScopeKey::Project(2)));
 
         // Submit URL for project 2
         app.submit_browser_url(&ctx, 2, "https://project2.com");
 
         // Now project 2 should have a browser
-        assert!(app.embedded_browsers_by_project.contains_key(&2));
+        assert!(app
+            .embedded_browsers_by_scope
+            .contains_key(&BrowserScopeKey::Project(2)));
     }
 
     #[test]
@@ -43137,26 +43194,32 @@ mod tests {
         // Add a project with browser state
         let project = test_project(1, "Project1", "C:/proj1", &[], &[]);
         app.projects.insert(1, project);
-        app.browser_url_draft_by_project
-            .insert(1, "draft-url".to_owned());
+        app.browser_url_draft_by_scope
+            .insert(BrowserScopeKey::Project(1), "draft-url".to_owned());
 
         // Create browser for the project
-        let _ = app.project_browser(1);
-        assert!(app.embedded_browsers_by_project.contains_key(&1));
+        let _ = app.browser_for_scope(1);
+        assert!(app
+            .embedded_browsers_by_scope
+            .contains_key(&BrowserScopeKey::Project(1)));
 
         // Remove the project
         app.remove_project(&ctx, 1);
 
         // Browser state should be cleaned up
-        assert!(!app.browser_url_draft_by_project.contains_key(&1));
-        assert!(!app.embedded_browsers_by_project.contains_key(&1));
+        assert!(!app
+            .browser_url_draft_by_scope
+            .contains_key(&BrowserScopeKey::Project(1)));
+        assert!(!app
+            .embedded_browsers_by_scope
+            .contains_key(&BrowserScopeKey::Project(1)));
     }
 
     #[test]
-    fn project_browser_uses_project_scoped_webview_profile_folder() {
+    fn browser_for_scope_uses_project_scoped_webview_profile_folder() {
         let mut app = test_app([], None);
 
-        let browser = app.project_browser(7);
+        let browser = app.browser_for_scope(7);
         let path = browser
             .user_data_folder()
             .expect("project browser should have a persistent profile folder");
@@ -43218,10 +43281,10 @@ mod tests {
         app.set_browser_panel_open_for_project(1, true);
 
         // Show the browser
-        app.project_browser(1).show();
+        app.browser_for_scope(1).show();
         assert!(app
-            .embedded_browsers_by_project
-            .get(&1)
+            .embedded_browsers_by_scope
+            .get(&BrowserScopeKey::Project(1))
             .unwrap()
             .requested_visible());
 
@@ -43261,10 +43324,10 @@ mod tests {
         app.show_settings_popup = true;
 
         // Show the browser
-        app.project_browser(1).show();
+        app.browser_for_scope(1).show();
         assert!(app
-            .embedded_browsers_by_project
-            .get(&1)
+            .embedded_browsers_by_scope
+            .get(&BrowserScopeKey::Project(1))
             .unwrap()
             .requested_visible());
 
@@ -43273,8 +43336,8 @@ mod tests {
 
         assert!(app.pending_browser_rect.is_none());
         assert!(!app
-            .embedded_browsers_by_project
-            .get(&1)
+            .embedded_browsers_by_scope
+            .get(&BrowserScopeKey::Project(1))
             .unwrap()
             .requested_visible());
     }
@@ -43293,7 +43356,9 @@ mod tests {
         // Sync should not create a browser while overlay is active
         app.sync_embedded_browser(&ctx);
 
-        assert!(!app.embedded_browsers_by_project.contains_key(&1));
+        assert!(!app
+            .embedded_browsers_by_scope
+            .contains_key(&BrowserScopeKey::Project(1)));
     }
 
     #[test]
@@ -43309,14 +43374,14 @@ mod tests {
         app.set_browser_panel_open_for_project(1, true);
 
         // Show the browser and simulate it being ready
-        app.project_browser(1).show();
+        app.browser_for_scope(1).show();
         app.pending_browser_rect = Some(egui::Rect::from_min_size(
             egui::pos2(800.0, 100.0),
             egui::vec2(400.0, 600.0),
         ));
         assert!(app
-            .embedded_browsers_by_project
-            .get(&1)
+            .embedded_browsers_by_scope
+            .get(&BrowserScopeKey::Project(1))
             .unwrap()
             .requested_visible());
 
@@ -43327,8 +43392,8 @@ mod tests {
         app.sync_embedded_browser(&ctx);
 
         assert!(!app
-            .embedded_browsers_by_project
-            .get(&1)
+            .embedded_browsers_by_scope
+            .get(&BrowserScopeKey::Project(1))
             .unwrap()
             .requested_visible());
     }
@@ -43346,14 +43411,14 @@ mod tests {
         app.set_browser_panel_open_for_project(1, true);
 
         // Show the browser and simulate it being ready
-        app.project_browser(1).show();
+        app.browser_for_scope(1).show();
         app.pending_browser_rect = Some(egui::Rect::from_min_size(
             egui::pos2(800.0, 100.0),
             egui::vec2(400.0, 600.0),
         ));
         assert!(app
-            .embedded_browsers_by_project
-            .get(&1)
+            .embedded_browsers_by_scope
+            .get(&BrowserScopeKey::Project(1))
             .unwrap()
             .requested_visible());
 
@@ -43364,8 +43429,8 @@ mod tests {
         app.sync_embedded_browser(&ctx);
 
         assert!(!app
-            .embedded_browsers_by_project
-            .get(&1)
+            .embedded_browsers_by_scope
+            .get(&BrowserScopeKey::Project(1))
             .unwrap()
             .requested_visible());
     }
@@ -43435,15 +43500,18 @@ mod tests {
         project.browser_last_url = Some("https://initial.com".to_owned());
         app.projects.insert(1, project);
         app.selected_project = Some(1);
-        app.browser_url_draft_by_project
-            .insert(1, "https://initial.com".to_owned());
+        app.browser_url_draft_by_scope.insert(
+            BrowserScopeKey::Project(1),
+            "https://initial.com".to_owned(),
+        );
 
         // Simulate browser observing a new URL
         let changed = app.apply_browser_observed_url(1, "https://example.com/new".to_owned());
 
         assert!(changed);
         assert_eq!(
-            app.browser_url_draft_by_project.get(&1),
+            app.browser_url_draft_by_scope
+                .get(&BrowserScopeKey::Project(1)),
             Some(&"https://example.com/new".to_owned())
         );
         assert_eq!(
@@ -43464,11 +43532,11 @@ mod tests {
         app.projects.insert(1, project);
         app.selected_project = Some(1);
 
-        app.browser_url_draft_by_project
-            .insert(1, initial_url.clone());
+        app.browser_url_draft_by_scope
+            .insert(BrowserScopeKey::Project(1), initial_url.clone());
 
         {
-            let browser = app.project_browser(1);
+            let browser = app.browser_for_scope(1);
             browser.send_test_event(web_browser::BrowserEvent::UrlChanged(
                 "about:blank".to_owned(),
             ));
@@ -43479,7 +43547,11 @@ mod tests {
 
         app.process_browser_events(&ctx);
 
-        assert_eq!(app.browser_url_draft_by_project.get(&1), Some(&initial_url));
+        assert_eq!(
+            app.browser_url_draft_by_scope
+                .get(&BrowserScopeKey::Project(1)),
+            Some(&initial_url)
+        );
         assert_eq!(
             app.projects.get(&1).unwrap().browser_last_url,
             Some(initial_url.clone())
@@ -43487,14 +43559,15 @@ mod tests {
 
         let supported_url = "https://valid.com".to_owned();
         {
-            let browser = app.project_browser(1);
+            let browser = app.browser_for_scope(1);
             browser.send_test_event(web_browser::BrowserEvent::UrlChanged(supported_url.clone()));
         }
 
         app.process_browser_events(&ctx);
 
         assert_eq!(
-            app.browser_url_draft_by_project.get(&1),
+            app.browser_url_draft_by_scope
+                .get(&BrowserScopeKey::Project(1)),
             Some(&supported_url)
         );
         assert_eq!(
@@ -43509,13 +43582,16 @@ mod tests {
         let mut app = test_app([], None);
         app.projects
             .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
-        app.project_browser(1);
+        app.browser_for_scope(1);
         let (tx, rx) = std::sync::mpsc::channel();
         app.browser_mcp_pending_responses
             .insert("req-1".to_owned(), tx);
 
         {
-            let browser = app.embedded_browsers_by_project.get(&1).unwrap();
+            let browser = app
+                .embedded_browsers_by_scope
+                .get(&BrowserScopeKey::Project(1))
+                .unwrap();
             browser.send_test_event(web_browser::BrowserEvent::McpToolResult {
                 request_id: "req-1".to_owned(),
                 result: Ok(web_browser::BrowserMcpToolOutput {
@@ -43540,13 +43616,16 @@ mod tests {
         let mut app = test_app([], None);
         app.projects
             .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
-        app.project_browser(1);
+        app.browser_for_scope(1);
         let (tx, rx) = std::sync::mpsc::channel();
         app.browser_mcp_pending_responses
             .insert("browser-click-1".to_owned(), tx);
 
         {
-            let browser = app.embedded_browsers_by_project.get(&1).unwrap();
+            let browser = app
+                .embedded_browsers_by_scope
+                .get(&BrowserScopeKey::Project(1))
+                .unwrap();
             browser.send_test_event(web_browser::BrowserEvent::McpToolResult {
                 request_id: "browser-click-1".to_owned(),
                 result: Ok(web_browser::BrowserMcpToolOutput {
@@ -43575,7 +43654,7 @@ mod tests {
         let mut app = test_app([], None);
         app.projects
             .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
-        app.project_browser(1)
+        app.browser_for_scope(1)
             .set_test_status(web_browser::BrowserStatus::Ready);
 
         assert!(!app.browser_mcp_screenshot_should_open_panel(1));
@@ -43607,7 +43686,13 @@ mod tests {
             .unwrap_err();
 
         assert!(err.contains("Browser tab limit reached"));
-        assert_eq!(app.browser_tabs_by_project.get(&1).unwrap().len(), 5);
+        assert_eq!(
+            app.browser_tabs_by_scope
+                .get(&BrowserScopeKey::Project(1))
+                .unwrap()
+                .len(),
+            5
+        );
     }
 
     #[test]
@@ -43620,7 +43705,10 @@ mod tests {
         app.close_browser_tab(1, first_tab)
             .expect("last tab should close");
 
-        let tabs = app.browser_tabs_by_project.get(&1).unwrap();
+        let tabs = app
+            .browser_tabs_by_scope
+            .get(&BrowserScopeKey::Project(1))
+            .unwrap();
         assert_eq!(tabs.len(), 1);
         assert_ne!(tabs[0].id, first_tab);
         assert_eq!(tabs[0].url, None);
@@ -43638,6 +43726,10 @@ mod tests {
             project_id: Some(7),
             session_id: None,
         };
+        let browser_scope = BrowserScopeKey::Terminal {
+            project_id: 7,
+            terminal_id: 1,
+        };
         let request = |tool: &str, params: serde_json::Value| {
             crate::browser_mcp_service::BrowserMcpIpcRequest {
                 request_id: "request".to_owned(),
@@ -43659,10 +43751,16 @@ mod tests {
         );
 
         assert!(!response.is_error, "{}", response.text);
-        assert_eq!(app.browser_tabs_by_project.get(&7).unwrap().len(), 2);
-        let new_tab_id = app.active_browser_tab_id(7).unwrap();
         assert_eq!(
-            app.browser_tab_mut(7, new_tab_id).unwrap().url.as_deref(),
+            app.browser_tabs_by_scope.get(&browser_scope).unwrap().len(),
+            2
+        );
+        let new_tab_id = app.active_browser_tab_id(browser_scope).unwrap();
+        assert_eq!(
+            app.browser_tab_mut(browser_scope, new_tab_id)
+                .unwrap()
+                .url
+                .as_deref(),
             Some("https://example.com/path")
         );
 
@@ -43676,7 +43774,7 @@ mod tests {
         );
 
         assert!(!response.is_error, "{}", response.text);
-        assert_ne!(app.active_browser_tab_id(7), Some(new_tab_id));
+        assert_ne!(app.active_browser_tab_id(browser_scope), Some(new_tab_id));
 
         let response = app.handle_browser_mcp_request(
             &ctx,
@@ -43688,7 +43786,7 @@ mod tests {
         );
 
         assert!(!response.is_error, "{}", response.text);
-        let tabs = app.browser_tabs_by_project.get(&7).unwrap();
+        let tabs = app.browser_tabs_by_scope.get(&browser_scope).unwrap();
         assert_eq!(tabs.len(), 1);
         assert!(tabs.iter().all(|tab| tab.id != new_tab_id));
     }
@@ -43704,6 +43802,10 @@ mod tests {
             project_id: Some(7),
             session_id: None,
         };
+        let browser_scope = BrowserScopeKey::Terminal {
+            project_id: 7,
+            terminal_id: 1,
+        };
         let request = |tool: &str, params: serde_json::Value| {
             crate::browser_mcp_service::BrowserMcpIpcRequest {
                 request_id: "request".to_owned(),
@@ -43724,7 +43826,7 @@ mod tests {
             scope.clone(),
         );
         assert!(!response.is_error, "{}", response.text);
-        let duplicate_tab_id = app.active_browser_tab_id(7).unwrap();
+        let duplicate_tab_id = app.active_browser_tab_id(browser_scope).unwrap();
 
         let response = app.handle_browser_mcp_request(
             &ctx,
@@ -43735,8 +43837,9 @@ mod tests {
             scope.clone(),
         );
         assert!(!response.is_error, "{}", response.text);
-        let active_before_duplicate = app.active_browser_tab_id(7);
-        let tab_count_before_duplicate = app.browser_tabs_by_project.get(&7).unwrap().len();
+        let active_before_duplicate = app.active_browser_tab_id(browser_scope);
+        let tab_count_before_duplicate =
+            app.browser_tabs_by_scope.get(&browser_scope).unwrap().len();
 
         let response = app.handle_browser_mcp_request(
             &ctx,
@@ -43756,10 +43859,13 @@ mod tests {
             "browser_tabs action=select tabId={duplicate_tab_id}"
         )));
         assert_eq!(
-            app.browser_tabs_by_project.get(&7).unwrap().len(),
+            app.browser_tabs_by_scope.get(&browser_scope).unwrap().len(),
             tab_count_before_duplicate
         );
-        assert_eq!(app.active_browser_tab_id(7), active_before_duplicate);
+        assert_eq!(
+            app.active_browser_tab_id(browser_scope),
+            active_before_duplicate
+        );
     }
 
     #[test]
@@ -43772,6 +43878,10 @@ mod tests {
             terminal_id: 1,
             project_id: Some(7),
             session_id: None,
+        };
+        let browser_scope = BrowserScopeKey::Terminal {
+            project_id: 7,
+            terminal_id: 1,
         };
         let request =
             |params: serde_json::Value| crate::browser_mcp_service::BrowserMcpIpcRequest {
@@ -43798,7 +43908,10 @@ mod tests {
 
         assert!(response.is_error);
         assert!(response.text.contains("Bu sekme zaten"));
-        assert_eq!(app.browser_tabs_by_project.get(&7).unwrap().len(), 2);
+        assert_eq!(
+            app.browser_tabs_by_scope.get(&browser_scope).unwrap().len(),
+            2
+        );
     }
 
     #[test]
@@ -43811,6 +43924,10 @@ mod tests {
             terminal_id: 1,
             project_id: Some(7),
             session_id: None,
+        };
+        let browser_scope = BrowserScopeKey::Terminal {
+            project_id: 7,
+            terminal_id: 1,
         };
         let request = |url: &str| crate::browser_mcp_service::BrowserMcpIpcRequest {
             request_id: "request".to_owned(),
@@ -43831,7 +43948,10 @@ mod tests {
             assert!(!response.is_error, "{url}: {}", response.text);
         }
 
-        assert_eq!(app.browser_tabs_by_project.get(&7).unwrap().len(), 5);
+        assert_eq!(
+            app.browser_tabs_by_scope.get(&browser_scope).unwrap().len(),
+            5
+        );
     }
 
     #[test]
@@ -43906,7 +44026,13 @@ mod tests {
             response.data.unwrap()["videoPath"].as_str(),
             Some(r"C:\recordings\full.mp4")
         );
-        assert_eq!(app.browser_tabs_by_project.get(&1).unwrap().len(), 5);
+        assert_eq!(
+            app.browser_tabs_by_scope
+                .get(&BrowserScopeKey::Project(1))
+                .unwrap()
+                .len(),
+            5
+        );
     }
 
     #[test]
@@ -43945,8 +44071,8 @@ mod tests {
         // Simulate LoadFinished event for the recording tab
         // This tests that the event handler properly identifies recording tabs
         let is_recording = app
-            .browser_tabs_by_project
-            .get(&1)
+            .browser_tabs_by_scope
+            .get(&BrowserScopeKey::Project(1))
             .and_then(|tabs| tabs.iter().find(|t| t.id == tab_id))
             .map(|t| t.kind == BrowserTabKind::Recording)
             .unwrap_or(false);
@@ -43976,8 +44102,8 @@ mod tests {
 
         // Verify page tab is correctly identified as non-recording
         let is_recording = app
-            .browser_tabs_by_project
-            .get(&1)
+            .browser_tabs_by_scope
+            .get(&BrowserScopeKey::Project(1))
             .and_then(|tabs| tabs.iter().find(|t| t.id == tab_id))
             .map(|t| t.kind == BrowserTabKind::Recording)
             .unwrap_or(false);
@@ -44057,17 +44183,22 @@ mod tests {
         project2.browser_last_url = Some("https://project2.com".to_owned());
         app.projects.insert(1, project1);
         app.projects.insert(2, project2);
-        app.browser_url_draft_by_project
-            .insert(1, "https://project1.com".to_owned());
-        app.browser_url_draft_by_project
-            .insert(2, "https://project2.com".to_owned());
+        app.browser_url_draft_by_scope.insert(
+            BrowserScopeKey::Project(1),
+            "https://project1.com".to_owned(),
+        );
+        app.browser_url_draft_by_scope.insert(
+            BrowserScopeKey::Project(2),
+            "https://project2.com".to_owned(),
+        );
 
         // Update project 1's URL
         app.apply_browser_observed_url(1, "https://project1-new.com".to_owned());
 
         // Project 2 should be unchanged
         assert_eq!(
-            app.browser_url_draft_by_project.get(&2),
+            app.browser_url_draft_by_scope
+                .get(&BrowserScopeKey::Project(2)),
             Some(&"https://project2.com".to_owned())
         );
         assert_eq!(
@@ -44077,7 +44208,8 @@ mod tests {
 
         // Project 1 should be updated
         assert_eq!(
-            app.browser_url_draft_by_project.get(&1),
+            app.browser_url_draft_by_scope
+                .get(&BrowserScopeKey::Project(1)),
             Some(&"https://project1-new.com".to_owned())
         );
         assert_eq!(
@@ -44095,8 +44227,10 @@ mod tests {
         let mut project = test_project(1, "Demo", "C:/demo", &[], &[]);
         project.browser_last_url = Some("https://example.com".to_owned());
         app.projects.insert(1, project);
-        app.browser_url_draft_by_project
-            .insert(1, "https://example.com".to_owned());
+        app.browser_url_draft_by_scope.insert(
+            BrowserScopeKey::Project(1),
+            "https://example.com".to_owned(),
+        );
 
         // Apply the same URL again - should not report a change
         let changed = app.apply_browser_observed_url(1, "https://example.com".to_owned());
@@ -44163,16 +44297,20 @@ mod tests {
 
         // Sync creates browser for project 1
         app.sync_embedded_browser(&ctx);
-        assert!(app.embedded_browsers_by_project.contains_key(&1));
+        assert!(app
+            .embedded_browsers_by_scope
+            .contains_key(&BrowserScopeKey::Project(1)));
 
         // Switch to project 2 (browser closed) - sync should not create project 2 browser
         app.active_terminal = Some(102);
         app.sync_embedded_browser(&ctx);
-        assert!(!app.embedded_browsers_by_project.contains_key(&2));
+        assert!(!app
+            .embedded_browsers_by_scope
+            .contains_key(&BrowserScopeKey::Project(2)));
     }
 
     #[test]
-    fn submit_browser_url_opens_only_target_project_browser_state() {
+    fn submit_browser_url_opens_only_target_browser_for_scope_state() {
         let ctx = egui::Context::default();
         let mut app = test_app([], None);
 
@@ -44198,7 +44336,7 @@ mod tests {
     }
 
     #[test]
-    fn checklist_open_closes_only_active_project_browser_state() {
+    fn checklist_open_closes_only_active_browser_for_scope_state() {
         let ctx = egui::Context::default();
         let mut app = test_app([], None);
 
@@ -44610,7 +44748,7 @@ mod tests {
             .browser_pending_screenshot_requests
             .get(&request_id)
             .unwrap();
-        assert_eq!(*pid, 1);
+        assert_eq!(*pid, BrowserScopeKey::Project(1));
         assert!(*full_page);
     }
 

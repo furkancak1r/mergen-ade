@@ -80,6 +80,21 @@ pub(crate) fn browser_user_data_dir_from_data_dir(data_dir: &Path, project_id: u
         .join(project_id.to_string())
 }
 
+/// Returns the profile directory path for a terminal-scoped browser.
+/// Terminal-scoped browsers provide isolation between multiple MCP sessions in the same project.
+pub fn browser_user_data_dir_path_for_terminal(
+    project_id: u64,
+    terminal_id: u64,
+) -> io::Result<PathBuf> {
+    Ok(project_dirs()?
+        .data_dir()
+        .join(WEBVIEW2_USER_DATA_DIR)
+        .join("projects")
+        .join(project_id.to_string())
+        .join("terminals")
+        .join(terminal_id.to_string()))
+}
+
 pub fn browser_recordings_dir(project_id: u64) -> io::Result<PathBuf> {
     let dir = browser_recordings_dir_from_data_dir(project_dirs()?.data_dir(), project_id);
     fs::create_dir_all(&dir)?;

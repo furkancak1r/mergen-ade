@@ -274,11 +274,11 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Browser panel UI must minimize vertical chrome to maximize WebView space.** The panel should allocate ~60-80px total for all UI chrome (tabs + toolbar), leaving the rest for the embedded browser content.
 - **Avoid separate header rows for titles or project names.** The browser panel header should not have a dedicated "Browser" title row or separate project name display; use the activity rail and terminal context to indicate the active project.
 - **Tabs must stay on a single row using horizontal scroll.** Use `ScrollArea::horizontal()` around the tab strip to prevent tabs from wrapping to multiple lines. This keeps tab height predictable (22px) regardless of panel width.
-- **Reserve fixed width for add tab button in tab strip layout.** The add tab (+) button must always be visible. Calculate scrollable tab area as `available_width - add_button_width - spacing` and use `allocate_ui_with_layout()` to constrain the ScrollArea. Button width should be ~28px with 14px icon.
+- **Place add tab button inside ScrollArea next to last tab.** The add tab (+) button should be rendered inside the `ScrollArea::horizontal()` block, immediately after the tabs loop. This ensures the button stays visually connected to the last tab and scrolls with the tab strip. Button width should be ~28px with 14px icon.
 - **Combine URL input and action buttons into one compact toolbar row.** Place the URL input field on the left taking available width, followed by icon-only buttons (Go, Clear, Design Inspect, Screenshot) on the same row with minimal 4px spacing.
 - **Use reduced padding and margins throughout.** Inner margins should be 6px (not 10px); spacing between UI sections should be 4-6px (not 8-16px).
 - **Reduce tab dimensions for compactness.** Tab height should be 22px (not 26px); tab close button should be 16px (not 18px); tab font should be 11px (not 12px).
-- **Preserve all functionality in compact layout.** URL editing with context menu (Copy/Paste), double-click to select all, tab switching/closing, and all toolbar buttons must remain fully functional.
+- **Preserve all functionality in compact layout.** URL editing with double-click to select all, Enter to submit, tab switching/closing, and all toolbar buttons must remain fully functional. Do not add custom right-click context menus to URL input; rely on standard keyboard shortcuts and native egui behavior.
 - **Maintain minimum URL input width.** The URL field should have a minimum width of 100px to remain usable even at narrow panel widths.
 - **Use scrollable tabs at max tab limit.** With 5 tabs (BROWSER_MAX_TABS_PER_PROJECT), horizontal scrolling must work smoothly without clipping tab content.
 
@@ -291,6 +291,18 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Clean stale `mergen-browser-mcp(.exe)` artifacts.** Release scripts must remove any existing sidecar executable from previous builds to prevent accidental packaging.
 - **Helper mode runs headless before GUI initialization.** When `--browser-mcp-helper` is detected, run the MCP JSON-RPC loop and exit; skip all eframe/egui initialization, wgpu setup, and window creation.
 - **Helper mode uses stdio pipes.** The helper reads JSON-RPC requests from stdin and writes responses to stdout; GUI subsystem executables on Windows still support stdio redirection via pipes.
+
+## Browser MCP Multi-Terminal Isolation Guidelines
+- **Browser instances must be terminal-scoped for MCP isolation.** Each terminal using the Browser MCP must have its own isolated WebView2 instance (`BrowserScopeKey::Terminal`) to prevent session conflicts when multiple AI agents control browsers in the same project simultaneously.
+- **BrowserScopeKey enum distinguishes project vs terminal scope.** Use `BrowserScopeKey::Project(pid)` for legacy UI-initiated browser usage; use `BrowserScopeKey::Terminal { project_id, terminal_id }` for MCP-originated browser commands.
+- **Terminal-scoped browsers use isolated profile directories.** Terminal browsers store their WebView2 user data in `webview2/projects/{project_id}/terminals/{terminal_id}/` (via `browser_user_data_dir_path_for_terminal()`), ensuring separate cookies, localStorage, and session state per terminal.
+- **Project browsers remain for UI-initiated navigation.** When users click terminal HTTP links or manually open the browser panel, continue using project-scoped browsers (`BrowserScopeKey::Project`) to preserve the existing single-browser-per-project user experience.
+- **Browser MCP commands always resolve to terminal scope.** The `resolve_browser_mcp_scope()` function returns `BrowserScopeKey::Terminal` based on authenticated `auth_scope.terminal_id`, ensuring MCP commands never share browser state between different terminal sessions.
+- **Session ID validation prevents cross-session contamination.** Browser MCP requests must include the `session_id` from the auth scope; mismatch between request and auth scope session ID rejects the request to prevent session hopping attacks.
+- **Browser state maps use BrowserScopeKey instead of raw project_id.** All browser state (tabs, URL drafts, embedded browser instances, design inspect state, video recordings) is keyed by `BrowserScopeKey` to support both project and terminal scopes uniformly.
+- **UI panel shows active terminal's browser when available.** The browser panel displays the terminal-scoped browser when the active terminal has one open, falling back to project-scoped browser for terminals without terminal-specific browsers.
+- **Terminal browser cleanup occurs on terminal close.** When a terminal exits, its terminal-scoped browser state (tabs, WebView instance, recordings) must be cleaned up to prevent resource leaks.
+- **Terminal-scoped browser URLs are not persisted.** Unlike project-scoped browsers that persist `browser_last_url` to config, terminal-scoped browser URLs are runtime-only and do not survive application restart.
 
 ## Terminal Shortcut Guidelines
 - **Terminal shortcuts are user-configurable.** Store custom terminal command shortcuts in `AppConfig::terminal_shortcuts`; do not hard-code new terminal command shortcuts directly in input handling.
