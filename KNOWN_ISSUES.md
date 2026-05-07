@@ -174,17 +174,17 @@ When adding an entry:
   4. "enter da çalışmıyor amk arka arkaya 2 kere basacak 1 saniye beklesin gerekiyorsa shortcuts" - Enter wasn't working reliably, need double Enter with 1 second delay like shortcuts.
 - Symptoms/Impact:
   1. Users couldn't type task commands in the popup when a terminal was waiting for AI input (e.g., Codex question prompt). The text would be routed to the terminal instead.
-  2. Small text area made it hard to edit multi-line commands/prompts.
+  2. Small text area made it hard to edit multi-line commands/prompts; excessive empty space below buttons.
   3. Default multiline behavior (Enter=newline, Shift+Enter=submit) was the opposite of user preference.
   4. Initial Enter handling in UI response wasn't reliable due to egui focus issues. Also, saved messages needed double Enter like shortcuts do.
 - Root cause:
   1. The `should_steal_attention_terminal_input()` function only checked Directory search, Browser URL, and Settings popup focus, but did not check for foreground message popup focus.
-  2. Window size was 520x320 with 160px text height; insufficient for comfortable editing.
+  2. Window size was 520x320 with 160px hardcoded text height; insufficient space usage with lots of unused area below buttons.
   3. `TextEdit::multiline` default `return_key` is Enter alone for newline; no custom handling for Enter-to-submit.
   4. Initial approach detected Enter in `draw_foreground_message_popup()` via `ui.input()` which wasn't reliable due to response focus state. Also, `send_saved_message_to_terminal()` only sent single Enter while shortcuts send double Enter.
-- Resolution (Part 1 - Initial fixes):
+- Resolution (Part 1 - Layout and initial fixes):
   1. Added early `return false` check in `should_steal_attention_terminal_input()` when `foreground_message_popup_open.is_some()`. This ensures the popup's text input focus blocks attention-stealing even when terminals are in Attention state.
-  2. Increased window size from 520x320 to 600x440 and text area height from 160px to 260px. Added extra 24px spacing before buttons.
+  2. Increased window size from 520x320 to 600x440. Changed text area from hardcoded 260px to dynamic calculation that fills available space: `text_height = available_height - button_row_height - 16px` with minimum 280px. Reduced button gap from 24px to 8px to position buttons closer to bottom and maximize text area.
   3. Changed `TextEdit::multiline` to use `Ctrl+Enter` as return key for newline. Added Enter key detection in `draw_foreground_message_popup()` to trigger save.
 - Resolution (Part 2 - Reliable Enter handling and double Enter):
   1. Moved Enter detection from `draw_foreground_message_popup()` to `raw_input_hook()` for reliable early capture before egui consumes the event.
@@ -204,10 +204,31 @@ When adding an entry:
     - `foreground_message_popup_execute_delete_removes_task` - delete operation works
     - `foreground_message_popup_enter_triggers_save_via_raw_input_hook` - plain Enter triggers save
     - `foreground_message_popup_ctrl_enter_does_not_submit` - Ctrl+Enter doesn't submit
-    - `send_saved_message_schedules_second_enter` - saved message sends double Enter
-    - `handle_shortcuts_sends_double_enter_with_delay` - shortcuts send double Enter (updated for 1000ms)
-- Files/Commands touched: `src/app.rs` (attention check, popup sizing, Ctrl+Enter handling, raw_input_hook Enter handling, helper methods, double Enter scheduling, 8 regression tests), `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo fmt`, `cargo test`
-- References: User request 2026-05-07: "foreground add new task da yaşadığım sorunlar , ilki terminal açıkken text alanına yazamıyorum gidip terminale yazıyor, ikincisi metin alanı daha büyük olabilir popupda butonlar daha aşağıda olabilir, ctrl enter yapınca alt satıra geçsin sadece entera basınca kaydetsin", "enter da çalışmıyor amk arka arkaya 2 kere basacak 1 saniye beklesin gerekiyorsa shortcuts"
+     - `send_saved_message_schedules_second_enter` - saved message sends double Enter
+     - `handle_shortcuts_sends_double_enter_with_delay` - shortcuts send double Enter (updated for 1000ms)
+ - Files/Commands touched: `src/app.rs` (attention check, popup sizing, Ctrl+Enter handling, raw_input_hook Enter handling, helper methods, double Enter scheduling, 8 regression tests), `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo fmt`, `cargo test`
+ - References: User request 2026-05-07: "foreground add new task da yaşadığım sorunlar , ilki terminal açıkken text alanına yazamıyorum gidip terminale yazıyor, ikincisi metin alanı daha büyük olabilir popupda butonlar daha aşağıda olabilir, ctrl enter yapınca alt satıra geçsin sadece entera basınca kaydetsin", "enter da çalışmıyor amk arka arkaya 2 kere basacak 1 saniye beklesin gerekiyorsa shortcuts"
+
+#### Foreground task menu button alignment {#foreground-task-menu-button-alignment}
+ - Date: 2026-05-07
+ - Context: Terminal Manager foreground task queue menu row layout
+ - Error signature: "şu butonları en sağa sabitle oynamasınlar prompta göre" - The edit and delete icon buttons were shifting left/right based on the prompt text length, not staying fixed at the right edge.
+ - Symptoms/Impact: When prompt text was short (e.g., "test"), the action buttons appeared closer to the text. When prompt was long, buttons could be pushed off the visible area or appear misaligned. This inconsistent positioning made the UI look unpolished and harder to use.
+ - Root cause: The `draw_terminal_foreground_message_menu_button()` function used `ui.horizontal()` with natural flow: message button first (size based on content), then edit/delete buttons. Since `ui.button()` sizes based on text content, the remaining space for action buttons varied, causing the right-aligned buttons to shift position.
+ - Resolution (Fixed approach):
+   1. **Initial attempt failed**: Using `ui.available_width()` inside egui menus caused infinite width expansion because menus have unbounded available width.
+   2. **Corrected approach**: Set a fixed menu width (`menu_fixed_width = 160.0`) at the loop level before iterating messages.
+   3. Added fixed width calculation for action buttons area: `action_button_width = CONTROL_ROW_HEIGHT * 2.0 + 4.0` (two icon buttons plus 4px gap).
+   4. Calculate message button width from fixed menu width: `message_width = menu_fixed_width - action_button_width - 8.0`, clamped to minimum 80px.
+   5. Use `ui.set_min_width()` and `ui.set_max_width()` on each row to constrain horizontal layout to the fixed width.
+   6. Changed message button from `ui.button()` to `ui.add_sized()` with the pre-calculated fixed width.
+   7. Edit and delete buttons maintain fixed positions at the right edge regardless of message content length.
+   8. Reduced `capped_hover_text()` limit from 40 to 35 chars to fit better in fixed-width layout.
+ - Prevent recurrence:
+   - Documented in AGENTS.md: "Fixed action button positioning" guideline for Terminal Manager Saved Messages.
+   - Added regression test placeholder: Menu row layout should reserve fixed action width.
+ - Files/Commands touched: `src/app.rs` (menu button layout in `draw_terminal_foreground_message_menu_button()`), `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo fmt`, `cargo test`
+ - References: User request 2026-05-07: "şu butonları en sağa sabitle oynamasınlar prompta göre"
 
 #### Design Inspect failed on disabled HTML buttons and icon did not toggle {#design-inspect-disabled-button}
 - Date: 2026-05-06

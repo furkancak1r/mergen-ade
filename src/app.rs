@@ -20077,12 +20077,16 @@ impl AdeApp {
                 );
                 ui.add_space(8.0);
 
-                // Multiline text input
+                // Multiline text input - fill available space dynamically
                 let input_id = Self::foreground_message_input_id();
                 let available_width = ui.available_width().max(0.0);
-                let text_height = 260.0;
+                // Calculate text height to fill space: available height minus label, spacing, and button row
+                let button_row_height = ui.spacing().interact_size.y;
+                let min_text_height = 280.0f32;
+                let text_height =
+                    (ui.available_height() - button_row_height - 16.0).max(min_text_height);
 
-                let text_edit_response = with_settings_text_edit_chrome(ui, |ui| {
+                let _text_edit_response = with_settings_text_edit_chrome(ui, |ui| {
                     let text_edit =
                         egui::TextEdit::multiline(&mut self.foreground_message_popup_draft)
                             .id(input_id)
@@ -20104,7 +20108,7 @@ impl AdeApp {
                     }
                 });
 
-                ui.add_space(24.0);
+                ui.add_space(8.0);
 
                 // Buttons
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -23407,11 +23411,28 @@ fn draw_terminal_foreground_message_menu_button(
                     );
                     ui.add_space(4.0);
 
+                    // Fixed menu width to prevent infinite expansion
+                    // Use set_min_width on the menu button wrapper to constrain layout
+                    let menu_fixed_width = 160.0f32;
+                    // Fixed width for action buttons area (2 icon buttons + gap)
+                    let action_button_width = CONTROL_ROW_HEIGHT * 2.0 + 4.0;
+                    let message_width = (menu_fixed_width - action_button_width - 8.0).max(80.0);
+
                     for (index, message) in foreground_messages.iter().enumerate() {
                         ui.horizontal(|ui| {
-                            // Message button - sends and removes from queue
+                            // Constrain horizontal layout to fixed width
+                            ui.set_min_width(menu_fixed_width);
+                            ui.set_max_width(menu_fixed_width);
+
+                            // Message button - sends and removes from queue (fixed width)
                             let msg_button = ui
-                                .button(RichText::new(capped_hover_text(message, 40)))
+                                .add_sized(
+                                    egui::vec2(message_width, CONTROL_ROW_HEIGHT),
+                                    egui::Button::new(RichText::new(capped_hover_text(
+                                        message, 35,
+                                    )))
+                                    .sense(egui::Sense::click()),
+                                )
                                 .on_hover_text(message)
                                 .on_hover_cursor(egui::CursorIcon::PointingHand);
                             if msg_button.clicked() {
@@ -23419,7 +23440,9 @@ fn draw_terminal_foreground_message_menu_button(
                                 ui.close_menu();
                             }
 
-                            // Edit button
+                            ui.add_space(4.0);
+
+                            // Edit button (fixed position on right)
                             if styled_icon_button(
                                 ui,
                                 AppIcon::Code,
@@ -23432,7 +23455,7 @@ fn draw_terminal_foreground_message_menu_button(
                                 ui.close_menu();
                             }
 
-                            // Delete button
+                            // Delete button (fixed position on right)
                             if styled_icon_button(
                                 ui,
                                 AppIcon::Trash,
