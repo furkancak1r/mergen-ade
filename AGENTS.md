@@ -252,6 +252,13 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Browser MCP waits must not block egui update paths.** Fixed waits and polling should run in the MCP helper or another non-UI pending flow, not inside `AdeApp::process_browser_mcp_commands()` or WebView script execution that blocks the UI frame.
 - **Native WebView focus must yield to terminal activation.** When a terminal is activated—including re-selecting the same terminal—clear app text-input focus via `surrender_ui_text_focus()` and restore the host window focus via `SetFocus(hwnd)` on Windows. This ensures browser URL input and native WebView2 keyboard focus do not block terminal input capture.
 
+## Browser Panel WebView Z-Order Guidelines
+- **Never use native-popup menus (menu_button) over the WebView content area.** Native WebView2 renders as a child window above egui's immediate-mode rendering. Popups like `ui.menu_button` that extend over the WebView area will appear BEHIND the WebView and be unusable.
+- **Use inline dual buttons instead of menus for WebView toolbar actions.** For screenshot and similar toolbar actions that need multiple options, render side-by-side buttons within a single bordered frame directly in the toolbar (e.g., `[ Full page | Visible area ]`). This avoids all menu/popup complexity and keeps controls in the egui layer above WebView.
+- **WebView must yield during overlay interactions.** When any overlay (tooltip, context menu, inline buttons) is active in the browser panel, hide the WebView via `SetIsVisible(false)` so the overlay appears above it.
+- **Use grace period for smooth hover transitions.** When overlay closes, keep WebView hidden briefly (150ms via `BROWSER_OVERLAY_GRACE_PERIOD_MS`) to prevent flickering when moving mouse between controls.
+- **No per-project menu state needed.** With inline buttons instead of togglable menus, no runtime state tracking (like `browser_screenshot_menu_open_by_project`) is required—buttons are always visible and clickable.
+
 ## Browser Panel Compact UI Guidelines
 - **Browser panel UI must minimize vertical chrome to maximize WebView space.** The panel should allocate ~60-80px total for all UI chrome (tabs + toolbar), leaving the rest for the embedded browser content.
 - **Avoid separate header rows for titles or project names.** The browser panel header should not have a dedicated "Browser" title row or separate project name display; use the activity rail and terminal context to indicate the active project.

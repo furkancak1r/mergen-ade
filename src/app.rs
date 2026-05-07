@@ -98,6 +98,9 @@ const BROWSER_TAB_CLOSE_SIZE: f32 = 16.0;
 const BROWSER_TAB_CLOSE_MARGIN: f32 = 3.0;
 const BROWSER_TAB_LABEL_LEFT_PADDING: f32 = 8.0;
 const BROWSER_TAB_LABEL_RIGHT_GAP: f32 = 3.0;
+/// Grace period in milliseconds to keep WebView hidden after overlay closes.
+/// Prevents flickering when moving mouse from button to dropdown/tooltip.
+const BROWSER_OVERLAY_GRACE_PERIOD_MS: u64 = 150;
 const TERMINAL_SNAPSHOT_BUDGET_PER_FRAME: usize = 2;
 const REPAINT_DEBOUNCE_MS: u64 = 5;
 const INPUT_ROUTING_GATE_MS: u64 = 75;
@@ -1370,6 +1373,9 @@ pub struct AdeApp {
     /// Whether any overlay (dropdown, tooltip, context menu) in the browser panel is active.
     /// Used to hide the native WebView so overlays appear above it.
     browser_panel_overlay_active: bool,
+    /// Grace period timestamp until which WebView should remain hidden after overlay closes.
+    /// Prevents flickering when moving mouse from button to dropdown/tooltip.
+    browser_overlay_grace_until: Option<Instant>,
     /// Active embedded-browser video recordings per project.
     browser_video_recordings_by_project: BTreeMap<u64, BrowserVideoRecordingState>,
     browser_video_encode_events_tx: Sender<BrowserVideoEncodeEvent>,
@@ -3822,6 +3828,7 @@ impl AdeApp {
             browser_design_inspect_last_delivery_by_destination: BTreeMap::new(),
             browser_pending_screenshot_requests: BTreeMap::new(),
             browser_panel_overlay_active: false,
+            browser_overlay_grace_until: None,
             browser_video_recordings_by_project: BTreeMap::new(),
             browser_video_encode_events_tx,
             browser_video_encode_events_rx,
@@ -16614,11 +16621,12 @@ impl AdeApp {
     }
 
     /// Check if the embedded browser should be hidden due to UI overlays.
-    /// Returns true when Settings, exit confirmation, popups, or context menus are open.
+    /// Returns true when Settings, exit confirmation, popups, context menus are open,
+    /// or when the grace period after an overlay is still active.
     fn should_hide_embedded_browser_for_ui_layer(&self, ctx: &egui::Context) -> bool {
         // Check if context menu overlaps with browser panel area
         let context_menu_overlaps_browser = self.context_menu_overlaps_browser_panel(ctx);
-        embedded_browser_should_yield_to_ui_layer(
+        let overlay_active = embedded_browser_should_yield_to_ui_layer(
             self.show_settings_popup,
             self.show_exit_confirm_popup,
             self.terminal_history_popup_open.is_some(),
@@ -16627,7 +16635,14 @@ impl AdeApp {
             context_menu_overlaps_browser,
             self.browser_panel_overlay_active,
             self.foreground_message_popup_open.is_some(),
-        )
+        );
+
+        // Check if grace period is still active (prevents flickering during hover transitions)
+        let grace_active = self
+            .browser_overlay_grace_until
+            .is_some_and(|until| Instant::now() < until);
+
+        overlay_active || grace_active
     }
 
     /// Check if the active context menu overlaps with the browser panel area.
@@ -18105,56 +18120,84 @@ impl AdeApp {
         }
     }
 
-    /// Draw the browser screenshot dropdown button.
-    /// Returns (menu_open, hovered) tuple to allow parent to track overlay state.
-    fn draw_browser_screenshot_button(
+    /// Draw the browser screenshot dual buttons in a single frame.
+    /// Side-by-side "Full page" and "Visible area" buttons without any popup/menu.
+    /// Returns true if either button is hovered (for overlay tracking).
+    fn draw_browser_screenshot_buttons(
         &mut self,
         ui: &mut Ui,
         ctx: &egui::Context,
         project_id: u64,
-    ) -> (bool, bool) {
-        let screenshot_menu = with_minimal_button_chrome(ui, |ui| {
-            ui.menu_button(format!("{}", icons::CAMERA), |ui| {
-                with_minimal_button_chrome(ui, |ui| {
-                    ui.label(RichText::new("Screenshot").strong().color(TEXT_PRIMARY));
-                    ui.separator();
-
-                    // Full page screenshot
-                    if ui.button("Full page").clicked() {
-                        self.queue_browser_screenshot(project_id, true, ctx);
-                        ui.close_menu();
-                    }
-                    // Visible area screenshot
-                    if ui.button("Visible area").clicked() {
-                        self.queue_browser_screenshot(project_id, false, ctx);
-                        ui.close_menu();
-                    }
-                });
-            })
-        });
-
+    ) -> bool {
         let has_pending = self
             .browser_pending_screenshot_requests
             .values()
             .any(|(pid, _, _)| *pid == project_id);
 
-        let tooltip = if has_pending {
-            "Screenshot capture pending..."
-        } else {
-            "Take screenshot"
-        };
+        // Container frame with border holding both buttons side by side
+        let mut any_hovered = false;
 
-        let response = screenshot_menu
-            .response
-            .on_hover_text(tooltip)
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        egui::Frame::none()
+            .fill(SURFACE_BG)
+            .stroke(Stroke::new(1.0, BORDER_COLOR))
+            .rounding(6.0)
+            .inner_margin(egui::Margin::symmetric(4.0, 4.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // Full page button
+                    let full_page_tooltip = if has_pending {
+                        "Full page screenshot (pending...)"
+                    } else {
+                        "Full page screenshot"
+                    };
+                    let full_page_btn = ui
+                        .add(
+                            egui::Button::new(RichText::new("Full page").color(TEXT_PRIMARY))
+                                .fill(Color32::TRANSPARENT)
+                                .frame(false),
+                        )
+                        .on_hover_text(full_page_tooltip)
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
 
-        if response.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
+                    if full_page_btn.hovered() {
+                        any_hovered = true;
+                    }
+                    if full_page_btn.clicked() {
+                        self.queue_browser_screenshot(project_id, true, ctx);
+                    }
 
-        // Return (menu_open, hovered) tuple
-        (screenshot_menu.inner.is_some(), response.hovered())
+                    ui.add_space(4.0);
+
+                    // Separator line
+                    ui.separator();
+
+                    ui.add_space(4.0);
+
+                    // Visible area button
+                    let visible_tooltip = if has_pending {
+                        "Visible area screenshot (pending...)"
+                    } else {
+                        "Visible area screenshot"
+                    };
+                    let visible_btn = ui
+                        .add(
+                            egui::Button::new(RichText::new("Visible area").color(TEXT_PRIMARY))
+                                .fill(Color32::TRANSPARENT)
+                                .frame(false),
+                        )
+                        .on_hover_text(visible_tooltip)
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                    if visible_btn.hovered() {
+                        any_hovered = true;
+                    }
+                    if visible_btn.clicked() {
+                        self.queue_browser_screenshot(project_id, false, ctx);
+                    }
+                });
+            });
+
+        any_hovered
     }
 
     /// Queue a browser screenshot request. The actual capture happens when the browser
@@ -18319,6 +18362,13 @@ impl AdeApp {
     fn draw_browser_panel(&mut self, ctx: &egui::Context) -> Option<egui::Rect> {
         if !self.is_active_browser_panel_open() {
             return None;
+        }
+
+        // If overlay was active last frame and is now being reset, start grace period.
+        // This prevents WebView from immediately reappearing during hover transitions.
+        if self.browser_panel_overlay_active {
+            self.browser_overlay_grace_until =
+                Some(Instant::now() + Duration::from_millis(BROWSER_OVERLAY_GRACE_PERIOD_MS));
         }
 
         // Reset the overlay active flag at the start of each frame.
@@ -18688,16 +18738,15 @@ impl AdeApp {
 
                         ui.add_space(4.0);
 
-                        // Screenshot dropdown button (already tracks menu and hover)
-                        let (screenshot_menu_open, screenshot_hovered) =
-                            self.draw_browser_screenshot_button(ui, ctx, browser_project_id);
+                        // Screenshot dual buttons in single frame (no popup, avoids WebView z-order issues)
+                        let screenshot_hovered =
+                            self.draw_browser_screenshot_buttons(ui, ctx, browser_project_id);
 
                         // Aggregate overlay state from all toolbar buttons
                         self.browser_panel_overlay_active = self.browser_panel_overlay_active
                             || go_hovered
                             || clear_hovered
                             || inspect_hovered
-                            || screenshot_menu_open
                             || screenshot_hovered;
                     });
 
@@ -35475,6 +35524,7 @@ mod tests {
             browser_design_inspect_last_delivery_by_destination: BTreeMap::new(),
             browser_pending_screenshot_requests: BTreeMap::new(),
             browser_panel_overlay_active: false,
+            browser_overlay_grace_until: None,
             browser_video_recordings_by_project: BTreeMap::new(),
             browser_video_encode_events_tx,
             browser_video_encode_events_rx,

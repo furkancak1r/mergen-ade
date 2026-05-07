@@ -142,6 +142,28 @@ When adding an entry:
 - Files/Commands touched: `src/app.rs` (AdeApp struct field rename, new `styled_icon_button_response()` helper, modified `draw_browser_panel()`, `draw_browser_screenshot_button()` signature change, tab strip hover tracking, `embedded_browser_should_yield_to_ui_layer()` parameter rename, `should_hide_embedded_browser_for_ui_layer()` update, new and updated tests), `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: User request 2026-05-07: "browserın altında kalıyor açılan dropdownlar hoverlar"
 
+#### Browser panel screenshot dropdown still hidden behind WebView {#browser-screenshot-dropdown-permanent-fix}
+- Date: 2026-05-07 (follow-up)
+- Context: Screenshot dropdown menu in browser panel toolbar still appearing behind WebView despite hover-based hiding
+- Error signature: Initial fix (hover-based WebView hiding) was insufficient. Dropdown appeared for one frame then disappeared because the native WebView intercepted mouse events when cursor moved from button to dropdown area. User reported: "screenshot almaya çalışıyorum dropdowna geliyorum ama browsera gelmişim gibi davranıyor kayboluyor arkaya geçiyor"
+- Symptoms/Impact: Screenshot dropdown menu opened then immediately closed; could not select "Full page" or "Visible area" options because WebView took focus during the hover transition from button to menu.
+- Root cause:
+  - The initial fix relied on `on_hover_text()` detection to hide WebView when hovering over toolbar buttons.
+  - When the user clicked to open the dropdown, the menu appeared as a native `egui::menu_button` popup which extends over the WebView content area.
+  - During the mouse movement from button to menu, there was a brief moment where neither button nor menu was hovered, causing WebView to reappear and steal the mouse event.
+  - Native WebView2 as a child window always renders above egui popups, making any floating menu/popup approach fundamentally incompatible.
+- Resolution (permanent fix - final):
+  - Removed all menu/popup approaches entirely. Instead of a dropdown or inline menu, implemented side-by-side dual buttons within a single bordered frame.
+  - Rewrote `draw_browser_screenshot_button()` as `draw_browser_screenshot_buttons()` which renders `[ Full page | Visible area ]` inline in the toolbar.
+  - Both buttons are always visible—no toggle state, no menu open/close logic, no WebView interference during transitions.
+  - Removed `browser_screenshot_menu_open_by_project` state tracking (no longer needed).
+  - The dual-button frame appears within the egui layer, completely avoiding WebView z-order issues.
+- Prevent recurrence:
+  - Updated AGENTS.md section: "Browser Panel WebView Z-Order Guidelines" with new invariant: "Use inline dual buttons instead of menus for WebView toolbar actions."
+  - Guideline explicitly states: side-by-side buttons within a single bordered frame, no per-project menu state needed.
+- Files/Commands touched: `src/app.rs` (dual buttons implementation, removed menu state), `AGENTS.md` (updated z-order guidelines), `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-05-07: "hala düzelmedi screenshot almaya çalışıyorum dropdowna geliyorum ama browsera gelmişim gibi davranıyor kayboluyor arkaya geçiyor", "tamam siktir et yan yana 2 tane ekran görüntüsü alma butonu ekle ikisini de bir dikdörtgen içinde göster öyle çözelim"
+
 #### Design Inspect failed on disabled HTML buttons and icon did not toggle {#design-inspect-disabled-button}
 - Date: 2026-05-06
 - Context: Browser panel Design Inspect mode on pages with disabled buttons/inputs
