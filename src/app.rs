@@ -101,6 +101,9 @@ const BROWSER_TAB_LABEL_RIGHT_GAP: f32 = 3.0;
 /// Grace period in milliseconds to keep WebView hidden after overlay closes.
 /// Prevents flickering when moving mouse from button to dropdown/tooltip.
 const BROWSER_OVERLAY_GRACE_PERIOD_MS: u64 = 150;
+/// Gap in pixels between browser toolbar buttons and their tooltips.
+/// Tooltips appear above buttons to avoid overlapping with the WebView.
+const BROWSER_TOOLBAR_TOOLTIP_GAP: f32 = 4.0;
 const TERMINAL_SNAPSHOT_BUDGET_PER_FRAME: usize = 2;
 const REPAINT_DEBOUNCE_MS: u64 = 5;
 const INPUT_ROUTING_GATE_MS: u64 = 75;
@@ -18349,20 +18352,18 @@ impl AdeApp {
             .inner_margin(egui::Margin::symmetric(4.0, 4.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    // Full page button (scan icon)
+                    // Full page button (scan icon) - custom tooltip above
                     let full_page_tooltip = if has_pending {
                         "Full page screenshot (pending...)"
                     } else {
                         "Full page screenshot"
                     };
-                    let full_page_btn = ui
-                        .add(
-                            egui::Button::new(format!("{}", icons::SCAN))
-                                .fill(Color32::TRANSPARENT)
-                                .frame(false),
-                        )
-                        .on_hover_text(full_page_tooltip)
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    let full_page_btn = ui.add(
+                        egui::Button::new(format!("{}", icons::SCAN))
+                            .fill(Color32::TRANSPARENT)
+                            .frame(false),
+                    );
+                    show_tooltip_above(ui, &full_page_btn, full_page_tooltip);
 
                     if full_page_btn.hovered() {
                         any_hovered = true;
@@ -18378,20 +18379,18 @@ impl AdeApp {
 
                     ui.add_space(4.0);
 
-                    // Visible area button (scan-line icon)
+                    // Visible area button (scan-line icon) - custom tooltip above
                     let visible_tooltip = if has_pending {
                         "Visible area screenshot (pending...)"
                     } else {
                         "Visible area screenshot"
                     };
-                    let visible_btn = ui
-                        .add(
-                            egui::Button::new(format!("{}", icons::SCAN_LINE))
-                                .fill(Color32::TRANSPARENT)
-                                .frame(false),
-                        )
-                        .on_hover_text(visible_tooltip)
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    let visible_btn = ui.add(
+                        egui::Button::new(format!("{}", icons::SCAN_LINE))
+                            .fill(Color32::TRANSPARENT)
+                            .frame(false),
+                    );
+                    show_tooltip_above(ui, &visible_btn, visible_tooltip);
 
                     if visible_btn.hovered() {
                         any_hovered = true;
@@ -18869,12 +18868,9 @@ impl AdeApp {
                         ui.add_space(4.0);
 
                         // Go button
-                        let go_response = styled_icon_button_response(
+                        let go_response = browser_toolbar_icon_button(
                             ui,
                             icons::ARROW_RIGHT,
-                            BTN_TEAL,
-                            BTN_TEAL_HOVER,
-                            BTN_ICON_ACTIVE,
                             "Go to URL",
                         );
                         if go_response.clicked() {
@@ -18884,12 +18880,9 @@ impl AdeApp {
                         ui.add_space(4.0);
 
                         // Clear URL button
-                        let clear_response = styled_icon_button_response(
+                        let clear_response = browser_toolbar_icon_button(
                             ui,
                             icons::TRASH,
-                            BTN_RED,
-                            BTN_RED_HOVER,
-                            Color32::from_rgb(186, 58, 58),
                             "Clear URL",
                         );
                         if clear_response.clicked() {
@@ -18911,7 +18904,7 @@ impl AdeApp {
                         } else {
                             icons::EYE_OFF
                         };
-                        let inspect_response = activity_rail_icon_button(
+                        let inspect_response = browser_toolbar_toggle_button(
                             ui,
                             design_inspect_enabled,
                             inspect_icon,
@@ -23996,6 +23989,99 @@ fn styled_icon_button(
     );
 
     response.clicked()
+}
+
+/// Browser toolbar icon button with tooltip shown above the button.
+/// Unlike standard tooltips that appear below (which can overlap WebView),
+/// this helper positions the tooltip above to avoid z-order issues.
+fn browser_toolbar_icon_button(ui: &mut Ui, icon: AppIcon, tooltip: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT),
+        Sense::click(),
+    );
+
+    // Show custom tooltip above the button when hovered
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect.shrink(1.0), 8.0, with_alpha(BTN_ICON_HOVER, 110));
+
+        let tooltip_id = ui.make_persistent_id(("browser_toolbar_tooltip", response.id));
+        let tooltip_pos = rect.center_top() + egui::vec2(0.0, -BROWSER_TOOLBAR_TOOLTIP_GAP);
+
+        egui::containers::show_tooltip_at(ui.ctx(), ui.layer_id(), tooltip_id, tooltip_pos, |ui| {
+            ui.label(tooltip);
+        });
+    }
+
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        format!("{icon}"),
+        egui::FontId::proportional(15.0),
+        if response.is_pointer_button_down_on() || response.hovered() {
+            Color32::from_rgb(255, 255, 255)
+        } else {
+            with_alpha(TEXT_PRIMARY, 178)
+        },
+    );
+
+    response
+}
+
+/// Browser toolbar toggle button with tooltip shown above.
+/// Supports ON/OFF state visualization like Design Inspect toggle.
+fn browser_toolbar_toggle_button(
+    ui: &mut Ui,
+    selected: bool,
+    icon: AppIcon,
+    tooltip: &str,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT),
+        Sense::click(),
+    );
+
+    // Show custom tooltip above the button when hovered
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect.shrink(1.0), 8.0, with_alpha(BTN_ICON_HOVER, 110));
+
+        let tooltip_id = ui.make_persistent_id(("browser_toolbar_tooltip", response.id));
+        let tooltip_pos = rect.center_top() + egui::vec2(0.0, -BROWSER_TOOLBAR_TOOLTIP_GAP);
+
+        egui::containers::show_tooltip_at(ui.ctx(), ui.layer_id(), tooltip_id, tooltip_pos, |ui| {
+            ui.label(tooltip);
+        });
+    }
+
+    let icon_color = if selected || response.hovered() || response.is_pointer_button_down_on() {
+        Color32::from_rgb(255, 255, 255)
+    } else {
+        with_alpha(TEXT_PRIMARY, 170)
+    };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        format!("{icon}"),
+        egui::FontId::proportional(14.0),
+        icon_color,
+    );
+
+    response
+}
+
+/// Show a tooltip above the given widget response.
+/// Helper for custom buttons that need tooltip positioning above the widget.
+fn show_tooltip_above(ui: &mut Ui, response: &egui::Response, tooltip: &str) {
+    if response.hovered() {
+        let tooltip_id = ui.make_persistent_id(("browser_toolbar_tooltip", response.id));
+        let tooltip_pos =
+            response.rect.center_top() + egui::vec2(0.0, -BROWSER_TOOLBAR_TOOLTIP_GAP);
+
+        egui::containers::show_tooltip_at(ui.ctx(), ui.layer_id(), tooltip_id, tooltip_pos, |ui| {
+            ui.label(tooltip);
+        });
+    }
 }
 
 /// Variant of `styled_icon_button` that returns the full Response for hover tracking.
