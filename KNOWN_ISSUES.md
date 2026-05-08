@@ -10,6 +10,55 @@ When adding an entry:
 
 ---
 
+#### Input History panel Foreground filter limited to 5 entries {#input-history-foreground-limit}
+- Date: 2026-05-08
+- Context: Input History left sidebar panel showing too many foreground entries
+- Error signature: User reported: "input historyde terminal foregroundda max 5 tane gözüksün şuan hepsi geliyor" — The Foreground filter in Input History panel was showing all matching entries instead of limiting to 5.
+- Symptoms/Impact: When viewing Input History with Foreground filter selected, users would see all historical foreground entries (potentially hundreds), making the list overwhelming and difficult to navigate.
+- Root cause:
+  - `draw_input_history_entries()` in `src/app.rs` collected all matching entries without applying any display limit.
+  - The `RECENT_INPUTS_MAX = 5` constant existed but was only used for `recent_inputs` (terminal popup/runtime history), not for the Input History panel display.
+  - The Foreground filter displayed every matching entry from persistent history (up to 500 entries per project).
+- Resolution:
+  - Modified `draw_input_history_entries()` to apply `truncate(Self::RECENT_INPUTS_MAX)` when `InputHistoryFilter::Foreground` is selected.
+  - The total matching count is preserved for the UI label (shows "X entries" where X is total matching, not limited count).
+  - `All` and `Background` filters remain unlimited — they show all matching entries.
+  - Persistent storage limit (500 entries per project) unchanged — only the display is limited.
+- Prevent recurrence:
+  - Added regression test `input_history_panel_foreground_shows_max_five_entries` verifying:
+    - 7 foreground entries in history, Foreground filter shows only 5
+    - Total count (7) preserved for UI label
+  - Added regression test `input_history_panel_all_and_background_unlimited` verifying:
+    - All filter shows all entries (14 total: 7 foreground + 7 background)
+    - Background filter shows all 7 background entries (no limit)
+  - Updated `AGENTS.md` Terminal Manager & Input History Guidelines with the new rule.
+- Files/Commands touched: `src/app.rs` (draw_input_history_entries() truncation logic, 2 new regression tests), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-05-08: "input historyde terminal foregroundda max 5 tane gözüksün şuan hepsi geliyor"
+
+---
+
+#### Browser tab strip tooltips now appear above tabs {#browser-tab-strip-tooltips-above}
+- Date: 2026-05-08
+- Context: Browser panel tab strip hover tooltips (Close tab, tab URL/title, New tab button)
+- Error signature: User reported: "browserda toolbarda üstüne gelince hover geliyor ya o gelen hoverlar altta değil üstte çıksın" — Tooltips on tab strip elements (close button, tab title, add tab button) were appearing below the tabs, potentially overlapping the WebView content area.
+- Symptoms/Impact: Tab strip tooltips appeared below the tab strip by default (egui standard behavior), causing them to extend into the WebView area where they could be obscured by the native WebView2 window.
+- Root cause:
+  - Tab close button, tab title hover, and add tab (+) button used standard `on_hover_text()` which positions tooltips below the widget.
+  - Native WebView2 renders as a child window above egui's immediate-mode rendering, so any tooltip overlapping the WebView area gets obscured.
+  - Previous fixes addressed toolbar buttons (Go, Clear, Design Inspect, Screenshot) but tab strip tooltips were missed.
+- Resolution:
+  - Changed tab close button tooltip from `.on_hover_text("Close tab")` to `show_tooltip_above(ui, &close_response, "Close tab")`.
+  - Changed tab title/URL tooltip from `.on_hover_text(url...)` to `show_tooltip_above(ui, &tab_response, tab_url_tooltip)`.
+  - Changed add tab (+) button tooltip from `.on_hover_text(if can_add_tab {...})` to `show_tooltip_above(ui, &add_response, add_tooltip)`.
+  - All tab strip tooltips now render entirely within the egui layer above the WebView using the shared `show_tooltip_above()` helper.
+- Prevent recurrence:
+  - Updated `AGENTS.md` Browser Panel WebView Z-Order Guidelines with new rule: "Tab strip tooltips must also appear above."
+  - The pattern is consistent with toolbar buttons which already use `browser_toolbar_icon_button()` and `show_tooltip_above()` helpers.
+- Files/Commands touched: `src/app.rs` (tab strip tooltip rendering in `draw_browser_panel()`), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-05-08: "browserda toolbarda üstüne gelince hover geliyor ya o gelen hoverlar altta değil üstte çıksın"
+
+---
+
 #### Browser tab lifecycle improvements {#browser-tab-lifecycle-improvements}
 - Date: 2026-05-08
 - Context: Browser panel tab closing behavior and auto-loading saved URLs

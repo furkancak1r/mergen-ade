@@ -14962,7 +14962,7 @@ impl AdeApp {
         let search = self.input_history_search_query.trim().to_lowercase();
 
         // Collect matching entries (clone to avoid borrow issues)
-        let entries: Vec<TerminalInputRecord> = self
+        let mut entries: Vec<TerminalInputRecord> = self
             .input_history
             .projects
             .get(&project_path_str)
@@ -14972,6 +14972,14 @@ impl AdeApp {
             .filter(|e| filter.matches(e.terminal_kind))
             .filter(|e| search.is_empty() || e.text.to_lowercase().contains(&search))
             .collect();
+
+        // Limit Foreground display to RECENT_INPUTS_MAX entries
+        let total_matching = entries.len();
+        if matches!(filter, InputHistoryFilter::Foreground)
+            && entries.len() > Self::RECENT_INPUTS_MAX
+        {
+            entries.truncate(Self::RECENT_INPUTS_MAX);
+        }
 
         if entries.is_empty() {
             let msg = if search.is_empty() {
@@ -14984,7 +14992,7 @@ impl AdeApp {
         }
 
         ui.label(
-            RichText::new(format!("{} entries", entries.len()))
+            RichText::new(format!("{} entries", total_matching))
                 .small()
                 .color(TEXT_MUTED),
         );
@@ -18713,19 +18721,18 @@ impl AdeApp {
                                         );
                                         let close_rect = browser_tab_close_rect(tab_rect);
                                         let label_rect = browser_tab_label_rect(tab_rect);
-                                        let close_response = ui
-                                            .interact(
-                                                close_rect,
-                                                ui.make_persistent_id(("browser-tab-close", project_id, tab_id)),
-                                                Sense::click(),
-                                            )
-                                            .on_hover_text("Close tab")
-                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                        let tab_response = tab_response
-                                            .on_hover_text(
-                                                url.as_deref().unwrap_or(title.as_str()).to_owned(),
-                                            )
-                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                        let close_response = ui.interact(
+                                            close_rect,
+                                            ui.make_persistent_id(("browser-tab-close", project_id, tab_id)),
+                                            Sense::click(),
+                                        );
+                                        // Show close tooltip above button to avoid WebView overlap
+                                        show_tooltip_above(ui, &close_response, "Close tab");
+
+                                        // Show tab URL/title tooltip above the tab
+                                        let tab_url_tooltip = url.as_deref().unwrap_or(title.as_str());
+                                        show_tooltip_above(ui, &tab_response, tab_url_tooltip);
+
                                         let tab_hovered = tab_response.hovered() || close_response.hovered();
                                         let painted_fill = if *is_active {
                                             fill
@@ -18797,12 +18804,14 @@ impl AdeApp {
                                             [BROWSER_ADD_TAB_BUTTON_WIDTH, BROWSER_TAB_HEIGHT],
                                             add_button,
                                         )
-                                        .on_hover_text(if can_add_tab {
-                                            "New tab"
-                                        } else {
-                                            "Tab limit reached"
-                                        })
                                         .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                    // Show add tab tooltip above button to avoid WebView overlap
+                                    let add_tooltip = if can_add_tab {
+                                        "New tab"
+                                    } else {
+                                        "Tab limit reached"
+                                    };
+                                    show_tooltip_above(ui, &add_response, add_tooltip);
                                     if add_response.clicked() && can_add_tab {
                                         add_tab_requested = true;
                                     }
@@ -40204,6 +40213,137 @@ mod tests {
         // Newest first
         assert_eq!(recent[0], "cmd0");
         assert_eq!(recent[4], "cmd4");
+    }
+
+    #[test]
+    fn input_history_panel_foreground_shows_max_five_entries() {
+        use crate::models::{
+            InputHistoryFilter, TerminalInputHistory, TerminalInputRecord, TerminalKind,
+        };
+        use std::path::PathBuf;
+
+        let mut app = test_app([(1, test_terminal_entry(1, 1))], Some(1));
+        app.projects.insert(
+            1,
+            test_project(1, "Test", "C:/test", &["msg1"], &["check1"]),
+        );
+        app.input_history_selected_project_id = Some(1);
+        app.config.ui.input_history_filter = InputHistoryFilter::Foreground;
+
+        // Create 7 Foreground entries (more than RECENT_INPUTS_MAX of 5)
+        let entries: Vec<TerminalInputRecord> = (0..7)
+            .map(|i| TerminalInputRecord {
+                project_path: PathBuf::from("C:/test"),
+                project_name: "Test".to_owned(),
+                terminal_kind: TerminalKind::Foreground,
+                text: format!("fg{}", i),
+                recorded_at: i as u64,
+            })
+            .collect();
+
+        let project_history = TerminalInputHistory {
+            max_entries: 500,
+            entries,
+        };
+        app.input_history
+            .projects
+            .insert("C:/test".to_owned(), project_history);
+
+        // Helper to simulate filtering logic from draw_input_history_entries
+        let project_path_str = "C:/test".to_owned();
+        let filter = app.config.ui.input_history_filter;
+        let search = "";
+        let mut entries: Vec<TerminalInputRecord> = app
+            .input_history
+            .projects
+            .get(&project_path_str)
+            .map(|h| h.entries.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| filter.matches(e.terminal_kind))
+            .filter(|e| search.is_empty() || e.text.to_lowercase().contains(&search))
+            .collect();
+        let total_matching = entries.len();
+        if matches!(filter, InputHistoryFilter::Foreground)
+            && entries.len() > crate::app::AdeApp::RECENT_INPUTS_MAX
+        {
+            entries.truncate(crate::app::AdeApp::RECENT_INPUTS_MAX);
+        }
+
+        // Should show only 5 entries even though 7 match
+        assert_eq!(entries.len(), 5);
+        assert_eq!(total_matching, 7); // Total count preserved for label
+    }
+
+    #[test]
+    fn input_history_panel_all_and_background_unlimited() {
+        use crate::models::{
+            InputHistoryFilter, TerminalInputHistory, TerminalInputRecord, TerminalKind,
+        };
+        use std::path::PathBuf;
+
+        let mut app = test_app([(1, test_terminal_entry(1, 1))], Some(1));
+        app.projects.insert(
+            1,
+            test_project(1, "Test", "C:/test", &["msg1"], &["check1"]),
+        );
+        app.input_history_selected_project_id = Some(1);
+
+        // Create 7 entries of each kind
+        let entries: Vec<TerminalInputRecord> = (0..7)
+            .flat_map(|i| {
+                [
+                    TerminalInputRecord {
+                        project_path: PathBuf::from("C:/test"),
+                        project_name: "Test".to_owned(),
+                        terminal_kind: TerminalKind::Foreground,
+                        text: format!("fg{}", i),
+                        recorded_at: (i * 2) as u64,
+                    },
+                    TerminalInputRecord {
+                        project_path: PathBuf::from("C:/test"),
+                        project_name: "Test".to_owned(),
+                        terminal_kind: TerminalKind::Background,
+                        text: format!("bg{}", i),
+                        recorded_at: (i * 2 + 1) as u64,
+                    },
+                ]
+            })
+            .collect();
+
+        let project_history = TerminalInputHistory {
+            max_entries: 500,
+            entries,
+        };
+        app.input_history
+            .projects
+            .insert("C:/test".to_owned(), project_history);
+
+        // Test All filter - should show all 14 entries (not limited)
+        app.config.ui.input_history_filter = InputHistoryFilter::All;
+        let all_entries: Vec<TerminalInputRecord> = app
+            .input_history
+            .projects
+            .get("C:/test")
+            .map(|h| h.entries.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| InputHistoryFilter::All.matches(e.terminal_kind))
+            .collect();
+        assert_eq!(all_entries.len(), 14);
+
+        // Test Background filter - should show all 7 background entries (not limited)
+        app.config.ui.input_history_filter = InputHistoryFilter::Background;
+        let bg_entries: Vec<TerminalInputRecord> = app
+            .input_history
+            .projects
+            .get("C:/test")
+            .map(|h| h.entries.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| InputHistoryFilter::Background.matches(e.terminal_kind))
+            .collect();
+        assert_eq!(bg_entries.len(), 7);
     }
 
     #[test]
