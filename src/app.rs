@@ -16713,7 +16713,6 @@ impl AdeApp {
         title: Option<String>,
     ) -> Result<u64, String> {
         let scope = scope.into();
-        self.ensure_browser_tab_state(scope);
         let tab_count = self
             .browser_tabs_by_scope
             .get(&scope)
@@ -16794,10 +16793,14 @@ impl AdeApp {
             .map(Vec::is_empty)
             .unwrap_or(true);
         if tabs_empty {
+            // Last tab closed - clean up all browser state for this scope
             self.active_browser_tab_by_scope.remove(&scope);
             self.browser_tabs_by_scope.remove(&scope);
             self.browser_url_draft_by_scope.remove(&scope);
-            self.ensure_browser_tab_state(scope);
+            // Also clean up any inactive browsers for this scope
+            self.inactive_browser_tab_browsers
+                .retain(|(s, _), _| s != &scope);
+            // Active browser was already shut down above if it was active
             return Ok(());
         }
 
@@ -17666,7 +17669,6 @@ impl AdeApp {
         request: &BrowserMcpIpcRequest,
     ) -> BrowserMcpIpcResponse {
         let scope = scope.into();
-        self.ensure_browser_tab_state(scope);
         let action = request
             .params
             .get("action")
@@ -17757,7 +17759,6 @@ impl AdeApp {
         request: &BrowserMcpIpcRequest,
     ) -> BrowserMcpIpcResponse {
         let scope = scope.into();
-        self.ensure_browser_tab_state(scope);
         let tab_id = match self.resolve_browser_tab_id_from_params(scope, &request.params) {
             Ok(tab_id) => tab_id,
             Err(err) => return BrowserMcpIpcResponse::error(err),
@@ -18660,7 +18661,24 @@ impl AdeApp {
                         .map(|browser| browser.status())
                         .unwrap_or(BrowserStatus::Uninitialized);
 
-                    self.ensure_browser_tab_state(browser_scope);
+                    // Auto-create first tab with saved URL if no tabs exist
+                    let has_tabs = self
+                        .browser_tabs_by_scope
+                        .get(&browser_scope)
+                        .map(|tabs| !tabs.is_empty())
+                        .unwrap_or(false);
+                    if !has_tabs {
+                        if let Some(url) = browser_last_url.clone() {
+                            // Create first tab with the saved URL and navigate
+                            let _ = self.add_browser_tab(
+                                browser_scope,
+                                Some(url.clone()),
+                                BrowserTabKind::Page,
+                                None,
+                            );
+                        }
+                    }
+
                     let tab_summaries = self.browser_tab_summary(browser_scope);
                     let mut tab_to_select = None;
                     let mut tab_to_close = None;
@@ -18817,8 +18835,18 @@ impl AdeApp {
                     ui.add_space(4.0);
 
                     // Get or initialize the URL draft for this project
+                    // Only auto-fill with browser_last_url if tabs exist
                     if !self.browser_url_draft_by_scope.contains_key(&browser_scope) {
-                        let initial_draft = browser_last_url.clone().unwrap_or_default();
+                        let has_tabs_now = self
+                            .browser_tabs_by_scope
+                            .get(&browser_scope)
+                            .map(|tabs| !tabs.is_empty())
+                            .unwrap_or(false);
+                        let initial_draft = if has_tabs_now {
+                            browser_last_url.clone().unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
                         self.browser_url_draft_by_scope
                             .insert(browser_scope, initial_draft);
                     }
@@ -43814,7 +43842,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_last_browser_tab_recreates_empty_tab() {
+    fn closing_last_browser_tab_leaves_no_tabs() {
         let mut app = test_app([], None);
         app.projects
             .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
@@ -43823,14 +43851,41 @@ mod tests {
         app.close_browser_tab(1, first_tab)
             .expect("last tab should close");
 
+        // After closing the last tab, no tabs should remain
+        let tabs_opt = app.browser_tabs_by_scope.get(&BrowserScopeKey::Project(1));
+        assert!(tabs_opt.is_none() || tabs_opt.unwrap().is_empty());
+        assert!(app.active_browser_tab_id(1).is_none());
+    }
+
+    #[test]
+    fn add_tab_creates_first_tab_when_no_tabs_exist() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+
+        // First ensure a tab exists, then close it to get to empty state
+        let first_tab = app.ensure_browser_tab_state(1);
+        app.close_browser_tab(1, first_tab)
+            .expect("last tab should close");
+
+        // Verify no tabs exist
+        assert!(app
+            .browser_tabs_by_scope
+            .get(&BrowserScopeKey::Project(1))
+            .is_none());
+
+        // Add a new tab - should create the first tab
+        let new_tab_id = app
+            .add_browser_tab(1, None, BrowserTabKind::Page, None)
+            .expect("should create first tab");
+
         let tabs = app
             .browser_tabs_by_scope
             .get(&BrowserScopeKey::Project(1))
             .unwrap();
         assert_eq!(tabs.len(), 1);
-        assert_ne!(tabs[0].id, first_tab);
-        assert_eq!(tabs[0].url, None);
-        assert_eq!(app.active_browser_tab_id(1), Some(tabs[0].id));
+        assert_eq!(tabs[0].id, new_tab_id);
+        assert_eq!(app.active_browser_tab_id(1), Some(new_tab_id));
     }
 
     #[test]
@@ -43869,9 +43924,10 @@ mod tests {
         );
 
         assert!(!response.is_error, "{}", response.text);
+        // With the new behavior, only 1 tab is created (no implicit ensure_browser_tab_state)
         assert_eq!(
             app.browser_tabs_by_scope.get(&browser_scope).unwrap().len(),
-            2
+            1
         );
         let new_tab_id = app.active_browser_tab_id(browser_scope).unwrap();
         assert_eq!(
@@ -43880,6 +43936,21 @@ mod tests {
                 .url
                 .as_deref(),
             Some("https://example.com/path")
+        );
+
+        // Add a second tab so we can test select
+        let response2 = app.handle_browser_mcp_request(
+            &ctx,
+            request(
+                "browser_tabs",
+                serde_json::json!({ "action": "new", "url": "example2.com" }),
+            ),
+            scope.clone(),
+        );
+        assert!(!response2.is_error, "{}", response2.text);
+        assert_eq!(
+            app.browser_tabs_by_scope.get(&browser_scope).unwrap().len(),
+            2
         );
 
         let response = app.handle_browser_mcp_request(
@@ -43892,7 +43963,8 @@ mod tests {
         );
 
         assert!(!response.is_error, "{}", response.text);
-        assert_ne!(app.active_browser_tab_id(browser_scope), Some(new_tab_id));
+        // After selecting index 0, we should be back on the first tab (new_tab_id)
+        assert_eq!(app.active_browser_tab_id(browser_scope), Some(new_tab_id));
 
         let response = app.handle_browser_mcp_request(
             &ctx,
@@ -43972,7 +44044,8 @@ mod tests {
         assert!(response
             .text
             .contains(&format!("{} numaralı sekmede açık", duplicate_tab_id)));
-        assert!(response.text.contains("index 1"));
+        // With new behavior, only 1 tab exists so duplicate is at index 0
+        assert!(response.text.contains("index 0"));
         assert!(response.text.contains(&format!(
             "browser_tabs action=select tabId={duplicate_tab_id}"
         )));
@@ -44026,9 +44099,10 @@ mod tests {
 
         assert!(response.is_error);
         assert!(response.text.contains("Bu sekme zaten"));
+        // With new behavior, only 1 tab exists (second request was rejected as duplicate)
         assert_eq!(
             app.browser_tabs_by_scope.get(&browser_scope).unwrap().len(),
-            2
+            1
         );
     }
 
@@ -44066,9 +44140,10 @@ mod tests {
             assert!(!response.is_error, "{url}: {}", response.text);
         }
 
+        // With new behavior, only 4 tabs exist (no implicit ensure_browser_tab_state)
         assert_eq!(
             app.browser_tabs_by_scope.get(&browser_scope).unwrap().len(),
-            5
+            4
         );
     }
 

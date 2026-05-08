@@ -288,6 +288,23 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Maintain minimum URL input width.** The URL field should have a minimum width of 100px to remain usable even at narrow panel widths.
 - **Use scrollable tabs at max tab limit.** With 5 tabs (BROWSER_MAX_TABS_PER_PROJECT), horizontal scrolling must work smoothly without clipping tab content.
 
+## Browser Tab Lifecycle Guidelines
+- **Closing the last tab leaves the browser empty (no auto-recreate).** When the last browser tab is closed via the X button or MCP `close` action, the browser enters an empty state with zero tabs. The tab state maps are cleaned up (`active_browser_tab_by_scope`, `browser_tabs_by_scope`, `browser_url_draft_by_scope` removed for the scope), and any active/inactive WebViews are shut down. Do not automatically recreate a new empty tab.
+- **The (+) Add Tab button creates the first tab when none exist.** When the browser panel is in an empty state (no tabs), clicking the "+" button in the tab strip creates the first tab. If `browser_last_url` has a saved URL, the first tab is created with that URL pre-filled and navigation is triggered automatically.
+- **Opening browser panel with saved URL auto-creates first tab.** When `draw_browser_panel()` detects that the browser is opening and `browser_last_url` exists but no tabs exist, it automatically creates the first tab with the saved URL and triggers navigation. The user does not need to press Enter or click Go.
+- **URL input is empty when no tabs exist.** When the browser panel has no tabs, the URL input field should be empty (not auto-filled with `browser_last_url`). This ensures a clean state for the empty browser. The draft is only populated with `browser_last_url` when at least one tab exists.
+- **Explicit tab creation only.** Do not call `ensure_browser_tab_state()` from `draw_browser_panel()`, `add_browser_tab()`, or `close_browser_tab()` to auto-create tabs. Tabs should only be created explicitly via:
+  - User clicking the "+" button (`add_browser_tab` with `None` URL)
+  - Auto-creation on panel open with saved URL
+  - MCP `new` action
+  - Video recording completion opening a recording tab
+- **Cleanup on last tab close.** When `close_browser_tab()` closes the last remaining tab, it must:
+  1. Remove `active_browser_tab_by_scope` entry for the scope
+  2. Remove `browser_tabs_by_scope` entry for the scope
+  3. Remove `browser_url_draft_by_scope` entry for the scope
+  4. Remove all inactive browsers for the scope from `inactive_browser_tab_browsers`
+  5. Shut down the active WebView if the closed tab was active
+
 ## Browser MCP Single-Binary Guidelines
 - **Browser MCP helper runs inside the main executable.** Browser MCP functionality must run via `mergen-ade(.exe) --browser-mcp-helper`, not as a separate sidecar binary.
 - **Do not ship a separate `mergen-browser-mcp(.exe)` binary.** Release ZIP/DMG must contain only the main Mergen executable; sidecar binaries are unsupported and must be removed.

@@ -10,6 +10,44 @@ When adding an entry:
 
 ---
 
+#### Browser tab lifecycle improvements {#browser-tab-lifecycle-improvements}
+- Date: 2026-05-08
+- Context: Browser panel tab closing behavior and auto-loading saved URLs
+- Error signature: User reported: "tek sekme varken kapattığımda kapanmıyor sekme kapansın ve artı ile açılabilsin ilk sekme ve browser açıldığında url varsa yüklesin ben ok tuşuna basmayayım" — Single tab doesn't close properly, should be able to create first tab with + button, and browser should auto-load saved URL without pressing Enter.
+- Symptoms/Impact:
+  1. Closing the last tab would immediately recreate a new empty tab instead of leaving the browser in an empty state.
+  2. The + button couldn't create the first tab when no tabs existed (because ensure_browser_tab_state was called implicitly).
+  3. Browser panel wouldn't automatically load the saved URL when opened - user had to press Enter or click Go.
+  4. URL input was auto-filled with browser_last_url even when no tabs existed, causing confusion.
+- Root cause:
+  - `close_browser_tab()` called `ensure_browser_tab_state()` when the last tab was closed, immediately creating a replacement tab.
+  - `add_browser_tab()` called `ensure_browser_tab_state()` before adding a new tab, which could create an implicit empty tab first.
+  - `draw_browser_panel()` called `ensure_browser_tab_state()` every frame, making it impossible to have an empty browser state.
+  - `draw_browser_panel()` initialized URL draft with `browser_last_url` unconditionally, regardless of whether tabs existed.
+  - No logic existed to auto-create a tab with the saved URL when the browser panel opened.
+- Resolution:
+  - Removed `ensure_browser_tab_state()` call from `close_browser_tab()` when the last tab is closed.
+  - Changed last-tab-close cleanup to properly remove all browser state maps (`active_browser_tab_by_scope`, `browser_tabs_by_scope`, `browser_url_draft_by_scope`) and shut down WebViews.
+  - Removed `ensure_browser_tab_state()` call from `add_browser_tab()` - it now handles creating the first tab directly via `entry().or_default()`.
+  - Removed `ensure_browser_tab_state()` call from `draw_browser_panel()`.
+  - Added auto-creation logic in `draw_browser_panel()`: when browser opens with `browser_last_url` but no tabs exist, automatically creates first tab with that URL and triggers navigation.
+  - Modified URL draft initialization to only use `browser_last_url` when tabs exist; when no tabs exist, URL input starts empty.
+  - Removed `ensure_browser_tab_state()` calls from MCP tab handlers (`handle_browser_mcp_tabs_request`, `handle_browser_mcp_close_request`) as they're no longer needed.
+- Prevent recurrence:
+  - Updated `AGENTS.md` with new "Browser Tab Lifecycle Guidelines" section documenting:
+    - Closing the last tab leaves the browser empty (no auto-recreate)
+    - The (+) Add Tab button creates the first tab when none exist
+    - Opening browser panel with saved URL auto-creates first tab
+    - URL input is empty when no tabs exist
+    - Explicit tab creation only (no implicit ensure_browser_tab_state calls)
+    - Cleanup requirements on last tab close
+  - Updated regression test: renamed `closing_last_browser_tab_recreates_empty_tab` to `closing_last_browser_tab_leaves_no_tabs` with inverted assertions.
+  - Added new regression test `add_tab_creates_first_tab_when_no_tabs_exist` verifying + button works from empty state.
+- Files/Commands touched: `src/app.rs` (close_browser_tab, add_browser_tab, draw_browser_panel, handle_browser_mcp_tabs_request, handle_browser_mcp_close_request, updated/added tests), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-05-08: "tek sekme varken kapattığımda kapanmıyor sekme kapansın ve artı ile açılabilsin ilk sekme ve browser açıldığında url varsa yüklesin ben ok tuşuna basmayayım"
+
+---
+
 #### Browser toolbar/tab hover no longer hides WebView content {#browser-toolbar-hover-fix}
 - Date: 2026-05-07
 - Context: Browser panel toolbar and tab strip hover interactions causing WebView flicker/black screen
