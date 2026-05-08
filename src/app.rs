@@ -11551,11 +11551,16 @@ impl AdeApp {
             }
 
             let destination_title = terminal.title.clone();
-            // Send only the message text (no immediate Enter)
-            // Both Enter presses will be sent after delays (0.5s and 1s)
-            let outbound = message.as_bytes().to_vec();
+            // Send via paste-safe path (bracketed paste when enabled) for consistent
+            // behavior with clipboard paste and terminal shortcuts. This ensures
+            // slash-prefixed AI CLI commands are not interpreted as interactive
+            // slash-menu key streams.
+            let Some(paste_bytes) = terminal.runtime.capture_paste_bytes(message) else {
+                self.status_line = "Failed to prepare message for terminal".to_owned();
+                return;
+            };
             reset_terminal_prompt_scroll_anchor(terminal);
-            terminal.runtime.send_bytes(outbound);
+            terminal.runtime.send_paste_bytes(paste_bytes);
             reset_opencode_manual_scroll_detached(terminal);
             Self::clear_terminal_selection(terminal);
             Self::append_pending_line(&mut terminal.pending_line_for_title, message);
@@ -45580,5 +45585,35 @@ mod tests {
 
         // Verify pending state is cleared
         assert!(app.pending_second_enter.is_empty());
+    }
+
+    #[test]
+    fn foreground_saved_message_uses_bracketed_paste_when_enabled() {
+        // Regression test: Foreground tasks should use paste-safe delivery (bracketed paste)
+        // when the terminal has bracketed paste enabled, consistent with clipboard paste
+        // and terminal shortcut behavior.
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        // Enable bracketed paste mode (\x1b[?2004h)
+        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
+
+        let mut app = test_app(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+
+        // Send a foreground task (same path as Terminal Manager foreground message button)
+        app.send_saved_message_to_terminal(&ctx, 1, "/prepare-fix-plan");
+        capture.drain();
+
+        // Verify the command was sent via bracketed paste (wrapped in ESC[200~...ESC[201~)
+        // and WITHOUT immediate Enter (Enters are sent after delays)
+        assert_eq!(
+            capture.bytes(),
+            b"\x1b[200~/prepare-fix-plan\x1b[201~".to_vec()
+        );
+
+        // Verify two delayed Enters are scheduled
+        assert_eq!(app.pending_second_enter.len(), 2);
     }
 }

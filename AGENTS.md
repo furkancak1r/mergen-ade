@@ -214,6 +214,10 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Browser overlay yield**: The foreground message popup is included in `embedded_browser_should_yield_to_ui_layer()` to ensure native WebView is hidden while the popup is open.
 - **Persistence**: Foreground saved messages are persisted to config TOML in `ProjectRecord::foreground_saved_messages` and survive application restarts and version updates.
 - **Send-and-remove behavior**: When a foreground message is sent to a terminal, it is automatically removed from the queue. This makes the foreground queue work as a task list that depletes as tasks are executed.
+- **Paste-safe delivery (bracketed paste)**: Foreground messages must use the paste-safe delivery path (`capture_paste_bytes()` + `send_paste_bytes()`) instead of raw `send_bytes()`. This ensures:
+  - Bracketed paste sequences (`ESC[200~...ESC[201~`) are applied when the terminal has bracketed paste enabled.
+  - Slash-prefixed AI CLI commands (e.g., `/prepare-fix-plan`) are not misinterpreted as interactive slash-menu key streams.
+  - Behavior is consistent with clipboard paste and terminal shortcuts.
 - **Double Enter for confirmation**: When sending a saved message (foreground or background), send the command followed by Enter (`\r`), then schedule a second Enter after `SECOND_ENTER_DELAY_MS` (1000ms) delay. This ensures AI CLI tools and shells process the command and any confirmation prompts. Use `schedule_second_enter_for_terminal()` helper and `process_pending_second_enters()` in the update loop. The same mechanism is used for terminal shortcuts.
 - **Edit/Delete actions**: Each foreground queue item has edit (pencil) and delete (trash) buttons. Edit opens the popup pre-filled with the message content. Delete removes immediately without confirmation.
 - **Empty queue handling**: When the foreground queue is empty, the menu shows "No tasks in queue" text and only the "Add New" button is available.

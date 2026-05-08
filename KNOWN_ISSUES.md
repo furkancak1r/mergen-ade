@@ -10,6 +10,40 @@ When adding an entry:
 
 ---
 
+#### Foreground tasks now use paste-safe bracketed paste delivery {#foreground-tasks-bracketed-paste}
+- Date: 2026-05-08
+- Context: Foreground task queue send behavior in Terminal Manager - user requested tasks behave like paste instead of typing
+- Error signature: User reported: "foregrounddan terminale yazarken normal kullanıcı yazıyormuş gibi yazıyor ama kopyala yapıştırdaki gibi hareket etmesini istiyorum tasks" - Foreground tasks were being sent to terminal as raw keystrokes instead of paste-safe delivery.
+- Symptoms/Impact: When sending a foreground task to the terminal, it would type character-by-character like a user typing, which could cause issues with AI CLI slash menus interpreting the `/` key as a menu submission instead of part of the command.
+- Root cause:
+  - `send_saved_message_to_terminal()` used `message.as_bytes().to_vec()` and `terminal.runtime.send_bytes(outbound)` which sends raw bytes as keystrokes.
+  - This differs from clipboard paste and terminal shortcuts which use `capture_paste_bytes()` and `send_paste_bytes()` for bracketed paste support.
+  - When bracketed paste is enabled (`\x1b[?2004h`), paste operations wrap content in `ESC[200~...ESC[201~` sequences to indicate atomic paste content.
+  - Without bracketed paste, slash-prefixed commands like `/prepare-fix-plan` could be misinterpreted by AI CLI slash menus.
+- Resolution:
+  - Changed `send_saved_message_to_terminal()` to use paste-safe delivery path:
+    - Replace raw `send_bytes()` with `capture_paste_bytes()` + `send_paste_bytes()`.
+    - This automatically applies bracketed paste wrapping when enabled in the terminal.
+  - Preserved all existing behavior:
+    - Title/history tracking via `append_pending_line()` and `pending_input_for_history.clear()`.
+    - AI state detection (Factory Droid, Codex, OpenCode) via `has_non_empty_line` checks.
+    - Two delayed Enter presses (0.5s and 1s) for command confirmation.
+    - Recent inputs tracking via `push_recent_input()`.
+    - Terminal visibility update via `in_main_view = true`.
+  - Added clear error handling: if `capture_paste_bytes()` fails, show status message "Failed to prepare message for terminal".
+- Prevent recurrence:
+  - Added regression test `foreground_saved_message_uses_bracketed_paste_when_enabled` that:
+    - Enables bracketed paste mode (`\x1b[?2004h`) in terminal.
+    - Sends a foreground task via `send_saved_message_to_terminal()`.
+    - Verifies output contains bracketed paste markers (`ESC[200~...ESC[201~`).
+    - Verifies no immediate Enter is sent (Enters are scheduled via `pending_second_enter`).
+    - Verifies two delayed Enters are scheduled.
+  - Updated `AGENTS.md` Terminal Manager & Input History Guidelines to clarify that foreground tasks use paste-safe delivery.
+- Files/Commands touched: `src/app.rs` (`send_saved_message_to_terminal()` paste-safe implementation, new regression test), `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-05-08: "foregrounddan terminale yazarken normal kullanıcı yazıyormuş gibi yazıyor ama kopyala yapıştırdaki gibi hareket etmesini istiyorum tasks"
+
+---
+
 #### Browser toolbar tooltips now centered above buttons {#browser-tooltips-centered-above}
 - Date: 2026-05-08
 - Context: Browser panel toolbar button hover tooltips (Design Inspect, Go, Clear, Screenshot, tab controls)
