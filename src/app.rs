@@ -5769,22 +5769,13 @@ impl AdeApp {
         }
         entry.runtime.set_active_ai_tool(Some(AiCliTool::OpenCode));
 
-        let mut changed = false;
         if entry.ai_session.tool != Some(AiCliTool::OpenCode) {
             entry.ai_session.tool = Some(AiCliTool::OpenCode);
-            changed = true;
         }
         if entry.ai_session.status != AiCliStatus::Inactive {
             entry.ai_session.status = AiCliStatus::Inactive;
-            changed = true;
-        }
-        if entry.opencode_launch_pending_since.is_none() {
-            changed = true;
         }
         entry.opencode_launch_pending_since = Some(Instant::now());
-        if entry.opencode_launch_process_baseline != baseline {
-            changed = true;
-        }
         entry.opencode_launch_process_baseline = baseline;
         entry.opencode_session_active = false;
         entry.opencode_process_identity = None;
@@ -5804,7 +5795,6 @@ impl AdeApp {
                 .unwrap_or(0)
         );
         entry.opencode_browser_mcp_session_id = Some(new_session_id.clone());
-        changed = true;
 
         // Safeguard: Ensure runtime config is up-to-date with current Browser MCP settings
         // before OpenCode launches. This handles stale sidecar paths from old binaries.
@@ -5843,7 +5833,7 @@ impl AdeApp {
             }
         }
 
-        changed
+        true
     }
 
     fn clear_opencode_state(&mut self, terminal_id: u64) -> bool {
@@ -10820,7 +10810,7 @@ impl AdeApp {
     }
 
     fn close_terminal(&mut self, ctx: &egui::Context, terminal_id: u64) {
-        let Some((title, project_id, close_result)) =
+        let Some((title, _project_id, close_result)) =
             self.terminals.get(&terminal_id).map(|terminal| {
                 let close_result = terminal.runtime.terminate();
                 (terminal.title.clone(), terminal.project_id, close_result)
@@ -17883,7 +17873,6 @@ impl AdeApp {
         scope: impl Into<BrowserScopeKey>,
     ) -> Option<BrowserMcpIpcResponse> {
         let scope = scope.into();
-        let project_id = scope.project_id();
         #[cfg(target_os = "windows")]
         {
             let window_hwnd = self.window_hwnd;
@@ -17902,7 +17891,7 @@ impl AdeApp {
 
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (project_id, scope);
+            let _ = scope;
             Some(BrowserMcpIpcResponse::error(
                 "Embedded browser MCP is currently Windows-only",
             ))
@@ -18467,7 +18456,7 @@ impl AdeApp {
 
     /// Queue a browser screenshot request. The actual capture happens when the browser
     /// is visible and ready to ensure we don't capture blank frames.
-    fn queue_browser_screenshot(&mut self, project_id: u64, full_page: bool, ctx: &egui::Context) {
+    fn queue_browser_screenshot(&mut self, _project_id: u64, full_page: bool, ctx: &egui::Context) {
         let counter = BROWSER_SCREENSHOT_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -18529,7 +18518,6 @@ impl AdeApp {
     /// Process any pending screenshot requests when the browser is visible and ready.
     fn process_pending_screenshot_requests(&mut self, ctx: &egui::Context) {
         let browser_scope = self.active_browser_scope();
-        let browser_project_id = browser_scope.project_id();
         let browser_ready = self.is_active_browser_panel_open()
             && !self.should_hide_embedded_browser_for_ui_layer(ctx)
             && self
@@ -20124,7 +20112,7 @@ impl AdeApp {
 
     /// Draw the foreground saved message popup (add/edit).
     fn draw_foreground_message_popup(&mut self, ctx: &egui::Context) {
-        let Some(project_id) = self.foreground_message_popup_open else {
+        let Some(_project_id) = self.foreground_message_popup_open else {
             return;
         };
 
