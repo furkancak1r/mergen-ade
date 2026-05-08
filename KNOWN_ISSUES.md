@@ -718,3 +718,33 @@ When adding an entry:
   - Added regression tests for inherited baseline replacement and fallback behavior.
 - Files/Commands touched: `src/opencode.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User request 2026-05-08: OpenCode crash output showing `opencode-windows-x64-baseline` Bun segmentation fault.
+
+---
+
+#### Browser MCP terminal-scoped browser now visible in panel {#browser-mcp-terminal-scope-visible}
+- Date: 2026-05-08
+- Context: AI (OpenCode/Codex) used Browser MCP to navigate/interact with pages, but user saw no changes in Mergen's browser panel
+- Error signature: User reported: "mergen browser mcp şuan çalışamıyor mesela çalışıyor bağlı bir sayfayı güncellemesi gerekiyor ai devam ediyor ama ben mergende hiçbir değişiklik görmüyorum browserda" — Browser MCP commands were running successfully for the AI, but the Mergen UI browser panel did not reflect any navigation or page updates.
+- Symptoms/Impact:
+  1. AI sends `browser_navigate` or `browser_click` via MCP; command succeeds and WebView2 navigates.
+  2. User sees the browser panel still showing the old project-scoped page, or an empty state.
+  3. Terminal-scoped browser state (tabs, URL) was isolated but invisible in the UI.
+  4. User cannot see what the AI is doing in the browser.
+- Root cause:
+  - MCP commands correctly created `BrowserScopeKey::Terminal` scoped browser instances for isolation.
+  - However, `draw_browser_panel()` and `sync_embedded_browser()` were hardcoded to use `BrowserScopeKey::Project(project_id)` as the visible scope.
+  - The terminal-scoped browser existed and processed commands, but the UI always rendered the project-scoped browser (or nothing if no project browser existed).
+  - This created a hidden browser that the AI controlled while the user saw an unrelated or empty browser panel.
+- Resolution:
+  - Introduced `active_browser_scope()` helper that returns the terminal scope when the active terminal has browser tabs, otherwise falls back to project scope.
+  - Updated `draw_browser_panel()` to use `active_browser_scope()` for tab rendering, URL input, toolbar actions, and auto-create logic.
+  - Updated `sync_embedded_browser()` to hide all non-active scopes and show/sync only the active scope's WebView2.
+  - Guarded project URL persistence so terminal-scoped URL changes do not write to `ProjectRecord::browser_last_url`.
+  - Prevented auto-creation of a project URL tab inside a terminal-scoped browser (terminal URLs are runtime-only).
+  - Updated `submit_browser_url()` and screenshot queueing to target the active scope instead of hardcoded project scope.
+- Prevent recurrence:
+  - Added regression test `terminal_scoped_browser_is_visible_in_panel_when_active`: verifies that when a terminal-scoped browser has tabs, `active_browser_scope()` returns the terminal scope and `sync_embedded_browser()` hides the project browser.
+  - Added regression test `terminal_scoped_url_does_not_persist_to_project_config`: verifies that `set_browser_url_for_scope()` writes `browser_last_url` only for project scope, not terminal scope.
+  - Updated `AGENTS.md` Browser MCP Multi-Terminal Isolation Guidelines to codify `active_browser_scope()` as the single source of truth for panel display and URL persistence rules.
+- Files/Commands touched: `src/app.rs` (`active_browser_scope()`, `draw_browser_panel()`, `sync_embedded_browser()`, `submit_browser_url()`, `set_browser_url_for_scope()`, `apply_browser_tab_observed_url()`, `queue_browser_screenshot()`, `process_pending_screenshot_requests()`, 2 new regression tests, 1 updated regression test), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User bug report 2026-05-08: "mergen browser mcp şuan çalışamıyor mesela çalışıyor bağlı bir sayfayı güncellemesi gerekiyor ai devam ediyor ama ben mergende hiçbir değişiklik görmüyorum browserda"

@@ -16424,11 +16424,13 @@ impl AdeApp {
                 .to_owned();
             tab.kind = BrowserTabKind::Page;
         }
-        if let Some(project) = self.projects.get_mut(&project_id) {
-            project.browser_last_url = Some(url.clone());
-            self.browser_url_draft_by_scope.insert(scope, url);
-            self.note_projects_changed();
-            self.persist_config();
+        self.browser_url_draft_by_scope.insert(scope, url.clone());
+        if !scope.is_terminal() {
+            if let Some(project) = self.projects.get_mut(&project_id) {
+                project.browser_last_url = Some(url);
+                self.note_projects_changed();
+                self.persist_config();
+            }
         }
     }
 
@@ -16440,7 +16442,11 @@ impl AdeApp {
             return;
         }
 
-        let scope = BrowserScopeKey::Project(project_id);
+        let mut scope = self.active_browser_scope();
+        // Fall back to the requested project scope if active scope belongs to a different project
+        if scope.project_id() != project_id {
+            scope = BrowserScopeKey::Project(project_id);
+        }
         self.set_browser_panel_open_for_project(project_id, true);
         self.config.ui.checklist_panel_expanded = false;
         self.note_ui_config_changed();
@@ -18083,14 +18089,16 @@ impl AdeApp {
             changed = true;
         }
 
-        // Update the persisted project URL
-        if let Some(project) = self.projects.get_mut(&project_id) {
-            match &project.browser_last_url {
-                Some(existing) if existing == &url => {}
-                _ => {
-                    project.browser_last_url = Some(url);
-                    self.note_projects_changed();
-                    changed = true;
+        // Update the persisted project URL (only for project-scoped browsers)
+        if !scope.is_terminal() {
+            if let Some(project) = self.projects.get_mut(&project_id) {
+                match &project.browser_last_url {
+                    Some(existing) if existing == &url => {}
+                    _ => {
+                        project.browser_last_url = Some(url);
+                        self.note_projects_changed();
+                        changed = true;
+                    }
                 }
             }
         }
@@ -18239,6 +18247,33 @@ impl AdeApp {
         self.active_terminal
             .and_then(|tid| self.terminals.get(&tid).map(|t| t.project_id))
             .or(self.selected_project)
+    }
+
+    /// Returns the browser scope that should be displayed in the panel.
+    /// If the active terminal has a terminal-scoped browser with tabs, use that;
+    /// otherwise fall back to the project-scoped browser.
+    fn active_browser_scope(&self) -> BrowserScopeKey {
+        if let Some(project_id) = self.active_browser_project_id() {
+            if let Some(active_terminal_id) = self.active_terminal {
+                let terminal_scope = BrowserScopeKey::Terminal {
+                    project_id,
+                    terminal_id: active_terminal_id,
+                };
+                if self
+                    .browser_tabs_by_scope
+                    .get(&terminal_scope)
+                    .map_or(false, |tabs| !tabs.is_empty())
+                {
+                    return terminal_scope;
+                }
+            }
+            return BrowserScopeKey::Project(project_id);
+        }
+        // Fallback to selected project if no active terminal
+        if let Some(pid) = self.selected_project {
+            return BrowserScopeKey::Project(pid);
+        }
+        BrowserScopeKey::Project(0)
     }
 
     /// Check if the Browser panel is open for a specific project.
@@ -18440,14 +18475,9 @@ impl AdeApp {
             .unwrap_or(0);
         let request_id = format!("{BROWSER_SCREENSHOT_REQUEST_PREFIX}-{nanos:x}-{counter:x}");
 
-        self.browser_pending_screenshot_requests.insert(
-            request_id.clone(),
-            (
-                BrowserScopeKey::Project(project_id),
-                full_page,
-                Instant::now(),
-            ),
-        );
+        let scope = self.active_browser_scope();
+        self.browser_pending_screenshot_requests
+            .insert(request_id.clone(), (scope, full_page, Instant::now()));
 
         self.status_line = format!(
             "Screenshot queued: {} ({})...",
@@ -18498,21 +18528,18 @@ impl AdeApp {
 
     /// Process any pending screenshot requests when the browser is visible and ready.
     fn process_pending_screenshot_requests(&mut self, ctx: &egui::Context) {
-        let browser_project_id = self.active_browser_project_id();
-        let browser_scope = browser_project_id.map(BrowserScopeKey::Project);
-        let browser_ready = browser_project_id.is_some()
-            && self.is_active_browser_panel_open()
+        let browser_scope = self.active_browser_scope();
+        let browser_project_id = browser_scope.project_id();
+        let browser_ready = self.is_active_browser_panel_open()
             && !self.should_hide_embedded_browser_for_ui_layer(ctx)
             && self
                 .embedded_browsers_by_scope
-                .get(&browser_scope.unwrap())
+                .get(&browser_scope)
                 .is_some_and(|b| matches!(b.status(), BrowserStatus::Ready));
 
         if !browser_ready {
             return;
         }
-
-        let browser_scope = browser_scope.unwrap();
         let mut to_start = Vec::new();
 
         // Find pending requests for the active project
@@ -18561,9 +18588,7 @@ impl AdeApp {
     /// Called after UI render to update native WebView bounds.
     /// Handles multiple project browsers - only the active project's browser is shown.
     fn sync_embedded_browser(&mut self, ctx: &egui::Context) {
-        // Determine which project's browser should be visible
-        let browser_project_id = self.active_browser_project_id();
-        let browser_scope = browser_project_id.map(BrowserScopeKey::Project);
+        let browser_scope = self.active_browser_scope();
 
         // Hide all browsers when panel is closed or a UI overlay is active
         if !self.is_active_browser_panel_open()
@@ -18574,9 +18599,9 @@ impl AdeApp {
             return;
         }
 
-        // Hide browsers for all projects except the active one
-        for (pid, browser) in &mut self.embedded_browsers_by_scope {
-            if Some(*pid) != browser_scope {
+        // Hide browsers for all scopes except the active one
+        for (scope, browser) in &mut self.embedded_browsers_by_scope {
+            if *scope != browser_scope {
                 browser.hide();
             }
         }
@@ -18584,56 +18609,50 @@ impl AdeApp {
             browser.hide();
         }
 
-        // Show and sync the active project's browser
-        if let Some(project_id) = browser_project_id {
-            let browser_scope = BrowserScopeKey::Project(project_id);
-            let window_hwnd = self.window_hwnd;
+        let window_hwnd = self.window_hwnd;
 
-            let browser_status = self
-                .embedded_browsers_by_scope
-                .get(&browser_scope)
-                .map(|browser| browser.status())
-                .unwrap_or(BrowserStatus::Uninitialized);
+        let browser_status = self
+            .embedded_browsers_by_scope
+            .get(&browser_scope)
+            .map(|browser| browser.status())
+            .unwrap_or(BrowserStatus::Uninitialized);
 
-            if matches!(browser_status, BrowserStatus::Uninitialized) {
-                let design_inspect_enabled =
-                    self.is_browser_design_inspect_enabled_for_scope(browser_scope);
-                let browser = self.browser_for_scope(browser_scope);
-                browser.set_design_inspect_enabled(design_inspect_enabled);
-                browser.ensure_created(window_hwnd);
-            }
+        if matches!(browser_status, BrowserStatus::Uninitialized) {
+            let design_inspect_enabled =
+                self.is_browser_design_inspect_enabled_for_scope(browser_scope);
+            let browser = self.browser_for_scope(browser_scope);
+            browser.set_design_inspect_enabled(design_inspect_enabled);
+            browser.ensure_created(window_hwnd);
+        }
 
-            let browser_status = self
-                .embedded_browsers_by_scope
-                .get(&browser_scope)
-                .map(|browser| browser.status())
-                .unwrap_or(BrowserStatus::Uninitialized);
+        let browser_status = self
+            .embedded_browsers_by_scope
+            .get(&browser_scope)
+            .map(|browser| browser.status())
+            .unwrap_or(BrowserStatus::Uninitialized);
 
-            match browser_status {
-                BrowserStatus::Ready => {
-                    if let Some(rect) = self.pending_browser_rect.take() {
-                        let bounds = web_browser::browser_bounds_from_egui_rect(
-                            rect,
-                            ctx.pixels_per_point(),
-                        );
-                        let browser = self.browser_for_scope(browser_scope);
-                        // Sync bounds before showing to avoid white flicker from wrong-sized surface
-                        browser.sync_position(&bounds);
-                        browser.show();
-                    }
+        match browser_status {
+            BrowserStatus::Ready => {
+                if let Some(rect) = self.pending_browser_rect.take() {
+                    let bounds =
+                        web_browser::browser_bounds_from_egui_rect(rect, ctx.pixels_per_point());
+                    let browser = self.browser_for_scope(browser_scope);
+                    // Sync bounds before showing to avoid white flicker from wrong-sized surface
+                    browser.sync_position(&bounds);
+                    browser.show();
                 }
-                BrowserStatus::Failed(_) | BrowserStatus::Unsupported(_) => {
-                    if let Some(browser) = self.embedded_browsers_by_scope.get_mut(&browser_scope) {
-                        browser.hide();
-                    }
-                }
-                BrowserStatus::Creating | BrowserStatus::Uninitialized => {}
             }
+            BrowserStatus::Failed(_) | BrowserStatus::Unsupported(_) => {
+                if let Some(browser) = self.embedded_browsers_by_scope.get_mut(&browser_scope) {
+                    browser.hide();
+                }
+            }
+            BrowserStatus::Creating | BrowserStatus::Uninitialized => {}
         }
     }
 
     /// Draw the Browser panel on the right side.
-    /// Project-scoped browser with URL persistence.
+    /// Displays the active browser scope (terminal-scoped when available, otherwise project-scoped).
     fn draw_browser_panel(&mut self, ctx: &egui::Context) -> Option<egui::Rect> {
         if !self.is_active_browser_panel_open() {
             return None;
@@ -18650,9 +18669,9 @@ impl AdeApp {
         // It will be set to true if any overlay (dropdown, tooltip, menu) is active.
         self.browser_panel_overlay_active = false;
 
-        // Determine which project's browser to show
-        let browser_project_id = self.active_browser_project_id()?;
-        let browser_scope = BrowserScopeKey::Project(browser_project_id);
+        // Determine which browser scope to show
+        let browser_scope = self.active_browser_scope();
+        let browser_project_id = browser_scope.project_id();
 
         let response = egui::SidePanel::right("browser_panel")
             .resizable(true)
@@ -18687,12 +18706,13 @@ impl AdeApp {
                         .unwrap_or(BrowserStatus::Uninitialized);
 
                     // Auto-create first tab with saved URL if no tabs exist
+                    // (only for project-scoped browsers; terminal-scoped URLs are runtime-only)
                     let has_tabs = self
                         .browser_tabs_by_scope
                         .get(&browser_scope)
                         .map(|tabs| !tabs.is_empty())
                         .unwrap_or(false);
-                    if !has_tabs {
+                    if !has_tabs && !browser_scope.is_terminal() {
                         if let Some(url) = browser_last_url.clone() {
                             // Create first tab with the saved URL and navigate
                             let _ = self.add_browser_tab(
@@ -18860,15 +18880,15 @@ impl AdeApp {
 
                     ui.add_space(4.0);
 
-                    // Get or initialize the URL draft for this project
-                    // Only auto-fill with browser_last_url if tabs exist
+                    // Get or initialize the URL draft for this scope
+                    // Only auto-fill with browser_last_url for project-scoped browsers
                     if !self.browser_url_draft_by_scope.contains_key(&browser_scope) {
                         let has_tabs_now = self
                             .browser_tabs_by_scope
                             .get(&browser_scope)
                             .map(|tabs| !tabs.is_empty())
                             .unwrap_or(false);
-                        let initial_draft = if has_tabs_now {
+                        let initial_draft = if has_tabs_now && !browser_scope.is_terminal() {
                             browser_last_url.clone().unwrap_or_default()
                         } else {
                             String::new()
@@ -44992,6 +45012,103 @@ mod tests {
         );
     }
 
+    #[test]
+    fn terminal_scoped_browser_is_visible_in_panel_when_active() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
+        app.active_terminal = Some(1);
+
+        // Open browser panel for project
+        app.set_browser_panel_open_for_project(7, true);
+
+        // Create a project-scoped browser
+        let project_scope = BrowserScopeKey::Project(7);
+        app.browser_for_scope(project_scope).show();
+        app.embedded_browsers_by_scope
+            .get_mut(&project_scope)
+            .unwrap()
+            .set_test_status(web_browser::BrowserStatus::Ready);
+
+        // Create a terminal-scoped browser via MCP-like flow
+        let terminal_scope = BrowserScopeKey::Terminal {
+            project_id: 7,
+            terminal_id: 1,
+        };
+        app.browser_for_scope(terminal_scope).show();
+        app.embedded_browsers_by_scope
+            .get_mut(&terminal_scope)
+            .unwrap()
+            .set_test_status(web_browser::BrowserStatus::Ready);
+
+        // Add a tab to the terminal-scoped browser
+        let tab_id = app
+            .add_browser_tab(
+                terminal_scope,
+                Some("https://terminal.example.com".to_owned()),
+                BrowserTabKind::Page,
+                None,
+            )
+            .expect("should create terminal tab");
+
+        // active_browser_scope should prefer terminal scope when it has tabs
+        assert_eq!(app.active_browser_scope(), terminal_scope);
+
+        // sync_embedded_browser should hide the non-active project browser
+        app.pending_browser_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(100.0, 50.0),
+            egui::vec2(400.0, 300.0),
+        ));
+        app.sync_embedded_browser(&ctx);
+
+        // Project browser should be hidden because it is not the active scope
+        assert!(!app
+            .embedded_browsers_by_scope
+            .get(&project_scope)
+            .unwrap()
+            .requested_visible());
+        // Terminal browser should remain the active scoped instance
+        assert!(app.embedded_browsers_by_scope.contains_key(&terminal_scope));
+
+        // The panel should reflect the terminal scope tab
+        assert_eq!(app.active_browser_tab_id(terminal_scope), Some(tab_id));
+    }
+
+    #[test]
+    fn terminal_scoped_url_does_not_persist_to_project_config() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
+        app.active_terminal = Some(1);
+
+        let terminal_scope = BrowserScopeKey::Terminal {
+            project_id: 7,
+            terminal_id: 1,
+        };
+
+        // Set URL for terminal-scoped browser
+        app.set_browser_url_for_scope(terminal_scope, "https://terminal-only.com".to_owned());
+
+        // Terminal scope should have the URL
+        assert_eq!(
+            app.browser_url_draft_by_scope.get(&terminal_scope),
+            Some(&"https://terminal-only.com".to_owned())
+        );
+        // Project config should NOT be updated
+        assert_eq!(app.projects.get(&7).unwrap().browser_last_url, None);
+
+        // Now set URL for project-scoped browser
+        let project_scope = BrowserScopeKey::Project(7);
+        app.set_browser_url_for_scope(project_scope, "https://project.com".to_owned());
+
+        // Project config SHOULD be updated
+        assert_eq!(
+            app.projects.get(&7).unwrap().browser_last_url,
+            Some("https://project.com".to_owned())
+        );
+    }
+
     // OpenCode Wheel Fallback Tests
 
     #[test]
@@ -45282,6 +45399,7 @@ mod tests {
         let mut app = test_app([], None);
         app.projects
             .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        app.selected_project = Some(1);
 
         // Initially no pending requests
         assert!(app.browser_pending_screenshot_requests.is_empty());
