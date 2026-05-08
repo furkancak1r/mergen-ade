@@ -254,6 +254,10 @@ const DIRECTORY_SEARCH_INPUT_ID: &str = "directory-search-input";
 const SAVED_MESSAGE_DRAFT_INPUT_ID: &str = "saved-message-draft-input";
 const BROWSER_URL_INPUT_ID: &str = "browser-url-input";
 const FOREGROUND_MESSAGE_INPUT_ID: &str = "foreground-message-input";
+// Foreground tasks UI limits
+const FOREGROUND_TASKS_MENU_MAX_HEIGHT: f32 = 300.0; // Max height for task list dropdown
+const FOREGROUND_MESSAGE_TEXT_MAX_HEIGHT: f32 = 320.0; // Max height for popup text input area
+const FOREGROUND_TASK_TOOLTIP_MAX_CHARS: usize = 100; // Max chars for task tooltip
 const SETTINGS_NAV_WIDTH: f32 = 144.0;
 const SETTINGS_WINDOW_DEFAULT_WIDTH: f32 = 760.0;
 const SETTINGS_WINDOW_DEFAULT_HEIGHT: f32 = 520.0;
@@ -20135,28 +20139,34 @@ impl AdeApp {
                 );
                 ui.add_space(8.0);
 
-                // Multiline text input - fill available space dynamically
+                // Multiline text input - wrapped in ScrollArea to prevent overflow
                 let input_id = Self::foreground_message_input_id();
                 let available_width = ui.available_width().max(0.0);
-                // Calculate text height to fill space: available height minus label, spacing, and button row
+                // Calculate text height: capped at max to prevent window expansion
                 let button_row_height = ui.spacing().interact_size.y;
-                let min_text_height = 280.0f32;
-                let text_height =
-                    (ui.available_height() - button_row_height - 16.0).max(min_text_height);
+                let min_text_height = 200.0f32;
+                let max_text_height = FOREGROUND_MESSAGE_TEXT_MAX_HEIGHT;
+                let available_for_text = ui.available_height() - button_row_height - 24.0;
+                let text_height = available_for_text.clamp(min_text_height, max_text_height);
 
-                let _text_edit_response = with_settings_text_edit_chrome(ui, |ui| {
-                    let text_edit =
-                        egui::TextEdit::multiline(&mut self.foreground_message_popup_draft)
-                            .id(input_id)
-                            .desired_width(available_width)
-                            .min_size(egui::vec2(available_width, text_height))
-                            .hint_text("Enter command or prompt here...")
-                            // Ctrl+Enter inserts newline, plain Enter triggers save
-                            .return_key(egui::KeyboardShortcut::new(
-                                egui::Modifiers::CTRL,
-                                egui::Key::Enter,
-                            ));
-                    ui.add(text_edit)
+                with_settings_text_edit_chrome(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("foreground_message_scroll")
+                        .max_height(text_height)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let text_edit =
+                                egui::TextEdit::multiline(&mut self.foreground_message_popup_draft)
+                                    .id(input_id)
+                                    .desired_width(available_width)
+                                    .hint_text("Enter command or prompt here...")
+                                    // Ctrl+Enter inserts newline, plain Enter triggers save
+                                    .return_key(egui::KeyboardShortcut::new(
+                                        egui::Modifiers::CTRL,
+                                        egui::Key::Enter,
+                                    ));
+                            ui.add(text_edit);
+                        });
                 });
 
                 // Request focus on first open
@@ -23485,57 +23495,67 @@ fn draw_terminal_foreground_message_menu_button(
                         let message_width =
                             (menu_fixed_width - action_button_width - 8.0).max(80.0);
 
-                        for (index, message) in foreground_messages.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                // Constrain horizontal layout to fixed width
-                                ui.set_min_width(menu_fixed_width);
-                                ui.set_max_width(menu_fixed_width);
+                        // Wrap task list in ScrollArea to prevent overflow with many/long tasks
+                        egui::ScrollArea::vertical()
+                            .id_salt("foreground_tasks_menu_scroll")
+                            .max_height(FOREGROUND_TASKS_MENU_MAX_HEIGHT)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for (index, message) in foreground_messages.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        // Constrain horizontal layout to fixed width
+                                        ui.set_min_width(menu_fixed_width);
+                                        ui.set_max_width(menu_fixed_width);
 
-                                // Message button - sends and removes from queue (fixed width)
-                                let msg_button = ui
-                                    .add_sized(
-                                        egui::vec2(message_width, CONTROL_ROW_HEIGHT),
-                                        egui::Button::new(RichText::new(capped_hover_text(
-                                            message, 35,
-                                        )))
-                                        .sense(egui::Sense::click()),
-                                    )
-                                    .on_hover_text(message)
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                if msg_button.clicked() {
-                                    send_message = Some(message.clone());
-                                    ui.close_menu();
-                                }
+                                        // Message button - sends and removes from queue (fixed width)
+                                        let msg_button = ui
+                                            .add_sized(
+                                                egui::vec2(message_width, CONTROL_ROW_HEIGHT),
+                                                egui::Button::new(RichText::new(
+                                                    capped_hover_text(message, 35),
+                                                ))
+                                                .sense(egui::Sense::click()),
+                                            )
+                                            .on_hover_text(capped_hover_text(
+                                                message,
+                                                FOREGROUND_TASK_TOOLTIP_MAX_CHARS,
+                                            ))
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                        if msg_button.clicked() {
+                                            send_message = Some(message.clone());
+                                            ui.close_menu();
+                                        }
 
-                                ui.add_space(4.0);
+                                        ui.add_space(4.0);
 
-                                // Edit button (fixed position on right)
-                                if styled_icon_button(
-                                    ui,
-                                    AppIcon::Code,
-                                    BTN_SUBTLE,
-                                    BTN_BLUE_HOVER,
-                                    BTN_ICON_ACTIVE,
-                                    "Edit",
-                                ) {
-                                    edit_index = Some(index);
-                                    ui.close_menu();
-                                }
+                                        // Edit button (fixed position on right)
+                                        if styled_icon_button(
+                                            ui,
+                                            AppIcon::Code,
+                                            BTN_SUBTLE,
+                                            BTN_BLUE_HOVER,
+                                            BTN_ICON_ACTIVE,
+                                            "Edit",
+                                        ) {
+                                            edit_index = Some(index);
+                                            ui.close_menu();
+                                        }
 
-                                // Delete button (fixed position on right)
-                                if styled_icon_button(
-                                    ui,
-                                    AppIcon::Trash,
-                                    BTN_SUBTLE,
-                                    BTN_RED_HOVER,
-                                    Color32::from_rgb(186, 58, 58),
-                                    "Delete",
-                                ) {
-                                    delete_index = Some(index);
-                                    ui.close_menu();
+                                        // Delete button (fixed position on right)
+                                        if styled_icon_button(
+                                            ui,
+                                            AppIcon::Trash,
+                                            BTN_SUBTLE,
+                                            BTN_RED_HOVER,
+                                            Color32::from_rgb(186, 58, 58),
+                                            "Delete",
+                                        ) {
+                                            delete_index = Some(index);
+                                            ui.close_menu();
+                                        }
+                                    });
                                 }
                             });
-                        }
                     }
 
                     ui.add_space(8.0);
@@ -24028,26 +24048,38 @@ fn styled_icon_button(
     response.clicked()
 }
 
-/// Browser toolbar icon button with tooltip shown above the button.
+/// Browser toolbar icon button with tooltip shown centered above the button.
 /// Unlike standard tooltips that appear below (which can overlap WebView),
-/// this helper positions the tooltip above to avoid z-order issues.
+/// this helper positions the tooltip centered above to avoid z-order issues.
 fn browser_toolbar_icon_button(ui: &mut Ui, icon: AppIcon, tooltip: &str) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT),
         Sense::click(),
     );
 
-    // Show custom tooltip above the button when hovered
+    // Show custom tooltip centered above the button when hovered
     if response.hovered() {
         ui.painter()
             .rect_filled(rect.shrink(1.0), 8.0, with_alpha(BTN_ICON_HOVER, 110));
 
         let tooltip_id = ui.make_persistent_id(("browser_toolbar_tooltip", response.id));
-        let tooltip_pos = rect.center_top() + egui::vec2(0.0, -BROWSER_TOOLBAR_TOOLTIP_GAP);
+        let tooltip_anchor = rect.center_top() + egui::vec2(0.0, -BROWSER_TOOLBAR_TOOLTIP_GAP);
 
-        egui::containers::show_tooltip_at(ui.ctx(), ui.layer_id(), tooltip_id, tooltip_pos, |ui| {
-            ui.label(tooltip);
-        });
+        // Use Area with CENTER_BOTTOM pivot so tooltip is centered horizontally above the anchor
+        let ctx = ui.ctx();
+        egui::Area::new(tooltip_id)
+            .kind(egui::UiKind::Tooltip)
+            .order(egui::Order::Tooltip)
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .fixed_pos(tooltip_anchor)
+            .default_width(ctx.style().spacing.tooltip_width)
+            .sense(egui::Sense::hover())
+            .show(ctx, |ui| {
+                egui::Frame::popup(&ctx.style()).show(ui, |ui| {
+                    ui.style_mut().interaction.selectable_labels = false;
+                    ui.label(tooltip);
+                });
+            });
     }
 
     ui.painter().text(
@@ -24065,7 +24097,7 @@ fn browser_toolbar_icon_button(ui: &mut Ui, icon: AppIcon, tooltip: &str) -> egu
     response
 }
 
-/// Browser toolbar toggle button with tooltip shown above.
+/// Browser toolbar toggle button with tooltip shown centered above.
 /// Supports ON/OFF state visualization like Design Inspect toggle.
 fn browser_toolbar_toggle_button(
     ui: &mut Ui,
@@ -24078,17 +24110,29 @@ fn browser_toolbar_toggle_button(
         Sense::click(),
     );
 
-    // Show custom tooltip above the button when hovered
+    // Show custom tooltip centered above the button when hovered
     if response.hovered() {
         ui.painter()
             .rect_filled(rect.shrink(1.0), 8.0, with_alpha(BTN_ICON_HOVER, 110));
 
         let tooltip_id = ui.make_persistent_id(("browser_toolbar_tooltip", response.id));
-        let tooltip_pos = rect.center_top() + egui::vec2(0.0, -BROWSER_TOOLBAR_TOOLTIP_GAP);
+        let tooltip_anchor = rect.center_top() + egui::vec2(0.0, -BROWSER_TOOLBAR_TOOLTIP_GAP);
 
-        egui::containers::show_tooltip_at(ui.ctx(), ui.layer_id(), tooltip_id, tooltip_pos, |ui| {
-            ui.label(tooltip);
-        });
+        // Use Area with CENTER_BOTTOM pivot so tooltip is centered horizontally above the anchor
+        let ctx = ui.ctx();
+        egui::Area::new(tooltip_id)
+            .kind(egui::UiKind::Tooltip)
+            .order(egui::Order::Tooltip)
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .fixed_pos(tooltip_anchor)
+            .default_width(ctx.style().spacing.tooltip_width)
+            .sense(egui::Sense::hover())
+            .show(ctx, |ui| {
+                egui::Frame::popup(&ctx.style()).show(ui, |ui| {
+                    ui.style_mut().interaction.selectable_labels = false;
+                    ui.label(tooltip);
+                });
+            });
     }
 
     let icon_color = if selected || response.hovered() || response.is_pointer_button_down_on() {
@@ -24107,17 +24151,29 @@ fn browser_toolbar_toggle_button(
     response
 }
 
-/// Show a tooltip above the given widget response.
-/// Helper for custom buttons that need tooltip positioning above the widget.
+/// Show a tooltip centered above the given widget response.
+/// Helper for custom buttons that need tooltip positioning centered above the widget.
 fn show_tooltip_above(ui: &mut Ui, response: &egui::Response, tooltip: &str) {
     if response.hovered() {
-        let tooltip_id = ui.make_persistent_id(("browser_toolbar_tooltip", response.id));
-        let tooltip_pos =
+        let tooltip_id = ui.make_persistent_id(("browser_tooltip_above", response.id));
+        let tooltip_anchor =
             response.rect.center_top() + egui::vec2(0.0, -BROWSER_TOOLBAR_TOOLTIP_GAP);
 
-        egui::containers::show_tooltip_at(ui.ctx(), ui.layer_id(), tooltip_id, tooltip_pos, |ui| {
-            ui.label(tooltip);
-        });
+        // Use Area with CENTER_BOTTOM pivot so tooltip is centered horizontally above the anchor
+        let ctx = ui.ctx();
+        egui::Area::new(tooltip_id)
+            .kind(egui::UiKind::Tooltip)
+            .order(egui::Order::Tooltip)
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .fixed_pos(tooltip_anchor)
+            .default_width(ctx.style().spacing.tooltip_width)
+            .sense(egui::Sense::hover())
+            .show(ctx, |ui| {
+                egui::Frame::popup(&ctx.style()).show(ui, |ui| {
+                    ui.style_mut().interaction.selectable_labels = false;
+                    ui.label(tooltip);
+                });
+            });
     }
 }
 

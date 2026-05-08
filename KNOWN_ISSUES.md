@@ -10,6 +10,66 @@ When adding an entry:
 
 ---
 
+#### Browser toolbar tooltips now centered above buttons {#browser-tooltips-centered-above}
+- Date: 2026-05-08
+- Context: Browser panel toolbar button hover tooltips (Design Inspect, Go, Clear, Screenshot, tab controls)
+- Error signature: User reported: "yanında çıkıyor hover üstte sağ çaprazda çıksın butonun üstünde" — Tooltips on browser toolbar buttons were appearing offset to the side (right/corner) instead of being centered directly above the button.
+- Symptoms/Impact: Hover tooltips on browser toolbar buttons (especially Design Inspect toggle) appeared horizontally offset from the button center, making them appear to the side rather than directly above the button as expected.
+- Root cause:
+  - `show_tooltip_at()` function uses `find_tooltip_position()` which determines tooltip placement based on available screen space.
+  - When the suggested position (`rect.center_top()`) was passed, egui treated this as a `LEFT_TOP` anchor point rather than a center anchor.
+  - The tooltip positioning logic would shift the tooltip horizontally to fit on screen, causing the offset appearance.
+  - The pivot/anchor system in `show_tooltip_at()` doesn't support center-based anchoring directly.
+- Resolution:
+  - Replaced `egui::containers::show_tooltip_at()` calls with custom `egui::Area` based implementation in all tooltip helpers:
+    - `browser_toolbar_icon_button()`: Go, Clear URL buttons
+    - `browser_toolbar_toggle_button()`: Design Inspect toggle
+    - `show_tooltip_above()`: Tab close, tab title, add tab buttons
+  - New implementation uses `egui::Area::new()` with explicit configuration:
+    - `pivot(egui::Align2::CENTER_BOTTOM)`: Centers tooltip horizontally above the anchor point
+    - `fixed_pos(tooltip_anchor)`: Positions at button's center_top minus gap
+    - `kind(egui::UiKind::Tooltip)` and `order(egui::Order::Tooltip)`: Proper tooltip layer ordering
+    - `Frame::popup()` for consistent tooltip styling
+  - Tooltip anchor calculation: `rect.center_top() + vec2(0.0, -BROWSER_TOOLBAR_TOOLTIP_GAP)`
+  - This ensures tooltip is horizontally centered on the button regardless of tooltip content width.
+- Prevent recurrence:
+  - Updated `AGENTS.md` Browser Panel WebView Z-Order Guidelines to specify "centered above" instead of just "above":
+    - "Toolbar and tab strip tooltips must appear centered above buttons"
+    - "These helpers use `egui::Area` with `CENTER_BOTTOM` pivot so the tooltip is horizontally centered on the button, not offset to the side"
+  - All three tooltip helpers now use the same centering implementation for consistency.
+- Files/Commands touched: `src/app.rs` (updated `browser_toolbar_icon_button()`, `browser_toolbar_toggle_button()`, `show_tooltip_above()` to use Area-based centered tooltips), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User feedback 2026-05-08: "yanında çıkıyor hover üstte sağ çaprazda çıksın butonun üstünde"
+
+---
+
+#### Foreground tasks menu and popup max height with scroll {#foreground-tasks-max-height-scroll}
+- Date: 2026-05-08
+- Context: Foreground tasks dropdown menu and Add/Edit Task popup - user reported long text causing layout issues
+- Error signature: User reported: "foreground tasks penceresine default max height ekle içine scroll ekle uzun metin olunca bozuluyor bozulmasın" — Foreground tasks menu and popup were breaking layout with long task lists or long text content.
+- Symptoms/Impact:
+  1. Foreground tasks dropdown menu with many tasks would grow indefinitely, potentially exceeding screen bounds.
+  2. The Add/Edit Task popup's multiline text input would expand with long content, pushing buttons off-screen or expanding the window beyond viewport.
+  3. Task tooltips with very long commands could extend beyond screen bounds.
+- Root cause:
+  - Task list in dropdown was not wrapped in a ScrollArea, allowing unlimited vertical growth.
+  - TextEdit::multiline in the popup was not constrained with max height or ScrollArea, allowing content to expand the window.
+  - Tooltips used raw message text without truncation, allowing unlimited width.
+- Resolution:
+  - Added `FOREGROUND_TASKS_MENU_MAX_HEIGHT = 300.0` constant and wrapped task list in `ScrollArea::vertical().max_height(FOREGROUND_TASKS_MENU_MAX_HEIGHT)`.
+  - Added `FOREGROUND_MESSAGE_TEXT_MAX_HEIGHT = 320.0` constant and wrapped popup TextEdit in ScrollArea with clamped height between 200px min and 320px max.
+  - Added `FOREGROUND_TASK_TOOLTIP_MAX_CHARS = 100` constant and applied `capped_hover_text()` to task tooltips.
+  - Popup text input now scrolls internally instead of expanding the window.
+- Prevent recurrence:
+  - Updated `AGENTS.md` Terminal Manager Saved Messages Guidelines with new rules:
+    - "Task list max height with scroll" documenting the ScrollArea requirement
+    - "Popup layout" documenting min/max height and ScrollArea wrapping
+    - "Popup text input scroll behavior" documenting internal scrolling
+    - "Tooltip length limits" documenting tooltip character cap
+- Files/Commands touched: `src/app.rs` (constants, `draw_foreground_message_popup()` ScrollArea wrapping, `draw_terminal_foreground_message_menu_button()` ScrollArea and tooltip changes), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-05-08: "foreground tasks penceresine default max height ekle içine scroll ekle uzun metin olunca bozuluyor bozulmasın"
+
+---
+
 #### Input History panel Foreground filter limited to 5 entries {#input-history-foreground-limit}
 - Date: 2026-05-08
 - Context: Input History left sidebar panel showing too many foreground entries
