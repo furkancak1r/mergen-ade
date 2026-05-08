@@ -20143,7 +20143,9 @@ impl AdeApp {
             return;
         }
 
-        let window_size = egui::vec2(600.0, 440.0);
+        let screen_width = ctx.screen_rect().width();
+        let popup_width = (screen_width - 64.0).clamp(480.0, 860.0);
+        let window_size = egui::vec2(popup_width, 440.0);
 
         egui::Window::new(title)
             .id(egui::Id::new("foreground_message_popup"))
@@ -20188,7 +20190,7 @@ impl AdeApp {
                                         egui::Modifiers::CTRL,
                                         egui::Key::Enter,
                                     ));
-                            ui.add(text_edit);
+                            ui.add_sized(egui::vec2(available_width, text_height), text_edit);
                         });
                 });
 
