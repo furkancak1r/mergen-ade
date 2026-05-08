@@ -137,19 +137,14 @@ pub fn opencode_notify_inbox_path_for_dir(
 }
 
 /// Environment variable name for forcing OpenCode to use a specific binary.
-/// Used to workaround AVX2 segfault by pointing to baseline binary.
 pub const OPENCODE_BIN_PATH_ENV_VAR: &str = "OPENCODE_BIN_PATH";
 
 pub fn opencode_env_pairs(
     terminal_id: u64,
     inbox_dir: &Path,
     inbox_token: &str,
-) -> [(String, OsString); 5] {
-    // Determine the baseline OpenCode binary path to avoid AVX2 segfault
-    // The baseline binary works on all CPUs without AVX2 requirements
-    let opencode_baseline_path = opencode_baseline_binary_path();
-
-    [
+) -> Vec<(String, OsString)> {
+    let mut pairs = vec![
         (
             MERGEN_TERMINAL_ID_ENV_VAR.to_owned(),
             OsString::from(terminal_id.to_string()),
@@ -166,36 +161,111 @@ pub fn opencode_env_pairs(
             MERGEN_ADE_OPENCODE_INBOX_TOKEN_ENV_VAR.to_owned(),
             OsString::from(inbox_token),
         ),
-        (OPENCODE_BIN_PATH_ENV_VAR.to_owned(), opencode_baseline_path),
-    ]
+    ];
+
+    if let Some(opencode_bin_path) = opencode_bin_path() {
+        pairs.push((OPENCODE_BIN_PATH_ENV_VAR.to_owned(), opencode_bin_path));
+    }
+
+    pairs
 }
 
-/// Returns the path to the baseline OpenCode binary.
-/// This binary works on all CPUs without AVX2 requirements.
-/// The path is determined based on the npm global installation location.
-fn opencode_baseline_binary_path() -> OsString {
-    // Default path based on standard npm global installation
-    let default_path = PathBuf::from(
-        std::env::var("APPDATA")
-            .as_deref()
-            .unwrap_or("C:\\Users\\Default\\AppData\\Roaming"),
+fn opencode_bin_path() -> Option<OsString> {
+    resolve_opencode_bin_path(
+        std::env::var_os(OPENCODE_BIN_PATH_ENV_VAR),
+        std::env::var_os("APPDATA"),
+        host_supports_avx2(),
+        cfg!(target_os = "windows"),
     )
-    .join("npm")
-    .join("node_modules")
-    .join("opencode-ai")
-    .join("node_modules")
-    .join("opencode-windows-x64-baseline")
-    .join("bin")
-    .join("opencode.exe");
+}
 
-    // If OPENCODE_BIN_PATH is already set externally, use that
-    if let Ok(existing) = std::env::var(OPENCODE_BIN_PATH_ENV_VAR) {
-        if !existing.is_empty() {
-            return OsString::from(existing);
+fn resolve_opencode_bin_path(
+    existing: Option<OsString>,
+    appdata: Option<OsString>,
+    avx2_supported: bool,
+    is_windows: bool,
+) -> Option<OsString> {
+    let existing = existing.filter(|value| !value.as_os_str().is_empty());
+
+    if !is_windows {
+        return existing;
+    }
+
+    if let Some(existing_path) = existing.as_ref().map(PathBuf::from) {
+        if is_windows_x64_baseline_opencode_path(&existing_path) {
+            if avx2_supported {
+                let non_baseline = sibling_windows_x64_opencode_binary_path(
+                    &existing_path,
+                    "opencode-windows-x64",
+                );
+                if let Some(path) = existing_file(non_baseline) {
+                    return Some(path.into_os_string());
+                }
+            }
+        } else {
+            return existing;
         }
     }
 
-    OsString::from(default_path)
+    if let Some(appdata) = appdata {
+        let modules_dir = PathBuf::from(appdata)
+            .join("npm")
+            .join("node_modules")
+            .join("opencode-ai")
+            .join("node_modules");
+
+        let preferred = if avx2_supported {
+            ["opencode-windows-x64", "opencode-windows-x64-baseline"]
+        } else {
+            ["opencode-windows-x64-baseline", "opencode-windows-x64"]
+        };
+
+        for package in preferred {
+            let path = windows_x64_opencode_binary_path(&modules_dir, package);
+            if let Some(path) = existing_file(Some(path)) {
+                return Some(path.into_os_string());
+            }
+        }
+    }
+
+    existing
+}
+
+fn windows_x64_opencode_binary_path(modules_dir: &Path, package: &str) -> PathBuf {
+    modules_dir.join(package).join("bin").join("opencode.exe")
+}
+
+fn sibling_windows_x64_opencode_binary_path(
+    existing_path: &Path,
+    package: &str,
+) -> Option<PathBuf> {
+    let bin_dir = existing_path.parent()?;
+    let package_dir = bin_dir.parent()?;
+    let modules_dir = package_dir.parent()?;
+    Some(windows_x64_opencode_binary_path(modules_dir, package))
+}
+
+fn is_windows_x64_baseline_opencode_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("opencode-windows-x64-baseline")
+    })
+}
+
+fn existing_file(path: Option<PathBuf>) -> Option<PathBuf> {
+    path.filter(|path| path.is_file())
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn host_supports_avx2() -> bool {
+    std::is_x86_feature_detected!("avx2")
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+fn host_supports_avx2() -> bool {
+    false
 }
 
 pub fn write_opencode_notify_event(
@@ -560,6 +630,22 @@ mod tests {
         }
     }
 
+    fn touch_file(path: &Path) {
+        fs::create_dir_all(path.parent().expect("test file has parent")).expect("create parent");
+        fs::write(path, b"").expect("write test file");
+    }
+
+    fn test_opencode_binary_path(appdata: &Path, package: &str) -> PathBuf {
+        appdata
+            .join("npm")
+            .join("node_modules")
+            .join("opencode-ai")
+            .join("node_modules")
+            .join(package)
+            .join("bin")
+            .join("opencode.exe")
+    }
+
     #[test]
     fn opencode_env_pairs_include_terminal_id_inbox_dir_tool_hint_and_token() {
         let inbox_dir = PathBuf::from("/tmp/opencode-inbox");
@@ -573,6 +659,45 @@ mod tests {
         assert_eq!(pairs[2].1, OsString::from(MERGEN_AI_TOOL_HINT_OPENCODE));
         assert_eq!(pairs[3].0, MERGEN_ADE_OPENCODE_INBOX_TOKEN_ENV_VAR);
         assert_eq!(pairs[3].1, OsString::from("opencode-token-42"));
+    }
+
+    #[test]
+    fn resolve_opencode_bin_path_replaces_inherited_baseline_on_avx2_windows() {
+        let temp = TestTempDir::new("opencode-bin-avx2");
+        let baseline = test_opencode_binary_path(&temp.path, "opencode-windows-x64-baseline");
+        let non_baseline = test_opencode_binary_path(&temp.path, "opencode-windows-x64");
+        touch_file(&baseline);
+        touch_file(&non_baseline);
+
+        let selected = resolve_opencode_bin_path(Some(baseline.into_os_string()), None, true, true);
+
+        assert_eq!(selected, Some(non_baseline.into_os_string()));
+    }
+
+    #[test]
+    fn resolve_opencode_bin_path_preserves_inherited_baseline_without_avx2() {
+        let temp = TestTempDir::new("opencode-bin-baseline");
+        let baseline = test_opencode_binary_path(&temp.path, "opencode-windows-x64-baseline");
+        let non_baseline = test_opencode_binary_path(&temp.path, "opencode-windows-x64");
+        touch_file(&baseline);
+        touch_file(&non_baseline);
+
+        let selected =
+            resolve_opencode_bin_path(Some(baseline.clone().into_os_string()), None, false, true);
+
+        assert_eq!(selected, Some(baseline.into_os_string()));
+    }
+
+    #[test]
+    fn resolve_opencode_bin_path_prefers_standard_avx2_binary_when_available() {
+        let temp = TestTempDir::new("opencode-bin-standard");
+        let non_baseline = test_opencode_binary_path(&temp.path, "opencode-windows-x64");
+        touch_file(&non_baseline);
+
+        let selected =
+            resolve_opencode_bin_path(None, Some(temp.path.clone().into_os_string()), true, true);
+
+        assert_eq!(selected, Some(non_baseline.into_os_string()));
     }
 
     #[test]

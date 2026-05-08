@@ -943,3 +943,23 @@ When adding an entry:
 - Files/Commands touched: `src/app.rs` (`draw_browser_panel()` tab strip layout), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User request 2026-05-07: "yeni sekme butonu en sonuncu sekmenin hemen yaninda olsun"
 
+
+---
+
+#### OpenCode baseline binary segfault on Windows {#opencode-baseline-binary-segfault}
+- Date: 2026-05-08
+- Context: OpenCode launched from a Mergen-managed Windows terminal
+- Error signature: `Bun v1.3.13 ... opencode-windows-x64-baseline ... panic(main thread): Segmentation fault`
+- Symptoms/Impact: Running `opencode` exited immediately before the OpenCode UI started, even after a PC restart.
+- Root cause:
+  - Mergen always injected `OPENCODE_BIN_PATH` pointing at `opencode-windows-x64-baseline` as an older AVX2 workaround.
+  - On the affected AVX2-capable machine, `opencode-windows-x64` works while `opencode-windows-x64-baseline` crashes.
+  - Because the env var was forced, OpenCode's npm shim never got a chance to choose the working binary.
+- Resolution:
+  - Replaced the unconditional baseline path with dynamic OpenCode binary resolution.
+  - On Windows + AVX2, Mergen now prefers the standard `opencode-windows-x64` binary when it exists.
+  - If a previous Mergen terminal inherited a baseline `OPENCODE_BIN_PATH`, Mergen replaces it with the sibling standard binary on AVX2 machines.
+  - Custom non-baseline `OPENCODE_BIN_PATH` values are preserved, and non-AVX2 machines still prefer baseline.
+  - Added regression tests for inherited baseline replacement and fallback behavior.
+- Files/Commands touched: `src/opencode.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-08: OpenCode crash output showing `opencode-windows-x64-baseline` Bun segmentation fault.
