@@ -268,6 +268,12 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Browser MCP waits must not fake success.** `browser_wait_for` may report success only after the requested duration has elapsed or the requested text/textGone condition is true.
 - **Browser MCP waits must not block egui update paths.** Fixed waits and polling should run in the MCP helper or another non-UI pending flow, not inside `AdeApp::process_browser_mcp_commands()` or WebView script execution that blocks the UI frame.
 - **Native WebView focus must yield to terminal activation.** When a terminal is activated—including re-selecting the same terminal—clear app text-input focus via `surrender_ui_text_focus()` and restore the host window focus via `SetFocus(hwnd)` on Windows. This ensures browser URL input and native WebView2 keyboard focus do not block terminal input capture.
+- **Modal popups must hide embedded browsers immediately.** All modal popups (Settings, exit confirmation, foreground message popup, Terminal Manager history popup) must hide embedded browsers BEFORE the first frame of the modal is rendered. The WebView2 native child window renders above egui layers, so:
+  - Call `hide_embedded_browsers()` at the start of `draw_*_popup()` functions (before rendering the overlay backdrop).
+  - Clear `pending_browser_rect` to prevent `sync_embedded_browser()` from re-showing the browser in the same frame.
+  - The `open_settings_popup()` function should also hide browsers immediately when called, before setting `show_settings_popup = true`.
+  - This ensures mouse/keyboard events reach the modal overlay, not the WebView window.
+  - See `KNOWN_ISSUES.md` entry `settings-popup-webview-z-order` for details on the bug this prevents.
 
 ## Browser Panel WebView Z-Order Guidelines
 - **Never use native-popup menus (menu_button) over the WebView content area.** Native WebView2 renders as a child window above egui's immediate-mode rendering. Popups like `ui.menu_button` that extend over the WebView area will appear BEHIND the WebView and be unusable.

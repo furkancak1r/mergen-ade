@@ -10,6 +10,41 @@ When adding an entry:
 
 ---
 
+#### Settings popup hidden behind browser WebView {#settings-popup-webview-z-order}
+- Date: 2026-05-08
+- Context: Settings modal and other UI overlays appearing behind the embedded browser WebView2 window
+- Error signature: User reported: "settings browser filan açıkken arkada kalıyor tıklanmıyor hiçbir şekilde rengi filan değişiyor daha koyu oluyor" — Settings popup appears behind the browser panel and cannot be clicked; the browser content appears darker.
+- Symptoms/Impact:
+  1. When opening Settings while the browser panel is visible, the Settings modal appears behind the native WebView2 window.
+  2. The Settings modal is visible but appears darker/less prominent (WebView content shows through the overlay).
+  3. Mouse clicks do not register on the Settings modal because the WebView window is intercepting them.
+  4. The Settings modal cannot be interacted with (buttons don't work, text inputs don't receive focus).
+- Root cause:
+  - Native WebView2 renders as a child window (`HWND`) above egui's immediate-mode rendering layer.
+  - The `sync_embedded_browser()` function that hides/shows the WebView is called AFTER UI rendering, not before.
+  - When Settings opens, the WebView remains visible and intercepts all mouse/keyboard events that should go to the modal.
+  - The modal overlay (dark backdrop) renders in egui but the WebView window stays on top, creating a visual conflict.
+- Resolution:
+  - Modified `open_settings_popup()` to immediately hide all embedded browsers and clear `pending_browser_rect` when the popup opens:
+    ```rust
+    self.hide_embedded_browsers();
+    self.pending_browser_rect = None;
+    ```
+  - Modified `draw_settings_popup()` to call `hide_embedded_browsers()` and clear `pending_browser_rect` at the start of rendering, ensuring the WebView is hidden BEFORE the first frame of the modal is drawn.
+  - Applied the same fix to `draw_foreground_message_popup()` and `draw_exit_confirm_popup()` for consistency.
+  - The `sync_embedded_browser()` function already had logic to hide browsers when overlays are active, but calling it at the start of modal rendering ensures immediate hiding without waiting for the frame end.
+- Prevent recurrence:
+  - Added regression tests verifying modal browser hiding:
+    - `open_settings_popup_hides_browsers_immediately`: Verifies browser is hidden immediately when Settings opens
+    - `open_settings_popup_hides_terminal_scoped_browsers`: Verifies terminal-scoped browsers are also hidden
+    - `foreground_message_popup_hides_browsers_immediately`: Verifies foreground message popup hides browsers
+    - `exit_confirm_popup_hides_browsers_immediately`: Verifies exit confirm popup hides browsers
+  - Updated `AGENTS.md` Embedded Browser Panel Guidelines to document the requirement that all modal popups must hide embedded browsers before rendering.
+- Files/Commands touched: `src/app.rs` (`open_settings_popup()`, `draw_settings_popup()`, `draw_foreground_message_popup()`, `draw_exit_confirm_popup()`, 4 new regression tests), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User bug report 2026-05-08: "settings browser filan açıkken arkada kalıyor tıklanmıyor hiçbir şekilde rengi filan değişiyor daha koyu oluyor"
+
+---
+
 #### Foreground tasks now use paste-safe bracketed paste delivery {#foreground-tasks-bracketed-paste}
 - Date: 2026-05-08
 - Context: Foreground task queue send behavior in Terminal Manager - user requested tasks behave like paste instead of typing

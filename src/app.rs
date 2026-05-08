@@ -3484,6 +3484,10 @@ impl AdeApp {
             return;
         }
 
+        // Hide embedded browsers to prevent WebView from blocking modal interaction
+        self.hide_embedded_browsers();
+        self.pending_browser_rect = None;
+
         use std::cell::Cell;
 
         // Track if popup should close (from overlay click or button clicks)
@@ -12155,6 +12159,10 @@ impl AdeApp {
         self.show_settings_popup = true;
         self.active_settings_section = SettingsSection::General;
         self.settings_diagnostics_expanded = false;
+        // Immediately hide all embedded browsers to prevent WebView from
+        // blocking the modal overlay (native child window z-order issue)
+        self.hide_embedded_browsers();
+        self.pending_browser_rect = None;
     }
 
     fn draw_settings_navigation(&mut self, ui: &mut Ui, shows_diagnostics_warning_badge: bool) {
@@ -19889,6 +19897,12 @@ impl AdeApp {
             return;
         }
 
+        // Ensure embedded browsers are hidden before rendering the modal.
+        // WebView2 native child window renders above egui layers; hiding
+        // must happen before the first frame to prevent interaction blocking.
+        self.hide_embedded_browsers();
+        self.pending_browser_rect = None;
+
         let mut changes = SettingsEditOutcome::default();
 
         // Dark overlay backdrop
@@ -20093,6 +20107,10 @@ impl AdeApp {
         let Some(project_id) = self.foreground_message_popup_open else {
             return;
         };
+
+        // Hide embedded browsers to prevent WebView from blocking modal interaction
+        self.hide_embedded_browsers();
+        self.pending_browser_rect = None;
 
         let is_editing = self.foreground_message_popup_editing_index.is_some();
         let title = if is_editing {
@@ -43685,6 +43703,72 @@ mod tests {
     }
 
     #[test]
+    fn open_settings_popup_hides_browsers_immediately() {
+        // Regression test: Settings modal must hide WebView BEFORE first frame
+        // to prevent native child window from blocking interaction
+        let mut app = test_app([], None);
+
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        app.selected_project = Some(1);
+        app.set_browser_panel_open_for_project(1, true);
+
+        // Show the browser and mark as visible
+        app.browser_for_scope(1).show();
+        app.pending_browser_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(800.0, 100.0),
+            egui::vec2(400.0, 600.0),
+        ));
+        assert!(app
+            .embedded_browsers_by_scope
+            .get(&BrowserScopeKey::Project(1))
+            .unwrap()
+            .requested_visible());
+
+        // Opening settings popup should immediately hide browsers
+        app.open_settings_popup();
+
+        // Verify browser is hidden immediately (before sync_embedded_browser runs)
+        assert!(!app
+            .embedded_browsers_by_scope
+            .get(&BrowserScopeKey::Project(1))
+            .unwrap()
+            .requested_visible());
+        assert!(app.pending_browser_rect.is_none());
+        assert!(app.show_settings_popup);
+    }
+
+    #[test]
+    fn open_settings_popup_hides_terminal_scoped_browsers() {
+        // Regression test: Settings modal must hide terminal-scoped browsers too
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
+
+        // Create a terminal-scoped browser
+        let terminal_scope = BrowserScopeKey::Terminal {
+            project_id: 7,
+            terminal_id: 1,
+        };
+        app.browser_for_scope(terminal_scope).show();
+        assert!(app
+            .embedded_browsers_by_scope
+            .get(&terminal_scope)
+            .unwrap()
+            .requested_visible());
+
+        // Opening settings popup should hide terminal-scoped browsers too
+        app.open_settings_popup();
+
+        // Verify terminal-scoped browser is hidden
+        assert!(!app
+            .embedded_browsers_by_scope
+            .get(&terminal_scope)
+            .unwrap()
+            .requested_visible());
+    }
+
+    #[test]
     fn sync_embedded_browser_does_not_create_browser_while_ui_overlay_active() {
         let ctx = egui::Context::default();
         let mut app = test_app([], None);
@@ -43738,6 +43822,82 @@ mod tests {
             .get(&BrowserScopeKey::Project(1))
             .unwrap()
             .requested_visible());
+    }
+
+    #[test]
+    fn foreground_message_popup_hides_browsers_immediately() {
+        // Regression test: Foreground message popup must hide WebView on open
+        let mut app = test_app([], None);
+
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        app.selected_project = Some(1);
+        app.set_browser_panel_open_for_project(1, true);
+
+        // Show the browser
+        app.browser_for_scope(1).show();
+        app.pending_browser_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(800.0, 100.0),
+            egui::vec2(400.0, 600.0),
+        ));
+        assert!(app
+            .embedded_browsers_by_scope
+            .get(&BrowserScopeKey::Project(1))
+            .unwrap()
+            .requested_visible());
+
+        // Simulate what happens when foreground message popup opens:
+        // 1. Set popup state
+        // 2. draw_foreground_message_popup() calls hide_embedded_browsers()
+        app.foreground_message_popup_open = Some(1);
+        app.hide_embedded_browsers();
+        app.pending_browser_rect = None;
+
+        // Browser should be hidden and pending rect cleared
+        assert!(!app
+            .embedded_browsers_by_scope
+            .get(&BrowserScopeKey::Project(1))
+            .unwrap()
+            .requested_visible());
+        assert!(app.pending_browser_rect.is_none());
+    }
+
+    #[test]
+    fn exit_confirm_popup_hides_browsers_immediately() {
+        // Regression test: Exit confirm popup must hide WebView on open
+        let mut app = test_app([], None);
+
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        app.selected_project = Some(1);
+        app.set_browser_panel_open_for_project(1, true);
+
+        // Show the browser
+        app.browser_for_scope(1).show();
+        app.pending_browser_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(800.0, 100.0),
+            egui::vec2(400.0, 600.0),
+        ));
+        assert!(app
+            .embedded_browsers_by_scope
+            .get(&BrowserScopeKey::Project(1))
+            .unwrap()
+            .requested_visible());
+
+        // Simulate what happens when exit confirm popup opens:
+        // 1. Set popup state
+        // 2. draw_exit_confirm_popup() calls hide_embedded_browsers()
+        app.show_exit_confirm_popup = true;
+        app.hide_embedded_browsers();
+        app.pending_browser_rect = None;
+
+        // Browser should be hidden and pending rect cleared
+        assert!(!app
+            .embedded_browsers_by_scope
+            .get(&BrowserScopeKey::Project(1))
+            .unwrap()
+            .requested_visible());
+        assert!(app.pending_browser_rect.is_none());
     }
 
     #[test]
