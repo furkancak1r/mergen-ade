@@ -389,6 +389,16 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Directory file icons are extension-based only.** Do not add blocking metadata reads just to choose icons; use the existing `DirectoryNode` path/name data.
 - **Directory search highlighting must remain char-safe with icons.** Adding icons must not alter UTF-8-safe match highlighting or split multi-byte characters.
 
+## OS Notifications Guidelines
+
+- **OS notifications use Windows `FlashWindowEx`** for portable EXE compatibility (avoids complex AppUserModelID/shortcut setup required for Windows toast notifications).
+- **Notification triggers** are tied to AI CLI attention state transitions: when Factory Droid, OpenCode, or Claude status changes to `AiCliStatus::Attention`, a notification is queued.
+- **Focus-aware delivery** via `ctx.input(|i| i.viewport().focused)`. When `only_when_unfocused` is enabled, notifications are suppressed if the app is currently focused.
+- **Cooldown deduplication** prevents notification spam. Each terminal tracks its last notification time; new notifications are blocked until `cooldown_secs` has elapsed.
+- **Pending notification pattern**: Status apply functions (`apply_factory_droid_status`, `apply_opencode_transport_status`, `apply_claude_status`) set `pending_os_notification: Option<u64>` since they lack access to `ctx`. The `update` loop then processes the pending notification with full access to the egui context.
+- **Config structure**: `OsNotificationConfig` contains `enabled`, `only_when_unfocused`, `on_permission`, `on_turn_complete`, `on_session_error`, and `cooldown_secs` fields.
+- **Settings UI**: Notifications section accessible via Settings popup with toggle for each trigger type and cooldown duration control.
+
 ## Browser Design Inspect Guidelines
 
 - **Design Inspect delivery is click-only.** Hover and pointer movement may update the highlight overlay but must never send context to the terminal.

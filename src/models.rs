@@ -671,6 +671,30 @@ fn normalize_shortcut_modifiers_for_current_platform(modifiers: &mut ShortcutMod
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct OsNotificationConfig {
+    pub enabled: bool,
+    pub only_when_unfocused: bool,
+    pub on_permission: bool,
+    pub on_turn_complete: bool,
+    pub on_session_error: bool,
+    pub cooldown_secs: u64,
+}
+
+impl Default for OsNotificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            only_when_unfocused: true,
+            on_permission: true,
+            on_turn_complete: true,
+            on_session_error: true,
+            cooldown_secs: 30,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -685,6 +709,8 @@ pub struct AppConfig {
     pub ai_hooks: AiHooksConfig,
     #[serde(default)]
     pub opencode: OpenCodeModelConfig,
+    #[serde(default)]
+    pub notifications: OsNotificationConfig,
 }
 
 impl Default for AppConfig {
@@ -698,6 +724,7 @@ impl Default for AppConfig {
             projects: Vec::new(),
             ai_hooks: AiHooksConfig::default(),
             opencode: OpenCodeModelConfig::default(),
+            notifications: OsNotificationConfig::default(),
         }
     }
 }

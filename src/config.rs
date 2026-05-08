@@ -284,6 +284,7 @@ impl From<LegacyAppConfig> for AppConfig {
             projects,
             ai_hooks: crate::hooks::AiHooksConfig::default(),
             opencode: crate::models::OpenCodeModelConfig::default(),
+            notifications: crate::models::OsNotificationConfig::default(),
         }
     }
 }

@@ -1437,6 +1437,10 @@ pub struct AdeApp {
     browser_video_recordings_by_scope: BTreeMap<BrowserScopeKey, BrowserVideoRecordingState>,
     browser_video_encode_events_tx: Sender<BrowserVideoEncodeEvent>,
     browser_video_encode_events_rx: Receiver<BrowserVideoEncodeEvent>,
+    /// Last OS notification dispatched per terminal (for cooldown deduplication).
+    os_notification_last_by_terminal: BTreeMap<u64, Instant>,
+    /// Pending OS notification terminal to dispatch in the next update frame.
+    pending_os_notification: Option<u64>,
 }
 
 /// Represents a single open file buffer in the built-in editor.
@@ -2625,16 +2629,18 @@ enum SettingsSection {
     OpenCode,
     SavedMessages,
     Shortcuts,
+    Notifications,
     Diagnostics,
 }
 
 impl SettingsSection {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::General,
         Self::Launchers,
         Self::OpenCode,
         Self::SavedMessages,
         Self::Shortcuts,
+        Self::Notifications,
         Self::Diagnostics,
     ];
 
@@ -2645,6 +2651,7 @@ impl SettingsSection {
             Self::OpenCode => "OpenCode",
             Self::SavedMessages => "Saved Messages",
             Self::Shortcuts => "Shortcuts",
+            Self::Notifications => "Notifications",
             Self::Diagnostics => "Diagnostics",
         }
     }
@@ -2656,6 +2663,7 @@ impl SettingsSection {
             Self::OpenCode => "OpenCode",
             Self::SavedMessages => "Saved Messages",
             Self::Shortcuts => "Shortcuts",
+            Self::Notifications => "Notifications",
             Self::Diagnostics => "Diagnostics",
         }
     }
@@ -2675,6 +2683,9 @@ impl SettingsSection {
             Self::Shortcuts => {
                 "Configure keyboard shortcuts to send commands to the active terminal."
             }
+            Self::Notifications => {
+                "Control OS-level attention alerts when AI agents need input or finish work."
+            }
             Self::Diagnostics => {
                 "Inspect Factory Droid and Codex CLI wiring, health, and runtime signals."
             }
@@ -2688,6 +2699,7 @@ impl SettingsSection {
             Self::OpenCode => AppIcon::ChatText,
             Self::SavedMessages => AppIcon::ChatText,
             Self::Shortcuts => AppIcon::Terminal,
+            Self::Notifications => AppIcon::Eye,
             Self::Diagnostics => AppIcon::Eye,
         }
     }
@@ -2699,6 +2711,7 @@ impl SettingsSection {
             Self::OpenCode => "settings-opencode-scroll",
             Self::SavedMessages => "settings-saved-messages-scroll",
             Self::Shortcuts => "settings-shortcuts-scroll",
+            Self::Notifications => "settings-notifications-scroll",
             Self::Diagnostics => "settings-diagnostics-scroll",
         }
     }
@@ -2730,6 +2743,7 @@ struct SettingsEditOutcome {
     opencode_changed: bool,
     projects_changed: bool,
     shortcuts_changed: bool,
+    notifications_changed: bool,
 }
 
 impl SettingsEditOutcome {
@@ -2761,6 +2775,11 @@ impl SettingsEditOutcome {
     fn note_shortcuts_change(&mut self) {
         self.should_persist = true;
         self.shortcuts_changed = true;
+    }
+
+    fn note_notifications_change(&mut self) {
+        self.should_persist = true;
+        self.notifications_changed = true;
     }
 }
 
@@ -3893,6 +3912,8 @@ impl AdeApp {
             browser_video_recordings_by_scope: BTreeMap::new(),
             browser_video_encode_events_tx,
             browser_video_encode_events_rx,
+            os_notification_last_by_terminal: BTreeMap::new(),
+            pending_os_notification: None,
         };
         // Do NOT seed runtime browser state from legacy config.
         // Browser panel open state is now runtime-only per project.
@@ -4862,6 +4883,9 @@ impl AdeApp {
         entry.factory_droid_last_process_seen_at = Some(Instant::now());
         if entry.factory_droid_launch_pending_since.take().is_some() {
             changed = true;
+        }
+        if changed && status == AiCliStatus::Attention {
+            self.pending_os_notification = Some(terminal_id);
         }
         entry.dirty = true;
         changed
@@ -6373,11 +6397,15 @@ impl AdeApp {
         }
 
         entry.opencode_last_process_seen_at = Some(now);
+
+        if changed && session_status == AiCliStatus::Attention {
+            self.pending_os_notification = Some(terminal_id);
+        }
+
         entry.dirty = true;
 
         changed
     }
-
     /// Apply Claude Code status to a terminal entry.
     /// This handles title-based detection and maintains Claude-specific state.
     fn apply_claude_status(
@@ -6484,6 +6512,10 @@ impl AdeApp {
                 }
                 entry.claude_normalized_status = None;
             }
+        }
+
+        if changed && status == AiCliStatus::Attention {
+            self.pending_os_notification = Some(terminal_id);
         }
 
         entry.dirty = true;
@@ -12274,6 +12306,9 @@ impl AdeApp {
                             SettingsSection::Shortcuts => {
                                 self.draw_settings_shortcuts_section(ctx, ui, changes);
                             }
+                            SettingsSection::Notifications => {
+                                self.draw_settings_notifications_section(ui, changes);
+                            }
                             SettingsSection::Diagnostics => {
                                 self.draw_settings_diagnostics_section(ctx, ui, diagnostics);
                             }
@@ -13395,6 +13430,105 @@ impl AdeApp {
                 }
             },
         );
+    }
+
+    fn draw_settings_notifications_section(
+        &mut self,
+        ui: &mut Ui,
+        changes: &mut SettingsEditOutcome,
+    ) {
+        let cfg = &mut self.config.notifications;
+        let previous = cfg.clone();
+        show_settings_card(
+            ui,
+            AppIcon::Eye,
+            "OS Notifications",
+            "Flash the taskbar when an AI agent needs your attention or finishes work.",
+            |ui| {
+                ui.checkbox(&mut cfg.enabled, "Enable OS attention alerts");
+                ui.add_space(8.0);
+                ui.checkbox(
+                    &mut cfg.only_when_unfocused,
+                    "Only when Mergen is not focused",
+                );
+                ui.add_space(8.0);
+                ui.label(RichText::new("Notify when").strong().color(TEXT_PRIMARY));
+                ui.checkbox(&mut cfg.on_permission, "Permission / input requested");
+                ui.checkbox(&mut cfg.on_turn_complete, "Agent finishes a turn");
+                ui.checkbox(&mut cfg.on_session_error, "Session error");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Cooldown seconds")
+                            .strong()
+                            .color(TEXT_PRIMARY),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut cfg.cooldown_secs)
+                            .speed(1.0)
+                            .range(0..=300)
+                            .suffix(" s"),
+                    );
+                });
+            },
+        );
+        if *cfg != previous {
+            changes.note_notifications_change();
+        }
+    }
+
+    /// Process pending OS notifications for AI attention events.
+    /// This should be called from the main update loop.
+    fn process_pending_os_notifications(&mut self, ctx: &egui::Context) {
+        let Some(terminal_id) = self.pending_os_notification.take() else {
+            return;
+        };
+
+        let cfg = &self.config.notifications;
+        if !cfg.enabled {
+            return;
+        }
+
+        // Check if app is focused (only relevant when only_when_unfocused is true)
+        if cfg.only_when_unfocused {
+            let is_focused = ctx.input(|i| i.viewport().focused);
+            if is_focused == Some(true) {
+                return;
+            }
+        }
+
+        // Cooldown check
+        if let Some(last) = self.os_notification_last_by_terminal.get(&terminal_id) {
+            if last.elapsed() < Duration::from_secs(cfg.cooldown_secs) {
+                return;
+            }
+        }
+
+        // Update last notification time
+        self.os_notification_last_by_terminal
+            .insert(terminal_id, Instant::now());
+
+        // Windows FlashWindowEx
+        #[cfg(target_os = "windows")]
+        if let Some(hwnd) = self.window_hwnd {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                FlashWindowEx, FLASHWINFO, FLASHW_ALL, FLASHW_TIMERNOFG,
+            };
+            unsafe {
+                let mut info = FLASHWINFO {
+                    cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+                    hwnd: HWND(hwnd as *mut std::ffi::c_void),
+                    dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+                    uCount: 3,
+                    dwTimeout: 0,
+                };
+                let _ = FlashWindowEx(&mut info);
+            }
+        }
+
+        // Update status to indicate notification was sent
+        self.status_line = "OS attention alert triggered".to_owned();
     }
 
     fn draw_settings_diagnostics_section(
@@ -20056,6 +20190,9 @@ impl AdeApp {
             if changes.projects_changed {
                 self.note_projects_changed();
             }
+            if changes.notifications_changed {
+                // Notifications config is part of AppConfig; persist_config will save it
+            }
             self.persist_config();
         }
     }
@@ -20469,6 +20606,9 @@ impl eframe::App for AdeApp {
         self.draw_exit_confirm_popup(ctx);
 
         self.draw_transient_toast(ctx);
+
+        // Process OS notifications for AI attention
+        self.process_pending_os_notifications(ctx);
 
         // Synchronize embedded browser with UI state
         self.sync_embedded_browser(ctx);

@@ -45,6 +45,43 @@ When adding an entry:
 
 ---
 
+#### OS Notifications MVP implemented with FlashWindowEx {#os-notifications-mvp}
+- Date: 2026-05-08
+- Context: New feature - OS attention notifications for AI CLI status changes
+- Error signature: N/A - feature implementation, not a bug fix
+- Symptoms/Impact:
+  1. Users needed visual/audible attention signals when AI CLIs (Factory Droid, OpenCode, Claude) require user attention.
+  2. No portable EXE-friendly notification mechanism existed (Windows toast notifications require AppUserModelID/shortcut setup).
+  3. Notification spam risk if multiple terminals trigger attention states rapidly.
+- Root cause: N/A - new feature requirement
+- Resolution:
+  - Implemented OS notifications using Windows `FlashWindowEx` API for portable EXE compatibility.
+  - Added `OsNotificationConfig` struct with fields: `enabled`, `only_when_unfocused`, `on_permission`, `on_turn_complete`, `on_session_error`, `cooldown_secs`.
+  - Notifications trigger when AI CLI status transitions to `AiCliStatus::Attention` (Factory Droid, OpenCode, Claude).
+  - Focus-aware delivery: checks `ctx.input(|i| i.viewport().focused)` to suppress notifications when app is focused (if `only_when_unfocused` is enabled).
+  - Cooldown deduplication: each terminal tracks last notification time via `os_notification_last_by_terminal: BTreeMap<u64, Instant>`.
+  - Pending notification pattern: status apply functions set `pending_os_notification: Option<u64>`, processed by `process_pending_os_notifications()` in update loop.
+  - Settings UI added with toggles for each trigger type and cooldown duration control.
+- Prevent recurrence:
+  - Updated `AGENTS.md` with OS Notifications Guidelines section documenting the FlashWindowEx approach, trigger conditions, focus-aware delivery, and cooldown mechanism.
+  - Config persistence ensures user preferences survive restarts.
+- Files/Commands touched:
+  - `src/models.rs`: Added `OsNotificationConfig` struct with `PartialEq` derive and `Default` impl
+  - `src/models.rs`: Added `notifications: OsNotificationConfig` field to `AppConfig`
+  - `src/config.rs`: Updated `AppConfig` legacy conversion to include `notifications` field
+  - `src/app.rs`: Added `os_notification_last_by_terminal`, `pending_os_notification` to `AdeApp`
+  - `src/app.rs`: Added `SettingsSection::Notifications` variant with `Eye` icon
+  - `src/app.rs`: Added `draw_settings_notifications_section()` with toggle UI and cooldown control
+  - `src/app.rs`: Added `process_pending_os_notifications()` with `FlashWindowEx` implementation
+  - `src/app.rs`: Added pending notification triggers in `apply_factory_droid_status`, `apply_opencode_transport_status`, `apply_claude_status`
+  - `src/app.rs`: Added `note_notifications_change()` to `SettingsEditOutcome`
+  - `AGENTS.md`: Added OS Notifications Guidelines section
+  - `KNOWN_ISSUES.md`: Added this entry
+  - `cargo build --release --target x86_64-pc-windows-msvc` (successful)
+- References: Feature request: "10 OS Notifications MVP — Windows-first, FlashWindowEx, portable-EXE constraints"
+
+---
+
 #### Foreground tasks now use paste-safe bracketed paste delivery {#foreground-tasks-bracketed-paste}
 - Date: 2026-05-08
 - Context: Foreground task queue send behavior in Terminal Manager - user requested tasks behave like paste instead of typing
