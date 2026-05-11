@@ -151,10 +151,10 @@ const DESIGN_INSPECT_MAX_FIELD_CHARS: usize = 280;
 const DESIGN_INSPECT_MAX_TEXT_CHARS: usize = 180;
 /// Polling interval while waiting for batch prompt or settle durations.
 const PENDING_RERUN_POLL_MS: u64 = 50;
-/// Delay before sending the second Enter after a terminal shortcut or saved message command.
-/// Ensures the first Enter is processed before the confirmation Enter is sent.
-/// Set to 0.5 seconds as requested by user for faster confirmation.
-const SECOND_ENTER_DELAY_MS: u64 = 500;
+/// Delay before sending the confirmation Enter after a saved message command.
+const SAVED_MESSAGE_SECOND_ENTER_DELAY_MS: u64 = 1000;
+/// Delay before sending the confirmation Enter after a terminal shortcut command.
+const SHORTCUT_SECOND_ENTER_DELAY_MS: u64 = 250;
 
 // Embedded Nerd Font for terminal icon support (Windows-only)
 #[cfg(target_os = "windows")]
@@ -1348,6 +1348,7 @@ pub struct AdeApp {
     foreground_message_popup_open: Option<u64>, // project_id if popup is open
     foreground_message_popup_editing_index: Option<usize>, // None for add, Some(index) for edit
     foreground_message_popup_draft: String,
+    foreground_message_popup_submit_pending: bool,
     launcher_draft: LauncherDraftState,
     launcher_icon_textures: BTreeMap<LauncherIconKey, TextureHandle>,
     launcher_icon_failures: BTreeSet<LauncherIconKey>,
@@ -3839,6 +3840,7 @@ impl AdeApp {
             foreground_message_popup_open: None,
             foreground_message_popup_editing_index: None,
             foreground_message_popup_draft: String::new(),
+            foreground_message_popup_submit_pending: false,
             launcher_draft: LauncherDraftState::default(),
             launcher_icon_textures: BTreeMap::new(),
             launcher_icon_failures: std::collections::BTreeSet::new(),
@@ -8920,8 +8922,8 @@ impl AdeApp {
 
     /// Execute a terminal shortcut by sending its command to the active terminal.
     /// Returns true if the shortcut was handled (to consume the event).
-    /// Sends the command with bracketed paste, waits 0.5 seconds, sends Enter,
-    /// waits 0.5 more seconds, then sends a second Enter for confirmation.
+    /// Sends the command with bracketed paste, sends Enter immediately,
+    /// then sends a second Enter after a short delay for confirmation.
     fn execute_terminal_shortcut(&mut self, ctx: &egui::Context, command: &str) -> bool {
         // Only execute if we have an active terminal that accepts input
         let Some(terminal_id) = self.active_terminal_accepts_input() else {
@@ -8939,9 +8941,12 @@ impl AdeApp {
         // Shortcut commands are delivered through paste bytes so slash-prefixed
         // AI CLI commands are not interpreted as an interactive slash-menu key stream.
         if Self::send_shortcut_command_to_terminal(terminal, command, ctx) {
-            // Schedule two delayed Enter presses:
-            // First Enter at 0.5 seconds, second Enter at 1 second
-            self.schedule_delayed_enters_for_terminal(terminal_id, 2, ctx);
+            self.schedule_delayed_enters_for_terminal(
+                terminal_id,
+                1,
+                SHORTCUT_SECOND_ENTER_DELAY_MS,
+                ctx,
+            );
             self.show_status_feedback(ctx, &format!("Sent: {command}"));
             true
         } else {
@@ -8951,15 +8956,16 @@ impl AdeApp {
 
     /// Schedule delayed Enter presses for a terminal.
     /// count: number of Enter presses to schedule
-    /// interval_ms: milliseconds between each Enter (uses SECOND_ENTER_DELAY_MS if None)
+    /// interval_ms: milliseconds between each Enter.
     fn schedule_delayed_enters_for_terminal(
         &mut self,
         terminal_id: u64,
         count: usize,
+        interval_ms: u64,
         ctx: &egui::Context,
     ) {
         let now = Instant::now();
-        let interval = Duration::from_millis(SECOND_ENTER_DELAY_MS);
+        let interval = Duration::from_millis(interval_ms);
 
         for i in 0..count {
             let due_at = now + interval * (i as u32 + 1);
@@ -11613,6 +11619,9 @@ impl AdeApp {
             };
             reset_terminal_prompt_scroll_anchor(terminal);
             terminal.runtime.send_paste_bytes(paste_bytes);
+            if !message.trim().is_empty() {
+                terminal.runtime.send_bytes(vec![b'\r']);
+            }
             reset_opencode_manual_scroll_detached(terminal);
             Self::clear_terminal_selection(terminal);
             Self::append_pending_line(&mut terminal.pending_line_for_title, message);
@@ -11648,10 +11657,14 @@ impl AdeApp {
             destination_title
         };
 
-        // Schedule two delayed Enter presses after the borrow is released:
-        // First Enter at 0.5 seconds, second Enter at 1 second
+        // Schedule one confirmation Enter after the immediate submit Enter.
         if !message.trim().is_empty() {
-            self.schedule_delayed_enters_for_terminal(terminal_id, 2, ctx);
+            self.schedule_delayed_enters_for_terminal(
+                terminal_id,
+                1,
+                SAVED_MESSAGE_SECOND_ENTER_DELAY_MS,
+                ctx,
+            );
         }
 
         // Record to persistent history after the mutable borrow is released
@@ -11865,9 +11878,8 @@ impl AdeApp {
         };
 
         reset_terminal_prompt_scroll_anchor(terminal);
-        // Send only the command text (no immediate Enter)
-        // Both Enter presses will be sent after delays (0.5s and 1s)
         terminal.runtime.send_paste_bytes(paste_bytes);
+        terminal.runtime.send_bytes(vec![b'\r']);
         reset_opencode_manual_scroll_detached(terminal);
         Self::clear_terminal_selection(terminal);
         terminal.pending_line_for_title.clear();
@@ -12070,19 +12082,19 @@ impl AdeApp {
     /// after a short delay to confirm the command execution.
     fn process_pending_second_enters(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
-        let delay = Duration::from_millis(SECOND_ENTER_DELAY_MS);
 
         let mut to_send: Vec<u64> = Vec::new();
         let mut still_pending: Vec<(u64, Instant)> = Vec::new();
-        let mut needs_repaint = false;
+        let mut next_due_in: Option<Duration> = None;
 
         // Drain the pending list and partition into ready/still-pending
         for (terminal_id, due_at) in std::mem::take(&mut self.pending_second_enter) {
             if now >= due_at {
                 to_send.push(terminal_id);
             } else {
+                let due_in = due_at.saturating_duration_since(now);
+                next_due_in = Some(next_due_in.map_or(due_in, |current| current.min(due_in)));
                 still_pending.push((terminal_id, due_at));
-                needs_repaint = true;
             }
         }
 
@@ -12099,7 +12111,7 @@ impl AdeApp {
             }
         }
 
-        if needs_repaint {
+        if let Some(delay) = next_due_in {
             ctx.request_repaint_after(delay);
         }
     }
@@ -20253,6 +20265,7 @@ impl AdeApp {
 
     /// Execute the save/add operation for the foreground message popup.
     fn execute_foreground_message_popup_save(&mut self) {
+        self.foreground_message_popup_submit_pending = false;
         let Some(project_id) = self.foreground_message_popup_open else {
             return;
         };
@@ -20278,12 +20291,12 @@ impl AdeApp {
             self.note_projects_changed();
             self.persist_config();
         }
-        self.foreground_message_popup_open = None;
-        self.foreground_message_popup_draft.clear();
+        self.close_foreground_message_popup();
     }
 
     /// Execute the delete operation for the foreground message popup.
     fn execute_foreground_message_popup_delete(&mut self) {
+        self.foreground_message_popup_submit_pending = false;
         let Some(project_id) = self.foreground_message_popup_open else {
             return;
         };
@@ -20297,8 +20310,21 @@ impl AdeApp {
                 }
             }
         }
+        self.close_foreground_message_popup();
+    }
+
+    fn close_foreground_message_popup(&mut self) {
         self.foreground_message_popup_open = None;
+        self.foreground_message_popup_editing_index = None;
         self.foreground_message_popup_draft.clear();
+        self.foreground_message_popup_submit_pending = false;
+    }
+
+    fn process_pending_foreground_message_popup_submit(&mut self) {
+        if !self.foreground_message_popup_submit_pending {
+            return;
+        }
+        self.execute_foreground_message_popup_save();
     }
 
     /// Draw the foreground saved message popup (add/edit).
@@ -20332,8 +20358,7 @@ impl AdeApp {
                     Color32::from_rgba_premultiplied(0, 0, 0, 140),
                 );
                 if response.clicked() {
-                    self.foreground_message_popup_open = None;
-                    self.foreground_message_popup_draft.clear();
+                    self.close_foreground_message_popup();
                 }
             });
 
@@ -20406,8 +20431,7 @@ impl AdeApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     // Cancel button
                     if ui.button("Cancel").clicked() {
-                        self.foreground_message_popup_open = None;
-                        self.foreground_message_popup_draft.clear();
+                        self.close_foreground_message_popup();
                     }
 
                     ui.add_space(8.0);
@@ -20440,8 +20464,7 @@ impl AdeApp {
             });
 
         if !open {
-            self.foreground_message_popup_open = None;
-            self.foreground_message_popup_draft.clear();
+            self.close_foreground_message_popup();
         }
     }
 }
@@ -20475,19 +20498,17 @@ impl eframe::App for AdeApp {
         if !capture_keyboard {
             // Handle Enter key in foreground message popup to trigger save.
             // This is done early in raw_input_hook to ensure reliable detection
-            // before egui's TextEdit consumes the event.
+            // before egui's TextEdit consumes the event. The actual save is
+            // deferred until after TextEdit processes same-frame text input.
             if self.foreground_message_popup_open.is_some() {
-                let draft_trimmed = self.foreground_message_popup_draft.trim();
-                if !draft_trimmed.is_empty() {
-                    let (popup_submit, remaining_events) =
-                        Self::partition_foreground_message_popup_submit(events);
-                    if popup_submit {
-                        self.execute_foreground_message_popup_save();
-                        raw_input.events = remaining_events;
-                        return;
-                    }
-                    events = remaining_events;
+                let (popup_submit, remaining_events) =
+                    Self::partition_foreground_message_popup_submit(events);
+                if popup_submit {
+                    self.foreground_message_popup_submit_pending = true;
+                    raw_input.events = remaining_events;
+                    return;
                 }
+                events = remaining_events;
             }
 
             let (alt_m_events, remaining_events) =
@@ -20657,6 +20678,7 @@ impl eframe::App for AdeApp {
         }
         self.draw_settings_popup(ctx);
         self.draw_foreground_message_popup(ctx);
+        self.process_pending_foreground_message_popup_submit();
         self.draw_exit_confirm_popup(ctx);
 
         self.draw_transient_toast(ctx);
@@ -36059,6 +36081,7 @@ mod tests {
             foreground_message_popup_open: None,
             foreground_message_popup_editing_index: None,
             foreground_message_popup_draft: String::new(),
+            foreground_message_popup_submit_pending: false,
             launcher_draft: super::LauncherDraftState::default(),
             launcher_icon_textures: BTreeMap::new(),
             launcher_icon_failures: std::collections::BTreeSet::new(),
@@ -43300,9 +43323,9 @@ mod tests {
         app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
         capture.drain();
 
-        // Verify command sent WITHOUT immediate Enter
-        // Enters will be sent after delays (0.5s and 1s)
-        assert_eq!(capture.bytes(), b"/prepare-fix-plan".to_vec());
+        // Verify command is submitted immediately, with one delayed confirmation Enter pending.
+        assert_eq!(capture.bytes(), b"/prepare-fix-plan\r".to_vec());
+        assert_eq!(app.pending_second_enter.len(), 1);
         assert_eq!(app.status_line, "Sent: /prepare-fix-plan");
         assert!(app
             .terminals
@@ -43329,12 +43352,12 @@ mod tests {
         app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
         capture.drain();
 
-        // Verify command sent via bracketed paste WITHOUT immediate Enter
-        // Enters will be sent after delays (0.5s and 1s)
+        // Verify command sent via bracketed paste and submitted immediately.
         assert_eq!(
             capture.bytes(),
-            b"\x1b[200~/prepare-fix-plan\x1b[201~".to_vec()
+            b"\x1b[200~/prepare-fix-plan\x1b[201~\r".to_vec()
         );
+        assert_eq!(app.pending_second_enter.len(), 1);
         assert_eq!(app.status_line, "Sent: /prepare-fix-plan");
         assert!(app
             .terminals
@@ -43343,9 +43366,9 @@ mod tests {
     }
 
     #[test]
-    fn handle_shortcuts_sends_double_enter_with_delay() {
-        // Regression test: Terminal shortcuts should send command immediately (no Enter),
-        // wait 0.5 seconds, send Enter, wait 0.5 more seconds, then send second Enter.
+    fn handle_shortcuts_sends_immediate_enter_plus_delayed_confirmation() {
+        // Regression test: Terminal shortcuts should send command+Enter immediately,
+        // then send one delayed Enter for confirmation.
         let ctx = Context::default();
         let (runtime, capture) = test_terminal_runtime_with_capture();
         let mut app = test_app(
@@ -43359,40 +43382,22 @@ mod tests {
             "/prepare-fix-plan".to_string(),
         )];
 
-        // Phase 1: Execute shortcut - should send command only (no immediate Enter)
+        // Phase 1: Execute shortcut - should send command plus immediate Enter.
         app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
         capture.drain();
 
-        // Verify initial output: command only (no Enter yet)
-        assert_eq!(capture.bytes(), b"/prepare-fix-plan".to_vec());
-
-        // Verify pending state is set for TWO delayed Enters at 0.5s and 1s
-        assert_eq!(app.pending_second_enter.len(), 2);
-        let (pending_terminal_id_0, _) = app.pending_second_enter[0];
-        let (pending_terminal_id_1, _) = app.pending_second_enter[1];
-        assert_eq!(pending_terminal_id_0, 1);
-        assert_eq!(pending_terminal_id_1, 1);
-
-        // Phase 2: Process first delayed Enter (at 0.5 seconds)
-        app.pending_second_enter[0].1 = Instant::now() - Duration::from_millis(1);
-        app.process_pending_second_enters(&ctx);
-        capture.drain();
-
-        // Verify output after first Enter (cumulative)
         assert_eq!(capture.bytes(), b"/prepare-fix-plan\r".to_vec());
 
-        // Should still have 1 pending Enter
         assert_eq!(app.pending_second_enter.len(), 1);
+        let (pending_terminal_id, _) = app.pending_second_enter[0];
+        assert_eq!(pending_terminal_id, 1);
 
-        // Phase 3: Process second delayed Enter (at 1 second)
+        // Phase 2: Process delayed confirmation Enter.
         app.pending_second_enter[0].1 = Instant::now() - Duration::from_millis(1);
         app.process_pending_second_enters(&ctx);
         capture.drain();
 
-        // Verify total output: command + \r + \r (two delayed Enters)
         assert_eq!(capture.bytes(), b"/prepare-fix-plan\r\r".to_vec());
-
-        // Verify pending state is cleared
         assert!(app.pending_second_enter.is_empty());
     }
 
@@ -46057,8 +46062,9 @@ mod tests {
     }
 
     #[test]
-    fn foreground_message_popup_enter_triggers_save_via_raw_input_hook() {
-        // Regression test: Plain Enter key in raw_input_hook should trigger save
+    fn foreground_message_popup_enter_defers_save_until_after_text_edit() {
+        // Regression test: plain Enter is consumed early, but the save is deferred
+        // until after TextEdit has processed same-frame input.
         use egui::{Context, RawInput};
 
         let ctx = Context::default();
@@ -46085,17 +46091,64 @@ mod tests {
 
         <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
 
-        // Verify task was added
+        assert!(app.foreground_message_popup_submit_pending);
+        assert!(app.foreground_message_popup_open.is_some());
+        assert!(raw_input.events.is_empty());
+
+        app.process_pending_foreground_message_popup_submit();
+
         let project = app.projects.get(&7).expect("project should exist");
         assert_eq!(project.foreground_saved_messages.len(), 1);
         assert_eq!(project.foreground_saved_messages[0], "echo test");
-
-        // Verify popup was closed
         assert!(app.foreground_message_popup_open.is_none());
         assert!(app.foreground_message_popup_draft.is_empty());
+        assert!(!app.foreground_message_popup_submit_pending);
+    }
 
-        // Verify Enter event was consumed (not passed to UI)
-        assert!(raw_input.events.is_empty());
+    #[test]
+    fn foreground_message_popup_submit_preserves_same_frame_text() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(7, test_project(7, "TestProject", "C:/test", &[], &[]));
+
+        app.foreground_message_popup_open = Some(7);
+        app.foreground_message_popup_editing_index = None;
+        app.foreground_message_popup_draft = "echo".to_owned();
+
+        let mut raw_input = RawInput {
+            events: vec![
+                Event::Text(" test".to_owned()),
+                Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: Some(egui::Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(app.foreground_message_popup_submit_pending);
+        assert_eq!(raw_input.events.len(), 1);
+        assert!(matches!(&raw_input.events[0], Event::Text(text) if text == " test"));
+
+        // Simulate TextEdit applying the remaining same-frame text before the deferred save.
+        if let Event::Text(text) = raw_input.events.remove(0) {
+            app.foreground_message_popup_draft.push_str(&text);
+        }
+        app.process_pending_foreground_message_popup_submit();
+
+        let project = app.projects.get(&7).expect("project should exist");
+        assert_eq!(
+            project.foreground_saved_messages,
+            vec!["echo test".to_owned()]
+        );
     }
 
     #[test]
@@ -46133,15 +46186,16 @@ mod tests {
 
         // Verify popup is still open
         assert!(app.foreground_message_popup_open.is_some());
+        assert!(!app.foreground_message_popup_submit_pending);
 
         // Verify Ctrl+Enter event was NOT consumed (passed to TextEdit for newline)
         assert_eq!(raw_input.events.len(), 1);
     }
 
     #[test]
-    fn send_saved_message_schedules_two_delayed_enters() {
-        // Regression test: Sending a saved message should send message immediately,
-        // wait 0.5 seconds, send Enter, wait 0.5 more seconds, then send second Enter.
+    fn send_saved_message_sends_immediate_enter_plus_delayed_confirmation() {
+        // Regression test: Sending a saved message should submit immediately,
+        // then send one delayed Enter for confirmation.
         let ctx = egui::Context::default();
         let (runtime, capture) = test_terminal_runtime_with_capture();
         let mut app = test_app(
@@ -46153,37 +46207,36 @@ mod tests {
         app.send_saved_message_to_terminal(&ctx, 1, "echo hello");
         capture.drain();
 
-        // Verify initial output: message only (no Enter yet)
-        assert_eq!(capture.bytes(), b"echo hello".to_vec());
-
-        // Verify pending state is set for TWO delayed Enters at 0.5s and 1s
-        assert_eq!(app.pending_second_enter.len(), 2);
-        let (pending_terminal_id_0, _) = app.pending_second_enter[0];
-        let (pending_terminal_id_1, _) = app.pending_second_enter[1];
-        assert_eq!(pending_terminal_id_0, 1);
-        assert_eq!(pending_terminal_id_1, 1);
-
-        // Phase 1: Process first delayed Enter (at 0.5 seconds)
-        app.pending_second_enter[0].1 = Instant::now() - Duration::from_millis(1);
-        app.process_pending_second_enters(&ctx);
-        capture.drain();
-
-        // Verify output after first Enter (cumulative)
         assert_eq!(capture.bytes(), b"echo hello\r".to_vec());
 
-        // Should still have 1 pending Enter
         assert_eq!(app.pending_second_enter.len(), 1);
+        let (pending_terminal_id, _) = app.pending_second_enter[0];
+        assert_eq!(pending_terminal_id, 1);
 
-        // Phase 2: Process second delayed Enter (at 1 second)
+        // Process delayed confirmation Enter.
         app.pending_second_enter[0].1 = Instant::now() - Duration::from_millis(1);
         app.process_pending_second_enters(&ctx);
         capture.drain();
 
-        // Verify total output: message + \r + \r (two delayed Enters)
         assert_eq!(capture.bytes(), b"echo hello\r\r".to_vec());
-
-        // Verify pending state is cleared
         assert!(app.pending_second_enter.is_empty());
+    }
+
+    #[test]
+    fn saved_messages_sent_back_to_back_do_not_merge() {
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+
+        app.send_saved_message_to_terminal(&ctx, 1, "first task");
+        app.send_saved_message_to_terminal(&ctx, 1, "second task");
+        capture.drain();
+
+        assert_eq!(capture.bytes(), b"first task\rsecond task\r".to_vec());
+        assert_eq!(app.pending_second_enter.len(), 2);
     }
 
     #[test]
@@ -46205,14 +46258,12 @@ mod tests {
         app.send_saved_message_to_terminal(&ctx, 1, "/prepare-fix-plan");
         capture.drain();
 
-        // Verify the command was sent via bracketed paste (wrapped in ESC[200~...ESC[201~)
-        // and WITHOUT immediate Enter (Enters are sent after delays)
+        // Verify the command was sent via bracketed paste and submitted immediately.
         assert_eq!(
             capture.bytes(),
-            b"\x1b[200~/prepare-fix-plan\x1b[201~".to_vec()
+            b"\x1b[200~/prepare-fix-plan\x1b[201~\r".to_vec()
         );
 
-        // Verify two delayed Enters are scheduled
-        assert_eq!(app.pending_second_enter.len(), 2);
+        assert_eq!(app.pending_second_enter.len(), 1);
     }
 }

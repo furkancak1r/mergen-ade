@@ -10,6 +10,29 @@ When adding an entry:
 
 ---
 
+#### Foreground task popup submit could drop final input and merge sends {#foreground-task-submit-drop-merge}
+- Date: 2026-05-11
+- Context: Foreground task queue Add/Edit popup and Terminal Manager task send behavior.
+- Error signature: User reported that after adding a new foreground task and saving, the terminal received it combined with the previous message and the newly typed text did not appear.
+- Symptoms/Impact:
+  1. Pressing plain Enter to save a foreground task could save the draft before the multiline `TextEdit` processed same-frame text events.
+  2. The last typed characters could be missing from the saved task.
+  3. Sending foreground tasks back-to-back could merge with the previous terminal line because Enter was delayed instead of sent immediately after the paste-safe message bytes.
+- Root cause:
+  - `raw_input_hook()` called `execute_foreground_message_popup_save()` immediately when it saw plain Enter, before egui applied remaining text events to the popup draft.
+  - `send_saved_message_to_terminal()` used paste-safe delivery but scheduled both Enter presses for later, leaving a window where the next task could be pasted before the previous command line was submitted.
+- Resolution:
+  - Added a runtime pending-submit flag so raw input consumes plain Enter but defers the actual foreground popup save until after `TextEdit` processes same-frame input.
+  - Changed saved/foreground message and terminal shortcut delivery to send paste-safe bytes followed by immediate `\r`, then schedule exactly one delayed confirmation Enter.
+  - Split saved-message and shortcut confirmation delays into explicit constants (`SAVED_MESSAGE_SECOND_ENTER_DELAY_MS` and `SHORTCUT_SECOND_ENTER_DELAY_MS`).
+- Prevent recurrence:
+  - Added regression tests for deferred popup submit, same-frame text preservation, back-to-back saved message separation, immediate Enter delivery, delayed confirmation Enter, and bracketed-paste output.
+  - Updated `AGENTS.md` foreground task and terminal shortcut guidelines to require deferred popup save and immediate submit Enter.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-05-11: "foreground tasks kısmına sorun var düzelt dedim yeni şeyler ekledim kaydet dedim önceki mesajla birleştirilmiş şekilde gönderdi terminale benim sonradan yazdığım şey görünmedi"
+
+---
+
 #### Browser scroll white area from top-level WebView2 hosting {#browser-scroll-host-hwnd-white-area}
 - Date: 2026-05-11
 - Context: Embedded WebView2 browser panel showing a half-white/blank region while scrolling pages in Mergen.
