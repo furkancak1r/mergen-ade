@@ -59,6 +59,29 @@ When adding an entry:
 
 ---
 
+#### Browser panel showed redundant terminal scope selector {#browser-panel-redundant-scope-selector}
+- Date: 2026-05-11
+- Context: Browser panel multi-terminal isolation UI after terminal-scoped browser support was added.
+- Error signature: User reported that the terminal/project selector shown under the Browser tabs was unnecessary and confusing because terminal-scoped browser viewing should be driven by terminal activation, not by another selector inside the Browser panel.
+- Symptoms/Impact:
+  1. The Browser panel rendered compact `Project` / `T{id}` buttons below the tab strip when terminal-scoped browser tabs existed.
+  2. Clicking those buttons could change the visible browser scope even though the user expected Browser visibility to follow terminal selection.
+  3. The terminal-scoped isolation behavior was correct, but exposing the internal scope distinction added redundant UI chrome.
+- Root cause:
+  - The terminal-scoped Browser MCP isolation work added a manual scope selector to make multiple browser scopes visible from the panel.
+  - That made an internal routing detail user-facing, duplicating the existing terminal selection workflow.
+- Resolution:
+  - Removed the `Project` / `T{id}` scope selector row from `draw_browser_panel()`.
+  - Preserved `BrowserScopeKey`, `active_browser_scope()`, terminal activation behavior, MCP visible-scope overrides, and terminal-scoped browser isolation.
+  - Updated `AGENTS.md` to require that the Browser panel not expose a separate terminal/project scope selector.
+- Prevent recurrence:
+  - Keep terminal browser scope selection tied to terminal activation and MCP routing state rather than adding another Browser-panel control for the same concept.
+  - Treat terminal/project scope labels as internal diagnostics unless a separate explicit user-facing design is requested.
+- Files/Commands touched: `src/app.rs` (`draw_browser_panel()` scope selector removal, `active_browser_scope()` comment), `AGENTS.md`, `KNOWN_ISSUES.md`
+- References: User request 2026-05-11: "browserda sekme altında terminal bilgisi yer alıyor ... terminal bazlı olacak ya zaten ben istersem terminali değiştiririm görmek için tekrar tarayıcı kısmında bu ayrıma gerek yok"
+
+---
+
 #### Settings popup hidden behind browser WebView {#settings-popup-webview-z-order}
 - Date: 2026-05-08
 - Context: Settings modal and other UI overlays appearing behind the embedded browser WebView2 window
@@ -918,3 +941,4 @@ When adding an entry:
   - Updated `AGENTS.md` Browser MCP Multi-Terminal Isolation Guidelines to document the visible scope override behavior.
 - Files/Commands touched: `src/app.rs` (struct, init, `active_browser_scope`, `set_active_terminal`, MCP handlers, `draw_browser_panel`, `remove_project`, `close_browser_tab`, 4 new regression tests), `src/opencode_config.rs` (disable external MCP servers, 1 new regression test), `src/browser_mcp_helper.rs` (update instructions), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: User bug report 2026-05-11: "browser ile browser mcpde sorun var, sorun şu mcp bağlı ama browserı kontrol etmiyor ben göremiyorum kendisi bir tarayıcı açıp orada devam ediyor ama mergen üzerinde canlı takip edebilmem lazım her terminal için ayrı bir tarayıcı gibi olması lazım"
+- Superseded UI detail: The compact `Project` / `T{id}` selector mentioned above was removed later on 2026-05-11; see `#browser-panel-redundant-scope-selector`. The visible-scope routing and terminal isolation remain in place.

@@ -18410,7 +18410,7 @@ impl AdeApp {
 
     /// Returns the browser scope that should be displayed in the panel.
     /// Priority:
-    /// 1. Explicit visible scope override set by MCP or user selector.
+    /// 1. Explicit visible scope override set by MCP or terminal activation.
     /// 2. Active terminal's terminal-scoped browser if it has tabs.
     /// 3. Project-scoped browser.
     fn active_browser_scope(&self) -> BrowserScopeKey {
@@ -19055,66 +19055,6 @@ impl AdeApp {
                     }
 
                     ui.add_space(4.0);
-
-                    // Compact scope selector: Project vs Terminal browsers
-                    let project_terminals_with_browser: Vec<(u64, String)> = self
-                        .terminals
-                        .values()
-                        .filter(|t| t.project_id == browser_project_id && !t.exited)
-                        .filter_map(|t| {
-                            let ts = BrowserScopeKey::Terminal {
-                                project_id: browser_project_id,
-                                terminal_id: t.id,
-                            };
-                            if self.browser_tabs_by_scope.get(&ts).map_or(false, |tabs| !tabs.is_empty()) {
-                                Some((t.id, format!("T{}", t.id)))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if !project_terminals_with_browser.is_empty() {
-                        ui.horizontal(|ui| {
-                            let mut scopes = vec![(
-                                BrowserScopeKey::Project(browser_project_id),
-                                "Project".to_owned(),
-                            )];
-                            for (tid, label) in &project_terminals_with_browser {
-                                scopes.push((
-                                    BrowserScopeKey::Terminal {
-                                        project_id: browser_project_id,
-                                        terminal_id: *tid,
-                                    },
-                                    label.clone(),
-                                ));
-                            }
-                            for (scope_key, label) in &scopes {
-                                let is_active = *scope_key == browser_scope;
-                                let btn = egui::Button::new(
-                                    RichText::new(label)
-                                        .size(10.0)
-                                        .color(if is_active {
-                                            TEXT_PRIMARY
-                                        } else {
-                                            TEXT_MUTED
-                                        }),
-                                )
-                                .frame(false)
-                                .fill(if is_active {
-                                    with_alpha(BTN_ICON_HOVER, 100)
-                                } else {
-                                    Color32::TRANSPARENT
-                                });
-                                let response = ui.add_sized([32.0, 18.0], btn);
-                                if response.clicked() && !is_active {
-                                    self.browser_panel_visible_scope_by_project
-                                        .insert(browser_project_id, *scope_key);
-                                    ctx.request_repaint();
-                                }
-                            }
-                        });
-                        ui.add_space(4.0);
-                    }
 
                     // Get or initialize the URL draft for this scope
                     // Only auto-fill with browser_last_url for project-scoped browsers
