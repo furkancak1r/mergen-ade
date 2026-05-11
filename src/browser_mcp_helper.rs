@@ -67,7 +67,7 @@ fn handle_jsonrpc_message(env: &HelperEnv, message: JsonValue) -> Option<JsonVal
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": { "tools": {} },
                     "serverInfo": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") },
-                    "instructions": "Controls the embedded Mergen ADE Browser panel. It never launches external Chrome."
+                    "instructions": "Controls the embedded Mergen ADE Browser panel. All actions are reflected live in the Mergen Browser panel. It never launches external Chrome or Playwright."
                 }
             })
         }),

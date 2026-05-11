@@ -835,3 +835,37 @@ When adding an entry:
   - Documented in `AGENTS.md` that both `agent.build.model` and `mode.build.model` must be kept in sync when writing OpenCode config.
 - Files/Commands touched: `src/opencode_config.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo fmt`, `cargo test`
 - References: User bug report 2026-05-11: "slot b seçiyorum openai/gpt-5.5-fast ama build modda kimi geliyor"
+
+---
+
+#### Browser MCP panel does not show the controlled terminal browser {#browser-mcp-panel-not-showing-controlled-browser}
+- Date: 2026-05-11
+- Context: Browser MCP multi-terminal isolation in Mergen ADE
+- Error signature: User reported: "browser ile browser mcpde sorun var, sorun şu mcp bağlı ama browserı kontrol etmiyor ben göremiyorum kendisi bir tarayıcı açıp orada devam ediyor ama mergen üzerinde canlı takip edebilmem lazım her terminal için ayrı bir tarayıcı gibi olması lazım" — MCP is connected but the browser panel does not display the terminal-scoped browser being controlled; OpenCode appears to open its own external browser instead.
+- Symptoms/Impact:
+  1. When OpenCode sends a `browser_navigate` or other browser MCP command, the embedded Mergen browser panel stays on the project-scoped browser (or empty) instead of showing the terminal-scoped browser.
+  2. The user cannot see what the AI is doing in the browser because the panel does not auto-switch to the controlling terminal's browser.
+  3. OpenCode may fall back to launching its own Chrome/Playwright instance when the Mergen browser panel does not appear to respond visibly.
+  4. Multiple terminals in the same project share the same project browser instead of having isolated per-terminal browsers visible in the panel.
+- Root cause:
+  - `active_browser_scope()` only checked whether the *active* terminal had a terminal-scoped browser with tabs. When an MCP command arrived from a *background* terminal (not the active one), the panel continued showing the active terminal's browser or the project browser.
+  - There was no mechanism to pin the visible browser scope to the terminal that an MCP command was targeting.
+  - The OpenCode runtime config did not explicitly disable external browser MCP servers (e.g., `playwright`), so OpenCode could silently fall back to launching its own browser when the embedded panel appeared unresponsive.
+- Resolution:
+  - Added runtime-only `browser_panel_visible_scope_by_project: BTreeMap<u64, BrowserScopeKey>` to track which scope should be displayed per project.
+  - Updated `active_browser_scope()` to check the visible scope override first, before falling back to active-terminal or project scope.
+  - Updated MCP command handlers (`prepare_browser_mcp_tool_scope`, `prepare_browser_mcp_screenshot_scope`, `handle_browser_mcp_request`) to insert the target terminal scope into `browser_panel_visible_scope_by_project` before executing the command.
+  - Updated `set_active_terminal()` to set/clear the visible scope override based on whether the newly active terminal has browser tabs.
+  - Added cleanup for the visible scope override in `remove_project()` and `close_browser_tab()` when the last tab closes.
+  - Added a compact scope selector in the browser panel toolbar (inline "Project" / "T1" / "T2" buttons) so users can manually switch between project and terminal browsers without changing the active terminal.
+  - Hardened the OpenCode runtime config to also disable external browser MCP server names (`playwright`, `browser`, `puppeteer`) with `"enabled": false`, preventing OpenCode from falling back to its own Chrome instance.
+  - Updated the `browser_mcp_helper.rs` initialize instructions to explicitly state that the browser is embedded in Mergen and visible.
+- Prevent recurrence:
+  - Added regression tests:
+    - `mcp_command_sets_visible_browser_scope_for_background_terminal`: Verifies that an MCP command from a non-active terminal pins its scope as visible.
+    - `active_browser_scope_falls_back_when_visible_override_removed`: Verifies fallback to project scope after override removal.
+    - `terminal_activation_updates_visible_browser_scope`: Verifies that switching active terminals updates the visible scope.
+    - `write_terminal_runtime_config_disables_external_browser_mcp_servers`: Verifies runtime config disables external browser MCPs.
+  - Updated `AGENTS.md` Browser MCP Multi-Terminal Isolation Guidelines to document the visible scope override behavior.
+- Files/Commands touched: `src/app.rs` (struct, init, `active_browser_scope`, `set_active_terminal`, MCP handlers, `draw_browser_panel`, `remove_project`, `close_browser_tab`, 4 new regression tests), `src/opencode_config.rs` (disable external MCP servers, 1 new regression test), `src/browser_mcp_helper.rs` (update instructions), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User bug report 2026-05-11: "browser ile browser mcpde sorun var, sorun şu mcp bağlı ama browserı kontrol etmiyor ben göremiyorum kendisi bir tarayıcı açıp orada devam ediyor ama mergen üzerinde canlı takip edebilmem lazım her terminal için ayrı bir tarayıcı gibi olması lazım"

@@ -205,6 +205,17 @@ pub fn write_terminal_runtime_config_with_browser_mcp(
                 ]
             }),
         );
+        // Also disable other common external browser MCP server names so OpenCode
+        // cannot silently fall back to launching its own Chrome/Playwright.
+        for disabled_name in ["playwright", "browser", "puppeteer"] {
+            mcp_servers.insert(
+                disabled_name.to_owned(),
+                json!({
+                    "type": "local",
+                    "enabled": false,
+                }),
+            );
+        }
         config["mcp"] = JsonValue::Object(mcp_servers);
 
         let mut permissions = serde_json::Map::new();
@@ -560,6 +571,54 @@ mod tests {
             command_exe, "mergen-browser-mcp.exe",
             "Command must NOT use old sidecar executable 'mergen-browser-mcp.exe'"
         );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn write_terminal_runtime_config_disables_external_browser_mcp_servers() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "mergen-opencode-browser-mcp-disabled-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let helper_path = temp_dir.join("mergen-ade.exe");
+        let endpoint = BrowserMcpEndpointEnv {
+            port: 54321,
+            token: "test-token".to_owned(),
+            terminal_id: 99,
+            project_id: Some(1),
+            session_id: None,
+        };
+
+        let config_dir = write_terminal_runtime_config_with_browser_mcp(
+            &temp_dir,
+            99,
+            "test-model",
+            Some((helper_path.as_path(), endpoint)),
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(config_dir.join("opencode.json")).unwrap();
+        let parsed: JsonValue = serde_json::from_str(&content).unwrap();
+        let mcp = parsed["mcp"].as_object().unwrap();
+
+        // Our own server must be enabled
+        assert_eq!(
+            mcp[MERGEN_BROWSER_MCP_SERVER_NAME]["enabled"].as_bool(),
+            Some(true)
+        );
+
+        // External browser MCP servers must be disabled
+        for server_name in ["playwright", "browser", "puppeteer"] {
+            assert_eq!(
+                mcp[server_name]["enabled"].as_bool(),
+                Some(false),
+                "External browser MCP server '{server_name}' must be disabled in runtime config"
+            );
+        }
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

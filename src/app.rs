@@ -1415,6 +1415,10 @@ pub struct AdeApp {
     /// Browser panel open state per project (runtime only, not persisted).
     /// Tracks which projects have the Browser panel open; the visible panel follows the active terminal project.
     browser_panel_open_projects: BTreeSet<u64>,
+    /// Which browser scope is currently visible in the panel for each project (runtime only, not persisted).
+    /// When an MCP command targets a terminal-scoped browser, that scope is pinned here so the panel
+    /// stays on the browser being controlled even if the terminal is not the active one.
+    browser_panel_visible_scope_by_project: BTreeMap<u64, BrowserScopeKey>,
     /// Browser design inspect mode open state per scope (runtime only, not persisted).
     browser_design_inspect_enabled_scopes: BTreeSet<BrowserScopeKey>,
     /// Terminal selected as design inspect destination per scope (runtime only, not persisted).
@@ -3902,6 +3906,7 @@ impl AdeApp {
             next_browser_tab_id: 1,
             pending_browser_rect: None,
             browser_panel_open_projects: BTreeSet::new(),
+            browser_panel_visible_scope_by_project: BTreeMap::new(),
             browser_design_inspect_enabled_scopes: BTreeSet::new(),
             browser_design_inspect_terminal_by_scope: BTreeMap::new(),
             browser_design_inspect_target_changed_at_by_scope: BTreeMap::new(),
@@ -4164,6 +4169,8 @@ impl AdeApp {
                 }
             });
         self.browser_panel_open_projects.remove(&project_id);
+        self.browser_panel_visible_scope_by_project
+            .remove(&project_id);
         self.browser_design_inspect_enabled_scopes
             .retain(|scope| scope.project_id() != project_id);
         self.browser_design_inspect_terminal_by_scope
@@ -10945,10 +10952,29 @@ impl AdeApp {
         // This ensures browser panel and other project-scoped UI follows the active terminal
         if let Some(terminal_id) = terminal_id {
             if let Some(terminal) = self.terminals.get(&terminal_id) {
-                if self.selected_project != Some(terminal.project_id) {
-                    self.selected_project = Some(terminal.project_id);
+                let project_id = terminal.project_id;
+                if self.selected_project != Some(project_id) {
+                    self.selected_project = Some(project_id);
                     self.note_selection_changed();
                     self.persist_config();
+                }
+                // When activating a terminal, switch the visible browser scope to that terminal's
+                // browser if it has tabs; otherwise clear any stale terminal override so the panel
+                // falls back to the project browser.
+                let terminal_scope = BrowserScopeKey::Terminal {
+                    project_id,
+                    terminal_id,
+                };
+                if self
+                    .browser_tabs_by_scope
+                    .get(&terminal_scope)
+                    .map_or(false, |tabs| !tabs.is_empty())
+                {
+                    self.browser_panel_visible_scope_by_project
+                        .insert(project_id, terminal_scope);
+                } else {
+                    self.browser_panel_visible_scope_by_project
+                        .remove(&project_id);
                 }
             }
         }
@@ -16950,6 +16976,11 @@ impl AdeApp {
             // Also clean up any inactive browsers for this scope
             self.inactive_browser_tab_browsers
                 .retain(|(s, _), _| s != &scope);
+            // Remove visible scope override if this was the terminal-scoped browser
+            if scope.is_terminal() {
+                self.browser_panel_visible_scope_by_project
+                    .remove(&scope.project_id());
+            }
             // Active browser was already shut down above if it was active
             return Ok(());
         }
@@ -17246,6 +17277,9 @@ impl AdeApp {
             self.config.ui.checklist_panel_expanded = false;
             ctx.request_repaint();
         }
+        // Pin the terminal-scoped browser as visible so the panel tracks it.
+        self.browser_panel_visible_scope_by_project
+            .insert(project_id, scope);
 
         if let Some(error) = self.prepare_browser_mcp_scope(scope) {
             return Err(error);
@@ -17313,6 +17347,10 @@ impl AdeApp {
 
         self.set_browser_panel_open_for_project(project_id, true);
         self.config.ui.checklist_panel_expanded = false;
+        // Pin the terminal-scoped browser as visible so the panel tracks it even when
+        // the controlling terminal is not the active one.
+        self.browser_panel_visible_scope_by_project
+            .insert(project_id, scope);
         ctx.request_repaint();
 
         if let Some(error) = self.prepare_browser_mcp_scope(scope) {
@@ -17944,6 +17982,9 @@ impl AdeApp {
 
         self.set_browser_panel_open_for_project(project_id, true);
         self.config.ui.checklist_panel_expanded = false;
+        // Pin the terminal-scoped browser as visible so the panel tracks it.
+        self.browser_panel_visible_scope_by_project
+            .insert(project_id, scope);
         ctx.request_repaint();
 
         match request.tool.as_str() {
@@ -18368,10 +18409,22 @@ impl AdeApp {
     }
 
     /// Returns the browser scope that should be displayed in the panel.
-    /// If the active terminal has a terminal-scoped browser with tabs, use that;
-    /// otherwise fall back to the project-scoped browser.
+    /// Priority:
+    /// 1. Explicit visible scope override set by MCP or user selector.
+    /// 2. Active terminal's terminal-scoped browser if it has tabs.
+    /// 3. Project-scoped browser.
     fn active_browser_scope(&self) -> BrowserScopeKey {
         if let Some(project_id) = self.active_browser_project_id() {
+            // 1. Explicit override (e.g., MCP commanded a background terminal browser)
+            if let Some(scope) = self.browser_panel_visible_scope_by_project.get(&project_id) {
+                // Only honor the override if the scope still has tabs or exists
+                if self.browser_tabs_by_scope.get(scope).map_or(false, |tabs| !tabs.is_empty())
+                    || self.embedded_browsers_by_scope.contains_key(scope)
+                {
+                    return *scope;
+                }
+            }
+            // 2. Active terminal's terminal-scoped browser
             if let Some(active_terminal_id) = self.active_terminal {
                 let terminal_scope = BrowserScopeKey::Terminal {
                     project_id,
@@ -18996,6 +19049,66 @@ impl AdeApp {
                     }
 
                     ui.add_space(4.0);
+
+                    // Compact scope selector: Project vs Terminal browsers
+                    let project_terminals_with_browser: Vec<(u64, String)> = self
+                        .terminals
+                        .values()
+                        .filter(|t| t.project_id == browser_project_id && !t.exited)
+                        .filter_map(|t| {
+                            let ts = BrowserScopeKey::Terminal {
+                                project_id: browser_project_id,
+                                terminal_id: t.id,
+                            };
+                            if self.browser_tabs_by_scope.get(&ts).map_or(false, |tabs| !tabs.is_empty()) {
+                                Some((t.id, format!("T{}", t.id)))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if !project_terminals_with_browser.is_empty() {
+                        ui.horizontal(|ui| {
+                            let mut scopes = vec![(
+                                BrowserScopeKey::Project(browser_project_id),
+                                "Project".to_owned(),
+                            )];
+                            for (tid, label) in &project_terminals_with_browser {
+                                scopes.push((
+                                    BrowserScopeKey::Terminal {
+                                        project_id: browser_project_id,
+                                        terminal_id: *tid,
+                                    },
+                                    label.clone(),
+                                ));
+                            }
+                            for (scope_key, label) in &scopes {
+                                let is_active = *scope_key == browser_scope;
+                                let btn = egui::Button::new(
+                                    RichText::new(label)
+                                        .size(10.0)
+                                        .color(if is_active {
+                                            TEXT_PRIMARY
+                                        } else {
+                                            TEXT_MUTED
+                                        }),
+                                )
+                                .frame(false)
+                                .fill(if is_active {
+                                    with_alpha(BTN_ICON_HOVER, 100)
+                                } else {
+                                    Color32::TRANSPARENT
+                                });
+                                let response = ui.add_sized([32.0, 18.0], btn);
+                                if response.clicked() && !is_active {
+                                    self.browser_panel_visible_scope_by_project
+                                        .insert(browser_project_id, *scope_key);
+                                    ctx.request_repaint();
+                                }
+                            }
+                        });
+                        ui.add_space(4.0);
+                    }
 
                     // Get or initialize the URL draft for this scope
                     // Only auto-fill with browser_last_url for project-scoped browsers
@@ -36047,6 +36160,7 @@ mod tests {
             next_browser_tab_id: 1,
             pending_browser_rect: None,
             browser_panel_open_projects: BTreeSet::new(),
+            browser_panel_visible_scope_by_project: BTreeMap::new(),
             browser_design_inspect_enabled_scopes: BTreeSet::new(),
             browser_design_inspect_terminal_by_scope: BTreeMap::new(),
             browser_design_inspect_target_changed_at_by_scope: BTreeMap::new(),
@@ -45199,6 +45313,127 @@ mod tests {
 
         // The panel should reflect the terminal scope tab
         assert_eq!(app.active_browser_tab_id(terminal_scope), Some(tab_id));
+    }
+
+    #[test]
+    fn mcp_command_sets_visible_browser_scope_for_background_terminal() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7)), (2, test_terminal_entry(2, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
+        app.active_terminal = Some(1);
+
+        // Open browser panel and create tabs for both terminals
+        app.set_browser_panel_open_for_project(7, true);
+        let terminal1_scope = BrowserScopeKey::Terminal {
+            project_id: 7,
+            terminal_id: 1,
+        };
+        let terminal2_scope = BrowserScopeKey::Terminal {
+            project_id: 7,
+            terminal_id: 2,
+        };
+        app.add_browser_tab(
+            terminal1_scope,
+            Some("https://t1.example.com".to_owned()),
+            BrowserTabKind::Page,
+            None,
+        )
+        .unwrap();
+        app.add_browser_tab(
+            terminal2_scope,
+            Some("https://t2.example.com".to_owned()),
+            BrowserTabKind::Page,
+            None,
+        )
+        .unwrap();
+
+        // active_browser_scope should follow active terminal (terminal 1)
+        assert_eq!(app.active_browser_scope(), terminal1_scope);
+
+        // Simulate MCP command from background terminal 2
+        let auth_scope = crate::browser_mcp_service::BrowserMcpAuthScope {
+            terminal_id: 2,
+            project_id: Some(7),
+            session_id: None,
+        };
+        let request = crate::browser_mcp_service::BrowserMcpIpcRequest {
+            request_id: "req".to_owned(),
+            terminal_id: Some(2),
+            project_id: Some(7),
+            session_id: None,
+            tool: "browser_tabs".to_owned(),
+            params: serde_json::json!({"action": "new", "url": "https://navigated.com"}),
+        };
+        let response = app.handle_browser_mcp_request(&ctx, request, auth_scope);
+        assert!(!response.is_error, "{}", response.text);
+
+        // Visible scope should now be terminal 2 even though active terminal is 1
+        assert_eq!(app.active_browser_scope(), terminal2_scope);
+    }
+
+    #[test]
+    fn active_browser_scope_falls_back_when_visible_override_removed() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
+        app.active_terminal = Some(1);
+
+        let terminal_scope = BrowserScopeKey::Terminal {
+            project_id: 7,
+            terminal_id: 1,
+        };
+        // Create an embedded browser so the override is honored by active_browser_scope
+        app.browser_for_scope(terminal_scope);
+        app.browser_panel_visible_scope_by_project
+            .insert(7, terminal_scope);
+        assert_eq!(app.active_browser_scope(), terminal_scope);
+
+        // Remove override and close the last tab so the active terminal has no browser tabs
+        let active_tab = app.active_browser_tab_id(terminal_scope).unwrap();
+        app.close_browser_tab(terminal_scope, active_tab).unwrap();
+        app.browser_panel_visible_scope_by_project.remove(&7);
+        // Should fall back to project scope (terminal has no tabs)
+        assert_eq!(app.active_browser_scope(), BrowserScopeKey::Project(7));
+    }
+
+    #[test]
+    fn terminal_activation_updates_visible_browser_scope() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7)), (2, test_terminal_entry(2, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
+
+        let terminal1_scope = BrowserScopeKey::Terminal {
+            project_id: 7,
+            terminal_id: 1,
+        };
+        let terminal2_scope = BrowserScopeKey::Terminal {
+            project_id: 7,
+            terminal_id: 2,
+        };
+        app.add_browser_tab(
+            terminal1_scope,
+            Some("https://t1.com".to_owned()),
+            BrowserTabKind::Page,
+            None,
+        )
+        .unwrap();
+        app.add_browser_tab(
+            terminal2_scope,
+            Some("https://t2.com".to_owned()),
+            BrowserTabKind::Page,
+            None,
+        )
+        .unwrap();
+
+        // Activate terminal 1 -> visible scope should be terminal 1
+        app.set_active_terminal(&ctx, Some(1));
+        assert_eq!(app.active_browser_scope(), terminal1_scope);
+
+        // Activate terminal 2 -> visible scope should switch to terminal 2
+        app.set_active_terminal(&ctx, Some(2));
+        assert_eq!(app.active_browser_scope(), terminal2_scope);
     }
 
     #[test]
