@@ -10,6 +10,34 @@ When adding an entry:
 
 ---
 
+#### Browser scroll white area from top-level WebView2 hosting {#browser-scroll-host-hwnd-white-area}
+- Date: 2026-05-11
+- Context: Embedded WebView2 browser panel showing a half-white/blank region while scrolling pages in Mergen.
+- Error signature: User reported: "tarayıcıda browserda mergende bazen scroll olunca yukarıyı yüklemiyor beyaz bir ekran geliyor yani ekranın yarısı beyaz oluyor" - while scrolling inside Mergen's browser, part of the WebView appears white and the upper content looks unloaded.
+- Symptoms/Impact:
+  1. Browser content can temporarily disappear into a white/blank rectangle during scroll or repaint-heavy movement.
+  2. The issue looks like the page failed to load the upper portion, but it is a native WebView2 repaint/hosting artifact.
+  3. The blank native child surface can be especially noticeable over Mergen's dark UI.
+- Root cause:
+  - WebView2 was bound directly to the top-level eframe window and positioned with absolute panel bounds.
+  - During scroll/re-layout, the WebView2 native child surface and egui/wgpu surface could repaint out of phase, exposing WebView2's white backing surface.
+  - Native state caches for `SetBounds()` / `SetIsVisible()` were also updated even if a native call failed, which could leave Mergen believing stale bounds or visibility had been applied.
+- Resolution:
+  - Added a dedicated Mergen-owned child host HWND per `EmbeddedBrowser` instance and pass that host to `CreateCoreWebView2Controller()`.
+  - Move/resize the host HWND to the browser panel rect, then set the WebView2 controller bounds relative to the host at `(0, 0, width, height)`.
+  - Prevent the host window from erasing its background (`WM_ERASEBKGND`) so it does not paint a white rectangle during WebView2 repaint delays.
+  - Hide both WebView2 and its host HWND for overlays/modals; destroy the host HWND on browser shutdown.
+  - Update `cached_bounds` / `cached_visible` only after successful native calls so failed native syncs are retried on the next frame.
+  - Added opt-in `MERGEN_WEBVIEW2_DISABLE_GPU=1` fallback for driver-specific WebView2 white/blank rendering issues.
+- Prevent recurrence:
+  - Documented dedicated child-host HWND, cache-success-only, host hide/show ordering, and GPU fallback rules in `AGENTS.md`.
+  - Added regression tests for host-relative WebView bounds and GPU fallback env parsing.
+  - Keep native sync order as: host bounds -> WebView2 bounds -> WebView2 visible -> host visible.
+- Files/Commands touched: `src/web_browser.rs` (dedicated host HWND, host-relative bounds, visibility/cache failure handling, optional GPU args, tests), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo check`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-11: "tarayıcıda browserda mergende bazen scroll olunca yukarıyı yüklemiyor beyaz bir ekran geliyor yani ekranın yarısı beyaz oluyor tarayıcı içinde araştır bu neden olabilir düzelt"
+
+---
+
 #### Settings popup hidden behind browser WebView {#settings-popup-webview-z-order}
 - Date: 2026-05-08
 - Context: Settings modal and other UI overlays appearing behind the embedded browser WebView2 window

@@ -1077,6 +1077,7 @@ impl EmbeddedBrowser {
             Ok((
                 controller,
                 webview,
+                host_hwnd,
                 source_changed_token,
                 web_message_received_token,
                 navigation_starting_token,
@@ -1084,6 +1085,7 @@ impl EmbeddedBrowser {
                 navigation_completed_token,
             )) => {
                 self.inner = Some(WindowsWebView {
+                    host_hwnd,
                     controller,
                     webview,
                     source_changed_token: Some(source_changed_token),
@@ -1146,6 +1148,7 @@ impl EmbeddedBrowser {
     #[cfg(target_os = "windows")]
     fn sync_position_internal(&mut self, bounds: &BrowserBounds) {
         use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, HWND_TOP, SWP_NOACTIVATE};
 
         // Skip redundant SetBounds calls to prevent flicker during scroll
         if self.cached_bounds.as_ref() == Some(bounds) {
@@ -1153,23 +1156,44 @@ impl EmbeddedBrowser {
         }
 
         if let Some(inner) = &self.inner {
-            let rect = RECT {
-                left: bounds.x,
-                top: bounds.y,
-                right: bounds.x + bounds.width,
-                bottom: bounds.y + bounds.height,
+            let host_result = unsafe {
+                SetWindowPos(
+                    inner.host_hwnd,
+                    HWND_TOP,
+                    bounds.x,
+                    bounds.y,
+                    bounds.width,
+                    bounds.height,
+                    SWP_NOACTIVATE,
+                )
             };
-            unsafe {
-                let _ = inner.controller.SetBounds(rect);
+            if let Err(err) = host_result {
+                log::warn!("WebView2 host bounds sync failed: {:?}", err);
+                return;
             }
-            self.cached_bounds = Some(*bounds);
-            log::debug!(
-                "WebView2 bounds synced: x={}, y={}, w={}, h={}",
-                bounds.x,
-                bounds.y,
-                bounds.width,
-                bounds.height
-            );
+
+            let webview_bounds = browser_host_relative_bounds(bounds);
+            let rect = RECT {
+                left: webview_bounds.x,
+                top: webview_bounds.y,
+                right: webview_bounds.x + webview_bounds.width,
+                bottom: webview_bounds.y + webview_bounds.height,
+            };
+            match unsafe { inner.controller.SetBounds(rect) } {
+                Ok(()) => {
+                    self.cached_bounds = Some(*bounds);
+                    log::debug!(
+                        "WebView2 bounds synced: x={}, y={}, w={}, h={}",
+                        bounds.x,
+                        bounds.y,
+                        bounds.width,
+                        bounds.height
+                    );
+                }
+                Err(err) => {
+                    log::warn!("WebView2 bounds sync failed: {:?}", err);
+                }
+            }
         }
     }
 
@@ -1235,6 +1259,7 @@ impl EmbeddedBrowser {
     #[cfg(target_os = "windows")]
     fn set_visible_internal(&mut self, visible: bool) {
         use windows::Win32::Foundation::BOOL;
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW};
 
         // Skip redundant SetIsVisible calls to prevent flicker
         if self.cached_visible == Some(visible) {
@@ -1242,9 +1267,27 @@ impl EmbeddedBrowser {
         }
 
         if let Some(inner) = &self.inner {
-            unsafe {
-                let _ = inner.controller.SetIsVisible(BOOL::from(visible));
+            let webview_result = unsafe { inner.controller.SetIsVisible(BOOL::from(visible)) };
+
+            if !visible {
+                // Even if WebView2 rejects the visibility change, hide the native
+                // host HWND so modal egui overlays are not blocked by a blank child window.
+                unsafe {
+                    let _ = ShowWindow(inner.host_hwnd, SW_HIDE);
+                }
             }
+
+            if let Err(err) = webview_result {
+                log::warn!("WebView2 visibility sync failed: {:?}", err);
+                return;
+            }
+
+            if visible {
+                unsafe {
+                    let _ = ShowWindow(inner.host_hwnd, SW_SHOW);
+                }
+            }
+
             self.cached_visible = Some(visible);
             log::debug!("WebView2 visibility set to: {}", visible);
         }
@@ -1782,6 +1825,14 @@ impl EmbeddedBrowser {
                         let _ = inner.webview.remove_NavigationCompleted(token);
                     }
                 }
+                unsafe {
+                    let _ = inner.controller.Close();
+                    if let Err(err) =
+                        windows::Win32::UI::WindowsAndMessaging::DestroyWindow(inner.host_hwnd)
+                    {
+                        log::warn!("WebView2 host window destroy failed: {:?}", err);
+                    }
+                }
                 log::info!("WebView2 resources released");
             }
         }
@@ -1980,6 +2031,15 @@ pub fn browser_bounds_from_egui_rect(rect: egui::Rect, pixels_per_point: f32) ->
         y,
         width,
         height,
+    }
+}
+
+fn browser_host_relative_bounds(bounds: &BrowserBounds) -> BrowserBounds {
+    BrowserBounds {
+        x: 0,
+        y: 0,
+        width: bounds.width,
+        height: bounds.height,
     }
 }
 
@@ -3758,6 +3818,7 @@ use windows::Win32::System::WinRT::EventRegistrationToken;
 
 #[cfg(target_os = "windows")]
 struct WindowsWebView {
+    host_hwnd: windows::Win32::Foundation::HWND,
     controller: ICoreWebView2Controller,
     webview: ICoreWebView2,
     source_changed_token: Option<EventRegistrationToken>,
@@ -3862,6 +3923,142 @@ fn path_to_null_terminated_wide(path: &std::path::Path) -> Vec<u16> {
 }
 
 #[cfg(target_os = "windows")]
+struct BrowserHostWindowGuard {
+    hwnd: windows::Win32::Foundation::HWND,
+}
+
+#[cfg(target_os = "windows")]
+impl BrowserHostWindowGuard {
+    fn new(hwnd: windows::Win32::Foundation::HWND) -> Self {
+        Self { hwnd }
+    }
+
+    fn hwnd(&self) -> windows::Win32::Foundation::HWND {
+        self.hwnd
+    }
+
+    fn release(self) -> windows::Win32::Foundation::HWND {
+        let hwnd = self.hwnd;
+        std::mem::forget(self);
+        hwnd
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for BrowserHostWindowGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn browser_host_wndproc(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::LRESULT;
+    use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, WM_ERASEBKGND};
+
+    if msg == WM_ERASEBKGND {
+        return LRESULT(1);
+    }
+
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+#[cfg(target_os = "windows")]
+fn register_browser_host_window_class(
+    hinstance: windows::Win32::Foundation::HINSTANCE,
+) -> Result<(), String> {
+    use std::sync::OnceLock;
+    use windows::core::w;
+    use windows::Win32::UI::WindowsAndMessaging::{RegisterClassExW, WNDCLASSEXW};
+
+    static REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
+
+    REGISTERED
+        .get_or_init(|| {
+            let class = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(browser_host_wndproc),
+                hInstance: hinstance,
+                lpszClassName: w!("MergenADEBrowserHost"),
+                ..Default::default()
+            };
+
+            let atom = unsafe { RegisterClassExW(&class) };
+            if atom == 0 {
+                Err(format!(
+                    "Browser host window class registration failed: {:?}",
+                    windows::core::Error::from_win32()
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .clone()
+}
+
+#[cfg(target_os = "windows")]
+fn create_browser_host_window(
+    parent_hwnd: windows::Win32::Foundation::HWND,
+) -> Result<windows::Win32::Foundation::HWND, Box<dyn std::error::Error>> {
+    use windows::core::w;
+    use windows::Win32::Foundation::HINSTANCE;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, GetWindowLongPtrW, GWLP_HINSTANCE, HMENU, WINDOW_EX_STYLE, WS_CHILD,
+        WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    };
+
+    let hinstance_value = unsafe { GetWindowLongPtrW(parent_hwnd, GWLP_HINSTANCE) };
+    if hinstance_value == 0 {
+        return Err(std::io::Error::other("Browser host HINSTANCE unavailable").into());
+    }
+    let hinstance = HINSTANCE(hinstance_value as *mut core::ffi::c_void);
+    register_browser_host_window_class(hinstance).map_err(std::io::Error::other)?;
+
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("MergenADEBrowserHost"),
+            w!(""),
+            WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+            0,
+            0,
+            1,
+            1,
+            parent_hwnd,
+            HMENU::default(),
+            hinstance,
+            None,
+        )?
+    };
+
+    Ok(hwnd)
+}
+
+fn browser_webview2_gpu_disabled_from_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        let value = value.trim();
+        value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn webview2_additional_browser_arguments() -> Option<&'static str> {
+    let disabled = std::env::var("MERGEN_WEBVIEW2_DISABLE_GPU").ok();
+    browser_webview2_gpu_disabled_from_value(disabled.as_deref())
+        .then_some("--disable-gpu --disable-gpu-compositing")
+}
+
+#[cfg(target_os = "windows")]
 fn install_design_inspect_bootstrap(
     webview: &ICoreWebView2,
     token: &str,
@@ -3895,6 +4092,7 @@ fn create_webview_sync(
     (
         ICoreWebView2Controller,
         ICoreWebView2,
+        windows::Win32::Foundation::HWND,
         EventRegistrationToken,
         EventRegistrationToken,
         EventRegistrationToken,
@@ -3911,7 +4109,7 @@ fn create_webview_sync(
         CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
         CreateCoreWebView2EnvironmentCompletedHandler,
     };
-    use windows::core::PCWSTR;
+    use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 
     unsafe {
@@ -3941,6 +4139,13 @@ fn create_webview_sync(
 
     let environment_options: ICoreWebView2EnvironmentOptions =
         CoreWebView2EnvironmentOptions::default().into();
+    if let Some(additional_args) = webview2_additional_browser_arguments() {
+        let additional_args = HSTRING::from(additional_args);
+        unsafe {
+            environment_options.SetAdditionalBrowserArguments(&additional_args)?;
+        }
+        log::info!("WebView2 additional browser arguments enabled");
+    }
     let user_data_folder_wide = user_data_folder
         .as_deref()
         .map(path_to_null_terminated_wide);
@@ -3967,6 +4172,8 @@ fn create_webview_sync(
     // Wait for environment
     let environment = webview2_com::wait_with_pump(env_rx)
         .map_err(|e| std::io::Error::other(e.to_string()))??;
+
+    let host_guard = BrowserHostWindowGuard::new(create_browser_host_window(parent_hwnd)?);
 
     // Channel for controller creation
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<
@@ -4004,7 +4211,7 @@ fn create_webview_sync(
 
     // Create controller (async)
     unsafe {
-        environment.CreateCoreWebView2Controller(parent_hwnd, &ctrl_handler)?;
+        environment.CreateCoreWebView2Controller(host_guard.hwnd(), &ctrl_handler)?;
     }
 
     // Wait for controller and webview
@@ -4147,10 +4354,12 @@ fn create_webview_sync(
             })?;
     }
 
+    let host_hwnd = host_guard.release();
     log::info!("WebView2 environment and controller created successfully");
     Ok((
         controller,
         webview,
+        host_hwnd,
         source_changed_token,
         web_message_received_token,
         navigation_starting_token,
@@ -4223,6 +4432,47 @@ mod tests {
         let bounds = browser_bounds_from_egui_rect(rect, 1.0);
         assert_eq!(bounds.width, 1); // Clamped to minimum
         assert_eq!(bounds.height, 1); // Clamped to minimum
+    }
+
+    #[test]
+    fn browser_host_relative_bounds_use_child_origin() {
+        let bounds = BrowserBounds {
+            x: 120,
+            y: 80,
+            width: 640,
+            height: 360,
+        };
+
+        let relative = browser_host_relative_bounds(&bounds);
+
+        assert_eq!(relative.x, 0);
+        assert_eq!(relative.y, 0);
+        assert_eq!(relative.width, 640);
+        assert_eq!(relative.height, 360);
+    }
+
+    #[test]
+    fn webview2_gpu_disable_env_accepts_only_truthy_values() {
+        for value in [
+            Some("1"),
+            Some("true"),
+            Some("TRUE"),
+            Some("yes"),
+            Some("on"),
+        ] {
+            assert!(browser_webview2_gpu_disabled_from_value(value));
+        }
+
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("maybe"),
+        ] {
+            assert!(!browser_webview2_gpu_disabled_from_value(value));
+        }
     }
 
     #[test]

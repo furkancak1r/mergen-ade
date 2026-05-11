@@ -18418,7 +18418,10 @@ impl AdeApp {
             // 1. Explicit override (e.g., MCP commanded a background terminal browser)
             if let Some(scope) = self.browser_panel_visible_scope_by_project.get(&project_id) {
                 // Only honor the override if the scope still has tabs or exists
-                if self.browser_tabs_by_scope.get(scope).map_or(false, |tabs| !tabs.is_empty())
+                if self
+                    .browser_tabs_by_scope
+                    .get(scope)
+                    .map_or(false, |tabs| !tabs.is_empty())
                     || self.embedded_browsers_by_scope.contains_key(scope)
                 {
                     return *scope;
@@ -45318,7 +45321,13 @@ mod tests {
     #[test]
     fn mcp_command_sets_visible_browser_scope_for_background_terminal() {
         let ctx = egui::Context::default();
-        let mut app = test_app([(1, test_terminal_entry(1, 7)), (2, test_terminal_entry(2, 7))], Some(1));
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(1),
+        );
         app.projects
             .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
         app.active_terminal = Some(1);
@@ -45400,7 +45409,13 @@ mod tests {
     #[test]
     fn terminal_activation_updates_visible_browser_scope() {
         let ctx = egui::Context::default();
-        let mut app = test_app([(1, test_terminal_entry(1, 7)), (2, test_terminal_entry(2, 7))], Some(1));
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(1),
+        );
         app.projects
             .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
 
