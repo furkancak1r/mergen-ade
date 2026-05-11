@@ -496,7 +496,7 @@ pub struct OpenCodeModelConfig {
 impl Default for OpenCodeModelConfig {
     fn default() -> Self {
         Self {
-            build_model_slot_a: "fireworks-ai/accounts/fireworks/routers/kimi-k2p5-turbo"
+            build_model_slot_a: "fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo"
                 .to_owned(),
             build_model_slot_b: "openai/gpt-5.5-fast".to_owned(),
             active_build_model_slot: "a".to_owned(),
@@ -1061,7 +1061,7 @@ mod tests {
     #[test]
     fn opencode_model_config_default_slot_a_is_kimi_k2p5_turbo() {
         let config = OpenCodeModelConfig::default();
-        assert!(config.build_model_slot_a.contains("kimi-k2p5-turbo"));
+        assert!(config.build_model_slot_a.contains("kimi-k2p6-turbo"));
         assert!(config.build_model_slot_b.contains("gpt-5.5-fast"));
         assert_eq!(config.active_build_model_slot, "a");
     }

@@ -297,6 +297,13 @@ fn normalize_config_for_current_platform(config: &mut AppConfig) {
     config.default_shell = config.default_shell.normalize_for_current_platform();
     normalize_launcher_entries(&mut config.launchers);
     normalize_terminal_shortcut_entries(&mut config.terminal_shortcuts);
+    // Migrate old OpenCode default model from k2.5 to k2.6
+    if config.opencode.build_model_slot_a
+        == "fireworks-ai/accounts/fireworks/routers/kimi-k2p5-turbo"
+    {
+        config.opencode.build_model_slot_a =
+            "fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo".to_owned();
+    }
 }
 
 #[cfg(test)]
@@ -898,6 +905,38 @@ command = false
             2,
             "both entries should be preserved after migration"
         );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_config_migrates_old_opencode_default_model_to_k2p6() {
+        let path = unique_temp_path("opencode-model-migration");
+        let mut config = AppConfig::default();
+        config.opencode.build_model_slot_a =
+            "fireworks-ai/accounts/fireworks/routers/kimi-k2p5-turbo".to_owned();
+
+        save_config(&path, &config).expect("should save config");
+
+        let loaded = load_config(&path).expect("should load config");
+        assert_eq!(
+            loaded.opencode.build_model_slot_a,
+            "fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_config_does_not_touch_custom_opencode_model() {
+        let path = unique_temp_path("opencode-model-custom");
+        let mut config = AppConfig::default();
+        config.opencode.build_model_slot_a = "custom/model-x".to_owned();
+
+        save_config(&path, &config).expect("should save config");
+
+        let loaded = load_config(&path).expect("should load config");
+        assert_eq!(loaded.opencode.build_model_slot_a, "custom/model-x");
 
         let _ = fs::remove_file(path);
     }

@@ -76,7 +76,29 @@ pub fn patch_global_opencode_config(build_model: &str) -> io::Result<OpenCodePat
     let previous_model = build.get("model").cloned();
     build.insert("model".to_owned(), json!(build_model));
 
-    let changed = previous_model.as_ref().and_then(|v| v.as_str()) != Some(build_model);
+    let agent_changed = previous_model.as_ref().and_then(|v| v.as_str()) != Some(build_model);
+
+    // Also set mode.build.model so build mode reads the same model.
+    let mode = root
+        .entry("mode")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "mode must be an object"))?;
+
+    let mode_build = mode
+        .entry("build")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "mode.build must be an object")
+        })?;
+
+    let previous_mode_model = mode_build.get("model").cloned();
+    mode_build.insert("model".to_owned(), json!(build_model));
+
+    let mode_changed = previous_mode_model.as_ref().and_then(|v| v.as_str()) != Some(build_model);
+
+    let changed = agent_changed || mode_changed;
 
     // Write back with pretty formatting
     let rendered = serde_json::to_string_pretty(&value)
@@ -132,6 +154,11 @@ pub fn write_terminal_runtime_config_with_browser_mcp(
     let mut config = json!({
         "$schema": "https://opencode.ai/config.json",
         "agent": {
+            "build": {
+                "model": build_model
+            }
+        },
+        "mode": {
             "build": {
                 "model": build_model
             }
@@ -374,7 +401,10 @@ mod tests {
             parsed["agent"]["build"]["model"].as_str(),
             Some("fireworks-ai/k2-turbo")
         );
-        assert!(parsed.get("mode").is_none());
+        assert_eq!(
+            parsed["mode"]["build"]["model"].as_str(),
+            Some("fireworks-ai/k2-turbo")
+        );
 
         // Cleanup
         let _ = fs::remove_dir_all(&temp_dir);
@@ -414,6 +444,10 @@ mod tests {
 
         assert_eq!(
             parsed["agent"]["build"]["model"].as_str(),
+            Some("fireworks-ai/k2-turbo")
+        );
+        assert_eq!(
+            parsed["mode"]["build"]["model"].as_str(),
             Some("fireworks-ai/k2-turbo")
         );
         assert_eq!(mcp["type"].as_str(), Some("local"));
@@ -496,6 +530,10 @@ mod tests {
 
         let content = fs::read_to_string(config_dir.join("opencode.json")).unwrap();
         let parsed: JsonValue = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["mode"]["build"]["model"].as_str(),
+            Some("test-model")
+        );
         let mcp = &parsed["mcp"][MERGEN_BROWSER_MCP_SERVER_NAME];
         let command = mcp["command"].as_array().unwrap();
 

@@ -12763,7 +12763,7 @@ impl AdeApp {
                         [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
                         egui::TextEdit::singleline(&mut self.config.opencode.build_model_slot_a)
                             .hint_text(
-                                "e.g., fireworks-ai/accounts/fireworks/routers/kimi-k2p5-turbo",
+                                "e.g., fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo",
                             )
                             .desired_width(ui.available_width().max(0.0)),
                     )
@@ -12796,7 +12796,7 @@ impl AdeApp {
                     [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
                     egui::Button::new(use_slot_a_text),
                 );
-                if use_slot_a_response.clicked() && !is_slot_a_active {
+                if use_slot_a_response.clicked() {
                     self.switch_opencode_build_model_slot(ctx, "a");
                     changes.note_opencode_change();
                 }
@@ -12849,7 +12849,7 @@ impl AdeApp {
                     [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
                     egui::Button::new(use_slot_b_text),
                 );
-                if use_slot_b_response.clicked() && is_slot_a_active {
+                if use_slot_b_response.clicked() {
                     self.switch_opencode_build_model_slot(ctx, "b");
                     changes.note_opencode_change();
                 }
@@ -12874,12 +12874,7 @@ impl AdeApp {
 
     fn switch_opencode_build_model_slot(&mut self, ctx: &egui::Context, slot: &str) {
         let opencode = &mut self.config.opencode;
-        let previous_slot = opencode.active_build_model_slot.clone();
         opencode.set_active_slot(slot);
-
-        if previous_slot == opencode.active_build_model_slot {
-            return; // No change
-        }
 
         let new_model = opencode.active_build_model().to_owned();
 
@@ -27248,10 +27243,11 @@ mod tests {
 
     #[test]
     fn settings_navigation_includes_shortcuts_section_metadata() {
-        assert_eq!(SettingsSection::ALL.len(), 6);
+        assert_eq!(SettingsSection::ALL.len(), 7);
         assert!(SettingsSection::ALL.contains(&SettingsSection::Shortcuts));
         assert_eq!(SettingsSection::ALL[4], SettingsSection::Shortcuts);
-        assert_eq!(SettingsSection::ALL[5], SettingsSection::Diagnostics);
+        assert_eq!(SettingsSection::ALL[5], SettingsSection::Notifications);
+        assert_eq!(SettingsSection::ALL[6], SettingsSection::Diagnostics);
         assert_eq!(SettingsSection::Shortcuts.title(), "Shortcuts");
         assert_eq!(SettingsSection::Shortcuts.navigation_title(), "Shortcuts");
         assert_eq!(
@@ -36059,6 +36055,8 @@ mod tests {
             browser_panel_overlay_active: false,
             browser_overlay_grace_until: None,
             browser_video_recordings_by_scope: BTreeMap::new(),
+            os_notification_last_by_terminal: BTreeMap::new(),
+            pending_os_notification: None,
             browser_video_encode_events_tx,
             browser_video_encode_events_rx,
         }

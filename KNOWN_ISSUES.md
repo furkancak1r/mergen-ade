@@ -785,3 +785,53 @@ When adding an entry:
   - Updated `AGENTS.md` Browser MCP Multi-Terminal Isolation Guidelines to codify `active_browser_scope()` as the single source of truth for panel display and URL persistence rules.
 - Files/Commands touched: `src/app.rs` (`active_browser_scope()`, `draw_browser_panel()`, `sync_embedded_browser()`, `submit_browser_url()`, `set_browser_url_for_scope()`, `apply_browser_tab_observed_url()`, `queue_browser_screenshot()`, `process_pending_screenshot_requests()`, 2 new regression tests, 1 updated regression test), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: User bug report 2026-05-08: "mergen browser mcp şuan çalışamıyor mesela çalışıyor bağlı bir sayfayı güncellemesi gerekiyor ai devam ediyor ama ben mergende hiçbir değişiklik görmüyorum browserda"
+
+---
+
+#### OpenCode settings model not applied when editing active slot {#opencode-settings-model-not-applied}
+- Date: 2026-05-11
+- Context: OpenCode Build Model settings in Mergen ADE Settings
+- Error signature: User reported: "ayarlardaki opencode settings hatalı set etmiyor şuan eski kimi k2.5 da değişmeli 2.6 olmalı" — Editing the active slot model text did not update the global/runtime OpenCode config, and the default model was still k2.5.
+- Symptoms/Impact:
+  1. Changing the model identifier in the active slot's text field and pressing Enter did not write the new model to OpenCode's global config or active terminal runtime configs.
+  2. The "Use Slot A/B" button was disabled when the slot was already active, so there was no way to re-apply the current slot.
+  3. The default Slot A model remained `kimi-k2p5-turbo` instead of the newer `kimi-k2p6-turbo`.
+- Root cause:
+  - `switch_opencode_build_model_slot` returned early when the active slot did not change (`if previous_slot == active_build_model_slot { return; }`), so editing the active slot's model string never triggered a global/runtime config patch.
+  - The UI button for the active slot was also guarded with `&& !is_slot_a_active`, making it non-interactive when already active.
+  - The default model string in `OpenCodeModelConfig::default()` had not been updated from k2.5 to k2.6.
+- Resolution:
+  - Updated default `build_model_slot_a` to `fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo`.
+  - Removed the early return in `switch_opencode_build_model_slot` so that clicking an already-active slot re-applies the current model to global and runtime configs.
+  - Removed the `&& !is_slot_a_active` guard on the slot button click handlers so the active slot button is always clickable.
+  - Added one-time config migration in `normalize_config_for_current_platform` that replaces the exact old default `kimi-k2p5-turbo` string with `kimi-k2p6-turbo` for users with existing persisted configs.
+- Prevent recurrence:
+  - Updated regression tests in `src/models.rs` and `src/config.rs` to expect the new default model.
+  - Documented the active-slot button behavior in AGENTS.md: the active slot button must always be clickable to re-apply the model.
+- Files/Commands touched: `src/models.rs`, `src/app.rs`, `src/config.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo fmt`, `cargo test`
+- References: User bug report 2026-05-11: "ayarlardaki opencode settings hatalı set etmiyor şuan eski kimi k2.5 da değişmeli 2.6 olmalı ayarla"
+
+---
+
+#### OpenCode build mode uses stale `mode.build.model` while `agent.build.model` is updated {#opencode-mode-build-model-stale}
+- Date: 2026-05-11
+- Context: OpenCode Build Model Slot switching in Mergen ADE Settings
+- Error signature: User reported: "slot b seçiyorum openai/gpt-5.5-fast ama build modda kimi geliyor" — After switching to Slot B (GPT), OpenCode's build mode still used the Kimi model from Slot A.
+- Symptoms/Impact:
+  1. Global OpenCode config (`~/.config/opencode/opencode.json`) had `agent.build.model` correctly set to the selected slot model.
+  2. However, `mode.build.model` remained at the old Kimi value.
+  3. OpenCode's build mode read `mode.build.model` and therefore launched with the wrong model regardless of the selected slot.
+  4. Runtime terminal configs also only wrote `agent.build.model`, leaving `mode.build.model` absent or stale.
+- Root cause:
+  - Mergen only updated `agent.build.model` when patching the global config and when writing per-terminal runtime configs.
+  - OpenCode's newer config schema uses `mode.build.model` as the authoritative build-mode model, which Mergen was not setting.
+  - When `mode.build.model` existed from an earlier OpenCode version or manual edit, it took precedence and caused the model mismatch.
+- Resolution:
+  - Updated `patch_global_opencode_config` to also write `mode.build.model` with the same value as `agent.build.model`.
+  - Updated `write_terminal_runtime_config_with_browser_mcp` (and `write_terminal_runtime_config`) to include `mode.build.model` in the emitted JSON alongside `agent.build.model`.
+  - Both paths now keep the two model fields synchronized so build mode cannot drift from the selected slot.
+- Prevent recurrence:
+  - Updated `opencode_config.rs` regression tests to assert that runtime configs contain `mode.build.model` and that it matches the selected model.
+  - Documented in `AGENTS.md` that both `agent.build.model` and `mode.build.model` must be kept in sync when writing OpenCode config.
+- Files/Commands touched: `src/opencode_config.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo fmt`, `cargo test`
+- References: User bug report 2026-05-11: "slot b seçiyorum openai/gpt-5.5-fast ama build modda kimi geliyor"
