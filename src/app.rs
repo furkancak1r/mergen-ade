@@ -18782,7 +18782,10 @@ impl AdeApp {
             browser.hide();
         }
 
+        #[cfg(target_os = "windows")]
         let window_hwnd = self.window_hwnd;
+        #[cfg(not(target_os = "windows"))]
+        let window_hwnd = None;
 
         let browser_status = self
             .embedded_browsers_by_scope

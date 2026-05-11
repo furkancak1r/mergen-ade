@@ -38,6 +38,27 @@ When adding an entry:
 
 ---
 
+#### Release workflow failed from ungated Windows-only browser HWND access {#release-macos-window-hwnd-cfg}
+- Date: 2026-05-11
+- Context: GitHub release workflow for tag `v0.1.31` failed while building the macOS ARM64 release after the WebView2 hosting changes.
+- Error signature: Non-Windows compilation referenced the Windows-only `AdeApp::window_hwnd` field from `sync_embedded_browser()`.
+- Symptoms/Impact:
+  1. Windows local checks and release builds could pass while the macOS release job failed.
+  2. A tag push could produce no GitHub release because the release workflow stopped before packaging assets.
+- Root cause:
+  - `AdeApp::window_hwnd` exists only behind `#[cfg(target_os = "windows")]`, but `sync_embedded_browser()` copied it into a local variable unconditionally.
+  - `EmbeddedBrowser::ensure_created()` accepts `Option<isize>` on all platforms, but the call site still needed to avoid reading the Windows-only field on non-Windows targets.
+- Resolution:
+  - Gate the local `window_hwnd` binding in `sync_embedded_browser()` so Windows passes `self.window_hwnd` and non-Windows passes `None`.
+  - Preserve the non-Windows browser behavior as unsupported rather than attempting WebView2 initialization.
+- Prevent recurrence:
+  - Keep WebView2 field accesses and native HWND plumbing target-gated at every call site, not only in the browser facade.
+  - Use the release workflow as the authoritative macOS ARM64 validation because local Windows cross-target checks can be blocked by host execution policy.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo check --target aarch64-apple-darwin` (blocked locally by OS error 5 before project diagnostics)
+- References: GitHub Actions release workflow run `25660483478` for tag `v0.1.31`.
+
+---
+
 #### Settings popup hidden behind browser WebView {#settings-popup-webview-z-order}
 - Date: 2026-05-08
 - Context: Settings modal and other UI overlays appearing behind the embedded browser WebView2 window
