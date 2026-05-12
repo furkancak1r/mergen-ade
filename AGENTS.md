@@ -18,6 +18,7 @@
 - `src/config.rs` + `src/models.rs`: persisted TOML config schema and load/save behavior.
 - `.github/workflows/release.yml`: GitHub release pipeline for Windows ZIP and signed/notarized macOS ARM64 DMG assets.
 - Build artifacts are in `target/` (do not commit).
+- **Do not watch the GitHub release workflow via CLI.** Once the release is triggered by pushing a version tag, the workflow runs asynchronously on GitHub Actions. There is no need to poll or watch it with `gh run watch` / `gh run list`; the user can track progress through the GitHub web interface if desired.
 
 ## Build, Test, and Development Commands
 - `cargo build --release`: default local production build using the repo MSVC target configuration.
