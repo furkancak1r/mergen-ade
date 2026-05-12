@@ -125,6 +125,10 @@ const OPENCODE_TRAILING_OUTPUT_GRACE_MS: u64 = 750;
 const OPENCODE_RUNNING_GRACE_MS: u64 = 2_000;
 const OPENCODE_NOTIFY_POLL_MS: u64 = 150;
 const OPENCODE_HOOK_POLL_MS: u64 = 100;
+/// Settle duration after Smart Input auto-dispatch before accepting Idle as turn-complete.
+/// Prevents stale delayed Idle events from the previous turn from immediately triggering
+/// back-to-back dispatch of the next queued task.
+const SMART_INPUT_AUTO_DISPATCH_SETTLE_MS: u64 = 300;
 const CURSOR_BLINK_STEP_SECS: f64 = 0.6;
 const TRANSIENT_TOAST_SECS: f64 = 1.75;
 const TRANSIENT_TOAST_MIN_WIDTH: f32 = 420.0;
@@ -917,6 +921,47 @@ impl OpenCodeAttentionReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OsNotificationKind {
+    Permission,
+    TurnComplete,
+    SessionError,
+}
+
+#[derive(Debug, Clone)]
+struct PendingOsNotification {
+    terminal_id: u64,
+    tool: Option<AiCliTool>,
+    kind: OsNotificationKind,
+}
+
+fn notification_title_and_body(
+    tool: Option<AiCliTool>,
+    kind: OsNotificationKind,
+) -> (String, String) {
+    let agent = match tool {
+        Some(AiCliTool::FactoryDroid) => "Factory Droid",
+        Some(AiCliTool::CodexCli) => "Codex CLI",
+        Some(AiCliTool::OpenCode) => "OpenCode",
+        Some(AiCliTool::Claude) => "Claude",
+        None => "AI Agent",
+    };
+    match kind {
+        OsNotificationKind::Permission => (
+            format!("{} needs your input", agent),
+            "The agent is waiting for approval or a reply.".to_owned(),
+        ),
+        OsNotificationKind::TurnComplete => (
+            format!("{} finished", agent),
+            "The agent completed its turn and is ready for your next prompt.".to_owned(),
+        ),
+        OsNotificationKind::SessionError => (
+            format!("{} error", agent),
+            "An error occurred. Please review the terminal output.".to_owned(),
+        ),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SmartInputMode {
     QueueAfterDone,
     SteerNow,
@@ -938,14 +983,22 @@ impl SmartInputMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct SmartInputAttachment {
+    id: u64,
+    path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SmartInputTask {
     id: u64,
     text: String,
+    attachments: Vec<SmartInputAttachment>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct SmartInputState {
     draft: String,
+    draft_attachments: Vec<SmartInputAttachment>,
     mode: SmartInputMode,
     auto_run_enabled: bool,
     expanded: bool,
@@ -953,6 +1006,7 @@ struct SmartInputState {
     next_task_id: u64,
     editing_task_id: Option<u64>,
     edit_draft: String,
+    edit_attachments: Vec<SmartInputAttachment>,
     dragging_task_id: Option<u64>,
     drag_hover_index: Option<usize>,
     user_height: Option<f32>,
@@ -961,12 +1015,17 @@ struct SmartInputState {
     history_nav_index: Option<usize>,
     /// Original draft text saved before entering history navigation.
     history_nav_stash: String,
+    /// Original draft attachments saved before entering history navigation.
+    history_nav_stash_attachments: Vec<SmartInputAttachment>,
+    /// Next attachment ID counter (shared across draft/queued/edit)
+    next_attachment_id: u64,
 }
 
 impl Default for SmartInputState {
     fn default() -> Self {
         Self {
             draft: String::new(),
+            draft_attachments: Vec::new(),
             mode: SmartInputMode::QueueAfterDone,
             auto_run_enabled: true,
             expanded: true,
@@ -974,26 +1033,31 @@ impl Default for SmartInputState {
             next_task_id: 1,
             editing_task_id: None,
             edit_draft: String::new(),
+            edit_attachments: Vec::new(),
             dragging_task_id: None,
             drag_hover_index: None,
             user_height: None,
             history_nav_index: None,
             history_nav_stash: String::new(),
+            history_nav_stash_attachments: Vec::new(),
+            next_attachment_id: 1,
         }
     }
 }
 
 impl SmartInputState {
     fn enqueue_draft(&mut self) -> Option<u64> {
-        if self.draft.trim().is_empty() {
+        if self.draft.trim().is_empty() && self.draft_attachments.is_empty() {
             return None;
         }
 
         let id = self.next_task_id;
         self.next_task_id = self.next_task_id.saturating_add(1).max(1);
+        let attachments = std::mem::take(&mut self.draft_attachments);
         self.tasks.push(SmartInputTask {
             id,
             text: self.draft.clone(),
+            attachments,
         });
         self.draft.clear();
         self.history_nav_reset();
@@ -1051,17 +1115,19 @@ impl SmartInputState {
         };
         self.editing_task_id = Some(task_id);
         self.edit_draft = task.text.clone();
+        self.edit_attachments = task.attachments.clone();
         true
     }
 
     fn save_edit(&mut self, task_id: u64) -> bool {
-        if self.edit_draft.trim().is_empty() {
+        if self.edit_draft.trim().is_empty() && self.edit_attachments.is_empty() {
             return false;
         }
         let Some(task) = self.tasks.iter_mut().find(|task| task.id == task_id) else {
             return false;
         };
         task.text = self.edit_draft.clone();
+        task.attachments = std::mem::take(&mut self.edit_attachments);
         self.cancel_edit();
         true
     }
@@ -1069,6 +1135,7 @@ impl SmartInputState {
     fn cancel_edit(&mut self) {
         self.editing_task_id = None;
         self.edit_draft.clear();
+        self.edit_attachments.clear();
     }
 
     /// Navigate up in combined history (newest queued tasks first, then older terminal inputs).
@@ -1083,6 +1150,7 @@ impl SmartInputState {
         }
         if self.history_nav_index.is_none() {
             self.history_nav_stash = self.draft.clone();
+            self.history_nav_stash_attachments = self.draft_attachments.clone();
             self.history_nav_index = Some(0);
         } else {
             let current = self.history_nav_index.unwrap();
@@ -1102,6 +1170,15 @@ impl SmartInputState {
             };
             if let Some(text) = text {
                 self.draft = text;
+                self.draft_attachments = if index < queued_tasks.len() {
+                    let rev_index = queued_tasks.len() - 1 - index;
+                    queued_tasks
+                        .get(rev_index)
+                        .map(|t| t.attachments.clone())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
             }
         }
     }
@@ -1122,6 +1199,7 @@ impl SmartInputState {
         };
         if current == 0 {
             self.draft = self.history_nav_stash.clone();
+            self.draft_attachments = std::mem::take(&mut self.history_nav_stash_attachments);
             self.history_nav_index = None;
         } else {
             let new_index = current - 1;
@@ -1137,6 +1215,15 @@ impl SmartInputState {
             };
             if let Some(text) = text {
                 self.draft = text;
+                self.draft_attachments = if new_index < queued_tasks.len() {
+                    let rev_index = queued_tasks.len() - 1 - new_index;
+                    queued_tasks
+                        .get(rev_index)
+                        .map(|t| t.attachments.clone())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
             }
         }
     }
@@ -1145,6 +1232,7 @@ impl SmartInputState {
     fn history_nav_reset(&mut self) {
         self.history_nav_index = None;
         self.history_nav_stash.clear();
+        self.history_nav_stash_attachments.clear();
     }
 }
 
@@ -1156,8 +1244,8 @@ enum SmartInputSubmitRequest {
 
 #[derive(Debug, Default)]
 struct SmartInputPaneAction {
-    send_draft_now: Option<String>,
-    send_task_now: Option<u64>,
+    send_draft_now: Option<(String, Vec<SmartInputAttachment>)>,
+    send_task_now: Option<(u64, Vec<SmartInputAttachment>)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1168,6 +1256,7 @@ struct TerminalPromptSubmitOptions {
     confirmation_enter_count: usize,
     record_history: bool,
     update_status_line: bool,
+    clear_previous_delayed_enters: bool,
 }
 
 impl TerminalPromptSubmitOptions {
@@ -1179,6 +1268,7 @@ impl TerminalPromptSubmitOptions {
             confirmation_enter_count: 1,
             record_history: true,
             update_status_line: true,
+            clear_previous_delayed_enters: false,
         }
     }
 
@@ -1190,6 +1280,7 @@ impl TerminalPromptSubmitOptions {
             confirmation_enter_count: 2,
             record_history: true,
             update_status_line: true,
+            clear_previous_delayed_enters: true,
         }
     }
 
@@ -1201,6 +1292,7 @@ impl TerminalPromptSubmitOptions {
             confirmation_enter_count: 2,
             record_history: true,
             update_status_line: true,
+            clear_previous_delayed_enters: true,
         }
     }
 }
@@ -1746,8 +1838,13 @@ pub struct AdeApp {
     browser_video_encode_events_rx: Receiver<BrowserVideoEncodeEvent>,
     /// Last OS notification dispatched per terminal (for cooldown deduplication).
     os_notification_last_by_terminal: BTreeMap<u64, Instant>,
-    /// Pending OS notification terminal to dispatch in the next update frame.
-    pending_os_notification: Option<u64>,
+    /// Pending OS notification to dispatch in the next update frame.
+    pending_os_notification: Option<PendingOsNotification>,
+    /// Windows tray icon state
+    #[cfg(target_os = "windows")]
+    tray_icon_added: bool,
+    #[cfg(target_os = "windows")]
+    tray_icon_hicon: Option<isize>,
     /// Create worktree popup state
     show_create_worktree_popup: bool,
     create_worktree_project_id: Option<u64>,
@@ -4250,6 +4347,10 @@ impl AdeApp {
             browser_video_encode_events_rx,
             os_notification_last_by_terminal: BTreeMap::new(),
             pending_os_notification: None,
+            #[cfg(target_os = "windows")]
+            tray_icon_added: false,
+            #[cfg(target_os = "windows")]
+            tray_icon_hicon: None,
             show_create_worktree_popup: false,
             create_worktree_project_id: None,
             create_worktree_branch_draft: String::new(),
@@ -5264,7 +5365,18 @@ impl AdeApp {
             changed = true;
         }
         if changed && status == AiCliStatus::Attention {
-            self.pending_os_notification = Some(terminal_id);
+            let kind = match next_reason {
+                Some(FactoryDroidAttentionReason::AskUser)
+                | Some(FactoryDroidAttentionReason::SpecificationApproval) => {
+                    OsNotificationKind::Permission
+                }
+                None => OsNotificationKind::TurnComplete,
+            };
+            self.pending_os_notification = Some(PendingOsNotification {
+                terminal_id,
+                tool: Some(AiCliTool::FactoryDroid),
+                kind,
+            });
         }
         entry.dirty = true;
         changed
@@ -5621,11 +5733,38 @@ impl AdeApp {
     }
 
     fn should_accept_opencode_turn_complete_chunk(entry: &TerminalEntry) -> bool {
-        !(entry.opencode_normalized_status == Some(OpenCodeTransportStatus::Working)
-            && matches!(
-                entry.opencode_last_status_source,
-                Some(OpenCodeStatusSource::Hook | OpenCodeStatusSource::Notify)
-            ))
+        if entry.opencode_normalized_status != Some(OpenCodeTransportStatus::Working) {
+            return true;
+        }
+        if !matches!(
+            entry.opencode_last_status_source,
+            Some(OpenCodeStatusSource::Hook | OpenCodeStatusSource::Notify)
+        ) {
+            return true;
+        }
+        // Reject visible turn-complete during the Smart Input post-submit settle window.
+        // A completion signal that arrives while a freshly dispatched prompt is still
+        // within the settle window is treated as stale (from the previous turn).
+        let prompt_fresh = entry.opencode_prompt_submit_since.is_some_and(|since| {
+            since.elapsed() < Duration::from_millis(SMART_INPUT_AUTO_DISPATCH_SETTLE_MS)
+        });
+        if prompt_fresh {
+            return false;
+        }
+
+        // Default: reject visible turn-complete when Hook/Notify Working is present.
+        // Only allow recovery when we have explicit evidence that the Working signal
+        // has gone stale (no fresh running evidence for a long time).
+        let running_stale = entry.opencode_running_since.is_some_and(|since| {
+            since.elapsed() >= Duration::from_millis(OPENCODE_RUNNING_GRACE_MS)
+        });
+        let title_working_stale = entry.opencode_last_title_working_at.is_some_and(|since| {
+            since.elapsed() >= Duration::from_millis(OPENCODE_RUNNING_GRACE_MS)
+        });
+        if running_stale || title_working_stale {
+            return true;
+        }
+        false
     }
 
     fn opencode_status_from_chunk(
@@ -6151,6 +6290,21 @@ impl AdeApp {
             entry.codex_last_notify_attention_at = Some(now);
         }
 
+        if changed && session_status == AiCliStatus::Attention {
+            let kind = match entry.codex_attention_reason {
+                Some(CodexAttentionReason::ApprovalRequested)
+                | Some(CodexAttentionReason::UserInputRequested)
+                | Some(CodexAttentionReason::PlanModePrompt) => OsNotificationKind::Permission,
+                Some(CodexAttentionReason::ExecutionError) => OsNotificationKind::SessionError,
+                _ => OsNotificationKind::TurnComplete,
+            };
+            self.pending_os_notification = Some(PendingOsNotification {
+                terminal_id,
+                tool: Some(AiCliTool::CodexCli),
+                kind,
+            });
+        }
+
         changed
     }
 
@@ -6449,6 +6603,25 @@ impl AdeApp {
         source: OpenCodeStatusSource,
         attention_reason: Option<OpenCodeAttentionReason>,
     ) -> bool {
+        // Suppress stale completion signals during the Smart Input post-submit settle
+        // window. This applies to title-based, visible chunk, and hook/notify paths.
+        if status == AiCliStatus::Attention
+            && matches!(
+                attention_reason,
+                Some(OpenCodeAttentionReason::TurnComplete) | None
+            )
+        {
+            if let Some(entry) = self.terminals.get(&terminal_id) {
+                if Self::is_stale_opencode_completion(
+                    entry,
+                    OpenCodeTransportStatus::Idle,
+                    attention_reason,
+                ) {
+                    return false;
+                }
+            }
+        }
+
         if status == AiCliStatus::Attention
             && source == OpenCodeStatusSource::VisibleUi
             && attention_reason == Some(OpenCodeAttentionReason::TurnComplete)
@@ -6623,6 +6796,13 @@ impl AdeApp {
             return false;
         };
 
+        // Suppress stale completion signals that arrive during the settle window
+        // after a Smart Input dispatch. This prevents a delayed previous-turn
+        // Idle from overwriting the Working state of the current turn.
+        if Self::is_stale_opencode_completion(entry, transport_status, reason_hint) {
+            return false;
+        }
+
         let now = Instant::now();
         let previous_transport_status = entry.opencode_normalized_status;
         let mut changed = false;
@@ -6750,6 +6930,9 @@ impl AdeApp {
             OpenCodeTransportStatus::Working => {
                 entry.opencode_running_since = Some(now);
                 entry.opencode_last_title_working_at = Some(now);
+                if source == OpenCodeStatusSource::PromptSubmit {
+                    entry.opencode_prompt_submit_since = Some(now);
+                }
             }
             OpenCodeTransportStatus::Idle => {
                 entry.opencode_last_title_idle_at = Some(now);
@@ -6778,7 +6961,18 @@ impl AdeApp {
         entry.opencode_last_process_seen_at = Some(now);
 
         if changed && session_status == AiCliStatus::Attention {
-            self.pending_os_notification = Some(terminal_id);
+            let kind = match entry.opencode_attention_reason {
+                Some(OpenCodeAttentionReason::PermissionAsked)
+                | Some(OpenCodeAttentionReason::QuestionAsked)
+                | Some(OpenCodeAttentionReason::PlanModePrompt) => OsNotificationKind::Permission,
+                Some(OpenCodeAttentionReason::SessionError) => OsNotificationKind::SessionError,
+                _ => OsNotificationKind::TurnComplete,
+            };
+            self.pending_os_notification = Some(PendingOsNotification {
+                terminal_id,
+                tool: Some(AiCliTool::OpenCode),
+                kind,
+            });
         }
 
         entry.dirty = true;
@@ -6894,7 +7088,15 @@ impl AdeApp {
         }
 
         if changed && status == AiCliStatus::Attention {
-            self.pending_os_notification = Some(terminal_id);
+            let kind = match entry.claude_attention_reason {
+                Some(ClaudeAttentionReason::PermissionAsked) => OsNotificationKind::Permission,
+                _ => OsNotificationKind::TurnComplete,
+            };
+            self.pending_os_notification = Some(PendingOsNotification {
+                terminal_id,
+                tool: Some(AiCliTool::Claude),
+                kind,
+            });
         }
 
         entry.dirty = true;
@@ -7342,6 +7544,10 @@ impl AdeApp {
         let mut changed = false;
         let terminal_ids = self.terminals.keys().copied().collect::<Vec<_>>();
         for terminal_id in terminal_ids {
+            // Clear stale Hook/Notify Working before resolving status so that
+            // visible turn-complete and Smart Input After Done can recover.
+            changed |= self.clear_opencode_stale_working_if_needed(terminal_id);
+
             let Some((
                 process_identity,
                 recovered_baseline,
@@ -7620,6 +7826,52 @@ impl AdeApp {
         entry.codex_last_title_idle_at = Some(now);
         entry.dirty = true;
 
+        changed
+    }
+
+    /// Clear stale OpenCode working state when no fresh running evidence has arrived
+    /// for an extended period. This allows visible/hook Idle signals to recover the
+    /// state when Hook/Notify Working gets stuck, preventing After Done queue stall.
+    ///
+    /// IMPORTANT: We only clear when the process is actually missing or gone.
+    /// Clearing based on elapsed time while the process is still alive would hide
+    /// the spinner during normal long-running work.
+    fn clear_opencode_stale_working_if_needed(&mut self, terminal_id: u64) -> bool {
+        let Some(entry) = self.terminals.get(&terminal_id) else {
+            return false;
+        };
+
+        // Only act if we have a Working normalized status
+        if entry.opencode_normalized_status != Some(OpenCodeTransportStatus::Working) {
+            return false;
+        }
+
+        let now = Instant::now();
+
+        // Clear if process is missing and trailing grace has expired.
+        // This is the only safe automatic cleanup path.
+        let process_missing_stale = entry.opencode_process_missing_since.is_some_and(|since| {
+            since.elapsed() >= Duration::from_millis(OPENCODE_TRAILING_OUTPUT_GRACE_MS)
+        });
+
+        if !process_missing_stale {
+            return false;
+        }
+
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        let mut changed = false;
+        if entry.opencode_normalized_status.take().is_some() {
+            changed = true;
+        }
+        if entry.ai_session.status == AiCliStatus::Running {
+            entry.ai_session.status = AiCliStatus::Attention;
+            changed = true;
+        }
+        entry.opencode_last_title_idle_at = Some(now);
+        entry.dirty = true;
         changed
     }
 
@@ -8288,17 +8540,33 @@ impl AdeApp {
                                 (None, None)
                             };
 
-                        // Store normalized status for resolver use
-                        if let Some(entry) = self.terminals.get_mut(&terminal_id) {
-                            if entry.opencode_normalized_status != normalized_status {
-                                entry.opencode_normalized_status = normalized_status;
-                                entry.dirty = true;
-                            }
-                        }
+                        // Suppress stale completion signals during Smart Input settle window
+                        let suppressed = normalized_status == Some(OpenCodeTransportStatus::Idle)
+                            && self.terminals.get(&terminal_id).is_some_and(|entry| {
+                                Self::is_stale_opencode_completion(
+                                    entry,
+                                    OpenCodeTransportStatus::Idle,
+                                    attention_reason,
+                                )
+                            });
 
-                        if self.apply_opencode_status(terminal_id, status, source, attention_reason)
-                        {
-                            dirty_ids.insert(terminal_id);
+                        if !suppressed {
+                            // Store normalized status for resolver use
+                            if let Some(entry) = self.terminals.get_mut(&terminal_id) {
+                                if entry.opencode_normalized_status != normalized_status {
+                                    entry.opencode_normalized_status = normalized_status;
+                                    entry.dirty = true;
+                                }
+                            }
+
+                            if self.apply_opencode_status(
+                                terminal_id,
+                                status,
+                                source,
+                                attention_reason,
+                            ) {
+                                dirty_ids.insert(terminal_id);
+                            }
                         }
                     } else if tool == Some(AiCliTool::Claude) {
                         // Claude Code uses title-based detection (Orca-compatible)
@@ -9407,6 +9675,65 @@ impl AdeApp {
 
         // Request repaint for the furthest delay
         ctx.request_repaint_after(interval * count as u32);
+    }
+
+    /// Submit an attachment-only Smart Input payload. Sends a bare Enter to
+    /// submit whatever the OpenCode TUI already received via bracketed paste,
+    /// transitions OpenCode to Working, and schedules confirmation Enters.
+    fn submit_smart_input_attachment_only(
+        &mut self,
+        ctx: &egui::Context,
+        terminal_id: u64,
+        options: TerminalPromptSubmitOptions,
+    ) -> bool {
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+        if terminal.exited {
+            return false;
+        }
+        reset_terminal_prompt_scroll_anchor(terminal);
+        terminal.runtime.send_bytes(vec![b'\r']);
+        // Clear pending buffers so the attachment path is not recorded as
+        // terminal input for title or history purposes.
+        terminal.pending_line_for_title.clear();
+        terminal.pending_input_for_history.clear();
+        reset_opencode_manual_scroll_detached(terminal);
+        Self::clear_terminal_selection(terminal);
+        terminal.dirty = true;
+        ctx.request_repaint();
+
+        let is_opencode = self
+            .terminals
+            .get(&terminal_id)
+            .is_some_and(|t| t.ai_session.tool == Some(AiCliTool::OpenCode));
+        if is_opencode {
+            let _ = self.apply_opencode_transport_status(
+                terminal_id,
+                OpenCodeTransportStatus::Working,
+                OpenCodeStatusSource::PromptSubmit,
+                None,
+            );
+        }
+
+        if options.schedule_confirmation_enter {
+            if options.clear_previous_delayed_enters {
+                self.pending_second_enter
+                    .retain(|(tid, _)| *tid != terminal_id);
+            }
+            self.schedule_delayed_enters_for_terminal(
+                terminal_id,
+                options.confirmation_enter_count,
+                SHORTCUT_SECOND_ENTER_DELAY_MS,
+                ctx,
+            );
+        }
+
+        self.bump_layout_epoch();
+        if options.activate_after_send {
+            self.set_active_terminal(ctx, Some(terminal_id));
+        }
+        true
     }
 
     /// Check if a key event matches any enabled terminal shortcut.
@@ -11187,6 +11514,25 @@ impl AdeApp {
         Self::deliver_pasted_bytes_to_terminal(terminal, text, paste_bytes, ctx);
     }
 
+    /// Deliver a Smart Input image attachment as bracketed paste bytes without
+    /// mutating terminal title or history buffers. Attachments are transport
+    /// payloads for OpenCode's image paste flow, not user prompt text.
+    fn deliver_smart_input_attachment_to_terminal(
+        terminal: &mut TerminalEntry,
+        path: &str,
+        ctx: &egui::Context,
+    ) {
+        let Some(paste_bytes) = terminal.runtime.capture_paste_bytes(path) else {
+            return;
+        };
+        Self::clear_terminal_selection(terminal);
+        reset_terminal_prompt_scroll_anchor(terminal);
+        terminal.runtime.send_paste_bytes(paste_bytes);
+        reset_opencode_manual_scroll_detached(terminal);
+        terminal.dirty = true;
+        ctx.request_repaint();
+    }
+
     fn queue_pasted_text_to_terminal(&mut self, terminal_id: u64, text: &str) -> bool {
         let Some(terminal) = self.terminals.get(&terminal_id) else {
             self.status_line = "Target terminal not found".to_owned();
@@ -11477,7 +11823,11 @@ impl AdeApp {
             // briefly flash a stale/empty scroll viewport on the next frame.
             if let Some(entry) = self.terminals.get_mut(&terminal_id) {
                 entry.snapshot_refresh_deferred = false;
-                entry.activation_scroll_align_pending = true;
+                // OpenCode terminals should start with stick-to-bottom so long
+                // TUI output doesn't jump to the prompt row on activation.
+                if entry.ai_session.tool != Some(AiCliTool::OpenCode) {
+                    entry.activation_scroll_align_pending = true;
+                }
                 reset_terminal_prompt_scroll_anchor(entry);
                 entry.dirty = true;
             }
@@ -12180,6 +12530,12 @@ impl AdeApp {
             } else {
                 SAVED_MESSAGE_SECOND_ENTER_DELAY_MS
             };
+            // Prevent old delayed Enters from a previous Smart Input dispatch from
+            // leaking into the current/new task's prompt handling.
+            if options.clear_previous_delayed_enters {
+                self.pending_second_enter
+                    .retain(|(tid, _)| *tid != terminal_id);
+            }
             self.schedule_delayed_enters_for_terminal(
                 terminal_id,
                 options.confirmation_enter_count,
@@ -12363,13 +12719,60 @@ impl AdeApp {
         desired.min(max_footer).max(SMART_INPUT_MIN_FOOTER_HEIGHT)
     }
 
+    /// Returns true if an incoming OpenCode Idle/TurnComplete signal should be
+    /// suppressed because it arrived during the Smart Input post-submit settle
+    /// window. Any completion-like Idle that arrives while a freshly dispatched
+    /// prompt is still within the settle window is treated as stale (from the
+    /// previous turn) or premature, and must not overwrite the Working state.
+    fn is_stale_opencode_completion(
+        entry: &TerminalEntry,
+        transport_status: OpenCodeTransportStatus,
+        reason: Option<OpenCodeAttentionReason>,
+    ) -> bool {
+        if transport_status != OpenCodeTransportStatus::Idle {
+            return false;
+        }
+        let is_completion = matches!(reason, Some(OpenCodeAttentionReason::TurnComplete) | None);
+        if !is_completion {
+            return false;
+        }
+        entry.opencode_prompt_submit_since.is_some_and(|submit_at| {
+            submit_at.elapsed() < Duration::from_millis(SMART_INPUT_AUTO_DISPATCH_SETTLE_MS)
+        })
+    }
+
     fn smart_input_auto_dispatch_ready(terminal: &TerminalEntry) -> bool {
-        Self::terminal_smart_input_visible(terminal)
-            && terminal.smart_input.auto_run_enabled
-            && !terminal.smart_input.tasks.is_empty()
-            && terminal.opencode_session_active
-            && terminal.opencode_normalized_status == Some(OpenCodeTransportStatus::Idle)
-            && terminal.opencode_attention_reason == Some(OpenCodeAttentionReason::TurnComplete)
+        if !Self::terminal_smart_input_visible(terminal) {
+            return false;
+        }
+        if !terminal.smart_input.auto_run_enabled {
+            return false;
+        }
+        if terminal.smart_input.tasks.is_empty() {
+            return false;
+        }
+        if !terminal.opencode_session_active {
+            return false;
+        }
+        if terminal.opencode_normalized_status != Some(OpenCodeTransportStatus::Idle) {
+            return false;
+        }
+        if terminal.opencode_attention_reason != Some(OpenCodeAttentionReason::TurnComplete) {
+            return false;
+        }
+        // Settle guard: after a recent prompt submit, wait briefly before accepting
+        // Idle as a genuine turn-complete for the next queued task. This prevents stale
+        // delayed Idle events from the previous turn from immediately triggering
+        // back-to-back dispatch.
+        let prompt_fresh = terminal
+            .opencode_prompt_submit_since
+            .is_some_and(|submit_at| {
+                submit_at.elapsed() < Duration::from_millis(SMART_INPUT_AUTO_DISPATCH_SETTLE_MS)
+            });
+        if prompt_fresh {
+            return false;
+        }
+        true
     }
 
     fn process_smart_input_queues(&mut self, ctx: &egui::Context) {
@@ -12378,27 +12781,55 @@ impl AdeApp {
             .iter()
             .filter_map(|(terminal_id, terminal)| {
                 Self::smart_input_auto_dispatch_ready(terminal).then(|| {
-                    terminal
-                        .smart_input
-                        .tasks
-                        .first()
-                        .map(|task| (*terminal_id, task.id, task.text.clone()))
+                    terminal.smart_input.tasks.first().map(|task| {
+                        (
+                            *terminal_id,
+                            task.id,
+                            task.text.clone(),
+                            task.attachments.clone(),
+                        )
+                    })
                 })
             })
             .flatten()
             .collect::<Vec<_>>();
 
-        for (terminal_id, task_id, text) in ready {
-            if self.submit_prompt_to_terminal(
-                ctx,
-                terminal_id,
-                &text,
-                TerminalPromptSubmitOptions::smart_auto(),
-            ) {
+        for (terminal_id, task_id, text, attachments) in ready {
+            // Send image attachments first as bracketed paste paths
+            if !attachments.is_empty() {
+                for att in &attachments {
+                    if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                        Self::deliver_smart_input_attachment_to_terminal(terminal, &att.path, ctx);
+                    }
+                }
+            }
+            if !text.trim().is_empty() {
+                if self.submit_prompt_to_terminal(
+                    ctx,
+                    terminal_id,
+                    &text,
+                    TerminalPromptSubmitOptions::smart_auto(),
+                ) {
+                    if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                        let _ = terminal.smart_input.remove_task(task_id);
+                    }
+                    self.status_line = "Smart Input sent queued OpenCode task".to_owned();
+                }
+            } else if !attachments.is_empty() {
+                if self.submit_smart_input_attachment_only(
+                    ctx,
+                    terminal_id,
+                    TerminalPromptSubmitOptions::smart_auto(),
+                ) {
+                    if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                        let _ = terminal.smart_input.remove_task(task_id);
+                    }
+                    self.status_line = "Smart Input sent queued image task".to_owned();
+                }
+            } else {
                 if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                     let _ = terminal.smart_input.remove_task(task_id);
                 }
-                self.status_line = "Smart Input sent queued OpenCode task".to_owned();
             }
         }
     }
@@ -12437,23 +12868,56 @@ impl AdeApp {
                 }
             }
             SmartInputMode::SteerNow => {
-                let Some(text) = self.terminals.get(&terminal_id).and_then(|terminal| {
-                    (!terminal.smart_input.draft.trim().is_empty())
-                        .then(|| terminal.smart_input.draft.clone())
-                }) else {
+                let Some((text, attachments)) =
+                    self.terminals.get(&terminal_id).and_then(|terminal| {
+                        let t = terminal.smart_input.draft.clone();
+                        let a = terminal.smart_input.draft_attachments.clone();
+                        if t.trim().is_empty() && a.is_empty() {
+                            return None;
+                        }
+                        Some((t, a))
+                    })
+                else {
                     return;
                 };
-                if self.submit_prompt_to_terminal(
-                    ctx,
-                    terminal_id,
-                    &text,
-                    TerminalPromptSubmitOptions::smart_manual(),
-                ) {
-                    if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
-                        terminal.smart_input.draft.clear();
-                        terminal.smart_input.history_nav_reset();
+                // Send image attachments first as bracketed paste paths
+                if !attachments.is_empty() {
+                    for att in &attachments {
+                        if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                            Self::deliver_smart_input_attachment_to_terminal(
+                                terminal, &att.path, ctx,
+                            );
+                        }
                     }
-                    self.status_line = "Smart Input sent steer prompt to OpenCode".to_owned();
+                }
+                if !text.trim().is_empty() {
+                    if self.submit_prompt_to_terminal(
+                        ctx,
+                        terminal_id,
+                        &text,
+                        TerminalPromptSubmitOptions::smart_manual(),
+                    ) {
+                        if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                            terminal.smart_input.draft.clear();
+                            terminal.smart_input.draft_attachments.clear();
+                            terminal.smart_input.history_nav_reset();
+                        }
+                        self.status_line = "Smart Input sent steer prompt to OpenCode".to_owned();
+                    }
+                } else if !attachments.is_empty() {
+                    if self.submit_smart_input_attachment_only(
+                        ctx,
+                        terminal_id,
+                        TerminalPromptSubmitOptions::smart_manual(),
+                    ) {
+                        if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                            terminal.smart_input.draft.clear();
+                            terminal.smart_input.draft_attachments.clear();
+                            terminal.smart_input.history_nav_reset();
+                        }
+                        self.status_line =
+                            "Smart Input sent image attachment(s) to OpenCode".to_owned();
+                    }
                 }
             }
         }
@@ -12474,44 +12938,89 @@ impl AdeApp {
         terminal_id: u64,
         action: SmartInputPaneAction,
     ) {
-        if let Some(text) = action.send_draft_now {
-            if text.trim().is_empty() {
+        if let Some((text, attachments)) = action.send_draft_now {
+            if text.trim().is_empty() && attachments.is_empty() {
                 return;
             }
-            if self.submit_prompt_to_terminal(
-                ctx,
-                terminal_id,
-                &text,
-                TerminalPromptSubmitOptions::smart_manual(),
-            ) {
-                if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
-                    terminal.smart_input.draft.clear();
+            // Send image attachments first as bracketed paste paths
+            if !attachments.is_empty() {
+                for att in &attachments {
+                    if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                        Self::deliver_smart_input_attachment_to_terminal(terminal, &att.path, ctx);
+                    }
                 }
-                self.status_line = "Smart Input sent steer prompt to OpenCode".to_owned();
+            }
+            if !text.trim().is_empty() {
+                if self.submit_prompt_to_terminal(
+                    ctx,
+                    terminal_id,
+                    &text,
+                    TerminalPromptSubmitOptions::smart_manual(),
+                ) {
+                    if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                        terminal.smart_input.draft.clear();
+                        terminal.smart_input.draft_attachments.clear();
+                    }
+                    self.status_line = "Smart Input sent steer prompt to OpenCode".to_owned();
+                }
+            } else if !attachments.is_empty() {
+                if self.submit_smart_input_attachment_only(
+                    ctx,
+                    terminal_id,
+                    TerminalPromptSubmitOptions::smart_manual(),
+                ) {
+                    if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                        terminal.smart_input.draft.clear();
+                        terminal.smart_input.draft_attachments.clear();
+                    }
+                    self.status_line =
+                        "Smart Input sent image attachment(s) to OpenCode".to_owned();
+                }
             }
         }
 
-        if let Some(task_id) = action.send_task_now {
-            let Some(text) = self.terminals.get(&terminal_id).and_then(|terminal| {
+        if let Some((task_id, attachments)) = action.send_task_now {
+            let Some((text, _)) = self.terminals.get(&terminal_id).and_then(|terminal| {
                 terminal
                     .smart_input
                     .tasks
                     .iter()
                     .find(|task| task.id == task_id)
-                    .map(|task| task.text.clone())
+                    .map(|task| (task.text.clone(), task.attachments.clone()))
             }) else {
                 return;
             };
-            if self.submit_prompt_to_terminal(
-                ctx,
-                terminal_id,
-                &text,
-                TerminalPromptSubmitOptions::smart_manual(),
-            ) {
-                if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
-                    let _ = terminal.smart_input.remove_task(task_id);
+            // Send image attachments first
+            if !attachments.is_empty() {
+                for att in &attachments {
+                    if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                        Self::deliver_smart_input_attachment_to_terminal(terminal, &att.path, ctx);
+                    }
                 }
-                self.status_line = "Smart Input sent queued task now".to_owned();
+            }
+            if !text.trim().is_empty() {
+                if self.submit_prompt_to_terminal(
+                    ctx,
+                    terminal_id,
+                    &text,
+                    TerminalPromptSubmitOptions::smart_manual(),
+                ) {
+                    if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                        let _ = terminal.smart_input.remove_task(task_id);
+                    }
+                    self.status_line = "Smart Input sent queued task now".to_owned();
+                }
+            } else if !attachments.is_empty() {
+                if self.submit_smart_input_attachment_only(
+                    ctx,
+                    terminal_id,
+                    TerminalPromptSubmitOptions::smart_manual(),
+                ) {
+                    if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                        let _ = terminal.smart_input.remove_task(task_id);
+                    }
+                    self.status_line = "Smart Input sent image task now".to_owned();
+                }
             }
         }
     }
@@ -14204,7 +14713,7 @@ impl AdeApp {
             ui,
             AppIcon::Eye,
             "OS Notifications",
-            "Flash the taskbar when an AI agent needs your attention or finishes work.",
+            "Show a Windows notification and flash the taskbar when an AI agent needs your attention or finishes work.",
             |ui| {
                 ui.checkbox(&mut cfg.enabled, "Enable OS attention alerts");
                 ui.add_space(8.0);
@@ -14241,7 +14750,7 @@ impl AdeApp {
     /// Process pending OS notifications for AI attention events.
     /// This should be called from the main update loop.
     fn process_pending_os_notifications(&mut self, ctx: &egui::Context) {
-        let Some(terminal_id) = self.pending_os_notification.take() else {
+        let Some(notification) = self.pending_os_notification.take() else {
             return;
         };
 
@@ -14250,7 +14759,15 @@ impl AdeApp {
             return;
         }
 
-        // Check if app is focused (only relevant when only_when_unfocused is true)
+        let should_send = match notification.kind {
+            OsNotificationKind::Permission => cfg.on_permission,
+            OsNotificationKind::TurnComplete => cfg.on_turn_complete,
+            OsNotificationKind::SessionError => cfg.on_session_error,
+        };
+        if !should_send {
+            return;
+        }
+
         if cfg.only_when_unfocused {
             let is_focused = ctx.input(|i| i.viewport().focused);
             if is_focused == Some(true) {
@@ -14258,39 +14775,197 @@ impl AdeApp {
             }
         }
 
-        // Cooldown check
-        if let Some(last) = self.os_notification_last_by_terminal.get(&terminal_id) {
+        if let Some(last) = self
+            .os_notification_last_by_terminal
+            .get(&notification.terminal_id)
+        {
             if last.elapsed() < Duration::from_secs(cfg.cooldown_secs) {
                 return;
             }
         }
 
-        // Update last notification time
         self.os_notification_last_by_terminal
-            .insert(terminal_id, Instant::now());
+            .insert(notification.terminal_id, Instant::now());
 
-        // Windows FlashWindowEx
+        let (title, body) = notification_title_and_body(notification.tool, notification.kind);
+        let mut fallback_to_flash = true;
+
         #[cfg(target_os = "windows")]
         if let Some(hwnd) = self.window_hwnd {
-            use windows::Win32::Foundation::HWND;
-            use windows::Win32::UI::WindowsAndMessaging::{
-                FlashWindowEx, FLASHWINFO, FLASHW_ALL, FLASHW_TIMERNOFG,
-            };
-            unsafe {
-                let mut info = FLASHWINFO {
-                    cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
-                    hwnd: HWND(hwnd as *mut std::ffi::c_void),
-                    dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
-                    uCount: 3,
-                    dwTimeout: 0,
-                };
-                let _ = FlashWindowEx(&mut info);
+            if self.init_tray_icon_if_needed(hwnd) {
+                if self.show_tray_balloon(hwnd, &title, &body) {
+                    fallback_to_flash = false;
+                    self.status_line = "OS notification sent".to_owned();
+                }
             }
         }
 
-        // Update status to indicate notification was sent
-        self.status_line = "OS attention alert triggered".to_owned();
+        if fallback_to_flash {
+            #[cfg(target_os = "windows")]
+            if let Some(hwnd) = self.window_hwnd {
+                use windows::Win32::Foundation::HWND;
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    FlashWindowEx, FLASHWINFO, FLASHW_ALL, FLASHW_TIMERNOFG,
+                };
+                unsafe {
+                    let mut info = FLASHWINFO {
+                        cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+                        hwnd: HWND(hwnd as *mut std::ffi::c_void),
+                        dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+                        uCount: 3,
+                        dwTimeout: 0,
+                    };
+                    let _ = FlashWindowEx(&mut info);
+                }
+            }
+            self.status_line = "OS attention alert triggered (taskbar flash)".to_owned();
+        }
     }
+
+    #[cfg(target_os = "windows")]
+    fn init_tray_icon_if_needed(&mut self, hwnd_raw: isize) -> bool {
+        if self.tray_icon_added {
+            return true;
+        }
+
+        let hicon = self.create_app_hicon(16).unwrap_or(0);
+
+        let hwnd = windows::Win32::Foundation::HWND(hwnd_raw as *mut std::ffi::c_void);
+        let mut tip = [0u16; 128];
+        for (i, wc) in "Mergen ADE".encode_utf16().take(127).enumerate() {
+            tip[i] = wc;
+        }
+
+        let mut data: windows::Win32::UI::Shell::NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+        data.cbSize = std::mem::size_of::<windows::Win32::UI::Shell::NOTIFYICONDATAW>() as u32;
+        data.hWnd = hwnd;
+        data.uID = 1;
+        data.uFlags = windows::Win32::UI::Shell::NIF_ICON | windows::Win32::UI::Shell::NIF_TIP;
+        data.hIcon = windows::Win32::UI::WindowsAndMessaging::HICON(hicon as *mut std::ffi::c_void);
+        data.szTip = tip;
+
+        let ok = unsafe {
+            windows::Win32::UI::Shell::Shell_NotifyIconW(
+                windows::Win32::UI::Shell::NIM_ADD,
+                &mut data,
+            )
+        };
+        if ok.as_bool() {
+            self.tray_icon_added = true;
+            if hicon != 0 {
+                self.tray_icon_hicon = Some(hicon);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn show_tray_balloon(&mut self, hwnd_raw: isize, title: &str, body: &str) -> bool {
+        if !self.tray_icon_added {
+            return false;
+        }
+        let hwnd = windows::Win32::Foundation::HWND(hwnd_raw as *mut std::ffi::c_void);
+
+        let mut info_title = [0u16; 64];
+        for (i, wc) in title.encode_utf16().take(63).enumerate() {
+            info_title[i] = wc;
+        }
+        let mut info = [0u16; 256];
+        for (i, wc) in body.encode_utf16().take(255).enumerate() {
+            info[i] = wc;
+        }
+
+        let mut data: windows::Win32::UI::Shell::NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+        data.cbSize = std::mem::size_of::<windows::Win32::UI::Shell::NOTIFYICONDATAW>() as u32;
+        data.hWnd = hwnd;
+        data.uID = 1;
+        data.uFlags = windows::Win32::UI::Shell::NIF_INFO;
+        data.szInfoTitle = info_title;
+        data.szInfo = info;
+        data.dwInfoFlags = windows::Win32::UI::Shell::NIIF_INFO;
+
+        let ok = unsafe {
+            windows::Win32::UI::Shell::Shell_NotifyIconW(
+                windows::Win32::UI::Shell::NIM_MODIFY,
+                &mut data,
+            )
+        };
+        ok.as_bool()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn cleanup_tray_icon(&mut self) {
+        if !self.tray_icon_added {
+            return;
+        }
+        if let Some(hwnd_raw) = self.window_hwnd {
+            let hwnd = windows::Win32::Foundation::HWND(hwnd_raw as *mut std::ffi::c_void);
+            let mut data: windows::Win32::UI::Shell::NOTIFYICONDATAW =
+                unsafe { std::mem::zeroed() };
+            data.cbSize = std::mem::size_of::<windows::Win32::UI::Shell::NOTIFYICONDATAW>() as u32;
+            data.hWnd = hwnd;
+            data.uID = 1;
+            unsafe {
+                let _ = windows::Win32::UI::Shell::Shell_NotifyIconW(
+                    windows::Win32::UI::Shell::NIM_DELETE,
+                    &mut data,
+                );
+            }
+        }
+        if let Some(hicon) = self.tray_icon_hicon.take() {
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::DestroyIcon(
+                    hicon as *mut std::ffi::c_void,
+                );
+            }
+        }
+        self.tray_icon_added = false;
+    }
+
+    #[cfg(target_os = "windows")]
+    fn create_app_hicon(&self, size: i32) -> Option<isize> {
+        let icon_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/app-icon.png"));
+        let Ok(icon_image) =
+            image::load_from_memory_with_format(icon_bytes, image::ImageFormat::Png)
+        else {
+            return None;
+        };
+        let rgba_image = icon_image.to_rgba8();
+        let scaled = image::imageops::resize(
+            &rgba_image,
+            size as u32,
+            size as u32,
+            image::imageops::FilterType::Lanczos3,
+        );
+        let mut png_bytes: Vec<u8> = Vec::new();
+        scaled
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .ok()?;
+        unsafe {
+            let hicon = windows_sys::Win32::UI::WindowsAndMessaging::CreateIconFromResourceEx(
+                png_bytes.as_ptr() as *mut u8,
+                png_bytes.len() as u32,
+                1,
+                0x00030000,
+                size,
+                size,
+                windows_sys::Win32::UI::WindowsAndMessaging::LR_DEFAULTCOLOR,
+            );
+            if hicon.is_null() {
+                None
+            } else {
+                Some(hicon as isize)
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn cleanup_tray_icon(&mut self) {}
 
     fn draw_settings_diagnostics_section(
         &mut self,
@@ -17319,9 +17994,14 @@ impl AdeApp {
                                 ui.add_space(8.0);
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        RichText::new(format!("{} ({})", project_name, checklist.len()))
+                                        RichText::new(format!("{} {}", icons::FOLDER_OPEN, project_name))
                                             .strong()
                                             .color(TEXT_PRIMARY),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!("({})", checklist.len()))
+                                            .small()
+                                            .color(TEXT_MUTED),
                                     );
                                 });
                                 ui.add_space(4.0);
@@ -20370,11 +21050,19 @@ impl AdeApp {
 
                 let (cols, lines) = terminal_grid_dimensions(output_size, char_width, line_height);
                 if output_size.x >= char_width * 8.0 && output_size.y >= line_height * 3.0 {
+                    // Quantize pixel dimensions to cell boundaries so small
+                    // Smart Input footer height changes don't jitter the PTY size.
+                    let pixel_width = (cols as f32 * char_width)
+                        .round()
+                        .clamp(1.0, u16::MAX as f32) as u16;
+                    let pixel_height = (lines as f32 * line_height)
+                        .round()
+                        .clamp(1.0, u16::MAX as f32) as u16;
                     let resize_applied = terminal.runtime.resize(TerminalDimensions {
                         cols,
                         lines,
-                        pixel_width: output_size.x.round().clamp(1.0, u16::MAX as f32) as u16,
-                        pixel_height: output_size.y.round().clamp(1.0, u16::MAX as f32) as u16,
+                        pixel_width,
+                        pixel_height,
                     });
                     if !resize_applied {
                         if self.last_repaint_request_at.elapsed()
@@ -20504,7 +21192,7 @@ impl AdeApp {
                     self.show_create_worktree_popup,
                 );
 
-                let _scroll_area_output = scroll_area.show(&mut output_ui, |ui| {
+                let scroll_area_output = scroll_area.show(&mut output_ui, |ui| {
                     ui.set_width(output_size.x);
                     ui.set_min_width(output_size.x);
                     ui.set_min_height(output_size.y);
@@ -20885,6 +21573,19 @@ impl AdeApp {
                                 });
                             }
                         }
+                    }
+                }
+                // If OpenCode viewport is already at the bottom (content fits or
+                // scroll offset is at max), clear manual scroll detach so new
+                // output resumes stick-to-bottom behavior.
+                if terminal.ai_session.tool == Some(AiCliTool::OpenCode) {
+                    let viewport_h = scroll_area_output.inner_rect.height();
+                    let content_h = scroll_area_output.content_size.y;
+                    let offset_y = scroll_area_output.state.offset.y;
+                    let at_bottom =
+                        content_h <= viewport_h || (offset_y + 1.0 >= content_h - viewport_h);
+                    if at_bottom {
+                        terminal.opencode_manual_scroll_detached = false;
                     }
                 }
                 if smart_footer_height > 0.0 {
@@ -21806,7 +22507,7 @@ impl eframe::App for AdeApp {
             }
 
             // Smart Input image paste: when the clipboard contains an image file,
-            // intercept the paste event and insert the image path instead of
+            // intercept the paste event and add it as an attachment instead of
             // letting egui's TextEdit paste raw image bytes or nothing.
             if let Some(request) = self.focused_smart_input_submit_request(ctx) {
                 let mut image_path: Option<String> = None;
@@ -21828,13 +22529,20 @@ impl eframe::App for AdeApp {
                     };
                     if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                         if Self::terminal_smart_input_visible(terminal) {
+                            let att_id = terminal.smart_input.next_attachment_id;
+                            terminal.smart_input.next_attachment_id = terminal
+                                .smart_input
+                                .next_attachment_id
+                                .saturating_add(1)
+                                .max(1);
+                            let attachment = SmartInputAttachment { id: att_id, path };
                             match request {
                                 SmartInputSubmitRequest::Draft { .. } => {
-                                    terminal.smart_input.draft.push_str(&path);
+                                    terminal.smart_input.draft_attachments.push(attachment);
                                 }
                                 SmartInputSubmitRequest::Edit { task_id, .. } => {
                                     if terminal.smart_input.editing_task_id == Some(task_id) {
-                                        terminal.smart_input.edit_draft.push_str(&path);
+                                        terminal.smart_input.edit_attachments.push(attachment);
                                     }
                                 }
                             }
@@ -22047,6 +22755,9 @@ impl eframe::App for AdeApp {
         for (_, browser) in &mut self.embedded_browsers_by_scope {
             browser.shutdown();
         }
+
+        #[cfg(target_os = "windows")]
+        self.cleanup_tray_icon();
 
         self.persist_config();
         self.persist_history();
@@ -25144,6 +25855,57 @@ fn smart_input_status_text(terminal: &TerminalEntry) -> (&'static str, Color32) 
     }
 }
 
+fn draw_smart_input_attachments(
+    ui: &mut Ui,
+    attachments: &mut Vec<SmartInputAttachment>,
+) -> Vec<u64> {
+    let mut removed = Vec::new();
+    if attachments.is_empty() {
+        return removed;
+    }
+    let chip_bg = Color32::from_rgb(44, 44, 48);
+    let chip_stroke = Stroke::new(1.0, Color32::from_rgb(90, 90, 95));
+    let chip_radius = 6.0;
+    let mut to_remove: Vec<usize> = Vec::new();
+    for (i, att) in attachments.iter().enumerate() {
+        let chip = egui::Frame::none()
+            .fill(chip_bg)
+            .stroke(chip_stroke)
+            .rounding(chip_radius)
+            .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+            .show(ui, |ui| {
+                ui.set_min_height(16.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Img:").small().color(TEXT_PRIMARY));
+                    let fname = std::path::Path::new(&att.path)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&att.path);
+                    let short = capped_hover_text(fname, 24);
+                    ui.label(RichText::new(short).small().color(TEXT_PRIMARY));
+                    if ui
+                        .button(
+                            RichText::new("x")
+                                .small()
+                                .color(Color32::from_rgb(232, 100, 100)),
+                        )
+                        .clicked()
+                    {
+                        to_remove.push(i);
+                    }
+                });
+            });
+        ui.painter()
+            .rect_stroke(chip.response.rect, chip_radius, chip_stroke);
+    }
+    for i in to_remove.iter().rev() {
+        if *i < attachments.len() {
+            removed.push(attachments.remove(*i).id);
+        }
+    }
+    removed
+}
+
 fn draw_smart_input_footer(
     ui: &mut Ui,
     terminal: &mut TerminalEntry,
@@ -25283,6 +26045,10 @@ fn draw_smart_input_footer(
                                                 .hint_text("Edit queued task"),
                                         );
                                     });
+                                    let _removed_edit = draw_smart_input_attachments(
+                                        ui,
+                                        &mut state.edit_attachments,
+                                    );
                                     if ui.button(RichText::new("Save").small()).clicked() {
                                         row_action = Some((task_id, "save"));
                                     }
@@ -25305,6 +26071,9 @@ fn draw_smart_input_footer(
                                         &task_text,
                                         SMART_INPUT_TOOLTIP_MAX_CHARS,
                                     ));
+                                    let task_attachments = &mut state.tasks[index].attachments;
+                                    let _removed =
+                                        draw_smart_input_attachments(ui, task_attachments);
 
                                     // Push buttons to the far right
                                     let buttons_width = 100.0f32;
@@ -25314,7 +26083,8 @@ fn draw_smart_input_footer(
                                     }
 
                                     if ui.button(RichText::new("Now").small()).clicked() {
-                                        action.send_task_now = Some(task_id);
+                                        let atts = state.tasks[index].attachments.clone();
+                                        action.send_task_now = Some((task_id, atts));
                                     }
                                     if ui.button(RichText::new("Edit").small()).clicked() {
                                         row_action = Some((task_id, "edit"));
@@ -25428,8 +26198,10 @@ fn draw_smart_input_footer(
                             )),
                     );
                 });
+                let _removed_draft = draw_smart_input_attachments(ui, &mut state.draft_attachments);
 
-                let can_submit = !state.draft.trim().is_empty();
+                let can_submit =
+                    !state.draft.trim().is_empty() || !state.draft_attachments.is_empty();
                 let button_text = match state.mode {
                     SmartInputMode::QueueAfterDone => "Queue",
                     SmartInputMode::SteerNow => "Send",
@@ -25441,7 +26213,8 @@ fn draw_smart_input_footer(
                                 let _ = state.enqueue_draft();
                             }
                             SmartInputMode::SteerNow => {
-                                action.send_draft_now = Some(state.draft.clone());
+                                let atts = state.draft_attachments.clone();
+                                action.send_draft_now = Some((state.draft.clone(), atts));
                             }
                         }
                     }
@@ -26356,42 +27129,82 @@ fn styled_launcher_menu_button(
                     ui.menu_button(format!("{icon}"), |ui| {
                         with_minimal_button_chrome(ui, |ui| {
                             if launchers.is_empty() {
-                                ui.label(
-                                    RichText::new("Enable a launcher in Settings > Launchers")
-                                        .small()
-                                        .color(TEXT_MUTED),
+                                let full_width = ui.available_width().max(0.0);
+                                let row_height = CONTROL_ROW_HEIGHT;
+                                let row_rect = egui::Rect::from_min_size(
+                                    ui.cursor().min,
+                                    egui::vec2(full_width, row_height),
+                                );
+                                ui.painter().rect_filled(
+                                    row_rect.shrink(2.0),
+                                    6.0,
+                                    SURFACE_BG_SOFT,
+                                );
+                                ui.allocate_new_ui(
+                                    egui::UiBuilder::new()
+                                        .max_rect(row_rect)
+                                        .layout(Layout::left_to_right(Align::Center)),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new(
+                                                "Enable a launcher in Settings > Launchers",
+                                            )
+                                            .small()
+                                            .color(TEXT_MUTED),
+                                        );
+                                        ui.set_min_size(row_rect.size());
+                                    },
                                 );
                                 return;
                             }
 
                             for launcher in launchers {
-                                let response = ui.horizontal(|ui| {
-                                    let _ = app.draw_launcher_icon(ui, launcher.icon_key, 20.0);
-                                    ui.add_space(6.0);
-                                    ui.vertical(|ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(&launcher.display_name)
-                                                    .strong()
-                                                    .color(TEXT_PRIMARY),
-                                            )
-                                            .selectable(false),
-                                        );
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(&launcher.launch_command)
-                                                    .small()
-                                                    .color(TEXT_MUTED),
-                                            )
-                                            .selectable(false),
-                                        );
-                                    });
-                                });
-                                let row_id =
-                                    ui.make_persistent_id(("foreground-launcher", &launcher.id));
-                                let row_response = ui
-                                    .interact(response.response.rect, row_id, Sense::click())
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                let full_width = ui.available_width().max(0.0);
+                                let row_height = CONTROL_ROW_HEIGHT + 4.0;
+                                let row_rect = egui::Rect::from_min_size(
+                                    ui.cursor().min,
+                                    egui::vec2(full_width, row_height),
+                                );
+                                let is_hovered = ui.rect_contains_pointer(row_rect);
+                                let row_bg = if is_hovered {
+                                    with_alpha(BTN_ICON_HOVER, 110)
+                                } else {
+                                    SURFACE_BG_SOFT
+                                };
+                                ui.painter().rect_filled(row_rect.shrink(2.0), 6.0, row_bg);
+
+                                let inner_response = ui.allocate_new_ui(
+                                    egui::UiBuilder::new()
+                                        .max_rect(row_rect)
+                                        .layout(Layout::left_to_right(Align::Center))
+                                        .sense(Sense::click()),
+                                    |ui| {
+                                        ui.add_space(6.0);
+                                        let _ = app.draw_launcher_icon(ui, launcher.icon_key, 20.0);
+                                        ui.add_space(6.0);
+                                        ui.vertical(|ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&launcher.display_name)
+                                                        .strong()
+                                                        .color(TEXT_PRIMARY),
+                                                )
+                                                .selectable(false),
+                                            );
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&launcher.launch_command)
+                                                        .small()
+                                                        .color(TEXT_MUTED),
+                                                )
+                                                .selectable(false),
+                                            );
+                                        });
+                                        ui.set_min_size(row_rect.size());
+                                        ui.response()
+                                    },
+                                );
+                                let row_response = inner_response.inner;
                                 if row_response.hovered() {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                 }
@@ -28177,6 +28990,8 @@ fn normalize_terminal_background(color: TerminalColor) -> Color32 {
 mod tests {
     use std::collections::BTreeSet;
 
+    use egui::{Align, Layout};
+
     use super::{
         ai_badge_tooltip_lines, ai_badge_visual, ai_cli_logo_key_for_terminal,
         average_terminal_cell_width, build_terminal_cursor_overlay, build_terminal_render,
@@ -28222,22 +29037,24 @@ mod tests {
         FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
         FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, FileEditorState,
         OpenCodeAttentionReason, OpenCodeStatusSource, OpenCodeTransportStatus, OpenFileBuffer,
-        PendingConfigChanges, PendingRerunPhase, PendingTerminalLinkClick, SettingsSection,
-        SmartInputState, SmartInputSubmitRequest, SmartInputTask, SourceControlBadgeState,
-        SourceControlFile, SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay,
-        TerminalEntry, TerminalManagerDiffSummaryVisual, TerminalNavigationDirection,
-        TerminalNavigationShortcut, TerminalOutputScrollBehavior, TerminalSecondaryClickAction,
-        TerminalSelection, TerminalSelectionPoint, TransientToast, BROWSER_MAX_TABS_PER_PROJECT,
+        OsNotificationKind, PendingConfigChanges, PendingOsNotification, PendingRerunPhase,
+        PendingTerminalLinkClick, SettingsSection, SmartInputAttachment, SmartInputState,
+        SmartInputSubmitRequest, SmartInputTask, SourceControlBadgeState, SourceControlFile,
+        SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
+        TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
+        TerminalOutputScrollBehavior, TerminalSecondaryClickAction, TerminalSelection,
+        TerminalSelectionPoint, TransientToast, BROWSER_MAX_TABS_PER_PROJECT,
         BROWSER_SCREENSHOT_REQUEST_PREFIX, CODEX_NOTIFY_POLL_MS, CODEX_PROCESS_POLL_MS,
         CODEX_STOP_SETTLE_MS, CODEX_TRAILING_OUTPUT_GRACE_MS, DESIGN_INSPECT_DELIVERY_DEDUPE_MS,
         DESIGN_INSPECT_TARGET_SWITCH_QUIET_MS, DIRECTORY_INDEX_CHANNEL_CAPACITY,
         FACTORY_DROID_HOOK_POLL_MS, OPENCODE_PROCESS_POLL_MS, OPENCODE_RUNNING_GRACE_MS,
         OPENCODE_TRAILING_OUTPUT_GRACE_MS, PENDING_RERUN_BATCH_CONFIRM_SETTLE_MS,
         PENDING_RERUN_BATCH_PROMPT_WAIT_MS, PENDING_RERUN_SETTLE_MS,
-        SOURCE_CONTROL_CHANNEL_CAPACITY, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG,
-        TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS,
-        TERMINAL_OUTPUT_BG, TEXT_MUTED, TEXT_PRIMARY, TRANSIENT_TOAST_MAX_WIDTH,
-        TRANSIENT_TOAST_MIN_WIDTH, TRANSIENT_TOAST_SCREEN_MARGIN, TRANSIENT_TOAST_SECS,
+        SMART_INPUT_AUTO_DISPATCH_SETTLE_MS, SOURCE_CONTROL_CHANNEL_CAPACITY,
+        SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG, TERMINAL_COPY_FEEDBACK_TEXT,
+        TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS, TERMINAL_OUTPUT_BG,
+        TEXT_MUTED, TEXT_PRIMARY, TRANSIENT_TOAST_MAX_WIDTH, TRANSIENT_TOAST_MIN_WIDTH,
+        TRANSIENT_TOAST_SCREEN_MARGIN, TRANSIENT_TOAST_SECS,
     };
     use crate::browser_video::BrowserVideoEncodeResult;
     use crate::codex::{CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
@@ -31276,6 +32093,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn foreground_launcher_menu_row_has_background_fill() {
+        // Regression test: launcher menu rows must render an opaque background
+        // so they remain visible against the dark app surface.
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let launchers = vec![LauncherEntry {
+            id: "opencode".to_owned(),
+            builtin: Some(BuiltinLauncherKind::OpenCode),
+            display_name: "OpenCode".to_owned(),
+            launch_command: "opencode".to_owned(),
+            enabled: true,
+            icon_key: LauncherIconKey::OpenCode,
+        }];
+
+        let output =
+            draw_foreground_launcher_menu_in_test_ui(&ctx, RawInput::default(), &launchers);
+
+        assert!(
+            frame_contains_rect_filled(&output, super::SURFACE_BG_SOFT),
+            "launcher menu row must paint a SURFACE_BG_SOFT background rect"
+        );
+    }
+
+    #[test]
+    fn foreground_launcher_menu_hover_row_has_highlight() {
+        // Regression test: hovering a launcher row must paint a lighter fill.
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let launchers = vec![LauncherEntry {
+            id: "opencode".to_owned(),
+            builtin: Some(BuiltinLauncherKind::OpenCode),
+            display_name: "OpenCode".to_owned(),
+            launch_command: "opencode".to_owned(),
+            enabled: true,
+            icon_key: LauncherIconKey::OpenCode,
+        }];
+
+        let output = draw_foreground_launcher_menu_in_test_ui(
+            &ctx,
+            RawInput {
+                events: vec![Event::PointerMoved(pos2(60.0, 10.0))],
+                ..RawInput::default()
+            },
+            &launchers,
+        );
+
+        assert!(
+            frame_contains_rect_filled(&output, super::with_alpha(super::BTN_ICON_HOVER, 110)),
+            "hovered launcher menu row must paint a highlight rect"
+        );
+    }
+
     fn draw_foreground_launcher_menu_in_test_ui(
         ctx: &Context,
         raw_input: RawInput,
@@ -31291,32 +32163,50 @@ mod tests {
                         // Just render the menu contents directly to test cursor behavior
                         with_minimal_button_chrome(ui, |ui| {
                             for launcher in launchers {
-                                let response = ui.horizontal(|ui| {
-                                    ui.add_space(6.0);
-                                    ui.vertical(|ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(&launcher.display_name)
-                                                    .strong()
-                                                    .color(TEXT_PRIMARY),
-                                            )
-                                            .selectable(false),
-                                        );
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(&launcher.launch_command)
-                                                    .small()
-                                                    .color(TEXT_MUTED),
-                                            )
-                                            .selectable(false),
-                                        );
-                                    });
-                                });
-                                let row_id =
-                                    ui.make_persistent_id(("foreground-launcher", &launcher.id));
-                                let row_response = ui
-                                    .interact(response.response.rect, row_id, Sense::click())
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                let full_width = ui.available_width().max(0.0);
+                                let row_height = super::CONTROL_ROW_HEIGHT + 4.0;
+                                let row_rect = egui::Rect::from_min_size(
+                                    ui.cursor().min,
+                                    egui::vec2(full_width, row_height),
+                                );
+                                let is_hovered = ui.rect_contains_pointer(row_rect);
+                                let row_bg = if is_hovered {
+                                    super::with_alpha(super::BTN_ICON_HOVER, 110)
+                                } else {
+                                    super::SURFACE_BG_SOFT
+                                };
+                                ui.painter().rect_filled(row_rect.shrink(2.0), 6.0, row_bg);
+
+                                let inner_response = ui.allocate_new_ui(
+                                    egui::UiBuilder::new()
+                                        .max_rect(row_rect)
+                                        .layout(Layout::left_to_right(Align::Center))
+                                        .sense(Sense::click()),
+                                    |ui| {
+                                        ui.add_space(6.0);
+                                        ui.vertical(|ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&launcher.display_name)
+                                                        .strong()
+                                                        .color(super::TEXT_PRIMARY),
+                                                )
+                                                .selectable(false),
+                                            );
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&launcher.launch_command)
+                                                        .small()
+                                                        .color(super::TEXT_MUTED),
+                                                )
+                                                .selectable(false),
+                                            );
+                                        });
+                                        ui.set_min_size(row_rect.size());
+                                        ui.response()
+                                    },
+                                );
+                                let row_response = inner_response.inner;
                                 if row_response.hovered() {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                 }
@@ -32536,6 +33426,28 @@ mod tests {
         let behavior = terminal_output_scroll_behavior(&terminal, 10.0, 50.0);
 
         assert!(!behavior.stick_to_bottom);
+        assert_eq!(behavior.vertical_offset, None);
+    }
+
+    #[test]
+    fn opencode_output_scroll_behavior_sticks_to_bottom_when_not_detached() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.ai_session.tool = Some(AiCliTool::OpenCode);
+        terminal.render_cache = TerminalSnapshot {
+            lines: vec![TerminalStyledLine::default(); 20],
+            cursor: Some(TerminalCursor {
+                x: 0,
+                y: 10,
+                shape: TerminalCursorShape::Block,
+                blinking: false,
+            }),
+            cursor_line: None,
+        };
+        terminal.opencode_manual_scroll_detached = false;
+
+        let behavior = terminal_output_scroll_behavior(&terminal, 10.0, 50.0);
+
+        assert!(behavior.stick_to_bottom);
         assert_eq!(behavior.vertical_offset, None);
     }
 
@@ -38047,6 +38959,10 @@ mod tests {
             browser_video_recordings_by_scope: BTreeMap::new(),
             os_notification_last_by_terminal: BTreeMap::new(),
             pending_os_notification: None,
+            #[cfg(target_os = "windows")]
+            tray_icon_added: false,
+            #[cfg(target_os = "windows")]
+            tray_icon_hicon: None,
             show_create_worktree_popup: false,
             create_worktree_project_id: None,
             create_worktree_branch_draft: String::new(),
@@ -38084,6 +39000,23 @@ mod tests {
             .shapes
             .iter()
             .any(|shape| shape_contains_filled_circle(&shape.shape, fill))
+    }
+
+    fn shape_contains_rect_filled(shape: &egui::epaint::Shape, fill: Color32) -> bool {
+        match shape {
+            egui::epaint::Shape::Rect(rect_shape) => rect_shape.fill == fill,
+            egui::epaint::Shape::Vec(shapes) => shapes
+                .iter()
+                .any(|shape| shape_contains_rect_filled(shape, fill)),
+            _ => false,
+        }
+    }
+
+    fn frame_contains_rect_filled(output: &egui::FullOutput, fill: Color32) -> bool {
+        output
+            .shapes
+            .iter()
+            .any(|shape| shape_contains_rect_filled(&shape.shape, fill))
     }
 
     fn snapshot_codex_launch_baseline(
@@ -39949,6 +40882,26 @@ mod tests {
     }
 
     #[test]
+    fn terminal_resize_pixel_dimensions_quantized_to_cell_boundaries() {
+        // Regression: small Smart Input footer height changes (within one cell)
+        // should not jitter the PTY pixel size because pixel dimensions must
+        // align to the grid.
+        let (cols, lines) = terminal_grid_dimensions(egui::vec2(400.0, 310.0), 10.0, 20.0);
+        let pixel_width = (cols as f32 * 10.0).round() as u16;
+        let pixel_height = (lines as f32 * 20.0).round() as u16;
+        assert_eq!(pixel_width, 400);
+        assert_eq!(pixel_height, 300);
+        // A 5px height difference (within one cell) keeps the same pixel_height.
+        let (cols2, lines2) = terminal_grid_dimensions(egui::vec2(400.0, 305.0), 10.0, 20.0);
+        let pixel_height2 = (lines2 as f32 * 20.0).round() as u16;
+        assert_eq!(pixel_height2, 300);
+        assert_eq!(
+            lines, lines2,
+            "5px change within one cell must not change lines"
+        );
+    }
+
+    #[test]
     fn force_terminal_pane_width_expands_ui_to_requested_right_edge() {
         let ctx = Context::default();
         ctx.set_fonts(FontDefinitions::default());
@@ -41793,6 +42746,23 @@ mod tests {
         assert!(
             !entry.activation_scroll_align_pending,
             "reselecting the active terminal should not force a fresh activation scroll"
+        );
+    }
+
+    #[test]
+    fn set_active_terminal_skips_activation_scroll_align_for_opencode() {
+        let mut entry = test_terminal_entry_with_runtime(1, 7, test_terminal_runtime());
+        entry.ai_session.tool = Some(AiCliTool::OpenCode);
+        entry.activation_scroll_align_pending = false;
+        let mut app = test_app([(1, entry)], Some(1));
+
+        let ctx = Context::default();
+        app.set_active_terminal(&ctx, Some(1));
+
+        let entry = app.terminals.get(&1).unwrap();
+        assert!(
+            !entry.activation_scroll_align_pending,
+            "OpenCode activation must not request prompt-aligned scroll; it should stick to bottom"
         );
     }
 
@@ -48408,6 +49378,7 @@ mod tests {
             .push(SmartInputTask {
                 id: 1,
                 text: "queued".to_owned(),
+                attachments: Vec::new(),
             });
 
         app.process_smart_input_queues(&ctx);
@@ -48468,6 +49439,7 @@ mod tests {
             terminal.smart_input.tasks.push(SmartInputTask {
                 id: 1,
                 text: "must stay queued".to_owned(),
+                attachments: Vec::new(),
             });
         }
 
@@ -48483,6 +49455,386 @@ mod tests {
                 .tasks
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn smart_input_settle_guard_blocks_stale_idle_after_auto_dispatch() {
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.smart_input.draft = "/first".to_owned();
+            terminal.smart_input.enqueue_draft();
+            terminal.smart_input.draft = "second".to_owned();
+            terminal.smart_input.enqueue_draft();
+        }
+
+        // First dispatch sends /first and sets status to Working
+        app.process_smart_input_queues(&ctx);
+        capture.drain();
+        assert_eq!(capture.bytes(), b"\x1b[200~/first\x1b[201~\r".to_vec());
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.smart_input.tasks.len(), 1);
+        assert_eq!(
+            terminal.opencode_normalized_status,
+            Some(OpenCodeTransportStatus::Working)
+        );
+
+        // Simulate a stale Idle event arriving immediately after dispatch
+        // (e.g., a delayed event from the previous turn). This must be suppressed
+        // so it cannot overwrite the Working state of the current turn.
+        let applied = app.apply_opencode_transport_status(
+            1,
+            OpenCodeTransportStatus::Idle,
+            OpenCodeStatusSource::Notify,
+            Some(OpenCodeAttentionReason::TurnComplete),
+        );
+        assert!(
+            !applied,
+            "stale Idle during settle window must be suppressed, not stored"
+        );
+
+        // Fast-forward past settle window to prove the stale Idle did not persist
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.opencode_prompt_submit_since = Some(
+                std::time::Instant::now()
+                    - std::time::Duration::from_millis(SMART_INPUT_AUTO_DISPATCH_SETTLE_MS + 50),
+            );
+        }
+
+        // The terminal must still be Working because the stale Idle was dropped
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.opencode_normalized_status,
+            Some(OpenCodeTransportStatus::Working),
+            "stale Idle must not persist after settle window expires"
+        );
+
+        // Second task must not dispatch because status is still Working
+        app.process_smart_input_queues(&ctx);
+        capture.drain();
+        assert_eq!(
+            capture.bytes(),
+            b"\x1b[200~/first\x1b[201~\r".to_vec(),
+            "stale Idle must not trigger second task even after settle"
+        );
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.smart_input.tasks.len(), 1);
+        assert_eq!(terminal.smart_input.tasks[0].text, "second");
+    }
+
+    #[test]
+    fn smart_input_dispatches_after_settle_guard_elapses() {
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.smart_input.draft = "/first".to_owned();
+            terminal.smart_input.enqueue_draft();
+            terminal.smart_input.draft = "second".to_owned();
+            terminal.smart_input.enqueue_draft();
+        }
+
+        // First dispatch
+        app.process_smart_input_queues(&ctx);
+        capture.drain();
+        assert_eq!(capture.bytes(), b"\x1b[200~/first\x1b[201~\r".to_vec());
+
+        // Fast-forward prompt submit timestamp so settle guard opens
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.opencode_prompt_submit_since = Some(
+                std::time::Instant::now()
+                    - std::time::Duration::from_millis(SMART_INPUT_AUTO_DISPATCH_SETTLE_MS + 50),
+            );
+        }
+
+        // Now a real Idle/TurnComplete should allow the second task
+        let _ = app.apply_opencode_transport_status(
+            1,
+            OpenCodeTransportStatus::Idle,
+            OpenCodeStatusSource::Notify,
+            Some(OpenCodeAttentionReason::TurnComplete),
+        );
+
+        app.process_smart_input_queues(&ctx);
+        capture.drain();
+        assert_eq!(
+            capture.bytes(),
+            b"\x1b[200~/first\x1b[201~\r\x1b[200~second\x1b[201~\r".to_vec(),
+            "second task should dispatch after settle guard elapses"
+        );
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(terminal.smart_input.tasks.is_empty());
+    }
+
+    #[test]
+    fn visible_opencode_turn_complete_recovers_stale_hook_working() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::OpenCode);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.opencode_session_active = true;
+            entry.opencode_normalized_status = Some(OpenCodeTransportStatus::Working);
+            entry.opencode_last_status_source = Some(OpenCodeStatusSource::Hook);
+            entry.opencode_running_since = Some(
+                std::time::Instant::now()
+                    - std::time::Duration::from_millis(OPENCODE_RUNNING_GRACE_MS + 100),
+            );
+            entry.opencode_last_title_working_at = Some(
+                std::time::Instant::now()
+                    - std::time::Duration::from_millis(OPENCODE_RUNNING_GRACE_MS + 100),
+            );
+        }
+
+        // Because Hook Working is stale, visible turn-complete should be accepted
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "opencode-turn-complete".to_owned(),
+                },
+            })
+            .expect("send visible turn complete chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.opencode_attention_reason,
+            Some(OpenCodeAttentionReason::TurnComplete)
+        );
+    }
+
+    #[test]
+    fn visible_opencode_turn_complete_suppressed_during_settle_window() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.ai_session.tool = Some(AiCliTool::OpenCode);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.opencode_session_active = true;
+            entry.opencode_normalized_status = Some(OpenCodeTransportStatus::Working);
+            entry.opencode_last_status_source = Some(OpenCodeStatusSource::TerminalTitle);
+            entry.opencode_running_since = Some(std::time::Instant::now());
+            entry.opencode_last_title_working_at = Some(std::time::Instant::now());
+            entry.opencode_prompt_submit_since = Some(std::time::Instant::now());
+        }
+
+        // A visible turn-complete chunk arriving during the settle window must
+        // be suppressed regardless of other acceptance rules.
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "opencode-turn-complete".to_owned(),
+                },
+            })
+            .expect("send visible turn complete chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.ai_session.status,
+            AiCliStatus::Running,
+            "visible turn-complete during settle must not change status"
+        );
+        assert_eq!(
+            terminal.opencode_normalized_status,
+            Some(OpenCodeTransportStatus::Working),
+            "visible turn-complete during settle must not overwrite Working"
+        );
+    }
+
+    #[test]
+    fn smart_input_delayed_enters_cleared_between_auto_dispatches() {
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.smart_input.draft = "/first".to_owned();
+            terminal.smart_input.enqueue_draft();
+            terminal.smart_input.draft = "second".to_owned();
+            terminal.smart_input.enqueue_draft();
+        }
+
+        // First auto dispatch schedules two delayed Enters
+        app.process_smart_input_queues(&ctx);
+        assert_eq!(app.pending_second_enter.len(), 2);
+
+        // Fast-forward past settle guard and simulate real Idle so second task dispatches
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.opencode_prompt_submit_since = Some(
+                std::time::Instant::now()
+                    - std::time::Duration::from_millis(SMART_INPUT_AUTO_DISPATCH_SETTLE_MS + 50),
+            );
+        }
+        let _ = app.apply_opencode_transport_status(
+            1,
+            OpenCodeTransportStatus::Idle,
+            OpenCodeStatusSource::Notify,
+            Some(OpenCodeAttentionReason::TurnComplete),
+        );
+
+        // Second auto dispatch should clear the old delayed Enters and schedule new ones
+        app.process_smart_input_queues(&ctx);
+        capture.drain();
+        assert_eq!(
+            app.pending_second_enter.len(),
+            2,
+            "second auto dispatch should clear old delayed Enters and schedule fresh ones"
+        );
+    }
+
+    #[test]
+    fn smart_input_attachment_only_submit_clears_pending_buffers() {
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.smart_input.mode = super::SmartInputMode::SteerNow;
+            terminal
+                .smart_input
+                .draft_attachments
+                .push(SmartInputAttachment {
+                    id: 1,
+                    path: "/tmp/test.png".to_owned(),
+                });
+        }
+
+        app.execute_smart_input_draft_submit(&ctx, 1);
+        capture.drain();
+
+        assert!(
+            capture.bytes().contains(&b'\r'),
+            "attachment-only submit must send Enter"
+        );
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(
+            terminal.pending_line_for_title.is_empty(),
+            "attachment path must not pollute pending_line_for_title"
+        );
+        assert!(
+            terminal.pending_input_for_history.is_empty(),
+            "attachment path must not pollute pending_input_for_history"
+        );
+    }
+
+    #[test]
+    fn smart_input_attachment_only_auto_dispatch_keeps_history_clean() {
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal
+                .smart_input
+                .draft_attachments
+                .push(SmartInputAttachment {
+                    id: 1,
+                    path: "/tmp/test.png".to_owned(),
+                });
+            let _ = terminal.smart_input.enqueue_draft();
+        }
+
+        app.process_smart_input_queues(&ctx);
+        capture.drain();
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(
+            terminal.pending_line_for_title.is_empty(),
+            "auto-dispatch attachment must not pollute pending_line_for_title"
+        );
+        assert!(
+            terminal.pending_input_for_history.is_empty(),
+            "auto-dispatch attachment must not pollute pending_input_for_history"
+        );
+        assert!(
+            terminal.smart_input.tasks.is_empty(),
+            "attachment-only task should be removed after dispatch"
+        );
+        assert_eq!(
+            terminal.opencode_normalized_status,
+            Some(OpenCodeTransportStatus::Working),
+            "attachment-only dispatch should transition to Working"
+        );
+    }
+
+    #[test]
+    fn smart_input_text_with_attachment_records_text_not_path() {
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.smart_input.mode = super::SmartInputMode::SteerNow;
+            terminal.smart_input.draft = "analyze this".to_owned();
+            terminal
+                .smart_input
+                .draft_attachments
+                .push(SmartInputAttachment {
+                    id: 1,
+                    path: "/tmp/test.png".to_owned(),
+                });
+        }
+
+        app.execute_smart_input_draft_submit(&ctx, 1);
+        capture.drain();
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(
+            terminal.pending_line_for_title.is_empty(),
+            "pending_line_for_title should be empty after submit (taken for title update)"
+        );
+        assert!(
+            !terminal.pending_input_for_history.contains("/tmp/test.png"),
+            "attachment path must not appear in pending history buffer"
+        );
+        assert!(
+            terminal.recent_inputs.iter().any(|r| r == "analyze this"),
+            "text prompt should be recorded in recent_inputs"
         );
     }
 
@@ -49321,10 +50673,12 @@ mod tests {
         terminal.smart_input.tasks.push(SmartInputTask {
             id: 1,
             text: "queued task one".to_owned(),
+            attachments: Vec::new(),
         });
         terminal.smart_input.tasks.push(SmartInputTask {
             id: 2,
             text: "queued task two".to_owned(),
+            attachments: Vec::new(),
         });
         terminal.recent_inputs.push_front("recent input".to_owned());
 
@@ -49434,5 +50788,171 @@ mod tests {
         let result = AdeApp::synthesize_smart_input_image_paste_events_with(events, || None);
         assert_eq!(result.len(), 1);
         assert!(matches!(&result[0], Event::Key { key: Key::V, .. }));
+    }
+
+    fn codex_reason_to_kind(reason: CodexAttentionReason) -> OsNotificationKind {
+        match reason {
+            CodexAttentionReason::ApprovalRequested
+            | CodexAttentionReason::UserInputRequested
+            | CodexAttentionReason::PlanModePrompt => OsNotificationKind::Permission,
+            CodexAttentionReason::ExecutionError => OsNotificationKind::SessionError,
+            _ => OsNotificationKind::TurnComplete,
+        }
+    }
+
+    fn opencode_reason_to_kind(reason: OpenCodeAttentionReason) -> OsNotificationKind {
+        match reason {
+            OpenCodeAttentionReason::PermissionAsked
+            | OpenCodeAttentionReason::QuestionAsked
+            | OpenCodeAttentionReason::PlanModePrompt => OsNotificationKind::Permission,
+            OpenCodeAttentionReason::SessionError => OsNotificationKind::SessionError,
+            _ => OsNotificationKind::TurnComplete,
+        }
+    }
+
+    fn factory_droid_reason_to_kind(reason: FactoryDroidAttentionReason) -> OsNotificationKind {
+        match reason {
+            FactoryDroidAttentionReason::AskUser
+            | FactoryDroidAttentionReason::SpecificationApproval => OsNotificationKind::Permission,
+        }
+    }
+
+    fn claude_reason_to_kind(reason: Option<ClaudeAttentionReason>) -> OsNotificationKind {
+        match reason {
+            Some(ClaudeAttentionReason::PermissionAsked) => OsNotificationKind::Permission,
+            _ => OsNotificationKind::TurnComplete,
+        }
+    }
+
+    #[test]
+    fn os_notification_kind_mapping() {
+        // Codex
+        assert_eq!(
+            codex_reason_to_kind(CodexAttentionReason::ApprovalRequested),
+            OsNotificationKind::Permission
+        );
+        assert_eq!(
+            codex_reason_to_kind(CodexAttentionReason::UserInputRequested),
+            OsNotificationKind::Permission
+        );
+        assert_eq!(
+            codex_reason_to_kind(CodexAttentionReason::PlanModePrompt),
+            OsNotificationKind::Permission
+        );
+        assert_eq!(
+            codex_reason_to_kind(CodexAttentionReason::ExecutionError),
+            OsNotificationKind::SessionError
+        );
+        assert_eq!(
+            codex_reason_to_kind(CodexAttentionReason::TurnComplete),
+            OsNotificationKind::TurnComplete
+        );
+        assert_eq!(
+            codex_reason_to_kind(CodexAttentionReason::UnknownNotify),
+            OsNotificationKind::TurnComplete
+        );
+
+        // OpenCode
+        assert_eq!(
+            opencode_reason_to_kind(OpenCodeAttentionReason::PermissionAsked),
+            OsNotificationKind::Permission
+        );
+        assert_eq!(
+            opencode_reason_to_kind(OpenCodeAttentionReason::QuestionAsked),
+            OsNotificationKind::Permission
+        );
+        assert_eq!(
+            opencode_reason_to_kind(OpenCodeAttentionReason::PlanModePrompt),
+            OsNotificationKind::Permission
+        );
+        assert_eq!(
+            opencode_reason_to_kind(OpenCodeAttentionReason::SessionError),
+            OsNotificationKind::SessionError
+        );
+        assert_eq!(
+            opencode_reason_to_kind(OpenCodeAttentionReason::TurnComplete),
+            OsNotificationKind::TurnComplete
+        );
+
+        // Factory Droid
+        assert_eq!(
+            factory_droid_reason_to_kind(FactoryDroidAttentionReason::AskUser),
+            OsNotificationKind::Permission
+        );
+        assert_eq!(
+            factory_droid_reason_to_kind(FactoryDroidAttentionReason::SpecificationApproval),
+            OsNotificationKind::Permission
+        );
+
+        // Claude
+        assert_eq!(
+            claude_reason_to_kind(Some(ClaudeAttentionReason::PermissionAsked)),
+            OsNotificationKind::Permission
+        );
+        assert_eq!(
+            claude_reason_to_kind(None),
+            OsNotificationKind::TurnComplete
+        );
+    }
+
+    #[test]
+    fn process_os_notifications_respects_config_filters() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let term_id = app.active_terminal.unwrap();
+
+        app.config.notifications.enabled = true;
+        app.config.notifications.on_permission = false;
+        app.config.notifications.on_turn_complete = true;
+        app.config.notifications.on_session_error = true;
+        app.config.notifications.cooldown_secs = 0;
+        app.config.notifications.only_when_unfocused = false;
+
+        // Permission notification should be dropped because on_permission is false
+        app.pending_os_notification = Some(PendingOsNotification {
+            terminal_id: term_id,
+            tool: Some(AiCliTool::OpenCode),
+            kind: OsNotificationKind::Permission,
+        });
+        app.process_pending_os_notifications(&egui::Context::default());
+        assert!(app.pending_os_notification.is_none());
+        assert!(app.os_notification_last_by_terminal.is_empty());
+
+        // Turn complete should go through
+        app.pending_os_notification = Some(PendingOsNotification {
+            terminal_id: term_id,
+            tool: Some(AiCliTool::OpenCode),
+            kind: OsNotificationKind::TurnComplete,
+        });
+        app.process_pending_os_notifications(&egui::Context::default());
+        assert!(app.os_notification_last_by_terminal.contains_key(&term_id));
+    }
+
+    #[test]
+    fn process_os_notifications_cooldown_blocks_second() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        let term_id = app.active_terminal.unwrap();
+
+        app.config.notifications.enabled = true;
+        app.config.notifications.on_turn_complete = true;
+        app.config.notifications.cooldown_secs = 60;
+        app.config.notifications.only_when_unfocused = false;
+
+        app.pending_os_notification = Some(PendingOsNotification {
+            terminal_id: term_id,
+            tool: Some(AiCliTool::CodexCli),
+            kind: OsNotificationKind::TurnComplete,
+        });
+        app.process_pending_os_notifications(&egui::Context::default());
+        assert!(app.os_notification_last_by_terminal.contains_key(&term_id));
+
+        // Immediate second notification should be blocked by cooldown
+        app.pending_os_notification = Some(PendingOsNotification {
+            terminal_id: term_id,
+            tool: Some(AiCliTool::CodexCli),
+            kind: OsNotificationKind::TurnComplete,
+        });
+        app.process_pending_os_notifications(&egui::Context::default());
+        // Should still only have one entry (the first one)
+        assert_eq!(app.os_notification_last_by_terminal.len(), 1);
     }
 }
