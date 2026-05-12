@@ -953,6 +953,11 @@ struct SmartInputState {
     dragging_task_id: Option<u64>,
     drag_hover_index: Option<usize>,
     user_height: Option<f32>,
+    /// Index into terminal recent_inputs when navigating history with Up/Down.
+    /// None means not currently navigating history.
+    history_nav_index: Option<usize>,
+    /// Original draft text saved before entering history navigation.
+    history_nav_stash: String,
 }
 
 impl Default for SmartInputState {
@@ -969,6 +974,8 @@ impl Default for SmartInputState {
             dragging_task_id: None,
             drag_hover_index: None,
             user_height: None,
+            history_nav_index: None,
+            history_nav_stash: String::new(),
         }
     }
 }
@@ -986,6 +993,7 @@ impl SmartInputState {
             text: self.draft.clone(),
         });
         self.draft.clear();
+        self.history_nav_reset();
         Some(id)
     }
 
@@ -1058,6 +1066,51 @@ impl SmartInputState {
     fn cancel_edit(&mut self) {
         self.editing_task_id = None;
         self.edit_draft.clear();
+    }
+
+    /// Navigate up in terminal input history (older entries).
+    fn history_navigate_up(&mut self, recent_inputs: &VecDeque<String>) {
+        if recent_inputs.is_empty() {
+            return;
+        }
+        if self.history_nav_index.is_none() {
+            self.history_nav_stash = self.draft.clone();
+            self.history_nav_index = Some(0);
+        } else {
+            let current = self.history_nav_index.unwrap();
+            if current + 1 < recent_inputs.len() {
+                self.history_nav_index = Some(current + 1);
+            }
+        }
+        if let Some(index) = self.history_nav_index {
+            if let Some(text) = recent_inputs.get(index) {
+                self.draft = text.clone();
+            }
+        }
+    }
+
+    /// Navigate down in terminal input history (newer entries).
+    /// When moving past the newest entry, restore the original stash.
+    fn history_navigate_down(&mut self, recent_inputs: &VecDeque<String>) {
+        let Some(current) = self.history_nav_index else {
+            return;
+        };
+        if current == 0 {
+            self.draft = self.history_nav_stash.clone();
+            self.history_nav_index = None;
+        } else {
+            let new_index = current - 1;
+            self.history_nav_index = Some(new_index);
+            if let Some(text) = recent_inputs.get(new_index) {
+                self.draft = text.clone();
+            }
+        }
+    }
+
+    /// Reset history navigation state, preserving current draft.
+    fn history_nav_reset(&mut self) {
+        self.history_nav_index = None;
+        self.history_nav_stash.clear();
     }
 }
 
@@ -12232,6 +12285,7 @@ impl AdeApp {
                 ) {
                     if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                         terminal.smart_input.draft.clear();
+                        terminal.smart_input.history_nav_reset();
                     }
                     self.status_line = "Smart Input sent steer prompt to OpenCode".to_owned();
                 }
@@ -21177,6 +21231,55 @@ impl eframe::App for AdeApp {
                             terminal.runtime.send_bytes(vec![b'\t']);
                             reset_opencode_manual_scroll_detached(terminal);
                             terminal.dirty = true;
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+            }
+
+            // Smart Input history navigation: Up/Down arrows cycle through
+            // terminal recent_inputs when the draft field is focused.
+            if let Some(SmartInputSubmitRequest::Draft { terminal_id }) =
+                self.focused_smart_input_submit_request(ctx)
+            {
+                let mut up_pressed = false;
+                let mut down_pressed = false;
+                events = events
+                    .into_iter()
+                    .filter(|event| {
+                        if let Event::Key {
+                            key,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } = event
+                        {
+                            if modifiers.is_none()
+                                && matches!(key, Key::ArrowUp | Key::ArrowDown)
+                            {
+                                if key == &Key::ArrowUp {
+                                    up_pressed = true;
+                                } else {
+                                    down_pressed = true;
+                                }
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .collect();
+                if up_pressed || down_pressed {
+                    if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                        if Self::terminal_smart_input_visible(terminal) {
+                            if up_pressed {
+                                terminal
+                                    .smart_input
+                                    .history_navigate_up(&terminal.recent_inputs);
+                            } else {
+                                terminal
+                                    .smart_input
+                                    .history_navigate_down(&terminal.recent_inputs);
+                            }
                             ctx.request_repaint();
                         }
                     }
@@ -48194,5 +48297,114 @@ mod tests {
             history.entries[0].text, "queued task one",
             "history text should match the queued task"
         );
+    }
+
+    #[test]
+    fn smart_input_up_arrow_cycles_through_recent_inputs() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Test", "C:/test", &[], &[]));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+        // push_front mimics the actual recent_inputs ordering (newest at index 0)
+        terminal.recent_inputs.push_front("git status".to_owned());
+        terminal.recent_inputs.push_front("cargo build".to_owned());
+        terminal.recent_inputs.push_front("npm test".to_owned());
+        terminal.smart_input.draft = "original draft".to_owned();
+
+        // Up arrow should navigate to older entries
+        terminal.smart_input.history_navigate_up(&terminal.recent_inputs);
+        assert_eq!(terminal.smart_input.draft, "npm test");
+        assert_eq!(terminal.smart_input.history_nav_index, Some(0));
+        assert_eq!(terminal.smart_input.history_nav_stash, "original draft");
+
+        terminal.smart_input.history_navigate_up(&terminal.recent_inputs);
+        assert_eq!(terminal.smart_input.draft, "cargo build");
+        assert_eq!(terminal.smart_input.history_nav_index, Some(1));
+
+        terminal.smart_input.history_navigate_up(&terminal.recent_inputs);
+        assert_eq!(terminal.smart_input.draft, "git status");
+        assert_eq!(terminal.smart_input.history_nav_index, Some(2));
+
+        // At oldest entry, further Up should stay
+        terminal.smart_input.history_navigate_up(&terminal.recent_inputs);
+        assert_eq!(terminal.smart_input.draft, "git status");
+        assert_eq!(terminal.smart_input.history_nav_index, Some(2));
+    }
+
+    #[test]
+    fn smart_input_down_arrow_restores_stash_at_newest_entry() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Test", "C:/test", &[], &[]));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+        terminal.recent_inputs.push_front("git status".to_owned());
+        terminal.recent_inputs.push_front("cargo build".to_owned());
+        terminal.smart_input.draft = "original draft".to_owned();
+
+        // Navigate up twice
+        terminal.smart_input.history_navigate_up(&terminal.recent_inputs);
+        terminal.smart_input.history_navigate_up(&terminal.recent_inputs);
+        assert_eq!(terminal.smart_input.draft, "git status");
+
+        // Down arrow moves to newer entry
+        terminal
+            .smart_input
+            .history_navigate_down(&terminal.recent_inputs);
+        assert_eq!(terminal.smart_input.draft, "cargo build");
+        assert_eq!(terminal.smart_input.history_nav_index, Some(0));
+
+        // Down at newest entry restores stash and exits history mode
+        terminal
+            .smart_input
+            .history_navigate_down(&terminal.recent_inputs);
+        assert_eq!(terminal.smart_input.draft, "original draft");
+        assert_eq!(terminal.smart_input.history_nav_index, None);
+    }
+
+    #[test]
+    fn smart_input_history_nav_reset_on_submit() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, test_terminal_runtime()))],
+            Some(1),
+        );
+        app.projects
+            .insert(7, test_project(7, "Test", "C:/test", &[], &[]));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+        terminal.recent_inputs.push_front("previous input".to_owned());
+        terminal.smart_input.draft = "original draft".to_owned();
+        terminal.smart_input.history_navigate_up(&terminal.recent_inputs);
+        assert_eq!(terminal.smart_input.draft, "previous input");
+        assert!(terminal.smart_input.history_nav_index.is_some());
+
+        // Submit should clear draft and reset history navigation
+        app.execute_smart_input_draft_submit(&ctx, 1);
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(terminal.smart_input.draft.is_empty());
+        assert!(terminal.smart_input.history_nav_index.is_none());
+        assert!(terminal.smart_input.history_nav_stash.is_empty());
+    }
+
+    #[test]
+    fn smart_input_history_empty_recent_inputs_does_nothing() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Test", "C:/test", &[], &[]));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+        terminal.smart_input.draft = "draft".to_owned();
+
+        terminal.smart_input.history_navigate_up(&terminal.recent_inputs);
+        assert_eq!(terminal.smart_input.draft, "draft");
+        assert!(terminal.smart_input.history_nav_index.is_none());
     }
 }
