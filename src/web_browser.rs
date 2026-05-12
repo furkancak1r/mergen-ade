@@ -2093,7 +2093,7 @@ pub(crate) fn browser_mcp_output_from_devtools_runtime_raw(
 
 #[cfg(target_os = "windows")]
 const MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT: &str = r#"
-if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 21) {
+if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 22) {
   window.__mergenMcpState = window.__mergenMcpState || { refCounter: 1, consoleMessages: [], networkRequests: [], routes: [], highlighted: null };
 
   const state = window.__mergenMcpState;
@@ -2102,12 +2102,53 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 21) {
   const CURSOR_AUTO_HIDE_MS = 30000;
   state.cursor.anchorElement = state.cursor.anchorElement || null;
   const clean = (value, max = 240) => String(value ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
+  const hiddenByStyle = (style) => style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || Number(style.opacity) === 0;
+  const rectFromDomRect = (rect) => ({ left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom, width: rect.width, height: rect.height });
+  const intersectRects = (a, b) => {
+    const left = Math.max(a.left, b.left);
+    const top = Math.max(a.top, b.top);
+    const right = Math.min(a.right, b.right);
+    const bottom = Math.min(a.bottom, b.bottom);
+    const width = right - left;
+    const height = bottom - top;
+    return width > 0 && height > 0 ? { left, top, right, bottom, width, height } : null;
+  };
+  const clipsOverflow = (style) => /(?:hidden|clip|auto|scroll|overlay)/.test(`${style.overflow} ${style.overflowX} ${style.overflowY}`);
+  const visibleRect = (element, clipToViewport = false) => {
+    if (!element || element.nodeType !== Node.ELEMENT_NODE) return false;
+    const style = window.getComputedStyle(element);
+    if (hiddenByStyle(style) || element.getClientRects().length === 0) return null;
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    let clipped = rectFromDomRect(rect);
+    for (let node = element.parentElement; node && node !== document.documentElement; node = node.parentElement) {
+      const nodeStyle = window.getComputedStyle(node);
+      if (hiddenByStyle(nodeStyle)) return null;
+      if (!clipsOverflow(nodeStyle)) continue;
+      const nodeRect = node.getBoundingClientRect();
+      if (nodeRect.width <= 0 || nodeRect.height <= 0) return null;
+      clipped = intersectRects(clipped, rectFromDomRect(nodeRect));
+      if (!clipped) return null;
+    }
+    if (clipToViewport) {
+      clipped = intersectRects(clipped, { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight, width: window.innerWidth, height: window.innerHeight });
+    }
+    return clipped;
+  };
   const visible = (element) => {
     if (!element || element.nodeType !== Node.ELEMENT_NODE) return false;
     const style = window.getComputedStyle(element);
-    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+    if (hiddenByStyle(style) || element.getClientRects().length === 0) return false;
     const rect = element.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    for (let node = element.parentElement; node && node !== document.documentElement; node = node.parentElement) {
+      const nodeStyle = window.getComputedStyle(node);
+      if (hiddenByStyle(nodeStyle)) return false;
+      if (!clipsOverflow(nodeStyle)) continue;
+      const nodeRect = node.getBoundingClientRect();
+      if (nodeRect.width <= 0 || nodeRect.height <= 0) return false;
+    }
+    return true;
   };
   const inViewport = (rect) => rect.bottom >= 0 && rect.right >= 0 && rect.top <= window.innerHeight && rect.left <= window.innerWidth;
   const isDisabled = (element) => Boolean(
@@ -2651,11 +2692,22 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 21) {
     );
   };
   const elementCenterIsTouchable = (element, margin = 0) => {
-    const rect = element.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0 || !inViewport(rect)) return false;
+    const rect = visibleRect(element, true);
+    if (!rect || !inViewport(rect)) return false;
     const centerX = rect.left + rect.width / 2;
     const centerY = rect.top + rect.height / 2;
     return centerX >= margin && centerX <= window.innerWidth - 1 - margin && centerY >= margin && centerY <= window.innerHeight - 1 - margin;
+  };
+  const elementHitTestPoint = (element) => {
+    const rect = visibleRect(element, true);
+    if (!rect) return null;
+    return clampPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+  };
+  const elementIsReachable = (element, point = null) => {
+    const hitPoint = point || elementHitTestPoint(element);
+    if (!hitPoint) return false;
+    const hit = document.elementFromPoint(hitPoint.x, hitPoint.y);
+    return Boolean(hit && (hit === element || element.contains(hit)));
   };
   const applyHumanScrollStep = (scrollTarget, point, deltaX, deltaY) => {
     const eventTarget = targetAt(point, isRootScrollTarget(scrollTarget) ? document.body : scrollTarget);
@@ -2711,12 +2763,15 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 21) {
     let latest = null;
     for (let frame = 0; frame < 5; frame++) {
       await nextFrame();
-      const rect = element.getBoundingClientRect();
-      if (rect.width <= 0 || rect.height <= 0) throw new Error('Element is not visible after scrolling');
-      latest = clampPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
-      if (previous && Math.abs(previous.x - latest.x) < 0.5 && Math.abs(previous.y - latest.y) < 0.5) return latest;
+      latest = elementHitTestPoint(element);
+      if (!latest) throw new Error('Element is clipped or not visible after scrolling');
+      if (previous && Math.abs(previous.x - latest.x) < 0.5 && Math.abs(previous.y - latest.y) < 0.5) {
+        if (!elementIsReachable(element, latest)) throw new Error('Element is clipped or covered by another element');
+        return latest;
+      }
       previous = latest;
     }
+    if (!elementIsReachable(element, latest)) throw new Error('Element is clipped or covered by another element');
     return latest;
   };
   const elementCenter = async (element) => stableElementCenterAfterScroll(element);
@@ -3633,8 +3688,9 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 21) {
   const highlightBaseRect = (highlightState) => {
     if (highlightState.anchorElement) {
       if (!document.documentElement.contains(highlightState.anchorElement) || !visible(highlightState.anchorElement)) return null;
-      const rect = highlightState.anchorElement.getBoundingClientRect();
-      return { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+      const rect = visibleRect(highlightState.anchorElement, true);
+      if (!rect) return null;
+      return rect;
     }
     return highlightState.rect;
   };
@@ -3646,10 +3702,17 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 21) {
       return false;
     }
     const padding = highlightState.padding;
-    const left = rect.left - padding;
-    const top = rect.top - padding;
-    const width = rect.width + padding * 2;
-    const height = rect.height + padding * 2;
+    const left = clamp(rect.left - padding, 0, Math.max(0, window.innerWidth));
+    const top = clamp(rect.top - padding, 0, Math.max(0, window.innerHeight));
+    const right = clamp(rect.left + rect.width + padding, 0, Math.max(0, window.innerWidth));
+    const bottom = clamp(rect.top + rect.height + padding, 0, Math.max(0, window.innerHeight));
+    const width = right - left;
+    const height = bottom - top;
+    if (width <= 0 || height <= 0) {
+      highlightState.overlay.style.display = 'none';
+      highlightState.active = false;
+      return false;
+    }
     Object.assign(highlightState.overlay.style, {
       left: `${Math.round(left)}px`,
       top: `${Math.round(top)}px`,
@@ -3665,6 +3728,8 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 21) {
       highlightState.label.textContent = highlightState.labelText;
       highlightState.label.style.display = 'block';
       highlightState.label.style.top = top < 42 ? '8px' : '-34px';
+      highlightState.label.style.left = left < 120 ? '8px' : '10px';
+      highlightState.label.style.right = left < 120 ? 'auto' : '';
     } else {
       highlightState.label.textContent = '';
       highlightState.label.style.display = 'none';
@@ -3728,6 +3793,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 21) {
     const element = resolve(target);
     if (!element) throw new Error(`Element not found: ${target}`);
     const point = await elementCenter(element);
+    if (!elementIsReachable(element, point)) throw new Error('Highlight target is clipped or covered by another element');
     anchorCursorTo(element);
     await moveCursorTo(point.x, point.y, { intent: 'click' });
     dispatchMoveAt(point, element);
@@ -3796,7 +3862,7 @@ if (!window.__mergenMcpRun || window.__mergenMcpRun.version !== 21) {
   });
   window.addEventListener('scroll', scheduleVisualAnchorSync, true);
   window.addEventListener('resize', scheduleVisualAnchorSync);
-  window.__mergenMcpRun.version = 21;
+  window.__mergenMcpRun.version = 22;
 }
 "#;
 
@@ -4745,7 +4811,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn browser_mcp_automation_script_includes_visible_cursor_and_mouse_tools() {
-        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 21"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("window.__mergenMcpRun.version = 22"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-version"));
         assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("data-mergen-mcp-cursor-pointer"));
@@ -4874,6 +4940,24 @@ mod tests {
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("browser_mouse_')) return fail"));
         assert!(!MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
             .contains("is not implemented by Mergen Browser MCP yet.`);"));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn browser_mcp_automation_script_rejects_clipped_highlight_targets() {
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("visibleRect"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("clipsOverflow"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("getClientRects"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("elementFromPoint"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("elementIsReachable"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("Element is clipped or covered by another element"));
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT
+            .contains("Highlight target is clipped or covered by another element"));
+        assert!(
+            MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("const left = clamp(rect.left - padding")
+        );
+        assert!(MERGEN_BROWSER_MCP_AUTOMATION_SCRIPT.contains("Math.max(0, window.innerWidth)"));
     }
 
     #[test]

@@ -756,7 +756,7 @@ fn devtools_tools() -> Vec<JsonValue> {
         ),
         tool(
             "browser_highlight",
-            "Move the visible browser mouse to an element (by ref) and show a highlight overlay. Use a ref from browser_page_summary. Defaults to a neutral green feature callout; use red only when explicitly marking an error. Only one highlight can be active; call browser_hide_highlight before creating another.",
+            "Move the visible browser mouse to a visible/reachable element (by ref) and show a highlight overlay. Use a ref from browser_page_summary. Defaults to a neutral green feature callout; use red only when explicitly marking an error. Only one highlight can be active; call browser_hide_highlight before creating another.",
             json!({
                 "type": "object",
                 "properties": element_props(json!({
@@ -1223,6 +1223,10 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("Only one highlight can be active"));
+        assert!(highlight["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("visible/reachable element"));
 
         let hide = tool_by_name("browser_hide_highlight");
         assert_eq!(hide["inputSchema"]["required"].as_array().unwrap().len(), 0);

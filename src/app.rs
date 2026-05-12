@@ -254,6 +254,14 @@ const DIRECTORY_SEARCH_INPUT_ID: &str = "directory-search-input";
 const SAVED_MESSAGE_DRAFT_INPUT_ID: &str = "saved-message-draft-input";
 const BROWSER_URL_INPUT_ID: &str = "browser-url-input";
 const FOREGROUND_MESSAGE_INPUT_ID: &str = "foreground-message-input";
+const SMART_INPUT_DRAFT_INPUT_ID: &str = "smart-input-draft";
+const SMART_INPUT_TASK_EDIT_INPUT_ID: &str = "smart-input-task-edit";
+const SMART_INPUT_MIN_FOOTER_HEIGHT: f32 = 88.0;
+const SMART_INPUT_BASE_FOOTER_HEIGHT: f32 = 104.0;
+const SMART_INPUT_TASK_ROW_HEIGHT: f32 = 28.0;
+const SMART_INPUT_MAX_VISIBLE_TASK_ROWS: usize = 3;
+const SMART_INPUT_FOOTER_GAP: f32 = 6.0;
+const SMART_INPUT_TOOLTIP_MAX_CHARS: usize = 140;
 // Foreground tasks UI limits
 const FOREGROUND_TASKS_MENU_MAX_HEIGHT: f32 = 300.0; // Max height for task list dropdown
 const FOREGROUND_MESSAGE_TEXT_MAX_HEIGHT: f32 = 320.0; // Max height for popup text input area
@@ -904,6 +912,182 @@ impl OpenCodeAttentionReason {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmartInputMode {
+    QueueAfterDone,
+    SteerNow,
+}
+
+impl Default for SmartInputMode {
+    fn default() -> Self {
+        Self::QueueAfterDone
+    }
+}
+
+impl SmartInputMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::QueueAfterDone => "After Done",
+            Self::SteerNow => "Steer Now",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SmartInputTask {
+    id: u64,
+    text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SmartInputState {
+    draft: String,
+    mode: SmartInputMode,
+    auto_run_enabled: bool,
+    expanded: bool,
+    tasks: Vec<SmartInputTask>,
+    next_task_id: u64,
+    editing_task_id: Option<u64>,
+    edit_draft: String,
+}
+
+impl Default for SmartInputState {
+    fn default() -> Self {
+        Self {
+            draft: String::new(),
+            mode: SmartInputMode::QueueAfterDone,
+            auto_run_enabled: true,
+            expanded: true,
+            tasks: Vec::new(),
+            next_task_id: 1,
+            editing_task_id: None,
+            edit_draft: String::new(),
+        }
+    }
+}
+
+impl SmartInputState {
+    fn enqueue_draft(&mut self) -> Option<u64> {
+        if self.draft.trim().is_empty() {
+            return None;
+        }
+
+        let id = self.next_task_id;
+        self.next_task_id = self.next_task_id.saturating_add(1).max(1);
+        self.tasks.push(SmartInputTask {
+            id,
+            text: self.draft.clone(),
+        });
+        self.draft.clear();
+        Some(id)
+    }
+
+    fn remove_task(&mut self, task_id: u64) -> Option<String> {
+        let index = self.tasks.iter().position(|task| task.id == task_id)?;
+        if self.editing_task_id == Some(task_id) {
+            self.cancel_edit();
+        }
+        Some(self.tasks.remove(index).text)
+    }
+
+    fn move_task(&mut self, task_id: u64, offset: isize) -> bool {
+        let Some(index) = self.tasks.iter().position(|task| task.id == task_id) else {
+            return false;
+        };
+        let next_index = if offset.is_negative() {
+            index.saturating_sub(offset.unsigned_abs())
+        } else {
+            index
+                .saturating_add(offset as usize)
+                .min(self.tasks.len().saturating_sub(1))
+        };
+        if next_index == index {
+            return false;
+        }
+        self.tasks.swap(index, next_index);
+        true
+    }
+
+    fn start_edit(&mut self, task_id: u64) -> bool {
+        let Some(task) = self.tasks.iter().find(|task| task.id == task_id) else {
+            return false;
+        };
+        self.editing_task_id = Some(task_id);
+        self.edit_draft = task.text.clone();
+        true
+    }
+
+    fn save_edit(&mut self, task_id: u64) -> bool {
+        if self.edit_draft.trim().is_empty() {
+            return false;
+        }
+        let Some(task) = self.tasks.iter_mut().find(|task| task.id == task_id) else {
+            return false;
+        };
+        task.text = self.edit_draft.clone();
+        self.cancel_edit();
+        true
+    }
+
+    fn cancel_edit(&mut self) {
+        self.editing_task_id = None;
+        self.edit_draft.clear();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmartInputSubmitRequest {
+    Draft { terminal_id: u64 },
+    Edit { terminal_id: u64, task_id: u64 },
+}
+
+#[derive(Debug, Default)]
+struct SmartInputPaneAction {
+    send_draft_now: Option<String>,
+    send_task_now: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TerminalPromptSubmitOptions {
+    activate_after_send: bool,
+    set_visible_in_main: bool,
+    schedule_confirmation_enter: bool,
+    record_history: bool,
+    update_status_line: bool,
+}
+
+impl TerminalPromptSubmitOptions {
+    const fn manual_saved_message() -> Self {
+        Self {
+            activate_after_send: true,
+            set_visible_in_main: true,
+            schedule_confirmation_enter: true,
+            record_history: true,
+            update_status_line: true,
+        }
+    }
+
+    const fn smart_manual() -> Self {
+        Self {
+            activate_after_send: true,
+            set_visible_in_main: true,
+            schedule_confirmation_enter: true,
+            record_history: true,
+            update_status_line: true,
+        }
+    }
+
+    const fn smart_auto() -> Self {
+        Self {
+            activate_after_send: false,
+            set_visible_in_main: false,
+            schedule_confirmation_enter: true,
+            record_history: true,
+            update_status_line: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FactoryDroidManagedInstallComponent {
     path: PathBuf,
@@ -1349,6 +1533,7 @@ pub struct AdeApp {
     foreground_message_popup_editing_index: Option<usize>, // None for add, Some(index) for edit
     foreground_message_popup_draft: String,
     foreground_message_popup_submit_pending: bool,
+    smart_input_submit_pending: Option<SmartInputSubmitRequest>,
     launcher_draft: LauncherDraftState,
     launcher_icon_textures: BTreeMap<LauncherIconKey, TextureHandle>,
     launcher_icon_failures: BTreeSet<LauncherIconKey>,
@@ -1764,6 +1949,7 @@ struct TerminalEntry {
     /// Unlike pending_line_for_title, this is NOT cleared on newlines.
     pending_input_for_history: String,
     recent_inputs: VecDeque<String>,
+    smart_input: SmartInputState,
     in_main_view: bool,
     dirty: bool,
     last_seqno: usize,
@@ -3841,6 +4027,7 @@ impl AdeApp {
             foreground_message_popup_editing_index: None,
             foreground_message_popup_draft: String::new(),
             foreground_message_popup_submit_pending: false,
+            smart_input_submit_pending: None,
             launcher_draft: LauncherDraftState::default(),
             launcher_icon_textures: BTreeMap::new(),
             launcher_icon_failures: std::collections::BTreeSet::new(),
@@ -4323,6 +4510,7 @@ impl AdeApp {
             pending_line_for_title: String::new(),
             pending_input_for_history: String::new(),
             recent_inputs: hydrated_recent_inputs,
+            smart_input: SmartInputState::default(),
             in_main_view: true,
             dirty: true,
             last_seqno: runtime.latest_seqno(),
@@ -8840,6 +9028,45 @@ impl AdeApp {
         Id::new((BROWSER_URL_INPUT_ID, project_id))
     }
 
+    fn smart_input_draft_input_id(terminal_id: u64) -> Id {
+        Id::new((SMART_INPUT_DRAFT_INPUT_ID, terminal_id))
+    }
+
+    fn smart_input_task_edit_input_id(terminal_id: u64, task_id: u64) -> Id {
+        Id::new((SMART_INPUT_TASK_EDIT_INPUT_ID, terminal_id, task_id))
+    }
+
+    fn focused_smart_input_submit_request(
+        &self,
+        ctx: &egui::Context,
+    ) -> Option<SmartInputSubmitRequest> {
+        for (terminal_id, terminal) in &self.terminals {
+            if !Self::terminal_smart_input_visible(terminal) {
+                continue;
+            }
+            if ctx.memory(|mem| mem.has_focus(Self::smart_input_draft_input_id(*terminal_id))) {
+                return Some(SmartInputSubmitRequest::Draft {
+                    terminal_id: *terminal_id,
+                });
+            }
+            if let Some(task_id) = terminal.smart_input.editing_task_id {
+                if ctx.memory(|mem| {
+                    mem.has_focus(Self::smart_input_task_edit_input_id(*terminal_id, task_id))
+                }) {
+                    return Some(SmartInputSubmitRequest::Edit {
+                        terminal_id: *terminal_id,
+                        task_id,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    fn smart_input_has_focus(&self, ctx: &egui::Context) -> bool {
+        self.focused_smart_input_submit_request(ctx).is_some()
+    }
+
     fn text_input_has_focus(&self, ctx: &egui::Context) -> bool {
         if ctx.memory(|mem| mem.has_focus(Self::directory_search_input_id())) {
             return true;
@@ -8885,6 +9112,10 @@ impl AdeApp {
         if self.foreground_message_popup_open.is_some() {
             return true;
         }
+        // Check if terminal Smart Input owns keyboard focus.
+        if self.smart_input_has_focus(ctx) {
+            return true;
+        }
         false
     }
 
@@ -8904,6 +9135,15 @@ impl AdeApp {
             }
             // Surrender foreground message popup input focus
             mem.surrender_focus(Self::foreground_message_input_id());
+            for (terminal_id, terminal) in &self.terminals {
+                mem.surrender_focus(Self::smart_input_draft_input_id(*terminal_id));
+                if let Some(task_id) = terminal.smart_input.editing_task_id {
+                    mem.surrender_focus(Self::smart_input_task_edit_input_id(
+                        *terminal_id,
+                        task_id,
+                    ));
+                }
+            }
         });
     }
 
@@ -9403,6 +9643,10 @@ impl AdeApp {
         // Do not steal text input from foreground message popup.
         // User intent: if foreground task popup is open, typed text belongs to the task input.
         if self.foreground_message_popup_open.is_some() {
+            return false;
+        }
+
+        if self.smart_input_has_focus(ctx) {
             return false;
         }
 
@@ -10871,6 +11115,20 @@ impl AdeApp {
         self.reset_codex_notify_inbox(terminal_id);
         self.clear_opencode_state(terminal_id);
         self.reset_opencode_notify_inbox(terminal_id);
+        if self
+            .smart_input_submit_pending
+            .is_some_and(|request| match request {
+                SmartInputSubmitRequest::Draft {
+                    terminal_id: target,
+                }
+                | SmartInputSubmitRequest::Edit {
+                    terminal_id: target,
+                    ..
+                } => target == terminal_id,
+            })
+        {
+            self.smart_input_submit_pending = None;
+        }
         if let Some(service) = self.browser_mcp_service.as_ref() {
             service.revoke_terminal(terminal_id);
         }
@@ -11593,6 +11851,21 @@ impl AdeApp {
         terminal_id: u64,
         message: &str,
     ) {
+        let _ = self.submit_prompt_to_terminal(
+            ctx,
+            terminal_id,
+            message,
+            TerminalPromptSubmitOptions::manual_saved_message(),
+        );
+    }
+
+    fn submit_prompt_to_terminal(
+        &mut self,
+        ctx: &egui::Context,
+        terminal_id: u64,
+        message: &str,
+        options: TerminalPromptSubmitOptions,
+    ) -> bool {
         let mut submitted_factory_prompt = false;
         let mut submitted_codex_prompt = false;
         let mut submitted_opencode_prompt = false;
@@ -11600,12 +11873,12 @@ impl AdeApp {
         let destination_title = {
             let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
                 self.status_line = "Target terminal not found".to_owned();
-                return;
+                return false;
             };
 
             if terminal.exited {
                 self.status_line = format!("{} is exited", terminal.title);
-                return;
+                return false;
             }
 
             let destination_title = terminal.title.clone();
@@ -11615,7 +11888,7 @@ impl AdeApp {
             // slash-menu key streams.
             let Some(paste_bytes) = terminal.runtime.capture_paste_bytes(message) else {
                 self.status_line = "Failed to prepare message for terminal".to_owned();
-                return;
+                return false;
             };
             reset_terminal_prompt_scroll_anchor(terminal);
             terminal.runtime.send_paste_bytes(paste_bytes);
@@ -11649,8 +11922,9 @@ impl AdeApp {
                 submitted_opencode_prompt = true;
             }
 
-            // Ensure the terminal is visible and collect recent_inputs reference
-            terminal.in_main_view = true;
+            if options.set_visible_in_main {
+                terminal.in_main_view = true;
+            }
             Self::push_recent_input(&mut terminal.recent_inputs, message);
             // Note: history is recorded after the borrow is released
             terminal.dirty = true;
@@ -11658,7 +11932,7 @@ impl AdeApp {
         };
 
         // Schedule one confirmation Enter after the immediate submit Enter.
-        if !message.trim().is_empty() {
+        if options.schedule_confirmation_enter && !message.trim().is_empty() {
             self.schedule_delayed_enters_for_terminal(
                 terminal_id,
                 1,
@@ -11668,28 +11942,36 @@ impl AdeApp {
         }
 
         // Record to persistent history after the mutable borrow is released
-        if !message.trim().is_empty() {
+        if options.record_history && !message.trim().is_empty() {
             let Some((pid, kind)) = self
                 .terminals
                 .get(&terminal_id)
                 .map(|t| (t.project_id, t.kind))
             else {
                 self.bump_layout_epoch();
-                self.set_active_terminal(ctx, Some(terminal_id));
-                self.status_line = format!("Sent saved message to {}", destination_title);
+                if options.activate_after_send {
+                    self.set_active_terminal(ctx, Some(terminal_id));
+                }
+                if options.update_status_line {
+                    self.status_line = format!("Sent saved message to {}", destination_title);
+                }
 
                 if committed_codex_reply && !submitted_codex_prompt {
                     let _ = self.clear_codex_attention_on_commit(terminal_id);
                 }
-                return;
+                return true;
             };
             self.record_input_history(pid, kind, message);
         }
 
         // Update layout and activate terminal so user sees the result
         self.bump_layout_epoch();
-        self.set_active_terminal(ctx, Some(terminal_id));
-        self.status_line = format!("Sent saved message to {}", destination_title);
+        if options.activate_after_send {
+            self.set_active_terminal(ctx, Some(terminal_id));
+        }
+        if options.update_status_line {
+            self.status_line = format!("Sent saved message to {}", destination_title);
+        }
 
         if committed_codex_reply && !submitted_codex_prompt {
             let _ = self.clear_codex_attention_on_commit(terminal_id);
@@ -11719,6 +12001,7 @@ impl AdeApp {
                 None,
             );
         }
+        true
     }
 
     const RECENT_INPUTS_MAX: usize = 5;
@@ -11786,6 +12069,196 @@ impl AdeApp {
         std::thread::spawn(move || {
             let _ = config::save_history(&path, &history_clone);
         });
+    }
+
+    fn terminal_smart_input_visible(terminal: &TerminalEntry) -> bool {
+        terminal.kind == TerminalKind::Foreground
+            && !terminal.exited
+            && terminal.ai_session.tool == Some(AiCliTool::OpenCode)
+            && terminal.opencode_session_active
+    }
+
+    fn smart_input_footer_height(
+        terminal: &TerminalEntry,
+        pane_height: f32,
+        line_height: f32,
+    ) -> f32 {
+        if !Self::terminal_smart_input_visible(terminal) {
+            return 0.0;
+        }
+
+        let max_footer =
+            (pane_height - TERMINAL_HEADER_HEIGHT - TERMINAL_HEADER_GAP - line_height * 3.0)
+                .max(0.0);
+        if max_footer < SMART_INPUT_MIN_FOOTER_HEIGHT {
+            return 0.0;
+        }
+
+        let task_rows = if terminal.smart_input.expanded {
+            terminal
+                .smart_input
+                .tasks
+                .len()
+                .min(SMART_INPUT_MAX_VISIBLE_TASK_ROWS)
+        } else {
+            0
+        };
+        let desired = SMART_INPUT_BASE_FOOTER_HEIGHT
+            + task_rows as f32 * SMART_INPUT_TASK_ROW_HEIGHT
+            + if task_rows > 0 { 6.0 } else { 0.0 };
+        desired.min(max_footer).max(SMART_INPUT_MIN_FOOTER_HEIGHT)
+    }
+
+    fn smart_input_auto_dispatch_ready(terminal: &TerminalEntry) -> bool {
+        Self::terminal_smart_input_visible(terminal)
+            && terminal.smart_input.auto_run_enabled
+            && !terminal.smart_input.tasks.is_empty()
+            && terminal.opencode_session_active
+            && terminal.opencode_normalized_status == Some(OpenCodeTransportStatus::Idle)
+            && terminal.opencode_attention_reason == Some(OpenCodeAttentionReason::TurnComplete)
+    }
+
+    fn process_smart_input_queues(&mut self, ctx: &egui::Context) {
+        let ready = self
+            .terminals
+            .iter()
+            .filter_map(|(terminal_id, terminal)| {
+                Self::smart_input_auto_dispatch_ready(terminal).then(|| {
+                    terminal
+                        .smart_input
+                        .tasks
+                        .first()
+                        .map(|task| (*terminal_id, task.id, task.text.clone()))
+                })
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+
+        for (terminal_id, task_id, text) in ready {
+            if self.submit_prompt_to_terminal(
+                ctx,
+                terminal_id,
+                &text,
+                TerminalPromptSubmitOptions::smart_auto(),
+            ) {
+                if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                    let _ = terminal.smart_input.remove_task(task_id);
+                }
+                self.status_line = "Smart Input sent queued OpenCode task".to_owned();
+            }
+        }
+    }
+
+    fn process_pending_smart_input_submit(&mut self, ctx: &egui::Context) {
+        let Some(request) = self.smart_input_submit_pending.take() else {
+            return;
+        };
+        match request {
+            SmartInputSubmitRequest::Draft { terminal_id } => {
+                self.execute_smart_input_draft_submit(ctx, terminal_id);
+            }
+            SmartInputSubmitRequest::Edit {
+                terminal_id,
+                task_id,
+            } => {
+                self.execute_smart_input_edit_submit(terminal_id, task_id);
+            }
+        }
+    }
+
+    fn execute_smart_input_draft_submit(&mut self, ctx: &egui::Context, terminal_id: u64) {
+        let Some(mode) = self.terminals.get(&terminal_id).and_then(|terminal| {
+            Self::terminal_smart_input_visible(terminal).then_some(terminal.smart_input.mode)
+        }) else {
+            return;
+        };
+
+        match mode {
+            SmartInputMode::QueueAfterDone => {
+                if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                    if terminal.smart_input.enqueue_draft().is_some() {
+                        self.status_line = "Smart Input queued task for OpenCode".to_owned();
+                        ctx.request_repaint();
+                    }
+                }
+            }
+            SmartInputMode::SteerNow => {
+                let Some(text) = self.terminals.get(&terminal_id).and_then(|terminal| {
+                    (!terminal.smart_input.draft.trim().is_empty())
+                        .then(|| terminal.smart_input.draft.clone())
+                }) else {
+                    return;
+                };
+                if self.submit_prompt_to_terminal(
+                    ctx,
+                    terminal_id,
+                    &text,
+                    TerminalPromptSubmitOptions::smart_manual(),
+                ) {
+                    if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                        terminal.smart_input.draft.clear();
+                    }
+                    self.status_line = "Smart Input sent steer prompt to OpenCode".to_owned();
+                }
+            }
+        }
+    }
+
+    fn execute_smart_input_edit_submit(&mut self, terminal_id: u64, task_id: u64) {
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        if terminal.smart_input.save_edit(task_id) {
+            self.status_line = "Smart Input updated queued task".to_owned();
+        }
+    }
+
+    fn handle_smart_input_pane_action(
+        &mut self,
+        ctx: &egui::Context,
+        terminal_id: u64,
+        action: SmartInputPaneAction,
+    ) {
+        if let Some(text) = action.send_draft_now {
+            if text.trim().is_empty() {
+                return;
+            }
+            if self.submit_prompt_to_terminal(
+                ctx,
+                terminal_id,
+                &text,
+                TerminalPromptSubmitOptions::smart_manual(),
+            ) {
+                if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                    terminal.smart_input.draft.clear();
+                }
+                self.status_line = "Smart Input sent steer prompt to OpenCode".to_owned();
+            }
+        }
+
+        if let Some(task_id) = action.send_task_now {
+            let Some(text) = self.terminals.get(&terminal_id).and_then(|terminal| {
+                terminal
+                    .smart_input
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == task_id)
+                    .map(|task| task.text.clone())
+            }) else {
+                return;
+            };
+            if self.submit_prompt_to_terminal(
+                ctx,
+                terminal_id,
+                &text,
+                TerminalPromptSubmitOptions::smart_manual(),
+            ) {
+                if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                    let _ = terminal.smart_input.remove_task(task_id);
+                }
+                self.status_line = "Smart Input sent queued task now".to_owned();
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -19347,7 +19820,14 @@ impl AdeApp {
             None
         };
 
-        let (clicked, close_requested, copied_selection, paste_requested, link_to_open) = {
+        let (
+            clicked,
+            close_requested,
+            copied_selection,
+            paste_requested,
+            link_to_open,
+            smart_input_action,
+        ) = {
             let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
                 return;
             };
@@ -19357,6 +19837,7 @@ impl AdeApp {
             let mut copied_selection = None;
             let mut paste_requested = false;
             let mut link_to_open = None;
+            let mut smart_input_action = SmartInputPaneAction::default();
             let header_chrome = terminal_header_chrome(is_active);
             let pane_width = pane_size.x.max(96.0);
             let pane_height = pane_size.y.max(124.0);
@@ -19531,8 +20012,19 @@ impl AdeApp {
                 let font_id = terminal_font_id(ui.style());
                 let char_width = terminal_char_width(ui, &font_id);
                 let line_height = terminal_line_height(ui, &font_id);
+                let smart_footer_height =
+                    Self::smart_input_footer_height(terminal, pane_height, line_height);
+                let smart_footer_gap = if smart_footer_height > 0.0 {
+                    SMART_INPUT_FOOTER_GAP
+                } else {
+                    0.0
+                };
 
-                let output_height = (pane_height - TERMINAL_HEADER_HEIGHT - TERMINAL_HEADER_GAP)
+                let output_height = (pane_height
+                    - TERMINAL_HEADER_HEIGHT
+                    - TERMINAL_HEADER_GAP
+                    - smart_footer_gap
+                    - smart_footer_height)
                     .max(line_height * 2.0);
                 let output_size = Vec2::new(pane_width, output_height);
 
@@ -20054,6 +20546,19 @@ impl AdeApp {
                         }
                     }
                 }
+                if smart_footer_height > 0.0 {
+                    ui.add_space(SMART_INPUT_FOOTER_GAP);
+                    let footer_size = Vec2::new(pane_width, smart_footer_height);
+                    let footer_response = ui.allocate_ui_with_layout(
+                        footer_size,
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.set_min_size(footer_size);
+                            draw_smart_input_footer(ui, terminal, footer_size)
+                        },
+                    );
+                    smart_input_action = footer_response.inner;
+                }
                 ui.expand_to_include_x(pane_right);
             }
 
@@ -20063,6 +20568,7 @@ impl AdeApp {
                 copied_selection,
                 paste_requested,
                 link_to_open,
+                smart_input_action,
             )
         };
 
@@ -20094,6 +20600,8 @@ impl AdeApp {
                 self.submit_browser_url(ui.ctx(), terminal.project_id, &url);
             }
         }
+
+        self.handle_smart_input_pane_action(ui.ctx(), terminal_id, smart_input_action);
 
         if clicked {
             ui.ctx().request_repaint();
@@ -20511,6 +21019,17 @@ impl eframe::App for AdeApp {
                 events = remaining_events;
             }
 
+            if let Some(request) = self.focused_smart_input_submit_request(ctx) {
+                let (smart_submit, remaining_events) =
+                    Self::partition_foreground_message_popup_submit(events);
+                if smart_submit {
+                    self.smart_input_submit_pending = Some(request);
+                    raw_input.events = remaining_events;
+                    return;
+                }
+                events = remaining_events;
+            }
+
             let (alt_m_events, remaining_events) =
                 Self::partition_alt_m_shortcut(events, global_modifiers);
             if !alt_m_events.is_empty() {
@@ -20645,7 +21164,10 @@ impl eframe::App for AdeApp {
         // Phase 3b: Process pending background reruns after settle duration.
         self.process_pending_reruns(ctx);
 
-        // Phase 3c: Process pending second Enter presses for terminal shortcuts.
+        // Phase 3c: Dispatch terminal-scoped Smart Input tasks after OpenCode completes a turn.
+        self.process_smart_input_queues(ctx);
+
+        // Phase 3d: Process pending second Enter presses for terminal shortcuts.
         self.process_pending_second_enters(ctx);
 
         self.process_source_control_events(ctx);
@@ -20673,6 +21195,7 @@ impl eframe::App for AdeApp {
         );
         self.handle_shortcuts(ctx, main_area_size);
         self.draw_main_area(ctx);
+        self.process_pending_smart_input_submit(ctx);
         if let (Some(activity_rect), Some(explorer_rect)) = (activity_rect, explorer_rect) {
             self.draw_sidebar_seam_fix(ctx, activity_rect, explorer_rect);
         }
@@ -23672,6 +24195,296 @@ fn with_minimal_button_chrome<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)
     .inner
 }
 
+fn smart_input_status_text(terminal: &TerminalEntry) -> (&'static str, Color32) {
+    if !terminal.smart_input.auto_run_enabled {
+        return ("Auto paused - tasks stay queued", TEXT_MUTED);
+    }
+
+    match terminal.opencode_normalized_status {
+        Some(OpenCodeTransportStatus::Working) => {
+            ("OpenCode working - queued tasks wait", TEXT_MUTED)
+        }
+        Some(OpenCodeTransportStatus::Permission) => (
+            "OpenCode needs input - auto queue paused",
+            Color32::from_rgb(232, 184, 76),
+        ),
+        Some(OpenCodeTransportStatus::Idle) => match terminal.opencode_attention_reason {
+            Some(OpenCodeAttentionReason::TurnComplete) => (
+                "Ready - next queued task will run",
+                Color32::from_rgb(100, 200, 100),
+            ),
+            Some(OpenCodeAttentionReason::SessionError) => (
+                "Session error - review before sending",
+                Color32::from_rgb(232, 100, 100),
+            ),
+            _ => ("OpenCode idle", TEXT_MUTED),
+        },
+        None => ("OpenCode session starting", TEXT_MUTED),
+    }
+}
+
+fn draw_smart_input_footer(
+    ui: &mut Ui,
+    terminal: &mut TerminalEntry,
+    footer_size: Vec2,
+) -> SmartInputPaneAction {
+    let terminal_id = terminal.id;
+    let (status_text, status_color) = smart_input_status_text(terminal);
+    let mut action = SmartInputPaneAction::default();
+
+    egui::Frame::none()
+        .fill(Color32::from_rgb(18, 20, 22))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(46, 50, 54)))
+        .rounding(8.0)
+        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+        .show(ui, |ui| {
+            ui.set_min_size(footer_size);
+            ui.set_max_width(footer_size.x);
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+
+            let state = &mut terminal.smart_input;
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{} Smart Input", icons::CHAT_TEXT))
+                        .strong()
+                        .color(TEXT_PRIMARY),
+                );
+                ui.add_space(6.0);
+                ui.label(RichText::new(status_text).small().color(status_color));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let toggle_label = if state.expanded { "Hide" } else { "Show" };
+                    if ui
+                        .button(RichText::new(toggle_label).small())
+                        .on_hover_text("Collapse or expand queued task rows")
+                        .clicked()
+                    {
+                        state.expanded = !state.expanded;
+                    }
+                    let auto_label = if state.auto_run_enabled {
+                        "Auto on"
+                    } else {
+                        "Auto off"
+                    };
+                    let auto_color = if state.auto_run_enabled {
+                        Color32::from_rgb(100, 200, 100)
+                    } else {
+                        TEXT_MUTED
+                    };
+                    if ui
+                        .button(RichText::new(auto_label).small().color(auto_color))
+                        .on_hover_text(
+                            "When enabled, queued tasks run after OpenCode turn complete",
+                        )
+                        .clicked()
+                    {
+                        state.auto_run_enabled = !state.auto_run_enabled;
+                    }
+                });
+            });
+
+            ui.horizontal(|ui| {
+                for mode in [SmartInputMode::QueueAfterDone, SmartInputMode::SteerNow] {
+                    let selected = state.mode == mode;
+                    if ui
+                        .selectable_label(selected, RichText::new(mode.label()).small())
+                        .on_hover_text(match mode {
+                            SmartInputMode::QueueAfterDone => {
+                                "Add prompts to Mergen's queue and send after OpenCode finishes"
+                            }
+                            SmartInputMode::SteerNow => {
+                                "Send immediately as a steer prompt to the current OpenCode turn"
+                            }
+                        })
+                        .clicked()
+                    {
+                        state.mode = mode;
+                    }
+                }
+
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!("{} queued", state.tasks.len()))
+                        .small()
+                        .color(TEXT_MUTED),
+                );
+
+                if !state.tasks.is_empty()
+                    && ui
+                        .button(
+                            RichText::new("Clear")
+                                .small()
+                                .color(Color32::from_rgb(232, 100, 100)),
+                        )
+                        .on_hover_text("Remove all queued Smart Input tasks")
+                        .clicked()
+                {
+                    state.tasks.clear();
+                    state.cancel_edit();
+                }
+            });
+
+            if state.expanded && !state.tasks.is_empty() {
+                let rows = state.tasks.len().min(SMART_INPUT_MAX_VISIBLE_TASK_ROWS);
+                let max_height = rows as f32 * SMART_INPUT_TASK_ROW_HEIGHT;
+                let mut row_action: Option<(u64, &'static str)> = None;
+                egui::ScrollArea::vertical()
+                    .id_salt(("smart_input_queue", terminal_id))
+                    .max_height(max_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for index in 0..state.tasks.len() {
+                            let task_id = state.tasks[index].id;
+                            let task_text = state.tasks[index].text.clone();
+                            let is_editing = state.editing_task_id == Some(task_id);
+
+                            ui.horizontal(|ui| {
+                                ui.set_min_height(SMART_INPUT_TASK_ROW_HEIGHT);
+                                ui.label(
+                                    RichText::new(format!("{}.", index + 1))
+                                        .small()
+                                        .color(TEXT_MUTED),
+                                );
+
+                                if is_editing {
+                                    let edit_id = AdeApp::smart_input_task_edit_input_id(
+                                        terminal_id,
+                                        task_id,
+                                    );
+                                    with_settings_text_edit_chrome(ui, |ui| {
+                                        ui.add_sized(
+                                            egui::vec2(
+                                                (ui.available_width() - 110.0).max(80.0),
+                                                22.0,
+                                            ),
+                                            egui::TextEdit::singleline(&mut state.edit_draft)
+                                                .id(edit_id)
+                                                .hint_text("Edit queued task"),
+                                        );
+                                    });
+                                    if ui.button(RichText::new("Save").small()).clicked() {
+                                        row_action = Some((task_id, "save"));
+                                    }
+                                    if ui.button(RichText::new("Cancel").small()).clicked() {
+                                        row_action = Some((task_id, "cancel"));
+                                    }
+                                } else {
+                                    let preview = capped_hover_text(&task_text, 72);
+                                    let response = ui.add_sized(
+                                        egui::vec2((ui.available_width() - 140.0).max(80.0), 22.0),
+                                        egui::Label::new(
+                                            RichText::new(preview).small().color(TEXT_PRIMARY),
+                                        )
+                                        .truncate(),
+                                    );
+                                    response.on_hover_text(capped_hover_text(
+                                        &task_text,
+                                        SMART_INPUT_TOOLTIP_MAX_CHARS,
+                                    ));
+
+                                    if ui.button(RichText::new("Now").small()).clicked() {
+                                        action.send_task_now = Some(task_id);
+                                    }
+                                    if ui.button(RichText::new("Edit").small()).clicked() {
+                                        row_action = Some((task_id, "edit"));
+                                    }
+                                    if ui.button(RichText::new("Up").small()).clicked() {
+                                        row_action = Some((task_id, "up"));
+                                    }
+                                    if ui.button(RichText::new("Dn").small()).clicked() {
+                                        row_action = Some((task_id, "down"));
+                                    }
+                                    if ui
+                                        .button(
+                                            RichText::new("Del")
+                                                .small()
+                                                .color(Color32::from_rgb(232, 100, 100)),
+                                        )
+                                        .clicked()
+                                    {
+                                        row_action = Some((task_id, "delete"));
+                                    }
+                                }
+                            });
+                        }
+                    });
+
+                if let Some((task_id, row_action)) = row_action {
+                    match row_action {
+                        "save" => {
+                            let _ = state.save_edit(task_id);
+                        }
+                        "cancel" => state.cancel_edit(),
+                        "edit" => {
+                            let _ = state.start_edit(task_id);
+                        }
+                        "up" => {
+                            let _ = state.move_task(task_id, -1);
+                        }
+                        "down" => {
+                            let _ = state.move_task(task_id, 1);
+                        }
+                        "delete" => {
+                            let _ = state.remove_task(task_id);
+                        }
+                        _ => {}
+                    }
+                }
+            } else if state.expanded {
+                ui.label(
+                    RichText::new("No queued tasks. Add a prompt below.")
+                        .small()
+                        .color(TEXT_MUTED),
+                );
+            }
+
+            ui.horizontal(|ui| {
+                let draft_id = AdeApp::smart_input_draft_input_id(terminal_id);
+                let input_width = (ui.available_width() - 92.0).max(120.0);
+                with_settings_text_edit_chrome(ui, |ui| {
+                    ui.add_sized(
+                        egui::vec2(input_width, 42.0),
+                        egui::TextEdit::multiline(&mut state.draft)
+                            .id(draft_id)
+                            .desired_width(input_width)
+                            .hint_text(match state.mode {
+                                SmartInputMode::QueueAfterDone => {
+                                    "Task for after done (Enter queues, Ctrl+Enter newline)"
+                                }
+                                SmartInputMode::SteerNow => {
+                                    "Steer now (Enter sends, Ctrl+Enter newline)"
+                                }
+                            })
+                            .return_key(egui::KeyboardShortcut::new(
+                                egui::Modifiers::CTRL,
+                                egui::Key::Enter,
+                            )),
+                    );
+                });
+
+                let can_submit = !state.draft.trim().is_empty();
+                let button_text = match state.mode {
+                    SmartInputMode::QueueAfterDone => "Queue",
+                    SmartInputMode::SteerNow => "Send",
+                };
+                ui.add_enabled_ui(can_submit, |ui| {
+                    if ui.button(button_text).clicked() {
+                        match state.mode {
+                            SmartInputMode::QueueAfterDone => {
+                                let _ = state.enqueue_draft();
+                            }
+                            SmartInputMode::SteerNow => {
+                                action.send_draft_now = Some(state.draft.clone());
+                            }
+                        }
+                    }
+                });
+            });
+        });
+
+    action
+}
+
 fn draw_terminal_saved_message_menu_button(
     ui: &mut Ui,
     saved_messages: &[String],
@@ -26443,11 +27256,11 @@ mod tests {
         FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, FileEditorState,
         OpenCodeAttentionReason, OpenCodeStatusSource, OpenCodeTransportStatus, OpenFileBuffer,
         PendingConfigChanges, PendingRerunPhase, PendingTerminalLinkClick, SettingsSection,
-        SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
-        SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
-        TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
-        TerminalOutputScrollBehavior, TerminalSecondaryClickAction, TerminalSelection,
-        TerminalSelectionPoint, TransientToast, BROWSER_MAX_TABS_PER_PROJECT,
+        SmartInputState, SmartInputSubmitRequest, SmartInputTask, SourceControlBadgeState,
+        SourceControlFile, SourceControlRefreshState, SourceControlSnapshot, TerminalCursorOverlay,
+        TerminalEntry, TerminalManagerDiffSummaryVisual, TerminalNavigationDirection,
+        TerminalNavigationShortcut, TerminalOutputScrollBehavior, TerminalSecondaryClickAction,
+        TerminalSelection, TerminalSelectionPoint, TransientToast, BROWSER_MAX_TABS_PER_PROJECT,
         BROWSER_SCREENSHOT_REQUEST_PREFIX, CODEX_NOTIFY_POLL_MS, CODEX_PROCESS_POLL_MS,
         CODEX_STOP_SETTLE_MS, CODEX_TRAILING_OUTPUT_GRACE_MS, DESIGN_INSPECT_DELIVERY_DEDUPE_MS,
         DESIGN_INSPECT_TARGET_SWITCH_QUIET_MS, DIRECTORY_INDEX_CHANNEL_CAPACITY,
@@ -35913,6 +36726,7 @@ mod tests {
             pending_line_for_title: String::new(),
             pending_input_for_history: String::new(),
             recent_inputs: VecDeque::new(),
+            smart_input: SmartInputState::default(),
             in_main_view: true,
             dirty: false,
             last_seqno: 0,
@@ -36082,6 +36896,7 @@ mod tests {
             foreground_message_popup_editing_index: None,
             foreground_message_popup_draft: String::new(),
             foreground_message_popup_submit_pending: false,
+            smart_input_submit_pending: None,
             launcher_draft: super::LauncherDraftState::default(),
             launcher_icon_textures: BTreeMap::new(),
             launcher_icon_failures: std::collections::BTreeSet::new(),
@@ -45910,6 +46725,359 @@ mod tests {
             Some(text.to_owned()),
             "Select-all should extract full URL"
         );
+    }
+
+    #[test]
+    fn smart_input_visible_only_for_foreground_opencode() {
+        let mut app = test_app_with_ai_hooks(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (
+                    2,
+                    test_terminal_entry_with_kind(2, 7, TerminalKind::Background),
+                ),
+                (3, test_terminal_entry(3, 7)),
+            ],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        seed_opencode_attention(&mut app, 2, OpenCodeAttentionReason::TurnComplete);
+
+        assert!(AdeApp::terminal_smart_input_visible(
+            app.terminals.get(&1).expect("terminal 1")
+        ));
+        assert!(
+            !AdeApp::terminal_smart_input_visible(app.terminals.get(&2).expect("terminal 2")),
+            "background OpenCode terminals should not show Smart Input"
+        );
+        assert!(
+            !AdeApp::terminal_smart_input_visible(app.terminals.get(&3).expect("terminal 3")),
+            "non-OpenCode foreground terminals should not show Smart Input"
+        );
+    }
+
+    #[test]
+    fn smart_input_focus_blocks_terminal_capture_and_attention_stealing() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::smart_input_draft_input_id(1));
+        });
+
+        assert!(app.text_input_has_focus_extended(&ctx));
+        assert!(!app.should_capture_terminal_keyboard(&ctx));
+        assert!(!app
+            .should_steal_attention_terminal_input(&ctx, &[Event::Text("queued task".to_owned())]));
+    }
+
+    #[test]
+    fn smart_input_hides_when_opencode_session_is_inactive() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        assert!(AdeApp::terminal_smart_input_visible(
+            app.terminals.get(&1).expect("terminal 1")
+        ));
+
+        assert!(app.note_opencode_process_missing(1));
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.tool, Some(AiCliTool::OpenCode));
+        assert_eq!(
+            terminal.opencode_attention_reason,
+            Some(OpenCodeAttentionReason::TurnComplete)
+        );
+        assert!(!terminal.opencode_session_active);
+        assert!(!AdeApp::terminal_smart_input_visible(terminal));
+        assert_eq!(
+            AdeApp::smart_input_footer_height(terminal, 320.0, 18.0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn smart_input_stale_focus_is_ignored_after_session_exit() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::smart_input_draft_input_id(1));
+        });
+        assert_eq!(
+            app.focused_smart_input_submit_request(&ctx),
+            Some(SmartInputSubmitRequest::Draft { terminal_id: 1 })
+        );
+
+        assert!(app.note_opencode_process_missing(1));
+
+        assert_eq!(app.focused_smart_input_submit_request(&ctx), None);
+        assert!(!app.smart_input_has_focus(&ctx));
+        assert!(!app.text_input_has_focus_extended(&ctx));
+        assert!(app.should_capture_terminal_keyboard(&ctx));
+    }
+
+    #[test]
+    fn smart_input_enter_submit_is_ignored_after_session_exit() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        app.terminals
+            .get_mut(&1)
+            .expect("terminal 1")
+            .smart_input
+            .draft = "echo".to_owned();
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::smart_input_draft_input_id(1));
+        });
+
+        assert!(app.note_opencode_process_missing(1));
+
+        let mut raw_input = RawInput {
+            events: vec![Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+        app.process_pending_smart_input_submit(&ctx);
+
+        let smart_input = &app.terminals.get(&1).expect("terminal 1").smart_input;
+        assert!(app.smart_input_submit_pending.is_none());
+        assert!(smart_input.tasks.is_empty());
+        assert_eq!(smart_input.draft, "echo");
+    }
+
+    #[test]
+    fn smart_input_enter_submit_preserves_same_frame_text() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        app.terminals
+            .get_mut(&1)
+            .expect("terminal 1")
+            .smart_input
+            .draft = "echo".to_owned();
+
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::smart_input_draft_input_id(1));
+        });
+
+        let mut raw_input = RawInput {
+            events: vec![
+                Event::Text(" test".to_owned()),
+                Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: Some(egui::Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert_eq!(
+            app.smart_input_submit_pending,
+            Some(SmartInputSubmitRequest::Draft { terminal_id: 1 })
+        );
+        assert_eq!(raw_input.events.len(), 1);
+        assert!(matches!(&raw_input.events[0], Event::Text(text) if text == " test"));
+
+        if let Event::Text(text) = raw_input.events.remove(0) {
+            app.terminals
+                .get_mut(&1)
+                .expect("terminal 1")
+                .smart_input
+                .draft
+                .push_str(&text);
+        }
+        app.process_pending_smart_input_submit(&ctx);
+
+        let smart_input = &app.terminals.get(&1).expect("terminal 1").smart_input;
+        assert_eq!(smart_input.tasks.len(), 1);
+        assert_eq!(smart_input.tasks[0].text, "echo test");
+        assert!(smart_input.draft.is_empty());
+        assert!(app.smart_input_submit_pending.is_none());
+    }
+
+    #[test]
+    fn smart_input_dispatches_one_task_on_opencode_turn_complete() {
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
+        let mut app = test_app_with_ai_hooks(
+            [
+                (1, test_terminal_entry_with_runtime(1, 7, runtime)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(2),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.smart_input.draft = "/first".to_owned();
+            terminal.smart_input.enqueue_draft();
+            terminal.smart_input.draft = "second".to_owned();
+            terminal.smart_input.enqueue_draft();
+        }
+
+        app.process_smart_input_queues(&ctx);
+        capture.drain();
+
+        assert_eq!(capture.bytes(), b"\x1b[200~/first\x1b[201~\r".to_vec());
+        assert_eq!(app.active_terminal, Some(2));
+        assert_eq!(app.pending_second_enter.len(), 1);
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.smart_input.tasks.len(), 1);
+        assert_eq!(terminal.smart_input.tasks[0].text, "second");
+        assert_eq!(
+            terminal.opencode_normalized_status,
+            Some(OpenCodeTransportStatus::Working)
+        );
+
+        app.process_smart_input_queues(&ctx);
+        capture.drain();
+        assert_eq!(
+            capture.bytes(),
+            b"\x1b[200~/first\x1b[201~\r".to_vec(),
+            "second queued task must wait for the next turn-complete signal"
+        );
+    }
+
+    #[test]
+    fn smart_input_does_not_dispatch_while_running_or_permission() {
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        let _ = app.apply_opencode_transport_status(
+            1,
+            OpenCodeTransportStatus::Working,
+            OpenCodeStatusSource::PromptSubmit,
+            None,
+        );
+        app.terminals
+            .get_mut(&1)
+            .expect("terminal 1")
+            .smart_input
+            .tasks
+            .push(SmartInputTask {
+                id: 1,
+                text: "queued".to_owned(),
+            });
+
+        app.process_smart_input_queues(&ctx);
+        capture.drain();
+        assert!(capture.bytes().is_empty());
+        assert_eq!(
+            app.terminals
+                .get(&1)
+                .expect("terminal 1")
+                .smart_input
+                .tasks
+                .len(),
+            1
+        );
+
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::PermissionAsked);
+        app.process_smart_input_queues(&ctx);
+        capture.drain();
+        assert!(capture.bytes().is_empty());
+        assert_eq!(
+            app.terminals
+                .get(&1)
+                .expect("terminal 1")
+                .smart_input
+                .tasks
+                .len(),
+            1
+        );
+
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::SessionError);
+        app.process_smart_input_queues(&ctx);
+        capture.drain();
+        assert!(capture.bytes().is_empty());
+        assert_eq!(
+            app.terminals
+                .get(&1)
+                .expect("terminal 1")
+                .smart_input
+                .tasks
+                .len(),
+            1,
+            "session errors must not auto-dispatch queued tasks"
+        );
+    }
+
+    #[test]
+    fn smart_input_does_not_dispatch_stale_turn_complete_after_session_exit() {
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.opencode_session_active = false;
+            terminal.smart_input.tasks.push(SmartInputTask {
+                id: 1,
+                text: "must stay queued".to_owned(),
+            });
+        }
+
+        app.process_smart_input_queues(&ctx);
+        capture.drain();
+
+        assert!(capture.bytes().is_empty());
+        assert_eq!(
+            app.terminals
+                .get(&1)
+                .expect("terminal 1")
+                .smart_input
+                .tasks
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn smart_input_state_supports_edit_reorder_and_delete() {
+        let mut state = SmartInputState::default();
+        state.draft = "first".to_owned();
+        let first_id = state.enqueue_draft().expect("first task");
+        state.draft = "second".to_owned();
+        let second_id = state.enqueue_draft().expect("second task");
+
+        assert!(state.move_task(second_id, -1));
+        assert_eq!(state.tasks[0].id, second_id);
+        assert_eq!(state.tasks[1].id, first_id);
+
+        assert!(state.start_edit(first_id));
+        state.edit_draft = "edited first".to_owned();
+        assert!(state.save_edit(first_id));
+        assert_eq!(state.tasks[1].text, "edited first");
+
+        assert_eq!(state.remove_task(second_id), Some("second".to_owned()));
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.tasks[0].id, first_id);
     }
 
     #[test]

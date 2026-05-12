@@ -10,6 +10,55 @@ When adding an entry:
 
 ---
 
+#### Smart Input stayed active after OpenCode process exit {#opencode-smart-input-stale-session}
+- Date: 2026-05-12
+- Context: Terminal-bottom Smart Input footer for foreground OpenCode terminals after OpenCode completes a turn and then exits while the shell remains open.
+- Error signature: `OpenCodeAttentionReason::TurnComplete` can persist after process tracking marks `opencode_session_active = false`, while `ai_session.tool` remains `Some(AiCliTool::OpenCode)`.
+- Symptoms/Impact:
+  1. Smart Input could remain visible after the OpenCode process exited and only the shell was left in the terminal.
+  2. Manual Smart Input sends could paste queued prompts into the shell instead of a live OpenCode session.
+  3. A previously focused hidden Smart Input field could keep owning Enter/text handling after the footer disappeared.
+- Root cause:
+  - `terminal_smart_input_visible()` checked foreground terminal, non-exited terminal, and OpenCode tool ownership, but did not require `opencode_session_active`.
+  - `focused_smart_input_submit_request()` trusted egui focus IDs without rechecking whether the corresponding Smart Input footer was still visible and live.
+- Resolution:
+  - Gate Smart Input visibility on `opencode_session_active == true` in addition to foreground OpenCode ownership.
+  - Ignore stale Smart Input draft/edit focus unless the terminal still satisfies the Smart Input visibility predicate.
+- Prevent recurrence:
+  - Added regression tests for hidden Smart Input after OpenCode process-missing state, stale focus release, ignored Enter submit after session exit, and zero footer height when the session is inactive.
+  - Updated `AGENTS.md` Smart Input invariants to require live-session gating and hidden-focus ignore behavior.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input`
+- References: Review finding 2026-05-12: Smart Input remained available for preserved OpenCode turn-complete state after the OpenCode process exited.
+
+---
+
+#### OpenCode busy-turn queue could not wait for true completion {#opencode-smart-input-after-done-queue}
+- Date: 2026-05-12
+- Context: Foreground OpenCode terminals needed a user-facing input area below terminal output for steering now or queueing prompts after all current work is complete.
+- Error signature: OpenCode's own busy-turn prompt handling can accept input while a turn is still running, then submit it through the next API call instead of waiting for Mergen-observed turn completion.
+- Symptoms/Impact:
+  1. Users could not stage multiple follow-up tasks and watch them run one by one only after OpenCode fully completed each turn.
+  2. Sending a prompt directly to a busy OpenCode session could behave as upstream steering/queueing rather than a strict after-done workflow.
+  3. Multiple foreground OpenCode terminals in the same project needed isolated task queues to avoid cross-terminal contamination.
+- Root cause:
+  - The existing foreground task system was project-scoped and manually sent from Terminal Manager.
+  - There was no terminal-scoped scheduler tied to `OpenCodeTransportStatus::Idle` plus `OpenCodeAttentionReason::TurnComplete`.
+  - Text focus/routing had no Smart Input IDs, so a footer input would risk terminal capture or AI attention stealing without explicit guards.
+- Resolution:
+  - Added a terminal-scoped runtime Smart Input state with draft, mode, queue, edit state, auto-run flag, and per-task IDs.
+  - Rendered a compact terminal-bottom Smart Input footer only for live foreground OpenCode terminals.
+  - Added `After Done` queue mode and `Steer Now` immediate-send mode.
+  - Added an OpenCode completion scheduler that dispatches exactly one queued task on each `Idle` + `TurnComplete` signal and does not activate/focus-steal the terminal during auto-run.
+  - Routed all Smart Input sends through paste-safe terminal delivery with immediate Enter plus delayed confirmation Enter.
+  - Added Smart Input focus IDs to keyboard ownership, focus surrender, and attention-steal guards.
+- Prevent recurrence:
+  - Added regression tests for visibility gating, focus/attention blocking, same-frame Enter submit preservation, bracketed-paste auto-dispatch, one-at-a-time completion dispatch, running/permission blocking, and edit/reorder/delete state behavior.
+  - Documented Smart Input invariants in `AGENTS.md`.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-05-12: implement terminal-bottom Smart Input with `Steer Now` and after-done queued OpenCode workflow.
+
+---
+
 #### Foreground task popup submit could drop final input and merge sends {#foreground-task-submit-drop-merge}
 - Date: 2026-05-11
 - Context: Foreground task queue Add/Edit popup and Terminal Manager task send behavior.
@@ -965,3 +1014,27 @@ When adding an entry:
 - Files/Commands touched: `src/app.rs` (struct, init, `active_browser_scope`, `set_active_terminal`, MCP handlers, `draw_browser_panel`, `remove_project`, `close_browser_tab`, 4 new regression tests), `src/opencode_config.rs` (disable external MCP servers, 1 new regression test), `src/browser_mcp_helper.rs` (update instructions), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: User bug report 2026-05-11: "browser ile browser mcpde sorun var, sorun şu mcp bağlı ama browserı kontrol etmiyor ben göremiyorum kendisi bir tarayıcı açıp orada devam ediyor ama mergen üzerinde canlı takip edebilmem lazım her terminal için ayrı bir tarayıcı gibi olması lazım"
 - Superseded UI detail: The compact `Project` / `T{id}` selector mentioned above was removed later on 2026-05-11; see `#browser-panel-redundant-scope-selector`. The visible-scope routing and terminal isolation remain in place.
+
+---
+
+#### Browser MCP highlight could target clipped sidebar elements {#browser-highlight-clipped-sidebar-target}
+- Date: 2026-05-11
+- Context: Browser MCP `browser_highlight` and visible mouse interactions against web apps with collapsible sidebars, tested on ProsoLocal `http://localhost:5174/`.
+- Error signature: User observed that a highlight expected to land on the page sidebar instead drew a detached green rectangle over the main content area while the sidebar was closed/collapsed.
+- Symptoms/Impact:
+  1. `browser_highlight` could draw an overlay for an element that existed in the DOM but was hidden by a collapsed/clipped sidebar ancestor.
+  2. The visible cursor/highlight could be clamped into the WebView content area, creating a misleading rectangle unrelated to the actual target.
+  3. `browser_page_summary` and action tools could treat clipped descendants as visible because the page-side `visible()` helper only checked element style and raw bounding-box size.
+- Root cause:
+  - The injected Browser MCP automation script used raw `getBoundingClientRect()` dimensions without intersecting ancestor overflow clips or verifying the target with browser hit-testing.
+  - Collapsed sidebar descendants can keep non-zero theoretical rects even though the ancestor clips them away from the painted/reachable viewport.
+- Resolution:
+  - Added `visibleRect()` in the injected automation script to intersect target geometry with clipping ancestors and optionally the WebView viewport.
+  - Updated element-center calculation, highlight geometry, and highlight base rects to use the painted/reachable rect rather than the raw bounding box.
+  - Added `elementIsReachable()` hit-testing via `document.elementFromPoint()` so clipped or covered targets fail closed with a clear error instead of drawing a bogus overlay.
+  - Clamped highlight overlay edges to the visible viewport and bumped the injected automation script version from `21` to `22`.
+- Prevent recurrence:
+  - Added regression assertions that the automation script includes clipping, `getClientRects()`, hit-testing, viewport clamping, and clipped-target error paths.
+  - Updated `AGENTS.md` Browser MCP Highlight Overlay Guidelines to require fail-closed clipped-target behavior and script version bumps for highlight visibility changes.
+- Files/Commands touched: `src/web_browser.rs`, `src/browser_mcp_helper.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-05-11: "highlight sidebarda yer alması lazım ama sidebar ile birleşik çalışmıyor ... mergen browser için"

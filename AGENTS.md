@@ -224,6 +224,18 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Edit/Delete actions**: Each foreground queue item has edit (pencil) and delete (trash) buttons. Edit opens the popup pre-filled with the message content. Delete removes immediately without confirmation.
 - **Empty queue handling**: When the foreground queue is empty, the menu shows "No tasks in queue" text and only the "Add New" button is available.
 
+## OpenCode Smart Input Guidelines
+- **Smart Input is terminal-scoped and runtime-only**: Store Smart Input draft, queue, edit state, and auto-run state on the foreground terminal session, not on `ProjectRecord`. Multiple OpenCode foreground terminals in the same project must have isolated queues.
+- **Smart Input visibility is narrow**: Render the Smart Input footer only for live `TerminalKind::Foreground` terminals owned by `AiCliTool::OpenCode` with `opencode_session_active == true`. Do not show it for background terminals, other AI CLIs, launch-pending OpenCode terminals, or preserved turn-complete state after the OpenCode process exits.
+- **Two delivery modes are distinct**: `Steer Now` sends immediately to the terminal; `After Done` adds to Mergen's queue and waits for OpenCode completion. Do not route `After Done` tasks through OpenCode's own busy-turn queue.
+- **Auto-run waits for real OpenCode completion**: Dispatch queued tasks only when OpenCode has `OpenCodeTransportStatus::Idle` and `OpenCodeAttentionReason::TurnComplete`. Do not auto-dispatch while OpenCode is `Working`, `Permission`, `QuestionAsked`, `PlanModePrompt`, or `SessionError`.
+- **Auto-run sends exactly one task per completion**: After dispatching one queued task, the terminal state must transition back to Working and the next queued task must wait for the next turn-complete signal.
+- **Paste-safe delivery is mandatory**: Smart Input sends must use `TerminalRuntime::capture_paste_bytes()` and `send_paste_bytes()`, followed by immediate Enter and one delayed confirmation Enter. Slash-prefixed prompts must never be typed as raw key streams.
+- **Auto-run must not steal focus**: Automatic Smart Input dispatch must not call `set_active_terminal()` or otherwise change the active terminal. Manual `Send` / `Now` actions may activate the target terminal.
+- **Smart Input text focus owns keyboard input only while visible**: Add Smart Input draft/edit IDs to extended text focus checks and focus surrender. When visible Smart Input is focused, terminal capture, terminal shortcuts, and AI attention stealing must not consume its text. Stale egui focus for hidden Smart Input fields must be ignored so terminal input resumes after OpenCode exits.
+- **Plain Enter submits, Ctrl+Enter inserts newline**: Capture plain Enter in `raw_input_hook()`, remove it from the event stream, and defer the actual Smart Input submit until after egui `TextEdit` processes same-frame text events.
+- **Queue editing remains local and non-destructive**: Reorder, edit, delete, clear, and send-now operations must mutate only the current terminal's Smart Input queue. Deleting or sending one task must not affect foreground saved messages or other terminals.
+
 ## Window Close Confirmation Guidelines
 - **Window close confirmation must not early-return before rendering.** When intercepting a close request (`ViewportCommand::CancelClose`), do not use `return` to exit the update function early. The confirmation popup should be rendered in the same frame by setting the state flag and allowing the normal render path to continue.
 - **Avoid `request_repaint()` after showing the confirmation popup.** Since the popup will be drawn later in the same update cycle by `draw_exit_confirm_popup()`, an explicit repaint request is unnecessary and can cause visual flicker.
@@ -356,6 +368,12 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Visible scope override must be cleaned up on project removal and last-tab-close.** In `remove_project()`, clear the project's visible scope entry. In `close_browser_tab()` when the last tab closes for a terminal scope, remove the override for that project.
 - **Browser panel must not show a separate terminal/project scope selector.** Terminal-scoped browser isolation remains internal; users switch which terminal browser they are viewing by activating that terminal, while MCP-originated background browser work may still pin the visible scope through `browser_panel_visible_scope_by_project`.
 - **OpenCode runtime config must disable external browser MCP servers.** In addition to enabling `mergen-browser`, the runtime `opencode.json` must explicitly disable known external browser MCP server names (`playwright`, `browser`, `puppeteer`) with `"enabled": false` to prevent OpenCode from falling back to its own Chrome/Playwright instance.
+
+## Browser MCP Highlight Overlay Guidelines
+- **`browser_highlight` must fail closed for clipped targets.** Do not draw highlight overlays for elements hidden by clipped/collapsed ancestors, closed sidebars, overlays, or hit-test coverage; return a clear error instead.
+- **Highlight target geometry must use the painted/reachable rect.** Account for ancestor `overflow` clipping and WebView viewport clipping before moving the cursor or drawing a fixed-position overlay.
+- **Highlight overlay geometry must stay inside the visible viewport.** Clamp overlay edges to `0..window.innerWidth` and `0..window.innerHeight` so sidebars and edge-aligned controls do not produce cut-off borders or labels.
+- **Bump the injected automation script version whenever highlight visibility, hit-testing, clipping, or label-placement behavior changes.** Add regression tests for hidden sidebars, clipped ancestors, and edge-of-viewport highlights.
 
 ## Terminal Shortcut Guidelines
 - **Terminal shortcuts are user-configurable.** Store custom terminal command shortcuts in `AppConfig::terminal_shortcuts`; do not hard-code new terminal command shortcuts directly in input handling.
