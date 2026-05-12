@@ -11958,13 +11958,15 @@ impl AdeApp {
         };
 
         // Schedule one confirmation Enter after the immediate submit Enter.
+        // Slash-prefixed commands (e.g., AI CLI prompts) use a shorter delay
+        // similar to terminal shortcuts so the second Enter arrives promptly.
         if options.schedule_confirmation_enter && !message.trim().is_empty() {
-            self.schedule_delayed_enters_for_terminal(
-                terminal_id,
-                1,
-                SAVED_MESSAGE_SECOND_ENTER_DELAY_MS,
-                ctx,
-            );
+            let delay_ms = if message.trim_start().starts_with('/') {
+                SHORTCUT_SECOND_ENTER_DELAY_MS
+            } else {
+                SAVED_MESSAGE_SECOND_ENTER_DELAY_MS
+            };
+            self.schedule_delayed_enters_for_terminal(terminal_id, 1, delay_ms, ctx);
         }
 
         // Record to persistent history after the mutable borrow is released
@@ -48085,6 +48087,74 @@ mod tests {
             TerminalKind::Foreground,
             "history should be marked as foreground"
         );
+    }
+
+    #[test]
+    fn smart_input_steer_now_slash_prefix_schedules_shortcut_like_confirmation_enter() {
+        // Regression test: slash-prefixed Smart Input commands should get a second
+        // Enter with the shorter shortcut-style delay (250ms), not the long saved-message
+        // delay (1000ms).
+        use egui::Context;
+        use std::time::Duration;
+
+        let ctx = Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        app.projects
+            .insert(7, test_project(7, "Test", "C:/test", &[], &[]));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.smart_input.draft = "/prepare-fix-plan".to_owned();
+            terminal.smart_input.mode = super::SmartInputMode::SteerNow;
+        }
+
+        let before_submit = std::time::Instant::now();
+        app.execute_smart_input_draft_submit(&ctx, 1);
+        capture.drain();
+
+        // Immediate command + Enter
+        assert_eq!(
+            capture.bytes(),
+            b"/prepare-fix-plan\r".to_vec(),
+            "command should be sent with immediate Enter"
+        );
+        assert_eq!(
+            app.pending_second_enter.len(),
+            1,
+            "slash-prefixed Smart Input should schedule a confirmation Enter"
+        );
+        let (pending_terminal_id, due_at) = app.pending_second_enter[0];
+        assert_eq!(pending_terminal_id, 1);
+
+        // Verify the delay is approximately the shortcut delay (250ms), not 1000ms.
+        // Use a generous tolerance (200-300ms) so the test is not flaky under load.
+        let expected_min = Duration::from_millis(200);
+        let expected_max = Duration::from_millis(300);
+        assert!(
+            due_at.duration_since(before_submit) >= expected_min,
+            "delayed Enter should not be too short (expected ~250ms)"
+        );
+        assert!(
+            due_at.duration_since(before_submit) <= expected_max,
+            "delayed Enter should not be too long (expected ~250ms, got {:?})",
+            due_at.duration_since(before_submit)
+        );
+
+        // Fast-forward time and process the delayed Enter
+        app.pending_second_enter[0].1 = std::time::Instant::now() - Duration::from_millis(1);
+        app.process_pending_second_enters(&ctx);
+        capture.drain();
+
+        assert_eq!(
+            capture.bytes(),
+            b"/prepare-fix-plan\r\r".to_vec(),
+            "second delayed Enter should be sent"
+        );
+        assert!(app.pending_second_enter.is_empty());
     }
 
     #[test]
