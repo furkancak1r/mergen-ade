@@ -21286,6 +21286,45 @@ impl eframe::App for AdeApp {
                 }
             }
 
+            // Smart Input image paste: when the clipboard contains an image file,
+            // intercept the paste event and insert the image path instead of
+            // letting egui's TextEdit paste raw image bytes or nothing.
+            if let Some(request) = self.focused_smart_input_submit_request(ctx) {
+                let mut image_path: Option<String> = None;
+                events = events
+                    .into_iter()
+                    .filter(|event| {
+                        if matches!(event, Event::Paste(_)) && image_path.is_none() {
+                            image_path = self.clipboard_image_path();
+                            // If image found, consume this paste event
+                            return image_path.is_none();
+                        }
+                        true
+                    })
+                    .collect();
+                if let Some(path) = image_path {
+                    let terminal_id = match request {
+                        SmartInputSubmitRequest::Draft { terminal_id } => terminal_id,
+                        SmartInputSubmitRequest::Edit { terminal_id, .. } => terminal_id,
+                    };
+                    if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                        if Self::terminal_smart_input_visible(terminal) {
+                            match request {
+                                SmartInputSubmitRequest::Draft { .. } => {
+                                    terminal.smart_input.draft.push_str(&path);
+                                }
+                                SmartInputSubmitRequest::Edit { task_id, .. } => {
+                                    if terminal.smart_input.editing_task_id == Some(task_id) {
+                                        terminal.smart_input.edit_draft.push_str(&path);
+                                    }
+                                }
+                            }
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+            }
+
             let (alt_m_events, remaining_events) =
                 Self::partition_alt_m_shortcut(events, global_modifiers);
             if !alt_m_events.is_empty() {
