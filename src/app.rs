@@ -256,11 +256,12 @@ const BROWSER_URL_INPUT_ID: &str = "browser-url-input";
 const FOREGROUND_MESSAGE_INPUT_ID: &str = "foreground-message-input";
 const SMART_INPUT_DRAFT_INPUT_ID: &str = "smart-input-draft";
 const SMART_INPUT_TASK_EDIT_INPUT_ID: &str = "smart-input-task-edit";
-const SMART_INPUT_MIN_FOOTER_HEIGHT: f32 = 88.0;
-const SMART_INPUT_BASE_FOOTER_HEIGHT: f32 = 104.0;
+const SMART_INPUT_MIN_FOOTER_HEIGHT: f32 = 132.0;
+const SMART_INPUT_BASE_FOOTER_HEIGHT: f32 = 156.0;
 const SMART_INPUT_TASK_ROW_HEIGHT: f32 = 28.0;
 const SMART_INPUT_MAX_VISIBLE_TASK_ROWS: usize = 3;
 const SMART_INPUT_FOOTER_GAP: f32 = 6.0;
+const SMART_INPUT_RESIZE_HANDLE_HEIGHT: f32 = 5.0;
 const SMART_INPUT_TOOLTIP_MAX_CHARS: usize = 140;
 // Foreground tasks UI limits
 const FOREGROUND_TASKS_MENU_MAX_HEIGHT: f32 = 300.0; // Max height for task list dropdown
@@ -939,7 +940,7 @@ struct SmartInputTask {
     text: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct SmartInputState {
     draft: String,
     mode: SmartInputMode,
@@ -949,6 +950,9 @@ struct SmartInputState {
     next_task_id: u64,
     editing_task_id: Option<u64>,
     edit_draft: String,
+    dragging_task_id: Option<u64>,
+    drag_hover_index: Option<usize>,
+    user_height: Option<f32>,
 }
 
 impl Default for SmartInputState {
@@ -962,6 +966,9 @@ impl Default for SmartInputState {
             next_task_id: 1,
             editing_task_id: None,
             edit_draft: String::new(),
+            dragging_task_id: None,
+            drag_hover_index: None,
+            user_height: None,
         }
     }
 }
@@ -1005,6 +1012,25 @@ impl SmartInputState {
             return false;
         }
         self.tasks.swap(index, next_index);
+        true
+    }
+
+    fn reorder_task_to_index(&mut self, task_id: u64, target_index: usize) -> bool {
+        let current_index = match self.tasks.iter().position(|task| task.id == task_id) {
+            Some(i) => i,
+            None => return false,
+        };
+        let target_index = target_index.min(self.tasks.len());
+        if current_index == target_index {
+            return false;
+        }
+        let task = self.tasks.remove(current_index);
+        let insert_index = if target_index > current_index {
+            target_index - 1
+        } else {
+            target_index
+        };
+        self.tasks.insert(insert_index, task);
         true
     }
 
@@ -12087,11 +12113,18 @@ impl AdeApp {
             return 0.0;
         }
 
-        let max_footer =
-            (pane_height - TERMINAL_HEADER_HEIGHT - TERMINAL_HEADER_GAP - line_height * 3.0)
-                .max(0.0);
+        let max_footer = (pane_height
+            - TERMINAL_HEADER_HEIGHT
+            - TERMINAL_HEADER_GAP
+            - SMART_INPUT_FOOTER_GAP
+            - line_height * 3.0)
+            .max(0.0);
         if max_footer < SMART_INPUT_MIN_FOOTER_HEIGHT {
             return 0.0;
+        }
+
+        if let Some(user_h) = terminal.smart_input.user_height {
+            return user_h.clamp(SMART_INPUT_MIN_FOOTER_HEIGHT, max_footer);
         }
 
         let task_rows = if terminal.smart_input.expanded {
@@ -20547,7 +20580,51 @@ impl AdeApp {
                     }
                 }
                 if smart_footer_height > 0.0 {
-                    ui.add_space(SMART_INPUT_FOOTER_GAP);
+                    // Draggable resize handle between terminal output and Smart Input footer
+                    let handle_height = SMART_INPUT_RESIZE_HANDLE_HEIGHT;
+                    let available_width = ui.available_width();
+                    let handle_size = egui::vec2(available_width, handle_height);
+                    let handle_response = ui.allocate_response(handle_size, Sense::drag());
+                    let handle_rect = handle_response.rect;
+                    let center_y = handle_rect.center().y;
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(handle_rect.left() + 4.0, center_y),
+                            egui::pos2(handle_rect.right() - 4.0, center_y),
+                        ],
+                        Stroke::new(2.0, Color32::from_rgb(60, 64, 68)),
+                    );
+                    // Grip dots in the center
+                    let grip_count = 3usize;
+                    let grip_spacing = 6.0f32;
+                    let total_grip_width = (grip_count.saturating_sub(1)) as f32 * grip_spacing;
+                    let start_x = handle_rect.center().x - total_grip_width / 2.0;
+                    for i in 0..grip_count {
+                        let x = start_x + i as f32 * grip_spacing;
+                        ui.painter().circle_filled(
+                            egui::pos2(x, center_y),
+                            1.5,
+                            Color32::from_rgb(100, 104, 108),
+                        );
+                    }
+                    if handle_response.hovered() || handle_response.dragged() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                    }
+                    if handle_response.dragged() {
+                        let delta = ui.ctx().input(|i| i.pointer.delta().y);
+                        let max_footer = (pane_height
+                            - TERMINAL_HEADER_HEIGHT
+                            - TERMINAL_HEADER_GAP
+                            - SMART_INPUT_FOOTER_GAP
+                            - line_height * 3.0)
+                            .max(0.0);
+                        let new_height = (smart_footer_height + delta)
+                            .max(SMART_INPUT_MIN_FOOTER_HEIGHT)
+                            .min(max_footer);
+                        terminal.smart_input.user_height = Some(new_height);
+                        ui.ctx().request_repaint();
+                    }
+
                     let footer_size = Vec2::new(pane_width, smart_footer_height);
                     let footer_response = ui.allocate_ui_with_layout(
                         footer_size,
@@ -20984,16 +21061,48 @@ impl eframe::App for AdeApp {
         let single_view_shortcuts_enabled = !self.config.ui.multi_terminal_view_enabled;
 
         let capture_keyboard = self.should_capture_terminal_keyboard(ctx);
+        let smart_input_request = self.focused_smart_input_submit_request(ctx);
 
-        // Only capture terminal command shortcuts when terminal owns keyboard.
-        // If UI owns keyboard (Settings open, text inputs focused), leave shortcut
-        // key events for the UI so Settings key capture and shortcut recording work.
-        if capture_keyboard {
+        // Capture terminal command shortcuts when terminal owns keyboard,
+        // OR when Smart Input draft/edit is focused so shortcuts redirect
+        // into the focused field. If another UI text input owns keyboard
+        // (Settings, popup), leave shortcut key events for the UI.
+        if capture_keyboard || smart_input_request.is_some() {
             let (command_shortcuts, remaining, conflict_messages) =
                 self.partition_terminal_command_shortcuts(events);
             if !command_shortcuts.is_empty() {
-                self.buffered_terminal_command_shortcuts
-                    .extend(command_shortcuts);
+                if let Some(request) = smart_input_request {
+                    match request {
+                        SmartInputSubmitRequest::Draft { terminal_id } => {
+                            if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                                if Self::terminal_smart_input_visible(terminal) {
+                                    for (_key, _modifiers, command) in command_shortcuts {
+                                        terminal.smart_input.draft.push_str(&command);
+                                    }
+                                    ctx.request_repaint();
+                                }
+                            }
+                        }
+                        SmartInputSubmitRequest::Edit {
+                            terminal_id,
+                            task_id,
+                        } => {
+                            if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                                if Self::terminal_smart_input_visible(terminal)
+                                    && terminal.smart_input.editing_task_id == Some(task_id)
+                                {
+                                    for (_key, _modifiers, command) in command_shortcuts {
+                                        terminal.smart_input.edit_draft.push_str(&command);
+                                    }
+                                    ctx.request_repaint();
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    self.buffered_terminal_command_shortcuts
+                        .extend(command_shortcuts);
+                }
             }
             if !conflict_messages.is_empty() {
                 // Show conflict warning for the first conflict
@@ -24338,7 +24447,7 @@ fn draw_smart_input_footer(
                             let task_text = state.tasks[index].text.clone();
                             let is_editing = state.editing_task_id == Some(task_id);
 
-                            ui.horizontal(|ui| {
+                            let row_ui = ui.horizontal(|ui| {
                                 ui.set_min_height(SMART_INPUT_TASK_ROW_HEIGHT);
                                 ui.label(
                                     RichText::new(format!("{}.", index + 1))
@@ -24352,11 +24461,9 @@ fn draw_smart_input_footer(
                                         task_id,
                                     );
                                     with_settings_text_edit_chrome(ui, |ui| {
+                                        let text_width = (ui.available_width() - 80.0).max(80.0);
                                         ui.add_sized(
-                                            egui::vec2(
-                                                (ui.available_width() - 110.0).max(80.0),
-                                                22.0,
-                                            ),
+                                            egui::vec2(text_width, 22.0),
                                             egui::TextEdit::singleline(&mut state.edit_draft)
                                                 .id(edit_id)
                                                 .hint_text("Edit queued task"),
@@ -24369,11 +24476,19 @@ fn draw_smart_input_footer(
                                         row_action = Some((task_id, "cancel"));
                                     }
                                 } else {
+                                    let is_dragging_this = state.dragging_task_id == Some(task_id);
+                                    let text_color = if is_dragging_this {
+                                        TEXT_MUTED
+                                    } else {
+                                        TEXT_PRIMARY
+                                    };
+
                                     let preview = capped_hover_text(&task_text, 72);
+                                    let text_width = (ui.available_width() - 100.0).max(80.0);
                                     let response = ui.add_sized(
-                                        egui::vec2((ui.available_width() - 140.0).max(80.0), 22.0),
+                                        egui::vec2(text_width, 22.0),
                                         egui::Label::new(
-                                            RichText::new(preview).small().color(TEXT_PRIMARY),
+                                            RichText::new(preview).small().color(text_color),
                                         )
                                         .truncate(),
                                     );
@@ -24388,12 +24503,6 @@ fn draw_smart_input_footer(
                                     if ui.button(RichText::new("Edit").small()).clicked() {
                                         row_action = Some((task_id, "edit"));
                                     }
-                                    if ui.button(RichText::new("Up").small()).clicked() {
-                                        row_action = Some((task_id, "up"));
-                                    }
-                                    if ui.button(RichText::new("Dn").small()).clicked() {
-                                        row_action = Some((task_id, "down"));
-                                    }
                                     if ui
                                         .button(
                                             RichText::new("Del")
@@ -24406,6 +24515,52 @@ fn draw_smart_input_footer(
                                     }
                                 }
                             });
+
+                            let row_rect = row_ui.response.rect;
+                            let drag_response = row_ui.response.interact(Sense::drag());
+
+                            if drag_response.drag_started() {
+                                state.dragging_task_id = Some(task_id);
+                            }
+
+                            // Drop target indicator
+                            if let Some(dragged_id) = state.dragging_task_id {
+                                if dragged_id != task_id {
+                                    if let Some(pointer_pos) =
+                                        ui.input(|i| i.pointer.interact_pos())
+                                    {
+                                        if row_rect.contains(pointer_pos) {
+                                            let is_above_center =
+                                                pointer_pos.y < row_rect.center().y;
+                                            let line_y = if is_above_center {
+                                                row_rect.top()
+                                            } else {
+                                                row_rect.bottom()
+                                            };
+                                            ui.painter().line_segment(
+                                                [
+                                                    egui::pos2(row_rect.left(), line_y),
+                                                    egui::pos2(row_rect.right(), line_y),
+                                                ],
+                                                Stroke::new(2.0, Color32::from_rgb(100, 200, 100)),
+                                            );
+                                            state.drag_hover_index = Some(if is_above_center {
+                                                index
+                                            } else {
+                                                index + 1
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+
+                            if drag_response.drag_stopped() {
+                                if let Some(dragged_id) = state.dragging_task_id.take() {
+                                    if let Some(target_idx) = state.drag_hover_index.take() {
+                                        let _ = state.reorder_task_to_index(dragged_id, target_idx);
+                                    }
+                                }
+                            }
                         }
                     });
 
@@ -24417,12 +24572,6 @@ fn draw_smart_input_footer(
                         "cancel" => state.cancel_edit(),
                         "edit" => {
                             let _ = state.start_edit(task_id);
-                        }
-                        "up" => {
-                            let _ = state.move_task(task_id, -1);
-                        }
-                        "down" => {
-                            let _ = state.move_task(task_id, 1);
                         }
                         "delete" => {
                             let _ = state.remove_task(task_id);
@@ -24448,11 +24597,13 @@ fn draw_smart_input_footer(
                             .id(draft_id)
                             .desired_width(input_width)
                             .hint_text(match state.mode {
-                                SmartInputMode::QueueAfterDone => {
-                                    "Task for after done (Enter queues, Ctrl+Enter newline)"
-                                }
+                                SmartInputMode::QueueAfterDone => RichText::new(
+                                    "Task for after done (Enter queues, Ctrl+Enter newline)",
+                                )
+                                .color(TEXT_MUTED),
                                 SmartInputMode::SteerNow => {
-                                    "Steer now (Enter sends, Ctrl+Enter newline)"
+                                    RichText::new("Steer now (Enter sends, Ctrl+Enter newline)")
+                                        .color(TEXT_MUTED)
                                 }
                             })
                             .return_key(egui::KeyboardShortcut::new(
@@ -33325,6 +33476,45 @@ mod tests {
         assert!(
             app.buffered_terminal_command_shortcuts.is_empty(),
             "Terminal command shortcuts should not be buffered when UI owns keyboard"
+        );
+    }
+
+    #[test]
+    fn raw_input_hook_redirects_shortcut_to_smart_input_draft_when_focused() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        // Focus the Smart Input draft field
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::smart_input_draft_input_id(1));
+        });
+
+        let mut raw_input = RawInput {
+            events: vec![Event::Key {
+                key: egui::Key::F6,
+                physical_key: Some(egui::Key::F6),
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+                repeat: false,
+            }],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(
+            raw_input.events.is_empty(),
+            "F6 event should be consumed when Smart Input is focused"
+        );
+        assert!(
+            app.buffered_terminal_command_shortcuts.is_empty(),
+            "shortcut should not be buffered for terminal"
+        );
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.smart_input.draft, "/prepare-fix-plan",
+            "shortcut command should be written into Smart Input draft"
         );
     }
 
@@ -47081,6 +47271,92 @@ mod tests {
     }
 
     #[test]
+    fn smart_input_reorder_task_to_end() {
+        let mut state = SmartInputState::default();
+        state.draft = "first".to_owned();
+        let first_id = state.enqueue_draft().expect("first task");
+        state.draft = "second".to_owned();
+        let second_id = state.enqueue_draft().expect("second task");
+        state.draft = "third".to_owned();
+        let third_id = state.enqueue_draft().expect("third task");
+
+        // Move first task to after the last row (target_index == len)
+        assert!(state.reorder_task_to_index(first_id, 3));
+        assert_eq!(state.tasks[0].id, second_id);
+        assert_eq!(state.tasks[1].id, third_id);
+        assert_eq!(state.tasks[2].id, first_id);
+    }
+
+    #[test]
+    fn raw_input_hook_redirects_shortcut_to_smart_input_edit_draft_when_focused() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        // Queue a task and enter edit mode
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.smart_input.draft = "queued task".to_owned();
+            let task_id = terminal.smart_input.enqueue_draft().expect("task");
+            let _ = terminal.smart_input.start_edit(task_id);
+            terminal.smart_input.edit_draft.clear(); // start fresh for the shortcut test
+        }
+
+        // Focus the Smart Input task edit field
+        let edit_id = AdeApp::smart_input_task_edit_input_id(1, 1);
+        ctx.memory_mut(|mem| {
+            mem.request_focus(edit_id);
+        });
+
+        let mut raw_input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::F6,
+                physical_key: Some(egui::Key::F6),
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+                repeat: false,
+            }],
+            ..egui::RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(
+            raw_input.events.is_empty(),
+            "F6 event should be consumed when Smart Input edit is focused"
+        );
+        assert!(
+            app.buffered_terminal_command_shortcuts.is_empty(),
+            "shortcut should not be buffered for terminal"
+        );
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.smart_input.edit_draft, "/prepare-fix-plan",
+            "shortcut command should be written into Smart Input edit_draft"
+        );
+    }
+
+    #[test]
+    fn smart_input_footer_preserves_three_terminal_lines_at_max_height() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        let pane_height = 400.0;
+        let line_height = 18.0;
+        let max_footer = AdeApp::smart_input_footer_height(terminal, pane_height, line_height);
+
+        let header = super::TERMINAL_HEADER_HEIGHT;
+        let header_gap = super::TERMINAL_HEADER_GAP;
+        let footer_gap = super::SMART_INPUT_FOOTER_GAP;
+        let output_height = pane_height - header - header_gap - footer_gap - max_footer;
+
+        assert!(
+            output_height >= line_height * 3.0 - 0.01,
+            "terminal output must preserve at least 3 lines when footer is at max, got output_height={output_height}"
+        );
+    }
+
+    #[test]
     fn foreground_message_popup_blocks_attention_stealing() {
         // Regression test: When foreground task popup is open, text input
         // should not be stolen by attention-terminal even when terminal
@@ -47433,5 +47709,119 @@ mod tests {
         );
 
         assert_eq!(app.pending_second_enter.len(), 1);
+    }
+
+    #[test]
+    fn smart_input_footer_height_is_tall_enough_for_expanded_empty_queue() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        let height = AdeApp::smart_input_footer_height(terminal, 400.0, 18.0);
+        assert!(
+            height >= 156.0,
+            "expanded empty queue footer should be at least base height (156), got {}",
+            height
+        );
+    }
+
+    #[test]
+    fn smart_input_footer_hides_when_pane_too_small() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        let height = AdeApp::smart_input_footer_height(terminal, 200.0, 18.0);
+        assert_eq!(
+            height, 0.0,
+            "small pane should hide Smart Input to prevent clipping"
+        );
+    }
+
+    #[test]
+    fn smart_input_steer_now_records_input_history() {
+        use egui::Context;
+        use std::path::PathBuf;
+
+        let ctx = Context::default();
+        let (runtime, _capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        app.projects
+            .insert(7, test_project(7, "Test", "C:/test", &[], &[]));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.smart_input.draft = "/steer-now-task".to_owned();
+            terminal.smart_input.mode = super::SmartInputMode::SteerNow;
+        }
+
+        app.execute_smart_input_draft_submit(&ctx, 1);
+
+        assert!(
+            app.terminals.get(&1).unwrap().smart_input.draft.is_empty(),
+            "draft should be cleared after submit; status was: {}",
+            app.status_line
+        );
+
+        let project_path = PathBuf::from("C:/test").display().to_string();
+        let history = app
+            .input_history
+            .projects
+            .get(&project_path)
+            .expect("history should exist for project");
+        assert_eq!(
+            history.entries.len(),
+            1,
+            "Smart Input steer now should record one history entry"
+        );
+        assert_eq!(
+            history.entries[0].text, "/steer-now-task",
+            "history text should match the Smart Input draft"
+        );
+        assert_eq!(
+            history.entries[0].terminal_kind,
+            TerminalKind::Foreground,
+            "history should be marked as foreground"
+        );
+    }
+
+    #[test]
+    fn smart_input_queued_task_dispatch_records_input_history() {
+        use egui::Context;
+        use std::path::PathBuf;
+
+        let ctx = Context::default();
+        let (runtime, _capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        app.projects
+            .insert(7, test_project(7, "Test", "C:/test", &[], &[]));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.smart_input.draft = "queued task one".to_owned();
+            terminal.smart_input.enqueue_draft();
+        }
+
+        app.process_smart_input_queues(&ctx);
+
+        let project_path = PathBuf::from("C:/test").display().to_string();
+        let history = app
+            .input_history
+            .projects
+            .get(&project_path)
+            .expect("history should exist for project");
+        assert_eq!(
+            history.entries.len(),
+            1,
+            "auto-dispatched queued task should record one history entry"
+        );
+        assert_eq!(
+            history.entries[0].text, "queued task one",
+            "history text should match the queued task"
+        );
     }
 }
