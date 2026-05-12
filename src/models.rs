@@ -429,6 +429,12 @@ pub struct ProjectRecord {
     /// Sent to foreground terminals and removed from queue upon sending.
     #[serde(default)]
     pub foreground_saved_messages: Vec<String>,
+    /// When this project is a git worktree, the root repository path.
+    #[serde(default)]
+    pub repo_root: Option<PathBuf>,
+    /// True when this project was auto-discovered/added as a worktree.
+    #[serde(default)]
+    pub is_worktree: bool,
 }
 
 /// A single recorded terminal input.

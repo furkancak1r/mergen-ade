@@ -271,6 +271,8 @@ impl From<LegacyAppConfig> for AppConfig {
                     checklist: Vec::new(),
                     browser_last_url: None,
                     foreground_saved_messages: Vec::new(),
+                    repo_root: None,
+                    is_worktree: false,
                 }
             })
             .collect();
@@ -753,6 +755,8 @@ command = false
             checklist: vec!["item1".to_owned(), "item2".to_owned()],
             browser_last_url: None,
             foreground_saved_messages: Vec::new(),
+            repo_root: None,
+            is_worktree: false,
         });
 
         save_config(&path, &config).expect("should save config");

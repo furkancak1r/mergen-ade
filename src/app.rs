@@ -1710,6 +1710,13 @@ pub struct AdeApp {
     os_notification_last_by_terminal: BTreeMap<u64, Instant>,
     /// Pending OS notification terminal to dispatch in the next update frame.
     pending_os_notification: Option<u64>,
+    /// Create worktree popup state
+    show_create_worktree_popup: bool,
+    create_worktree_project_id: Option<u64>,
+    create_worktree_branch_draft: String,
+    create_worktree_base_branch: String,
+    create_worktree_path_draft: String,
+    create_worktree_error: Option<String>,
 }
 
 /// Represents a single open file buffer in the built-in editor.
@@ -2286,6 +2293,7 @@ struct SourceControlSnapshot {
     loading: bool,
     last_error: Option<String>,
     partial_warning: Option<String>,
+    worktrees: Vec<crate::worktree::GitWorktreeInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -3961,6 +3969,8 @@ impl AdeApp {
                     checklist: Vec::new(),
                     browser_last_url: None,
                     foreground_saved_messages: Vec::new(),
+                    repo_root: None,
+                    is_worktree: false,
                 });
             }
         }
@@ -4187,6 +4197,12 @@ impl AdeApp {
             browser_video_encode_events_rx,
             os_notification_last_by_terminal: BTreeMap::new(),
             pending_os_notification: None,
+            show_create_worktree_popup: false,
+            create_worktree_project_id: None,
+            create_worktree_branch_draft: String::new(),
+            create_worktree_base_branch: String::new(),
+            create_worktree_path_draft: String::new(),
+            create_worktree_error: None,
         };
         // Do NOT seed runtime browser state from legacy config.
         // Browser panel open state is now runtime-only per project.
@@ -4323,16 +4339,43 @@ impl AdeApp {
     }
 
     fn add_project(&mut self, path: PathBuf) {
+        self.add_project_with_worktree(path, None, false);
+    }
+
+    fn add_project_with_worktree(
+        &mut self,
+        path: PathBuf,
+        repo_root: Option<PathBuf>,
+        is_worktree: bool,
+    ) {
         if self.projects.values().any(|project| project.path == path) {
             self.status_line = "Project is already added".to_owned();
             return;
         }
 
-        let name = path
-            .file_name()
-            .map(|segment| segment.to_string_lossy().to_string())
-            .filter(|segment| !segment.trim().is_empty())
-            .unwrap_or_else(|| path.display().to_string());
+        let name = if is_worktree {
+            if let Some(ref root) = repo_root {
+                let root_name = root
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| root.display().to_string());
+                let branch_slug = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                format!("{root_name} · {branch_slug}")
+            } else {
+                path.file_name()
+                    .map(|segment| segment.to_string_lossy().to_string())
+                    .filter(|segment| !segment.trim().is_empty())
+                    .unwrap_or_else(|| path.display().to_string())
+            }
+        } else {
+            path.file_name()
+                .map(|segment| segment.to_string_lossy().to_string())
+                .filter(|segment| !segment.trim().is_empty())
+                .unwrap_or_else(|| path.display().to_string())
+        };
 
         let project = ProjectRecord {
             id: self.next_project_id,
@@ -4343,6 +4386,8 @@ impl AdeApp {
             checklist: Vec::new(),
             browser_last_url: None,
             foreground_saved_messages: Vec::new(),
+            repo_root,
+            is_worktree,
         };
 
         let new_project_id = project.id;
@@ -4475,11 +4520,16 @@ impl AdeApp {
         });
 
         self.bump_layout_epoch();
+        let removed_label = if project.is_worktree {
+            "Removed worktree"
+        } else {
+            "Removed project"
+        };
         if close_failures == 0 {
-            self.status_line = format!("Removed project '{}'", project.name);
+            self.status_line = format!("{removed_label} '{}'", project.name);
         } else {
             self.status_line = format!(
-                "Removed project '{}' ({close_failures} terminal(s) failed to close cleanly)",
+                "{removed_label} '{}' ({close_failures} terminal(s) failed to close cleanly)",
                 project.name
             );
         }
@@ -9191,6 +9241,10 @@ impl AdeApp {
         if self.foreground_message_popup_open.is_some() {
             return true;
         }
+        // Check if create worktree popup is open (it has text inputs)
+        if self.show_create_worktree_popup {
+            return true;
+        }
         // Check if terminal Smart Input owns keyboard focus.
         if self.smart_input_has_focus(ctx) {
             return true;
@@ -9511,6 +9565,7 @@ fn embedded_browser_should_yield_to_ui_layer(
     context_menu_overlaps_browser: bool,
     browser_overlay_active: bool,
     foreground_message_popup_open: bool,
+    create_worktree_popup_open: bool,
 ) -> bool {
     show_settings_popup
         || show_exit_confirm_popup
@@ -9519,6 +9574,7 @@ fn embedded_browser_should_yield_to_ui_layer(
         || (context_menu_open && context_menu_overlaps_browser)
         || browser_overlay_active
         || foreground_message_popup_open
+        || create_worktree_popup_open
 }
 
 /// Determine if terminal output mouse wheel events should be processed.
@@ -9529,11 +9585,13 @@ fn terminal_output_mouse_wheel_enabled(
     show_exit_confirm_popup: bool,
     terminal_history_popup_open: bool,
     foreground_message_popup_open: bool,
+    create_worktree_popup_open: bool,
 ) -> bool {
     !(show_settings_popup
         || show_exit_confirm_popup
         || terminal_history_popup_open
-        || foreground_message_popup_open)
+        || foreground_message_popup_open
+        || create_worktree_popup_open)
 }
 
 fn ui_owns_keyboard_state(
@@ -9722,6 +9780,11 @@ impl AdeApp {
         // Do not steal text input from foreground message popup.
         // User intent: if foreground task popup is open, typed text belongs to the task input.
         if self.foreground_message_popup_open.is_some() {
+            return false;
+        }
+
+        // Do not steal text input from create worktree popup.
+        if self.show_create_worktree_popup {
             return false;
         }
 
@@ -15427,6 +15490,27 @@ impl AdeApp {
                                     ) {
                                         open_project_folder = true;
                                     }
+                                    if styled_icon_button(
+                                        ui,
+                                        icons::PLUS,
+                                        BTN_TEAL,
+                                        BTN_TEAL_HOVER,
+                                        BTN_ICON_ACTIVE,
+                                        "Create Worktree",
+                                    ) {
+                                        if let Some((pid, _)) = selected_project_details {
+                                            self.show_create_worktree_popup = true;
+                                            self.create_worktree_project_id = Some(pid);
+                                            self.create_worktree_branch_draft.clear();
+                                            self.create_worktree_base_branch = self
+                                                .source_control_state
+                                                .get(&pid)
+                                                .map(|s| s.branch.clone())
+                                                .unwrap_or_default();
+                                            self.create_worktree_path_draft.clear();
+                                            self.create_worktree_error = None;
+                                        }
+                                    }
                                 });
                             });
                         });
@@ -15513,6 +15597,48 @@ impl AdeApp {
                                         TEXT_MUTED,
                                         &branch_line,
                                     );
+                                }
+
+                                // Worktrees section
+                                if !snapshot.worktrees.is_empty() {
+                                    ui.separator();
+                                    ui.label(
+                                        RichText::new(format!("{} Worktrees", icons::TREE_VIEW))
+                                            .color(TEXT_MUTED)
+                                            .strong(),
+                                    );
+                                    for wt in &snapshot.worktrees {
+                                        let already_added = self
+                                            .projects
+                                            .values()
+                                            .any(|p| p.path == wt.path);
+                                        let label = wt.display_label();
+                                        let is_current = project.path == wt.path;
+                                        let current_marker = if is_current { " ●" } else { "" };
+                                        let row_text = format!("{}{}", label, current_marker);
+                                        let row_response = draw_clickable_sidebar_text_row(
+                                            ui,
+                                            RichText::new(&row_text).color(TEXT_PRIMARY),
+                                            TEXT_PRIMARY,
+                                            &format!("{}\n{}", row_text, wt.path.display()),
+                                        );
+                                        if !already_added && row_response.clicked() {
+                                            self.add_project_with_worktree(
+                                                wt.path.clone(),
+                                                Some(project.path.clone()),
+                                                true,
+                                            );
+                                            self.status_line = format!(
+                                                "Added worktree '{}' as project",
+                                                label
+                                            );
+                                        }
+                                        if !already_added && row_response.hovered() {
+                                            ui.ctx().set_cursor_icon(
+                                                egui::CursorIcon::PointingHand,
+                                            );
+                                        }
+                                    }
                                 }
 
                                 ui.separator();
@@ -19250,6 +19376,7 @@ impl AdeApp {
             context_menu_overlaps_browser,
             self.browser_panel_overlay_active,
             self.foreground_message_popup_open.is_some(),
+            self.show_create_worktree_popup,
         )
     }
 
@@ -20248,6 +20375,7 @@ impl AdeApp {
                     self.show_exit_confirm_popup,
                     self.terminal_history_popup_open.is_some(),
                     self.foreground_message_popup_open.is_some(),
+                    self.show_create_worktree_popup,
                 );
 
                 let _scroll_area_output = scroll_area.show(&mut output_ui, |ui| {
@@ -21106,6 +21234,227 @@ impl AdeApp {
             self.close_foreground_message_popup();
         }
     }
+
+    fn draw_create_worktree_popup(&mut self, ctx: &egui::Context) {
+        if !self.show_create_worktree_popup {
+            return;
+        }
+
+        let Some(project_id) = self.create_worktree_project_id else {
+            self.show_create_worktree_popup = false;
+            return;
+        };
+        let Some(project) = self.projects.get(&project_id).cloned() else {
+            self.show_create_worktree_popup = false;
+            return;
+        };
+
+        // Hide embedded browsers to prevent WebView from blocking modal interaction
+        self.hide_embedded_browsers();
+        self.pending_browser_rect = None;
+
+        let mut open = true;
+        let screen_width = ctx.screen_rect().width();
+        let popup_width = (screen_width - 64.0).clamp(480.0, 700.0);
+
+        egui::Window::new(format!("{} Create Worktree", icons::PLUS))
+            .id(egui::Id::new("create_worktree_popup"))
+            .open(&mut open)
+            .order(egui::Order::Foreground)
+            .resizable(false)
+            .collapsible(false)
+            .movable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size(egui::vec2(popup_width, 380.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(format!("Repository: {}", project.name))
+                        .small()
+                        .color(TEXT_MUTED),
+                );
+                ui.add_space(8.0);
+
+                ui.label(RichText::new("Branch name").small().color(TEXT_MUTED));
+                ui.add_sized(
+                    [ui.available_width(), CONTROL_ROW_HEIGHT],
+                    egui::TextEdit::singleline(&mut self.create_worktree_branch_draft)
+                        .hint_text("feature/my-task"),
+                );
+                ui.add_space(6.0);
+
+                ui.label(
+                    RichText::new("Base branch (optional)")
+                        .small()
+                        .color(TEXT_MUTED),
+                );
+                ui.add_sized(
+                    [ui.available_width(), CONTROL_ROW_HEIGHT],
+                    egui::TextEdit::singleline(&mut self.create_worktree_base_branch)
+                        .hint_text("main or origin/main"),
+                );
+                ui.add_space(6.0);
+
+                ui.label(RichText::new("Worktree path").small().color(TEXT_MUTED));
+                ui.add_sized(
+                    [ui.available_width(), CONTROL_ROW_HEIGHT],
+                    egui::TextEdit::singleline(&mut self.create_worktree_path_draft)
+                        .hint_text("../worktrees/feature-my-task or full path"),
+                );
+                ui.add_space(8.0);
+
+                if let Some(ref error) = self.create_worktree_error {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                    ui.add_space(4.0);
+                }
+
+                let branch_owned = self.create_worktree_branch_draft.trim().to_owned();
+                let path_owned = self.create_worktree_path_draft.trim().to_owned();
+                let base_owned = self.create_worktree_base_branch.trim().to_owned();
+                let can_create = !branch_owned.is_empty() && !path_owned.is_empty();
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add_enabled_ui(can_create, |ui| {
+                        if ui.button("Create Worktree").clicked() {
+                            let base_opt = if base_owned.is_empty() {
+                                None
+                            } else {
+                                Some(base_owned.as_str())
+                            };
+                            match Self::run_git_worktree_add(
+                                &project.path,
+                                &path_owned,
+                                &branch_owned,
+                                base_opt,
+                            ) {
+                                Ok(wt_path) => {
+                                    self.add_project_with_worktree(
+                                        wt_path,
+                                        Some(project.path.clone()),
+                                        true,
+                                    );
+                                    self.show_create_worktree_popup = false;
+                                    self.create_worktree_error = None;
+                                    self.status_line =
+                                        "Worktree created and added as project".to_owned();
+                                }
+                                Err(err) => {
+                                    self.create_worktree_error = Some(err);
+                                }
+                            }
+                        }
+                    });
+
+                    if ui.button("Cancel").clicked() {
+                        self.show_create_worktree_popup = false;
+                        self.create_worktree_error = None;
+                    }
+                });
+            });
+
+        if !open {
+            self.show_create_worktree_popup = false;
+            self.create_worktree_error = None;
+        }
+    }
+
+    fn run_git_worktree_add(
+        repo_path: &std::path::Path,
+        worktree_path: &str,
+        branch: &str,
+        base_branch: Option<&str>,
+    ) -> Result<std::path::PathBuf, String> {
+        let mut command = std::process::Command::new("git");
+        command.arg("-C").arg(repo_path);
+        command.arg("worktree").arg("add");
+        if base_branch.is_some() {
+            command.arg("-b").arg(branch);
+            command.arg(worktree_path);
+            if let Some(base) = base_branch {
+                command.arg(base);
+            }
+        } else {
+            command.arg("-b").arg(branch);
+            command.arg(worktree_path);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
+
+        let output = command
+            .output()
+            .map_err(|e| format!("Failed to run git: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("git worktree add failed: {stderr}"));
+        }
+
+        let resolved = if std::path::Path::new(worktree_path).is_absolute() {
+            std::path::PathBuf::from(worktree_path)
+        } else {
+            repo_path.join(worktree_path)
+        };
+        if let Ok(canonical) = resolved.canonicalize() {
+            Ok(canonical)
+        } else {
+            Ok(resolved)
+        }
+    }
+
+    /// Delete a git worktree from disk. Requires clean state and no live terminals.
+    fn delete_git_worktree(&mut self, ctx: &egui::Context, project_id: u64) -> Result<(), String> {
+        let Some(project) = self.projects.get(&project_id).cloned() else {
+            return Err("Project not found".to_owned());
+        };
+        if !project.is_worktree {
+            return Err("Not a worktree project".to_owned());
+        }
+        let has_live = self
+            .terminals
+            .values()
+            .any(|t| t.project_id == project_id && !t.exited);
+        if has_live {
+            return Err(
+                "Cannot delete worktree while it has live terminals. Close them first.".to_owned(),
+            );
+        }
+        // Check dirty state via source control snapshot if available
+        if let Some(snapshot) = self.source_control_state.get(&project_id) {
+            if !snapshot.files.is_empty() {
+                return Err(
+                    "Worktree has uncommitted changes. Commit, stash, or discard them first."
+                        .to_owned(),
+                );
+            }
+        }
+
+        let mut command = std::process::Command::new("git");
+        if let Some(ref root) = project.repo_root {
+            command.arg("-C").arg(root);
+        } else {
+            command.arg("-C").arg(&project.path);
+        }
+        command.args(["worktree", "remove", &project.path.display().to_string()]);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
+
+        let output = command
+            .output()
+            .map_err(|e| format!("Failed to run git: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("git worktree remove failed: {stderr}"));
+        }
+
+        // Also remove from Mergen projects list
+        self.remove_project(ctx, project_id);
+        self.status_line = format!("Deleted worktree '{}' from disk", project.name);
+        Ok(())
+    }
 }
 
 impl eframe::App for AdeApp {
@@ -21254,9 +21603,7 @@ impl eframe::App for AdeApp {
                             ..
                         } = event
                         {
-                            if modifiers.is_none()
-                                && matches!(key, Key::ArrowUp | Key::ArrowDown)
-                            {
+                            if modifiers.is_none() && matches!(key, Key::ArrowUp | Key::ArrowDown) {
                                 if key == &Key::ArrowUp {
                                     up_pressed = true;
                                 } else {
@@ -21497,6 +21844,8 @@ impl eframe::App for AdeApp {
         self.draw_settings_popup(ctx);
         self.draw_foreground_message_popup(ctx);
         self.process_pending_foreground_message_popup_submit();
+        self.draw_create_worktree_popup(ctx);
+
         self.draw_exit_confirm_popup(ctx);
 
         self.draw_transient_toast(ctx);
@@ -21913,6 +22262,17 @@ fn collect_source_control_snapshot(project_path: &Path, run_fetch: bool) -> Sour
     if let Some((added_lines, removed_lines)) = collect_source_control_line_totals(project_path) {
         snapshot.added_lines = Some(added_lines);
         snapshot.removed_lines = Some(removed_lines);
+    }
+
+    // Discover worktrees; failure here is non-fatal and should not mask status data.
+    match crate::worktree::discover_worktrees(project_path) {
+        Ok(worktrees) => {
+            snapshot.worktrees = worktrees;
+        }
+        Err(_) => {
+            // Silently ignore worktree discovery failures so non-git or
+            // shallow clones still show status normally.
+        }
     }
 
     snapshot
@@ -23802,6 +24162,37 @@ where
     let desired_height = sidebar_row_desired_height(ui, galley.size().y, button_padding);
     let desired_size = egui::vec2(available_width, desired_height);
     let (rect, response) = ui.allocate_exact_size(desired_size, Sense::hover());
+
+    if ui.is_rect_visible(rect) {
+        let text_pos = directory_row_text_position(rect, button_padding, galley.size(), 0.0);
+        ui.painter().galley(text_pos, galley, fallback_color);
+    }
+
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    with_truncation_tooltip(ui, response, tooltip, &font_id, fallback_color, wrap_width)
+}
+
+fn draw_clickable_sidebar_text_row<T>(
+    ui: &mut Ui,
+    text: T,
+    fallback_color: Color32,
+    tooltip: &str,
+) -> egui::Response
+where
+    T: Into<WidgetText>,
+{
+    let button_padding = ui.spacing().button_padding;
+    let available_width = ui.available_width().max(0.0);
+    let wrap_width = sidebar_row_wrap_width(available_width, button_padding);
+    let galley = text.into().into_galley(
+        ui,
+        Some(TextWrapMode::Truncate),
+        wrap_width,
+        egui::TextStyle::Body,
+    );
+    let desired_height = sidebar_row_desired_height(ui, galley.size().y, button_padding);
+    let desired_size = egui::vec2(available_width, desired_height);
+    let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
 
     if ui.is_rect_visible(rect) {
         let text_pos = directory_row_text_position(rect, button_padding, galley.size(), 0.0);
@@ -27547,7 +27938,6 @@ fn normalize_terminal_background(color: TerminalColor) -> Color32 {
 mod tests {
     use std::collections::BTreeSet;
 
-    use crate::config;
     use super::{
         ai_badge_tooltip_lines, ai_badge_visual, ai_cli_logo_key_for_terminal,
         average_terminal_cell_width, build_terminal_cursor_overlay, build_terminal_render,
@@ -27611,6 +28001,7 @@ mod tests {
     };
     use crate::browser_video::BrowserVideoEncodeResult;
     use crate::codex::{CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
+    use crate::config;
     use crate::hooks::{
         AiCliSession, AiCliStatus, AiCliTool, AiHookManager, AiHooksConfig, ClaudeAttentionReason,
         ClaudeTransportStatus, ProjectAiConfig,
@@ -31098,6 +31489,7 @@ mod tests {
             loading: false,
             last_error: None,
             partial_warning: None,
+            worktrees: Vec::new(),
         };
 
         let lines = source_control_tooltip_lines(&snapshot, 12);
@@ -31325,6 +31717,7 @@ mod tests {
                 loading: false,
                 last_error: Some("old error".to_owned()),
                 partial_warning: None,
+                worktrees: Vec::new(),
             },
         );
 
@@ -31361,6 +31754,7 @@ mod tests {
             loading: true,
             last_error: None,
             partial_warning: None,
+            worktrees: Vec::new(),
         };
         let incoming = SourceControlSnapshot {
             last_error: Some("git status failed".to_owned()),
@@ -37046,6 +37440,8 @@ mod tests {
             checklist: checklist.iter().map(|item| (*item).to_owned()).collect(),
             browser_last_url: None,
             foreground_saved_messages: Vec::new(),
+            repo_root: None,
+            is_worktree: false,
         }
     }
 
@@ -37071,6 +37467,7 @@ mod tests {
             loading: false,
             last_error: None,
             partial_warning: None,
+            worktrees: Vec::new(),
         }
     }
 
@@ -37332,6 +37729,12 @@ mod tests {
             browser_video_recordings_by_scope: BTreeMap::new(),
             os_notification_last_by_terminal: BTreeMap::new(),
             pending_os_notification: None,
+            show_create_worktree_popup: false,
+            create_worktree_project_id: None,
+            create_worktree_branch_draft: String::new(),
+            create_worktree_base_branch: String::new(),
+            create_worktree_path_draft: String::new(),
+            create_worktree_error: None,
             browser_video_encode_events_tx,
             browser_video_encode_events_rx,
         }
@@ -41578,6 +41981,8 @@ mod tests {
                 ai_config: crate::hooks::ProjectAiConfig::default(),
                 checklist: vec!["item1".to_owned()],
                 browser_last_url: None,
+                repo_root: None,
+                is_worktree: false,
                 foreground_saved_messages: Vec::new(),
             }],
             ..AppConfig::default()
@@ -44208,6 +44613,8 @@ mod tests {
             checklist: vec![],
             browser_last_url: Some("https://loaded.com".to_owned()),
             foreground_saved_messages: Vec::new(),
+            repo_root: None,
+            is_worktree: false,
         }];
 
         // Current (in-memory) project has different URL
@@ -44223,6 +44630,8 @@ mod tests {
                 checklist: vec![],
                 browser_last_url: Some("https://current.com".to_owned()),
                 foreground_saved_messages: Vec::new(),
+                repo_root: None,
+                is_worktree: false,
             },
         );
 
@@ -44254,6 +44663,8 @@ mod tests {
             checklist: vec![],
             browser_last_url: Some("https://loaded.com".to_owned()),
             foreground_saved_messages: Vec::new(),
+            repo_root: None,
+            is_worktree: false,
         }];
 
         // Current (in-memory) project has no URL
@@ -44269,6 +44680,8 @@ mod tests {
                 checklist: vec![],
                 browser_last_url: None,
                 foreground_saved_messages: Vec::new(),
+                repo_root: None,
+                is_worktree: false,
             },
         );
 
@@ -44377,6 +44790,23 @@ mod tests {
         });
 
         assert!(!app.text_input_has_focus(&ctx));
+        assert!(app.text_input_has_focus_extended(&ctx));
+    }
+
+    #[test]
+    fn text_input_has_focus_extended_detects_create_worktree_popup() {
+        use egui::Context;
+
+        let ctx = Context::default();
+        let mut app = test_app([], None);
+
+        // Initially false
+        assert!(!app.text_input_has_focus_extended(&ctx));
+
+        // Open create worktree popup
+        app.show_create_worktree_popup = true;
+
+        // Should detect create worktree popup as text input owner
         assert!(app.text_input_has_focus_extended(&ctx));
     }
 
@@ -45000,38 +45430,42 @@ mod tests {
     #[test]
     fn embedded_browser_yields_to_ui_overlay_layers() {
         // Test the pure predicate for all overlay sources
-        // Parameters: settings, exit_confirm, terminal_history_popup, egui_popup, context_menu_open, context_menu_overlaps_browser, browser_overlay_active, foreground_message_popup_open
+        // Parameters: settings, exit_confirm, terminal_history_popup, egui_popup, context_menu_open, context_menu_overlaps_browser, browser_overlay_active, foreground_message_popup_open, create_worktree_popup_open
         assert!(embedded_browser_should_yield_to_ui_layer(
-            true, false, false, false, false, false, false, false
+            true, false, false, false, false, false, false, false, false
         ));
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, true, false, false, false, false, false, false
+            false, true, false, false, false, false, false, false, false
         ));
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, true, false, false, false, false, false
+            false, false, true, false, false, false, false, false, false
         ));
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, false, true, false, false, false, false
+            false, false, false, true, false, false, false, false, false
         ));
         // Context menu only yields when it overlaps with browser
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, true, true, false, false
+            false, false, false, false, true, true, false, false, false
         ));
         // Context menu does NOT yield when it doesn't overlap
         assert!(!embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, true, false, false, false
+            false, false, false, false, true, false, false, false, false
         ));
         // No overlays at all
         assert!(!embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, false, false, false, false
+            false, false, false, false, false, false, false, false, false
         ));
         // Browser overlay active (dropdown, tooltip, hover) should cause yield
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, false, false, true, false
+            false, false, false, false, false, false, true, false, false
         ));
         // Foreground message popup open should cause yield
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, false, false, false, true
+            false, false, false, false, false, false, false, true, false
+        ));
+        // Create worktree popup open should cause yield
+        assert!(embedded_browser_should_yield_to_ui_layer(
+            false, false, false, false, false, false, false, false, true
         ));
     }
 
@@ -45351,7 +45785,7 @@ mod tests {
     fn terminal_output_mouse_wheel_enabled_returns_true_when_no_overlays() {
         // When no UI overlays are open, wheel handling should be enabled
         assert!(terminal_output_mouse_wheel_enabled(
-            false, false, false, false
+            false, false, false, false, false
         ));
     }
 
@@ -45359,7 +45793,7 @@ mod tests {
     fn terminal_output_mouse_wheel_enabled_returns_false_when_settings_open() {
         // Settings popup should disable terminal wheel handling
         assert!(!terminal_output_mouse_wheel_enabled(
-            true, false, false, false
+            true, false, false, false, false
         ));
     }
 
@@ -45367,7 +45801,7 @@ mod tests {
     fn terminal_output_mouse_wheel_enabled_returns_false_when_exit_confirm_open() {
         // Exit confirmation popup should disable terminal wheel handling
         assert!(!terminal_output_mouse_wheel_enabled(
-            false, true, false, false
+            false, true, false, false, false
         ));
     }
 
@@ -45375,7 +45809,7 @@ mod tests {
     fn terminal_output_mouse_wheel_enabled_returns_false_when_terminal_history_open() {
         // Terminal history popup should disable terminal wheel handling
         assert!(!terminal_output_mouse_wheel_enabled(
-            false, false, true, false
+            false, false, true, false, false
         ));
     }
 
@@ -45383,7 +45817,15 @@ mod tests {
     fn terminal_output_mouse_wheel_enabled_returns_false_when_foreground_message_open() {
         // Foreground message popup should disable terminal wheel handling
         assert!(!terminal_output_mouse_wheel_enabled(
-            false, false, false, true
+            false, false, false, true, false
+        ));
+    }
+
+    #[test]
+    fn terminal_output_mouse_wheel_enabled_returns_false_when_create_worktree_open() {
+        // Create worktree popup should disable terminal wheel handling
+        assert!(!terminal_output_mouse_wheel_enabled(
+            false, false, false, false, true
         ));
     }
 
@@ -45391,15 +45833,17 @@ mod tests {
     fn terminal_output_mouse_wheel_enabled_returns_false_when_multiple_overlays() {
         // Any combination of overlays should disable wheel handling
         assert!(!terminal_output_mouse_wheel_enabled(
-            true, true, false, false
+            true, true, false, false, false
         ));
         assert!(!terminal_output_mouse_wheel_enabled(
-            true, false, true, false
+            true, false, true, false, false
         ));
         assert!(!terminal_output_mouse_wheel_enabled(
-            false, true, true, true
+            false, true, true, true, false
         ));
-        assert!(!terminal_output_mouse_wheel_enabled(true, true, true, true));
+        assert!(!terminal_output_mouse_wheel_enabled(
+            true, true, true, true, false
+        ));
     }
 
     #[test]
@@ -47846,6 +48290,39 @@ mod tests {
     }
 
     #[test]
+    fn create_worktree_popup_blocks_attention_stealing() {
+        // Regression test: When create worktree popup is open, text input
+        // should not be stolen by attention-terminal even when terminal
+        // is waiting for user input.
+        use egui::Context;
+
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "TestProject", "C:/test", &[], &[]));
+        seed_ai_attention(&mut app, 1);
+
+        // Open create worktree popup
+        app.show_create_worktree_popup = true;
+        app.create_worktree_project_id = Some(7);
+
+        // Test that terminal keyboard capture is blocked
+        let capture_keyboard = app.should_capture_terminal_keyboard(&ctx);
+        assert!(
+            !capture_keyboard,
+            "Terminal should not capture keyboard when create worktree popup is open"
+        );
+
+        // Test that attention input stealing is blocked
+        let events = vec![Event::Text("branch name".to_owned())];
+        let should_steal = app.should_steal_attention_terminal_input(&ctx, &events);
+        assert!(
+            !should_steal,
+            "Attention should not steal text from create worktree popup"
+        );
+    }
+
+    #[test]
     fn foreground_message_popup_execute_save_adds_new_task() {
         // Test that execute_foreground_message_popup_save adds a new task
         let ctx = egui::Context::default();
@@ -48354,21 +48831,29 @@ mod tests {
         terminal.smart_input.draft = "original draft".to_owned();
 
         // Up arrow should navigate to older entries
-        terminal.smart_input.history_navigate_up(&terminal.recent_inputs);
+        terminal
+            .smart_input
+            .history_navigate_up(&terminal.recent_inputs);
         assert_eq!(terminal.smart_input.draft, "npm test");
         assert_eq!(terminal.smart_input.history_nav_index, Some(0));
         assert_eq!(terminal.smart_input.history_nav_stash, "original draft");
 
-        terminal.smart_input.history_navigate_up(&terminal.recent_inputs);
+        terminal
+            .smart_input
+            .history_navigate_up(&terminal.recent_inputs);
         assert_eq!(terminal.smart_input.draft, "cargo build");
         assert_eq!(terminal.smart_input.history_nav_index, Some(1));
 
-        terminal.smart_input.history_navigate_up(&terminal.recent_inputs);
+        terminal
+            .smart_input
+            .history_navigate_up(&terminal.recent_inputs);
         assert_eq!(terminal.smart_input.draft, "git status");
         assert_eq!(terminal.smart_input.history_nav_index, Some(2));
 
         // At oldest entry, further Up should stay
-        terminal.smart_input.history_navigate_up(&terminal.recent_inputs);
+        terminal
+            .smart_input
+            .history_navigate_up(&terminal.recent_inputs);
         assert_eq!(terminal.smart_input.draft, "git status");
         assert_eq!(terminal.smart_input.history_nav_index, Some(2));
     }
@@ -48387,8 +48872,12 @@ mod tests {
         terminal.smart_input.draft = "original draft".to_owned();
 
         // Navigate up twice
-        terminal.smart_input.history_navigate_up(&terminal.recent_inputs);
-        terminal.smart_input.history_navigate_up(&terminal.recent_inputs);
+        terminal
+            .smart_input
+            .history_navigate_up(&terminal.recent_inputs);
+        terminal
+            .smart_input
+            .history_navigate_up(&terminal.recent_inputs);
         assert_eq!(terminal.smart_input.draft, "git status");
 
         // Down arrow moves to newer entry
@@ -48410,7 +48899,10 @@ mod tests {
     fn smart_input_history_nav_reset_on_submit() {
         let ctx = egui::Context::default();
         let mut app = test_app_with_ai_hooks(
-            [(1, test_terminal_entry_with_runtime(1, 7, test_terminal_runtime()))],
+            [(
+                1,
+                test_terminal_entry_with_runtime(1, 7, test_terminal_runtime()),
+            )],
             Some(1),
         );
         app.projects
@@ -48418,9 +48910,13 @@ mod tests {
         seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
 
         let terminal = app.terminals.get_mut(&1).expect("terminal 1");
-        terminal.recent_inputs.push_front("previous input".to_owned());
+        terminal
+            .recent_inputs
+            .push_front("previous input".to_owned());
         terminal.smart_input.draft = "original draft".to_owned();
-        terminal.smart_input.history_navigate_up(&terminal.recent_inputs);
+        terminal
+            .smart_input
+            .history_navigate_up(&terminal.recent_inputs);
         assert_eq!(terminal.smart_input.draft, "previous input");
         assert!(terminal.smart_input.history_nav_index.is_some());
 
@@ -48442,7 +48938,9 @@ mod tests {
         let terminal = app.terminals.get_mut(&1).expect("terminal 1");
         terminal.smart_input.draft = "draft".to_owned();
 
-        terminal.smart_input.history_navigate_up(&terminal.recent_inputs);
+        terminal
+            .smart_input
+            .history_navigate_up(&terminal.recent_inputs);
         assert_eq!(terminal.smart_input.draft, "draft");
         assert!(terminal.smart_input.history_nav_index.is_none());
     }

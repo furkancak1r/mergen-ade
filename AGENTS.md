@@ -16,6 +16,7 @@
 - `src/layout.rs`: auto-tiling grid math and related unit tests.
 - `src/title.rs`: terminal title update/truncation logic and unit tests.
 - `src/config.rs` + `src/models.rs`: persisted TOML config schema and load/save behavior.
+- `src/worktree.rs`: git worktree discovery (`git worktree list --porcelain` parser), worktree metadata, and create/remove helpers.
 - `.github/workflows/release.yml`: GitHub release pipeline for Windows ZIP and signed/notarized macOS ARM64 DMG assets.
 - Build artifacts are in `target/` (do not commit).
 - **Do not watch the GitHub release workflow via CLI.** Once the release is triggered by pushing a version tag, the workflow runs asynchronously on GitHub Actions. There is no need to poll or watch it with `gh run watch` / `gh run list`; the user can track progress through the GitHub web interface if desired.
@@ -185,6 +186,18 @@ If `cargo` is not on PATH in PowerShell, use:
 - Kendi işlemlerine devam et; başkasının yaptığı değişiklikleri değiştirme, silme veya üzerine yazma.
 - Çakışma olursa kullanıcıya danış; tek başına karar verip başkasının işini bozma.
 
+## Git Worktree Integration Guidelines
+- **Worktrees are first-class ProjectRecords**: Each git worktree is stored as an independent `ProjectRecord` with `is_worktree: true` and `repo_root` pointing to the parent repository. Directory, Source Control, Browser, and terminal-scoped systems operate on the worktree path directly.
+- **Critical invariant — never fallback to repo root**: When a worktree project is selected, all foreground and background terminals must spawn with `cwd = worktree_path`. Terminal shortcuts, saved messages, Smart Input, and AI launcher submissions must all target the worktree `project_id` and never silently fall back to the parent repo root.
+- **Source Control panel discovers worktrees automatically**: The source control worker calls `crate::worktree::discover_worktrees()` during refresh and stores the list in `SourceControlSnapshot::worktrees`. The UI renders a "Worktrees" section with branch labels and an "Add to Mergen" action for unregistered worktrees.
+- **Create worktree modal**: Triggered from the Source Control toolbar (`+ Worktree`). Fields: branch name, base branch (optional), and worktree path. Validates inputs and runs `git worktree add -b <branch> <path> [base]`. On success, automatically adds the new worktree as a `ProjectRecord`, selects it, and optionally opens a terminal.
+- **Safe removal vs destructive delete**:
+  - "Remove from Mergen" (`remove_project`) keeps files on disk and only deletes the project record. Status line distinguishes worktree removal from regular project removal.
+  - "Delete Git Worktree" (`delete_git_worktree`) runs `git worktree remove <path>` and is blocked when live terminals exist or when the worktree has uncommitted changes. Never uses `--force` by default.
+- **Worktree parser tests**: `src/worktree.rs` includes unit tests for `git worktree list --porcelain` parsing: normal worktrees, detached HEAD, locked worktrees, prunable worktrees, and empty output.
+- **Create worktree modal keyboard ownership**: The Create Worktree popup must be treated as a modal text-input owner. Include `show_create_worktree_popup` in `text_input_has_focus_extended()`, attention-steal guards (`should_steal_attention_terminal_input()`), browser overlay yield (`embedded_browser_should_yield_to_ui_layer()`), and terminal wheel overlay checks (`terminal_output_mouse_wheel_enabled()`). This prevents active terminals from capturing typed branch/path text.
+- **Actionable worktree rows must use click-capable Sense**: Rows that trigger actions (e.g., Add-to-Mergen for discovered worktrees) must allocate with `Sense::click()`, not `Sense::hover()`. Use `draw_clickable_sidebar_text_row()` for actionable rows; keep `draw_sidebar_text_row()` as hover-only for status/error/clean messages.
+
 ## Terminal Manager & Input History Guidelines
 - **Background terminals use runtime-only input history**: Do not persist background terminal inputs to `history.json`. They use `recent_inputs` (runtime-only) for the rerun/interrupt button.
 - **Foreground terminals persist input history**: Foreground terminal inputs are recorded to persistent history and shown in the global Input History panel.
@@ -224,6 +237,7 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Double Enter for confirmation**: When sending a saved message (foreground or background), send the command followed by Enter (`\r`) immediately, then schedule one confirmation Enter after `SAVED_MESSAGE_SECOND_ENTER_DELAY_MS` (1000ms). This prevents back-to-back foreground tasks from merging into one terminal line while still confirming AI CLI prompts. Use `schedule_delayed_enters_for_terminal()` and `process_pending_second_enters()` in the update loop.
 - **Edit/Delete actions**: Each foreground queue item has edit (pencil) and delete (trash) buttons. Edit opens the popup pre-filled with the message content. Delete removes immediately without confirmation.
 - **Empty queue handling**: When the foreground queue is empty, the menu shows "No tasks in queue" text and only the "Add New" button is available.
+- **Deferred submit drain must stay in the update loop**: The update loop must call `process_pending_foreground_message_popup_submit()` immediately after `draw_foreground_message_popup()`. Adding new modal popups must not remove, skip, or move this deferred submit drain before `TextEdit` has processed same-frame text input.
 
 ## OpenCode Smart Input Guidelines
 - **Smart Input is terminal-scoped and runtime-only**: Store Smart Input draft, queue, edit state, and auto-run state on the foreground terminal session, not on `ProjectRecord`. Multiple OpenCode foreground terminals in the same project must have isolated queues.
