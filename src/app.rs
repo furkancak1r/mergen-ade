@@ -21139,6 +21139,50 @@ impl eframe::App for AdeApp {
                 events = remaining_events;
             }
 
+            // Smart Input Tab passthrough: plain Tab is forwarded to the terminal
+            // while Smart Input keeps focus so egui focus traversal is skipped.
+            if let Some(request) = self.focused_smart_input_submit_request(ctx) {
+                let terminal_id = match request {
+                    SmartInputSubmitRequest::Draft { terminal_id } => terminal_id,
+                    SmartInputSubmitRequest::Edit { terminal_id, .. } => terminal_id,
+                };
+                let mut tab_pressed = false;
+                events = events
+                    .into_iter()
+                    .filter(|event| {
+                        if let Event::Key {
+                            key: Key::Tab,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } = event
+                        {
+                            if !modifiers.shift
+                                && !modifiers.ctrl
+                                && !modifiers.alt
+                                && !modifiers.command
+                            {
+                                tab_pressed = true;
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .collect();
+                if tab_pressed {
+                    if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                        if Self::terminal_smart_input_visible(terminal) {
+                            Self::clear_terminal_selection(terminal);
+                            reset_terminal_prompt_scroll_anchor(terminal);
+                            terminal.runtime.send_bytes(vec![b'\t']);
+                            reset_opencode_manual_scroll_detached(terminal);
+                            terminal.dirty = true;
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+            }
+
             let (alt_m_events, remaining_events) =
                 Self::partition_alt_m_shortcut(events, global_modifiers);
             if !alt_m_events.is_empty() {
@@ -47007,6 +47051,177 @@ mod tests {
         assert!(!app.smart_input_has_focus(&ctx));
         assert!(!app.text_input_has_focus_extended(&ctx));
         assert!(app.should_capture_terminal_keyboard(&ctx));
+    }
+
+    #[test]
+    fn smart_input_tab_passthrough_sends_tab_to_terminal_when_draft_focused() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::smart_input_draft_input_id(1));
+        });
+
+        let mut raw_input = RawInput {
+            events: vec![Event::Key {
+                key: egui::Key::Tab,
+                physical_key: Some(egui::Key::Tab),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(
+            raw_input.events.is_empty(),
+            "plain Tab should be consumed when Smart Input draft is focused"
+        );
+        capture.drain();
+        assert_eq!(
+            capture.bytes(),
+            vec![b'\t'],
+            "Tab byte should be sent directly to terminal runtime"
+        );
+    }
+
+    #[test]
+    fn smart_input_tab_passthrough_sends_tab_to_terminal_when_edit_focused() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.smart_input.draft = "task".to_owned();
+            let task_id = terminal.smart_input.enqueue_draft().expect("task");
+            let _ = terminal.smart_input.start_edit(task_id);
+        }
+        let edit_id = AdeApp::smart_input_task_edit_input_id(1, 1);
+        ctx.memory_mut(|mem| {
+            mem.request_focus(edit_id);
+        });
+
+        let mut raw_input = RawInput {
+            events: vec![Event::Key {
+                key: egui::Key::Tab,
+                physical_key: Some(egui::Key::Tab),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(
+            raw_input.events.is_empty(),
+            "plain Tab should be consumed when Smart Input edit is focused"
+        );
+        capture.drain();
+        assert_eq!(
+            capture.bytes(),
+            vec![b'\t'],
+            "Tab byte should be sent to terminal runtime during task edit"
+        );
+    }
+
+    #[test]
+    fn smart_input_tab_passthrough_targets_correct_terminal_when_not_active() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        let (runtime1, _capture1) = test_terminal_runtime_with_capture();
+        let (runtime2, capture2) = test_terminal_runtime_with_capture();
+        let mut app = test_app_with_ai_hooks(
+            [
+                (1, test_terminal_entry_with_runtime(1, 7, runtime1)),
+                (2, test_terminal_entry_with_runtime(2, 7, runtime2)),
+            ],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 2, OpenCodeAttentionReason::TurnComplete);
+        // Focus terminal 2's Smart Input draft while active terminal is 1
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::smart_input_draft_input_id(2));
+        });
+
+        let mut raw_input = RawInput {
+            events: vec![Event::Key {
+                key: egui::Key::Tab,
+                physical_key: Some(egui::Key::Tab),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(raw_input.events.is_empty());
+        capture2.drain();
+        assert_eq!(
+            capture2.bytes(),
+            vec![b'\t'],
+            "Tab should go to terminal 2 (Smart Input owner), not terminal 1 (active)"
+        );
+    }
+
+    #[test]
+    fn smart_input_shift_tab_not_passthrough_stays_blocked_for_ui() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::smart_input_draft_input_id(1));
+        });
+
+        let mut raw_input = RawInput {
+            events: vec![Event::Key {
+                key: egui::Key::Tab,
+                physical_key: Some(egui::Key::Tab),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    shift: true,
+                    ..egui::Modifiers::default()
+                },
+            }],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(
+            raw_input.events.is_empty(),
+            "Shift+Tab should be blocked (not passed to UI or terminal)"
+        );
+        capture.drain();
+        assert!(
+            capture.bytes().is_empty(),
+            "Shift+Tab should NOT be sent to terminal"
+        );
     }
 
     #[test]

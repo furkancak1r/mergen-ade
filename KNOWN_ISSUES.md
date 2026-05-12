@@ -60,3 +60,28 @@
 - Files/Commands touched: `src/app.rs` (`smart_input_footer_height`, resize handle block), `cargo test`
 - References: Internal review 2026-05-12
 
+---
+
+#### Smart Input plain Tab did not forward to terminal {#smart-input-tab-passthrough}
+- Date: 2026-05-12
+- Context: Smart Input footer draft/edit field keyboard focus.
+- Error signature: User reported: "smart input alanında tab a basınca terminale de tab göndersin" — pressing Tab in Smart Input should also send Tab to the terminal.
+- Symptoms/Impact:
+  1. When typing in Smart Input draft or editing a queued task, pressing `Tab` did nothing useful — egui consumed it for focus traversal, moving focus away from the Smart Input field.
+  2. Terminal applications (e.g., interactive prompts, editors, shell completion) that expect `Tab` input could not receive it while the user was interacting with Smart Input.
+- Root cause:
+  - Smart Input focus marks `ui_owns_keyboard` as true, which blocks `route_active_terminal_input()` from sending any input to the terminal.
+  - Plain `Tab` events were falling through to egui's default focus traversal behavior because there was no special handling for them when Smart Input owned focus.
+- Resolution:
+  - Added a dedicated plain-Tab passthrough block in `raw_input_hook()` inside the `!capture_keyboard` branch.
+  - When `focused_smart_input_submit_request()` returns a Draft or Edit request, plain `Tab` (no modifiers) is intercepted: removed from the UI event stream, and `\t` is sent directly to the terminal runtime that owns the focused Smart Input field.
+  - `Shift+Tab` remains blocked by the existing `partition_blocked_ui_reverse_focus_traversal_events` path to prevent focus from leaving the Smart Input field.
+- Prevent recurrence:
+  - Added regression tests:
+    - `smart_input_tab_passthrough_sends_tab_to_terminal_when_draft_focused`: verifies `\t` is sent to terminal when draft has focus.
+    - `smart_input_tab_passthrough_sends_tab_to_terminal_when_edit_focused`: verifies `\t` is sent during task edit.
+    - `smart_input_tab_passthrough_targets_correct_terminal_when_not_active`: verifies Tab goes to the Smart Input owner terminal even when it's not the active terminal.
+    - `smart_input_shift_tab_not_passthrough_stays_blocked_for_ui`: verifies Shift+Tab is not forwarded.
+- Files/Commands touched: `src/app.rs` (`raw_input_hook`), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`
+- References: User request 2026-05-12: "smart input alanında tab a basınca terminale de tab göndersin"
+
