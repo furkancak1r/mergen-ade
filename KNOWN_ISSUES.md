@@ -65,3 +65,81 @@
   - AGENTS.md guideline: the update loop must drain the deferred submit immediately after `draw_foreground_message_popup()`; new modal popups must not remove or move this drain.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`
 - References: Internal review 2026-05-12
+
+---
+
+#### Source Control auto refresh flashed loading indicator and Create Worktree path was manual {#source-control-silent-refresh-worktree-auto-path}
+- Date: 2026-05-12
+- Context: User-facing UX feedback on worktree integration.
+- Error signature:
+  1. "source control refresh oluyor sürekli olarak refresh olduğu görüntüsü ui a gelmesin" — auto refresh should not constantly show "Refreshing source control...".
+  2. "worktree pathi ben yazmayayım mümkünse otomatik oluşsun isme göre anlık gözüksün" — worktree path should auto-generate from branch name.
+- Symptoms/Impact:
+  1. Every 5–20 seconds the Source Control panel flashed "Refreshing source control..." even though no user action occurred, causing visual distraction.
+  2. The Terminal Manager diff summary showed `...` every auto refresh cycle, making the row width jump.
+  3. The Create Worktree modal required the user to manually type the worktree path even though it should always be a predictable sibling directory derived from the branch name.
+- Root cause:
+  - `request_source_control_refresh()` unconditionally set `snapshot.loading = true` regardless of whether the request was triggered by a user (manual) or by the periodic scheduler (auto).
+  - `draw_create_worktree_popup()` presented the worktree path as a user-editable `TextEdit::singleline` with no auto-generation logic.
+- Resolution:
+  - Changed `request_source_control_refresh()` to only set `snapshot.loading = true` when `manual || run_fetch`. Auto refreshes now silently update the snapshot in the background without any loading UI.
+  - Added `sanitize_worktree_slug()` and `default_worktree_path_for_branch()` helpers to compute the worktree path live from the branch name.
+  - Replaced the editable path `TextEdit` in the Create Worktree modal with a read-only `.interactive(false)` field that updates in real time as the user types the branch name.
+  - Path defaults to `<repo_parent>/worktrees/<branch-slug>` with `/`, `\`, spaces, and Windows-invalid characters replaced by `-`.
+- Prevent recurrence:
+  - Added regression tests:
+    - `auto_source_control_refresh_does_not_set_loading`
+    - `manual_source_control_refresh_sets_loading`
+    - `worktree_slug_sanitizes_branch_name`
+    - `default_worktree_path_computed_from_repo_parent`
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`
+- References: User request 2026-05-12
+
+---
+
+#### Smart Input could not paste image-only clipboard data {#smart-input-image-paste}
+- Date: 2026-05-12
+- Context: Smart Input draft and queued-task edit fields only handled `Event::Paste(_)`, which egui does not emit when the clipboard contains an image without text.
+- Error signature: User reported inability to paste images into Smart Input.
+- Symptoms/Impact:
+  1. Pressing Ctrl+V / Cmd+V in Smart Input with an image-only clipboard did nothing.
+  2. Explorer-copied image files and screenshots could not be inserted as paths.
+- Root cause:
+  - `raw_input_hook` waited for an explicit `Event::Paste` from egui, which never arrives for image-only clipboard data.
+- Resolution:
+  - Added `synthesize_smart_input_image_paste_events()` to intercept the primary paste shortcut (`Ctrl+V` / `Cmd+V`) when Smart Input is focused.
+  - If the clipboard contains an image file (via CF_HDROP) or bitmap data, it is saved to disk and a synthetic `Event::Paste(image_path)` is injected into the event stream so egui's TextEdit inserts the path.
+- Prevent recurrence:
+  - Added regression tests:
+    - `smart_input_synthesizes_image_paste_on_primary_paste_key`
+    - `smart_input_leaves_non_paste_keys_untouched`
+    - `smart_input_leaves_shift_ctrl_v_untouched`
+    - `smart_input_falls_back_to_normal_key_when_no_clipboard_image`
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`
+- References: Internal fix 2026-05-12
+
+---
+
+#### Smart Input and shortcuts sent only one delayed Enter, causing commands to stall waiting for confirmation {#smart-input-shortcut-confirmation-enters}
+- Date: 2026-05-12
+- Context: Smart Input manual/auto dispatch and terminal shortcuts schedule one delayed confirmation Enter after the initial submit. Users reported that the second Enter either never appeared (Smart Input looked like it sent nothing) or arrived too quickly (250ms) before the shell/AI CLI had time to render a confirmation prompt, so it was swallowed.
+- Error signature: User reported that shortcuts and Smart Input "only press Enter once" and "Smart Input does not press Enter at all", and requested three staggered Enter presses with increased delay.
+- Symptoms/Impact:
+  1. Smart Input slash-prefixed commands (e.g. `/prepare-fix-plan`) sent only one immediate Enter and one short-delayed Enter (250ms). Many AI CLIs need two confirmation Enters after bracketed-paste delivery, so the prompt stalled waiting for additional input.
+  2. The 250ms delay was too short for bracketed-paste processing + prompt rendering on slower machines or busy terminals, making the second Enter invisible or lost.
+  3. Terminal shortcuts experienced the same too-short delay, making confirmation unreliable.
+- Root cause:
+  - `TerminalPromptSubmitOptions` only tracked a boolean `schedule_confirmation_enter` and always scheduled exactly one delayed Enter with a fixed 250ms delay for slash-prefixed commands.
+  - No mechanism existed to send multiple staggered confirmation Enters.
+- Resolution:
+  - Replaced the boolean flag with `confirmation_enter_count: usize` in `TerminalPromptSubmitOptions`.
+  - Set `confirmation_enter_count: 2` for `smart_manual()` and `smart_auto()` (producing an immediate Enter plus two delayed Enters).
+  - Increased `SHORTCUT_SECOND_ENTER_DELAY_MS` from 250ms to 600ms so each confirmation Enter arrives after the shell/AI CLI has had time to process the paste and display any prompt.
+  - `schedule_delayed_enters_for_terminal()` already supported `count`; wired `options.confirmation_enter_count` into `submit_prompt_to_terminal()`.
+- Prevent recurrence:
+  - Updated regression tests:
+    - `smart_input_dispatches_one_task_on_opencode_turn_complete` now asserts `pending_second_enter.len() == 2`.
+    - `smart_input_steer_now_slash_prefix_schedules_two_confirmation_enters` replaced the old 250ms single-Enter test and verifies two staggered delays (≈600ms and ≈1200ms) plus three total Enter bytes.
+  - Updated `AGENTS.md` to document `confirmation_enter_count: 2` for Smart Input and the new 600ms shortcut delay.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`
+- References: User request 2026-05-12

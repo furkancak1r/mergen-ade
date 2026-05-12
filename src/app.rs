@@ -154,7 +154,7 @@ const PENDING_RERUN_POLL_MS: u64 = 50;
 /// Delay before sending the confirmation Enter after a saved message command.
 const SAVED_MESSAGE_SECOND_ENTER_DELAY_MS: u64 = 1000;
 /// Delay before sending the confirmation Enter after a terminal shortcut command.
-const SHORTCUT_SECOND_ENTER_DELAY_MS: u64 = 250;
+const SHORTCUT_SECOND_ENTER_DELAY_MS: u64 = 600;
 
 // Embedded Nerd Font for terminal icon support (Windows-only)
 #[cfg(target_os = "windows")]
@@ -1068,9 +1068,14 @@ impl SmartInputState {
         self.edit_draft.clear();
     }
 
-    /// Navigate up in terminal input history (older entries).
-    fn history_navigate_up(&mut self, recent_inputs: &VecDeque<String>) {
-        if recent_inputs.is_empty() {
+    /// Navigate up in combined history (newest queued tasks first, then older terminal inputs).
+    fn history_navigate_up(
+        &mut self,
+        recent_inputs: &VecDeque<String>,
+        queued_tasks: &[SmartInputTask],
+    ) {
+        let pool_len = queued_tasks.len() + recent_inputs.len();
+        if pool_len == 0 {
             return;
         }
         if self.history_nav_index.is_none() {
@@ -1078,20 +1083,37 @@ impl SmartInputState {
             self.history_nav_index = Some(0);
         } else {
             let current = self.history_nav_index.unwrap();
-            if current + 1 < recent_inputs.len() {
+            if current + 1 < pool_len {
                 self.history_nav_index = Some(current + 1);
             }
         }
         if let Some(index) = self.history_nav_index {
-            if let Some(text) = recent_inputs.get(index) {
-                self.draft = text.clone();
+            let text = if index < queued_tasks.len() {
+                // Reverse task order so newest queued task appears first
+                let rev_index = queued_tasks.len() - 1 - index;
+                queued_tasks.get(rev_index).map(|t| t.text.clone())
+            } else {
+                recent_inputs
+                    .get(index - queued_tasks.len())
+                    .map(|t| t.clone())
+            };
+            if let Some(text) = text {
+                self.draft = text;
             }
         }
     }
 
-    /// Navigate down in terminal input history (newer entries).
+    /// Navigate down in combined history (newer entries).
     /// When moving past the newest entry, restore the original stash.
-    fn history_navigate_down(&mut self, recent_inputs: &VecDeque<String>) {
+    fn history_navigate_down(
+        &mut self,
+        recent_inputs: &VecDeque<String>,
+        queued_tasks: &[SmartInputTask],
+    ) {
+        let pool_len = queued_tasks.len() + recent_inputs.len();
+        if pool_len == 0 {
+            return;
+        }
         let Some(current) = self.history_nav_index else {
             return;
         };
@@ -1101,8 +1123,17 @@ impl SmartInputState {
         } else {
             let new_index = current - 1;
             self.history_nav_index = Some(new_index);
-            if let Some(text) = recent_inputs.get(new_index) {
-                self.draft = text.clone();
+            let text = if new_index < queued_tasks.len() {
+                // Reverse task order so newest queued task appears first
+                let rev_index = queued_tasks.len() - 1 - new_index;
+                queued_tasks.get(rev_index).map(|t| t.text.clone())
+            } else {
+                recent_inputs
+                    .get(new_index - queued_tasks.len())
+                    .map(|t| t.clone())
+            };
+            if let Some(text) = text {
+                self.draft = text;
             }
         }
     }
@@ -1131,6 +1162,7 @@ struct TerminalPromptSubmitOptions {
     activate_after_send: bool,
     set_visible_in_main: bool,
     schedule_confirmation_enter: bool,
+    confirmation_enter_count: usize,
     record_history: bool,
     update_status_line: bool,
 }
@@ -1141,6 +1173,7 @@ impl TerminalPromptSubmitOptions {
             activate_after_send: true,
             set_visible_in_main: true,
             schedule_confirmation_enter: true,
+            confirmation_enter_count: 1,
             record_history: true,
             update_status_line: true,
         }
@@ -1151,6 +1184,7 @@ impl TerminalPromptSubmitOptions {
             activate_after_send: true,
             set_visible_in_main: true,
             schedule_confirmation_enter: true,
+            confirmation_enter_count: 2,
             record_history: true,
             update_status_line: true,
         }
@@ -1161,6 +1195,7 @@ impl TerminalPromptSubmitOptions {
             activate_after_send: false,
             set_visible_in_main: false,
             schedule_confirmation_enter: true,
+            confirmation_enter_count: 2,
             record_history: true,
             update_status_line: true,
         }
@@ -8439,15 +8474,22 @@ impl AdeApp {
             return;
         }
 
+        // Only show visible loading UI for manual actions or explicit fetch.
+        // Auto-refresh runs silently in the background without flashing
+        // "Refreshing source control..." in the UI.
+        let visible_loading = manual || run_fetch;
+
         self.source_control_state
             .entry(project_id)
             .and_modify(|snapshot| {
-                snapshot.loading = true;
+                if visible_loading {
+                    snapshot.loading = true;
+                }
                 snapshot.last_error = None;
                 snapshot.partial_warning = None;
             })
             .or_insert_with(|| SourceControlSnapshot {
-                loading: true,
+                loading: visible_loading,
                 ..SourceControlSnapshot::default()
             });
 
@@ -11807,6 +11849,44 @@ impl AdeApp {
             .and_then(|snapshot| terminal_selection_text(snapshot, terminal.selection.as_ref()))
     }
 
+    /// When Smart Input is focused and the user presses the primary paste shortcut
+    /// (Ctrl+V / Cmd+V), if the clipboard contains an image, synthesize an
+    /// `Event::Paste(image_path)` so egui's TextEdit inserts the path as text
+    /// instead of silently ignoring image-only clipboard data.
+    fn synthesize_smart_input_image_paste_events(&self, events: Vec<Event>) -> Vec<Event> {
+        Self::synthesize_smart_input_image_paste_events_with(events, || self.clipboard_image_path())
+    }
+
+    /// Testable variant that accepts a clipboard image path provider.
+    fn synthesize_smart_input_image_paste_events_with(
+        events: Vec<Event>,
+        mut get_image_path: impl FnMut() -> Option<String>,
+    ) -> Vec<Event> {
+        let mut image_path: Option<String> = None;
+        let mut out = Vec::with_capacity(events.len());
+        for event in events {
+            if let Event::Key {
+                key: Key::V,
+                pressed: true,
+                modifiers,
+                ..
+            } = &event
+            {
+                if primary_shortcut_modifier(*modifiers) && !modifiers.alt && !modifiers.shift {
+                    if image_path.is_none() {
+                        image_path = get_image_path();
+                    }
+                    if let Some(ref path) = image_path {
+                        out.push(Event::Paste(path.clone()));
+                        continue;
+                    }
+                }
+            }
+            out.push(event);
+        }
+        out
+    }
+
     /// Try to get an image path from clipboard for terminal paste.
     /// Checks for:
     /// 1. File path to image (Windows CF_HDROP)
@@ -12082,7 +12162,12 @@ impl AdeApp {
             } else {
                 SAVED_MESSAGE_SECOND_ENTER_DELAY_MS
             };
-            self.schedule_delayed_enters_for_terminal(terminal_id, 1, delay_ms, ctx);
+            self.schedule_delayed_enters_for_terminal(
+                terminal_id,
+                options.confirmation_enter_count,
+                delay_ms,
+                ctx,
+            );
         }
 
         // Record to persistent history after the mutable borrow is released
@@ -20800,7 +20885,9 @@ impl AdeApp {
                             - SMART_INPUT_FOOTER_GAP
                             - line_height * 3.0)
                             .max(0.0);
-                        let new_height = (smart_footer_height + delta)
+                        // Subtract delta because screen Y grows downward:
+                        // dragging up (negative delta) should increase footer height.
+                        let new_height = (smart_footer_height - delta)
                             .max(SMART_INPUT_MIN_FOOTER_HEIGHT)
                             .min(max_footer);
                         terminal.smart_input.user_height = Some(new_height);
@@ -21235,6 +21322,28 @@ impl AdeApp {
         }
     }
 
+    fn sanitize_worktree_slug(branch: &str) -> String {
+        branch
+            .chars()
+            .map(|c| match c {
+                '/' | '\\' | ' ' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+                _ => c,
+            })
+            .collect::<String>()
+            .replace("..", "-")
+            .trim_matches('-')
+            .to_lowercase()
+    }
+
+    fn default_worktree_path_for_branch(
+        repo_path: &std::path::Path,
+        branch: &str,
+    ) -> std::path::PathBuf {
+        let slug = Self::sanitize_worktree_slug(branch);
+        let parent = repo_path.parent().unwrap_or(repo_path);
+        parent.join("worktrees").join(&slug)
+    }
+
     fn draw_create_worktree_popup(&mut self, ctx: &egui::Context) {
         if !self.show_create_worktree_popup {
             return;
@@ -21248,6 +21357,15 @@ impl AdeApp {
             self.show_create_worktree_popup = false;
             return;
         };
+
+        // Auto-compute worktree path from branch name as user types.
+        let branch_trimmed = self.create_worktree_branch_draft.trim();
+        if !branch_trimmed.is_empty() {
+            self.create_worktree_path_draft =
+                Self::default_worktree_path_for_branch(&project.path, branch_trimmed)
+                    .display()
+                    .to_string();
+        }
 
         // Hide embedded browsers to prevent WebView from blocking modal interaction
         self.hide_embedded_browsers();
@@ -21265,7 +21383,7 @@ impl AdeApp {
             .collapsible(false)
             .movable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .fixed_size(egui::vec2(popup_width, 380.0))
+            .fixed_size(egui::vec2(popup_width, 360.0))
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new(format!("Repository: {}", project.name))
@@ -21294,11 +21412,16 @@ impl AdeApp {
                 );
                 ui.add_space(6.0);
 
-                ui.label(RichText::new("Worktree path").small().color(TEXT_MUTED));
+                ui.label(
+                    RichText::new("Worktree path (auto)")
+                        .small()
+                        .color(TEXT_MUTED),
+                );
                 ui.add_sized(
                     [ui.available_width(), CONTROL_ROW_HEIGHT],
                     egui::TextEdit::singleline(&mut self.create_worktree_path_draft)
-                        .hint_text("../worktrees/feature-my-task or full path"),
+                        .hint_text("auto-generated from branch")
+                        .interactive(false),
                 );
                 ui.add_space(8.0);
 
@@ -21471,6 +21594,13 @@ impl eframe::App for AdeApp {
         // into the focused field. If another UI text input owns keyboard
         // (Settings, popup), leave shortcut key events for the UI.
         if capture_keyboard || smart_input_request.is_some() {
+            // When Smart Input is focused, intercept primary paste shortcut
+            // (Ctrl+V / Cmd+V) and synthesize a text paste event if the
+            // clipboard contains an image path. This handles image-only
+            // clipboard data that egui does not emit as Event::Paste.
+            if smart_input_request.is_some() {
+                events = self.synthesize_smart_input_image_paste_events(events);
+            }
             let (command_shortcuts, remaining, conflict_messages) =
                 self.partition_terminal_command_shortcuts(events);
             if !command_shortcuts.is_empty() {
@@ -21587,7 +21717,7 @@ impl eframe::App for AdeApp {
             }
 
             // Smart Input history navigation: Up/Down arrows cycle through
-            // terminal recent_inputs when the draft field is focused.
+            // queued tasks first, then terminal recent_inputs when the draft field is focused.
             if let Some(SmartInputSubmitRequest::Draft { terminal_id }) =
                 self.focused_smart_input_submit_request(ctx)
             {
@@ -21618,14 +21748,15 @@ impl eframe::App for AdeApp {
                 if up_pressed || down_pressed {
                     if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                         if Self::terminal_smart_input_visible(terminal) {
+                            let tasks = terminal.smart_input.tasks.clone();
                             if up_pressed {
                                 terminal
                                     .smart_input
-                                    .history_navigate_up(&terminal.recent_inputs);
+                                    .history_navigate_up(&terminal.recent_inputs, &tasks);
                             } else {
                                 terminal
                                     .smart_input
-                                    .history_navigate_down(&terminal.recent_inputs);
+                                    .history_navigate_down(&terminal.recent_inputs, &tasks);
                             }
                             ctx.request_repaint();
                         }
@@ -24939,6 +25070,8 @@ fn draw_smart_input_footer(
                 ui.add_space(6.0);
                 ui.label(RichText::new(status_text).small().color(status_color));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // Push buttons a bit left so they don’t hug the far-right edge
+                    ui.add_space(100.0);
                     let toggle_label = if state.expanded { "Hide" } else { "Show" };
                     if ui
                         .button(RichText::new(toggle_label).small())
@@ -25061,18 +25194,20 @@ fn draw_smart_input_footer(
                                     };
 
                                     let preview = capped_hover_text(&task_text, 72);
-                                    let text_width = (ui.available_width() - 100.0).max(80.0);
-                                    let response = ui.add_sized(
-                                        egui::vec2(text_width, 22.0),
-                                        egui::Label::new(
-                                            RichText::new(preview).small().color(text_color),
-                                        )
-                                        .truncate(),
-                                    );
+                                    // Natural-width left-aligned label
+                                    let response =
+                                        ui.label(RichText::new(preview).small().color(text_color));
                                     response.on_hover_text(capped_hover_text(
                                         &task_text,
                                         SMART_INPUT_TOOLTIP_MAX_CHARS,
                                     ));
+
+                                    // Push buttons to the far right
+                                    let buttons_width = 100.0f32;
+                                    let remaining = ui.available_width() - buttons_width;
+                                    if remaining > 0.0 {
+                                        ui.add_space(remaining);
+                                    }
 
                                     if ui.button(RichText::new("Now").small()).clicked() {
                                         action.send_task_now = Some(task_id);
@@ -31771,6 +31906,60 @@ mod tests {
         assert_eq!(merged.removed_lines, Some(3));
         assert!(!merged.loading);
         assert_eq!(merged.last_error.as_deref(), Some("git status failed"));
+    }
+
+    #[test]
+    fn auto_source_control_refresh_does_not_set_loading() {
+        let mut app = test_app([], None);
+        app.projects = BTreeMap::from([(7, test_project(7, "Repo", "C:/repo", &[], &[]))]);
+
+        app.request_source_control_refresh(7, false, false);
+
+        let snapshot = app
+            .source_control_state
+            .get(&7)
+            .expect("expected source control snapshot");
+        assert!(
+            !snapshot.loading,
+            "auto refresh should not set loading=true"
+        );
+    }
+
+    #[test]
+    fn manual_source_control_refresh_sets_loading() {
+        let mut app = test_app([], None);
+        app.projects = BTreeMap::from([(7, test_project(7, "Repo", "C:/repo", &[], &[]))]);
+
+        app.request_source_control_refresh(7, false, true);
+
+        let snapshot = app
+            .source_control_state
+            .get(&7)
+            .expect("expected source control snapshot");
+        assert!(snapshot.loading, "manual refresh should set loading=true");
+    }
+
+    #[test]
+    fn worktree_slug_sanitizes_branch_name() {
+        assert_eq!(
+            super::AdeApp::sanitize_worktree_slug("feature/login-fix"),
+            "feature-login-fix"
+        );
+        assert_eq!(
+            super::AdeApp::sanitize_worktree_slug("bug  browser crash"),
+            "bug--browser-crash"
+        );
+        assert_eq!(super::AdeApp::sanitize_worktree_slug("HEAD..2"), "head-2");
+    }
+
+    #[test]
+    fn default_worktree_path_computed_from_repo_parent() {
+        let repo = std::path::PathBuf::from("C:/projects/Mergen-ADE");
+        let path = super::AdeApp::default_worktree_path_for_branch(&repo, "feature/foo");
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("C:/projects/worktrees/feature-foo")
+        );
     }
 
     #[test]
@@ -48019,7 +48208,11 @@ mod tests {
 
         assert_eq!(capture.bytes(), b"\x1b[200~/first\x1b[201~\r".to_vec());
         assert_eq!(app.active_terminal, Some(2));
-        assert_eq!(app.pending_second_enter.len(), 1);
+        assert_eq!(
+            app.pending_second_enter.len(),
+            2,
+            "Smart Input auto-dispatch should schedule two confirmation Enters"
+        );
         let terminal = app.terminals.get(&1).expect("terminal 1");
         assert_eq!(terminal.smart_input.tasks.len(), 1);
         assert_eq!(terminal.smart_input.tasks[0].text, "second");
@@ -48709,10 +48902,11 @@ mod tests {
     }
 
     #[test]
-    fn smart_input_steer_now_slash_prefix_schedules_shortcut_like_confirmation_enter() {
-        // Regression test: slash-prefixed Smart Input commands should get a second
-        // Enter with the shorter shortcut-style delay (250ms), not the long saved-message
-        // delay (1000ms).
+    fn smart_input_steer_now_slash_prefix_schedules_two_confirmation_enters() {
+        // Regression test: slash-prefixed Smart Input commands should schedule two
+        // confirmation Enters with the shorter shortcut-style delay (600ms), not the
+        // long saved-message delay (1000ms). This gives the shell/AI CLI enough time
+        // to process the bracketed-paste command before each confirmation arrives.
         use egui::Context;
         use std::time::Duration;
 
@@ -48743,27 +48937,25 @@ mod tests {
         );
         assert_eq!(
             app.pending_second_enter.len(),
-            1,
-            "slash-prefixed Smart Input should schedule a confirmation Enter"
-        );
-        let (pending_terminal_id, due_at) = app.pending_second_enter[0];
-        assert_eq!(pending_terminal_id, 1);
-
-        // Verify the delay is approximately the shortcut delay (250ms), not 1000ms.
-        // Use a generous tolerance (200-300ms) so the test is not flaky under load.
-        let expected_min = Duration::from_millis(200);
-        let expected_max = Duration::from_millis(300);
-        assert!(
-            due_at.duration_since(before_submit) >= expected_min,
-            "delayed Enter should not be too short (expected ~250ms)"
-        );
-        assert!(
-            due_at.duration_since(before_submit) <= expected_max,
-            "delayed Enter should not be too long (expected ~250ms, got {:?})",
-            due_at.duration_since(before_submit)
+            2,
+            "slash-prefixed Smart Input should schedule two confirmation Enters"
         );
 
-        // Fast-forward time and process the delayed Enter
+        // Verify staggered delays (first ~600ms, second ~1200ms)
+        let expected_min = Duration::from_millis(500);
+        let expected_max = Duration::from_millis(700);
+        let first_due = app.pending_second_enter[0].1;
+        assert!(
+            first_due.duration_since(before_submit) >= expected_min,
+            "first delayed Enter should not be too short (expected ~600ms)"
+        );
+        assert!(
+            first_due.duration_since(before_submit) <= expected_max,
+            "first delayed Enter should not be too long (expected ~600ms, got {:?})",
+            first_due.duration_since(before_submit)
+        );
+
+        // Fast-forward first delayed Enter
         app.pending_second_enter[0].1 = std::time::Instant::now() - Duration::from_millis(1);
         app.process_pending_second_enters(&ctx);
         capture.drain();
@@ -48771,7 +48963,23 @@ mod tests {
         assert_eq!(
             capture.bytes(),
             b"/prepare-fix-plan\r\r".to_vec(),
-            "second delayed Enter should be sent"
+            "first delayed Enter should be sent"
+        );
+        assert_eq!(
+            app.pending_second_enter.len(),
+            1,
+            "second delayed Enter should still be pending"
+        );
+
+        // Fast-forward second delayed Enter
+        app.pending_second_enter[0].1 = std::time::Instant::now() - Duration::from_millis(1);
+        app.process_pending_second_enters(&ctx);
+        capture.drain();
+
+        assert_eq!(
+            capture.bytes(),
+            b"/prepare-fix-plan\r\r\r".to_vec(),
+            "second delayed Enter should produce a third total Enter"
         );
         assert!(app.pending_second_enter.is_empty());
     }
@@ -48833,27 +49041,27 @@ mod tests {
         // Up arrow should navigate to older entries
         terminal
             .smart_input
-            .history_navigate_up(&terminal.recent_inputs);
+            .history_navigate_up(&terminal.recent_inputs, &[]);
         assert_eq!(terminal.smart_input.draft, "npm test");
         assert_eq!(terminal.smart_input.history_nav_index, Some(0));
         assert_eq!(terminal.smart_input.history_nav_stash, "original draft");
 
         terminal
             .smart_input
-            .history_navigate_up(&terminal.recent_inputs);
+            .history_navigate_up(&terminal.recent_inputs, &[]);
         assert_eq!(terminal.smart_input.draft, "cargo build");
         assert_eq!(terminal.smart_input.history_nav_index, Some(1));
 
         terminal
             .smart_input
-            .history_navigate_up(&terminal.recent_inputs);
+            .history_navigate_up(&terminal.recent_inputs, &[]);
         assert_eq!(terminal.smart_input.draft, "git status");
         assert_eq!(terminal.smart_input.history_nav_index, Some(2));
 
         // At oldest entry, further Up should stay
         terminal
             .smart_input
-            .history_navigate_up(&terminal.recent_inputs);
+            .history_navigate_up(&terminal.recent_inputs, &[]);
         assert_eq!(terminal.smart_input.draft, "git status");
         assert_eq!(terminal.smart_input.history_nav_index, Some(2));
     }
@@ -48874,23 +49082,23 @@ mod tests {
         // Navigate up twice
         terminal
             .smart_input
-            .history_navigate_up(&terminal.recent_inputs);
+            .history_navigate_up(&terminal.recent_inputs, &[]);
         terminal
             .smart_input
-            .history_navigate_up(&terminal.recent_inputs);
+            .history_navigate_up(&terminal.recent_inputs, &[]);
         assert_eq!(terminal.smart_input.draft, "git status");
 
         // Down arrow moves to newer entry
         terminal
             .smart_input
-            .history_navigate_down(&terminal.recent_inputs);
+            .history_navigate_down(&terminal.recent_inputs, &[]);
         assert_eq!(terminal.smart_input.draft, "cargo build");
         assert_eq!(terminal.smart_input.history_nav_index, Some(0));
 
         // Down at newest entry restores stash and exits history mode
         terminal
             .smart_input
-            .history_navigate_down(&terminal.recent_inputs);
+            .history_navigate_down(&terminal.recent_inputs, &[]);
         assert_eq!(terminal.smart_input.draft, "original draft");
         assert_eq!(terminal.smart_input.history_nav_index, None);
     }
@@ -48916,7 +49124,7 @@ mod tests {
         terminal.smart_input.draft = "original draft".to_owned();
         terminal
             .smart_input
-            .history_navigate_up(&terminal.recent_inputs);
+            .history_navigate_up(&terminal.recent_inputs, &[]);
         assert_eq!(terminal.smart_input.draft, "previous input");
         assert!(terminal.smart_input.history_nav_index.is_some());
 
@@ -48940,8 +49148,135 @@ mod tests {
 
         terminal
             .smart_input
-            .history_navigate_up(&terminal.recent_inputs);
+            .history_navigate_up(&terminal.recent_inputs, &[]);
         assert_eq!(terminal.smart_input.draft, "draft");
         assert!(terminal.smart_input.history_nav_index.is_none());
+    }
+
+    #[test]
+    fn smart_input_history_includes_queued_tasks_before_recent_inputs() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Test", "C:/test", &[], &[]));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+        terminal.smart_input.draft = "original draft".to_owned();
+        terminal.smart_input.tasks.push(SmartInputTask {
+            id: 1,
+            text: "queued task one".to_owned(),
+        });
+        terminal.smart_input.tasks.push(SmartInputTask {
+            id: 2,
+            text: "queued task two".to_owned(),
+        });
+        terminal.recent_inputs.push_front("recent input".to_owned());
+
+        // Up should first show newest queued task
+        terminal
+            .smart_input
+            .history_navigate_up(&terminal.recent_inputs, &terminal.smart_input.tasks.clone());
+        assert_eq!(terminal.smart_input.draft, "queued task two");
+
+        // Up again → older queued task
+        terminal
+            .smart_input
+            .history_navigate_up(&terminal.recent_inputs, &terminal.smart_input.tasks.clone());
+        assert_eq!(terminal.smart_input.draft, "queued task one");
+
+        // Up again → recent input
+        terminal
+            .smart_input
+            .history_navigate_up(&terminal.recent_inputs, &terminal.smart_input.tasks.clone());
+        assert_eq!(terminal.smart_input.draft, "recent input");
+
+        // Down → back to queued task one
+        terminal
+            .smart_input
+            .history_navigate_down(&terminal.recent_inputs, &terminal.smart_input.tasks.clone());
+        assert_eq!(terminal.smart_input.draft, "queued task one");
+
+        // Down → queued task two
+        terminal
+            .smart_input
+            .history_navigate_down(&terminal.recent_inputs, &terminal.smart_input.tasks.clone());
+        assert_eq!(terminal.smart_input.draft, "queued task two");
+
+        // Down → restores original draft
+        terminal
+            .smart_input
+            .history_navigate_down(&terminal.recent_inputs, &terminal.smart_input.tasks.clone());
+        assert_eq!(terminal.smart_input.draft, "original draft");
+        assert!(terminal.smart_input.history_nav_index.is_none());
+    }
+
+    #[test]
+    fn smart_input_synthesizes_image_paste_on_primary_paste_key() {
+        let events = vec![Event::Key {
+            key: Key::V,
+            physical_key: Some(Key::V),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        }];
+        let result = AdeApp::synthesize_smart_input_image_paste_events_with(events, || {
+            Some(r"C:\test\image.png".to_owned())
+        });
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], Event::Paste(text) if text == r"C:\test\image.png"));
+    }
+
+    #[test]
+    fn smart_input_leaves_non_paste_keys_untouched() {
+        let events = vec![Event::Key {
+            key: Key::A,
+            physical_key: Some(Key::A),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::default(),
+        }];
+        let result = AdeApp::synthesize_smart_input_image_paste_events_with(events.clone(), || {
+            Some(r"C:\test\image.png".to_owned())
+        });
+        assert_eq!(result, events);
+    }
+
+    #[test]
+    fn smart_input_leaves_shift_ctrl_v_untouched() {
+        let events = vec![Event::Key {
+            key: Key::V,
+            physical_key: Some(Key::V),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Modifiers::default()
+            },
+        }];
+        let result = AdeApp::synthesize_smart_input_image_paste_events_with(events.clone(), || {
+            Some(r"C:\test\image.png".to_owned())
+        });
+        assert_eq!(result, events);
+    }
+
+    #[test]
+    fn smart_input_falls_back_to_normal_key_when_no_clipboard_image() {
+        let events = vec![Event::Key {
+            key: Key::V,
+            physical_key: Some(Key::V),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        }];
+        let result = AdeApp::synthesize_smart_input_image_paste_events_with(events, || None);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], Event::Key { key: Key::V, .. }));
     }
 }
