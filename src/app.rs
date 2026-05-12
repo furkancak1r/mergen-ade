@@ -17140,24 +17140,22 @@ impl AdeApp {
                     }
                 }
             }
-            BrowserScopeKey::Terminal {
-                project_id,
-                terminal_id,
-            } => match config::browser_user_data_dir_path_for_terminal(project_id, terminal_id) {
-                Ok(path) => Some(path),
-                Err(err) => {
-                    log::error!(
-                        "Browser profile folder setup failed for project {} terminal {}: {}",
-                        project_id,
-                        terminal_id,
-                        err
-                    );
-                    self.status_line =
+            BrowserScopeKey::Terminal { project_id, .. } => {
+                match config::browser_user_data_dir_path(project_id) {
+                    Ok(path) => Some(path),
+                    Err(err) => {
+                        log::error!(
+                            "Browser profile folder setup failed for project {} terminal scope: {}",
+                            project_id,
+                            err
+                        );
+                        self.status_line =
                         "Browser profile folder could not be prepared; passwords may not persist"
                             .to_owned();
-                    None
+                        None
+                    }
                 }
-            },
+            }
         };
         web_browser::EmbeddedBrowser::new_with_user_data_folder(user_data_folder)
     }
@@ -27405,6 +27403,7 @@ fn normalize_terminal_background(color: TerminalColor) -> Color32 {
 mod tests {
     use std::collections::BTreeSet;
 
+    use crate::config;
     use super::{
         ai_badge_tooltip_lines, ai_badge_visual, ai_cli_logo_key_for_terminal,
         average_terminal_cell_width, build_terminal_cursor_overlay, build_terminal_render,
@@ -46480,6 +46479,93 @@ mod tests {
             app.projects.get(&7).unwrap().browser_last_url,
             Some("https://project.com".to_owned())
         );
+    }
+
+    #[test]
+    fn terminal_scoped_browser_uses_project_profile_folder() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
+        app.active_terminal = Some(1);
+
+        let terminal_scope = BrowserScopeKey::Terminal {
+            project_id: 7,
+            terminal_id: 1,
+        };
+        let expected = config::browser_user_data_dir_path(7).unwrap();
+
+        {
+            let browser = app.browser_for_scope(terminal_scope);
+            assert_eq!(browser.user_data_folder(), Some(&expected));
+        }
+
+        // Project-scoped browser for the same project should use the same path
+        let project_scope = BrowserScopeKey::Project(7);
+        {
+            let browser = app.browser_for_scope(project_scope);
+            assert_eq!(browser.user_data_folder(), Some(&expected));
+        }
+    }
+
+    #[test]
+    fn same_project_terminals_share_browser_profile_folder() {
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(1),
+        );
+        app.projects
+            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
+
+        let scope1 = BrowserScopeKey::Terminal {
+            project_id: 7,
+            terminal_id: 1,
+        };
+        let scope2 = BrowserScopeKey::Terminal {
+            project_id: 7,
+            terminal_id: 2,
+        };
+        let expected = config::browser_user_data_dir_path(7).unwrap();
+
+        {
+            let browser = app.browser_for_scope(scope1);
+            assert_eq!(browser.user_data_folder(), Some(&expected));
+        }
+        {
+            let browser = app.browser_for_scope(scope2);
+            assert_eq!(browser.user_data_folder(), Some(&expected));
+        }
+    }
+
+    #[test]
+    fn different_projects_use_different_browser_profile_folders() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
+        app.projects
+            .insert(8, test_project(8, "Other", "C:/other", &[], &[]));
+
+        let scope7 = BrowserScopeKey::Terminal {
+            project_id: 7,
+            terminal_id: 1,
+        };
+        let scope8 = BrowserScopeKey::Terminal {
+            project_id: 8,
+            terminal_id: 1,
+        };
+        let expected7 = config::browser_user_data_dir_path(7).unwrap();
+        let expected8 = config::browser_user_data_dir_path(8).unwrap();
+
+        {
+            let browser = app.browser_for_scope(scope7);
+            assert_eq!(browser.user_data_folder(), Some(&expected7));
+        }
+        {
+            let browser = app.browser_for_scope(scope8);
+            assert_eq!(browser.user_data_folder(), Some(&expected8));
+        }
     }
 
     // OpenCode Wheel Fallback Tests

@@ -85,3 +85,27 @@
 - Files/Commands touched: `src/app.rs` (`raw_input_hook`), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`
 - References: User request 2026-05-12: "smart input alanında tab a basınca terminale de tab göndersin"
 
+---
+
+#### Browser password prompt repeated for every new terminal {#browser-password-repeat-terminal}
+- Date: 2026-05-12
+- Context: Embedded browser (WebView2) password/autofill persistence across terminals in the same project.
+- Error signature: User reported: "browserda parola hatırlatma çalışmıyor doğru düzgün her yeni terminalde sekmede tekrar soruyor tekrar kaydet çıkıyor hatırlamıyor" — browser does not remember passwords; every new terminal/tab prompts to save the password again.
+- Symptoms/Impact:
+  1. Logging into a site in a terminal-scoped browser saved the password for that terminal only.
+  2. Opening a new terminal in the same project created a new WebView2 profile folder (`webview2/projects/{pid}/terminals/{tid}/`), so the password manager database, cookies, and localStorage were empty again.
+  3. WebView2 repeatedly showed the "Save password?" prompt because each profile had no prior credential record.
+- Root cause:
+  - `create_browser_instance_for_scope()` used `browser_user_data_dir_path_for_terminal(project_id, terminal_id)` for `BrowserScopeKey::Terminal`, creating a separate WebView2 user data folder per terminal.
+  - WebView2 stores passwords, cookies, and autofill data inside the user data folder; separate folders mean separate credential stores.
+- Resolution:
+  - Changed `create_browser_instance_for_scope()` to use `browser_user_data_dir_path(project_id)` for both `BrowserScopeKey::Project` and `BrowserScopeKey::Terminal`, so all terminals in the same project share one WebView2 profile.
+  - Terminal-scoped isolation for tabs, design inspect state, and video recordings is preserved via `BrowserScopeKey::Terminal` keyed state maps; only the underlying WebView2 user data folder is shared.
+- Prevent recurrence:
+  - Added regression tests:
+    - `terminal_scoped_browser_uses_project_profile_folder`: verifies terminal scope uses the project profile path.
+    - `same_project_terminals_share_browser_profile_folder`: verifies two terminals in the same project use the same profile path.
+    - `different_projects_use_different_browser_profile_folders`: verifies cross-project profile separation remains.
+- Files/Commands touched: `src/app.rs` (`create_browser_instance_for_scope`), `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`
+- References: User request 2026-05-12: "browserda parola hatırlatma çalışmıyor doğru düzgün her yeni terminalde sekmede tekrar soruyor tekrar kaydet çıkıyor hatırlamıyor"
+
