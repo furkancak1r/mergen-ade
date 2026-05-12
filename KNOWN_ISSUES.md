@@ -143,3 +143,66 @@
   - Updated `AGENTS.md` to document `confirmation_enter_count: 2` for Smart Input and the new 600ms shortcut delay.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`
 - References: User request 2026-05-12
+
+---
+
+#### Bright white resize handle on left panel was too harsh {#left-panel-resize-handle-harsh}
+- Date: 2026-05-12
+- Context: UI visual feedback on resizable left panel.
+- Error signature: The default egui resize handle uses `hovered/active.fg_stroke` which is near-white, causing a glaring bright vertical bar when hovering or dragging the Project Explorer edge in the dark theme.
+- Symptoms/Impact:
+  1. When the mouse hovered over the right edge of the Project Explorer, a bright white vertical line appeared.
+  2. During resize drag, the line remained bright and distracting against the dark background.
+- Root cause:
+  - egui's `SidePanel` draws the resize indicator using the widget `fg_stroke`, which is configured to near-white for hover/active states in the Mergen dark theme.
+- Resolution:
+  - Added a dim foreground-layer overlay on the panel's right edge after `draw_project_explorer()` finishes. The overlay uses `Color32::from_rgb(45, 45, 45)` normally and `Color32::from_rgb(80, 80, 80)` when the pointer is near the handle, replacing the bright default line without altering the resize hitbox or cursor behavior.
+- Prevent recurrence:
+  - The overlay is scoped inside `draw_project_explorer()` and only affects the Project Explorer edge.
+  - Resize functionality (cursor, drag, width persistence) remains unchanged.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`
+- References: User request 2026-05-12
+
+---
+
+#### Transient toast notification was too narrow causing text wrapping {#transient-toast-too-narrow}
+- Date: 2026-05-12
+- Context: Shortcut command feedback toast displayed in bottom-right corner.
+- Error signature: The `draw_transient_toast()` function rendered the toast message with no explicit width constraint, causing egui to wrap text at a very narrow width. Short messages like "Sent: /prepare-fix-plan" were broken across multiple short lines.
+- Symptoms/Impact:
+  1. After pressing a terminal shortcut (e.g., F6, F7), the bottom-right toast wrapped the command text into multiple short lines.
+  2. The toast looked cramped and unreadable for even moderately long commands.
+- Root cause:
+  - `draw_transient_toast()` used a plain `ui.label()` inside an `egui::Area` without setting any width bounds, so the label wrapped at whatever small width the area's default layout provided.
+- Resolution:
+  - Added `TRANSIENT_TOAST_MIN_WIDTH` (420px), `TRANSIENT_TOAST_MAX_WIDTH` (640px), and `TRANSIENT_TOAST_SCREEN_MARGIN` (48px) constants.
+  - Added `AdeApp::transient_toast_content_width(screen_width)` helper that clamps the toast width between min/max while respecting screen size.
+  - Updated `draw_transient_toast()` to call `ui.set_width(toast_width)` and use `Label::new(...).wrap()` so the label fills the available width and wraps only when the message genuinely exceeds it.
+- Prevent recurrence:
+  - Added regression tests for `transient_toast_content_width`:
+    - `transient_toast_content_width_uses_max_on_wide_screen`
+    - `transient_toast_content_width_caps_at_screen_on_narrow_screen`
+    - `transient_toast_content_width_never_exceeds_screen`
+    - `transient_toast_content_width_scales_between_min_and_max`
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo test`
+- References: User request 2026-05-12
+
+---
+
+#### Worktree rows in Source Control panel lacked an icon {#worktree-row-missing-icon}
+- Date: 2026-05-12
+- Context: Source Control panel “Worktrees” section rendered worktree rows as plain text without a leading icon, making them hard to distinguish from branch labels and other metadata.
+- Error signature: User reported “worktree deki simge görülmüyor” — the worktree icon was not visible.
+- Symptoms/Impact:
+  1. Worktree rows appeared as plain text with no visual affordance (e.g., main ● looked like a tiny square or invisible dot depending on font fallback).
+  2. The row looked inconsistent with the rest of the Source Control panel, where file rows use an icon (CHECK_CIRCLE / CLOCK) and the branch line uses GIT_BRANCH.
+- Root cause:
+  - draw_clickable_sidebar_text_row() was used for worktree rows, which paints only text without any icon slot.
+- Resolution:
+  - Added draw_source_control_worktree_row() helper that reserves a left-side icon area, paints icons::GIT_BRANCH in TEXT_MUTED, and then draws the branch label + optional current-worktree marker in TEXT_PRIMARY.
+  - Replaced the worktree loop’s draw_clickable_sidebar_text_row() call with the new helper, preserving click behavior (Add to Mergen for unregistered worktrees) and hover cursor.
+- Prevent recurrence:
+  - Added regression test source_control_worktree_row_uses_full_available_width to ensure the new helper respects sidebar width and icon offset.
+  - AGENTS.md guideline: actionable sidebar rows that represent named resources (branches, worktrees, files) should include a contextual icon for visual consistency.
+- Files/Commands touched: src/app.rs, AGENTS.md, KNOWN_ISSUES.md, cargo test
+- References: User request 2026-05-12

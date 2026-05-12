@@ -127,6 +127,9 @@ const OPENCODE_NOTIFY_POLL_MS: u64 = 150;
 const OPENCODE_HOOK_POLL_MS: u64 = 100;
 const CURSOR_BLINK_STEP_SECS: f64 = 0.6;
 const TRANSIENT_TOAST_SECS: f64 = 1.75;
+const TRANSIENT_TOAST_MIN_WIDTH: f32 = 420.0;
+const TRANSIENT_TOAST_MAX_WIDTH: f32 = 640.0;
+const TRANSIENT_TOAST_SCREEN_MARGIN: f32 = 48.0;
 const TERMINAL_COPY_FEEDBACK_TEXT: &str = "Copied terminal selection";
 const POWERSHELL_CURSOR_ROW_STABLE_SECS: f64 = 0.06;
 const TERMINAL_CHAR_WIDTH_SAMPLE_CELLS: usize = 64;
@@ -226,13 +229,13 @@ const TERMINAL_TILE_GAP_X: f32 = 0.0;
 const TERMINAL_TILE_GAP_Y: f32 = 0.0;
 const TERMINAL_PANE_INNER_MARGIN: f32 = 2.0;
 const APP_BG: Color32 = Color32::from_rgb(16, 16, 16);
-const SURFACE_BG: Color32 = Color32::from_rgb(22, 22, 22);
-const SURFACE_BG_SOFT: Color32 = Color32::from_rgb(28, 28, 28);
-const TERMINAL_OUTPUT_BG: Color32 = SURFACE_BG;
-const BORDER_COLOR: Color32 = Color32::from_rgb(38, 38, 38);
-const ACCENT: Color32 = Color32::from_rgb(200, 200, 200);
-const TEXT_PRIMARY: Color32 = Color32::from_rgb(255, 255, 255);
-const TEXT_MUTED: Color32 = Color32::from_rgb(140, 140, 140);
+const SURFACE_BG: Color32 = Color32::from_rgb(24, 24, 24);
+const SURFACE_BG_SOFT: Color32 = Color32::from_rgb(30, 30, 30);
+const TERMINAL_OUTPUT_BG: Color32 = Color32::from_rgb(20, 20, 20);
+const BORDER_COLOR: Color32 = Color32::from_rgb(42, 42, 42);
+const ACCENT: Color32 = Color32::from_rgb(170, 170, 170);
+const TEXT_PRIMARY: Color32 = Color32::from_rgb(244, 244, 244);
+const TEXT_MUTED: Color32 = Color32::from_rgb(138, 138, 138);
 const DIRECTORY_SEARCH_MATCH_COLOR: Color32 = Color32::from_rgb(255, 176, 64);
 // Fallback defaults for persisted, resizable side panels.
 const PROJECT_EXPLORER_WIDTH: f32 = 352.0;
@@ -286,17 +289,17 @@ const SETTINGS_ACCORDION_DISCLOSURE_Y_OFFSET: f32 = 2.5;
 const SETTINGS_ACCORDION_HEADER_ICON_GAP: f32 = 6.0;
 const SETTINGS_NAV_ROW_HEIGHT: f32 = 34.0;
 // Pill button palette
-const BTN_BLUE: Color32 = Color32::from_rgb(16, 64, 112);
-const BTN_BLUE_HOVER: Color32 = Color32::from_rgb(48, 48, 48);
-const BTN_TEAL: Color32 = Color32::from_rgb(14, 68, 82);
-const BTN_TEAL_HOVER: Color32 = Color32::from_rgb(20, 92, 110);
-const BTN_SUBTLE: Color32 = Color32::from_rgb(20, 63, 92);
-const BTN_SUBTLE_HOVER: Color32 = Color32::from_rgb(44, 44, 44);
-const BTN_RED: Color32 = Color32::from_rgb(120, 30, 30);
-const BTN_RED_HOVER: Color32 = Color32::from_rgb(160, 40, 40);
-const BTN_ICON: Color32 = Color32::from_rgb(24, 70, 103);
-const BTN_ICON_HOVER: Color32 = Color32::from_rgb(50, 50, 50);
-const BTN_ICON_ACTIVE: Color32 = Color32::from_rgb(24, 118, 172);
+const BTN_BLUE: Color32 = Color32::from_rgb(37, 99, 235);
+const BTN_BLUE_HOVER: Color32 = Color32::from_rgb(29, 78, 216);
+const BTN_TEAL: Color32 = Color32::from_rgb(15, 76, 92);
+const BTN_TEAL_HOVER: Color32 = Color32::from_rgb(20, 100, 120);
+const BTN_SUBTLE: Color32 = Color32::from_rgb(25, 70, 100);
+const BTN_SUBTLE_HOVER: Color32 = Color32::from_rgb(35, 35, 35);
+const BTN_RED: Color32 = Color32::from_rgb(185, 45, 45);
+const BTN_RED_HOVER: Color32 = Color32::from_rgb(220, 60, 60);
+const BTN_ICON: Color32 = Color32::from_rgb(30, 30, 30);
+const BTN_ICON_HOVER: Color32 = Color32::from_rgb(45, 45, 45);
+const BTN_ICON_ACTIVE: Color32 = Color32::from_rgb(37, 99, 235);
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(target_os = "windows")]
@@ -680,9 +683,9 @@ fn decode_launcher_icon_image(bytes: &[u8]) -> Result<egui::ColorImage, ImageErr
 
 fn paint_builtin_launcher_icon(ui: &Ui, rect: egui::Rect, texture: &TextureHandle, hovered: bool) {
     let fill = if hovered {
-        with_alpha(Color32::from_rgb(54, 54, 54), 220)
+        with_alpha(Color32::from_rgb(50, 50, 50), 220)
     } else {
-        Color32::from_rgb(38, 38, 38)
+        Color32::from_rgb(30, 30, 30)
     };
     ui.painter().rect_filled(rect, 8.0, fill);
     ui.painter().image(
@@ -2550,31 +2553,31 @@ fn ai_badge_visual(
 ) -> Option<AiBadgeVisual> {
     match status {
         AiCliStatus::Inactive => None,
-        AiCliStatus::Running => Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180))),
+        AiCliStatus::Running => Some(AiBadgeVisual::Spinner(Color32::from_rgb(170, 170, 170))),
         AiCliStatus::Attention => {
             // Check Codex first - if it has normalized status, use Codex rules
             if let Some(codex_status) = codex_normalized_status {
                 return match codex_status {
                     CodexTransportStatus::Working => {
-                        Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180)))
+                        Some(AiBadgeVisual::Spinner(Color32::from_rgb(170, 170, 170)))
                     }
                     CodexTransportStatus::Permission => {
                         // Permission: pulse if pending, solid if acknowledged
                         if codex_attention_pending {
-                            Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 180, 100)))
+                            Some(AiBadgeVisual::Pulse(Color32::from_rgb(210, 170, 80)))
                         } else {
-                            Some(AiBadgeVisual::Solid(Color32::from_rgb(220, 180, 100)))
+                            Some(AiBadgeVisual::Solid(Color32::from_rgb(210, 170, 80)))
                         }
                     }
                     CodexTransportStatus::Idle => {
                         // Idle: pulse if pending, hidden if acknowledged
                         if codex_attention_pending {
-                            Some(AiBadgeVisual::Pulse(Color32::from_rgb(100, 200, 100)))
+                            Some(AiBadgeVisual::Pulse(Color32::from_rgb(90, 185, 90)))
                         } else if codex_attention_reason == Some(CodexAttentionReason::TurnComplete)
                         {
                             None
                         } else {
-                            Some(AiBadgeVisual::Solid(Color32::from_rgb(100, 200, 100)))
+                            Some(AiBadgeVisual::Solid(Color32::from_rgb(90, 185, 90)))
                         }
                     }
                 };
@@ -2584,20 +2587,20 @@ fn ai_badge_visual(
             if let Some(claude_status) = claude_normalized_status {
                 return match claude_status {
                     ClaudeTransportStatus::Working => {
-                        Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180)))
+                        Some(AiBadgeVisual::Spinner(Color32::from_rgb(170, 170, 170)))
                     }
                     ClaudeTransportStatus::Permission => {
                         if codex_attention_pending {
-                            Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 180, 100)))
+                            Some(AiBadgeVisual::Pulse(Color32::from_rgb(210, 170, 80)))
                         } else {
-                            Some(AiBadgeVisual::Solid(Color32::from_rgb(220, 180, 100)))
+                            Some(AiBadgeVisual::Solid(Color32::from_rgb(210, 170, 80)))
                         }
                     }
                     ClaudeTransportStatus::Idle => {
                         if codex_attention_pending {
-                            Some(AiBadgeVisual::Pulse(Color32::from_rgb(100, 200, 100)))
+                            Some(AiBadgeVisual::Pulse(Color32::from_rgb(90, 185, 90)))
                         } else {
-                            Some(AiBadgeVisual::Solid(Color32::from_rgb(100, 200, 100)))
+                            Some(AiBadgeVisual::Solid(Color32::from_rgb(90, 185, 90)))
                         }
                     }
                 };
@@ -2608,17 +2611,17 @@ fn ai_badge_visual(
                 Some(OpenCodeTransportStatus::Permission) => {
                     // Permission/Question: pulse if pending, solid if acknowledged
                     if opencode_attention_pending {
-                        Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 180, 100)))
+                        Some(AiBadgeVisual::Pulse(Color32::from_rgb(210, 170, 80)))
                         // Amber pulse
                     } else {
-                        Some(AiBadgeVisual::Solid(Color32::from_rgb(220, 180, 100)))
+                        Some(AiBadgeVisual::Solid(Color32::from_rgb(210, 170, 80)))
                         // Amber solid (acknowledged)
                     }
                 }
                 Some(OpenCodeTransportStatus::Idle) => {
                     // Idle/TurnComplete: pulse if pending, hidden if acknowledged
                     if opencode_attention_pending {
-                        Some(AiBadgeVisual::Pulse(Color32::from_rgb(100, 200, 100)))
+                        Some(AiBadgeVisual::Pulse(Color32::from_rgb(90, 185, 90)))
                         // Green pulse (turn complete notification)
                     } else {
                         // Hide badge for TurnComplete after acknowledge
@@ -2627,21 +2630,21 @@ fn ai_badge_visual(
                         {
                             None // Turn complete acknowledged - badge hidden
                         } else {
-                            Some(AiBadgeVisual::Solid(Color32::from_rgb(100, 200, 100)))
+                            Some(AiBadgeVisual::Solid(Color32::from_rgb(90, 185, 90)))
                             // Green solid (non-TurnComplete Idle states)
                         }
                     }
                 }
                 Some(OpenCodeTransportStatus::Working) => {
                     // Shouldn't be attention + working, but handle gracefully
-                    Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180)))
+                    Some(AiBadgeVisual::Spinner(Color32::from_rgb(170, 170, 170)))
                 }
                 None => {
                     // No normalized status - use pending flag to decide
                     if codex_attention_pending || opencode_attention_pending {
-                        Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 220, 220)))
+                        Some(AiBadgeVisual::Pulse(Color32::from_rgb(200, 200, 200)))
                     } else {
-                        Some(AiBadgeVisual::Solid(Color32::from_rgb(180, 180, 180)))
+                        Some(AiBadgeVisual::Solid(Color32::from_rgb(170, 170, 170)))
                     }
                 }
             }
@@ -3926,6 +3929,14 @@ impl AdeApp {
         }
     }
 
+    /// Compute the preferred content width for a transient toast notification.
+    /// Respects screen size so the toast never overflows the viewport.
+    fn transient_toast_content_width(screen_width: f32) -> f32 {
+        let preferred = (screen_width - TRANSIENT_TOAST_SCREEN_MARGIN)
+            .clamp(TRANSIENT_TOAST_MIN_WIDTH, TRANSIENT_TOAST_MAX_WIDTH);
+        preferred.min(screen_width)
+    }
+
     fn draw_transient_toast(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|input| input.time);
         let Some(message) =
@@ -3942,6 +3953,9 @@ impl AdeApp {
             .unwrap_or_default();
         ctx.request_repaint_after(Duration::from_secs_f64(remaining));
 
+        let screen_width = ctx.screen_rect().width();
+        let toast_width = Self::transient_toast_content_width(screen_width);
+
         egui::Area::new(Id::new("transient_status_toast"))
             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-18.0, -18.0))
             .order(egui::Order::Foreground)
@@ -3953,11 +3967,15 @@ impl AdeApp {
                     .rounding(10.0)
                     .inner_margin(egui::Margin::symmetric(12.0, 8.0))
                     .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(message)
-                                .color(TEXT_PRIMARY)
-                                .strong()
-                                .size(13.0),
+                        ui.set_width(toast_width);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(message)
+                                    .color(TEXT_PRIMARY)
+                                    .strong()
+                                    .size(13.0),
+                            )
+                            .wrap(),
                         );
                     });
             });
@@ -10889,32 +10907,32 @@ impl AdeApp {
         visuals.panel_fill = SURFACE_BG;
         visuals.window_fill = SURFACE_BG;
         visuals.faint_bg_color = SURFACE_BG_SOFT;
-        visuals.extreme_bg_color = Color32::from_rgb(16, 16, 16);
-        visuals.code_bg_color = Color32::from_rgb(18, 18, 18);
+        visuals.extreme_bg_color = Color32::from_rgb(14, 14, 14);
+        visuals.code_bg_color = Color32::from_rgb(16, 16, 16);
         visuals.hyperlink_color = ACCENT;
         visuals.window_stroke = Stroke::new(1.0, BORDER_COLOR);
-        visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(30, 30, 30);
-        visuals.widgets.noninteractive.weak_bg_fill = Color32::from_rgb(26, 26, 26);
-        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(45, 45, 45));
+        visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(28, 28, 28);
+        visuals.widgets.noninteractive.weak_bg_fill = Color32::from_rgb(24, 24, 24);
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(42, 42, 42));
         visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_MUTED);
-        visuals.widgets.inactive.bg_fill = Color32::from_rgb(32, 32, 32);
-        visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(28, 28, 28);
-        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(50, 50, 50));
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(30, 30, 30);
+        visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(26, 26, 26);
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(46, 46, 46));
         visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(50, 50, 50);
-        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(45, 45, 45);
-        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(80, 80, 80));
-        visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::from_rgb(255, 255, 255));
-        visuals.widgets.active.bg_fill = Color32::from_rgb(60, 60, 60);
-        visuals.widgets.active.weak_bg_fill = Color32::from_rgb(55, 55, 55);
-        visuals.widgets.active.bg_stroke = Stroke::new(1.0, Color32::from_rgb(100, 100, 100));
-        visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::from_rgb(255, 255, 255));
-        visuals.widgets.open.bg_fill = Color32::from_rgb(70, 70, 70);
-        visuals.widgets.open.weak_bg_fill = Color32::from_rgb(60, 60, 60);
-        visuals.widgets.open.bg_stroke = Stroke::new(1.0, Color32::from_rgb(120, 120, 120));
-        visuals.widgets.open.fg_stroke = Stroke::new(1.0, Color32::from_rgb(255, 255, 255));
-        visuals.selection.bg_fill = Color32::from_rgb(50, 50, 50);
-        visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(100, 100, 100));
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(44, 44, 44);
+        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(40, 40, 40);
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(70, 70, 70));
+        visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+        visuals.widgets.active.bg_fill = Color32::from_rgb(52, 52, 52);
+        visuals.widgets.active.weak_bg_fill = Color32::from_rgb(48, 48, 48);
+        visuals.widgets.active.bg_stroke = Stroke::new(1.0, Color32::from_rgb(90, 90, 90));
+        visuals.widgets.active.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+        visuals.widgets.open.bg_fill = Color32::from_rgb(60, 60, 60);
+        visuals.widgets.open.weak_bg_fill = Color32::from_rgb(54, 54, 54);
+        visuals.widgets.open.bg_stroke = Stroke::new(1.0, Color32::from_rgb(100, 100, 100));
+        visuals.widgets.open.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+        visuals.selection.bg_fill = Color32::from_rgb(44, 44, 44);
+        visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(90, 90, 90));
 
         style.visuals = visuals;
         ctx.set_style(style);
@@ -13358,7 +13376,7 @@ impl AdeApp {
                         ui.label(
                             RichText::new(warning)
                                 .small()
-                                .color(Color32::from_rgb(232, 184, 76)),
+                                .color(Color32::from_rgb(220, 170, 60)),
                         );
                     }
 
@@ -13485,8 +13503,8 @@ impl AdeApp {
         ui: &mut Ui,
         changes: &mut SettingsEditOutcome,
     ) {
-        let healthy_color = Color32::from_rgb(114, 209, 152);
-        let _warning_color = Color32::from_rgb(232, 184, 76);
+        let healthy_color = Color32::from_rgb(100, 195, 140);
+        let _warning_color = Color32::from_rgb(220, 170, 60);
 
         ui.label(
             RichText::new(
@@ -13910,7 +13928,7 @@ impl AdeApp {
                     dup_summary
                 ))
                 .small()
-                .color(Color32::from_rgb(232, 184, 76)),
+                .color(Color32::from_rgb(220, 170, 60)),
             );
             ui.add_space(8.0);
         }
@@ -13948,7 +13966,7 @@ impl AdeApp {
             ui.label(
                 RichText::new("Recording key... Press any key to assign, or Escape to cancel.")
                     .strong()
-                    .color(Color32::from_rgb(114, 209, 152)),
+                    .color(Color32::from_rgb(100, 195, 140)),
             );
             ui.add_space(8.0);
         }
@@ -14280,8 +14298,8 @@ impl AdeApp {
         ui: &mut Ui,
         diagnostics: &FactoryDroidTransportDiagnostics,
     ) {
-        let healthy_color = Color32::from_rgb(114, 209, 152);
-        let warning_color = Color32::from_rgb(232, 184, 76);
+        let healthy_color = Color32::from_rgb(100, 195, 140);
+        let warning_color = Color32::from_rgb(220, 170, 60);
         let active_terminal = self
             .active_terminal
             .and_then(|terminal_id| self.terminals.get(&terminal_id));
@@ -15162,7 +15180,7 @@ impl AdeApp {
                                         icons::TRASH,
                                         BTN_RED,
                                         BTN_RED_HOVER,
-                                        Color32::from_rgb(186, 58, 58),
+                                        Color32::from_rgb(170, 50, 50),
                                         "Remove Project",
                                     ) {
                                         remove_selected_project = true;
@@ -15701,11 +15719,12 @@ impl AdeApp {
                                         let is_current = project.path == wt.path;
                                         let current_marker = if is_current { " ●" } else { "" };
                                         let row_text = format!("{}{}", label, current_marker);
-                                        let row_response = draw_clickable_sidebar_text_row(
+                                        let tooltip = format!("{}\n{}", row_text, wt.path.display());
+                                        let row_response = draw_source_control_worktree_row(
                                             ui,
-                                            RichText::new(&row_text).color(TEXT_PRIMARY),
-                                            TEXT_PRIMARY,
-                                            &format!("{}\n{}", row_text, wt.path.display()),
+                                            &label,
+                                            is_current,
+                                            &tooltip,
                                         );
                                         if !already_added && row_response.clicked() {
                                             self.add_project_with_worktree(
@@ -15814,6 +15833,28 @@ impl AdeApp {
                 self.config.ui.project_explorer_width = actual_width;
                 self.note_ui_config_changed();
             }
+
+            // Overlay to soften egui's default bright white resize handle on the panel edge.
+            let explorer_rect = response.response.rect;
+            let resize_x = explorer_rect.max.x - 1.0;
+            let pointer = ctx.input(|i| i.pointer.hover_pos());
+            let near_resize = pointer.map_or(false, |p| {
+                (p.x - resize_x).abs() < 6.0 && explorer_rect.y_range().contains(p.y)
+            });
+            let color = if near_resize {
+                Color32::from_rgb(80, 80, 80) // slightly brighter on hover, still dim
+            } else {
+                Color32::from_rgb(45, 45, 45) // very dim separator
+            };
+            ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("project-explorer-resize-overlay"),
+            ))
+            .vline(
+                resize_x,
+                explorer_rect.y_range(),
+                egui::Stroke::new(1.0, color),
+            );
 
             Some(response.response.rect)
         } else {
@@ -16356,7 +16397,7 @@ impl AdeApp {
                             icons::X,
                             BTN_RED,
                             BTN_RED_HOVER,
-                            Color32::from_rgb(186, 58, 58),
+                            Color32::from_rgb(170, 50, 50),
                             "Close",
                         ) {
                             close_terminal = true;
@@ -20296,7 +20337,7 @@ impl AdeApp {
                                     icons::X,
                                     BTN_RED,
                                     BTN_RED_HOVER,
-                                    Color32::from_rgb(186, 58, 58),
+                                    Color32::from_rgb(170, 50, 50),
                                     "Close",
                                 ) {
                                     close_requested = true;
@@ -24401,6 +24442,70 @@ fn draw_source_control_file_row(ui: &mut Ui, status_icon: AppIcon, text: &str) -
     )
 }
 
+fn draw_source_control_worktree_row(
+    ui: &mut Ui,
+    label: &str,
+    is_current: bool,
+    tooltip: &str,
+) -> egui::Response {
+    let button_padding = ui.spacing().button_padding;
+    let available_width = ui.available_width().max(0.0);
+    let icon_width = SOURCE_CONTROL_FILE_ICON_WIDTH;
+    let icon_gap = SOURCE_CONTROL_FILE_ICON_GAP;
+    let wrap_width =
+        (sidebar_row_wrap_width(available_width, button_padding) - icon_width - icon_gap).max(0.0);
+
+    let current_marker = if is_current { " ●" } else { "" };
+    let text = format!("{}{}", label, current_marker);
+    let galley = WidgetText::from(RichText::new(&text)).into_galley(
+        ui,
+        Some(TextWrapMode::Truncate),
+        wrap_width,
+        egui::TextStyle::Body,
+    );
+    let desired_height = sidebar_row_desired_height(ui, galley.size().y, button_padding);
+    let desired_size = egui::vec2(available_width, desired_height);
+    let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
+
+    if ui.is_rect_visible(rect) {
+        if let Some(fill) = directory_file_row_hover_fill(
+            response.hovered() || response.highlighted() || response.has_focus(),
+        ) {
+            ui.painter()
+                .rect_filled(rect.shrink2(egui::vec2(1.0, 1.0)), 8.0, fill);
+        }
+
+        let content_rect = sidebar_row_content_rect(rect, button_padding);
+        let icon_rect = egui::Rect::from_min_size(
+            content_rect.min,
+            egui::vec2(icon_width.min(content_rect.width()), content_rect.height()),
+        );
+        ui.painter().text(
+            icon_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            icons::GIT_BRANCH.to_string(),
+            egui::FontId::proportional(12.0),
+            TEXT_MUTED,
+        );
+
+        let text_rect = egui::Rect::from_min_max(
+            egui::pos2(
+                (icon_rect.max.x + icon_gap).min(content_rect.max.x),
+                content_rect.min.y,
+            ),
+            content_rect.max,
+        );
+        let text_pos = egui::pos2(
+            text_rect.min.x,
+            content_rect.center().y - (galley.size().y * 0.5),
+        );
+        ui.painter().galley(text_pos, galley, TEXT_PRIMARY);
+    }
+
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    with_truncation_tooltip(ui, response, tooltip, &font_id, TEXT_PRIMARY, wrap_width)
+}
+
 fn directory_file_row_hover_fill(is_hovered: bool) -> Option<Color32> {
     is_hovered.then(|| with_alpha(BTN_ICON_HOVER, 110))
 }
@@ -24994,18 +25099,17 @@ fn with_minimal_button_chrome<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)
         style.visuals.widgets.hovered.bg_fill = hover_fill;
         style.visuals.widgets.hovered.weak_bg_fill = hover_fill;
         style.visuals.widgets.hovered.bg_stroke = Stroke::NONE;
-        style.visuals.widgets.hovered.fg_stroke =
-            Stroke::new(1.0, Color32::from_rgb(255, 255, 255));
+        style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
 
         style.visuals.widgets.active.bg_fill = Color32::TRANSPARENT;
         style.visuals.widgets.active.weak_bg_fill = Color32::TRANSPARENT;
         style.visuals.widgets.active.bg_stroke = Stroke::NONE;
-        style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::from_rgb(255, 255, 255));
+        style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
 
         style.visuals.widgets.open.bg_fill = Color32::TRANSPARENT;
         style.visuals.widgets.open.weak_bg_fill = Color32::TRANSPARENT;
         style.visuals.widgets.open.bg_stroke = Stroke::NONE;
-        style.visuals.widgets.open.fg_stroke = Stroke::new(1.0, Color32::from_rgb(255, 255, 255));
+        style.visuals.widgets.open.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
 
         add_contents(ui)
     })
@@ -25023,16 +25127,16 @@ fn smart_input_status_text(terminal: &TerminalEntry) -> (&'static str, Color32) 
         }
         Some(OpenCodeTransportStatus::Permission) => (
             "OpenCode needs input - auto queue paused",
-            Color32::from_rgb(232, 184, 76),
+            Color32::from_rgb(220, 170, 60),
         ),
         Some(OpenCodeTransportStatus::Idle) => match terminal.opencode_attention_reason {
             Some(OpenCodeAttentionReason::TurnComplete) => (
                 "Ready - next queued task will run",
-                Color32::from_rgb(100, 200, 100),
+                Color32::from_rgb(90, 185, 90),
             ),
             Some(OpenCodeAttentionReason::SessionError) => (
                 "Session error - review before sending",
-                Color32::from_rgb(232, 100, 100),
+                Color32::from_rgb(210, 90, 90),
             ),
             _ => ("OpenCode idle", TEXT_MUTED),
         },
@@ -25050,8 +25154,8 @@ fn draw_smart_input_footer(
     let mut action = SmartInputPaneAction::default();
 
     egui::Frame::none()
-        .fill(Color32::from_rgb(18, 20, 22))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(46, 50, 54)))
+        .fill(Color32::from_rgb(22, 22, 24))
+        .stroke(Stroke::new(1.0, BORDER_COLOR))
         .rounding(8.0)
         .inner_margin(egui::Margin::symmetric(8.0, 6.0))
         .show(ui, |ui| {
@@ -25086,7 +25190,7 @@ fn draw_smart_input_footer(
                         "Auto off"
                     };
                     let auto_color = if state.auto_run_enabled {
-                        Color32::from_rgb(100, 200, 100)
+                        Color32::from_rgb(90, 185, 90)
                     } else {
                         TEXT_MUTED
                     };
@@ -25133,7 +25237,7 @@ fn draw_smart_input_footer(
                         .button(
                             RichText::new("Clear")
                                 .small()
-                                .color(Color32::from_rgb(232, 100, 100)),
+                                .color(Color32::from_rgb(210, 90, 90)),
                         )
                         .on_hover_text("Remove all queued Smart Input tasks")
                         .clicked()
@@ -25254,7 +25358,7 @@ fn draw_smart_input_footer(
                                                     egui::pos2(row_rect.left(), line_y),
                                                     egui::pos2(row_rect.right(), line_y),
                                                 ],
-                                                Stroke::new(2.0, Color32::from_rgb(100, 200, 100)),
+                                                Stroke::new(2.0, Color32::from_rgb(90, 185, 90)),
                                             );
                                             state.drag_hover_index = Some(if is_above_center {
                                                 index
@@ -25394,7 +25498,7 @@ fn draw_terminal_foreground_message_menu_button(
     let icon_color = if foreground_messages.is_empty() {
         with_alpha(TEXT_PRIMARY, 190)
     } else {
-        Color32::from_rgb(100, 200, 100)
+        Color32::from_rgb(90, 185, 90)
     };
 
     let message_menu = with_minimal_button_chrome(ui, |ui| {
@@ -25472,7 +25576,7 @@ fn draw_terminal_foreground_message_menu_button(
                                             AppIcon::Trash,
                                             BTN_SUBTLE,
                                             BTN_RED_HOVER,
-                                            Color32::from_rgb(186, 58, 58),
+                                            Color32::from_rgb(170, 50, 50),
                                             "Delete",
                                         ) {
                                             delete_index = Some(index);
@@ -25958,7 +26062,7 @@ fn styled_icon_button(
     }
 
     let icon_color = if response.is_pointer_button_down_on() || response.hovered() {
-        Color32::from_rgb(255, 255, 255)
+        TEXT_PRIMARY
     } else {
         with_alpha(TEXT_PRIMARY, 178)
     };
@@ -26013,7 +26117,7 @@ fn browser_toolbar_icon_button(ui: &mut Ui, icon: AppIcon, tooltip: &str) -> egu
         format!("{icon}"),
         egui::FontId::proportional(15.0),
         if response.is_pointer_button_down_on() || response.hovered() {
-            Color32::from_rgb(255, 255, 255)
+            TEXT_PRIMARY
         } else {
             with_alpha(TEXT_PRIMARY, 178)
         },
@@ -26061,7 +26165,7 @@ fn browser_toolbar_toggle_button(
     }
 
     let icon_color = if selected || response.hovered() || response.is_pointer_button_down_on() {
-        Color32::from_rgb(255, 255, 255)
+        TEXT_PRIMARY
     } else {
         with_alpha(TEXT_PRIMARY, 170)
     };
@@ -26125,7 +26229,7 @@ fn styled_icon_button_response(
     }
 
     let icon_color = if response.is_pointer_button_down_on() || response.hovered() {
-        Color32::from_rgb(255, 255, 255)
+        TEXT_PRIMARY
     } else {
         with_alpha(TEXT_PRIMARY, 178)
     };
@@ -26165,7 +26269,7 @@ fn editor_header_icon_button(
 
     // Icon color: use provided high-contrast color
     let final_icon_color = if response.is_pointer_button_down_on() {
-        Color32::from_rgb(255, 255, 255)
+        TEXT_PRIMARY
     } else {
         icon_color
     };
@@ -26210,7 +26314,7 @@ fn terminal_manager_test_done_toggle(ui: &mut Ui, test_done: bool) -> bool {
 
     // Icon color: green when done, white when not done
     let icon_color = if test_done {
-        Color32::from_rgb(100, 200, 100)
+        Color32::from_rgb(90, 185, 90)
     } else {
         TEXT_PRIMARY
     };
@@ -26340,7 +26444,7 @@ fn activity_rail_icon_button(
     }
 
     let icon_color = if selected || response.hovered() || response.is_pointer_button_down_on() {
-        Color32::from_rgb(255, 255, 255)
+        TEXT_PRIMARY
     } else {
         with_alpha(TEXT_PRIMARY, 170)
     };
@@ -26358,7 +26462,7 @@ fn activity_rail_icon_button(
 fn paint_activity_rail_warning_badge(ui: &Ui, button_rect: egui::Rect) {
     let center = egui::pos2(button_rect.right() - 6.0, button_rect.top() + 6.0);
     ui.painter()
-        .circle_filled(center, 4.0, Color32::from_rgb(232, 184, 76));
+        .circle_filled(center, 4.0, Color32::from_rgb(220, 170, 60));
     ui.painter()
         .circle_stroke(center, 4.0, Stroke::new(1.0, SURFACE_BG));
 }
@@ -26724,7 +26828,7 @@ fn draw_settings_saved_message_card(
                 AppIcon::Trash,
                 BTN_RED,
                 BTN_RED_HOVER,
-                Color32::from_rgb(186, 58, 58),
+                Color32::from_rgb(170, 50, 50),
                 "Remove saved message",
             ) {
                 remove_clicked = true;
@@ -28132,7 +28236,8 @@ mod tests {
         PENDING_RERUN_BATCH_PROMPT_WAIT_MS, PENDING_RERUN_SETTLE_MS,
         SOURCE_CONTROL_CHANNEL_CAPACITY, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG,
         TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS,
-        TERMINAL_OUTPUT_BG, TEXT_MUTED, TEXT_PRIMARY, TRANSIENT_TOAST_SECS,
+        TERMINAL_OUTPUT_BG, TEXT_MUTED, TEXT_PRIMARY, TRANSIENT_TOAST_MAX_WIDTH,
+        TRANSIENT_TOAST_MIN_WIDTH, TRANSIENT_TOAST_SCREEN_MARGIN, TRANSIENT_TOAST_SECS,
     };
     use crate::browser_video::BrowserVideoEncodeResult;
     use crate::codex::{CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
@@ -29817,6 +29922,30 @@ mod tests {
             None
         );
         assert_eq!(AdeApp::active_transient_toast_message(None, 0.0), None);
+    }
+
+    #[test]
+    fn transient_toast_content_width_uses_max_on_wide_screen() {
+        assert_eq!(
+            AdeApp::transient_toast_content_width(1920.0),
+            TRANSIENT_TOAST_MAX_WIDTH
+        );
+    }
+
+    #[test]
+    fn transient_toast_content_width_caps_at_screen_on_narrow_screen() {
+        assert_eq!(AdeApp::transient_toast_content_width(300.0), 300.0);
+    }
+
+    #[test]
+    fn transient_toast_content_width_never_exceeds_screen() {
+        assert_eq!(AdeApp::transient_toast_content_width(200.0), 200.0);
+    }
+
+    #[test]
+    fn transient_toast_content_width_scales_between_min_and_max() {
+        // 600px screen -> 600 - 48 = 552, which is between 420 and 640
+        assert_eq!(AdeApp::transient_toast_content_width(600.0), 552.0);
     }
 
     #[test]
@@ -36129,7 +36258,7 @@ mod tests {
         );
         assert_eq!(
             visual,
-            Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180)))
+            Some(AiBadgeVisual::Spinner(Color32::from_rgb(170, 170, 170)))
         );
     }
 
@@ -36189,7 +36318,7 @@ mod tests {
         );
         assert_eq!(
             visual,
-            Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 180, 100)))
+            Some(AiBadgeVisual::Pulse(Color32::from_rgb(210, 170, 80)))
         );
     }
 
@@ -36497,7 +36626,7 @@ mod tests {
         );
         assert_eq!(
             visual,
-            Some(AiBadgeVisual::Solid(Color32::from_rgb(220, 180, 100))),
+            Some(AiBadgeVisual::Solid(Color32::from_rgb(210, 170, 80))),
             "QuestionAsked badge should remain visible (amber solid) after acknowledge"
         );
     }
@@ -36536,7 +36665,7 @@ mod tests {
         );
         assert_eq!(
             visual,
-            Some(AiBadgeVisual::Solid(Color32::from_rgb(220, 180, 100))),
+            Some(AiBadgeVisual::Solid(Color32::from_rgb(210, 170, 80))),
             "PermissionAsked badge should remain visible (amber solid) after acknowledge"
         );
     }
@@ -36685,7 +36814,7 @@ mod tests {
         );
         assert_eq!(
             initial_visual,
-            Some(AiBadgeVisual::Pulse(Color32::from_rgb(100, 200, 100))),
+            Some(AiBadgeVisual::Pulse(Color32::from_rgb(90, 185, 90))),
             "Initial state should show green pulse"
         );
 
@@ -36753,7 +36882,7 @@ mod tests {
         );
         assert_eq!(
             visual,
-            Some(AiBadgeVisual::Solid(Color32::from_rgb(220, 180, 100))),
+            Some(AiBadgeVisual::Solid(Color32::from_rgb(210, 170, 80))),
             "QuestionAsked badge should remain visible (amber solid) after keyboard interaction"
         );
     }
@@ -39920,6 +40049,34 @@ mod tests {
     }
 
     #[test]
+    fn source_control_worktree_row_uses_full_available_width() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let mut observed_width = None;
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(320.0, 80.0));
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(egui::Align::Center)),
+                );
+                let response = super::draw_source_control_worktree_row(
+                    &mut child,
+                    "feature-x",
+                    false,
+                    "feature-x\n/repo/wt",
+                );
+                observed_width = Some(response.rect.width());
+            });
+        });
+
+        let observed_width = observed_width.expect("worktree row width was not observed");
+        assert_eq!(observed_width, 320.0);
+    }
+
+    #[test]
     fn sidebar_row_wrap_width_reserves_shared_leading_inset() {
         let wrap_width = super::sidebar_row_wrap_width(160.0, egui::vec2(8.0, 4.0));
 
@@ -40178,7 +40335,6 @@ mod tests {
     #[test]
     fn normalizes_near_black_terminal_background() {
         let normalized = normalize_terminal_background(TerminalColor { r: 0, g: 0, b: 0 });
-        assert_eq!(normalized, SURFACE_BG);
         assert_eq!(normalized, TERMINAL_OUTPUT_BG);
     }
 
@@ -40478,7 +40634,7 @@ mod tests {
                 false,
                 None
             ),
-            Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180)))
+            Some(AiBadgeVisual::Spinner(Color32::from_rgb(170, 170, 170)))
         );
         assert_eq!(
             ai_badge_visual(
@@ -40491,7 +40647,7 @@ mod tests {
                 true,
                 None
             ),
-            Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 220, 220)))
+            Some(AiBadgeVisual::Pulse(Color32::from_rgb(200, 200, 200)))
         );
         // Without normalized status - pending=false shows solid
         assert_eq!(
@@ -40505,7 +40661,7 @@ mod tests {
                 false,
                 None
             ),
-            Some(AiBadgeVisual::Solid(Color32::from_rgb(180, 180, 180)))
+            Some(AiBadgeVisual::Solid(Color32::from_rgb(170, 170, 170)))
         );
         assert_eq!(
             ai_badge_visual(
@@ -40533,7 +40689,7 @@ mod tests {
                 false,
                 None
             ),
-            Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 180, 100)))
+            Some(AiBadgeVisual::Pulse(Color32::from_rgb(210, 170, 80)))
         );
         assert_eq!(
             ai_badge_visual(
@@ -40559,7 +40715,7 @@ mod tests {
                 false,
                 None
             ),
-            Some(AiBadgeVisual::Solid(Color32::from_rgb(100, 200, 100)))
+            Some(AiBadgeVisual::Solid(Color32::from_rgb(90, 185, 90)))
         );
 
         // With OpenCode normalized status for semantic differentiation
@@ -40576,7 +40732,7 @@ mod tests {
                 true,
                 None
             ),
-            Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 180, 100)))
+            Some(AiBadgeVisual::Pulse(Color32::from_rgb(210, 170, 80)))
         );
         // Permission + pending=false -> solid (acknowledged)
         assert_eq!(
@@ -40590,7 +40746,7 @@ mod tests {
                 false,
                 None
             ),
-            Some(AiBadgeVisual::Solid(Color32::from_rgb(220, 180, 100)))
+            Some(AiBadgeVisual::Solid(Color32::from_rgb(210, 170, 80)))
         );
         // Idle + pending=true -> pulse (turn complete notification)
         assert_eq!(
@@ -40604,7 +40760,7 @@ mod tests {
                 true,
                 Some(OpenCodeAttentionReason::TurnComplete)
             ),
-            Some(AiBadgeVisual::Pulse(Color32::from_rgb(100, 200, 100)))
+            Some(AiBadgeVisual::Pulse(Color32::from_rgb(90, 185, 90)))
         );
         // Idle + pending=false + TurnComplete -> hidden (acknowledged turn complete)
         assert_eq!(
@@ -40632,7 +40788,7 @@ mod tests {
                 false,
                 Some(OpenCodeAttentionReason::PermissionAsked)
             ),
-            Some(AiBadgeVisual::Solid(Color32::from_rgb(220, 180, 100)))
+            Some(AiBadgeVisual::Solid(Color32::from_rgb(210, 170, 80)))
         );
         // Idle + pending=false + QuestionAsked -> amber solid (acknowledged but still needs action)
         assert_eq!(
@@ -40646,7 +40802,7 @@ mod tests {
                 false,
                 Some(OpenCodeAttentionReason::QuestionAsked)
             ),
-            Some(AiBadgeVisual::Solid(Color32::from_rgb(220, 180, 100)))
+            Some(AiBadgeVisual::Solid(Color32::from_rgb(210, 170, 80)))
         );
         // Working status
         assert_eq!(
@@ -40660,7 +40816,7 @@ mod tests {
                 false,
                 None
             ),
-            Some(AiBadgeVisual::Spinner(Color32::from_rgb(180, 180, 180)))
+            Some(AiBadgeVisual::Spinner(Color32::from_rgb(170, 170, 170)))
         );
 
         // With Claude normalized status (takes precedence over OpenCode)
@@ -40676,7 +40832,7 @@ mod tests {
                 false,
                 None
             ),
-            Some(AiBadgeVisual::Pulse(Color32::from_rgb(220, 180, 100)))
+            Some(AiBadgeVisual::Pulse(Color32::from_rgb(210, 170, 80)))
         );
         assert_eq!(
             ai_badge_visual(
@@ -40689,7 +40845,7 @@ mod tests {
                 false,
                 None
             ),
-            Some(AiBadgeVisual::Solid(Color32::from_rgb(100, 200, 100)))
+            Some(AiBadgeVisual::Solid(Color32::from_rgb(90, 185, 90)))
         );
     }
 
@@ -41081,7 +41237,7 @@ mod tests {
 
         assert!(frame_contains_filled_circle(
             &output,
-            Color32::from_rgb(232, 184, 76)
+            Color32::from_rgb(220, 170, 60)
         ));
     }
 

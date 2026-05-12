@@ -196,6 +196,7 @@ If `cargo` is not on PATH in PowerShell, use:
   - "Delete Git Worktree" (`delete_git_worktree`) runs `git worktree remove <path>` and is blocked when live terminals exist or when the worktree has uncommitted changes. Never uses `--force` by default.
 - **Worktree parser tests**: `src/worktree.rs` includes unit tests for `git worktree list --porcelain` parsing: normal worktrees, detached HEAD, locked worktrees, prunable worktrees, and empty output.
 - **Source Control auto-refresh is silent**: Background auto-refreshes do not set `snapshot.loading = true`; only manual Refresh/Fetch actions show the "Refreshing source control..." indicator. This prevents the UI from flashing loading states during periodic updates while still keeping data current.
+- **Worktree list rows must include a contextual icon**: Source Control panel worktree rows should display a recognizable icon (e.g., `icons::GIT_BRANCH`) and a visible current-worktree indicator rather than relying on plain text or a tiny dot. Use `draw_source_control_worktree_row()` for consistent icon + label layout.
 
 ## Terminal Manager & Input History Guidelines
 - **Background terminals use runtime-only input history**: Do not persist background terminal inputs to `history.json`. They use `recent_inputs` (runtime-only) for the rerun/interrupt button.
@@ -435,6 +436,7 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Do not make settings popups resizable.** Modal/pop-up windows such as Settings must keep their fixed sizing unless explicitly redesigned.
 - **Avoid per-frame config writes.** Persist resized panel widths only when width changes meaningfully to prevent excessive disk writes.
 - **Config recovery must preserve persisted panel width fields.** Ensure `recover_config_state()` preserves `project_explorer_width`, `checklist_panel_width`, and `browser_panel_width` when `pending_config_changes.ui` is true.
+- **Resize handle visuals must match the dark theme.** Override egui's default bright white resize handle (`fg_stroke`) with a dim overlay (`Color32::from_rgb(45, 45, 45)`) on the panel edge so the separator does not appear harsh against the dark background. The overlay should be painted in the foreground layer after the panel renders.
 
 ## Directory Icons Guidelines
 - **Directory rows must include stable icons.** File and folder rows should render IDE-like icons without changing lazy loading, search filtering, or row ordering behavior.
