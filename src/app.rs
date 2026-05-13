@@ -27190,17 +27190,15 @@ fn styled_launcher_menu_button(
                                         ui.add_space(6.0);
                                         let _ = app.draw_launcher_icon(ui, launcher.icon_key, 16.0);
                                         ui.add_space(6.0);
-                                        ui.vertical(|ui| {
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(&launcher.display_name)
-                                                        .strong()
-                                                        .color(TEXT_PRIMARY),
-                                                )
-                                                .selectable(false)
-                                                .truncate(),
-                                            );
-                                        });
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&launcher.display_name)
+                                                    .strong()
+                                                    .color(TEXT_PRIMARY),
+                                            )
+                                            .selectable(false)
+                                            .truncate(),
+                                        );
                                         ui.response()
                                     },
                                 );
@@ -32173,17 +32171,15 @@ mod tests {
                                         .sense(Sense::click()),
                                     |ui| {
                                         ui.add_space(6.0);
-                                        ui.vertical(|ui| {
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(&launcher.display_name)
-                                                        .strong()
-                                                        .color(super::TEXT_PRIMARY),
-                                                )
-                                                .selectable(false)
-                                                .truncate(),
-                                            );
-                                        });
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&launcher.display_name)
+                                                    .strong()
+                                                    .color(super::TEXT_PRIMARY),
+                                            )
+                                            .selectable(false)
+                                            .truncate(),
+                                        );
                                         ui.response()
                                     },
                                 );
