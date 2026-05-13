@@ -208,6 +208,7 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Windows batch confirmation prompt detection**: On Windows PowerShell/CMD shells, after sending `Ctrl+C`, check the latest runtime snapshot for `Terminate batch job (Y/N)?` on the last non-empty line. If detected, send automatic `y\r` confirmation, wait for `PENDING_RERUN_BATCH_CONFIRM_SETTLE_MS`, then replay the command.
 - **Internal confirmation input must not be recorded**: The automatic `y` sent to confirm batch termination is internal control input and must never be added to `recent_inputs` or persisted history.
 - **Do not interpolate GitHub contexts directly**: In workflow `run:` steps, use environment variables instead of direct `${{ github.ref_name }}` interpolation to avoid shell injection risks (per Semgrep findings).
+- **Launcher dropdown uses fixed width.** The Terminal Manager project header's foreground launcher menu (`styled_launcher_menu_button`) must set a fixed width (`FOREGROUND_LAUNCHER_MENU_WIDTH`) via `ui.set_min_width` / `ui.set_max_width` inside the popup. `ui.available_width()` in egui popups is unbounded and can produce absurdly wide menus. Launcher display names and commands are truncated with `.truncate()`; hover tooltip shows the full text.
 
 ## Terminal Manager Saved Messages Guidelines
 - **Two separate message systems**: Terminal Manager has distinct saved message systems for foreground and background terminals:

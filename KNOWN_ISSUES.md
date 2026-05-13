@@ -148,3 +148,23 @@
 - References: Internal review 2026-05-12
 
 ---
+
+#### Terminal Manager foreground launcher menu opened at absurd width {#launcher-menu-absurd-width}
+- Date: 2026-05-13
+- Context: User reported that clicking the "new terminal" (foreground launcher) button in the Terminal Manager opened a menu that was extremely wide.
+- Error signature: `ui.available_width()` inside an egui popup can return a very large or effectively unbounded value, causing the launcher menu rows to stretch far beyond the sidebar.
+- Symptoms/Impact:
+  1. The foreground launcher dropdown was visually broken, spanning hundreds of pixels.
+  2. Long launcher display names or commands made the menu even wider.
+- Root cause:
+  - `styled_launcher_menu_button` used `ui.available_width().max(0.0)` for each launcher row inside a popup. In egui popups `available_width()` is not constrained by the parent sidebar width.
+- Resolution:
+  - Introduced `FOREGROUND_LAUNCHER_MENU_WIDTH` (220 px) constant.
+  - The popup now calls `ui.set_min_width` / `ui.set_max_width` with this fixed width.
+  - Each row is drawn at exactly this width; launcher names and commands use `.truncate()` with a hover tooltip for the full text.
+- Prevent recurrence:
+  - Added regression test `foreground_launcher_menu_row_does_not_exceed_fixed_width`.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo test`
+- References: User request 2026-05-13
+
+---
