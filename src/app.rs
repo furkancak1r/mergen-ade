@@ -254,6 +254,7 @@ const TERMINAL_MANAGER_FILTER_TOP_PADDING: f32 = 4.0;
 const TERMINAL_MANAGER_FILTER_UNDERLINE_GAP: f32 = 2.0;
 const TERMINAL_MANAGER_FILTER_UNDERLINE_HEIGHT: f32 = 2.0;
 const SIDEBAR_ROW_LEADING_INSET: f32 = 6.0;
+const TERMINAL_MANAGER_WORKTREE_TERMINAL_EXTRA_INDENT: f32 = 10.0;
 const TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH: f32 = 32.0;
 const SOURCE_CONTROL_FILE_ICON_WIDTH: f32 = 16.0;
 const SOURCE_CONTROL_FILE_ICON_GAP: f32 = 6.0;
@@ -8789,6 +8790,48 @@ impl AdeApp {
         }
     }
 
+    fn cleanup_orphan_worktrees_for_project(
+        &mut self,
+        ctx: &egui::Context,
+        project_id: u64,
+        snapshot: &SourceControlSnapshot,
+    ) {
+        let Some(root_project) = self.projects.get(&project_id) else {
+            return;
+        };
+        if root_project.is_worktree {
+            return;
+        }
+        let repo_path = root_project.path.clone();
+
+        let discovered_paths: std::collections::HashSet<std::path::PathBuf> = snapshot
+            .worktrees
+            .iter()
+            .map(|wt| wt.path.clone())
+            .collect();
+
+        let orphan_ids: Vec<u64> = self
+            .projects
+            .values()
+            .filter(|p| {
+                if !p.is_worktree {
+                    return false;
+                }
+                if p.repo_root.as_ref() != Some(&repo_path) {
+                    return false;
+                }
+                let still_known_by_git = discovered_paths.contains(&p.path);
+                let path_exists = p.path.exists();
+                !still_known_by_git && !path_exists
+            })
+            .map(|p| p.id)
+            .collect();
+
+        for orphan_id in orphan_ids {
+            self.remove_project(ctx, orphan_id);
+        }
+    }
+
     fn process_source_control_events(&mut self, ctx: &egui::Context) {
         let mut changed = false;
         let completed_at = ctx.input(|input| input.time);
@@ -8802,6 +8845,9 @@ impl AdeApp {
                 self.source_control_state.get(&event.project_id),
                 event.snapshot,
             );
+            if merged_snapshot.last_error.is_none() {
+                self.cleanup_orphan_worktrees_for_project(ctx, event.project_id, &merged_snapshot);
+            }
             self.source_control_state
                 .insert(event.project_id, merged_snapshot);
             changed = true;
@@ -17023,19 +17069,28 @@ impl AdeApp {
                                 self.terminal_count_for_project_kind(wt_project_id, visible_kind);
                             if wt_visible_count > 0 {
                                 ui.add_space(2.0);
-                                ui.indent(
-                                    Id::new(("terminal-manager-body", project_id, wt_project_id)),
-                                    |ui| {
-                                        self.draw_terminal_rows(
-                                            ctx,
-                                            ui,
+                                ui.scope(|ui| {
+                                    let previous_indent = ui.spacing().indent;
+                                    ui.spacing_mut().indent = previous_indent
+                                        + TERMINAL_MANAGER_WORKTREE_TERMINAL_EXTRA_INDENT;
+                                    ui.indent(
+                                        Id::new((
+                                            "terminal-manager-body",
+                                            project_id,
                                             wt_project_id,
-                                            visible_kind,
-                                            panel_right,
-                                            max_tooltip_right,
-                                        );
-                                    },
-                                );
+                                        )),
+                                        |ui| {
+                                            self.draw_terminal_rows(
+                                                ctx,
+                                                ui,
+                                                wt_project_id,
+                                                visible_kind,
+                                                panel_right,
+                                                max_tooltip_right,
+                                            );
+                                        },
+                                    );
+                                });
                             }
                         }
                         if worktree_count > 0 && visible_count > 0 {
@@ -22522,6 +22577,27 @@ impl AdeApp {
         }
     }
 
+    /// Copy `.env*` files from the repo root into a newly created worktree so
+    /// that runtime commands (e.g. `npm run dev`) still find their environment
+    /// variables. Only root-level files are copied; deeper nested `.env` files
+    /// are left untouched to avoid surprising overwrites in monorepos.
+    fn copy_worktree_env_files(repo_path: &std::path::Path, worktree_path: &std::path::Path) {
+        let Ok(entries) = std::fs::read_dir(repo_path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_lossy = name.to_string_lossy();
+            if name_lossy.starts_with(".env") {
+                let src = entry.path();
+                if src.is_file() {
+                    let dst = worktree_path.join(&name);
+                    let _ = std::fs::copy(&src, &dst);
+                }
+            }
+        }
+    }
+
     fn run_git_worktree_add(
         repo_path: &std::path::Path,
         worktree_path: &str,
@@ -22560,11 +22636,13 @@ impl AdeApp {
         } else {
             repo_path.join(worktree_path)
         };
-        if let Ok(canonical) = resolved.canonicalize() {
-            Ok(canonical)
+        let result = if let Ok(canonical) = resolved.canonicalize() {
+            canonical
         } else {
-            Ok(resolved)
-        }
+            resolved
+        };
+        let _ = Self::copy_worktree_env_files(repo_path, &result);
+        Ok(result)
     }
 
     /// Delete a git worktree from disk. Requires clean state and no live terminals.
@@ -25506,7 +25584,7 @@ fn draw_source_control_worktree_row(
             icon_rect.center(),
             egui::Align2::CENTER_CENTER,
             icons::GIT_BRANCH.to_string(),
-            egui::FontId::proportional(12.0),
+            egui::FontId::proportional(10.0),
             TEXT_MUTED,
         );
 
@@ -26442,13 +26520,15 @@ fn draw_smart_input_footer(
             });
 
             if state.expanded && !state.tasks.is_empty() {
-                let rows = state.tasks.len().min(SMART_INPUT_MAX_VISIBLE_TASK_ROWS);
-                let max_height = rows as f32 * SMART_INPUT_TASK_ROW_HEIGHT;
+                // Budget up to ~45% of footer height for queue, but always allow at least 3 rows
+                let queue_budget = (footer_size.y * 0.45 - 30.0)
+                    .max(SMART_INPUT_MAX_VISIBLE_TASK_ROWS as f32 * SMART_INPUT_TASK_ROW_HEIGHT);
+                let max_height = queue_budget;
                 let mut row_action: Option<(u64, &'static str)> = None;
                 egui::ScrollArea::vertical()
                     .id_salt(("smart_input_queue", terminal_id))
                     .max_height(max_height)
-                    .auto_shrink([false, false])
+                    .auto_shrink([false, true])
                     .show(ui, |ui| {
                         for index in 0..state.tasks.len() {
                             let task_id = state.tasks[index].id;
@@ -26599,7 +26679,32 @@ fn draw_smart_input_footer(
                                         TEXT_PRIMARY
                                     };
 
-                                    // Action icons on the left
+                                    // Prompt text on the left
+                                    let preview = capped_hover_text(&task_text, 72);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(preview).small().color(text_color),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(
+                                        capped_hover_text(
+                                            &task_text,
+                                            SMART_INPUT_TOOLTIP_MAX_CHARS,
+                                        ),
+                                    );
+                                    let task_attachments = &mut state.tasks[index].attachments;
+                                    let _removed =
+                                        draw_smart_input_attachments(ui, task_attachments);
+
+                                    // Reserve fixed width for the three action buttons before
+                                    // adding flexible spacer so they remain visible at finite widths
+                                    let action_width = 3.0 * CONTROL_ROW_HEIGHT
+                                        + 2.0 * ui.spacing().item_spacing.x;
+                                    let remaining = (ui.available_width() - action_width).max(0.0);
+                                    ui.add_space(remaining);
+
+                                    // Action buttons on the right
                                     if styled_icon_button(
                                         ui,
                                         icons::ARROW_RIGHT,
@@ -26631,25 +26736,6 @@ fn draw_smart_input_footer(
                                     ) {
                                         row_action = Some((task_id, "delete"));
                                     }
-
-                                    ui.add_space(6.0);
-
-                                    let preview = capped_hover_text(&task_text, 72);
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(preview).small().color(text_color),
-                                        )
-                                        .truncate(),
-                                    )
-                                    .on_hover_text(
-                                        capped_hover_text(
-                                            &task_text,
-                                            SMART_INPUT_TOOLTIP_MAX_CHARS,
-                                        ),
-                                    );
-                                    let task_attachments = &mut state.tasks[index].attachments;
-                                    let _removed =
-                                        draw_smart_input_attachments(ui, task_attachments);
                                 }
                             });
 
@@ -27628,7 +27714,9 @@ fn show_tooltip_above(ui: &mut Ui, response: &egui::Response, tooltip: &str) {
         let tooltip_anchor =
             response.rect.center_top() + egui::vec2(0.0, -BROWSER_TOOLBAR_TOOLTIP_GAP);
 
-        // Use Area with CENTER_BOTTOM pivot so tooltip is centered horizontally above the anchor
+        // Use Area with CENTER_BOTTOM pivot so tooltip is centered horizontally above the anchor.
+        // No .sense() is set so the tooltip does not capture hover; this prevents flicker
+        // caused by the tooltip stealing hover from the underlying widget.
         let ctx = ui.ctx();
         egui::Area::new(tooltip_id)
             .kind(egui::UiKind::Tooltip)
@@ -27636,7 +27724,6 @@ fn show_tooltip_above(ui: &mut Ui, response: &egui::Response, tooltip: &str) {
             .pivot(egui::Align2::CENTER_BOTTOM)
             .fixed_pos(tooltip_anchor)
             .default_width(ctx.style().spacing.tooltip_width)
-            .sense(egui::Sense::hover())
             .show(ctx, |ui| {
                 egui::Frame::popup(&ctx.style()).show(ui, |ui| {
                     ui.style_mut().interaction.selectable_labels = false;
@@ -51914,5 +52001,225 @@ mod tests {
         app.process_pending_os_notifications(&egui::Context::default());
         // Should still only have one entry (the first one)
         assert_eq!(app.os_notification_last_by_terminal.len(), 1);
+    }
+
+    #[test]
+    fn worktree_terminal_indent_exceeds_root_terminal() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let mut min_x_without_extra = None;
+        let mut min_x_with_extra = None;
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect =
+                    egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(320.0, 400.0));
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+
+                // Simulate root indent (as in Terminal Manager body)
+                child.indent(egui::Id::new("root-body"), |ui| {
+                    let before = ui.max_rect().min.x;
+                    // Allocate a dummy row to capture starting x without extra indent
+                    let (row_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width().max(0.0), super::CONTROL_ROW_HEIGHT),
+                        egui::Sense::hover(),
+                    );
+                    min_x_without_extra = Some(row_rect.min.x);
+
+                    // Now simulate worktree extra indent
+                    ui.scope(|ui| {
+                        let previous_indent = ui.spacing().indent;
+                        ui.spacing_mut().indent = previous_indent
+                            + super::TERMINAL_MANAGER_WORKTREE_TERMINAL_EXTRA_INDENT;
+                        ui.indent(egui::Id::new("wt-body"), |ui| {
+                            let (row_rect2, _) = ui.allocate_exact_size(
+                                egui::vec2(
+                                    ui.available_width().max(0.0),
+                                    super::CONTROL_ROW_HEIGHT,
+                                ),
+                                egui::Sense::hover(),
+                            );
+                            min_x_with_extra = Some(row_rect2.min.x);
+                        });
+                    });
+                });
+            });
+        });
+
+        let without = min_x_without_extra.expect("root terminal row x");
+        let with = min_x_with_extra.expect("worktree terminal row x");
+        assert!(
+            with > without,
+            "Worktree terminal row should start more to the right than root terminal row ({} > {})",
+            with,
+            without
+        );
+    }
+
+    #[test]
+    fn orphan_worktree_removed_when_source_control_refresh_shows_missing() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let mut app = test_app([], None);
+        let root_project = super::ProjectRecord {
+            id: 1,
+            name: "Root Repo".to_owned(),
+            path: PathBuf::from("C:/repo"),
+            saved_messages: Vec::new(),
+            ai_config: ProjectAiConfig::default(),
+            checklist: Vec::new(),
+            browser_last_url: None,
+            foreground_saved_messages: Vec::new(),
+            repo_root: None,
+            is_worktree: false,
+        };
+        let wt_project = super::ProjectRecord {
+            id: 2,
+            name: "feature".to_owned(),
+            path: PathBuf::from("C:/repo/worktrees/feature"),
+            saved_messages: Vec::new(),
+            ai_config: ProjectAiConfig::default(),
+            checklist: Vec::new(),
+            browser_last_url: None,
+            foreground_saved_messages: Vec::new(),
+            repo_root: Some(PathBuf::from("C:/repo")),
+            is_worktree: true,
+        };
+        app.projects.insert(1, root_project);
+        app.projects.insert(2, wt_project);
+        app.terminals.insert(
+            10,
+            test_terminal_entry_with_kind(10, 2, super::TerminalKind::Foreground),
+        );
+
+        let (tx, rx) = crossbeam_channel::bounded(super::SOURCE_CONTROL_CHANNEL_CAPACITY);
+        app.source_control_events_rx = rx;
+
+        let snapshot = super::SourceControlSnapshot {
+            branch: "main".to_owned(),
+            ahead: 0,
+            behind: 0,
+            files: Vec::new(),
+            omitted_files: 0,
+            added_lines: Some(0),
+            removed_lines: Some(0),
+            loading: false,
+            last_error: None,
+            partial_warning: None,
+            worktrees: Vec::new(),
+        };
+        tx.send(super::SourceControlEvent {
+            project_id: 1,
+            snapshot,
+        })
+        .unwrap();
+
+        app.process_source_control_events(&ctx);
+
+        assert!(
+            !app.projects.contains_key(&2),
+            "Orphan worktree project should be removed"
+        );
+        assert!(app.projects.contains_key(&1), "Root project should remain");
+        assert!(
+            !app.terminals.contains_key(&10),
+            "Worktree terminal should be closed"
+        );
+    }
+
+    #[test]
+    fn copy_worktree_env_files_copies_root_env_files() {
+        let tmp = std::env::temp_dir().join(format!("mergen-test-env-{}", std::process::id()));
+        let repo = tmp.join("repo");
+        let wt = tmp.join("wt");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+
+        std::fs::write(repo.join(".env"), "FOO=bar\n").unwrap();
+        std::fs::write(repo.join(".env.local"), "BAZ=qux\n").unwrap();
+        std::fs::write(repo.join("README.md"), "# hello\n").unwrap();
+
+        super::AdeApp::copy_worktree_env_files(&repo, &wt);
+
+        assert!(wt.join(".env").exists(), ".env should be copied");
+        assert!(
+            wt.join(".env.local").exists(),
+            ".env.local should be copied"
+        );
+        assert!(
+            !wt.join("README.md").exists(),
+            "README.md should not be copied"
+        );
+
+        // cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn smart_input_task_row_spacer_reserves_action_buttons() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let mut action_rects: Vec<egui::Rect> = Vec::new();
+        let mut captured_row_width = 0.0f32;
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let row_width = 180.0f32;
+                captured_row_width = row_width;
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(row_width, super::CONTROL_ROW_HEIGHT),
+                        ))
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+
+                // Simulate a prompt label that consumes some but not all width
+                child.label("Task text");
+
+                // Apply the same reservation logic used in draw_smart_input_footer
+                let action_width =
+                    3.0 * super::CONTROL_ROW_HEIGHT + 2.0 * child.spacing().item_spacing.x;
+                let remaining = (child.available_width() - action_width).max(0.0);
+                child.add_space(remaining);
+
+                // Allocate the three action buttons
+                for _ in 0..3 {
+                    let (rect, _) = child.allocate_exact_size(
+                        egui::vec2(super::CONTROL_ROW_HEIGHT, super::CONTROL_ROW_HEIGHT),
+                        egui::Sense::click(),
+                    );
+                    action_rects.push(rect);
+                }
+            });
+        });
+
+        assert_eq!(
+            action_rects.len(),
+            3,
+            "All three buttons should be allocated"
+        );
+        for (i, rect) in action_rects.iter().enumerate() {
+            assert!(
+                rect.max.x <= captured_row_width + 0.01,
+                "Button {} must fit inside row width (max.x={})",
+                i,
+                rect.max.x
+            );
+            assert!(
+                rect.min.x >= 0.0,
+                "Button {} must not start before row origin (min.x={})",
+                i,
+                rect.min.x
+            );
+        }
     }
 }

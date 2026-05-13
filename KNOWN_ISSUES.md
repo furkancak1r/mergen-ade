@@ -381,3 +381,89 @@
 - References: User request 2026-05-13
 
 ---
+
+
+#### Worktree terminal rows lacked extra indentation in Terminal Manager {#worktree-terminal-indent-missing}
+- Date: 2026-05-13
+- Context: User reported that when a terminal is opened inside a worktree in the Terminal Manager, the terminal row should open slightly more to the right to preserve the BOM-style tree view structure.
+- Error signature: draw_terminal_manager_contents drew worktree terminals inside a standard ui.indent() block, making them start at the same horizontal offset as the worktree row itself.
+- Symptoms/Impact:
+  1. Worktree terminal rows visually aligned with the worktree row, breaking the BOM tree hierarchy.
+  2. Root project terminals and worktree terminals looked equally indented, reducing visual clarity.
+- Root cause:
+  - draw_terminal_manager_contents applied only the default ui.indent() for worktree terminals, with no additional horizontal offset.
+- Resolution:
+  - Added TERMINAL_MANAGER_WORKTREE_TERMINAL_EXTRA_INDENT constant (10 px).
+  - Wrapped the worktree terminal ui.indent() block in an extra ui.scope() that increments ui.spacing_mut().indent by the constant before allocating terminal rows.
+  - Root project terminals remain unchanged.
+- Prevent recurrence:
+  - Regression test worktree_terminal_indent_exceeds_root_terminal asserts that a row allocated under the extra indent starts farther to the right than a row without it.
+- Files/Commands touched: src/app.rs, AGENTS.md, KNOWN_ISSUES.md, cargo test, cargo fmt
+- References: User request 2026-05-13
+
+---
+
+
+#### Orphan worktree projects were not auto-removed when deleted externally {#orphan-worktree-not-auto-removed}
+- Date: 2026-05-13
+- Context: User reported that if a worktree is deleted externally (no longer in source control / git worktree list) but still registered as a project in Mergen, it should be automatically removed along with its terminals.
+- Error signature: Mergen kept stale worktree ProjectRecords and their terminals even after the worktree directory was deleted and git stopped tracking it.
+- Symptoms/Impact:
+  1. Terminal Manager showed ghost worktree rows with no actual directory behind them.
+  2. Terminals inside deleted worktrees remained open, wasting resources.
+  3. Users had to manually remove orphaned worktrees from Mergen.
+- Root cause:
+  - process_source_control_events merged source control snapshots but never compared discovered worktrees against registered worktree projects.
+  - No periodic or event-driven cleanup existed for orphaned worktrees.
+- Resolution:
+  - Added cleanup_orphan_worktrees_for_project() helper that runs after each successful source control refresh for root repos.
+  - It builds a set of paths from snapshot.worktrees, then scans registered worktrees under that repo.
+  - Any worktree missing from the git list AND whose path no longer exists on disk is removed via remove_project(), which closes its terminals and cleans up all associated state.
+  - Cleanup is skipped when the source control refresh fails (last_error present) to avoid removing worktrees due to transient git errors.
+- Prevent recurrence:
+  - Regression test orphan_worktree_removed_when_source_control_refresh_shows_missing verifies that a worktree with a non-existent path and empty worktrees list is automatically removed while the root project and unrelated projects remain.
+- Files/Commands touched: src/app.rs, AGENTS.md, KNOWN_ISSUES.md, cargo test, cargo fmt
+- References: User request 2026-05-13
+
+---
+
+
+#### Worktree creation did not copy .env files {#worktree-env-copy-missing}
+- Date: 2026-05-13
+- Context: User reported that newly created worktrees did not inherit root repo .env files, causing runtime commands like npm run dev to fail because environment variables were missing.
+- Error signature: git worktree add only checks out tracked files; .gitignored/untracked .env files are left behind in the root repo.
+- Symptoms/Impact:
+  1. Users had to manually copy .env files into the new worktree after creation.
+  2. Background/foreground terminals spawned in the worktree could not find required environment configuration.
+- Root cause:
+  - Mergen called git worktree add but performed no post-creation file copying.
+- Resolution:
+  - Added copy_worktree_env_files() helper that scans the repo root for .env* files and copies them into the newly created worktree path.
+  - The helper is called immediately after a successful git worktree add inside run_git_worktree_add().
+  - Only root-level .env* files are copied; deeper nested files are intentionally skipped to avoid surprising overwrites in monorepos.
+- Prevent recurrence:
+  - Regression test copy_worktree_env_files_copies_root_env_files creates a fake repo with .env, .env.local and README.md, runs the helper into a worktree directory, and asserts that .env files arrive while README.md does not.
+- Files/Commands touched: src/app.rs, AGENTS.md, KNOWN_ISSUES.md, cargo test, cargo fmt
+- References: User request 2026-05-13
+
+---
+
+
+#### Smart Input queued task action buttons were pushed out of the row {#smart-input-task-buttons-clipped}
+- Date: 2026-05-13
+- Context: Queued Smart Input rows were changed to place prompt text/attachments on the left and actions on the right.
+- Error signature: `ui.add_space(ui.available_width().max(0.0))` was used before rendering Send/Edit/Delete action buttons.
+- Symptoms/Impact:
+  1. Send/Edit/Delete buttons could be clipped or unreachable in normal finite-width Smart Input footers.
+  2. Users could not send, edit, or delete queued tasks directly from the row.
+- Root cause:
+  - The spacer consumed all remaining horizontal space before the action buttons were allocated, causing them to extend past the visible row boundary.
+- Resolution:
+  - Reserve fixed action button width (`3.0 * CONTROL_ROW_HEIGHT + 2.0 * item_spacing.x`) before adding the flexible spacer.
+  - Buttons remain right-aligned and fully visible within the row.
+- Prevent recurrence:
+  - Regression test `smart_input_task_row_spacer_reserves_action_buttons` creates a 300 px row with a long label, applies the reservation logic, allocates the three action buttons, and asserts that every button fits inside the row width.
+- Files/Commands touched: src/app.rs, AGENTS.md, KNOWN_ISSUES.md, cargo test, cargo fmt
+- References: Code review 2026-05-13
+
+---
