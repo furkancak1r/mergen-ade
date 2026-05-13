@@ -1856,6 +1856,8 @@ pub struct AdeApp {
     create_worktree_base_branch: String,
     create_worktree_path_draft: String,
     create_worktree_error: Option<String>,
+    /// Existing git worktrees discovered when popup opened (not yet in Mergen).
+    create_worktree_existing_worktrees: Vec<crate::worktree::GitWorktreeInfo>,
 }
 
 /// Represents a single open file buffer in the built-in editor.
@@ -4361,6 +4363,7 @@ impl AdeApp {
             create_worktree_base_branch: String::new(),
             create_worktree_path_draft: String::new(),
             create_worktree_error: None,
+            create_worktree_existing_worktrees: Vec::new(),
         };
         // Do NOT seed runtime browser state from legacy config.
         // Browser panel open state is now runtime-only per project.
@@ -16311,6 +16314,8 @@ impl AdeApp {
                                                 .unwrap_or_default();
                                             self.create_worktree_path_draft.clear();
                                             self.create_worktree_error = None;
+                                            self.create_worktree_existing_worktrees =
+                                                self.discover_existing_worktrees_for_popup(pid);
                                         }
                                     }
                                 });
@@ -16391,16 +16396,6 @@ impl AdeApp {
                                         warning,
                                     );
                                 }
-                                if let Some(branch_line) = source_control_branch_line(&snapshot) {
-                                    let branch_line = format!("{} {}", icons::GIT_BRANCH, branch_line);
-                                    draw_sidebar_text_row(
-                                        ui,
-                                        RichText::new(&branch_line).color(TEXT_MUTED),
-                                        TEXT_MUTED,
-                                        &branch_line,
-                                    );
-                                }
-
                                 // Worktrees section
                                 if !snapshot.worktrees.is_empty() {
                                     ui.separator();
@@ -16832,13 +16827,21 @@ impl AdeApp {
             let has_live_terminal =
                 self.terminal_count_live_for_project_kind(project_id, visible_kind) > 0;
             let worktree_count = child_worktrees.len();
+            let worktree_visible_count: usize = child_worktrees
+                .iter()
+                .map(|wt| self.terminal_count_for_project_kind(wt.id, visible_kind))
+                .sum();
+            let worktree_has_live = child_worktrees
+                .iter()
+                .any(|wt| self.terminal_count_live_for_project_kind(wt.id, visible_kind) > 0);
 
-            // Skip inactive projects when filter is enabled (consider root-only activity)
-            if hide_inactive && !has_live_terminal && worktree_count == 0 {
+            // Skip inactive projects when filter is enabled (consider root + worktree activity)
+            if hide_inactive && !has_live_terminal && !worktree_has_live && worktree_count == 0 {
                 continue;
             }
 
-            let has_children = visible_count > 0 || worktree_count > 0;
+            let has_children =
+                visible_count > 0 || worktree_count > 0 || worktree_visible_count > 0;
             let mut create_worktree_clicked = false;
             let (header_response, spawn_clicked, selected_launcher_id, header_clicked) =
                 draw_project_group_header(
@@ -16889,6 +16892,8 @@ impl AdeApp {
                     .unwrap_or_default();
                 self.create_worktree_path_draft.clear();
                 self.create_worktree_error = None;
+                self.create_worktree_existing_worktrees =
+                    self.discover_existing_worktrees_for_popup(project_id);
             }
             if has_children {
                 let _ = header_state.show_body_unindented(ui, |ui| {
@@ -16960,6 +16965,25 @@ impl AdeApp {
                                     }
                                 });
                             });
+                            // Draw worktree's own terminals under its row
+                            let wt_visible_count =
+                                self.terminal_count_for_project_kind(wt_project_id, visible_kind);
+                            if wt_visible_count > 0 {
+                                ui.add_space(2.0);
+                                ui.indent(
+                                    Id::new(("terminal-manager-body", project_id, wt_project_id)),
+                                    |ui| {
+                                        self.draw_terminal_rows(
+                                            ctx,
+                                            ui,
+                                            wt_project_id,
+                                            visible_kind,
+                                            panel_right,
+                                            max_tooltip_right,
+                                        );
+                                    },
+                                );
+                            }
                         }
                         if worktree_count > 0 && visible_count > 0 {
                             ui.add_space(2.0);
@@ -22214,6 +22238,40 @@ impl AdeApp {
         parent.join("worktrees").join(&slug)
     }
 
+    /// Discover existing git worktrees under the project's root repo that are not yet
+    /// registered as Mergen projects. Returns an empty list if discovery fails.
+    fn discover_existing_worktrees_for_popup(
+        &self,
+        project_id: u64,
+    ) -> Vec<crate::worktree::GitWorktreeInfo> {
+        let Some(project) = self.projects.get(&project_id) else {
+            return Vec::new();
+        };
+        let repo_path = if let Some(ref root) = project.repo_root {
+            root.clone()
+        } else {
+            project.path.clone()
+        };
+        match crate::worktree::discover_worktrees(&repo_path) {
+            Ok(worktrees) => worktrees
+                .into_iter()
+                .filter(|wt| {
+                    let already_added = self.projects.values().any(|p| {
+                        let wt_canonical = wt.path.canonicalize();
+                        let p_canonical = p.path.canonicalize();
+                        if let (Ok(w), Ok(p)) = (wt_canonical, p_canonical) {
+                            w == p
+                        } else {
+                            wt.path == p.path
+                        }
+                    });
+                    !already_added
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     fn draw_create_worktree_popup(&mut self, ctx: &egui::Context) {
         if !self.show_create_worktree_popup {
             return;
@@ -22245,6 +22303,13 @@ impl AdeApp {
         let screen_width = ctx.screen_rect().width();
         let popup_width = (screen_width - 64.0).clamp(480.0, 700.0);
 
+        let repo_root = if let Some(ref root) = project.repo_root {
+            root.clone()
+        } else {
+            project.path.clone()
+        };
+        let mut worktrees_to_add: Vec<std::path::PathBuf> = Vec::new();
+
         egui::Window::new(format!("{} Create Worktree", icons::PLUS))
             .id(egui::Id::new("create_worktree_popup"))
             .open(&mut open)
@@ -22253,7 +22318,7 @@ impl AdeApp {
             .collapsible(false)
             .movable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .fixed_size(egui::vec2(popup_width, 360.0))
+            .fixed_size(egui::vec2(popup_width, 400.0))
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new(format!("Repository: {}", project.name))
@@ -22261,6 +22326,52 @@ impl AdeApp {
                         .color(TEXT_MUTED),
                 );
                 ui.add_space(8.0);
+
+                // Existing worktrees section
+                if !self.create_worktree_existing_worktrees.is_empty() {
+                    ui.label(
+                        RichText::new("Existing worktrees not in Mergen")
+                            .small()
+                            .color(TEXT_MUTED)
+                            .strong(),
+                    );
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("existing-worktrees-scroll")
+                        .max_height(100.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for wt in &self.create_worktree_existing_worktrees {
+                                let label = wt.display_label();
+                                let tooltip = format!("{}", wt.path.display());
+                                let row_response = ui.horizontal(|ui| {
+                                    ui.label(RichText::new(&label).color(TEXT_PRIMARY).strong());
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if ui.button("Add to Mergen").clicked() {
+                                            worktrees_to_add.push(wt.path.clone());
+                                        }
+                                    });
+                                });
+                                let font_id = egui::TextStyle::Body.resolve(ui.style());
+                                let _ = with_truncation_tooltip(
+                                    ui,
+                                    row_response.response,
+                                    &tooltip,
+                                    &font_id,
+                                    TEXT_PRIMARY,
+                                    ui.available_width(),
+                                );
+                            }
+                        });
+                    ui.separator();
+                    ui.label(
+                        RichText::new("Or create new worktree")
+                            .small()
+                            .color(TEXT_MUTED)
+                            .strong(),
+                    );
+                    ui.add_space(4.0);
+                }
 
                 ui.label(RichText::new("Branch name").small().color(TEXT_MUTED));
                 ui.add_sized(
@@ -22322,7 +22433,7 @@ impl AdeApp {
                                 Ok(wt_path) => {
                                     self.add_project_with_worktree(
                                         wt_path,
-                                        Some(project.path.clone()),
+                                        Some(repo_root.clone()),
                                         true,
                                     );
                                     self.show_create_worktree_popup = false;
@@ -22343,6 +22454,14 @@ impl AdeApp {
                     }
                 });
             });
+
+        // Process one-click additions of existing worktrees
+        for wt_path in worktrees_to_add {
+            self.add_project_with_worktree(wt_path.clone(), Some(repo_root.clone()), true);
+            self.create_worktree_existing_worktrees
+                .retain(|wt| wt.path != wt_path);
+            self.status_line = format!("Added existing worktree '{}' to Mergen", wt_path.display());
+        }
 
         if !open {
             self.show_create_worktree_popup = false;
@@ -25294,8 +25413,7 @@ fn draw_source_control_worktree_row(
     let wrap_width =
         (sidebar_row_wrap_width(available_width, button_padding) - icon_width - icon_gap).max(0.0);
 
-    let current_marker = if is_current { " ●" } else { "" };
-    let text = format!("{}{}", label, current_marker);
+    let text = label.to_owned();
     let galley = WidgetText::from(RichText::new(&text)).into_galley(
         ui,
         Some(TextWrapMode::Truncate),
@@ -25338,7 +25456,8 @@ fn draw_source_control_worktree_row(
             text_rect.min.x,
             content_rect.center().y - (galley.size().y * 0.5),
         );
-        ui.painter().galley(text_pos, galley, TEXT_PRIMARY);
+        let text_color = if is_current { ACCENT } else { TEXT_PRIMARY };
+        ui.painter().galley(text_pos, galley, text_color);
     }
 
     let font_id = egui::TextStyle::Body.resolve(ui.style());
@@ -25400,25 +25519,7 @@ fn draw_terminal_manager_worktree_row(
         }
 
         let content_rect = sidebar_row_content_rect(body_rect, button_padding);
-        let icon_rect = egui::Rect::from_min_size(
-            content_rect.min,
-            egui::vec2(icon_width.min(content_rect.width()), content_rect.height()),
-        );
-        ui.painter().text(
-            icon_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            icons::TREE_VIEW.to_string(),
-            egui::FontId::proportional(12.0),
-            TEXT_MUTED,
-        );
-
-        let text_rect = egui::Rect::from_min_max(
-            egui::pos2(
-                (icon_rect.max.x + icon_gap).min(content_rect.max.x),
-                content_rect.min.y,
-            ),
-            content_rect.max,
-        );
+        let text_rect = egui::Rect::from_min_max(content_rect.min, content_rect.max);
         let text_pos = egui::pos2(
             text_rect.min.x,
             content_rect.center().y - (galley.size().y * 0.5),
@@ -25426,7 +25527,7 @@ fn draw_terminal_manager_worktree_row(
         let text_color = if is_selected {
             TEXT_PRIMARY
         } else {
-            with_alpha(TEXT_MUTED, 180)
+            with_alpha(ACCENT, 200)
         };
         ui.painter().galley(text_pos, galley, text_color);
 
@@ -39309,6 +39410,7 @@ mod tests {
             create_worktree_base_branch: String::new(),
             create_worktree_path_draft: String::new(),
             create_worktree_error: None,
+            create_worktree_existing_worktrees: Vec::new(),
             browser_video_encode_events_tx,
             browser_video_encode_events_rx,
         }
@@ -46460,6 +46562,7 @@ mod tests {
 
         // Open create worktree popup
         app.show_create_worktree_popup = true;
+        app.create_worktree_existing_worktrees = Vec::new();
 
         // Should detect create worktree popup as text input owner
         assert!(app.text_input_has_focus_extended(&ctx));
@@ -50346,6 +50449,7 @@ mod tests {
         // Open create worktree popup
         app.show_create_worktree_popup = true;
         app.create_worktree_project_id = Some(7);
+        app.create_worktree_existing_worktrees = Vec::new();
 
         // Test that terminal keyboard capture is blocked
         let capture_keyboard = app.should_capture_terminal_keyboard(&ctx);

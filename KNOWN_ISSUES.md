@@ -1,6 +1,26 @@
 
 ---
 
+#### Create worktree popup did not show existing unregistered worktrees {#create-worktree-popup-missing-existing}
+- Date: 2026-05-13
+- Context: User reported that git worktrees already existing on disk but not registered in Mergen were invisible in the Create Worktree popup. The popup only supported creating brand-new worktrees.
+- Error signature: Existing worktrees appeared in Source Control panel but the Create Worktree modal had no way to add them to Mergen without manually clicking in Source Control.
+- Symptoms/Impact:
+  1. Users had to switch to Source Control panel to add existing worktrees.
+  2. The Create Worktree button in Terminal Manager only created new worktrees, missing the "add existing" use case.
+- Root cause: `draw_create_worktree_popup()` only rendered a "new worktree" form. There was no discovery or listing of `git worktree list` entries that were already on disk but absent from `self.projects`.
+- Resolution:
+  - Added `discover_existing_worktrees_for_popup()` helper that runs `crate::worktree::discover_worktrees()` on the root repo and filters out already-registered paths via canonical comparison.
+  - Popup now shows a scrollable "Existing worktrees not in Mergen" section with branch labels and `Add to Mergen` buttons.
+  - One-click addition calls `add_project_with_worktree()` with `is_worktree: true` and inherits saved messages from the root project.
+  - The popup remains open after adding so multiple worktrees can be registered in sequence.
+- Prevent recurrence:
+  - Added the behavior to AGENTS.md Git Worktree Integration Guidelines.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`
+- References: User request 2026-05-13
+
+---
+
 #### Smart Input caused OpenCode terminal black areas, scroll lock, and mid-viewport jumps {#smart-input-opencode-scroll-issues}
 - Date: 2026-05-12
 - Context: User reported that since Smart Input arrived, OpenCode terminal view broke: "bazen yukarısı siyah oluyor hiçbir şey göstermiyor, bazen scroll yapamıyorum, bazen de ortasına atıyor beni en aşağı scroll yapmak zorunda kalıyorum."
