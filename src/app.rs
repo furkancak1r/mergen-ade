@@ -4052,6 +4052,18 @@ impl AdeApp {
                 );
             });
 
+        // Keep the modal window above its dark backdrop overlay so that
+        // reopening the popup never leaves the overlay on top of the window.
+        let backdrop_layer = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("exit_confirm_overlay"),
+        );
+        let window_layer = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("exit_confirm_window"),
+        );
+        ctx.set_sublayer(backdrop_layer, window_layer);
+
         // Handle exit after the closure
         if should_exit.get() {
             self.allow_confirmed_close = true;
@@ -12417,7 +12429,7 @@ impl AdeApp {
 
             // Get clipboard data: the handle itself is the HDROP
             let hdrop: HDROP = match GetClipboardData(CF_HDROP) {
-                Ok(handle) => HDROP(handle.0 as *mut _), // HDROP is a handle type; no GlobalLock needed
+                Ok(handle) => HDROP(handle.0), // HDROP wraps the raw handle value
                 Err(_) => {
                     let _ = CloseClipboard();
                     return None;
@@ -12476,6 +12488,8 @@ impl AdeApp {
             return false;
         }
 
+        // Accept any absolute or relative path that contains separators
+        // or starts with a Windows drive letter or UNC/extended prefix.
         text.contains('/') || text.contains('\\') || text.starts_with("C:")
     }
 
@@ -22090,6 +22104,14 @@ impl AdeApp {
                 }
             });
 
+        // Keep the modal window above its dark backdrop overlay so that
+        // reopening the popup never leaves the overlay on top of the window.
+        let backdrop_layer =
+            egui::LayerId::new(egui::Order::Foreground, egui::Id::new("settings_overlay"));
+        let window_layer =
+            egui::LayerId::new(egui::Order::Foreground, egui::Id::new(SETTINGS_WINDOW_ID));
+        ctx.set_sublayer(backdrop_layer, window_layer);
+
         self.show_settings_popup = open;
 
         if changes.should_persist {
@@ -22320,6 +22342,18 @@ impl AdeApp {
                     }
                 });
             });
+
+        // Keep the modal window above its dark backdrop overlay so that
+        // reopening the popup never leaves the overlay on top of the window.
+        let backdrop_layer = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("foreground_message_overlay"),
+        );
+        let window_layer = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("foreground_message_popup"),
+        );
+        ctx.set_sublayer(backdrop_layer, window_layer);
 
         if !open {
             self.close_foreground_message_popup();
@@ -22721,7 +22755,66 @@ impl eframe::App for AdeApp {
             // clipboard contains an image path. This handles image-only
             // clipboard data that egui does not emit as Event::Paste.
             if smart_input_request.is_some() {
-                events = self.synthesize_smart_input_image_paste_events(events);
+                // Only probe clipboard when the actual paste key is present in
+                // the current frame, preventing duplicate attachment creation
+                // on every input frame while Smart Input remains focused.
+                let has_paste_key = events.iter().any(|e| {
+                    if let Event::Key {
+                        key: Key::V,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } = e
+                    {
+                        primary_shortcut_modifier(*modifiers)
+                            && !modifiers.alt
+                            && !modifiers.shift
+                    } else {
+                        false
+                    }
+                });
+                let clipboard_image = if has_paste_key {
+                    self.clipboard_image_path()
+                } else {
+                    None
+                };
+                if let Some(ref path) = clipboard_image {
+                    if let Some(request) = smart_input_request {
+                        let terminal_id = match request {
+                            SmartInputSubmitRequest::Draft { terminal_id } => terminal_id,
+                            SmartInputSubmitRequest::Edit { terminal_id, .. } => terminal_id,
+                        };
+                        if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                            if Self::terminal_smart_input_visible(terminal) {
+                                let att_id = terminal.smart_input.next_attachment_id;
+                                terminal.smart_input.next_attachment_id += 1;
+                                match request {
+                                    SmartInputSubmitRequest::Draft { .. } => {
+                                        terminal.smart_input.draft_attachments.push(
+                                            SmartInputAttachment {
+                                                id: att_id,
+                                                path: path.clone(),
+                                            },
+                                        );
+                                    }
+                                    SmartInputSubmitRequest::Edit { task_id, .. } => {
+                                        if terminal.smart_input.editing_task_id == Some(task_id) {
+                                            terminal.smart_input.edit_attachments.push(
+                                                SmartInputAttachment {
+                                                    id: att_id,
+                                                    path: path.clone(),
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                events = Self::synthesize_smart_input_image_paste_events_with(events, || {
+                    clipboard_image.clone()
+                });
             }
             let (command_shortcuts, remaining, conflict_messages) =
                 self.partition_terminal_command_shortcuts(events);
@@ -26699,14 +26792,10 @@ fn draw_smart_input_footer(
                                     let _removed =
                                         draw_smart_input_attachments(ui, task_attachments);
 
-                                    // Reserve fixed width for the three action buttons before
-                                    // adding flexible spacer so they remain visible at finite widths
-                                    let action_width = 3.0 * CONTROL_ROW_HEIGHT
-                                        + 2.0 * ui.spacing().item_spacing.x;
-                                    let remaining = (ui.available_width() - action_width).max(0.0);
-                                    ui.add_space(remaining);
+                                    // Small fixed gap so buttons sit near text instead of far right
+                                    ui.add_space(8.0);
 
-                                    // Action buttons on the right
+                                    // Action buttons
                                     if styled_icon_button(
                                         ui,
                                         icons::ARROW_RIGHT,
@@ -27586,7 +27675,7 @@ fn styled_icon_button(
 
     if response.hovered() {
         ui.painter()
-            .rect_filled(rect.shrink(1.0), 8.0, with_alpha(BTN_ICON_HOVER, 110));
+            .rect_filled(rect.shrink(2.0), 8.0, with_alpha(BTN_ICON_HOVER, 110));
     }
 
     let icon_color = if response.is_pointer_button_down_on() || response.hovered() {
@@ -27598,7 +27687,7 @@ fn styled_icon_button(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         format!("{icon}"),
-        egui::FontId::proportional(15.0),
+        egui::FontId::proportional(14.0),
         icon_color,
     );
 
@@ -27754,7 +27843,7 @@ fn styled_icon_button_response(
 
     if response.hovered() {
         ui.painter()
-            .rect_filled(rect.shrink(1.0), 8.0, with_alpha(BTN_ICON_HOVER, 110));
+            .rect_filled(rect.shrink(2.0), 8.0, with_alpha(BTN_ICON_HOVER, 110));
     }
 
     let icon_color = if response.is_pointer_button_down_on() || response.hovered() {
@@ -27766,7 +27855,7 @@ fn styled_icon_button_response(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         format!("{icon}"),
-        egui::FontId::proportional(15.0),
+        egui::FontId::proportional(14.0),
         icon_color,
     );
 
@@ -30901,6 +30990,130 @@ mod tests {
         assert!(
             window_rect.bottom() <= screen_rect.bottom(),
             "window_rect={window_rect:?} screen_rect={screen_rect:?}"
+        );
+    }
+
+    #[test]
+    fn settings_popup_window_stays_above_backdrop_after_reopen() {
+        let ctx = Context::default();
+        let screen_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &["msg"], &[]));
+        app.selected_project = Some(1);
+        app.active_settings_section = SettingsSection::SavedMessages;
+
+        app.show_settings_popup = true;
+        let raw_input = RawInput {
+            screen_rect: Some(screen_rect),
+            ..RawInput::default()
+        };
+
+        // Frame 1: draw popup (both layers are new and get move_to_top; window ends up on top)
+        let _ = draw_settings_popup_in_test_ui(&ctx, raw_input.clone(), &mut app);
+
+        // Force the backdrop to the top of the Foreground order, simulating
+        // the edge case where egui's automatic reordering puts it above the window.
+        let backdrop_layer =
+            egui::LayerId::new(egui::Order::Foreground, egui::Id::new("settings_overlay"));
+        ctx.move_to_top(backdrop_layer);
+
+        // Frame 2: draw popup again. Without set_sublayer the backdrop would win.
+        let _ = draw_settings_popup_in_test_ui(&ctx, raw_input, &mut app);
+
+        let layer_at_center = ctx.layer_id_at(screen_rect.center());
+
+        let window_layer = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new(super::SETTINGS_WINDOW_ID),
+        );
+        assert_eq!(
+            layer_at_center,
+            Some(window_layer),
+            "settings window should be above backdrop after reopen; got {:?}",
+            layer_at_center
+        );
+    }
+
+    #[test]
+    fn foreground_message_popup_window_stays_above_backdrop_after_reopen() {
+        let ctx = Context::default();
+        let screen_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+
+        app.foreground_message_popup_open = Some(1);
+        let raw_input = RawInput {
+            screen_rect: Some(screen_rect),
+            ..RawInput::default()
+        };
+
+        let _ = ctx.run(raw_input.clone(), |ctx| {
+            app.draw_foreground_message_popup(ctx);
+        });
+
+        let backdrop_layer = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("foreground_message_overlay"),
+        );
+        ctx.move_to_top(backdrop_layer);
+
+        let _ = ctx.run(raw_input, |ctx| {
+            app.draw_foreground_message_popup(ctx);
+        });
+
+        let layer_at_center = ctx.layer_id_at(screen_rect.center());
+
+        let window_layer = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("foreground_message_popup"),
+        );
+        assert_eq!(
+            layer_at_center,
+            Some(window_layer),
+            "foreground message window should be above backdrop after reopen; got {:?}",
+            layer_at_center
+        );
+    }
+
+    #[test]
+    fn exit_confirm_popup_window_stays_above_backdrop_after_reopen() {
+        let ctx = Context::default();
+        let screen_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+
+        app.show_exit_confirm_popup = true;
+        let raw_input = RawInput {
+            screen_rect: Some(screen_rect),
+            ..RawInput::default()
+        };
+
+        let _ = ctx.run(raw_input.clone(), |ctx| {
+            app.draw_exit_confirm_popup(ctx);
+        });
+
+        let backdrop_layer = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("exit_confirm_overlay"),
+        );
+        ctx.move_to_top(backdrop_layer);
+
+        let _ = ctx.run(raw_input, |ctx| {
+            app.draw_exit_confirm_popup(ctx);
+        });
+
+        let layer_at_center = ctx.layer_id_at(screen_rect.center());
+
+        let window_layer = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("exit_confirm_window"),
+        );
+        assert_eq!(
+            layer_at_center,
+            Some(window_layer),
+            "exit confirm window should be above backdrop after reopen; got {:?}",
+            layer_at_center
         );
     }
 
@@ -52164,16 +52377,17 @@ mod tests {
     }
 
     #[test]
-    fn smart_input_task_row_spacer_reserves_action_buttons() {
+    fn smart_input_task_row_buttons_sit_near_text() {
         let ctx = egui::Context::default();
         ctx.set_fonts(egui::FontDefinitions::default());
 
+        let mut label_rect: Option<egui::Rect> = None;
         let mut action_rects: Vec<egui::Rect> = Vec::new();
         let mut captured_row_width = 0.0f32;
 
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                let row_width = 180.0f32;
+                let row_width = 300.0f32;
                 captured_row_width = row_width;
                 let mut child = ui.new_child(
                     egui::UiBuilder::new()
@@ -52184,16 +52398,12 @@ mod tests {
                         .layout(egui::Layout::left_to_right(egui::Align::Center)),
                 );
 
-                // Simulate a prompt label that consumes some but not all width
-                child.label("Task text");
+                let response = child.label("Task text");
+                label_rect = Some(response.rect);
 
-                // Apply the same reservation logic used in draw_smart_input_footer
-                let action_width =
-                    3.0 * super::CONTROL_ROW_HEIGHT + 2.0 * child.spacing().item_spacing.x;
-                let remaining = (child.available_width() - action_width).max(0.0);
-                child.add_space(remaining);
+                // Small fixed gap instead of pushing buttons far right
+                child.add_space(8.0);
 
-                // Allocate the three action buttons
                 for _ in 0..3 {
                     let (rect, _) = child.allocate_exact_size(
                         egui::vec2(super::CONTROL_ROW_HEIGHT, super::CONTROL_ROW_HEIGHT),
@@ -52208,6 +52418,22 @@ mod tests {
             action_rects.len(),
             3,
             "All three buttons should be allocated"
+        );
+        let label_rect = label_rect.expect("expected label rect");
+        let first_button = action_rects.first().expect("expected first button");
+        // Buttons should be after the label
+        assert!(
+            first_button.min.x > label_rect.max.x,
+            "First button should sit after label (min.x={}, label max.x={})",
+            first_button.min.x,
+            label_rect.max.x
+        );
+        // But not pushed all the way to the far right
+        assert!(
+            first_button.min.x < label_rect.max.x + 24.0,
+            "First button should be near label, not far right (min.x={}, label max.x={})",
+            first_button.min.x,
+            label_rect.max.x
         );
         for (i, rect) in action_rects.iter().enumerate() {
             assert!(

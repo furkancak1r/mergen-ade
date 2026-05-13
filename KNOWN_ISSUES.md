@@ -488,3 +488,50 @@
 - References: Code review 2026-05-13
 
 ---
+
+#### Settings popup turned black and blocked clicks after reopening from Saved Messages {#settings-popup-black-screen-after-reopen}
+- Date: 2026-05-13
+- Context: User reported that after adding a saved message in Settings, closing the window, and reopening Settings, the screen turned black and nothing was clickable.
+- Error signature: The dark overlay backdrop (`settings_overlay`) rendered above the Settings window, consuming all pointer input and preventing interaction.
+- Symptoms/Impact:
+  1. Settings popup appeared completely black (only the backdrop visible).
+  2. No buttons, navigation, or text inputs responded to clicks.
+  3. The app seemed frozen until the user clicked the backdrop (which closed it) or restarted.
+- Root cause:
+  - `draw_settings_popup()`, `draw_foreground_message_popup()`, and `draw_exit_confirm_popup()` each draw a full-screen `Area` backdrop and a `Window` in the same `Order::Foreground` layer. egui reorders layers based on last interaction; after clicking the backdrop to close the popup, the backdrop could end up above the window on reopen, causing the overlay to steal all clicks.
+- Resolution:
+  - After each modal’s `.show()` block, call `ctx.set_sublayer(backdrop_layer, window_layer)` to pin the window directly above its backdrop. This makes the stacking order explicit and immune to egui’s automatic reordering.
+  - Applied the same fix to `foreground_message_popup` and `exit_confirm_popup` to prevent the same class of bug.
+- Prevent recurrence:
+  - Added regression tests:
+    - `settings_popup_window_stays_above_backdrop_after_reopen`
+    - `foreground_message_popup_window_stays_above_backdrop_after_reopen`
+    - `exit_confirm_popup_window_stays_above_backdrop_after_reopen`
+  - Updated `AGENTS.md` modal guidelines to require `set_sublayer` for all backdrop+window modals.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-13
+
+---
+
+#### Smart Input clipboard image paste did not add attachment chip or path {#smart-input-image-paste-missing}
+- Date: 2026-05-13
+- Context: User reported that pressing `Ctrl+V` in the Smart Input draft field with a screenshot in the clipboard did nothing—no image path was inserted and no attachment chip appeared.
+- Error signature: `raw_input_hook` synthesized an `Event::Paste(path)` for the text edit, but `SmartInputState.draft_attachments` was never populated, so the attachment chip did not render and the queued task never included the image.
+- Symptoms/Impact:
+  1. Smart Input appeared to ignore image-only clipboard data entirely.
+  2. Users could not attach screenshots to Smart Input prompts for OpenCode.
+  3. Normal text paste still worked, but bitmap/file clipboard contents silently failed.
+- Root cause:
+  - `synthesize_smart_input_image_paste_events_with` only converted the `Ctrl+V` key event into an `Event::Paste(path)`, which egui's `TextEdit` inserts as plain text. It did not touch `SmartInputState.draft_attachments`.
+  - On Windows, the `HDROP` handle cast in `clipboard_image_path_from_hdrop()` used `HDROP(handle.0 as *mut _)` which could fail depending on `windows` crate struct layout.
+- Resolution:
+  - In `raw_input_hook`, when Smart Input is focused and a clipboard image path is found, push a `SmartInputAttachment` into `draft_attachments` (or `edit_attachments` when editing a queued task) before synthesizing the `Event::Paste(path)`. This ensures both the text path and the visual chip appear.
+  - Fixed `clipboard_image_path_from_hdrop()` to use `HDROP(handle.0)` instead of an intermediate pointer cast.
+  - Added `Copy` to `SmartInputSubmitRequest` so the request can be reused after the clipboard check without borrow-checker conflicts.
+- Prevent recurrence:
+  - Regression tests already cover synthesized paste events (`smart_input_synthesizes_image_paste_on_primary_paste_key`, `smart_input_falls_back_to_normal_key_when_no_clipboard_image`).
+  - Updated `AGENTS.md` Smart Input paste guideline to state that both `Event::Paste(path)` text insertion and `draft_attachments` push must happen together.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-13
+
+---
