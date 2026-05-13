@@ -15025,6 +15025,8 @@ impl AdeApp {
         data.szInfoTitle = info_title;
         data.szInfo = info;
         data.dwInfoFlags = windows::Win32::UI::Shell::NIIF_INFO;
+        // Cap balloon timeout so the notification does not linger too long
+        data.Anonymous.uTimeout = 5000;
 
         let ok = unsafe {
             windows::Win32::UI::Shell::Shell_NotifyIconW(
