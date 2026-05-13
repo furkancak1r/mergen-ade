@@ -198,3 +198,31 @@
 - References: User request 2026-05-13
 
 ---
+
+#### Worktree projects lacked saved messages from root repo {#worktree-saved-messages-missing}
+- Date: 2026-05-13
+- Context: User reported that saved messages created in the root repo were not available in worktree projects.
+- Error signature: Worktree `ProjectRecord`s were created with `saved_messages: Vec::new()`, and Settings add/remove operated only on the selected project, so the Terminal Manager showed empty saved-message menus for worktrees.
+- Symptoms/Impact:
+  1. Background terminal saved-message button in Terminal Manager showed "No saved messages" for worktrees even when the root repo had snippets.
+  2. Adding a message in Settings for a worktree did not propagate to the root or sibling worktrees.
+  3. Removing a message from the root did not clean it from worktrees.
+- Root cause:
+  - `add_project_with_worktree` did not copy `saved_messages` from the root project.
+  - Settings Saved Messages section used per-project add/remove without family awareness.
+  - No startup backfill existed for existing worktree records loaded from config.
+- Resolution:
+  - `add_project_with_worktree` now copies the root project's `saved_messages` into new worktree records.
+  - Added `worktree_family_root_path`, `add_saved_message_to_family`, `remove_saved_message_from_family`, and `backfill_worktree_saved_messages` helpers.
+  - Startup bootstrap calls `backfill_worktree_saved_messages` so existing worktrees receive the union of family messages.
+  - Settings add/remove now applies to every project in the same repo family.
+- Prevent recurrence:
+  - Regression tests cover:
+    - `add_project_with_worktree_copies_root_saved_messages`
+    - `backfill_worktree_saved_messages_merges_family`
+    - `add_saved_message_to_family_avoids_duplicates`
+    - `remove_saved_message_from_family_removes_from_all_members`
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`
+- References: User request 2026-05-13
+
+---

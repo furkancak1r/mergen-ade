@@ -197,6 +197,7 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Worktree parser tests**: `src/worktree.rs` includes unit tests for `git worktree list --porcelain` parsing: normal worktrees, detached HEAD, locked worktrees, prunable worktrees, and empty output.
 - **Source Control auto-refresh is silent**: Background auto-refreshes do not set `snapshot.loading = true`; only manual Refresh/Fetch actions show the "Refreshing source control..." indicator. This prevents the UI from flashing loading states during periodic updates while still keeping data current.
 - **Worktree list rows must include a contextual icon**: Source Control panel worktree rows should display a recognizable icon (e.g., `icons::GIT_BRANCH`) and a visible current-worktree indicator rather than relying on plain text or a tiny dot. Use `draw_source_control_worktree_row()` for consistent icon + label layout.
+- **Worktree saved messages are family-shared**: Saved messages (`ProjectRecord::saved_messages`) belong to the repo family (root repo + its worktrees). When a worktree is added, it inherits the root project's saved messages. Adding or removing a saved message in Settings affects all family members. `foreground_saved_messages` remain local to each project and are not shared across worktrees.
 
 ## Terminal Manager & Input History Guidelines
 - **Background terminals use runtime-only input history**: Do not persist background terminal inputs to `history.json`. They use `recent_inputs` (runtime-only) for the rerun/interrupt button.

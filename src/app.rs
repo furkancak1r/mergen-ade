@@ -4535,15 +4535,35 @@ impl AdeApp {
                 .unwrap_or_else(|| path.display().to_string())
         };
 
+        // Family-shared saved messages: worktrees inherit root project's saved messages
+        let (saved_messages, foreground_saved_messages) = if is_worktree {
+            if let Some(ref root_path) = repo_root {
+                self.projects
+                    .values()
+                    .find(|p| p.path == *root_path)
+                    .map(|root_project| {
+                        (
+                            root_project.saved_messages.clone(),
+                            root_project.foreground_saved_messages.clone(),
+                        )
+                    })
+                    .unwrap_or_default()
+            } else {
+                (Vec::new(), Vec::new())
+            }
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
         let project = ProjectRecord {
             id: self.next_project_id,
             name,
             path,
-            saved_messages: Vec::new(),
+            saved_messages,
             ai_config: crate::hooks::ProjectAiConfig::default(),
             checklist: Vec::new(),
             browser_last_url: None,
-            foreground_saved_messages: Vec::new(),
+            foreground_saved_messages,
             repo_root,
             is_worktree,
         };
@@ -16421,6 +16441,17 @@ impl AdeApp {
                                                 egui::CursorIcon::PointingHand,
                                             );
                                         }
+                                        // Context menu for branch copy
+                                        let branch_name_for_copy = wt.branch_name().map(|s| s.to_owned()).unwrap_or_else(|| label.clone());
+                                        row_response.context_menu(|ui| {
+                                            with_minimal_button_chrome(ui, |ui| {
+                                                if ui.button(format!("{} Copy Branch Name", icons::COPY)).clicked() {
+                                                    ui.ctx().copy_text(branch_name_for_copy.clone());
+                                                    self.status_line = format!("Copied branch name '{}'", branch_name_for_copy);
+                                                    ui.close_menu();
+                                                }
+                                            });
+                                        });
                                     }
                                 }
 
@@ -16761,8 +16792,10 @@ impl AdeApp {
         let visible_kind = self.config.ui.terminal_manager_filter.terminal_kind();
         let foreground_launchers = self.foreground_launchers();
         let hide_inactive = self.config.ui.terminal_manager_hide_inactive_projects;
+        // Only root projects at the top level; worktrees render indented under their parent
         let project_ids: Vec<u64> = sorted_projects(&self.projects)
             .into_iter()
+            .filter(|p| !p.is_worktree)
             .map(|p| p.id)
             .collect();
 
@@ -16775,6 +16808,19 @@ impl AdeApp {
             let project_diff_summary =
                 terminal_manager_diff_summary_model(self.source_control_state.get(&project_id));
 
+            // Collect child worktrees for this root project (clone to release borrow)
+            let child_worktrees: Vec<ProjectRecord> = self
+                .projects
+                .values()
+                .filter(|p| {
+                    p.is_worktree
+                        && p.repo_root
+                            .as_ref()
+                            .is_some_and(|root| root == &project_snapshot.path)
+                })
+                .cloned()
+                .collect();
+
             let header_id = ui.make_persistent_id(format!("project-group-{project_id}"));
             let mut header_state = egui::collapsing_header::CollapsingState::load_with_default_open(
                 ui.ctx(),
@@ -16785,17 +16831,20 @@ impl AdeApp {
             let visible_count = self.terminal_count_for_project_kind(project_id, visible_kind);
             let has_live_terminal =
                 self.terminal_count_live_for_project_kind(project_id, visible_kind) > 0;
+            let worktree_count = child_worktrees.len();
 
-            // Skip inactive projects when filter is enabled
-            if hide_inactive && !has_live_terminal {
+            // Skip inactive projects when filter is enabled (consider root-only activity)
+            if hide_inactive && !has_live_terminal && worktree_count == 0 {
                 continue;
             }
 
-            let has_children = visible_count > 0;
+            let has_children = visible_count > 0 || worktree_count > 0;
+            let mut create_worktree_clicked = false;
             let (header_response, spawn_clicked, selected_launcher_id, header_clicked) =
                 draw_project_group_header(
                     self,
                     ui,
+                    project_id,
                     &project_snapshot.name,
                     header_open,
                     has_children,
@@ -16803,6 +16852,7 @@ impl AdeApp {
                     &foreground_launchers,
                     &project_diff_summary,
                     has_live_terminal,
+                    &mut create_worktree_clicked,
                 );
             let spawn_succeeded = match visible_kind {
                 TerminalKind::Foreground => {
@@ -16828,6 +16878,18 @@ impl AdeApp {
                 header_state.set_open(true);
                 header_state.store(ui.ctx());
             }
+            if create_worktree_clicked {
+                self.show_create_worktree_popup = true;
+                self.create_worktree_project_id = Some(project_id);
+                self.create_worktree_branch_draft.clear();
+                self.create_worktree_base_branch = self
+                    .source_control_state
+                    .get(&project_id)
+                    .map(|s| s.branch.clone())
+                    .unwrap_or_default();
+                self.create_worktree_path_draft.clear();
+                self.create_worktree_error = None;
+            }
             if has_children {
                 let _ = header_state.show_body_unindented(ui, |ui| {
                     ui.indent(Id::new(("terminal-manager-body", project_id)), |ui| {
@@ -16840,6 +16902,68 @@ impl AdeApp {
                         } else {
                             ui.ctx().screen_rect().right() - 16.0
                         };
+                        // Draw child worktrees under the root project (BOM-style tree)
+                        for wt in &child_worktrees {
+                            let wt_name = &wt.name;
+                            let wt_project_id = wt.id;
+                            let wt_path_str = wt.path.display().to_string();
+                            let is_selected = self.selected_project == Some(wt_project_id);
+                            let (row_response, selected_launcher_id) =
+                                draw_terminal_manager_worktree_row(
+                                    self,
+                                    ui,
+                                    wt_name,
+                                    is_selected,
+                                    &wt_path_str,
+                                    &foreground_launchers,
+                                );
+                            if row_response.clicked() {
+                                self.selected_project = Some(wt_project_id);
+                                self.note_selection_changed();
+                                self.persist_config();
+                            }
+                            if selected_launcher_id.as_deref().is_some_and(|launcher_id| {
+                                self.spawn_terminal_for_project(
+                                    ctx,
+                                    wt_project_id,
+                                    TerminalKind::Foreground,
+                                    Some(launcher_id),
+                                )
+                            }) {
+                                // Spawn succeeded; nothing further needed
+                            }
+                            row_response.context_menu(|ui| {
+                                with_minimal_button_chrome(ui, |ui| {
+                                    if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
+                                        ui.ctx().copy_text(wt_path_str.clone());
+                                        self.status_line =
+                                            format!("Copied path for worktree '{}'", wt_name);
+                                        ui.close_menu();
+                                    }
+                                    if ui
+                                        .button(format!("{} Open in Folder", icons::FOLDER_OPEN))
+                                        .clicked()
+                                    {
+                                        match open_in_file_explorer(&wt.path, false) {
+                                            Ok(()) => {
+                                                self.status_line = format!(
+                                                    "Opened worktree '{}' in Explorer",
+                                                    wt_name
+                                                );
+                                            }
+                                            Err(err) => {
+                                                self.status_line =
+                                                    format!("Open folder failed: {err}");
+                                            }
+                                        }
+                                        ui.close_menu();
+                                    }
+                                });
+                            });
+                        }
+                        if worktree_count > 0 && visible_count > 0 {
+                            ui.add_space(2.0);
+                        }
                         self.draw_terminal_rows(
                             ctx,
                             ui,
@@ -25221,6 +25345,123 @@ fn draw_source_control_worktree_row(
     with_truncation_tooltip(ui, response, tooltip, &font_id, TEXT_PRIMARY, wrap_width)
 }
 
+/// Draw a worktree row inside the Terminal Manager under its parent project (BOM-style tree).
+fn draw_terminal_manager_worktree_row(
+    app: &mut AdeApp,
+    ui: &mut Ui,
+    label: &str,
+    is_selected: bool,
+    tooltip: &str,
+    foreground_launchers: &[LauncherEntry],
+) -> (egui::Response, Option<String>) {
+    let button_padding = ui.spacing().button_padding;
+    let available_width = ui.available_width().max(0.0);
+    let icon_width = SOURCE_CONTROL_FILE_ICON_WIDTH;
+    let icon_gap = SOURCE_CONTROL_FILE_ICON_GAP;
+    let actions_width = CONTROL_ROW_HEIGHT;
+    let section_gap = ui.spacing().item_spacing.x;
+    let label_width = (available_width - actions_width - section_gap).max(0.0);
+    let wrap_width =
+        (sidebar_row_wrap_width(label_width, button_padding) - icon_width - icon_gap).max(0.0);
+
+    let text = label.to_string();
+    let galley = WidgetText::from(RichText::new(&text)).into_galley(
+        ui,
+        Some(TextWrapMode::Truncate),
+        wrap_width,
+        egui::TextStyle::Body,
+    );
+    let desired_height = sidebar_row_desired_height(ui, galley.size().y, button_padding);
+    let desired_size = egui::vec2(available_width, desired_height);
+    let (rect, _response) = ui.allocate_exact_size(desired_size, Sense::hover());
+
+    // Separate body and action interaction areas
+    let body_rect = egui::Rect::from_min_size(rect.min, egui::vec2(label_width, rect.height()));
+    let actions_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - actions_width, rect.top()),
+        egui::vec2(actions_width, rect.height()),
+    );
+
+    let body_response = ui.interact(
+        body_rect,
+        ui.id().with(("worktree_row_body", label)),
+        Sense::click(),
+    );
+    let body_response = body_response.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    let mut selected_launcher_id = None;
+
+    if ui.is_rect_visible(rect) {
+        if body_response.hovered() || body_response.highlighted() || body_response.has_focus() {
+            if let Some(fill_color) = directory_file_row_hover_fill(true) {
+                ui.painter()
+                    .rect_filled(rect.shrink2(egui::vec2(1.0, 1.0)), 8.0, fill_color);
+            }
+        }
+
+        let content_rect = sidebar_row_content_rect(body_rect, button_padding);
+        let icon_rect = egui::Rect::from_min_size(
+            content_rect.min,
+            egui::vec2(icon_width.min(content_rect.width()), content_rect.height()),
+        );
+        ui.painter().text(
+            icon_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            icons::TREE_VIEW.to_string(),
+            egui::FontId::proportional(12.0),
+            TEXT_MUTED,
+        );
+
+        let text_rect = egui::Rect::from_min_max(
+            egui::pos2(
+                (icon_rect.max.x + icon_gap).min(content_rect.max.x),
+                content_rect.min.y,
+            ),
+            content_rect.max,
+        );
+        let text_pos = egui::pos2(
+            text_rect.min.x,
+            content_rect.center().y - (galley.size().y * 0.5),
+        );
+        let text_color = if is_selected {
+            TEXT_PRIMARY
+        } else {
+            with_alpha(TEXT_MUTED, 180)
+        };
+        ui.painter().galley(text_pos, galley, text_color);
+
+        // Foreground launcher button on the right
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(actions_rect)
+                .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
+            |ui| {
+                selected_launcher_id = styled_launcher_menu_button(
+                    app,
+                    ui,
+                    icons::TERMINAL,
+                    BTN_BLUE,
+                    BTN_BLUE_HOVER,
+                    BTN_ICON_ACTIVE,
+                    "Open Foreground Launcher",
+                    foreground_launchers,
+                );
+            },
+        );
+    }
+
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let response = with_truncation_tooltip(
+        ui,
+        body_response,
+        tooltip,
+        &font_id,
+        TEXT_PRIMARY,
+        wrap_width,
+    );
+    (response, selected_launcher_id)
+}
+
 fn directory_file_row_hover_fill(is_hovered: bool) -> Option<Color32> {
     is_hovered.then(|| with_alpha(BTN_ICON_HOVER, 110))
 }
@@ -26394,8 +26635,11 @@ fn draw_terminal_foreground_message_menu_button(
     (send_message, edit_index, delete_index, add_new_clicked)
 }
 
-fn project_group_header_actions_width(_section_gap: f32) -> f32 {
-    CONTROL_ROW_HEIGHT
+fn project_group_header_actions_width(action_kind: TerminalKind, _section_gap: f32) -> f32 {
+    match action_kind {
+        TerminalKind::Foreground => CONTROL_ROW_HEIGHT * 2.0,
+        TerminalKind::Background => CONTROL_ROW_HEIGHT,
+    }
 }
 
 fn project_group_header_action_spec(
@@ -26683,10 +26927,15 @@ fn terminal_ids_for_project_kind(
         .collect()
 }
 
-fn project_group_header_row_layout(total_width: f32, section_gap: f32) -> (f32, f32) {
+fn project_group_header_row_layout(
+    action_kind: TerminalKind,
+    total_width: f32,
+    section_gap: f32,
+) -> (f32, f32) {
     let total_width = total_width.max(0.0);
     let section_gap = section_gap.max(0.0);
-    let actions_width = project_group_header_actions_width(section_gap).min(total_width);
+    let actions_width =
+        project_group_header_actions_width(action_kind, section_gap).min(total_width);
     let label_width = (total_width - actions_width - section_gap).max(0.0);
     (label_width, actions_width)
 }
@@ -26694,6 +26943,7 @@ fn project_group_header_row_layout(total_width: f32, section_gap: f32) -> (f32, 
 fn draw_project_group_header(
     app: &mut AdeApp,
     ui: &mut Ui,
+    _project_id: u64,
     project_name: &str,
     open: bool,
     can_expand: bool,
@@ -26701,10 +26951,12 @@ fn draw_project_group_header(
     foreground_launchers: &[LauncherEntry],
     diff_summary: &TerminalManagerDiffSummaryModel,
     has_live_terminal: bool,
+    create_worktree_clicked: &mut bool,
 ) -> (egui::Response, bool, Option<String>, bool) {
     let row_width = ui.available_width();
     let section_gap = ui.spacing().item_spacing.x;
-    let (_label_width, actions_width) = project_group_header_row_layout(row_width, section_gap);
+    let (_label_width, actions_width) =
+        project_group_header_row_layout(action_kind, row_width, section_gap);
     let row_height = CONTROL_ROW_HEIGHT;
 
     // Allocate the full row for visual layout, but we'll create separate interactions
@@ -26789,6 +27041,17 @@ fn draw_project_group_header(
         |ui| {
             let (icon, bg, hover_bg, tooltip) = project_group_header_action_spec(action_kind);
             if action_kind == TerminalKind::Foreground {
+                // Worktree button next to the launcher
+                if styled_icon_button(
+                    ui,
+                    icons::TREE_VIEW,
+                    BTN_TEAL,
+                    BTN_TEAL_HOVER,
+                    BTN_ICON_ACTIVE,
+                    "Create Worktree",
+                ) {
+                    *create_worktree_clicked = true;
+                }
                 selected_launcher_id = styled_launcher_menu_button(
                     app,
                     ui,
@@ -26806,8 +27069,10 @@ fn draw_project_group_header(
     );
 
     // Determine header click - only if body was clicked and no action was taken
-    let header_clicked =
-        body_response.clicked() && !spawn_clicked && selected_launcher_id.is_none();
+    let header_clicked = body_response.clicked()
+        && !spawn_clicked
+        && selected_launcher_id.is_none()
+        && !*create_worktree_clicked;
 
     (
         body_response,
@@ -32412,9 +32677,11 @@ mod tests {
                     egui::vec2(row_width, super::CONTROL_ROW_HEIGHT),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
+                        let mut create_worktree_clicked = false;
                         let (response, _, _, _) = super::draw_project_group_header(
                             &mut app,
                             ui,
+                            1,
                             "Demo Project",
                             false,
                             false,
@@ -32422,6 +32689,7 @@ mod tests {
                             &[],
                             diff_summary,
                             false,
+                            &mut create_worktree_clicked,
                         );
                         observed = Some(response.rect);
                     },
@@ -32459,9 +32727,11 @@ mod tests {
                         egui::vec2(row_width, super::CONTROL_ROW_HEIGHT),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
+                            let mut create_worktree_clicked = false;
                             let _ = super::draw_project_group_header(
                                 &mut app,
                                 ui,
+                                1,
                                 "Demo Project",
                                 false,
                                 can_expand,
@@ -32469,6 +32739,7 @@ mod tests {
                                 &[],
                                 diff_summary,
                                 has_live_terminal,
+                                &mut create_worktree_clicked,
                             );
                         },
                     );
@@ -32544,18 +32815,20 @@ mod tests {
 
     #[test]
     fn project_group_header_row_reserves_space_for_single_inline_action() {
-        let (label_width, actions_width) = super::project_group_header_row_layout(160.0, 8.0);
+        let (label_width, actions_width) =
+            super::project_group_header_row_layout(super::TerminalKind::Background, 160.0, 8.0);
 
         assert_eq!(
             actions_width,
-            super::project_group_header_actions_width(8.0)
+            super::project_group_header_actions_width(super::TerminalKind::Background, 8.0)
         );
         assert!((label_width - 124.0).abs() < f32::EPSILON);
     }
 
     #[test]
     fn project_group_header_row_keeps_label_space_when_one_button_fits() {
-        let (label_width, actions_width) = super::project_group_header_row_layout(40.0, 8.0);
+        let (label_width, actions_width) =
+            super::project_group_header_row_layout(super::TerminalKind::Background, 40.0, 8.0);
 
         assert_eq!(label_width, 4.0);
         assert_eq!(actions_width, super::CONTROL_ROW_HEIGHT);
@@ -32564,8 +32837,16 @@ mod tests {
     #[test]
     fn project_group_header_actions_width_matches_single_button() {
         assert_eq!(
-            super::project_group_header_actions_width(8.0),
+            super::project_group_header_actions_width(super::TerminalKind::Background, 8.0),
             super::CONTROL_ROW_HEIGHT
+        );
+    }
+
+    #[test]
+    fn project_group_header_actions_width_matches_two_buttons_for_foreground() {
+        assert_eq!(
+            super::project_group_header_actions_width(super::TerminalKind::Foreground, 8.0),
+            super::CONTROL_ROW_HEIGHT * 2.0
         );
     }
 
