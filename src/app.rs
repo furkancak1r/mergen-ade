@@ -272,10 +272,10 @@ const SMART_INPUT_RESIZE_HANDLE_HEIGHT: f32 = 5.0;
 const SMART_INPUT_TOOLTIP_MAX_CHARS: usize = 140;
 // Foreground tasks UI limits
 const FOREGROUND_TASKS_MENU_MAX_HEIGHT: f32 = 300.0; // Max height for task list dropdown
-const FOREGROUND_LAUNCHER_MENU_WIDTH: f32 = 220.0; // Fixed width for foreground launcher dropdown
-const FOREGROUND_LAUNCHER_MENU_PADDING_X: f32 = 6.0; // Horizontal padding between menu border and row backgrounds
-const FOREGROUND_LAUNCHER_MENU_PADDING_Y: f32 = 6.0; // Vertical padding before first row / after last row
-const FOREGROUND_LAUNCHER_ROW_GAP: f32 = 4.0; // Gap between launcher rows
+const FOREGROUND_LAUNCHER_MENU_WIDTH: f32 = 168.0; // Fixed width for foreground launcher dropdown
+const FOREGROUND_LAUNCHER_MENU_PADDING_X: f32 = 4.0; // Horizontal padding between menu border and row backgrounds
+const FOREGROUND_LAUNCHER_MENU_PADDING_Y: f32 = 4.0; // Vertical padding before first row / after last row
+const FOREGROUND_LAUNCHER_ROW_GAP: f32 = 2.0; // Gap between launcher rows
 const FOREGROUND_MESSAGE_TEXT_MAX_HEIGHT: f32 = 320.0; // Max height for popup text input area
 const FOREGROUND_TASK_TOOLTIP_MAX_CHARS: usize = 100; // Max chars for task tooltip
 const SETTINGS_NAV_WIDTH: f32 = 144.0;
@@ -27138,7 +27138,7 @@ fn styled_launcher_menu_button(
                             ui.add_space(FOREGROUND_LAUNCHER_MENU_PADDING_Y);
 
                             if launchers.is_empty() {
-                                let row_height = CONTROL_ROW_HEIGHT;
+                                let row_height = 24.0;
                                 let full_row_rect = egui::Rect::from_min_size(
                                     ui.cursor().min,
                                     egui::vec2(menu_width, row_height),
@@ -27151,7 +27151,7 @@ fn styled_launcher_menu_button(
                                         .max_rect(row_rect)
                                         .layout(Layout::left_to_right(Align::Center)),
                                     |ui| {
-                                        ui.add_space(8.0);
+                                        ui.add_space(6.0);
                                         ui.label(
                                             RichText::new(
                                                 "Enable a launcher in Settings > Launchers",
@@ -27166,7 +27166,7 @@ fn styled_launcher_menu_button(
                             }
 
                             for (index, launcher) in launchers.iter().enumerate() {
-                                let row_height = CONTROL_ROW_HEIGHT + 4.0;
+                                let row_height = 24.0;
                                 let full_row_rect = egui::Rect::from_min_size(
                                     ui.cursor().min,
                                     egui::vec2(menu_width, row_height),
@@ -27187,24 +27187,15 @@ fn styled_launcher_menu_button(
                                         .layout(Layout::left_to_right(Align::Center))
                                         .sense(Sense::click()),
                                     |ui| {
-                                        ui.add_space(8.0);
-                                        let _ = app.draw_launcher_icon(ui, launcher.icon_key, 20.0);
-                                        ui.add_space(8.0);
+                                        ui.add_space(6.0);
+                                        let _ = app.draw_launcher_icon(ui, launcher.icon_key, 16.0);
+                                        ui.add_space(6.0);
                                         ui.vertical(|ui| {
                                             ui.add(
                                                 egui::Label::new(
                                                     RichText::new(&launcher.display_name)
                                                         .strong()
                                                         .color(TEXT_PRIMARY),
-                                                )
-                                                .selectable(false)
-                                                .truncate(),
-                                            );
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(&launcher.launch_command)
-                                                        .small()
-                                                        .color(TEXT_MUTED),
                                                 )
                                                 .selectable(false)
                                                 .truncate(),
@@ -32094,7 +32085,7 @@ mod tests {
         let output = draw_foreground_launcher_menu_in_test_ui(
             &ctx,
             RawInput {
-                events: vec![Event::PointerMoved(pos2(60.0, 40.0))],
+                events: vec![Event::PointerMoved(pos2(60.0, 16.0))],
                 ..RawInput::default()
             },
             &launchers,
@@ -32127,7 +32118,7 @@ mod tests {
         let output = draw_foreground_launcher_menu_in_test_ui(
             &ctx,
             RawInput {
-                events: vec![Event::PointerMoved(pos2(60.0, 30.0))],
+                events: vec![Event::PointerMoved(pos2(60.0, 16.0))],
                 ..RawInput::default()
             },
             &launchers,
@@ -32158,7 +32149,7 @@ mod tests {
                             ui.set_max_width(menu_width);
                             ui.add_space(super::FOREGROUND_LAUNCHER_MENU_PADDING_Y);
                             for (index, launcher) in launchers.iter().enumerate() {
-                                let row_height = super::CONTROL_ROW_HEIGHT + 4.0;
+                                let row_height = 24.0;
                                 let full_row_rect = egui::Rect::from_min_size(
                                     ui.cursor().min,
                                     egui::vec2(menu_width, row_height),
@@ -32181,22 +32172,13 @@ mod tests {
                                         .layout(Layout::left_to_right(Align::Center))
                                         .sense(Sense::click()),
                                     |ui| {
-                                        ui.add_space(8.0);
+                                        ui.add_space(6.0);
                                         ui.vertical(|ui| {
                                             ui.add(
                                                 egui::Label::new(
                                                     RichText::new(&launcher.display_name)
                                                         .strong()
                                                         .color(super::TEXT_PRIMARY),
-                                                )
-                                                .selectable(false)
-                                                .truncate(),
-                                            );
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(&launcher.launch_command)
-                                                        .small()
-                                                        .color(super::TEXT_MUTED),
                                                 )
                                                 .selectable(false)
                                                 .truncate(),

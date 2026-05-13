@@ -173,3 +173,28 @@
 - References: User request 2026-05-13
 
 ---
+
+#### Foreground launcher menu minimalized and aligned {#launcher-menu-minimal}
+- Date: 2026-05-13
+- Context: User asked to "adam gibi hizala ve küçült şunları minimal olsun" for the foreground launcher dropdown.
+- Error signature: The menu was too wide (220 px), padding too large (6 px), rows too tall (32 px), and the small `launch_command` label repeated the tool name, cluttering the UI.
+- Symptoms/Impact:
+  1. Menu felt bulky compared to the rest of the minimal UI.
+  2. Duplicate small command text ("codex", "opencode") appeared under every launcher name.
+  3. 20 px icons and 32 px rows wasted vertical space.
+- Root cause:
+  - Original fix only addressed width/padding but kept the large dimensions and duplicate label from the initial implementation.
+- Resolution:
+  - Reduced `FOREGROUND_LAUNCHER_MENU_WIDTH` from 220.0 to 168.0.
+  - Reduced `FOREGROUND_LAUNCHER_MENU_PADDING_X` from 6.0 to 4.0 and `FOREGROUND_LAUNCHER_MENU_PADDING_Y` from 6.0 to 4.0.
+  - Reduced `FOREGROUND_LAUNCHER_ROW_GAP` from 4.0 to 2.0.
+  - Reduced row height from `CONTROL_ROW_HEIGHT + 4.0` (32 px) to a fixed 24 px.
+  - Reduced icon size from 20.0 to 16.0.
+  - Removed the small `launch_command` label under `display_name` to eliminate duplicate text.
+  - Replaced `ui.vertical_centered` with `ui.vertical` inside the row so the label is left-aligned and properly centered vertically by the outer `Align::Center` layout.
+- Prevent recurrence:
+  - Regression tests updated to match new dimensions and pointer positions.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo test`
+- References: User request 2026-05-13
+
+---
