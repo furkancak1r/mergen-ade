@@ -1023,6 +1023,14 @@ struct SmartInputState {
     history_nav_stash_attachments: Vec<SmartInputAttachment>,
     /// Next attachment ID counter (shared across draft/queued/edit)
     next_attachment_id: u64,
+    /// Stored selection range for draft context menu (preserved before right-click collapses it).
+    draft_context_menu_selection_range: Option<egui::text::CCursorRange>,
+    /// Tracks whether draft context menu was open in previous frame.
+    draft_context_menu_was_open: bool,
+    /// Stored selection range for edit context menu (preserved before right-click collapses it).
+    edit_context_menu_selection_range: Option<egui::text::CCursorRange>,
+    /// Tracks whether edit context menu was open in previous frame.
+    edit_context_menu_was_open: bool,
 }
 
 impl Default for SmartInputState {
@@ -1045,6 +1053,10 @@ impl Default for SmartInputState {
             history_nav_stash: String::new(),
             history_nav_stash_attachments: Vec::new(),
             next_attachment_id: 1,
+            draft_context_menu_selection_range: None,
+            draft_context_menu_was_open: false,
+            edit_context_menu_selection_range: None,
+            edit_context_menu_was_open: false,
         }
     }
 }
@@ -1065,6 +1077,8 @@ impl SmartInputState {
         });
         self.draft.clear();
         self.history_nav_reset();
+        self.draft_context_menu_selection_range = None;
+        self.draft_context_menu_was_open = false;
         Some(id)
     }
 
@@ -1120,6 +1134,8 @@ impl SmartInputState {
         self.editing_task_id = Some(task_id);
         self.edit_draft = task.text.clone();
         self.edit_attachments = task.attachments.clone();
+        self.edit_context_menu_selection_range = None;
+        self.edit_context_menu_was_open = false;
         true
     }
 
@@ -1140,6 +1156,18 @@ impl SmartInputState {
         self.editing_task_id = None;
         self.edit_draft.clear();
         self.edit_attachments.clear();
+        self.edit_context_menu_selection_range = None;
+        self.edit_context_menu_was_open = false;
+    }
+
+    fn queue_command_task(&mut self, command: String) {
+        let id = self.next_task_id;
+        self.next_task_id = self.next_task_id.saturating_add(1).max(1);
+        self.tasks.push(SmartInputTask {
+            id,
+            text: command,
+            attachments: Vec::new(),
+        });
     }
 
     /// Navigate up in combined history (newest queued tasks first, then older terminal inputs).
@@ -2508,8 +2536,9 @@ enum SourceControlBadgeState {
     Error,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum TerminalManagerDiffSummaryState {
+    #[default]
     Unknown,
     Loading,
     Ready,
@@ -2517,7 +2546,7 @@ enum TerminalManagerDiffSummaryState {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct TerminalManagerDiffSummaryModel {
     state: TerminalManagerDiffSummaryState,
     added_lines: usize,
@@ -12928,6 +12957,8 @@ impl AdeApp {
                             terminal.smart_input.draft.clear();
                             terminal.smart_input.draft_attachments.clear();
                             terminal.smart_input.history_nav_reset();
+                            terminal.smart_input.draft_context_menu_selection_range = None;
+                            terminal.smart_input.draft_context_menu_was_open = false;
                         }
                         self.status_line = "Smart Input sent steer prompt to OpenCode".to_owned();
                     }
@@ -12941,6 +12972,8 @@ impl AdeApp {
                             terminal.smart_input.draft.clear();
                             terminal.smart_input.draft_attachments.clear();
                             terminal.smart_input.history_nav_reset();
+                            terminal.smart_input.draft_context_menu_selection_range = None;
+                            terminal.smart_input.draft_context_menu_was_open = false;
                         }
                         self.status_line =
                             "Smart Input sent image attachment(s) to OpenCode".to_owned();
@@ -12987,6 +13020,8 @@ impl AdeApp {
                     if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                         terminal.smart_input.draft.clear();
                         terminal.smart_input.draft_attachments.clear();
+                        terminal.smart_input.draft_context_menu_selection_range = None;
+                        terminal.smart_input.draft_context_menu_was_open = false;
                     }
                     self.status_line = "Smart Input sent steer prompt to OpenCode".to_owned();
                 }
@@ -12999,6 +13034,8 @@ impl AdeApp {
                     if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                         terminal.smart_input.draft.clear();
                         terminal.smart_input.draft_attachments.clear();
+                        terminal.smart_input.draft_context_menu_selection_range = None;
+                        terminal.smart_input.draft_context_menu_was_open = false;
                     }
                     self.status_line =
                         "Smart Input sent image attachment(s) to OpenCode".to_owned();
@@ -16913,7 +16950,10 @@ impl AdeApp {
                             let wt_project_id = wt.id;
                             let wt_path_str = wt.path.display().to_string();
                             let is_selected = self.selected_project == Some(wt_project_id);
-                            let (row_response, selected_launcher_id) =
+                            let wt_diff_summary = terminal_manager_diff_summary_model(
+                                self.source_control_state.get(&wt_project_id),
+                            );
+                            let (row_response, spawn_clicked, selected_launcher_id) =
                                 draw_terminal_manager_worktree_row(
                                     self,
                                     ui,
@@ -16921,22 +16961,35 @@ impl AdeApp {
                                     is_selected,
                                     &wt_path_str,
                                     &foreground_launchers,
+                                    visible_kind,
+                                    &wt_diff_summary,
                                 );
                             if row_response.clicked() {
                                 self.selected_project = Some(wt_project_id);
                                 self.note_selection_changed();
                                 self.persist_config();
                             }
-                            if selected_launcher_id.as_deref().is_some_and(|launcher_id| {
-                                self.spawn_terminal_for_project(
-                                    ctx,
-                                    wt_project_id,
-                                    TerminalKind::Foreground,
-                                    Some(launcher_id),
-                                )
-                            }) {
-                                // Spawn succeeded; nothing further needed
-                            }
+                            let _spawn_succeeded = match visible_kind {
+                                TerminalKind::Foreground => {
+                                    selected_launcher_id.as_deref().is_some_and(|launcher_id| {
+                                        self.spawn_terminal_for_project(
+                                            ctx,
+                                            wt_project_id,
+                                            TerminalKind::Foreground,
+                                            Some(launcher_id),
+                                        )
+                                    })
+                                }
+                                TerminalKind::Background => {
+                                    spawn_clicked
+                                        && self.spawn_terminal_for_project(
+                                            ctx,
+                                            wt_project_id,
+                                            TerminalKind::Background,
+                                            None,
+                                        )
+                                }
+                            };
                             row_response.context_menu(|ui| {
                                 with_minimal_button_chrome(ui, |ui| {
                                     if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
@@ -22599,7 +22652,7 @@ impl eframe::App for AdeApp {
                             if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                                 if Self::terminal_smart_input_visible(terminal) {
                                     for (_key, _modifiers, command) in command_shortcuts {
-                                        terminal.smart_input.draft.push_str(&command);
+                                        terminal.smart_input.queue_command_task(command);
                                     }
                                     ctx.request_repaint();
                                 }
@@ -22614,7 +22667,7 @@ impl eframe::App for AdeApp {
                                     && terminal.smart_input.editing_task_id == Some(task_id)
                                 {
                                     for (_key, _modifiers, command) in command_shortcuts {
-                                        terminal.smart_input.edit_draft.push_str(&command);
+                                        terminal.smart_input.queue_command_task(command);
                                     }
                                     ctx.request_repaint();
                                 }
@@ -22751,6 +22804,18 @@ impl eframe::App for AdeApp {
                         }
                     }
                 }
+            }
+
+            // Buffer terminal navigation shortcuts even when Smart Input owns focus
+            if self.smart_input_has_focus(ctx) {
+                let (navigation_shortcuts, remaining_events) =
+                    Self::partition_terminal_navigation_shortcuts(
+                        events,
+                        single_view_shortcuts_enabled,
+                    );
+                self.buffered_terminal_navigation
+                    .extend(navigation_shortcuts);
+                events = remaining_events;
             }
 
             // Smart Input image paste: when the clipboard contains an image file,
@@ -25465,6 +25530,8 @@ fn draw_source_control_worktree_row(
 }
 
 /// Draw a worktree row inside the Terminal Manager under its parent project (BOM-style tree).
+/// `action_kind` determines whether the row shows a foreground launcher menu or a background
+/// spawn button, matching the active Terminal Manager filter.
 fn draw_terminal_manager_worktree_row(
     app: &mut AdeApp,
     ui: &mut Ui,
@@ -25472,16 +25539,15 @@ fn draw_terminal_manager_worktree_row(
     is_selected: bool,
     tooltip: &str,
     foreground_launchers: &[LauncherEntry],
-) -> (egui::Response, Option<String>) {
+    action_kind: TerminalKind,
+    diff_summary: &TerminalManagerDiffSummaryModel,
+) -> (egui::Response, bool, Option<String>) {
     let button_padding = ui.spacing().button_padding;
     let available_width = ui.available_width().max(0.0);
-    let icon_width = SOURCE_CONTROL_FILE_ICON_WIDTH;
-    let icon_gap = SOURCE_CONTROL_FILE_ICON_GAP;
     let actions_width = CONTROL_ROW_HEIGHT;
     let section_gap = ui.spacing().item_spacing.x;
     let label_width = (available_width - actions_width - section_gap).max(0.0);
-    let wrap_width =
-        (sidebar_row_wrap_width(label_width, button_padding) - icon_width - icon_gap).max(0.0);
+    let wrap_width = sidebar_row_wrap_width(label_width, button_padding).max(0.0);
 
     let text = label.to_string();
     let galley = WidgetText::from(RichText::new(&text)).into_galley(
@@ -25490,6 +25556,11 @@ fn draw_terminal_manager_worktree_row(
         wrap_width,
         egui::TextStyle::Body,
     );
+    let text_color = if is_selected {
+        TEXT_PRIMARY
+    } else {
+        with_alpha(ACCENT, 200)
+    };
     let desired_height = sidebar_row_desired_height(ui, galley.size().y, button_padding);
     let desired_size = egui::vec2(available_width, desired_height);
     let (rect, _response) = ui.allocate_exact_size(desired_size, Sense::hover());
@@ -25508,6 +25579,7 @@ fn draw_terminal_manager_worktree_row(
     );
     let body_response = body_response.on_hover_cursor(egui::CursorIcon::PointingHand);
 
+    let mut spawn_clicked = false;
     let mut selected_launcher_id = None;
 
     if ui.is_rect_visible(rect) {
@@ -25518,35 +25590,49 @@ fn draw_terminal_manager_worktree_row(
             }
         }
 
-        let content_rect = sidebar_row_content_rect(body_rect, button_padding);
-        let text_rect = egui::Rect::from_min_max(content_rect.min, content_rect.max);
-        let text_pos = egui::pos2(
-            text_rect.min.x,
-            content_rect.center().y - (galley.size().y * 0.5),
+        // Draw title + diff summary like root project header
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(body_rect)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                let _ = draw_terminal_manager_title_and_diff_summary(
+                    ui,
+                    label,
+                    text_color,
+                    false,
+                    rect.height(),
+                    diff_summary,
+                    true,
+                    Some(tooltip),
+                );
+            },
         );
-        let text_color = if is_selected {
-            TEXT_PRIMARY
-        } else {
-            with_alpha(ACCENT, 200)
-        };
-        ui.painter().galley(text_pos, galley, text_color);
 
-        // Foreground launcher button on the right
+        // Action button on the right
         ui.scope_builder(
             egui::UiBuilder::new()
                 .max_rect(actions_rect)
                 .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
             |ui| {
-                selected_launcher_id = styled_launcher_menu_button(
-                    app,
-                    ui,
-                    icons::TERMINAL,
-                    BTN_BLUE,
-                    BTN_BLUE_HOVER,
-                    BTN_ICON_ACTIVE,
-                    "Open Foreground Launcher",
-                    foreground_launchers,
-                );
+                if action_kind == TerminalKind::Foreground {
+                    selected_launcher_id = styled_launcher_menu_button(
+                        app,
+                        ui,
+                        icons::TERMINAL,
+                        BTN_BLUE,
+                        BTN_BLUE_HOVER,
+                        BTN_ICON_ACTIVE,
+                        "Open Foreground Launcher",
+                        foreground_launchers,
+                    );
+                } else {
+                    let (icon, bg, hover_bg, tooltip) =
+                        project_group_header_action_spec(TerminalKind::Background);
+                    if styled_icon_button(ui, icon, bg, hover_bg, BTN_ICON_ACTIVE, tooltip) {
+                        spawn_clicked = true;
+                    }
+                }
             },
         );
     }
@@ -25560,7 +25646,7 @@ fn draw_terminal_manager_worktree_row(
         TEXT_PRIMARY,
         wrap_width,
     );
-    (response, selected_launcher_id)
+    (response, spawn_clicked, selected_launcher_id)
 }
 
 fn directory_file_row_hover_fill(is_hovered: bool) -> Option<Color32> {
@@ -26341,14 +26427,14 @@ fn draw_smart_input_footer(
                 );
 
                 if !state.tasks.is_empty()
-                    && ui
-                        .button(
-                            RichText::new("Clear")
-                                .small()
-                                .color(Color32::from_rgb(210, 90, 90)),
-                        )
-                        .on_hover_text("Remove all queued Smart Input tasks")
-                        .clicked()
+                    && styled_icon_button(
+                        ui,
+                        icons::TRASH,
+                        BTN_SUBTLE,
+                        BTN_RED_HOVER,
+                        Color32::from_rgb(210, 90, 90),
+                        "Remove all queued tasks",
+                    )
                 {
                     state.tasks.clear();
                     state.cancel_edit();
@@ -26382,23 +26468,127 @@ fn draw_smart_input_footer(
                                         terminal_id,
                                         task_id,
                                     );
-                                    with_settings_text_edit_chrome(ui, |ui| {
+                                    // Preserve selection before right-click collapses it
+                                    let secondary_pressed =
+                                        ui.ctx().input(|input| input.pointer.secondary_pressed());
+                                    let pre_click_range =
+                                        egui::text_edit::TextEditState::load(ui.ctx(), edit_id)
+                                            .and_then(|s| s.cursor.char_range())
+                                            .filter(|range| range.primary != range.secondary);
+                                    if secondary_pressed && pre_click_range.is_some() {
+                                        state.edit_context_menu_selection_range = pre_click_range;
+                                    }
+                                    let edit_response = with_settings_text_edit_chrome(ui, |ui| {
                                         let text_width = (ui.available_width() - 80.0).max(80.0);
                                         ui.add_sized(
                                             egui::vec2(text_width, 22.0),
                                             egui::TextEdit::singleline(&mut state.edit_draft)
                                                 .id(edit_id)
                                                 .hint_text("Edit queued task"),
-                                        );
+                                        )
                                     });
+                                    // Determine effective selection for context menu
+                                    let post_show_range =
+                                        egui::text_edit::TextEditState::load(ui.ctx(), edit_id)
+                                            .and_then(|s| s.cursor.char_range())
+                                            .filter(|range| range.primary != range.secondary);
+                                    let effective_range = state
+                                        .edit_context_menu_selection_range
+                                        .or(post_show_range)
+                                        .filter(|range| range.primary != range.secondary);
+                                    edit_response.context_menu(|ui| {
+                                        with_minimal_button_chrome(ui, |ui| {
+                                            let has_selection = effective_range.is_some();
+
+                                            ui.add_enabled_ui(has_selection, |ui| {
+                                                if ui
+                                                    .button(format!("{} Copy", icons::COPY))
+                                                    .clicked()
+                                                {
+                                                    if let Some(range) = effective_range {
+                                                        let copied = extract_text_from_char_range(
+                                                            &state.edit_draft,
+                                                            Some(range),
+                                                        );
+                                                        if let Some(text) = copied {
+                                                            ui.ctx().copy_text(text);
+                                                        }
+                                                    }
+                                                    ui.close_menu();
+                                                }
+                                            });
+
+                                            if ui.button(format!("{} Paste", icons::PLUS)).clicked()
+                                            {
+                                                if let Ok(mut clipboard) = Clipboard::new() {
+                                                    if let Ok(text) = clipboard.get_text() {
+                                                        if let Some(range) = effective_range {
+                                                            let [start, end] = range.sorted();
+                                                            let mut new_draft = String::new();
+                                                            let mut chars =
+                                                                state.edit_draft.chars();
+                                                            for _ in 0..start.index {
+                                                                if let Some(ch) = chars.next() {
+                                                                    new_draft.push(ch);
+                                                                }
+                                                            }
+                                                            for _ in start.index..end.index {
+                                                                chars.next();
+                                                            }
+                                                            new_draft.push_str(&text);
+                                                            for ch in chars {
+                                                                new_draft.push(ch);
+                                                            }
+                                                            state.edit_draft = new_draft;
+                                                        } else {
+                                                            state.edit_draft.push_str(&text);
+                                                        }
+                                                    }
+                                                }
+                                                ui.close_menu();
+                                            }
+                                        });
+                                    });
+                                    // Restore stored selection so it remains visible while menu is open
+                                    if let Some(stored_range) =
+                                        state.edit_context_menu_selection_range
+                                    {
+                                        if stored_range.primary != stored_range.secondary {
+                                            if let Some(mut text_state) =
+                                                egui::text_edit::TextEditState::load(
+                                                    ui.ctx(),
+                                                    edit_id,
+                                                )
+                                            {
+                                                text_state
+                                                    .cursor
+                                                    .set_char_range(Some(stored_range));
+                                                text_state.store(ui.ctx(), edit_id);
+                                            }
+                                        }
+                                    }
                                     let _removed_edit = draw_smart_input_attachments(
                                         ui,
                                         &mut state.edit_attachments,
                                     );
-                                    if ui.button(RichText::new("Save").small()).clicked() {
+                                    if styled_icon_button(
+                                        ui,
+                                        icons::CHECK_CIRCLE,
+                                        BTN_SUBTLE,
+                                        BTN_TEAL_HOVER,
+                                        BTN_ICON_ACTIVE,
+                                        "Save",
+                                    ) {
                                         row_action = Some((task_id, "save"));
                                     }
-                                    if ui.button(RichText::new("Cancel").small()).clicked() {
+                                    if styled_icon_button(
+                                        ui,
+                                        icons::X,
+                                        BTN_SUBTLE,
+                                        BTN_RED_HOVER,
+                                        Color32::from_rgb(170, 50, 50),
+                                        "Cancel",
+                                    ) {
                                         row_action = Some((task_id, "cancel"));
                                     }
                                 } else {
@@ -26409,42 +26599,57 @@ fn draw_smart_input_footer(
                                         TEXT_PRIMARY
                                     };
 
-                                    let preview = capped_hover_text(&task_text, 72);
-                                    // Natural-width left-aligned label
-                                    let response =
-                                        ui.label(RichText::new(preview).small().color(text_color));
-                                    response.on_hover_text(capped_hover_text(
-                                        &task_text,
-                                        SMART_INPUT_TOOLTIP_MAX_CHARS,
-                                    ));
-                                    let task_attachments = &mut state.tasks[index].attachments;
-                                    let _removed =
-                                        draw_smart_input_attachments(ui, task_attachments);
-
-                                    // Push buttons to the far right
-                                    let buttons_width = 100.0f32;
-                                    let remaining = ui.available_width() - buttons_width;
-                                    if remaining > 0.0 {
-                                        ui.add_space(remaining);
-                                    }
-
-                                    if ui.button(RichText::new("Now").small()).clicked() {
+                                    // Action icons on the left
+                                    if styled_icon_button(
+                                        ui,
+                                        icons::ARROW_RIGHT,
+                                        BTN_SUBTLE,
+                                        BTN_BLUE_HOVER,
+                                        BTN_ICON_ACTIVE,
+                                        "Send task now",
+                                    ) {
                                         let atts = state.tasks[index].attachments.clone();
                                         action.send_task_now = Some((task_id, atts));
                                     }
-                                    if ui.button(RichText::new("Edit").small()).clicked() {
+                                    if styled_icon_button(
+                                        ui,
+                                        icons::CODE,
+                                        BTN_SUBTLE,
+                                        BTN_BLUE_HOVER,
+                                        BTN_ICON_ACTIVE,
+                                        "Edit task",
+                                    ) {
                                         row_action = Some((task_id, "edit"));
                                     }
-                                    if ui
-                                        .button(
-                                            RichText::new("Del")
-                                                .small()
-                                                .color(Color32::from_rgb(232, 100, 100)),
-                                        )
-                                        .clicked()
-                                    {
+                                    if styled_icon_button(
+                                        ui,
+                                        icons::TRASH,
+                                        BTN_SUBTLE,
+                                        BTN_RED_HOVER,
+                                        Color32::from_rgb(170, 50, 50),
+                                        "Delete task",
+                                    ) {
                                         row_action = Some((task_id, "delete"));
                                     }
+
+                                    ui.add_space(6.0);
+
+                                    let preview = capped_hover_text(&task_text, 72);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(preview).small().color(text_color),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(
+                                        capped_hover_text(
+                                            &task_text,
+                                            SMART_INPUT_TOOLTIP_MAX_CHARS,
+                                        ),
+                                    );
+                                    let task_attachments = &mut state.tasks[index].attachments;
+                                    let _removed =
+                                        draw_smart_input_attachments(ui, task_attachments);
                                 }
                             });
 
@@ -26521,10 +26726,19 @@ fn draw_smart_input_footer(
 
             ui.horizontal(|ui| {
                 let draft_id = AdeApp::smart_input_draft_input_id(terminal_id);
+                let input_height = ui.available_height().max(42.0);
                 let input_width = (ui.available_width() - 92.0).max(120.0);
-                with_settings_text_edit_chrome(ui, |ui| {
+                // Preserve selection before right-click collapses it
+                let secondary_pressed = ui.ctx().input(|input| input.pointer.secondary_pressed());
+                let pre_click_range = egui::text_edit::TextEditState::load(ui.ctx(), draft_id)
+                    .and_then(|s| s.cursor.char_range())
+                    .filter(|range| range.primary != range.secondary);
+                if secondary_pressed && pre_click_range.is_some() {
+                    state.draft_context_menu_selection_range = pre_click_range;
+                }
+                let draft_response = with_settings_text_edit_chrome(ui, |ui| {
                     ui.add_sized(
-                        egui::vec2(input_width, 42.0),
+                        egui::vec2(input_width, input_height),
                         egui::TextEdit::multiline(&mut state.draft)
                             .id(draft_id)
                             .desired_width(input_width)
@@ -26542,18 +26756,91 @@ fn draw_smart_input_footer(
                                 egui::Modifiers::CTRL,
                                 egui::Key::Enter,
                             )),
-                    );
+                    )
                 });
+                // Determine effective selection for context menu
+                let post_show_range = egui::text_edit::TextEditState::load(ui.ctx(), draft_id)
+                    .and_then(|s| s.cursor.char_range())
+                    .filter(|range| range.primary != range.secondary);
+                let effective_range = state
+                    .draft_context_menu_selection_range
+                    .or(post_show_range)
+                    .filter(|range| range.primary != range.secondary);
+                draft_response.context_menu(|ui| {
+                    with_minimal_button_chrome(ui, |ui| {
+                        let has_selection = effective_range.is_some();
+
+                        ui.add_enabled_ui(has_selection, |ui| {
+                            if ui.button(format!("{} Copy", icons::COPY)).clicked() {
+                                if let Some(range) = effective_range {
+                                    let copied =
+                                        extract_text_from_char_range(&state.draft, Some(range));
+                                    if let Some(text) = copied {
+                                        ui.ctx().copy_text(text);
+                                    }
+                                }
+                                ui.close_menu();
+                            }
+                        });
+
+                        if ui.button(format!("{} Paste", icons::PLUS)).clicked() {
+                            if let Ok(mut clipboard) = Clipboard::new() {
+                                if let Ok(text) = clipboard.get_text() {
+                                    if let Some(range) = effective_range {
+                                        let [start, end] = range.sorted();
+                                        let mut new_draft = String::new();
+                                        let mut chars = state.draft.chars();
+                                        for _ in 0..start.index {
+                                            if let Some(ch) = chars.next() {
+                                                new_draft.push(ch);
+                                            }
+                                        }
+                                        for _ in start.index..end.index {
+                                            chars.next();
+                                        }
+                                        new_draft.push_str(&text);
+                                        for ch in chars {
+                                            new_draft.push(ch);
+                                        }
+                                        state.draft = new_draft;
+                                    } else {
+                                        state.draft.push_str(&text);
+                                    }
+                                }
+                            }
+                            ui.close_menu();
+                        }
+                    });
+                });
+                // Restore stored selection so it remains visible while menu is open
+                if let Some(stored_range) = state.draft_context_menu_selection_range {
+                    if stored_range.primary != stored_range.secondary {
+                        if let Some(mut text_state) =
+                            egui::text_edit::TextEditState::load(ui.ctx(), draft_id)
+                        {
+                            text_state.cursor.set_char_range(Some(stored_range));
+                            text_state.store(ui.ctx(), draft_id);
+                        }
+                    }
+                }
+
                 let _removed_draft = draw_smart_input_attachments(ui, &mut state.draft_attachments);
 
                 let can_submit =
                     !state.draft.trim().is_empty() || !state.draft_attachments.is_empty();
-                let button_text = match state.mode {
-                    SmartInputMode::QueueAfterDone => "Queue",
-                    SmartInputMode::SteerNow => "Send",
+                let (submit_icon, submit_tooltip) = match state.mode {
+                    SmartInputMode::QueueAfterDone => (icons::PLUS, "Queue draft"),
+                    SmartInputMode::SteerNow => (icons::TERMINAL, "Send now"),
                 };
                 ui.add_enabled_ui(can_submit, |ui| {
-                    if ui.button(button_text).clicked() {
+                    if styled_icon_button(
+                        ui,
+                        submit_icon,
+                        BTN_BLUE,
+                        BTN_BLUE_HOVER,
+                        BTN_ICON_ACTIVE,
+                        submit_tooltip,
+                    ) {
                         match state.mode {
                             SmartInputMode::QueueAfterDone => {
                                 let _ = state.enqueue_draft();
@@ -26566,6 +26853,17 @@ fn draw_smart_input_footer(
                     }
                 });
             });
+
+            // Clear stored context menu selections when menu closes
+            let is_menu_open = ui.ctx().is_context_menu_open();
+            if state.draft_context_menu_was_open && !is_menu_open {
+                state.draft_context_menu_selection_range = None;
+            }
+            if state.edit_context_menu_was_open && !is_menu_open {
+                state.edit_context_menu_selection_range = None;
+            }
+            state.draft_context_menu_was_open = is_menu_open;
+            state.edit_context_menu_was_open = is_menu_open;
         });
 
     action
@@ -27142,17 +27440,6 @@ fn draw_project_group_header(
         |ui| {
             let (icon, bg, hover_bg, tooltip) = project_group_header_action_spec(action_kind);
             if action_kind == TerminalKind::Foreground {
-                // Worktree button next to the launcher
-                if styled_icon_button(
-                    ui,
-                    icons::TREE_VIEW,
-                    BTN_TEAL,
-                    BTN_TEAL_HOVER,
-                    BTN_ICON_ACTIVE,
-                    "Create Worktree",
-                ) {
-                    *create_worktree_clicked = true;
-                }
                 selected_launcher_id = styled_launcher_menu_button(
                     app,
                     ui,
@@ -27163,6 +27450,16 @@ fn draw_project_group_header(
                     tooltip,
                     foreground_launchers,
                 );
+                if styled_icon_button(
+                    ui,
+                    icons::TREE_VIEW,
+                    BTN_TEAL,
+                    BTN_TEAL_HOVER,
+                    BTN_ICON_ACTIVE,
+                    "Create Worktree",
+                ) {
+                    *create_worktree_clicked = true;
+                }
             } else if styled_icon_button(ui, icon, bg, hover_bg, BTN_ICON_ACTIVE, tooltip) {
                 spawn_clicked = true;
             }
@@ -29371,15 +29668,16 @@ mod tests {
         deduplicated_recent_inputs, default_app_open_command, design_inspect_delivery_signature,
         design_inspect_matches_current_page, design_inspect_should_deliver,
         detach_terminal_prompt_scroll_anchor_on_manual_scroll, draw_ai_badge,
-        draw_terminal_manager_title_and_diff_summary, draw_terminal_status_badges,
-        embedded_browser_should_yield_to_ui_layer, file_editor_selection_drag_active_after_input,
-        force_terminal_pane_width, format_design_inspect_terminal_text,
-        install_terminal_font_family, launcher_icon_for_ai_tool,
-        merge_source_control_refresh_result, next_active_terminal_after_close,
-        next_terminal_in_direction, next_terminal_in_linear_direction,
-        normalize_terminal_background, parse_branch_header, parse_git_numstat_totals,
-        primary_shortcut_modifier, recent_inputs_tooltip_text, recover_config_state,
-        resolve_ctrl_c_action, sanitize_design_inspect_value, selection_edge_autoscroll_delta,
+        draw_terminal_manager_title_and_diff_summary, draw_terminal_manager_worktree_row,
+        draw_terminal_status_badges, embedded_browser_should_yield_to_ui_layer,
+        file_editor_selection_drag_active_after_input, force_terminal_pane_width,
+        format_design_inspect_terminal_text, install_terminal_font_family,
+        launcher_icon_for_ai_tool, merge_source_control_refresh_result,
+        next_active_terminal_after_close, next_terminal_in_direction,
+        next_terminal_in_linear_direction, normalize_terminal_background, parse_branch_header,
+        parse_git_numstat_totals, primary_shortcut_modifier, project_group_header_action_spec,
+        recent_inputs_tooltip_text, recover_config_state, resolve_ctrl_c_action,
+        sanitize_design_inspect_value, selection_edge_autoscroll_delta,
         selection_edge_autoscroll_speed, settings_accordion_disclosure_icon_rect,
         settings_diagnostics_accordion_header_layout, settings_diagnostics_uses_single_column,
         settings_general_inline_control_width, settings_general_uses_stacked_layout,
@@ -32963,6 +33261,80 @@ mod tests {
     }
 
     #[test]
+    fn draw_terminal_manager_worktree_row_background_returns_no_launcher() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let mut app = test_app([], None);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(320.0, 80.0));
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(egui::Align::Center)),
+                );
+                let (_, spawn_clicked, selected_launcher_id) =
+                    super::draw_terminal_manager_worktree_row(
+                        &mut app,
+                        &mut child,
+                        "feature-x",
+                        false,
+                        "/repo/wt",
+                        &[],
+                        TerminalKind::Background,
+                        &super::TerminalManagerDiffSummaryModel::default(),
+                    );
+                assert!(
+                    !spawn_clicked,
+                    "Background worktree row should not auto-click"
+                );
+                assert_eq!(
+                    selected_launcher_id, None,
+                    "Background row should not offer a launcher"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn draw_terminal_manager_worktree_row_foreground_returns_no_launcher_without_interaction() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let mut app = test_app([], None);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(320.0, 80.0));
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(egui::Align::Center)),
+                );
+                let (_, spawn_clicked, selected_launcher_id) =
+                    super::draw_terminal_manager_worktree_row(
+                        &mut app,
+                        &mut child,
+                        "feature-x",
+                        false,
+                        "/repo/wt",
+                        &[],
+                        TerminalKind::Foreground,
+                        &super::TerminalManagerDiffSummaryModel::default(),
+                    );
+                assert!(
+                    !spawn_clicked,
+                    "Foreground worktree row should not auto-click spawn"
+                );
+                assert_eq!(
+                    selected_launcher_id, None,
+                    "Foreground row without interaction should not select a launcher"
+                );
+            });
+        });
+    }
+
+    #[test]
     fn successful_foreground_spawn_auto_opens_terminal_group() {
         assert!(super::AdeApp::should_auto_open_project_terminal_group(true));
     }
@@ -35764,9 +36136,58 @@ mod tests {
             "shortcut should not be buffered for terminal"
         );
         let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(
+            terminal.smart_input.draft.is_empty(),
+            "shortcut should not be written into Smart Input draft"
+        );
         assert_eq!(
-            terminal.smart_input.draft, "/prepare-fix-plan",
-            "shortcut command should be written into Smart Input draft"
+            terminal.smart_input.tasks.len(),
+            1,
+            "shortcut should create a queued task"
+        );
+        assert_eq!(
+            terminal.smart_input.tasks[0].text, "/prepare-fix-plan",
+            "shortcut command should be queued as a task"
+        );
+    }
+
+    #[test]
+    fn raw_input_hook_buffers_ctrl_arrow_for_terminal_navigation_while_smart_input_focused() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        // Focus the Smart Input draft field
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::smart_input_draft_input_id(1));
+        });
+
+        let ctrl_right = Event::Key {
+            key: egui::Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..egui::Modifiers::default()
+            },
+        };
+        let mut raw_input = RawInput {
+            events: vec![ctrl_right],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(raw_input.events.is_empty());
+        assert!(
+            app.buffered_terminal_navigation.contains(
+                &super::TerminalNavigationShortcut::SingleViewFilter(
+                    super::TerminalNavigationDirection::Right,
+                )
+            ),
+            "Ctrl+Arrow should be buffered for terminal navigation even when Smart Input is focused"
         );
     }
 
@@ -50321,6 +50742,91 @@ mod tests {
     }
 
     #[test]
+    fn smart_input_queue_command_task_adds_task_without_draft() {
+        let mut state = SmartInputState::default();
+        state.draft = "keep this".to_owned();
+        state.queue_command_task("/prepare-fix-plan".to_owned());
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.tasks[0].text, "/prepare-fix-plan");
+        assert_eq!(state.draft, "keep this");
+    }
+
+    #[test]
+    fn smart_input_draft_context_menu_selection_clears_on_enqueue() {
+        let mut state = SmartInputState::default();
+        state.draft = "test".to_owned();
+        state.draft_context_menu_selection_range = Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(4),
+        ));
+        state.enqueue_draft();
+        assert!(
+            state.draft_context_menu_selection_range.is_none(),
+            "draft context menu selection should clear after enqueue"
+        );
+        assert!(!state.draft_context_menu_was_open);
+    }
+
+    #[test]
+    fn smart_input_edit_context_menu_selection_clears_on_cancel() {
+        let mut state = SmartInputState::default();
+        state.tasks.push(SmartInputTask {
+            id: 1,
+            text: "task".to_owned(),
+            attachments: Vec::new(),
+        });
+        state.start_edit(1);
+        state.edit_context_menu_selection_range = Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(4),
+        ));
+        state.cancel_edit();
+        assert!(
+            state.edit_context_menu_selection_range.is_none(),
+            "edit context menu selection should clear after cancel"
+        );
+        assert!(!state.edit_context_menu_was_open);
+    }
+
+    #[test]
+    fn smart_input_edit_context_menu_selection_clears_on_start_edit() {
+        let mut state = SmartInputState::default();
+        state.tasks.push(SmartInputTask {
+            id: 1,
+            text: "task".to_owned(),
+            attachments: Vec::new(),
+        });
+        state.edit_context_menu_selection_range = Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(2),
+        ));
+        state.start_edit(1);
+        assert!(
+            state.edit_context_menu_selection_range.is_none(),
+            "edit context menu selection should clear when starting a new edit"
+        );
+    }
+
+    #[test]
+    fn smart_input_context_menu_effective_range_prefers_stored() {
+        let mut state = SmartInputState::default();
+        let stored = Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(5),
+        ));
+        state.draft_context_menu_selection_range = stored;
+        let post_show = Some(egui::text::CCursorRange::one(egui::text::CCursor::new(2)));
+        let effective = state
+            .draft_context_menu_selection_range
+            .or(post_show)
+            .filter(|range| range.primary != range.secondary);
+        assert_eq!(
+            effective, stored,
+            "stored selection should take precedence over collapsed post-show range"
+        );
+    }
+
+    #[test]
     fn raw_input_hook_redirects_shortcut_to_smart_input_edit_draft_when_focused() {
         let ctx = egui::Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
@@ -50363,9 +50869,19 @@ mod tests {
             "shortcut should not be buffered for terminal"
         );
         let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(
+            terminal.smart_input.edit_draft.is_empty(),
+            "shortcut should not be written into Smart Input edit_draft"
+        );
         assert_eq!(
-            terminal.smart_input.edit_draft, "/prepare-fix-plan",
-            "shortcut command should be written into Smart Input edit_draft"
+            terminal.smart_input.tasks.len(),
+            2,
+            "shortcut should add a new queued task"
+        );
+        assert_eq!(
+            terminal.smart_input.tasks.last().unwrap().text,
+            "/prepare-fix-plan",
+            "shortcut command should be queued as a task"
         );
     }
 

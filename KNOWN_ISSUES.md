@@ -246,3 +246,138 @@
 - References: User request 2026-05-13
 
 ---
+
+#### Worktree row in Terminal Manager ignored Background filter {#worktree-row-ignored-background-filter}
+- Date: 2026-05-13
+- Context: User reported that when Terminal Manager filter was set to Background, worktree rows still showed "Open Foreground Launcher" menu instead of a background spawn button.
+- Error signature: `draw_terminal_manager_worktree_row` always rendered a foreground launcher menu and hard-coded `TerminalKind::Foreground` when spawning.
+- Symptoms/Impact:
+  1. Background filter active → clicking worktree action opened a foreground launcher dropdown.
+  2. Spawned terminals for worktrees were always Foreground even when user expected Background.
+- Root cause:
+  - `draw_terminal_manager_worktree_row` did not accept the active `TerminalKind` filter.
+  - The call site in `draw_terminal_manager_contents` always passed `TerminalKind::Foreground` to `spawn_terminal_for_project` for worktrees.
+- Resolution:
+  - Added `action_kind: TerminalKind` parameter to `draw_terminal_manager_worktree_row`.
+  - When `action_kind == TerminalKind::Background`, the row renders a single `LIST` icon button ("New Background Terminal") using the same spec as the root project header.
+  - The call site now routes worktree spawn through `match visible_kind`, spawning `TerminalKind::Background` with no launcher when the filter is Background.
+- Prevent recurrence:
+  - Regression tests:
+    - `draw_terminal_manager_worktree_row_background_returns_no_launcher` — verifies Background row returns `None` launcher and no auto-click
+    - `draw_terminal_manager_worktree_row_foreground_returns_no_launcher_without_interaction` — verifies Foreground row shape
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-13
+
+---
+
+#### Terminal Manager worktree rows lacked source control diff summary {#worktree-diff-summary-missing}
+- Date: 2026-05-13
+- Context: User reported that worktree rows in Terminal Manager did not show the `+` / `-` source control summary like normal project headers.
+- Error signature: `draw_terminal_manager_worktree_row` only painted the worktree name without any diff summary.
+- Symptoms/Impact:
+  1. Users could not see at a glance whether a worktree had uncommitted changes.
+  2. Worktree rows looked inconsistent with root project rows which showed `+N -M`.
+- Root cause:
+  - `draw_terminal_manager_worktree_row` did not accept or render a `TerminalManagerDiffSummaryModel`.
+  - `draw_terminal_manager_contents` did not compute the worktree's diff summary.
+- Resolution:
+  - Added `diff_summary: &TerminalManagerDiffSummaryModel` parameter to `draw_terminal_manager_worktree_row`.
+  - The row now uses `draw_terminal_manager_title_and_diff_summary()` inside the body rect, producing the same `+N -M` label as root projects.
+  - The call site computes `wt_diff_summary` from `self.source_control_state.get(&wt_project_id)` before drawing the row.
+- Prevent recurrence:
+  - Regression tests pass `TerminalManagerDiffSummaryModel::default()` to worktree row calls.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-13
+
+---
+
+#### Smart Input shortcuts typed into draft instead of queuing {#smart-input-shortcut-draft-instead-of-queue}
+- Date: 2026-05-13
+- Context: User reported that pressing a terminal shortcut (e.g., F6) while Smart Input was focused only typed the command into the draft field and left it there, instead of adding it to the queue.
+- Error signature: `raw_input_hook` appended shortcut command text to `smart_input.draft` (or `edit_draft` during edit mode).
+- Symptoms/Impact:
+  1. The draft field contained unexpected command text.
+  2. The command was not queued for After Done dispatch.
+  3. Users had to manually submit or delete the typed command.
+- Root cause:
+  - The shortcut redirect branch in `raw_input_hook` simply called `draft.push_str(&command)`.
+- Resolution:
+  - Added `SmartInputState::queue_command_task()` helper that pushes a new `SmartInputTask` without mutating the draft.
+  - Updated `raw_input_hook` redirect for both Draft and Edit focus to call `queue_command_task()`.
+- Prevent recurrence:
+  - Regression tests assert that draft/edit_draft remain empty and a queued task is created.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-13
+
+---
+
+#### Smart Input focus blocked Ctrl+Arrow terminal navigation {#smart-input-focus-blocked-ctrl-arrow}
+- Date: 2026-05-13
+- Context: User reported that Ctrl+Arrow keys for terminal grid/filter navigation did not work while Smart Input draft was focused.
+- Error signature: `raw_input_hook` consumed all key events when Smart Input was focused, but only processed command shortcuts and plain Up/Down history navigation. Ctrl+Arrow events were dropped on the floor.
+- Symptoms/Impact:
+  1. Users could not switch terminals with Ctrl+Left/Right while typing in Smart Input.
+  2. Ctrl+Up/Down single-view navigation was also blocked.
+- Root cause:
+  - The Smart Input focus branch in `raw_input_hook` did not call `partition_terminal_navigation_shortcuts` for the remaining events.
+- Resolution:
+  - After processing Smart Input history navigation (plain Up/Down), added a check: if Smart Input still has focus, partition navigation shortcuts and buffer them into `buffered_terminal_navigation`.
+- Prevent recurrence:
+  - Added regression test `raw_input_hook_buffers_ctrl_arrow_for_terminal_navigation_while_smart_input_focused`.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-13
+
+---
+
+#### Smart Input UI overflow and missing interactions {#smart-input-ui-polish}
+- Date: 2026-05-13
+- Context: User reported multiple Smart Input usability issues: task row action buttons overflowed off-screen, no right-click copy/paste, input height was fixed and small, and buttons used text labels instead of icons.
+- Error signature: Task row used `ui.add_space(remaining)` to push buttons right, which overflowed narrow panels. Input height was hard-coded `42.0`. No context menu on TextEdit. Buttons were text-based.
+- Symptoms/Impact:
+  1. "Now", "Edit", "Del" buttons could render outside the visible row.
+  2. Users could not copy selected text or paste clipboard into Smart Input inputs.
+  3. Resizing the footer did not enlarge the text input area.
+  4. Text buttons consumed extra horizontal space and looked cluttered.
+- Root cause:
+  - Row layout manually pushed buttons right without reserving fixed space.
+  - No `.context_menu()` was attached to the TextEdit responses.
+  - Input size used a constant.
+  - Buttons used `ui.button(RichText::new("..."))`.
+- Resolution:
+  - Replaced task row layout: action icons (`ARROW_RIGHT`, `CODE`, `TRASH`) are drawn first on the left, followed by a truncating label and attachment chips.
+  - Added `.context_menu()` to both the draft multiline TextEdit and the edit singleline TextEdit, supporting Copy (when selection exists) and Paste.
+  - Replaced fixed `42.0` input height with `ui.available_height().max(42.0)` so the multiline area grows when the footer is resized taller.
+  - Converted task row buttons, Clear button, Save/Cancel buttons, and the Queue/Send submit button to icon-only (`styled_icon_button`) with tooltips.
+- Prevent recurrence:
+  - Visual verification via manual test; regression tests cover Smart Input state helpers.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-13
+
+---
+
+#### Smart Input context menu lost selected text after right-click {#smart-input-context-menu-selection}
+- Date: 2026-05-13
+- Context: Review found that Smart Input Copy/Paste context menus read `TextEditState` after right-click, but `egui::TextEdit` can collapse the selection on secondary click.
+- Error signature: `TextEditState::load(...).cursor.char_range()` inside `.context_menu()` after `TextEdit` can collapse selection.
+- Symptoms/Impact:
+  1. Copy disabled after right-clicking selected Smart Input text.
+  2. Paste appends or fails to replace the intended selected text.
+  3. Affects both draft and queued-task edit fields.
+- Root cause:
+  - Smart Input did not preserve pre-click selection like the file editor does.
+- Resolution:
+  - Added `draft_context_menu_selection_range` / `edit_context_menu_selection_range` to `SmartInputState`.
+  - Before rendering a Smart Input `TextEdit`, detect `secondary_pressed` and store the pre-click non-empty selection.
+  - Use the stored effective selection for Copy and Paste in the context menu.
+  - Restore the stored selection after the menu opens so the highlight remains visible.
+  - Clear stored ranges when the menu closes or when draft/edit state resets (enqueue, submit, save, cancel, start-edit).
+- Prevent recurrence:
+  - Regression tests:
+    - `smart_input_draft_context_menu_selection_clears_on_enqueue`
+    - `smart_input_edit_context_menu_selection_clears_on_cancel`
+    - `smart_input_edit_context_menu_selection_clears_on_start_edit`
+    - `smart_input_context_menu_effective_range_prefers_stored`
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-13
+
+---
