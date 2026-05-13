@@ -26635,7 +26635,6 @@ fn draw_smart_input_footer(
                                 ui.set_min_height(SMART_INPUT_TASK_ROW_HEIGHT);
                                 ui.label(
                                     RichText::new(format!("{}.", index + 1))
-                                        .small()
                                         .color(TEXT_MUTED),
                                 );
 
@@ -26777,18 +26776,22 @@ fn draw_smart_input_footer(
 
                                     // Prompt text on the left
                                     let preview = capped_hover_text(&task_text, 72);
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(preview).small().color(text_color),
+                                    let label_response = ui
+                                        .add(
+                                            egui::Label::new(
+                                                RichText::new(preview).color(text_color),
+                                            )
+                                            .truncate(),
                                         )
-                                        .truncate(),
-                                    )
-                                    .on_hover_text(
-                                        capped_hover_text(
-                                            &task_text,
-                                            SMART_INPUT_TOOLTIP_MAX_CHARS,
-                                        ),
-                                    );
+                                        .on_hover_text(
+                                            capped_hover_text(
+                                                &task_text,
+                                                SMART_INPUT_TOOLTIP_MAX_CHARS,
+                                            ),
+                                        );
+                                    if label_response.clicked() {
+                                        ui.ctx().copy_text(task_text.clone());
+                                    }
                                     let task_attachments = &mut state.tasks[index].attachments;
                                     let _removed =
                                         draw_smart_input_attachments(ui, task_attachments);
@@ -26807,6 +26810,16 @@ fn draw_smart_input_footer(
                                     ) {
                                         let atts = state.tasks[index].attachments.clone();
                                         action.send_task_now = Some((task_id, atts));
+                                    }
+                                    if styled_icon_button(
+                                        ui,
+                                        icons::COPY,
+                                        BTN_SUBTLE,
+                                        BTN_BLUE_HOVER,
+                                        BTN_ICON_ACTIVE,
+                                        "Copy prompt",
+                                    ) {
+                                        ui.ctx().copy_text(task_text.clone());
                                     }
                                     if styled_icon_button(
                                         ui,
