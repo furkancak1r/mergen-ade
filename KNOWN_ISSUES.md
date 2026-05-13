@@ -161,9 +161,14 @@
 - Resolution:
   - Introduced `FOREGROUND_LAUNCHER_MENU_WIDTH` (220 px) constant.
   - The popup now calls `ui.set_min_width` / `ui.set_max_width` with this fixed width.
-  - Each row is drawn at exactly this width; launcher names and commands use `.truncate()` with a hover tooltip for the full text.
+  - Added `FOREGROUND_LAUNCHER_MENU_PADDING_X` (6 px) and `FOREGROUND_LAUNCHER_MENU_PADDING_Y` (6 px) constants for inner padding.
+  - Row backgrounds are explicitly shrunk by `FOREGROUND_LAUNCHER_MENU_PADDING_X` on both sides so they never touch the popup border.
+  - Added `FOREGROUND_LAUNCHER_ROW_GAP` (4 px) between rows for visual breathing room.
+  - Launcher names and commands use `.truncate()` with a hover tooltip for the full text.
 - Prevent recurrence:
-  - Added regression test `foreground_launcher_menu_row_does_not_exceed_fixed_width`.
+  - Added regression tests:
+    - `foreground_launcher_menu_row_does_not_exceed_fixed_width` — width cap
+    - `foreground_launcher_menu_row_is_inset_from_menu_edges` — padding/inset verification
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo test`
 - References: User request 2026-05-13
 

@@ -273,6 +273,9 @@ const SMART_INPUT_TOOLTIP_MAX_CHARS: usize = 140;
 // Foreground tasks UI limits
 const FOREGROUND_TASKS_MENU_MAX_HEIGHT: f32 = 300.0; // Max height for task list dropdown
 const FOREGROUND_LAUNCHER_MENU_WIDTH: f32 = 220.0; // Fixed width for foreground launcher dropdown
+const FOREGROUND_LAUNCHER_MENU_PADDING_X: f32 = 6.0; // Horizontal padding between menu border and row backgrounds
+const FOREGROUND_LAUNCHER_MENU_PADDING_Y: f32 = 6.0; // Vertical padding before first row / after last row
+const FOREGROUND_LAUNCHER_ROW_GAP: f32 = 4.0; // Gap between launcher rows
 const FOREGROUND_MESSAGE_TEXT_MAX_HEIGHT: f32 = 320.0; // Max height for popup text input area
 const FOREGROUND_TASK_TOOLTIP_MAX_CHARS: usize = 100; // Max chars for task tooltip
 const SETTINGS_NAV_WIDTH: f32 = 144.0;
@@ -27132,24 +27135,23 @@ fn styled_launcher_menu_button(
                             let menu_width = FOREGROUND_LAUNCHER_MENU_WIDTH;
                             ui.set_min_width(menu_width);
                             ui.set_max_width(menu_width);
+                            ui.add_space(FOREGROUND_LAUNCHER_MENU_PADDING_Y);
 
                             if launchers.is_empty() {
                                 let row_height = CONTROL_ROW_HEIGHT;
-                                let row_rect = egui::Rect::from_min_size(
+                                let full_row_rect = egui::Rect::from_min_size(
                                     ui.cursor().min,
                                     egui::vec2(menu_width, row_height),
                                 );
-                                ui.painter().rect_filled(
-                                    row_rect.shrink(2.0),
-                                    6.0,
-                                    SURFACE_BG_SOFT,
-                                );
+                                let row_rect = full_row_rect
+                                    .shrink2(egui::vec2(FOREGROUND_LAUNCHER_MENU_PADDING_X, 0.0));
+                                ui.painter().rect_filled(row_rect, 6.0, SURFACE_BG_SOFT);
                                 ui.allocate_new_ui(
                                     egui::UiBuilder::new()
                                         .max_rect(row_rect)
                                         .layout(Layout::left_to_right(Align::Center)),
                                     |ui| {
-                                        ui.add_space(6.0);
+                                        ui.add_space(8.0);
                                         ui.label(
                                             RichText::new(
                                                 "Enable a launcher in Settings > Launchers",
@@ -27159,22 +27161,25 @@ fn styled_launcher_menu_button(
                                         );
                                     },
                                 );
+                                ui.add_space(FOREGROUND_LAUNCHER_MENU_PADDING_Y);
                                 return;
                             }
 
-                            for launcher in launchers {
+                            for (index, launcher) in launchers.iter().enumerate() {
                                 let row_height = CONTROL_ROW_HEIGHT + 4.0;
-                                let row_rect = egui::Rect::from_min_size(
+                                let full_row_rect = egui::Rect::from_min_size(
                                     ui.cursor().min,
                                     egui::vec2(menu_width, row_height),
                                 );
+                                let row_rect = full_row_rect
+                                    .shrink2(egui::vec2(FOREGROUND_LAUNCHER_MENU_PADDING_X, 0.0));
                                 let is_hovered = ui.rect_contains_pointer(row_rect);
                                 let row_bg = if is_hovered {
                                     with_alpha(BTN_ICON_HOVER, 110)
                                 } else {
                                     SURFACE_BG_SOFT
                                 };
-                                ui.painter().rect_filled(row_rect.shrink(2.0), 6.0, row_bg);
+                                ui.painter().rect_filled(row_rect, 6.0, row_bg);
 
                                 let inner_response = ui.allocate_new_ui(
                                     egui::UiBuilder::new()
@@ -27182,9 +27187,9 @@ fn styled_launcher_menu_button(
                                         .layout(Layout::left_to_right(Align::Center))
                                         .sense(Sense::click()),
                                     |ui| {
-                                        ui.add_space(6.0);
+                                        ui.add_space(8.0);
                                         let _ = app.draw_launcher_icon(ui, launcher.icon_key, 20.0);
-                                        ui.add_space(6.0);
+                                        ui.add_space(8.0);
                                         ui.vertical(|ui| {
                                             ui.add(
                                                 egui::Label::new(
@@ -27219,7 +27224,11 @@ fn styled_launcher_menu_button(
                                     selected_launcher = Some(launcher.id.clone());
                                     ui.close_menu();
                                 }
+                                if index + 1 < launchers.len() {
+                                    ui.add_space(FOREGROUND_LAUNCHER_ROW_GAP);
+                                }
                             }
+                            ui.add_space(FOREGROUND_LAUNCHER_MENU_PADDING_Y);
                         });
                     })
                 })
@@ -32118,7 +32127,7 @@ mod tests {
         let output = draw_foreground_launcher_menu_in_test_ui(
             &ctx,
             RawInput {
-                events: vec![Event::PointerMoved(pos2(60.0, 10.0))],
+                events: vec![Event::PointerMoved(pos2(60.0, 30.0))],
                 ..RawInput::default()
             },
             &launchers,
@@ -32147,19 +32156,24 @@ mod tests {
                             let menu_width = super::FOREGROUND_LAUNCHER_MENU_WIDTH;
                             ui.set_min_width(menu_width);
                             ui.set_max_width(menu_width);
-                            for launcher in launchers {
+                            ui.add_space(super::FOREGROUND_LAUNCHER_MENU_PADDING_Y);
+                            for (index, launcher) in launchers.iter().enumerate() {
                                 let row_height = super::CONTROL_ROW_HEIGHT + 4.0;
-                                let row_rect = egui::Rect::from_min_size(
+                                let full_row_rect = egui::Rect::from_min_size(
                                     ui.cursor().min,
                                     egui::vec2(menu_width, row_height),
                                 );
+                                let row_rect = full_row_rect.shrink2(egui::vec2(
+                                    super::FOREGROUND_LAUNCHER_MENU_PADDING_X,
+                                    0.0,
+                                ));
                                 let is_hovered = ui.rect_contains_pointer(row_rect);
                                 let row_bg = if is_hovered {
                                     super::with_alpha(super::BTN_ICON_HOVER, 110)
                                 } else {
                                     super::SURFACE_BG_SOFT
                                 };
-                                ui.painter().rect_filled(row_rect.shrink(2.0), 6.0, row_bg);
+                                ui.painter().rect_filled(row_rect, 6.0, row_bg);
 
                                 let inner_response = ui.allocate_new_ui(
                                     egui::UiBuilder::new()
@@ -32167,7 +32181,7 @@ mod tests {
                                         .layout(Layout::left_to_right(Align::Center))
                                         .sense(Sense::click()),
                                     |ui| {
-                                        ui.add_space(6.0);
+                                        ui.add_space(8.0);
                                         ui.vertical(|ui| {
                                             ui.add(
                                                 egui::Label::new(
@@ -32195,7 +32209,11 @@ mod tests {
                                 if row_response.hovered() {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                 }
+                                if index + 1 < launchers.len() {
+                                    ui.add_space(super::FOREGROUND_LAUNCHER_ROW_GAP);
+                                }
                             }
+                            ui.add_space(super::FOREGROUND_LAUNCHER_MENU_PADDING_Y);
                         });
                     },
                 );
@@ -32237,6 +32255,47 @@ mod tests {
             !exceeds,
             "launcher menu row must not exceed fixed width {}",
             max_allowed
+        );
+    }
+
+    #[test]
+    fn foreground_launcher_menu_row_is_inset_from_menu_edges() {
+        // Regression test: launcher menu rows must have horizontal padding so
+        // the row background does not touch the popup border.
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let launchers = vec![LauncherEntry {
+            id: "opencode".to_owned(),
+            builtin: Some(BuiltinLauncherKind::OpenCode),
+            display_name: "OpenCode".to_owned(),
+            launch_command: "opencode".to_owned(),
+            enabled: true,
+            icon_key: LauncherIconKey::OpenCode,
+        }];
+
+        let output =
+            draw_foreground_launcher_menu_in_test_ui(&ctx, RawInput::default(), &launchers);
+
+        let padding = super::FOREGROUND_LAUNCHER_MENU_PADDING_X;
+        let menu_width = super::FOREGROUND_LAUNCHER_MENU_WIDTH;
+        let expected_max_width = menu_width - 2.0 * padding;
+        let mut touches_edge = false;
+        for shape in &output.shapes {
+            if let egui::epaint::Shape::Rect(rect_shape) = &shape.shape {
+                if rect_shape.fill == super::SURFACE_BG_SOFT
+                    || rect_shape.fill == super::with_alpha(super::BTN_ICON_HOVER, 110)
+                {
+                    if rect_shape.rect.width() > expected_max_width + 1.0 {
+                        touches_edge = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            !touches_edge,
+            "launcher menu row background must be inset by at least {}px from menu edges (width <= {})",
+            padding, expected_max_width
         );
     }
 
