@@ -1034,6 +1034,9 @@ struct SmartInputState {
     edit_context_menu_selection_range: Option<egui::text::CCursorRange>,
     /// Tracks whether edit context menu was open in previous frame.
     edit_context_menu_was_open: bool,
+    /// When true, scroll the queue list to the bottom on the next frame
+    /// so newly added tasks are visible.
+    queue_scroll_to_end: bool,
 }
 
 impl Default for SmartInputState {
@@ -1060,6 +1063,7 @@ impl Default for SmartInputState {
             draft_context_menu_was_open: false,
             edit_context_menu_selection_range: None,
             edit_context_menu_was_open: false,
+            queue_scroll_to_end: false,
         }
     }
 }
@@ -1082,6 +1086,7 @@ impl SmartInputState {
         self.history_nav_reset();
         self.draft_context_menu_selection_range = None;
         self.draft_context_menu_was_open = false;
+        self.queue_scroll_to_end = true;
         Some(id)
     }
 
@@ -1171,6 +1176,7 @@ impl SmartInputState {
             text: command,
             attachments: Vec::new(),
         });
+        self.queue_scroll_to_end = true;
     }
 
     /// Navigate up in combined history (newest queued tasks first, then older terminal inputs).
@@ -14901,6 +14907,14 @@ impl AdeApp {
             }
         }
 
+        // Skip notification when the target terminal has queued Smart Input tasks,
+        // because the user already has follow-up work prepared.
+        if let Some(terminal) = self.terminals.get(&notification.terminal_id) {
+            if !terminal.smart_input.tasks.is_empty() {
+                return;
+            }
+        }
+
         if let Some(last) = self
             .os_notification_last_by_terminal
             .get(&notification.terminal_id)
@@ -26598,29 +26612,16 @@ fn draw_smart_input_footer(
                         .small()
                         .color(TEXT_MUTED),
                 );
-
-                if !state.tasks.is_empty()
-                    && styled_icon_button(
-                        ui,
-                        icons::TRASH,
-                        BTN_SUBTLE,
-                        BTN_RED_HOVER,
-                        Color32::from_rgb(210, 90, 90),
-                        "Remove all queued tasks",
-                    )
-                {
-                    state.tasks.clear();
-                    state.cancel_edit();
-                }
             });
 
             if state.expanded && !state.tasks.is_empty() {
-                // Budget up to ~45% of footer height for queue, but always allow at least 3 rows
-                let queue_budget = (footer_size.y * 0.45 - 30.0)
+                // Budget up to ~35% of footer height for queue, leaving more room for the
+                // multiline input field when the footer is expanded.
+                let queue_budget = (footer_size.y * 0.35 - 30.0)
                     .max(SMART_INPUT_MAX_VISIBLE_TASK_ROWS as f32 * SMART_INPUT_TASK_ROW_HEIGHT);
                 let max_height = queue_budget;
                 let mut row_action: Option<(u64, &'static str)> = None;
-                egui::ScrollArea::vertical()
+                let scroll_output = egui::ScrollArea::vertical()
                     .id_salt(("smart_input_queue", terminal_id))
                     .max_height(max_height)
                     .auto_shrink([false, true])
@@ -26811,9 +26812,9 @@ fn draw_smart_input_footer(
                                         ui,
                                         icons::CODE,
                                         BTN_SUBTLE,
-                                        BTN_BLUE_HOVER,
+                                        BTN_TEAL_HOVER,
                                         BTN_ICON_ACTIVE,
-                                        "Edit task",
+                                        "Edit",
                                     ) {
                                         row_action = Some((task_id, "edit"));
                                     }
@@ -26823,14 +26824,14 @@ fn draw_smart_input_footer(
                                         BTN_SUBTLE,
                                         BTN_RED_HOVER,
                                         Color32::from_rgb(170, 50, 50),
-                                        "Delete task",
+                                        "Delete",
                                     ) {
                                         row_action = Some((task_id, "delete"));
                                     }
                                 }
                             });
-
                             let row_rect = row_ui.response.rect;
+
                             let drag_response = row_ui.response.interact(Sense::drag());
 
                             if drag_response.drag_started() {
@@ -26878,6 +26879,14 @@ fn draw_smart_input_footer(
                         }
                     });
 
+                // Scroll to the bottom when a new task was just added so it is visible
+                if state.queue_scroll_to_end {
+                    let mut scroll_state = scroll_output.state;
+                    scroll_state.offset.y = f32::MAX;
+                    scroll_state.store(ui.ctx(), scroll_output.id);
+                    state.queue_scroll_to_end = false;
+                }
+
                 if let Some((task_id, row_action)) = row_action {
                     match row_action {
                         "save" => {
@@ -26903,7 +26912,7 @@ fn draw_smart_input_footer(
 
             ui.horizontal(|ui| {
                 let draft_id = AdeApp::smart_input_draft_input_id(terminal_id);
-                let input_height = ui.available_height().max(42.0);
+                let input_height = ui.available_height().max(80.0);
                 let input_width = (ui.available_width() - 92.0).max(120.0);
                 // Preserve selection before right-click collapses it
                 let secondary_pressed = ui.ctx().input(|input| input.pointer.secondary_pressed());
