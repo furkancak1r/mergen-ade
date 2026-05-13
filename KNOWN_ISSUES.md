@@ -382,6 +382,27 @@
 
 ---
 
+#### Terminal shortcut confirmation Enter was too early and got ignored by AI CLI {#terminal-shortcut-confirmation-too-early}
+- Date: 2026-05-13
+- Context: User reported that terminal shortcut confirmation (second Enter) was not working when the terminal was selected. The first Enter submitted the command, but the second confirmation Enter was not reaching the prompt.
+- Error signature: `SHORTCUT_SECOND_ENTER_DELAY_MS` was 600ms, which was too short for slower AI CLI prompts to be ready.
+- Symptoms/Impact:
+  1. Shortcut (e.g., F6/F11) first Enter worked, second Enter was ignored.
+  2. AI CLI prompts did not receive the confirmation and appeared stuck.
+- Root cause:
+  - `execute_terminal_shortcut` scheduled the delayed confirmation Enter with 600ms, while the shell/AI CLI prompt was not yet ready to consume the input.
+- Resolution:
+  - Introduced separate `TERMINAL_SHORTCUT_SECOND_ENTER_DELAY_MS = 1200` constant for terminal shortcuts.
+  - Smart Input and saved-message slash confirmations continue to use the existing 600ms.
+  - `execute_terminal_shortcut()` now uses the longer delay.
+- Prevent recurrence:
+  - Regression test `handle_shortcuts_sends_immediate_enter_plus_delayed_confirmation` already verifies that the delayed Enter is eventually sent.
+- Files/Commands touched: src/app.rs, AGENTS.md, KNOWN_ISSUES.md, cargo test, cargo fmt
+- References: User request 2026-05-13
+
+---
+
+
 
 #### Worktree terminal rows lacked extra indentation in Terminal Manager {#worktree-terminal-indent-missing}
 - Date: 2026-05-13

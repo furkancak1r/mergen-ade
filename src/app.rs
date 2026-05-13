@@ -161,6 +161,8 @@ const PENDING_RERUN_POLL_MS: u64 = 50;
 /// Delay before sending the confirmation Enter after a saved message command.
 const SAVED_MESSAGE_SECOND_ENTER_DELAY_MS: u64 = 1000;
 /// Delay before sending the confirmation Enter after a terminal shortcut command.
+const TERMINAL_SHORTCUT_SECOND_ENTER_DELAY_MS: u64 = 1200;
+/// Delay used for slash-prefixed prompt confirmation (Smart Input + saved messages).
 const SHORTCUT_SECOND_ENTER_DELAY_MS: u64 = 600;
 
 // Embedded Nerd Font for terminal icon support (Windows-only)
@@ -9747,7 +9749,7 @@ impl AdeApp {
             self.schedule_delayed_enters_for_terminal(
                 terminal_id,
                 1,
-                SHORTCUT_SECOND_ENTER_DELAY_MS,
+                TERMINAL_SHORTCUT_SECOND_ENTER_DELAY_MS,
                 ctx,
             );
             self.show_status_feedback(ctx, &format!("Sent: {command}"));
