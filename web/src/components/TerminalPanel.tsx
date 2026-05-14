@@ -32,9 +32,11 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
 
     useEffect(() => {
       if (!containerRef.current) return;
+      const isMobile = window.innerWidth <= 768;
+      const isSmallPhone = window.innerWidth <= 480;
       const term = new XTerm({
         fontFamily: 'Consolas, "Courier New", monospace',
-        fontSize: 14,
+        fontSize: isSmallPhone ? 11 : isMobile ? 12 : 14,
         theme: {
           background: '#0c0c0c',
           foreground: '#e0e0e0',

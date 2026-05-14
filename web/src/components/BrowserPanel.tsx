@@ -44,7 +44,9 @@ export const BrowserPanel: React.FC<Props> = ({ url, onUrlChange }) => {
             ref={iframeRef}
             src={url}
             style={{ width: '100%', height: '100%', border: 'none', background: '#fff' }}
-            sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+            sandbox="allow-scripts allow-same-origin allow-forms"
+            referrerPolicy="strict-origin-when-cross-origin"
+            title="Browser Panel"
           />
         ) : (
           <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#666', fontSize: 12 }}>

@@ -4,6 +4,10 @@
   --scrollbar-thumb: #3a3a3a;
   --scrollbar-thumb-hover: #555;
   --scrollbar-width: 8px;
+
+  /* Touch targets */
+  --touch-min: 44px;
+  --tap-highlight: transparent;
 }
 
 /* Global WebKit scrollbar override */
@@ -34,6 +38,8 @@
 * {
   scrollbar-width: thin;
   scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+  -webkit-tap-highlight-color: var(--tap-highlight);
+  touch-action: manipulation;
 }
 
 /* Ensure scrollable panels inherit */
@@ -42,4 +48,186 @@ div[style*="overflow:auto"],
 div[style*="overflow: hidden"],
 div[style*="overflow:hidden"] {
   scrollbar-width: thin;
+}
+
+/* ============================================
+   RESPONSIVE / MOBILE LAYOUT
+   ============================================ */
+
+/* Tablet and below (<= 768px) */
+@media (max-width: 768px) {
+  :root {
+    --scrollbar-width: 4px;
+  }
+
+  /* Sidebar becomes overlay drawer */
+  .sidebar-drawer {
+    position: fixed !important;
+    left: 0;
+    top: 40px;
+    bottom: 56px;
+    z-index: 100;
+    width: 85vw !important;
+    max-width: 320px !important;
+    box-shadow: 4px 0 16px rgba(0, 0, 0, 0.5);
+    transform: translateX(-100%);
+    transition: transform 0.25s ease;
+  }
+
+  .sidebar-drawer.open {
+    transform: translateX(0);
+  }
+
+  /* Overlay backdrop */
+  .sidebar-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 99;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s ease;
+  }
+
+  .sidebar-backdrop.open {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  /* Activity rail becomes bottom bar */
+  .activity-rail-desktop {
+    display: none !important;
+  }
+
+  .activity-rail-mobile {
+    display: flex !important;
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 56px;
+    background: #111;
+    border-top: 1px solid #333;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-around;
+    padding: 0 4px;
+    z-index: 50;
+  }
+
+  .activity-rail-mobile button {
+    width: 48px;
+    height: 48px;
+    font-size: 18px;
+  }
+
+  /* Main area fills full height minus top bar and bottom rail */
+  .main-area {
+    padding-bottom: 56px !important;
+  }
+
+  /* Smart input becomes bottom sheet */
+  .smart-input-footer {
+    position: fixed !important;
+    left: 0;
+    right: 0;
+    bottom: 56px;
+    z-index: 40;
+    max-height: 35vh;
+    overflow-y: auto;
+    box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.4);
+  }
+
+  /* Terminal panel full height on mobile */
+  .terminal-fullscreen {
+    position: fixed !important;
+    inset: 40px 0 56px 0;
+    z-index: 10;
+  }
+
+  /* Larger touch targets */
+  button, [role="button"], input, textarea, select {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  /* Font scaling */
+  body {
+    font-size: 14px;
+  }
+
+  /* Hide browser / checklist panels on small screens unless explicitly open */
+  .panel-hidden-mobile {
+    display: none !important;
+  }
+
+  /* Top bar compact */
+  .top-bar {
+    height: 40px !important;
+    padding: 0 8px !important;
+  }
+
+  .top-bar strong {
+    font-size: 13px !important;
+  }
+}
+
+/* Small phones (<= 480px) */
+@media (max-width: 480px) {
+  .sidebar-drawer {
+    width: 90vw !important;
+  }
+
+  .activity-rail-mobile button {
+    width: 44px;
+    height: 44px;
+    font-size: 16px;
+  }
+
+  /* Further reduce fonts */
+  body {
+    font-size: 13px;
+  }
+
+  .top-bar {
+    height: 36px !important;
+  }
+}
+
+/* Landscape phones */
+@media (max-height: 480px) and (orientation: landscape) {
+  .activity-rail-mobile {
+    height: 48px;
+  }
+
+  .main-area {
+    padding-bottom: 48px !important;
+  }
+
+  .smart-input-footer {
+    bottom: 48px;
+    max-height: 28vh;
+  }
+}
+
+/* Prevent text zoom on iOS inputs */
+input, textarea, select {
+  font-size: 16px;
+}
+
+/* Desktop only (min-width: 769px) */
+@media (min-width: 769px) {
+  .activity-rail-mobile {
+    display: none !important;
+  }
+
+  .sidebar-drawer {
+    transform: none !important;
+    position: relative !important;
+    box-shadow: none !important;
+  }
+
+  .sidebar-backdrop {
+    display: none !important;
+  }
 }

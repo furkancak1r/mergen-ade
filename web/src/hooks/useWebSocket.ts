@@ -15,34 +15,79 @@ export function useWebSocket(
   const wsRef = useRef<WebSocket | null>(null);
   const onTerminalOutputRef = useRef(onTerminalOutput);
   onTerminalOutputRef.current = onTerminalOutput;
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectDelayRef = useRef(1000);
 
   useEffect(() => {
     if (!token) return;
-    const ws = new WebSocket(`${WS_URL}?token=${encodeURIComponent(token)}`);
-    wsRef.current = ws;
 
-    ws.onopen = () => {
-      onConnectedChange(true);
-    };
-    ws.onclose = () => {
-      onConnectedChange(false);
-    };
-    ws.onmessage = (event) => {
-      try {
-        if (typeof event.data === 'string') {
-          const msg: ServerMessage = JSON.parse(event.data);
-          if (msg.kind === 'terminal_output') {
-            onTerminalOutputRef.current?.(msg.terminal_id, new Uint8Array(msg.data));
+    const connect = () => {
+      const ws = new WebSocket(`${WS_URL}?token=${encodeURIComponent(token)}`);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        reconnectDelayRef.current = 1000;
+        onConnectedChange(true);
+      };
+
+      ws.onclose = () => {
+        onConnectedChange(false);
+        // Auto-reconnect with exponential backoff (max 30s)
+        reconnectDelayRef.current = Math.min(reconnectDelayRef.current * 2, 30000);
+        reconnectTimerRef.current = setTimeout(connect, reconnectDelayRef.current);
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          if (typeof event.data === 'string') {
+            const msg: ServerMessage = JSON.parse(event.data);
+            if (msg.kind === 'terminal_output') {
+              onTerminalOutputRef.current?.(msg.terminal_id, new Uint8Array(msg.data));
+            }
+            onMessage(msg);
+          } else if (event.data instanceof ArrayBuffer) {
+            // Binary frame: first 8 bytes = terminal_id LE, rest = raw PTY data
+            const buf = new Uint8Array(event.data);
+            if (buf.length >= 8) {
+              const view = new DataView(buf.buffer);
+              const terminalId = Number(view.getBigUint64(0, true));
+              const payload = buf.slice(8);
+              onTerminalOutputRef.current?.(terminalId, payload);
+            }
+          } else if (event.data instanceof Blob) {
+            // Convert Blob to ArrayBuffer then process
+            const reader = new FileReader();
+            reader.onload = () => {
+              const buf = new Uint8Array(reader.result as ArrayBuffer);
+              if (buf.length >= 8) {
+                const view = new DataView(buf.buffer);
+                const terminalId = Number(view.getBigUint64(0, true));
+                const payload = buf.slice(8);
+                onTerminalOutputRef.current?.(terminalId, payload);
+              }
+            };
+            reader.readAsArrayBuffer(event.data);
           }
-          onMessage(msg);
+        } catch (e) {
+          console.error('WS parse error', e);
         }
-      } catch (e) {
-        console.error('WS parse error', e);
-      }
+      };
+
+      ws.onerror = (err) => {
+        console.error('WebSocket error', err);
+      };
     };
+
+    connect();
 
     return () => {
-      ws.close();
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+      }
+      if (wsRef.current) {
+        wsRef.current.onclose = null; // prevent reconnect after intentional close
+        wsRef.current.close();
+      }
     };
   }, [token]);
 

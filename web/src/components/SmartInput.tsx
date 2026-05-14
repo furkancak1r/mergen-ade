@@ -63,6 +63,7 @@ export const SmartInput: React.FC<Props> = ({ terminal, onSubmit }) => {
             }}
             placeholder="Type a task for Smart Input..."
             rows={1}
+            maxLength={4096}
             style={{
               background: '#1a1a1a',
               border: '1px solid #444',
@@ -85,9 +86,11 @@ export const SmartInput: React.FC<Props> = ({ terminal, onSubmit }) => {
             color: '#4fc3f7',
             fontSize: 12,
             cursor: 'pointer',
-            padding: '6px 14px',
+            padding: '8px 16px',
             borderRadius: 4,
             fontWeight: 'bold',
+            minHeight: 44,
+            minWidth: 60,
           }}
         >
           Send

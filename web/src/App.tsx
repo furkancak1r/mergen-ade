@@ -1,6 +1,7 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import './styles/global.css';
 import { useWebSocket } from './hooks/useWebSocket';
+import { useIsMobile } from './hooks/useMediaQuery';
 import { TerminalPanel, TerminalPanelHandle } from './components/TerminalPanel';
 import { TerminalManager } from './components/TerminalManager';
 import { ProjectExplorer } from './components/ProjectExplorer';
@@ -22,6 +23,7 @@ import {
 const API_URL = '';
 
 export default function App() {
+  const isMobile = useIsMobile();
   const [token, setToken] = useState(() => {
     const hash = window.location.hash.replace('#', '');
     return hash || localStorage.getItem('mergen_token') || '';
@@ -33,6 +35,7 @@ export default function App() {
   const [statusLine, setStatusLine] = useState('Ready');
   const [connected, setConnected] = useState(false);
   const [activePanel, setActivePanel] = useState<PanelId | null>('projects');
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [browserOpen, setBrowserOpen] = useState(false);
   const [browserUrl, setBrowserUrl] = useState('');
   const [checklistOpen, setChecklistOpen] = useState(false);
@@ -100,9 +103,19 @@ export default function App() {
     handleTerminalOutput
   );
 
+  // Shared fetch options with auth token
+  const fetchOpts = (method: string, body?: object): RequestInit => ({
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Auth-Token': token,
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
   useEffect(() => {
     if (connected) {
-      fetch(`${API_URL}/api/config`)
+      fetch(`${API_URL}/api/config`, fetchOpts('GET'))
         .then(r => r.json())
         .then(data => {
           if (data.success && data.data) {
@@ -119,18 +132,13 @@ export default function App() {
   const handleSelectProject = (projectId: number) => {
     sendMessage({ kind: 'select_project', project_id: projectId });
     setActivePanel('projects');
+    if (isMobile) setMobileSidebarOpen(false);
   };
 
   const handleAddProject = async (name: string, path: string) => {
-    const res = await fetch(`${API_URL}/api/projects`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, path }),
-    });
+    const res = await fetch(`${API_URL}/api/projects`, fetchOpts('POST', { name, path }));
     const data = await res.json();
     if (data.success) {
-      setProjects(prev => [...prev, data.data]);
-    } else {
       setStatusLine(data.error || 'Failed to add project');
     }
   };
@@ -148,7 +156,13 @@ export default function App() {
       setSettingsOpen(true);
       return;
     }
-    setActivePanel(prev => prev === panel ? null : panel);
+    setActivePanel(prev => {
+      const next = prev === panel ? null : panel;
+      if (isMobile && next !== null) {
+        setMobileSidebarOpen(true);
+      }
+      return next;
+    });
   };
 
   const activeTerminal = terminals.find(t => t.id === activeTerminalId);
@@ -182,7 +196,10 @@ export default function App() {
           <TerminalManager
             terminals={terminals}
             activeTerminalId={activeTerminalId}
-            onActivate={id => setActiveTerminalId(id)}
+            onActivate={id => {
+              setActiveTerminalId(id);
+              if (isMobile) setMobileSidebarOpen(false);
+            }}
             selectedProjectId={selectedProjectId}
             projects={projects}
             onSpawn={handleSpawnTerminal}
@@ -198,10 +215,21 @@ export default function App() {
     }
   };
 
+  const showSidebar = activePanel && activePanel !== 'browser' && activePanel !== 'checklist';
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', width: '100vw', height: '100vh', overflow: 'hidden', background: '#0c0c0c' }}>
+    <div className="main-area" style={{ display: 'flex', flexDirection: 'column', width: '100vw', height: '100vh', overflow: 'hidden', background: '#0c0c0c' }}>
       {/* Top bar */}
-      <div style={{ height: 40, background: '#1a1a1a', borderBottom: '1px solid #333', display: 'flex', alignItems: 'center', padding: '0 12px', gap: 12, flexShrink: 0 }}>
+      <div className="top-bar" style={{ height: 40, background: '#1a1a1a', borderBottom: '1px solid #333', display: 'flex', alignItems: 'center', padding: '0 12px', gap: 12, flexShrink: 0 }}>
+        {isMobile && (
+          <button
+            onClick={() => setMobileSidebarOpen(v => !v)}
+            style={{ background: 'transparent', border: 'none', color: '#e0e0e0', fontSize: 20, cursor: 'pointer', minWidth: 44, minHeight: 44, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+            aria-label="Toggle menu"
+          >
+            ☰
+          </button>
+        )}
         <strong style={{ color: '#4fc3f7', fontSize: 14 }}>Mergen ADE</strong>
         <span style={{ fontSize: 12, color: connected ? '#4caf50' : '#f44336' }}>
           {connected ? '● Connected' : '● Disconnected'}
@@ -218,7 +246,7 @@ export default function App() {
             />
             <button
               onClick={() => { localStorage.setItem('mergen_token', token); window.location.reload(); }}
-              style={{ background: '#333', border: '1px solid #555', color: '#e0e0e0', fontSize: 12, cursor: 'pointer' }}
+              style={{ background: '#333', border: '1px solid #555', color: '#e0e0e0', fontSize: 12, cursor: 'pointer', padding: '6px 12px' }}
             >
               Connect
             </button>
@@ -230,7 +258,7 @@ export default function App() {
       </div>
 
       {/* Body */}
-      <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+      <div style={{ display: 'flex', flex: 1, overflow: 'hidden', position: 'relative' }}>
         <ActivityRail
           activePanel={activePanel}
           onTogglePanel={handleTogglePanel}
@@ -238,9 +266,28 @@ export default function App() {
           checklistOpen={checklistOpen}
         />
 
+        {/* Mobile sidebar backdrop */}
+        {isMobile && (
+          <div
+            className={`sidebar-backdrop ${mobileSidebarOpen ? 'open' : ''}`}
+            onClick={() => setMobileSidebarOpen(false)}
+          />
+        )}
+
         {/* Left sidebar */}
-        {activePanel && activePanel !== 'browser' && activePanel !== 'checklist' && (
-          <div style={{ width: 280, flexShrink: 0, background: '#141414', borderRight: '1px solid #333', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        {showSidebar && (
+          <div
+            className={`sidebar-drawer ${isMobile && mobileSidebarOpen ? 'open' : ''}`}
+            style={{
+              width: 280,
+              flexShrink: 0,
+              background: '#141414',
+              borderRight: '1px solid #333',
+              display: 'flex',
+              flexDirection: 'column',
+              overflow: 'hidden',
+            }}
+          >
             {selectedProject && (
               <div style={{ padding: '8px 10px', borderBottom: '1px solid #333', background: '#1a1a1a' }}>
                 <div style={{ fontSize: 12, fontWeight: 'bold', color: '#e0e0e0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginBottom: 6 }}>
@@ -249,13 +296,13 @@ export default function App() {
                 <div style={{ display: 'flex', gap: 4 }}>
                   <button
                     onClick={() => handleSpawnTerminal(selectedProject.id, 'powershell', 'foreground')}
-                    style={{ flex: 1, fontSize: 10, background: '#1e3a5f', border: '1px solid #4fc3f7', color: '#4fc3f7', cursor: 'pointer', padding: '3px 6px', borderRadius: 3 }}
+                    style={{ flex: 1, fontSize: 10, background: '#1e3a5f', border: '1px solid #4fc3f7', color: '#4fc3f7', cursor: 'pointer', padding: '6px 6px', borderRadius: 3, minHeight: 32 }}
                   >
                     + Foreground
                   </button>
                   <button
                     onClick={() => handleSpawnTerminal(selectedProject.id, 'powershell', 'background')}
-                    style={{ flex: 1, fontSize: 10, background: '#2a2a2a', border: '1px solid #888', color: '#888', cursor: 'pointer', padding: '3px 6px', borderRadius: 3 }}
+                    style={{ flex: 1, fontSize: 10, background: '#2a2a2a', border: '1px solid #888', color: '#888', cursor: 'pointer', padding: '6px 6px', borderRadius: 3, minHeight: 32 }}
                   >
                     + Background
                   </button>
@@ -291,14 +338,14 @@ export default function App() {
                   onResize={(cols, lines) => sendMessage({ kind: 'terminal_resize', terminal_id: activeTerminal.id, cols, lines })}
                 />
               ) : (
-                <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#666', fontSize: 14 }}>
+                <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#666', fontSize: 14, textAlign: 'center', padding: 16 }}>
                   No active terminal. Select a project and spawn a terminal.
                 </div>
               )}
             </div>
 
-            {/* Check-list panel (right side, floating-ish) */}
-            {checklistOpen && (
+            {/* Check-list panel (right side, hidden on mobile) */}
+            {checklistOpen && !isMobile && (
               <div style={{ width: 260, flexShrink: 0, background: '#141414', borderLeft: '1px solid #333', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
                 <ChecklistPanel
                   projects={projects}
@@ -313,8 +360,8 @@ export default function App() {
               </div>
             )}
 
-            {/* Browser panel (right side) */}
-            {browserOpen && (
+            {/* Browser panel (right side, hidden on mobile) */}
+            {browserOpen && !isMobile && (
               <div style={{ width: 360, flexShrink: 0, background: '#141414', borderLeft: '1px solid #333', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
                 <BrowserPanel
                   url={browserUrl}
@@ -326,12 +373,14 @@ export default function App() {
 
           {/* Smart Input footer */}
           {activeTerminal && (
-            <SmartInput
-              terminal={activeTerminal}
-              onSubmit={(text, mode) => {
-                sendMessage({ kind: 'smart_input_submit', terminal_id: activeTerminal.id, text, mode });
-              }}
-            />
+            <div className="smart-input-footer">
+              <SmartInput
+                terminal={activeTerminal}
+                onSubmit={(text, mode) => {
+                  sendMessage({ kind: 'smart_input_submit', terminal_id: activeTerminal.id, text, mode });
+                }}
+              />
+            </div>
           )}
         </div>
       </div>

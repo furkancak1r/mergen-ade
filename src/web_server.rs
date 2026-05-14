@@ -73,6 +73,33 @@ async fn run_web_server() -> Result<(), String> {
         token: token.clone(),
     };
 
+    // Security: rate limiting per IP
+    let rate_limiter = Arc::new(Mutex::new(RateLimiter::new()));
+
+    // Auth extractor middleware: validates X-Auth-Token header against state.token
+    let auth_middleware = axum::middleware::from_fn_with_state(
+        token.clone(),
+        |State(token): State<String>, req: axum::extract::Request, next: axum::middleware::Next| async move {
+            let path = req.uri().path();
+            // Skip auth for health check, index page, static assets, and WebSocket (WS uses query token)
+            let is_public = path == "/" || path == "/health" || path.starts_with("/assets/") || path == "/api/ws";
+            if !is_public {
+                let header_token = req
+                    .headers()
+                    .get("x-auth-token")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if header_token != token {
+                    return Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .body(axum::body::Body::from("Unauthorized"))
+                        .unwrap();
+                }
+            }
+            next.run(req).await
+        },
+    );
+
     let app = Router::new()
         .route("/", get(index_handler))
         .route("/health", get(health_handler))
@@ -85,21 +112,41 @@ async fn run_web_server() -> Result<(), String> {
         .route("/api/source-control", get(api_source_control_handler))
         .route("/api/ws", get(ws_handler))
         .fallback(static_handler)
-        .layer(CorsLayer::permissive())
+        // CORS: only allow localhost origins (same-origin policy)
+        .layer(
+            CorsLayer::new()
+                .allow_origin([
+                    "http://127.0.0.1:8765".parse().unwrap(),
+                    "http://127.0.0.1:8766".parse().unwrap(),
+                    "http://localhost:8765".parse().unwrap(),
+                    "http://localhost:8766".parse().unwrap(),
+                ])
+                .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+                .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::HeaderName::from_static("x-auth-token")])
+        )
+        .layer(auth_middleware)
+        .layer(axum::middleware::from_fn(security_headers_middleware))
+        .layer(axum::middleware::from_fn_with_state(rate_limiter.clone(), rate_limit_middleware))
         .with_state(app_state);
+
+    // Security: reject empty tokens
+    let token = if token.trim().is_empty() {
+        let random: u64 = rand::random();
+        format!("{:x}", random)
+    } else {
+        token
+    };
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     log::info!("Mergen web mode listening on http://{}", addr);
     eprintln!("Mergen web mode: open http://{} in your browser", addr);
-    if !token.is_empty() {
-        eprintln!("Auth token: {}", token);
-    }
+    eprintln!("Auth token: {}", token);
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("bind failed: {e}"))?;
 
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .map_err(|e| format!("server error: {e}"))?;
 
@@ -585,6 +632,20 @@ async fn api_add_project_handler(
     State(state): State<AppState>,
     Json(body): Json<AddProjectBody>,
 ) -> impl IntoResponse {
+    if let Err(e) = validate_project_name(&body.name) {
+        return Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e),
+        });
+    }
+    if let Err(e) = validate_project_path(&body.path) {
+        return Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e),
+        });
+    }
     let mut guard = state.shared.lock().unwrap();
     match guard.add_project(body.name, body.path) {
         Ok(p) => Json(ApiResponse {
@@ -720,7 +781,15 @@ fn build_directory_node(path: &std::path::Path, project_root: &std::path::Path) 
             for entry in entries.take(100) {
                 if let Ok(entry) = entry {
                     let child_path = entry.path();
-                    let rel = child_path.strip_prefix(project_root).unwrap_or(&child_path);
+                    // Security: skip symlinks to prevent traversal outside project
+                    if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
+                        continue;
+                    }
+                    // Security: only include children under project_root
+                    let rel = match child_path.strip_prefix(project_root) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
                     if rel.components().count() <= 2 {
                         children.push(build_directory_node(&child_path, project_root));
                     }
@@ -729,9 +798,11 @@ fn build_directory_node(path: &std::path::Path, project_root: &std::path::Path) 
         }
     }
     children.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+    // Return relative path instead of absolute to prevent path leakage
+    let rel_path = path.strip_prefix(project_root).unwrap_or(path).display().to_string();
     WebDirectoryNode {
         name,
-        path: path.display().to_string(),
+        path: if rel_path.is_empty() { ".".to_owned() } else { rel_path },
         is_dir,
         is_deferred: false,
         children,
@@ -824,9 +895,20 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     Query(query): Query<WsQuery>,
     State(state): State<AppState>,
+    req: axum::extract::Request,
 ) -> impl IntoResponse {
     let token_ok = query.token.as_ref() == Some(&state.token);
-    ws.on_upgrade(move |socket| handle_socket(socket, state, token_ok))
+    // Validate Origin header to prevent CSWSH
+    let origin_ok = req
+        .headers()
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .map(|o| {
+            o.starts_with("http://127.0.0.1:") || o.starts_with("http://localhost:")
+        })
+        .unwrap_or(true); // allow if no origin header (local clients)
+    let allowed = token_ok && origin_ok;
+    ws.on_upgrade(move |socket| handle_socket(socket, state, allowed))
 }
 
 async fn handle_socket(mut socket: WebSocket, state: AppState, token_ok: bool) {
@@ -979,6 +1061,12 @@ async fn handle_client_message(state: &AppState, msg: ClientMessage) {
             });
         }
         ClientMessage::AddProject { name, path } => {
+            if validate_project_name(&name).is_err() || validate_project_path(&path).is_err() {
+                let _ = state.shared.lock().unwrap().broadcast_tx.send(ServerMessage::Error {
+                    message: "Invalid project name or path".to_owned(),
+                });
+                return;
+            }
             let mut guard = state.shared.lock().unwrap();
             let _ = guard.add_project(name, path);
         }
@@ -1060,4 +1148,146 @@ fn web_server_port() -> u16 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(WEB_SERVER_DEFAULT_PORT)
+}
+
+// ---------------------------------------------------------------------------
+// Security middleware
+// ---------------------------------------------------------------------------
+
+/// Add security headers to all responses.
+async fn security_headers_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+
+    // Prevent clickjacking
+    headers.insert("X-Frame-Options", "DENY".parse().unwrap());
+    // Prevent MIME-type sniffing
+    headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
+    // Restrict referrer info
+    headers.insert("Referrer-Policy", "strict-origin-when-cross-origin".parse().unwrap());
+    // Restrict browser features
+    headers.insert(
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=(), magnetometer=(), gyroscope=(), display-capture=()"
+            .parse()
+            .unwrap(),
+    );
+    // Content Security Policy
+    headers.insert(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self' ws: wss:; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none';"
+            .parse()
+            .unwrap(),
+    );
+    response
+}
+
+// ---------------------------------------------------------------------------
+// Rate limiting
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use std::time::Instant;
+
+struct RateLimiter {
+    requests: HashMap<String, Vec<Instant>>,
+    max_requests: usize,
+    window_secs: u64,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            requests: HashMap::new(),
+            max_requests: 60,   // 60 requests per minute
+            window_secs: 60,
+        }
+    }
+
+    fn is_allowed(&mut self, key: &str) -> bool {
+        let now = Instant::now();
+        let window = Duration::from_secs(self.window_secs);
+        let entries = self.requests.entry(key.to_owned()).or_default();
+        entries.retain(|t| now.duration_since(*t) < window);
+        if entries.len() >= self.max_requests {
+            return false;
+        }
+        entries.push(now);
+        true
+    }
+}
+
+async fn rate_limit_middleware(
+    State(limiter): State<Arc<Mutex<RateLimiter>>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let is_loopback = addr.ip().is_loopback();
+    // Only trust x-forwarded-for from loopback (local proxy)
+    let key = if is_loopback {
+        req.headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(|s| s.trim().to_owned())
+            .unwrap_or_else(|| addr.ip().to_string())
+    } else {
+        addr.ip().to_string()
+    };
+
+    let allowed = {
+        let mut guard = limiter.lock().unwrap();
+        guard.is_allowed(&key)
+    };
+
+    if !allowed {
+        return Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .body(axum::body::Body::from("Rate limit exceeded"))
+            .unwrap();
+    }
+
+    next.run(req).await
+}
+
+// ---------------------------------------------------------------------------
+// Input validation helpers
+// ---------------------------------------------------------------------------
+
+/// Validate project path to prevent path traversal attacks.
+fn validate_project_path(path: &str) -> Result<(), String> {
+    if path.len() > 512 {
+        return Err("Path too long".to_owned());
+    }
+    if path.is_empty() {
+        return Err("Path cannot be empty".to_owned());
+    }
+    // Reject paths with traversal sequences
+    let normalized = path.replace('\\', "/");
+    if normalized.contains("..") || normalized.contains("//") {
+        return Err("Invalid path characters".to_owned());
+    }
+    // Reject non-printable characters
+    if path.chars().any(|c| c.is_control()) {
+        return Err("Path contains control characters".to_owned());
+    }
+    Ok(())
+}
+
+/// Validate project name.
+fn validate_project_name(name: &str) -> Result<(), String> {
+    if name.len() > 128 {
+        return Err("Name too long".to_owned());
+    }
+    if name.is_empty() {
+        return Err("Name cannot be empty".to_owned());
+    }
+    if name.chars().any(|c| c.is_control()) {
+        return Err("Name contains control characters".to_owned());
+    }
+    Ok(())
 }
