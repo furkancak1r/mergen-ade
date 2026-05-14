@@ -254,17 +254,41 @@ export default function App() {
         </span>
         <div style={{ flex: 1 }} />
         {!connected && (
-          <div style={{ display: 'flex', gap: 'var(--space-sm)', alignItems: 'center' }}>
-            <Input
-              type="text"
-              placeholder="Auth token"
+          <div style={{ display: 'flex', gap: 'var(--space-xs)', alignItems: 'center' }}>
+            <input
+              type="password"
+              placeholder="Token"
               value={token}
               onChange={e => setToken(e.target.value)}
-              style={{ width: 200 }}
+              style={{
+                width: 100,
+                background: 'var(--bg-input)',
+                border: '1px solid var(--border-default)',
+                color: 'var(--text-primary)',
+                fontSize: 'var(--font-xs)',
+                padding: '2px 6px',
+                borderRadius: 'var(--radius-sm)',
+                outline: 'none',
+              }}
+              onFocus={e => { e.currentTarget.style.borderColor = 'var(--border-focus)'; }}
+              onBlur={e => { e.currentTarget.style.borderColor = 'var(--border-default)'; }}
             />
-            <Button variant="secondary" onClick={() => { localStorage.setItem('mergen_token', token); window.location.reload(); }}>
+            <button
+              onClick={() => { localStorage.setItem('mergen_token', token); window.location.reload(); }}
+              style={{
+                background: 'var(--accent-dim)',
+                border: '1px solid var(--accent)',
+                color: 'var(--accent)',
+                fontSize: 'var(--font-xs)',
+                cursor: 'pointer',
+                padding: '2px 8px',
+                borderRadius: 'var(--radius-sm)',
+                fontWeight: 600,
+                lineHeight: 1,
+              }}
+            >
               Connect
-            </Button>
+            </button>
           </div>
         )}
         <span style={{
