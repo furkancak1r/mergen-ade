@@ -1017,6 +1017,8 @@ struct SmartInputState {
     dragging_task_id: Option<u64>,
     drag_hover_index: Option<usize>,
     user_height: Option<f32>,
+    /// User-resized height for the draft text area within the Smart Input footer.
+    draft_user_height: Option<f32>,
     /// Index into terminal recent_inputs when navigating history with Up/Down.
     /// None means not currently navigating history.
     history_nav_index: Option<usize>,
@@ -1055,6 +1057,7 @@ impl Default for SmartInputState {
             dragging_task_id: None,
             drag_hover_index: None,
             user_height: None,
+            draft_user_height: None,
             history_nav_index: None,
             history_nav_stash: String::new(),
             history_nav_stash_attachments: Vec::new(),
@@ -22782,9 +22785,7 @@ impl eframe::App for AdeApp {
                         ..
                     } = e
                     {
-                        primary_shortcut_modifier(*modifiers)
-                            && !modifiers.alt
-                            && !modifiers.shift
+                        primary_shortcut_modifier(*modifiers) && !modifiers.alt && !modifiers.shift
                     } else {
                         false
                     }
@@ -26636,8 +26637,7 @@ fn draw_smart_input_footer(
                             let row_ui = ui.horizontal(|ui| {
                                 ui.set_min_height(SMART_INPUT_TASK_ROW_HEIGHT);
                                 ui.label(
-                                    RichText::new(format!("{}.", index + 1))
-                                        .color(TEXT_MUTED),
+                                    RichText::new(format!("{}.", index + 1)).color(TEXT_MUTED),
                                 );
 
                                 if is_editing {
@@ -26785,12 +26785,10 @@ fn draw_smart_input_footer(
                                             )
                                             .truncate(),
                                         )
-                                        .on_hover_text(
-                                            capped_hover_text(
-                                                &task_text,
-                                                SMART_INPUT_TOOLTIP_MAX_CHARS,
-                                            ),
-                                        );
+                                        .on_hover_text(capped_hover_text(
+                                            &task_text,
+                                            SMART_INPUT_TOOLTIP_MAX_CHARS,
+                                        ));
                                     if label_response.clicked() {
                                         ui.ctx().copy_text(task_text.clone());
                                     }
@@ -26925,9 +26923,18 @@ fn draw_smart_input_footer(
                 );
             }
 
+            let mut draft_rect = egui::Rect::ZERO;
+            let mut last_input_height = 0.0f32;
+            let mut last_available_h = 0.0f32;
             ui.horizontal(|ui| {
                 let draft_id = AdeApp::smart_input_draft_input_id(terminal_id);
-                let input_height = ui.available_height().max(80.0);
+                let available_h = ui.available_height().max(80.0);
+                let input_height = state
+                    .draft_user_height
+                    .unwrap_or(available_h)
+                    .clamp(40.0, available_h);
+                last_input_height = input_height;
+                last_available_h = available_h;
                 let input_width = (ui.available_width() - 92.0).max(120.0);
                 // Preserve selection before right-click collapses it
                 let secondary_pressed = ui.ctx().input(|input| input.pointer.secondary_pressed());
@@ -26959,6 +26966,7 @@ fn draw_smart_input_footer(
                             )),
                     )
                 });
+                draft_rect = draft_response.rect;
                 // Determine effective selection for context menu
                 let post_show_range = egui::text_edit::TextEditState::load(ui.ctx(), draft_id)
                     .and_then(|s| s.cursor.char_range())
@@ -27053,6 +27061,44 @@ fn draw_smart_input_footer(
                         }
                     }
                 });
+
+                // Draggable resize grip at bottom-right of the draft text area
+                let grip_size = 12.0;
+                let grip_rect = egui::Rect::from_min_size(
+                    egui::pos2(
+                        draft_rect.right() - grip_size,
+                        draft_rect.bottom() - grip_size,
+                    ),
+                    egui::vec2(grip_size, grip_size),
+                );
+                let grip_response =
+                    ui.interact(grip_rect, ui.id().with("draft_resize"), Sense::drag());
+                let grip_color = if grip_response.hovered() || grip_response.dragged() {
+                    Color32::from_rgb(160, 160, 160)
+                } else {
+                    Color32::from_rgb(100, 100, 100)
+                };
+                let x0 = grip_rect.left() + 3.0;
+                let y0 = grip_rect.top() + 3.0;
+                let x1 = grip_rect.right() - 3.0;
+                let y1 = grip_rect.bottom() - 3.0;
+                ui.painter().line_segment(
+                    [egui::pos2(x0, y1), egui::pos2(x1, y0)],
+                    Stroke::new(1.5, grip_color),
+                );
+                ui.painter().line_segment(
+                    [egui::pos2(x0 + 3.0, y1), egui::pos2(x1, y0 + 3.0)],
+                    Stroke::new(1.5, grip_color),
+                );
+                if grip_response.hovered() || grip_response.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                }
+                if grip_response.dragged() {
+                    let delta = ui.ctx().input(|i| i.pointer.delta().y);
+                    let new_height = (last_input_height + delta).clamp(40.0, last_available_h);
+                    state.draft_user_height = Some(new_height);
+                    ui.ctx().request_repaint();
+                }
             });
 
             // Clear stored context menu selections when menu closes
@@ -27653,7 +27699,7 @@ fn draw_project_group_header(
                 );
                 if styled_icon_button(
                     ui,
-                    icons::TREE_VIEW,
+                    icons::FOLDER_PLUS,
                     BTN_TEAL,
                     BTN_TEAL_HOVER,
                     BTN_ICON_ACTIVE,
@@ -28040,7 +28086,7 @@ fn styled_launcher_menu_button(
                                     .shrink2(egui::vec2(FOREGROUND_LAUNCHER_MENU_PADDING_X, 0.0));
                                 let is_hovered = ui.rect_contains_pointer(row_rect);
                                 let row_bg = if is_hovered {
-                                    with_alpha(BTN_ICON_HOVER, 110)
+                                    BTN_ICON_HOVER
                                 } else {
                                     SURFACE_BG_SOFT
                                 };
@@ -33113,7 +33159,7 @@ mod tests {
         );
 
         assert!(
-            frame_contains_rect_filled(&output, super::with_alpha(super::BTN_ICON_HOVER, 110)),
+            frame_contains_rect_filled(&output, super::BTN_ICON_HOVER),
             "hovered launcher menu row must paint a highlight rect"
         );
     }
@@ -33148,7 +33194,7 @@ mod tests {
                                 ));
                                 let is_hovered = ui.rect_contains_pointer(row_rect);
                                 let row_bg = if is_hovered {
-                                    super::with_alpha(super::BTN_ICON_HOVER, 110)
+                                    super::BTN_ICON_HOVER
                                 } else {
                                     super::SURFACE_BG_SOFT
                                 };
@@ -33213,7 +33259,7 @@ mod tests {
         let exceeds = output.shapes.iter().any(|shape| {
             if let egui::epaint::Shape::Rect(rect_shape) = &shape.shape {
                 (rect_shape.fill == super::SURFACE_BG_SOFT
-                    || rect_shape.fill == super::with_alpha(super::BTN_ICON_HOVER, 110))
+                    || rect_shape.fill == super::BTN_ICON_HOVER)
                     && rect_shape.rect.width() > max_allowed + 1.0
             } else {
                 false
@@ -33252,7 +33298,7 @@ mod tests {
         for shape in &output.shapes {
             if let egui::epaint::Shape::Rect(rect_shape) = &shape.shape {
                 if rect_shape.fill == super::SURFACE_BG_SOFT
-                    || rect_shape.fill == super::with_alpha(super::BTN_ICON_HOVER, 110)
+                    || rect_shape.fill == super::BTN_ICON_HOVER
                 {
                     if rect_shape.rect.width() > expected_max_width + 1.0 {
                         touches_edge = true;
