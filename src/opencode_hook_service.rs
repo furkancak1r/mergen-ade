@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -15,6 +15,14 @@ pub const MERGEN_OPENCODE_TERMINAL_ID_ENV_VAR: &str = "MERGEN_OPENCODE_TERMINAL_
 pub const OPENCODE_CONFIG_DIR_ENV_VAR: &str = "OPENCODE_CONFIG_DIR";
 pub const MERGEN_OPENCODE_PLUGIN_FILE: &str = "mergen-opencode-status.js";
 
+/// Answer payload for an OpenCode question that Mergen Smart Input will submit.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct OpenCodeQuestionAnswer {
+    pub request_id: String,
+    pub answers: Vec<Vec<String>>,
+    pub rejected: bool,
+}
+
 /// Shared state for the hook service tracking last status per terminal
 #[derive(Debug, Default)]
 struct HookServiceState {
@@ -22,6 +30,8 @@ struct HookServiceState {
     /// Normalized status per terminal (Orca-compatible: working | idle | permission)
     last_status_by_terminal: HashMap<u64, OpenCodeTransportStatus>,
     pending_events: Vec<OpenCodeNotifyInboxEvent>,
+    /// Answers queued by Mergen Smart Input, keyed by terminal id (FIFO).
+    pending_answers: HashMap<u64, VecDeque<OpenCodeQuestionAnswer>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +39,10 @@ struct OpenCodeHookStatusRequest {
     status: OpenCodeTransportStatus,
     session_id: Option<String>,
     parent_session_id: Option<String>,
+    /// The actual event kind from the hook body (e.g. "question.asked", "session.idle").
+    event_kind: Option<String>,
+    /// Full request body string so question/permission payloads are preserved.
+    raw_json: Option<String>,
 }
 
 impl HookServiceState {
@@ -37,6 +51,7 @@ impl HookServiceState {
             token,
             last_status_by_terminal: HashMap::new(),
             pending_events: Vec::new(),
+            pending_answers: HashMap::new(),
         }
     }
 
@@ -48,6 +63,8 @@ impl HookServiceState {
         status: OpenCodeTransportStatus,
         session_id: Option<String>,
         parent_session_id: Option<String>,
+        event_kind: Option<String>,
+        raw_json: Option<String>,
     ) -> bool {
         if parent_session_id
             .as_deref()
@@ -57,11 +74,26 @@ impl HookServiceState {
         }
 
         let changed = self.last_status_by_terminal.get(&terminal_id) != Some(&status);
-        if changed {
-            self.last_status_by_terminal.insert(terminal_id, status);
+        // Always enqueue metadata-bearing attention events (e.g. question.asked)
+        // even when the terminal is already in Permission status.
+        let is_metadata_event = event_kind.as_deref().is_some_and(|k| {
+            k == "question.asked"
+                || k == "question_asked"
+                || k == "question-asked"
+                || k == "permission.asked"
+                || k == "permission_asked"
+                || k == "permission-asked"
+                || k == "plan_mode_prompt"
+                || k == "plan-mode-prompt"
+        });
+        let should_enqueue = changed || is_metadata_event;
+        if should_enqueue {
+            if changed {
+                self.last_status_by_terminal.insert(terminal_id, status);
+            }
 
-            // Map to event kind string
-            let event_kind = status.as_str().to_owned();
+            // Use actual event kind from body when available; fall back to status mapping.
+            let event_kind = event_kind.unwrap_or_else(|| status.as_str().to_owned());
 
             // Legacy status for backward compatibility
             let legacy_status = match status {
@@ -69,6 +101,9 @@ impl HookServiceState {
                 OpenCodeTransportStatus::Idle | OpenCodeTransportStatus::Permission => "attention",
             }
             .to_owned();
+
+            let raw_json =
+                raw_json.unwrap_or_else(|| format!("{{\"status\":\"{}\"}}", status.as_str()));
 
             let event = OpenCodeNotifyInboxEvent {
                 terminal_id: terminal_id.to_string(),
@@ -79,7 +114,7 @@ impl HookServiceState {
                 inbox_token: Some(self.token.clone()),
                 event_kind: Some(event_kind),
                 opencode_status: Some(status),
-                raw_json: format!("{{\"status\":\"{}\"}}", status.as_str()),
+                raw_json,
                 timestamp_utc: format_iso_timestamp(),
             };
             self.pending_events.push(event);
@@ -89,6 +124,37 @@ impl HookServiceState {
 
     fn drain_pending_events(&mut self) -> Vec<OpenCodeNotifyInboxEvent> {
         std::mem::take(&mut self.pending_events)
+    }
+
+    fn store_answer(&mut self, terminal_id: u64, answer: OpenCodeQuestionAnswer) {
+        self.pending_answers
+            .entry(terminal_id)
+            .or_default()
+            .push_back(answer);
+    }
+
+    /// Peek at the next answer without removing it (non-destructive).
+    fn peek_answer(&self, terminal_id: u64) -> Option<OpenCodeQuestionAnswer> {
+        self.pending_answers
+            .get(&terminal_id)
+            .and_then(|answers| answers.front().cloned())
+    }
+
+    /// Acknowledge (remove) the front answer after successful delivery.
+    fn ack_answer(&mut self, terminal_id: u64) -> bool {
+        let removed = if let Some(answers) = self.pending_answers.get_mut(&terminal_id) {
+            answers.pop_front().is_some()
+        } else {
+            false
+        };
+        if self
+            .pending_answers
+            .get(&terminal_id)
+            .is_some_and(|a| a.is_empty())
+        {
+            self.pending_answers.remove(&terminal_id);
+        }
+        removed
     }
 }
 
@@ -131,6 +197,21 @@ impl OpenCodeHookService {
     /// Get and clear pending status events since last check
     pub fn drain_pending_events(&self) -> Vec<OpenCodeNotifyInboxEvent> {
         self.state.lock().unwrap().drain_pending_events()
+    }
+
+    /// Queue an answer for the plugin to consume.
+    pub fn store_answer(&self, terminal_id: u64, answer: OpenCodeQuestionAnswer) {
+        self.state.lock().unwrap().store_answer(terminal_id, answer);
+    }
+
+    /// Peek at the next answer without removing it.
+    pub fn peek_answer(&self, terminal_id: u64) -> Option<OpenCodeQuestionAnswer> {
+        self.state.lock().unwrap().peek_answer(terminal_id)
+    }
+
+    /// Acknowledge (remove) the front answer after successful delivery.
+    pub fn ack_answer(&self, terminal_id: u64) -> bool {
+        self.state.lock().unwrap().ack_answer(terminal_id)
     }
 
     /// Get the port the service is listening on (test-only)
@@ -209,10 +290,13 @@ impl OpenCodeHookService {
         let first_line = request.lines().next().unwrap_or("");
         let parts: Vec<&str> = first_line.split_whitespace().collect();
 
-        if parts.len() != 3 || parts[0] != "POST" || parts[1] != "/hook" {
-            Self::write_response(&mut stream, 404, "Not Found")?;
+        if parts.len() != 3 {
+            Self::write_response(&mut stream, 400, "Bad Request")?;
             return Ok(());
         }
+
+        let method = parts[0];
+        let path = parts[1];
 
         // Extract headers
         let mut token_header = None::<String>;
@@ -258,41 +342,77 @@ impl OpenCodeHookService {
             }
         };
 
-        // Read and parse body
-        if content_length > 0 {
-            let expected_request_len = header_end.saturating_add(content_length);
-            while request_bytes.len() < expected_request_len {
-                let bytes_read = stream.read(&mut buffer)?;
-                if bytes_read == 0 {
-                    break;
+        if method == "POST" && path == "/hook" {
+            // Read and parse body
+            if content_length > 0 {
+                let expected_request_len = header_end.saturating_add(content_length);
+                while request_bytes.len() < expected_request_len {
+                    let bytes_read = stream.read(&mut buffer)?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    request_bytes.extend_from_slice(&buffer[..bytes_read]);
                 }
-                request_bytes.extend_from_slice(&buffer[..bytes_read]);
             }
+
+            let body = if content_length > 0 {
+                let body_end = header_end
+                    .saturating_add(content_length)
+                    .min(request_bytes.len());
+                String::from_utf8_lossy(&request_bytes[header_end..body_end]).to_string()
+            } else {
+                String::from_utf8_lossy(&request_bytes[header_end..]).to_string()
+            };
+
+            let request = Self::parse_status_request_from_body(&body);
+
+            if let Some(request) = request {
+                state.lock().unwrap().record_status(
+                    terminal_id,
+                    request.status,
+                    request.session_id,
+                    request.parent_session_id,
+                    request.event_kind,
+                    request.raw_json,
+                );
+                Self::write_response(&mut stream, 204, "No Content")?;
+            } else {
+                Self::write_response(&mut stream, 400, "Bad Request")?;
+            }
+
+            return Ok(());
         }
 
-        let body = if content_length > 0 {
-            let body_end = header_end
-                .saturating_add(content_length)
-                .min(request_bytes.len());
-            String::from_utf8_lossy(&request_bytes[header_end..body_end]).to_string()
-        } else {
-            String::from_utf8_lossy(&request_bytes[header_end..]).to_string()
-        };
+        if method == "GET" && path == "/answer" {
+            let answer = state.lock().unwrap().peek_answer(terminal_id);
+            if let Some(answer) = answer {
+                let body = match serde_json::to_string(&answer) {
+                    Ok(json) => json,
+                    Err(_) => {
+                        Self::write_response(&mut stream, 500, "Internal Server Error")?;
+                        return Ok(());
+                    }
+                };
+                Self::write_json_response(&mut stream, 200, &body)?;
+            } else {
+                Self::write_response(&mut stream, 204, "No Content")?;
+            }
 
-        let request = Self::parse_status_request_from_body(&body);
-
-        if let Some(request) = request {
-            state.lock().unwrap().record_status(
-                terminal_id,
-                request.status,
-                request.session_id,
-                request.parent_session_id,
-            );
-            Self::write_response(&mut stream, 204, "No Content")?;
-        } else {
-            Self::write_response(&mut stream, 400, "Bad Request")?;
+            return Ok(());
         }
 
+        if method == "POST" && path == "/answer/ack" {
+            let acked = state.lock().unwrap().ack_answer(terminal_id);
+            if acked {
+                Self::write_response(&mut stream, 204, "No Content")?;
+            } else {
+                Self::write_response(&mut stream, 410, "Gone")?;
+            }
+
+            return Ok(());
+        }
+
+        Self::write_response(&mut stream, 404, "Not Found")?;
         Ok(())
     }
 
@@ -305,6 +425,17 @@ impl OpenCodeHookService {
         let status = string_at_path(&parsed, &["status"])
             .as_deref()
             .and_then(OpenCodeTransportStatus::from_str)?;
+
+        // Extract actual event kind from body (e.g. question.asked inside event.type)
+        let event_kind = string_at_any_path(
+            &parsed,
+            &[
+                &["event", "type"],
+                &["type"],
+                &["event", "event_type"],
+                &["event_type"],
+            ],
+        );
 
         Some(OpenCodeHookStatusRequest {
             status,
@@ -339,6 +470,8 @@ impl OpenCodeHookService {
                     &["properties", "parentId"],
                 ],
             ),
+            event_kind,
+            raw_json: Some(body.to_owned()),
         })
     }
 
@@ -346,6 +479,18 @@ impl OpenCodeHookService {
         let response = format!(
             "HTTP/1.1 {} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             code, message
+        );
+        stream.write_all(response.as_bytes())?;
+        stream.flush()
+    }
+
+    fn write_json_response(stream: &mut TcpStream, code: u16, body: &str) -> io::Result<()> {
+        let response = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            code,
+            if code == 200 { "OK" } else { "No Content" },
+            body.len(),
+            body
         );
         stream.write_all(response.as_bytes())?;
         stream.flush()
@@ -397,11 +542,18 @@ impl Drop for OpenCodeHookService {
 /// Generate the OpenCode plugin JavaScript source
 pub fn get_opencode_plugin_source() -> String {
     r#"const HOOK_PATH = "/hook";
+const ANSWER_PATH = "/answer";
 const sessionParents = new Map();
+const pendingQuestions = new Map();
 
 function getHookUrl() {
   const port = process.env.MERGEN_OPENCODE_HOOK_PORT;
   return port ? `http://127.0.0.1:${port}${HOOK_PATH}` : null;
+}
+
+function getAnswerUrl() {
+  const port = process.env.MERGEN_OPENCODE_HOOK_PORT;
+  return port ? `http://127.0.0.1:${port}${ANSWER_PATH}` : null;
 }
 
 function getStatusType(event) {
@@ -467,6 +619,9 @@ async function postStatus(status, event) {
   if (parentSessionID) return;
 
   const body = { status };
+  if (event?.type === "question.asked") {
+    body.event = event;
+  }
   if (sessionID) body.session_id = sessionID;
 
   try {
@@ -485,58 +640,143 @@ async function postStatus(status, event) {
   }
 }
 
-export const MergenOpenCodeStatusPlugin = async () => ({
-  event: async ({ event }) => {
-    if (!event?.type) return;
+const ackedAnswers = new Set();
 
-    if (event.type === "session.created" || event.type === "session.updated") {
-      rememberSession(event?.properties?.info ?? event?.properties);
-      return;
+async function ackAnswer(requestId) {
+  const url = getAnswerUrl();
+  const token = process.env.MERGEN_OPENCODE_HOOK_TOKEN;
+  const terminalId = process.env.MERGEN_OPENCODE_TERMINAL_ID;
+  if (!url || !token || !terminalId || !requestId) return;
+  try {
+    await fetch(`${url}/ack`, {
+      method: "POST",
+      headers: {
+        "X-Mergen-Token": token,
+        "X-Mergen-OpenCode-Terminal-Id": terminalId,
+      },
+    });
+  } catch {
+    // ignore ack errors
+  }
+}
+
+async function pollForAnswers(client) {
+  const url = getAnswerUrl();
+  const token = process.env.MERGEN_OPENCODE_HOOK_TOKEN;
+  const terminalId = process.env.MERGEN_OPENCODE_TERMINAL_ID;
+  if (!url || !token || !terminalId) return;
+
+  // Feature-detect OpenCode SDK question APIs
+  const canReply = typeof client?.question?.reply === "function";
+  const canReject = typeof client?.question?.reject === "function";
+  if (!canReply && !canReject) return;
+
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      headers: {
+        "X-Mergen-Token": token,
+        "X-Mergen-OpenCode-Terminal-Id": terminalId,
+      },
+    });
+    if (res.status === 200) {
+      const answer = await res.json();
+      if (answer?.request_id && pendingQuestions.has(answer.request_id) && !ackedAnswers.has(answer.request_id)) {
+        let delivered = false;
+        try {
+          if (answer.rejected && canReject) {
+            await client.question.reject({ requestID: answer.request_id });
+            delivered = true;
+          } else if (canReply) {
+            await client.question.reply({
+              requestID: answer.request_id,
+              answers: answer.answers,
+            });
+            delivered = true;
+          }
+        } catch {
+          // Delivery failed; leave answer on server queue for retry
+        }
+        if (delivered) {
+          ackedAnswers.add(answer.request_id);
+          pendingQuestions.delete(answer.request_id);
+          await ackAnswer(answer.request_id);
+        }
+      }
     }
+  } catch {
+    // ignore polling errors
+  }
+}
 
-    // Permission asked (user approval needed)
-    if (event.type === "permission.asked") {
-      await postStatus("permission", event);
-      return;
-    }
+export const MergenOpenCodeStatusPlugin = async ({ client }) => {
+  const pollInterval = setInterval(() => pollForAnswers(client), 500);
 
-    // Question asked (user input needed) - also maps to permission state
-    if (event.type === "question.asked") {
-      await postStatus("permission", event);
-      return;
-    }
+  return {
+    event: async ({ event }) => {
+      if (!event?.type) return;
 
-    // Session idle (turn complete / waiting)
-    if (event.type === "session.idle") {
-      await postStatus("idle", event);
-      return;
-    }
+      if (event.type === "session.created" || event.type === "session.updated") {
+        rememberSession(event?.properties?.info ?? event?.properties);
+        return;
+      }
 
-    // Session error - still idle but with error context
-    if (event.type === "session.error") {
-      await postStatus("idle", event);
-      return;
-    }
+      // Permission asked (user approval needed)
+      if (event.type === "permission.asked") {
+        await postStatus("permission", event);
+        return;
+      }
 
-    // Tool execution signals working state
-    if (event.type === "tool.execute.before") {
-      await postStatus("working", event);
-      return;
-    }
+      // Question asked (user input needed) - also maps to permission state
+      if (event.type === "question.asked") {
+        const props = event.properties || event;
+        const requestID = props?.id;
+        if (requestID) {
+          pendingQuestions.set(requestID, {
+            sessionID: props.sessionID,
+            questions: props.questions,
+          });
+        }
+        await postStatus("permission", event);
+        return;
+      }
 
-    // Session status updates (busy/idle)
-    if (event.type === "session.status") {
-      const statusType = getStatusType(event);
-      if (statusType === "busy" || statusType === "retry") {
+      // Session idle (turn complete / waiting)
+      if (event.type === "session.idle") {
+        await postStatus("idle", event);
+        return;
+      }
+
+      // Session error - still idle but with error context
+      if (event.type === "session.error") {
+        await postStatus("idle", event);
+        return;
+      }
+
+      // Tool execution signals working state
+      if (event.type === "tool.execute.before") {
         await postStatus("working", event);
         return;
       }
-      if (statusType === "idle") {
-        await postStatus("idle", event);
+
+      // Session status updates (busy/idle)
+      if (event.type === "session.status") {
+        const statusType = getStatusType(event);
+        if (statusType === "busy" || statusType === "retry") {
+          await postStatus("working", event);
+          return;
+        }
+        if (statusType === "idle") {
+          await postStatus("idle", event);
+        }
       }
-    }
-  },
-});
+    },
+
+    dispose: () => {
+      clearInterval(pollInterval);
+    },
+  };
+};
 "#
     .to_owned()
 }
@@ -651,6 +891,8 @@ mod tests {
             OpenCodeTransportStatus::Working,
             Some("main-session".to_owned()),
             None,
+            None,
+            None,
         ));
         assert_eq!(state.drain_pending_events().len(), 1);
 
@@ -659,6 +901,8 @@ mod tests {
             OpenCodeTransportStatus::Idle,
             Some("sub-session".to_owned()),
             Some("main-session".to_owned()),
+            None,
+            None,
         ));
         assert!(state.drain_pending_events().is_empty());
 
@@ -666,6 +910,8 @@ mod tests {
             1,
             OpenCodeTransportStatus::Idle,
             Some("main-session".to_owned()),
+            None,
+            None,
             None,
         ));
         let events = state.drain_pending_events();
@@ -676,6 +922,125 @@ mod tests {
         );
         assert_eq!(events[0].session_id.as_deref(), Some("main-session"));
         assert_eq!(events[0].parent_session_id, None);
+    }
+
+    #[test]
+    fn hook_service_preserves_question_payload_in_raw_json() {
+        let mut state = HookServiceState::new("token".to_owned());
+        let body = r#"{"status":"permission","event":{"type":"question.asked","properties":{"id":"req-1","sessionID":"sess-1","questions":[{"header":"Build","question":"Which model?","options":[{"label":"gpt-4","description":"Fast"}],"multiple":false,"custom":true}]}}}"#;
+
+        let request = OpenCodeHookService::parse_status_request_from_body(body)
+            .expect("should parse request with event");
+        assert!(request.raw_json.is_some());
+        assert_eq!(request.event_kind.as_deref(), Some("question.asked"));
+
+        assert!(state.record_status(
+            1,
+            request.status,
+            request.session_id,
+            request.parent_session_id,
+            request.event_kind,
+            request.raw_json,
+        ));
+
+        let events = state.drain_pending_events();
+        assert_eq!(events.len(), 1);
+        let raw = &events[0].raw_json;
+        assert!(raw.contains("question.asked"));
+        assert!(raw.contains("req-1"));
+        assert!(raw.contains("gpt-4"));
+        assert_eq!(events[0].event_kind.as_deref(), Some("question.asked"));
+    }
+
+    #[test]
+    fn hook_service_question_event_kind_enqueues_even_when_status_unchanged() {
+        let mut state = HookServiceState::new("token".to_owned());
+
+        // First permission event
+        assert!(state.record_status(
+            1,
+            OpenCodeTransportStatus::Permission,
+            Some("sess-a".to_owned()),
+            None,
+            Some("permission.asked".to_owned()),
+            None,
+        ));
+        assert_eq!(state.drain_pending_events().len(), 1);
+
+        // Second question.asked with same Permission status must still enqueue
+        assert!(!state.record_status(
+            1,
+            OpenCodeTransportStatus::Permission,
+            Some("sess-a".to_owned()),
+            None,
+            Some("question.asked".to_owned()),
+            Some(r#"{"status":"permission","event":{"type":"question.asked","properties":{"id":"req-2","sessionID":"sess-a","questions":[]}}}"#.to_owned()),
+        ));
+        let events = state.drain_pending_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_kind.as_deref(), Some("question.asked"));
+        assert!(events[0].raw_json.contains("req-2"));
+    }
+
+    #[test]
+    fn hook_service_answer_peek_returns_stored_answer() {
+        let mut state = HookServiceState::new("token".to_owned());
+        let answer = OpenCodeQuestionAnswer {
+            request_id: "req-42".to_owned(),
+            answers: vec![vec!["Option A".to_owned()]],
+            rejected: false,
+        };
+        state.store_answer(7, answer.clone());
+
+        // Peek should return the answer without removing it
+        let peeked = state.peek_answer(7);
+        assert!(peeked.is_some());
+        let peeked = peeked.unwrap();
+        assert_eq!(peeked.request_id, "req-42");
+        assert_eq!(peeked.answers, vec![vec!["Option A".to_owned()]]);
+        assert!(!peeked.rejected);
+
+        // Second peek should still return the same answer
+        let peeked2 = state.peek_answer(7);
+        assert!(peeked2.is_some());
+        assert_eq!(peeked2.unwrap().request_id, "req-42");
+
+        // Ack should remove it
+        assert!(state.ack_answer(7));
+        assert!(state.peek_answer(7).is_none());
+    }
+
+    #[test]
+    fn hook_service_answer_peek_returns_none_when_empty() {
+        let state = HookServiceState::new("token".to_owned());
+        assert!(state.peek_answer(7).is_none());
+    }
+
+    #[test]
+    fn hook_service_answer_fifo_ordering() {
+        let mut state = HookServiceState::new("token".to_owned());
+        state.store_answer(
+            7,
+            OpenCodeQuestionAnswer {
+                request_id: "req-1".to_owned(),
+                answers: vec![vec!["A".to_owned()]],
+                rejected: false,
+            },
+        );
+        state.store_answer(
+            7,
+            OpenCodeQuestionAnswer {
+                request_id: "req-2".to_owned(),
+                answers: vec![vec!["B".to_owned()]],
+                rejected: false,
+            },
+        );
+
+        assert_eq!(state.peek_answer(7).unwrap().request_id, "req-1");
+        state.ack_answer(7);
+        assert_eq!(state.peek_answer(7).unwrap().request_id, "req-2");
+        state.ack_answer(7);
+        assert!(state.peek_answer(7).is_none());
     }
 
     #[test]

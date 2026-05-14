@@ -306,6 +306,14 @@ fn normalize_config_for_current_platform(config: &mut AppConfig) {
         config.opencode.build_model_slot_a =
             "fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo".to_owned();
     }
+    // Strip Windows verbatim path prefixes from persisted project paths
+    for project in &mut config.projects {
+        project.path = crate::path_utils::normalize_windows_verbatim_path_for_shell(&project.path);
+        if let Some(ref root) = project.repo_root {
+            project.repo_root =
+                Some(crate::path_utils::normalize_windows_verbatim_path_for_shell(root));
+        }
+    }
 }
 
 #[cfg(test)]

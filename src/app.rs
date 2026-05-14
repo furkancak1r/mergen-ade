@@ -69,7 +69,7 @@ use crate::opencode::{
     OPENCODE_TOOL_EXECUTE_AFTER_EVENT, OPENCODE_TOOL_EXECUTE_BEFORE_EVENT,
     OPENCODE_TURN_COMPLETE_EVENT,
 };
-use crate::opencode_hook_service::OpenCodeHookService;
+use crate::opencode_hook_service::{OpenCodeHookService, OpenCodeQuestionAnswer};
 use crate::terminal::{
     try_terminal_selection_snapshot, try_terminal_snapshots, TerminalColor, TerminalCursor,
     TerminalCursorShape, TerminalDimensions, TerminalRuntime, TerminalSelectionLine,
@@ -131,9 +131,10 @@ const OPENCODE_HOOK_POLL_MS: u64 = 100;
 const SMART_INPUT_AUTO_DISPATCH_SETTLE_MS: u64 = 300;
 const CURSOR_BLINK_STEP_SECS: f64 = 0.6;
 const TRANSIENT_TOAST_SECS: f64 = 1.75;
-const TRANSIENT_TOAST_MIN_WIDTH: f32 = 420.0;
+const TRANSIENT_TOAST_MIN_WIDTH: f32 = 140.0;
 const TRANSIENT_TOAST_MAX_WIDTH: f32 = 640.0;
 const TRANSIENT_TOAST_SCREEN_MARGIN: f32 = 48.0;
+const TRANSIENT_TOAST_TEXT_EXTRA_PADDING: f32 = 32.0;
 const TERMINAL_COPY_FEEDBACK_TEXT: &str = "Copied terminal selection";
 const POWERSHELL_CURSOR_ROW_STABLE_SECS: f64 = 0.06;
 const TERMINAL_CHAR_WIDTH_SAMPLE_CELLS: usize = 64;
@@ -229,6 +230,9 @@ const SOURCE_CONTROL_TOOLTIP_FILE_LIMIT: usize = 12;
 const DIRECTORY_ENTRY_TOOLTIP_MAX_CHARS: usize = 500;
 // Pure Dark Theme colors
 const TERMINAL_HOVER_WIDTH: f32 = 320.0;
+const TERMINAL_HISTORY_POPUP_MAX_HEIGHT: f32 = 400.0;
+const TERMINAL_HISTORY_MESSAGE_MAX_HEIGHT: f32 = 120.0;
+const CHECKLIST_MESSAGE_MAX_HEIGHT: f32 = 120.0;
 const TERMINAL_HEADER_HEIGHT: f32 = 38.0;
 const TERMINAL_HEADER_GAP: f32 = 6.0;
 const TERMINAL_TILE_GAP_X: f32 = 0.0;
@@ -266,6 +270,7 @@ const BROWSER_URL_INPUT_ID: &str = "browser-url-input";
 const FOREGROUND_MESSAGE_INPUT_ID: &str = "foreground-message-input";
 const SMART_INPUT_DRAFT_INPUT_ID: &str = "smart-input-draft";
 const SMART_INPUT_TASK_EDIT_INPUT_ID: &str = "smart-input-task-edit";
+const SMART_INPUT_QUESTION_CUSTOM_INPUT_ID: &str = "smart-input-question-custom";
 const SMART_INPUT_MIN_FOOTER_HEIGHT: f32 = 132.0;
 const SMART_INPUT_BASE_FOOTER_HEIGHT: f32 = 156.0;
 const SMART_INPUT_TASK_ROW_HEIGHT: f32 = 28.0;
@@ -402,6 +407,7 @@ enum AppIcon {
     Globe,
     List,
     Plus,
+    Question,
     File,
     FileText,
     FileCode,
@@ -419,7 +425,7 @@ enum AppIcon {
 }
 
 impl AppIcon {
-    const ALL: [Self; 34] = [
+    const ALL: [Self; 35] = [
         Self::ArrowClockwise,
         Self::ArrowLeft,
         Self::ArrowRight,
@@ -440,6 +446,7 @@ impl AppIcon {
         Self::Globe,
         Self::List,
         Self::Plus,
+        Self::Question,
         Self::File,
         Self::FileText,
         Self::FileCode,
@@ -478,6 +485,7 @@ impl AppIcon {
             Self::Globe => "globe",
             Self::List => "list",
             Self::Plus => "plus",
+            Self::Question => "help-circle",
             Self::File => "file",
             Self::FileText => "file-text",
             Self::FileCode => "file-code",
@@ -547,6 +555,7 @@ mod icons {
     pub const GLOBE: AppIcon = AppIcon::Globe;
     pub const LIST: AppIcon = AppIcon::List;
     pub const PLUS: AppIcon = AppIcon::Plus;
+    pub const QUESTION: AppIcon = AppIcon::Question;
     pub const SCAN: AppIcon = AppIcon::Scan;
     pub const SCAN_LINE: AppIcon = AppIcon::ScanLine;
     pub const TERMINAL: AppIcon = AppIcon::Terminal;
@@ -996,6 +1005,23 @@ struct SmartInputAttachment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenCodeQuestionOption {
+    label: String,
+    description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenCodeQuestionInfo {
+    request_id: String,
+    session_id: String,
+    header: String,
+    question: String,
+    options: Vec<OpenCodeQuestionOption>,
+    multiple: bool,
+    custom: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SmartInputTask {
     id: u64,
     text: String,
@@ -1290,6 +1316,8 @@ enum SmartInputSubmitRequest {
 struct SmartInputPaneAction {
     send_draft_now: Option<(String, Vec<SmartInputAttachment>)>,
     send_task_now: Option<(u64, Vec<SmartInputAttachment>)>,
+    submit_question: bool,
+    reject_question: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2300,6 +2328,14 @@ struct TerminalEntry {
     /// True when user needs to acknowledge attention (idle/permission after working)
     /// Cleared on terminal focus or keyboard input
     opencode_attention_pending: bool,
+    /// Active OpenCode question (from question.asked hook/notify event) waiting
+    /// for a Smart Input answer. Cleared when answered or when OpenCode transitions
+    /// to Working/Idle.
+    opencode_pending_question: Option<OpenCodeQuestionInfo>,
+    /// UI state for the active question: selected option labels.
+    opencode_question_selected: Vec<String>,
+    /// UI state for the active question: custom answer text.
+    opencode_question_custom: String,
     /// Pending background rerun: command to replay after Ctrl+C settle.
     /// Stores the full raw command (including multi-line) to be sent in a second phase.
     pending_rerun_command: Option<String>,
@@ -4086,11 +4122,22 @@ impl AdeApp {
     }
 
     /// Compute the preferred content width for a transient toast notification.
-    /// Respects screen size so the toast never overflows the viewport.
-    fn transient_toast_content_width(screen_width: f32) -> f32 {
-        let preferred = (screen_width - TRANSIENT_TOAST_SCREEN_MARGIN)
-            .clamp(TRANSIENT_TOAST_MIN_WIDTH, TRANSIENT_TOAST_MAX_WIDTH);
-        preferred.min(screen_width)
+    /// Width is driven by the message text plus padding, clamped between min/max
+    /// and never exceeding the available screen space.
+    fn transient_toast_content_width(ctx: &egui::Context, screen_width: f32, message: &str) -> f32 {
+        let font_id = egui::FontId::proportional(13.0);
+        let text_width = ctx.fonts(|fonts| {
+            fonts
+                .layout(message.into(), font_id, Color32::PLACEHOLDER, f32::INFINITY)
+                .size()
+                .x
+        });
+        let content_for_text = text_width + TRANSIENT_TOAST_TEXT_EXTRA_PADDING;
+        let max_available =
+            (screen_width - TRANSIENT_TOAST_SCREEN_MARGIN).max(TRANSIENT_TOAST_MIN_WIDTH);
+        let preferred =
+            content_for_text.clamp(TRANSIENT_TOAST_MIN_WIDTH, TRANSIENT_TOAST_MAX_WIDTH);
+        preferred.min(max_available).min(screen_width)
     }
 
     fn draw_transient_toast(&mut self, ctx: &egui::Context) {
@@ -4110,7 +4157,7 @@ impl AdeApp {
         ctx.request_repaint_after(Duration::from_secs_f64(remaining));
 
         let screen_width = ctx.screen_rect().width();
-        let toast_width = Self::transient_toast_content_width(screen_width);
+        let toast_width = Self::transient_toast_content_width(ctx, screen_width, &message);
 
         egui::Area::new(Id::new("transient_status_toast"))
             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-18.0, -18.0))
@@ -4152,10 +4199,6 @@ impl AdeApp {
         }
         // Always show projects without live terminals on startup
         config.ui.terminal_manager_hide_inactive_projects = false;
-        // Collapse checklist panel on startup if no checklist items exist across all projects
-        if !has_any_checklist_items(&config.projects) {
-            config.ui.checklist_panel_expanded = false;
-        }
         #[cfg(target_os = "windows")]
         let window_hwnd = Self::extract_window_hwnd(_cc);
 
@@ -4940,6 +4983,9 @@ impl AdeApp {
             opencode_last_hook_attention_at: None,
             opencode_last_turn_complete_at: None,
             opencode_attention_pending: false,
+            opencode_pending_question: None,
+            opencode_question_selected: Vec::new(),
+            opencode_question_custom: String::new(),
             pending_rerun_command: None,
             pending_rerun_since: None,
             // Claude Code state (Orca-compatible title-based detection)
@@ -6516,6 +6562,10 @@ impl AdeApp {
         entry.opencode_attention_reason = None;
         entry.opencode_prompt_submit_since = None;
         entry.opencode_running_since = None;
+        if entry.opencode_pending_question.take().is_some() {
+            entry.opencode_question_selected.clear();
+            entry.opencode_question_custom.clear();
+        }
         entry.dirty = true;
         changed
     }
@@ -6901,6 +6951,12 @@ impl AdeApp {
                     entry.opencode_attention_pending = false;
                     changed = true;
                 }
+                // Working also clears any pending question state
+                if entry.opencode_pending_question.take().is_some() {
+                    entry.opencode_question_selected.clear();
+                    entry.opencode_question_custom.clear();
+                    changed = true;
+                }
                 (AiCliStatus::Running, None)
             }
             OpenCodeTransportStatus::Idle => {
@@ -6930,6 +6986,13 @@ impl AdeApp {
                         entry.opencode_attention_reason = Some(r);
                         changed = true;
                     }
+                }
+
+                // Safety net: clear any stale pending question when OpenCode goes idle
+                if entry.opencode_pending_question.take().is_some() {
+                    entry.opencode_question_selected.clear();
+                    entry.opencode_question_custom.clear();
+                    changed = true;
                 }
 
                 (AiCliStatus::Attention, reason)
@@ -7577,19 +7640,42 @@ impl AdeApp {
             }
 
             if let Ok(terminal_id) = event.terminal_id.parse::<u64>() {
-                let (transport_status, reason_hint) = match event.event_kind.as_deref() {
-                    Some("working") => (OpenCodeTransportStatus::Working, None),
-                    Some("idle") => (
+                let event_kind = event.event_kind.as_deref().unwrap_or("");
+                let (transport_status, reason_hint) = match event_kind {
+                    "working" => (OpenCodeTransportStatus::Working, None),
+                    "idle" | "session.idle" | "session_idle" | "session-idle" | "turn-complete"
+                    | "turn_complete" | "turn-complete" => (
                         OpenCodeTransportStatus::Idle,
                         Some(OpenCodeAttentionReason::TurnComplete),
                     ),
-                    Some("permission") => (
+                    "permission" | "permission.asked" | "permission_asked" | "permission-asked"
+                    | "approval-prompt" | "approval_prompt" => (
                         OpenCodeTransportStatus::Permission,
                         Some(OpenCodeAttentionReason::PermissionAsked),
                     ),
-                    Some("plan_mode") | Some("plan-mode") => (
+                    "question.asked" | "question_asked" | "question-asked" | "question-prompt"
+                    | "question_prompt" => {
+                        if let Some(info) =
+                            Self::parse_opencode_question_from_raw_json(&event.raw_json)
+                        {
+                            if let Some(entry) = self.terminals.get_mut(&terminal_id) {
+                                entry.opencode_pending_question = Some(info);
+                                entry.opencode_question_selected.clear();
+                                entry.opencode_question_custom.clear();
+                            }
+                        }
+                        (
+                            OpenCodeTransportStatus::Permission,
+                            Some(OpenCodeAttentionReason::QuestionAsked),
+                        )
+                    }
+                    "plan_mode" | "plan-mode" | "plan_mode_prompt" | "plan-mode-prompt" => (
                         OpenCodeTransportStatus::Permission,
                         Some(OpenCodeAttentionReason::PlanModePrompt),
+                    ),
+                    "session.error" | "session_error" | "session-error" | "error" => (
+                        OpenCodeTransportStatus::Idle,
+                        Some(OpenCodeAttentionReason::SessionError),
                     ),
                     _ => continue,
                 };
@@ -8277,6 +8363,56 @@ impl AdeApp {
         changed
     }
 
+    /// Parse an OpenCode question payload from raw hook/notify JSON.
+    /// Handles both hook shape (`{"event":{"properties":{...}}}`) and
+    /// notify shape (`{"properties":{...}}` or `{"type":"question.asked",...}`).
+    fn parse_opencode_question_from_raw_json(raw_json: &str) -> Option<OpenCodeQuestionInfo> {
+        let parsed: serde_json::Value = serde_json::from_str(raw_json).ok()?;
+
+        // Hook events wrap the event under `event`; notify events may be the event itself.
+        let event_node = parsed.get("event").unwrap_or(&parsed);
+        let properties = event_node.get("properties")?;
+
+        let questions = properties.get("questions")?.as_array()?;
+        let first = questions.first()?;
+
+        let header = first.get("header")?.as_str()?.to_string();
+        let question = first.get("question")?.as_str()?.to_string();
+        let multiple = first
+            .get("multiple")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let custom = first
+            .get("custom")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        let options = first
+            .get("options")?
+            .as_array()?
+            .iter()
+            .filter_map(|opt| {
+                Some(OpenCodeQuestionOption {
+                    label: opt.get("label")?.as_str()?.to_string(),
+                    description: opt.get("description")?.as_str()?.to_string(),
+                })
+            })
+            .collect();
+
+        let request_id = properties.get("id")?.as_str()?.to_string();
+        let session_id = properties.get("sessionID")?.as_str()?.to_string();
+
+        Some(OpenCodeQuestionInfo {
+            request_id,
+            session_id,
+            header,
+            question,
+            options,
+            multiple,
+            custom,
+        })
+    }
+
     fn apply_opencode_notify_inbox_event(
         &mut self,
         terminal_id: u64,
@@ -8331,6 +8467,15 @@ impl AdeApp {
                                 || kind == "question_asked"
                                 || kind == "question-asked" =>
                         {
+                            if let Some(info) =
+                                Self::parse_opencode_question_from_raw_json(&event.raw_json)
+                            {
+                                if let Some(entry) = self.terminals.get_mut(&terminal_id) {
+                                    entry.opencode_pending_question = Some(info);
+                                    entry.opencode_question_selected.clear();
+                                    entry.opencode_question_custom.clear();
+                                }
+                            }
                             Some(OpenCodeAttentionReason::QuestionAsked)
                         }
                         Some(kind)
@@ -8378,10 +8523,20 @@ impl AdeApp {
                     OpenCodeTransportStatus::Idle,
                     Some(OpenCodeAttentionReason::TurnComplete),
                 ),
-                Some(kind) if kind == OPENCODE_QUESTION_PROMPT_EVENT => (
-                    OpenCodeTransportStatus::Permission,
-                    Some(OpenCodeAttentionReason::QuestionAsked),
-                ),
+                Some(kind) if kind == OPENCODE_QUESTION_PROMPT_EVENT => {
+                    if let Some(info) = Self::parse_opencode_question_from_raw_json(&event.raw_json)
+                    {
+                        if let Some(entry) = self.terminals.get_mut(&terminal_id) {
+                            entry.opencode_pending_question = Some(info);
+                            entry.opencode_question_selected.clear();
+                            entry.opencode_question_custom.clear();
+                        }
+                    }
+                    (
+                        OpenCodeTransportStatus::Permission,
+                        Some(OpenCodeAttentionReason::QuestionAsked),
+                    )
+                }
                 Some(kind) if kind == OPENCODE_APPROVAL_PROMPT_EVENT => (
                     OpenCodeTransportStatus::Permission,
                     Some(OpenCodeAttentionReason::PermissionAsked),
@@ -9618,6 +9773,10 @@ impl AdeApp {
         Id::new((SMART_INPUT_TASK_EDIT_INPUT_ID, terminal_id, task_id))
     }
 
+    fn smart_input_question_custom_input_id(terminal_id: u64) -> Id {
+        Id::new((SMART_INPUT_QUESTION_CUSTOM_INPUT_ID, terminal_id))
+    }
+
     fn focused_smart_input_submit_request(
         &self,
         ctx: &egui::Context,
@@ -9646,7 +9805,66 @@ impl AdeApp {
     }
 
     fn smart_input_has_focus(&self, ctx: &egui::Context) -> bool {
-        self.focused_smart_input_submit_request(ctx).is_some()
+        if self.focused_smart_input_submit_request(ctx).is_some() {
+            return true;
+        }
+        // Also treat the active OpenCode question custom input as Smart Input focus
+        if let Some(active_id) = self.active_terminal {
+            if self
+                .terminals
+                .get(&active_id)
+                .is_some_and(|t| t.opencode_pending_question.is_some())
+            {
+                if ctx.memory(|mem| {
+                    mem.has_focus(Self::smart_input_question_custom_input_id(active_id))
+                }) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Ensures keyboard focus lands on a visible Smart Input field when no
+    /// other UI text input or modal is claiming it. Only the active terminal's
+    /// Smart Input (or the single visible terminal in single-view mode) is
+    /// considered; never auto-focuses a different visible terminal's Smart Input.
+    fn ensure_smart_input_focus(&self, ctx: &egui::Context) {
+        // Already focused on some Smart Input field — keep it.
+        if self.smart_input_has_focus(ctx) {
+            return;
+        }
+        // Modal/popup/context menu open — don't steal focus.
+        if self.show_settings_popup
+            || self.foreground_message_popup_open.is_some()
+            || self.show_create_worktree_popup
+            || ctx.memory(|mem| mem.any_popup_open())
+            || ctx.is_context_menu_open()
+        {
+            return;
+        }
+        // Another non-Smart UI text input is focused — don't steal.
+        if self.text_input_has_focus(ctx) {
+            return;
+        }
+        // Only focus the active terminal's Smart Input.
+        // In single-view mode, fall back to the single visible terminal if no
+        // explicit active terminal is set.
+        let target_terminal = self
+            .active_terminal
+            .or_else(|| self.single_terminal_id_for_main());
+        if let Some(terminal_id) = target_terminal {
+            if let Some(terminal) = self.terminals.get(&terminal_id) {
+                if Self::terminal_smart_input_visible(terminal) {
+                    let draft_id = Self::smart_input_draft_input_id(terminal_id);
+                    ctx.memory_mut(|mem| {
+                        if !mem.has_focus(draft_id) {
+                            mem.request_focus(draft_id);
+                        }
+                    });
+                }
+            }
+        }
     }
 
     fn text_input_has_focus(&self, ctx: &egui::Context) -> bool {
@@ -9748,8 +9966,16 @@ impl AdeApp {
 
     /// Execute a terminal shortcut by sending its command to the active terminal.
     /// Returns true if the shortcut was handled (to consume the event).
-    /// Sends the command with bracketed paste, sends Enter immediately,
-    /// then sends a second Enter after a short delay for confirmation.
+    ///
+    /// For slash-prefixed commands (OpenCode/Codex slash-menu commands), uses the
+    /// same robust confirmation strategy as Smart Input:
+    ///   - clear any stale delayed Enters from a previous shortcut,
+    ///   - send the command with immediate Enter,
+    ///   - schedule two additional confirmation Enters (at ~600ms and ~1200ms).
+    /// This ensures OpenCode has enough time to populate its slash command list
+    /// before the selection/submission Enters arrive.
+    ///
+    /// For non-slash commands, keeps the old single delayed confirmation Enter.
     fn execute_terminal_shortcut(&mut self, ctx: &egui::Context, command: &str) -> bool {
         // Only execute if we have an active terminal that accepts input
         let Some(terminal_id) = self.active_terminal_accepts_input() else {
@@ -9767,12 +9993,25 @@ impl AdeApp {
         // Shortcut commands are delivered through paste bytes so slash-prefixed
         // AI CLI commands are not interpreted as an interactive slash-menu key stream.
         if Self::send_shortcut_command_to_terminal(terminal, command, ctx) {
-            self.schedule_delayed_enters_for_terminal(
-                terminal_id,
-                1,
-                TERMINAL_SHORTCUT_SECOND_ENTER_DELAY_MS,
-                ctx,
-            );
+            let trimmed = command.trim_start();
+            if trimmed.starts_with('/') {
+                // Slash command: use Smart Input-style robust confirmation.
+                self.pending_second_enter
+                    .retain(|(tid, _)| *tid != terminal_id);
+                self.schedule_delayed_enters_for_terminal(
+                    terminal_id,
+                    2,
+                    SHORTCUT_SECOND_ENTER_DELAY_MS,
+                    ctx,
+                );
+            } else {
+                self.schedule_delayed_enters_for_terminal(
+                    terminal_id,
+                    1,
+                    TERMINAL_SHORTCUT_SECOND_ENTER_DELAY_MS,
+                    ctx,
+                );
+            }
             self.show_status_feedback(ctx, &format!("Sent: {command}"));
             true
         } else {
@@ -11937,6 +12176,20 @@ impl AdeApp {
             if let Some(terminal_id) = terminal_id {
                 self.acknowledge_terminal_attention(terminal_id);
             }
+            // Re-focus Smart Input for the already-active terminal so clicking
+            // the terminal pane always restores typing to the correct draft.
+            if let Some(tid) = terminal_id {
+                if let Some(terminal) = self.terminals.get(&tid) {
+                    if Self::terminal_smart_input_visible(terminal) {
+                        let draft_id = Self::smart_input_draft_input_id(tid);
+                        ctx.memory_mut(|mem| {
+                            if !mem.has_focus(draft_id) {
+                                mem.request_focus(draft_id);
+                            }
+                        });
+                    }
+                }
+            }
             ctx.request_repaint();
             return;
         }
@@ -11962,9 +12215,18 @@ impl AdeApp {
         self.clear_terminal_held_key_repeat();
         self.clear_terminal_selections_except(terminal_id);
 
-        // Ensure mutual exclusivity: if browser is now open for the active project, close checklist
-        if self.is_active_browser_panel_open() {
-            self.config.ui.checklist_panel_expanded = false;
+        // After switching, focus the newly active terminal's Smart Input draft.
+        if let Some(tid) = terminal_id {
+            if let Some(terminal) = self.terminals.get(&tid) {
+                if Self::terminal_smart_input_visible(terminal) {
+                    let draft_id = Self::smart_input_draft_input_id(tid);
+                    ctx.memory_mut(|mem| {
+                        if !mem.has_focus(draft_id) {
+                            mem.request_focus(draft_id);
+                        }
+                    });
+                }
+            }
         }
 
         // Repaint to update AI badge state
@@ -12878,6 +13140,9 @@ impl AdeApp {
         if terminal.smart_input.tasks.is_empty() {
             return false;
         }
+        if terminal.opencode_pending_question.is_some() {
+            return false;
+        }
         if !terminal.opencode_session_active {
             return false;
         }
@@ -13063,12 +13328,96 @@ impl AdeApp {
         }
     }
 
+    fn submit_opencode_question_answer(&mut self, terminal_id: u64) {
+        let Some(terminal) = self.terminals.get(&terminal_id) else {
+            return;
+        };
+        let Some(ref question) = terminal.opencode_pending_question else {
+            return;
+        };
+
+        let mut answers: Vec<Vec<String>> = Vec::new();
+        if !terminal.opencode_question_selected.is_empty() {
+            answers.push(terminal.opencode_question_selected.clone());
+        } else if question.custom && !terminal.opencode_question_custom.is_empty() {
+            answers.push(vec![terminal.opencode_question_custom.clone()]);
+        }
+
+        let request_id = question.request_id.clone();
+        let answer = OpenCodeQuestionAnswer {
+            request_id,
+            answers,
+            rejected: false,
+        };
+
+        if let Some(ref hook_service) = self.opencode_hook_service {
+            hook_service.store_answer(terminal_id, answer);
+        }
+
+        if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+            terminal.opencode_pending_question = None;
+            terminal.opencode_question_selected.clear();
+            terminal.opencode_question_custom.clear();
+        }
+
+        // Mark OpenCode as working again since the answer was submitted
+        let _ = self.apply_opencode_transport_status(
+            terminal_id,
+            OpenCodeTransportStatus::Working,
+            OpenCodeStatusSource::Hook,
+            None,
+        );
+
+        self.status_line = "Smart Input sent OpenCode question answer".to_owned();
+    }
+
+    fn reject_opencode_question(&mut self, terminal_id: u64) {
+        let Some(terminal) = self.terminals.get(&terminal_id) else {
+            return;
+        };
+        let Some(ref question) = terminal.opencode_pending_question else {
+            return;
+        };
+
+        let answer = OpenCodeQuestionAnswer {
+            request_id: question.request_id.clone(),
+            answers: Vec::new(),
+            rejected: true,
+        };
+
+        if let Some(ref hook_service) = self.opencode_hook_service {
+            hook_service.store_answer(terminal_id, answer);
+        }
+
+        if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+            terminal.opencode_pending_question = None;
+            terminal.opencode_question_selected.clear();
+            terminal.opencode_question_custom.clear();
+        }
+
+        let _ = self.apply_opencode_transport_status(
+            terminal_id,
+            OpenCodeTransportStatus::Working,
+            OpenCodeStatusSource::Hook,
+            None,
+        );
+
+        self.status_line = "Smart Input rejected OpenCode question".to_owned();
+    }
+
     fn handle_smart_input_pane_action(
         &mut self,
         ctx: &egui::Context,
         terminal_id: u64,
         action: SmartInputPaneAction,
     ) {
+        if action.submit_question {
+            self.submit_opencode_question_answer(terminal_id);
+        }
+        if action.reject_question {
+            self.reject_opencode_question(terminal_id);
+        }
+
         if let Some((text, attachments)) = action.send_draft_now {
             if text.trim().is_empty() && attachments.is_empty() {
                 return;
@@ -13156,6 +13505,14 @@ impl AdeApp {
                     }
                     self.status_line = "Smart Input sent image task now".to_owned();
                 }
+            }
+        }
+        // Keep focus on the Smart Input draft after any pane action
+        // so the user can continue typing without re-clicking.
+        if let Some(terminal) = self.terminals.get(&terminal_id) {
+            if Self::terminal_smart_input_visible(terminal) {
+                let draft_id = Self::smart_input_draft_input_id(terminal_id);
+                ctx.memory_mut(|mem| mem.request_focus(draft_id));
             }
         }
     }
@@ -15598,7 +15955,8 @@ impl AdeApp {
         content_rect: egui::Rect,
         activity_rect: Option<egui::Rect>,
         explorer_rect: Option<egui::Rect>,
-        right_panel_rect: Option<egui::Rect>,
+        checklist_rect: Option<egui::Rect>,
+        browser_rect: Option<egui::Rect>,
     ) -> Vec2 {
         let mut width = content_rect.width();
         let height = content_rect.height();
@@ -15609,9 +15967,12 @@ impl AdeApp {
         if let Some(explorer_rect) = explorer_rect {
             width -= explorer_rect.width();
         }
-        // Right panel can be either Check-list or Browser (mutually exclusive)
-        if let Some(right_panel_rect) = right_panel_rect {
-            width -= right_panel_rect.width();
+        // Right panels stack: Check-list next to Browser (both can be open)
+        if let Some(checklist_rect) = checklist_rect {
+            width -= checklist_rect.width();
+        }
+        if let Some(browser_rect) = browser_rect {
+            width -= browser_rect.width();
         }
 
         egui::vec2(width.max(1.0), height.max(1.0))
@@ -15720,20 +16081,13 @@ impl AdeApp {
                     }
 
                     ui.add_space(6.0);
-                    let checklist_panel_active = self.config.ui.checklist_panel_expanded;
-                    if styled_icon_toggle(
+                    let _checklist_response = styled_icon_toggle(
                         ui,
-                        checklist_panel_active,
+                        true,
                         icons::CHECK_CIRCLE,
-                        "Toggle Check-list Panel",
-                    ) {
-                        self.config.ui.checklist_panel_expanded = !checklist_panel_active;
-                        // Mutual exclusivity: close browser for the active project when opening checklist
-                        if self.config.ui.checklist_panel_expanded {
-                            self.set_active_browser_panel_open(false);
-                        }
-                        should_persist = true;
-                    }
+                        "Check-list Panel (pinned)",
+                    );
+                    // Check-list is always visible; no toggle behavior
 
                     ui.add_space(6.0);
                     let browser_panel_active = self.is_active_browser_panel_open();
@@ -15745,10 +16099,6 @@ impl AdeApp {
                     ) {
                         let new_open = !browser_panel_active;
                         self.set_active_browser_panel_open(new_open);
-                        // Mutual exclusivity: close checklist when opening browser
-                        if new_open {
-                            self.config.ui.checklist_panel_expanded = false;
-                        }
                         should_persist = true;
                     }
 
@@ -16685,15 +17035,17 @@ impl AdeApp {
             } else {
                 Color32::from_rgb(45, 45, 45) // very dim separator
             };
-            ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
-                egui::Id::new("project-explorer-resize-overlay"),
-            ))
-            .vline(
-                resize_x,
-                explorer_rect.y_range(),
-                egui::Stroke::new(1.0, color),
-            );
+            if !ctx.memory(|m| m.any_popup_open()) {
+                ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("project-explorer-resize-overlay"),
+                ))
+                .vline(
+                    resize_x,
+                    explorer_rect.y_range(),
+                    egui::Stroke::new(1.0, color),
+                );
+            }
 
             Some(response.response.rect)
         } else {
@@ -16928,6 +17280,13 @@ impl AdeApp {
             .map(|p| p.id)
             .collect();
 
+        let scroll_height = ui.available_height();
+
+        egui::ScrollArea::vertical()
+            .id_salt("terminal-manager-scroll")
+            .max_height(scroll_height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
         for project_id in project_ids {
             let Some(project_snapshot) = self.projects.get(&project_id).cloned() else {
                 continue;
@@ -17034,13 +17393,14 @@ impl AdeApp {
                     ui.indent(Id::new(("terminal-manager-body", project_id)), |ui| {
                         ui.add_space(4.0);
                         // Calculate max available tooltip right edge based on checklist panel
-                        let max_tooltip_right = if self.config.ui.checklist_panel_expanded {
-                            let screen_right = ui.ctx().screen_rect().right();
-                            (screen_right - self.config.ui.checklist_panel_width - 8.0)
-                                .max(panel_right + 100.0)
-                        } else {
-                            ui.ctx().screen_rect().right() - 16.0
-                        };
+                        // Calculate max available tooltip right edge based on right panels
+                        let screen_right = ui.ctx().screen_rect().right();
+                        let mut right_offset = self.config.ui.checklist_panel_width + 8.0;
+                        if self.is_active_browser_panel_open() {
+                            right_offset += self.config.ui.browser_panel_width;
+                        }
+                        let max_tooltip_right =
+                            (screen_right - right_offset).max(panel_right + 100.0);
                         // Draw child worktrees under the root project (BOM-style tree)
                         for wt in &child_worktrees {
                             let wt_name = &wt.name;
@@ -17090,7 +17450,8 @@ impl AdeApp {
                             row_response.context_menu(|ui| {
                                 with_minimal_button_chrome(ui, |ui| {
                                     if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
-                                        ui.ctx().copy_text(wt_path_str.clone());
+                                        let normalized = crate::path_utils::normalize_windows_verbatim_path_for_shell(&wt.path);
+                                        ui.ctx().copy_text(normalized.display().to_string());
                                         self.status_line =
                                             format!("Copied path for worktree '{}'", wt_name);
                                         ui.close_menu();
@@ -17190,6 +17551,7 @@ impl AdeApp {
         }
 
         ui.expand_to_include_x(panel_right);
+        });
     }
 
     fn draw_terminal_rows(
@@ -17628,7 +17990,13 @@ impl AdeApp {
                     let popup_width = TERMINAL_HOVER_WIDTH
                         .min(max_tooltip_right - panel_right - tooltip_gap)
                         .max(200.0);
-                    let popup_pos = egui::pos2(panel_right + tooltip_gap, row_rect.top());
+                    let viewport_rect = ctx.screen_rect();
+                    let popup_height_estimate = TERMINAL_HISTORY_POPUP_MAX_HEIGHT + 80.0;
+                    let popup_y = row_rect
+                        .top()
+                        .min(viewport_rect.max.y - popup_height_estimate)
+                        .max(viewport_rect.min.y);
+                    let popup_pos = egui::pos2(panel_right + tooltip_gap, popup_y);
 
                     // Track if we should close the popup
                     let should_close = std::cell::Cell::new(false);
@@ -17671,64 +18039,68 @@ impl AdeApp {
                                         .map(|p| p.checklist.clone())
                                         .unwrap_or_default();
 
-                                    for (idx, message) in deduplicated.iter().enumerate() {
-                                        let is_checked =
-                                            project_checklist.contains(&(*message).to_string());
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("terminal_history_popup_list")
+                                        .max_height(TERMINAL_HISTORY_POPUP_MAX_HEIGHT)
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            for (idx, message) in deduplicated.iter().enumerate() {
+                                                let is_checked = project_checklist
+                                                    .contains(&(*message).to_string());
 
-                                        ui.horizontal(|ui| {
-                                            // Checkbox to toggle checklist status
-                                            let mut checked = is_checked;
-                                            if ui.checkbox(&mut checked, "").changed() {
-                                                if let Some(project) =
-                                                    self.projects.get_mut(&project_id)
-                                                {
-                                                    if checked {
-                                                        // Add to checklist if not already present
-                                                        if !project.checklist.contains(message) {
-                                                            project
-                                                                .checklist
-                                                                .push((*message).to_owned());
-                                                        }
-                                                    } else {
-                                                        // Remove from checklist
-                                                        project.checklist.retain(|m| m != *message);
-                                                        // Collapse checklist panel if this was the last item globally
-                                                        if self
-                                                            .projects
-                                                            .values()
-                                                            .all(|p| p.checklist.is_empty())
+                                                ui.horizontal_top(|ui| {
+                                                    // Checkbox to toggle checklist status
+                                                    let mut checked = is_checked;
+                                                    if ui.checkbox(&mut checked, "").changed() {
+                                                        if let Some(project) =
+                                                            self.projects.get_mut(&project_id)
                                                         {
-                                                            self.config
-                                                                .ui
-                                                                .checklist_panel_expanded = false;
+                                                            if checked {
+                                                                // Add to checklist if not already present
+                                                                if !project
+                                                                    .checklist
+                                                                    .contains(message)
+                                                                {
+                                                                    project.checklist.push(
+                                                                        (*message).to_owned(),
+                                                                    );
+                                                                }
+                                                            } else {
+                                                                // Remove from checklist
+                                                                project
+                                                                    .checklist
+                                                                    .retain(|m| m != *message);
+                                                            }
+                                                            self.note_projects_changed();
+                                                            self.persist_config();
                                                         }
                                                     }
-                                                    self.note_projects_changed();
-                                                    self.persist_config();
+
+                                                    // Clickable message label with scroll clamp
+                                                    let msg_response =
+                                                        draw_clamped_scrollable_label(
+                                                            ui,
+                                                            message.as_str(),
+                                                            TEXT_PRIMARY,
+                                                            13.0,
+                                                            TERMINAL_HISTORY_MESSAGE_MAX_HEIGHT,
+                                                            egui::Sense::click(),
+                                                            ("popup_msg", idx),
+                                                        )
+                                                        .on_hover_cursor(
+                                                            egui::CursorIcon::PointingHand,
+                                                        );
+                                                    if msg_response.clicked() {
+                                                        copied_from_popup
+                                                            .set(Some((*message).clone()));
+                                                    }
+                                                });
+
+                                                if idx < deduplicated.len() - 1 {
+                                                    ui.add_space(4.0);
                                                 }
                                             }
-
-                                            // Clickable message label
-                                            let msg_response = ui
-                                                .add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(message.as_str())
-                                                            .color(TEXT_PRIMARY)
-                                                            .size(13.0),
-                                                    )
-                                                    .wrap()
-                                                    .sense(egui::Sense::click()),
-                                                )
-                                                .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                            if msg_response.clicked() {
-                                                copied_from_popup.set(Some((*message).clone()));
-                                            }
                                         });
-
-                                        if idx < deduplicated.len() - 1 {
-                                            ui.add_space(4.0);
-                                        }
-                                    }
                                 })
                                 .response;
 
@@ -18229,20 +18601,24 @@ impl AdeApp {
         let seam_rect =
             egui::Rect::from_min_max(egui::pos2(seam_left, top), egui::pos2(seam_right, bottom));
 
-        ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new("sidebar-seam-fix"),
-        ))
-        .rect_filled(seam_rect, 0.0, SURFACE_BG);
+        if !ctx.memory(|m| m.any_popup_open()) {
+            ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("sidebar-seam-fix"),
+            ))
+            .rect_filled(seam_rect, 0.0, SURFACE_BG);
+        }
+    }
+
+    /// Join checklist items into a clipboard-friendly string.
+    /// Items are separated by a blank line so multi-line entries stay distinct.
+    fn format_checklist_for_clipboard(items: &[String]) -> String {
+        items.join("\n\n")
     }
 
     /// Draw the Check-list panel on the right side.
     /// Shows projects with checklist items.
     fn draw_checklist_panel(&mut self, ctx: &egui::Context) -> Option<egui::Rect> {
-        if !self.config.ui.checklist_panel_expanded {
-            return None;
-        }
-
         // Collect projects with checklist items first (to avoid borrow issues)
         let projects_with_checklist: Vec<(u64, String, Vec<String>)> = {
             let mut projects: Vec<(u64, String, Vec<String>)> = Vec::new();
@@ -18314,40 +18690,58 @@ impl AdeApp {
                                             .small()
                                             .color(TEXT_MUTED),
                                     );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if styled_icon_button(
+                                                ui,
+                                                icons::COPY,
+                                                BTN_ICON,
+                                                BTN_ICON_HOVER,
+                                                BTN_ICON_ACTIVE,
+                                                "Copy all checklist items",
+                                            ) {
+                                                let text = Self::format_checklist_for_clipboard(&checklist);
+                                                ctx.copy_text(text);
+                                                self.show_status_feedback(
+                                                    ctx,
+                                                    &format!(
+                                                        "Copied {} checklist items",
+                                                        checklist.len()
+                                                    ),
+                                                );
+                                            }
+                                        },
+                                    );
                                 });
                                 ui.add_space(4.0);
 
                                 // Checklist items for this project
                                 ui.indent(Id::new(("checklist-items", project_id)), |ui| {
                                     for (idx, message) in checklist.iter().enumerate() {
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_top(|ui| {
                                             // Checkbox to uncheck item
                                             let mut checked = true;
                                             if ui.checkbox(&mut checked, "").changed() {
-                                                if let Some(p) = self.projects.get_mut(&project_id) {
-                                                    p.checklist.retain(|m| m != message);
-                                                    // Collapse checklist panel if this was the last item globally
-                                                    if self.projects.values().all(|p| p.checklist.is_empty()) {
-                                                        self.config.ui.checklist_panel_expanded = false;
-                                                    }
-                                                    self.note_projects_changed();
-                                                    self.persist_config();
-                                                }
+                                            if let Some(p) = self.projects.get_mut(&project_id) {
+                                                p.checklist.retain(|m| m != message);
+                                                self.note_projects_changed();
+                                                self.persist_config();
+                                            }
                                             }
 
-                                            // Clickable message label
-                                            let msg_response = ui
-                                                .add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(message)
-                                                            .color(TEXT_PRIMARY)
-                                                            .size(12.0),
-                                                    )
-                                                    .wrap()
-                                                    .sense(egui::Sense::click()),
-                                                )
-                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                                .on_hover_text("Click to copy");
+                                            // Clickable message label with scroll clamp
+                                            let msg_response = draw_clamped_scrollable_label(
+                                                ui,
+                                                message,
+                                                TEXT_PRIMARY,
+                                                12.0,
+                                                CHECKLIST_MESSAGE_MAX_HEIGHT,
+                                                egui::Sense::click(),
+                                                ("checklist_msg", idx),
+                                            )
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                            .on_hover_text("Click to copy");
                                             if msg_response.clicked() {
                                                 ctx.copy_text(message.to_string());
                                                 self.show_status_feedback(ctx, "Copied message");
@@ -18410,7 +18804,6 @@ impl AdeApp {
             scope = BrowserScopeKey::Project(project_id);
         }
         self.set_browser_panel_open_for_project(project_id, true);
-        self.config.ui.checklist_panel_expanded = false;
         self.note_ui_config_changed();
         self.set_browser_url_for_scope(scope, normalized.clone());
         self.browser_for_scope(scope).navigate(&normalized);
@@ -19089,7 +19482,6 @@ impl AdeApp {
 
         if self.browser_mcp_screenshot_should_open_panel(project_id) {
             self.set_browser_panel_open_for_project(project_id, true);
-            self.config.ui.checklist_panel_expanded = false;
             ctx.request_repaint();
         }
         // Pin the terminal-scoped browser as visible so the panel tracks it.
@@ -19161,7 +19553,6 @@ impl AdeApp {
         }
 
         self.set_browser_panel_open_for_project(project_id, true);
-        self.config.ui.checklist_panel_expanded = false;
         // Pin the terminal-scoped browser as visible so the panel tracks it even when
         // the controlling terminal is not the active one.
         self.browser_panel_visible_scope_by_project
@@ -19361,7 +19752,6 @@ impl AdeApp {
             .unwrap_or_else(|| "Recording".to_owned());
         let tab_result = if self.projects.contains_key(&event.project_id) {
             self.set_browser_panel_open_for_project(event.project_id, true);
-            self.config.ui.checklist_panel_expanded = false;
             self.add_browser_tab(
                 event.project_id,
                 Some(file_url.clone()),
@@ -19796,7 +20186,6 @@ impl AdeApp {
         }
 
         self.set_browser_panel_open_for_project(project_id, true);
-        self.config.ui.checklist_panel_expanded = false;
         // Pin the terminal-scoped browser as visible so the panel tracks it.
         self.browser_panel_visible_scope_by_project
             .insert(project_id, scope);
@@ -21503,7 +21892,7 @@ impl AdeApp {
                     self.show_create_worktree_popup,
                 );
 
-                let scroll_area_output = scroll_area.show(&mut output_ui, |ui| {
+                let mut scroll_area_output = scroll_area.show(&mut output_ui, |ui| {
                     ui.set_width(output_size.x);
                     ui.set_min_width(output_size.x);
                     ui.set_min_height(output_size.y);
@@ -21899,6 +22288,26 @@ impl AdeApp {
                         terminal.opencode_manual_scroll_detached = false;
                     }
                 }
+                // Clamp scroll offset so blank leading rows (left by OpenCode
+                // display clears) are not exposed when the user scrolls up.
+                if terminal.ai_session.tool == Some(AiCliTool::OpenCode)
+                    && terminal.opencode_manual_scroll_detached
+                {
+                    let viewport_h = scroll_area_output.inner_rect.height();
+                    let content_h = scroll_area_output.content_size.y;
+                    if content_h > viewport_h {
+                        let leading_blank_rows =
+                            terminal_leading_blank_rows(&terminal.render_cache);
+                        let min_offset_y = leading_blank_rows as f32 * line_height;
+                        if scroll_area_output.state.offset.y < min_offset_y {
+                            scroll_area_output.state.offset.y = min_offset_y;
+                            scroll_area_output
+                                .state
+                                .store(ui.ctx(), scroll_area_output.id);
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                }
                 if smart_footer_height > 0.0 {
                     // Draggable resize handle between terminal output and Smart Input footer
                     let handle_height = SMART_INPUT_RESIZE_HANDLE_HEIGHT;
@@ -21944,6 +22353,7 @@ impl AdeApp {
                             .max(SMART_INPUT_MIN_FOOTER_HEIGHT)
                             .min(max_footer);
                         terminal.smart_input.user_height = Some(new_height);
+                        terminal.smart_input.draft_user_height = None;
                         ui.ctx().request_repaint();
                     }
 
@@ -21953,7 +22363,13 @@ impl AdeApp {
                         Layout::top_down(Align::Min),
                         |ui| {
                             ui.set_min_size(footer_size);
-                            draw_smart_input_footer(ui, terminal, footer_size)
+                            draw_smart_input_footer(
+                                ui,
+                                terminal,
+                                footer_size,
+                                pane_height,
+                                line_height,
+                            )
                         },
                     );
                     smart_input_action = footer_response.inner;
@@ -22712,6 +23128,7 @@ impl AdeApp {
         } else {
             resolved
         };
+        let result = crate::path_utils::normalize_windows_verbatim_path_for_shell(&result);
         let _ = Self::copy_worktree_env_files(repo_path, &result);
         Ok(result)
     }
@@ -22773,6 +23190,11 @@ impl AdeApp {
 
 impl eframe::App for AdeApp {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // If Smart Input is visible but unfocused, claim focus before
+        // event routing so typed text goes to the Smart Input TextEdit
+        // rather than the terminal PTY.
+        self.ensure_smart_input_focus(ctx);
+
         let mut events = std::mem::take(&mut raw_input.events);
         let global_modifiers = raw_input.modifiers;
         let single_view_shortcuts_enabled = !self.config.ui.multi_terminal_view_enabled;
@@ -23024,52 +23446,6 @@ impl eframe::App for AdeApp {
                 events = remaining_events;
             }
 
-            // Smart Input image paste: when the clipboard contains an image file,
-            // intercept the paste event and add it as an attachment instead of
-            // letting egui's TextEdit paste raw image bytes or nothing.
-            if let Some(request) = self.focused_smart_input_submit_request(ctx) {
-                let mut image_path: Option<String> = None;
-                events = events
-                    .into_iter()
-                    .filter(|event| {
-                        if matches!(event, Event::Paste(_)) && image_path.is_none() {
-                            image_path = self.clipboard_image_path();
-                            // If image found, consume this paste event
-                            return image_path.is_none();
-                        }
-                        true
-                    })
-                    .collect();
-                if let Some(path) = image_path {
-                    let terminal_id = match request {
-                        SmartInputSubmitRequest::Draft { terminal_id } => terminal_id,
-                        SmartInputSubmitRequest::Edit { terminal_id, .. } => terminal_id,
-                    };
-                    if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
-                        if Self::terminal_smart_input_visible(terminal) {
-                            let att_id = terminal.smart_input.next_attachment_id;
-                            terminal.smart_input.next_attachment_id = terminal
-                                .smart_input
-                                .next_attachment_id
-                                .saturating_add(1)
-                                .max(1);
-                            let attachment = SmartInputAttachment { id: att_id, path };
-                            match request {
-                                SmartInputSubmitRequest::Draft { .. } => {
-                                    terminal.smart_input.draft_attachments.push(attachment);
-                                }
-                                SmartInputSubmitRequest::Edit { task_id, .. } => {
-                                    if terminal.smart_input.editing_task_id == Some(task_id) {
-                                        terminal.smart_input.edit_attachments.push(attachment);
-                                    }
-                                }
-                            }
-                            ctx.request_repaint();
-                        }
-                    }
-                }
-            }
-
             let (alt_m_events, remaining_events) =
                 Self::partition_alt_m_shortcut(events, global_modifiers);
             if !alt_m_events.is_empty() {
@@ -23223,18 +23599,20 @@ impl eframe::App for AdeApp {
         // Phase 4: UI rendering
         let activity_rect = self.draw_activity_rail(ctx);
         let explorer_rect = self.draw_project_explorer(ctx);
-        let checklist_rect = self.draw_checklist_panel(ctx);
+        // Browser first (outermost right), then checklist (inner right)
         let browser_rect = self.draw_browser_panel(ctx);
-        // Right panel is either checklist or browser (mutually exclusive)
-        let right_panel_rect = checklist_rect.or(browser_rect);
+        let checklist_rect = self.draw_checklist_panel(ctx);
         let main_area_size = self.main_area_size_from_chrome(
             ctx.screen_rect(),
             activity_rect,
             explorer_rect,
-            right_panel_rect,
+            checklist_rect,
+            browser_rect,
         );
         self.handle_shortcuts(ctx, main_area_size);
         self.draw_main_area(ctx);
+        // After UI rendering, ensure Smart Input owns focus if visible.
+        self.ensure_smart_input_focus(ctx);
         self.process_pending_smart_input_submit(ctx);
         if let (Some(activity_rect), Some(explorer_rect)) = (activity_rect, explorer_rect) {
             self.draw_sidebar_seam_fix(ctx, activity_rect, explorer_rect);
@@ -23353,10 +23731,6 @@ fn recover_config_state(
 
     // Always show projects without live terminals on startup
     config.ui.terminal_manager_hide_inactive_projects = false;
-    // Collapse checklist panel if no checklist items exist after recovery
-    if !has_any_checklist_items(&config.projects) {
-        config.ui.checklist_panel_expanded = false;
-    }
 
     config
 }
@@ -23369,7 +23743,15 @@ fn recover_project_records(
     let mut projects = loaded_projects
         .iter()
         .cloned()
-        .map(|project| (project.id, project))
+        .map(|mut project| {
+            project.path =
+                crate::path_utils::normalize_windows_verbatim_path_for_shell(&project.path);
+            if let Some(ref root) = project.repo_root {
+                project.repo_root =
+                    Some(crate::path_utils::normalize_windows_verbatim_path_for_shell(root));
+            }
+            (project.id, project)
+        })
         .collect::<BTreeMap<_, _>>();
     let mut project_id_remap = BTreeMap::new();
 
@@ -23416,6 +23798,11 @@ fn recover_project_records(
         };
 
         let mut project = current_project.clone();
+        project.path = crate::path_utils::normalize_windows_verbatim_path_for_shell(&project.path);
+        if let Some(ref root) = project.repo_root {
+            project.repo_root =
+                Some(crate::path_utils::normalize_windows_verbatim_path_for_shell(root));
+        }
         project.id = target_project_id;
         projects.insert(target_project_id, project);
         project_id_remap.insert(current_project.id, target_project_id);
@@ -25992,6 +26379,32 @@ fn capped_hover_text(text: &str, max_chars: usize) -> String {
     result
 }
 
+/// Draws a wrapped text label vertically clamped to `max_height`.
+/// If the wrapped text exceeds `max_height`, a vertical scrollbar appears.
+/// Returns the response of the inner label for click sensing.
+fn draw_clamped_scrollable_label(
+    ui: &mut Ui,
+    text: &str,
+    text_color: Color32,
+    text_size: f32,
+    max_height: f32,
+    sense: egui::Sense,
+    id_salt: impl std::hash::Hash,
+) -> egui::Response {
+    egui::ScrollArea::vertical()
+        .id_salt(ui.id().with(id_salt))
+        .max_height(max_height)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.add(
+                egui::Label::new(egui::RichText::new(text).color(text_color).size(text_size))
+                    .wrap()
+                    .sense(sense),
+            )
+        })
+        .inner
+}
+
 #[allow(dead_code)]
 const RECENT_INPUTS_HOVER_MAX_CHARS: usize = 100;
 
@@ -26470,6 +26883,13 @@ fn smart_input_status_text(terminal: &TerminalEntry) -> (&'static str, Color32) 
         return ("Auto paused - tasks stay queued", TEXT_MUTED);
     }
 
+    if terminal.opencode_pending_question.is_some() {
+        return (
+            "OpenCode question - answer below",
+            Color32::from_rgb(220, 170, 60),
+        );
+    }
+
     match terminal.opencode_normalized_status {
         Some(OpenCodeTransportStatus::Working) => {
             ("OpenCode working - queued tasks wait", TEXT_MUTED)
@@ -26548,6 +26968,8 @@ fn draw_smart_input_footer(
     ui: &mut Ui,
     terminal: &mut TerminalEntry,
     footer_size: Vec2,
+    pane_height: f32,
+    line_height: f32,
 ) -> SmartInputPaneAction {
     let terminal_id = terminal.id;
     let (status_text, status_color) = smart_input_status_text(terminal);
@@ -26632,6 +27054,99 @@ fn draw_smart_input_footer(
                         .color(TEXT_MUTED),
                 );
             });
+
+            // Render active OpenCode question card if present
+            if let Some(ref question) = terminal.opencode_pending_question {
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(35, 30, 20))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(220, 170, 60)))
+                    .rounding(6.0)
+                    .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("{} OpenCode Question", icons::QUESTION))
+                                    .strong()
+                                    .color(Color32::from_rgb(220, 170, 60)),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .button(
+                                        RichText::new("Reject")
+                                            .small()
+                                            .color(Color32::from_rgb(210, 90, 90)),
+                                    )
+                                    .on_hover_text("Reject this question")
+                                    .clicked()
+                                {
+                                    action.reject_question = true;
+                                }
+                            });
+                        });
+
+                        ui.label(RichText::new(&question.header).strong().color(TEXT_PRIMARY));
+                        ui.label(RichText::new(&question.question).color(TEXT_PRIMARY));
+
+                        if !question.options.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                for opt in &question.options {
+                                    let is_selected =
+                                        terminal.opencode_question_selected.contains(&opt.label);
+                                    if ui
+                                        .selectable_label(
+                                            is_selected,
+                                            RichText::new(&opt.label).small(),
+                                        )
+                                        .on_hover_text(&opt.description)
+                                        .clicked()
+                                    {
+                                        if question.multiple {
+                                            if is_selected {
+                                                terminal
+                                                    .opencode_question_selected
+                                                    .retain(|l| l != &opt.label);
+                                            } else {
+                                                terminal
+                                                    .opencode_question_selected
+                                                    .push(opt.label.clone());
+                                            }
+                                        } else {
+                                            terminal.opencode_question_selected.clear();
+                                            terminal
+                                                .opencode_question_selected
+                                                .push(opt.label.clone());
+                                        }
+                                    }
+                                }
+                            });
+                        }
+
+                        if question.custom {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Custom:").small().color(TEXT_MUTED));
+                                let custom_id =
+                                    AdeApp::smart_input_question_custom_input_id(terminal_id);
+                                ui.add(
+                                    egui::TextEdit::singleline(
+                                        &mut terminal.opencode_question_custom,
+                                    )
+                                    .id(custom_id),
+                                );
+                            });
+                        }
+
+                        ui.horizontal(|ui| {
+                            let can_submit = !terminal.opencode_question_selected.is_empty()
+                                || (question.custom
+                                    && !terminal.opencode_question_custom.is_empty());
+                            ui.add_enabled_ui(can_submit, |ui| {
+                                if ui.button(RichText::new("Submit Answer").strong()).clicked() {
+                                    action.submit_question = true;
+                                }
+                            });
+                        });
+                    });
+            }
 
             if state.expanded && !state.tasks.is_empty() {
                 // Budget up to ~35% of footer height for queue, leaving more room for the
@@ -26930,6 +27445,19 @@ fn draw_smart_input_footer(
                         }
                         _ => {}
                     }
+                    // Restore focus to the appropriate Smart Input field
+                    // after queue edit actions so typing continues there.
+                    match row_action {
+                        "edit" => {
+                            let edit_id =
+                                AdeApp::smart_input_task_edit_input_id(terminal_id, task_id);
+                            ui.ctx().memory_mut(|mem| mem.request_focus(edit_id));
+                        }
+                        _ => {
+                            let draft_id = AdeApp::smart_input_draft_input_id(terminal_id);
+                            ui.ctx().memory_mut(|mem| mem.request_focus(draft_id));
+                        }
+                    }
                 }
             } else if state.expanded {
                 ui.label(
@@ -26939,9 +27467,6 @@ fn draw_smart_input_footer(
                 );
             }
 
-            let mut draft_rect = egui::Rect::ZERO;
-            let mut last_input_height = 0.0f32;
-            let mut last_available_h = 0.0f32;
             ui.horizontal(|ui| {
                 let draft_id = AdeApp::smart_input_draft_input_id(terminal_id);
                 let available_h = ui.available_height().max(80.0);
@@ -26949,8 +27474,6 @@ fn draw_smart_input_footer(
                     .draft_user_height
                     .unwrap_or(available_h)
                     .clamp(40.0, available_h);
-                last_input_height = input_height;
-                last_available_h = available_h;
                 let input_width = (ui.available_width() - 92.0).max(120.0);
                 // Preserve selection before right-click collapses it
                 let secondary_pressed = ui.ctx().input(|input| input.pointer.secondary_pressed());
@@ -26982,7 +27505,6 @@ fn draw_smart_input_footer(
                             )),
                     )
                 });
-                draft_rect = draft_response.rect;
                 // Determine effective selection for context menu
                 let post_show_range = egui::text_edit::TextEditState::load(ui.ctx(), draft_id)
                     .and_then(|s| s.cursor.char_range())
@@ -27078,43 +27600,49 @@ fn draw_smart_input_footer(
                     }
                 });
 
-                // Draggable resize grip at bottom-right of the draft text area
-                let grip_size = 12.0;
-                let grip_rect = egui::Rect::from_min_size(
-                    egui::pos2(
-                        draft_rect.right() - grip_size,
-                        draft_rect.bottom() - grip_size,
-                    ),
-                    egui::vec2(grip_size, grip_size),
-                );
-                let grip_response =
-                    ui.interact(grip_rect, ui.id().with("draft_resize"), Sense::drag());
-                let grip_color = if grip_response.hovered() || grip_response.dragged() {
-                    Color32::from_rgb(160, 160, 160)
-                } else {
-                    Color32::from_rgb(100, 100, 100)
-                };
-                let x0 = grip_rect.left() + 3.0;
-                let y0 = grip_rect.top() + 3.0;
-                let x1 = grip_rect.right() - 3.0;
-                let y1 = grip_rect.bottom() - 3.0;
-                ui.painter().line_segment(
-                    [egui::pos2(x0, y1), egui::pos2(x1, y0)],
-                    Stroke::new(1.5, grip_color),
-                );
-                ui.painter().line_segment(
-                    [egui::pos2(x0 + 3.0, y1), egui::pos2(x1, y0 + 3.0)],
-                    Stroke::new(1.5, grip_color),
-                );
-                if grip_response.hovered() || grip_response.dragged() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
-                }
-                if grip_response.dragged() {
-                    let delta = ui.ctx().input(|i| i.pointer.delta().y);
-                    let new_height = (last_input_height + delta).clamp(40.0, last_available_h);
-                    state.draft_user_height = Some(new_height);
-                    ui.ctx().request_repaint();
-                }
+                // Draggable resize grip at the bottom-right of the draft row.
+                // This resizes the overall Smart Input footer so the draft area can grow.
+                ui.with_layout(Layout::bottom_up(Align::Max), |ui| {
+                    let grip_size = 12.0;
+                    let grip_response =
+                        ui.allocate_response(egui::vec2(grip_size, grip_size), Sense::drag());
+                    let grip_rect = grip_response.rect;
+                    let grip_color = if grip_response.hovered() || grip_response.dragged() {
+                        Color32::from_rgb(160, 160, 160)
+                    } else {
+                        Color32::from_rgb(100, 100, 100)
+                    };
+                    let x0 = grip_rect.left() + 3.0;
+                    let y0 = grip_rect.top() + 3.0;
+                    let x1 = grip_rect.right() - 3.0;
+                    let y1 = grip_rect.bottom() - 3.0;
+                    ui.painter().line_segment(
+                        [egui::pos2(x0, y1), egui::pos2(x1, y0)],
+                        Stroke::new(1.5, grip_color),
+                    );
+                    ui.painter().line_segment(
+                        [egui::pos2(x0 + 3.0, y1), egui::pos2(x1, y0 + 3.0)],
+                        Stroke::new(1.5, grip_color),
+                    );
+                    if grip_response.hovered() || grip_response.dragged() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                    }
+                    if grip_response.dragged() {
+                        let delta = ui.ctx().input(|i| i.pointer.delta().y);
+                        let max_footer = (pane_height
+                            - TERMINAL_HEADER_HEIGHT
+                            - TERMINAL_HEADER_GAP
+                            - SMART_INPUT_FOOTER_GAP
+                            - line_height * 3.0)
+                            .max(0.0);
+                        let new_height = (footer_size.y + delta)
+                            .max(SMART_INPUT_MIN_FOOTER_HEIGHT)
+                            .min(max_footer);
+                        state.user_height = Some(new_height);
+                        state.draft_user_height = None;
+                        ui.ctx().request_repaint();
+                    }
+                });
             });
 
             // Clear stored context menu selections when menu closes
@@ -28034,6 +28562,93 @@ fn terminal_manager_test_done_toggle(ui: &mut Ui, test_done: bool) -> bool {
     response.clicked()
 }
 
+fn draw_launcher_menu_contents(
+    app: &mut AdeApp,
+    ui: &mut Ui,
+    launchers: &[LauncherEntry],
+) -> Option<String> {
+    let mut selected_launcher = None;
+    let menu_width = FOREGROUND_LAUNCHER_MENU_WIDTH;
+    ui.set_min_width(menu_width);
+    ui.set_max_width(menu_width);
+    ui.add_space(FOREGROUND_LAUNCHER_MENU_PADDING_Y);
+
+    if launchers.is_empty() {
+        let row_height = 24.0;
+        let full_row_rect =
+            egui::Rect::from_min_size(ui.cursor().min, egui::vec2(menu_width, row_height));
+        let row_rect = full_row_rect.shrink2(egui::vec2(FOREGROUND_LAUNCHER_MENU_PADDING_X, 0.0));
+        ui.painter().rect_filled(row_rect, 6.0, SURFACE_BG_SOFT);
+        ui.allocate_new_ui(
+            egui::UiBuilder::new()
+                .max_rect(row_rect)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Enable a launcher in Settings > Launchers")
+                        .small()
+                        .color(TEXT_MUTED),
+                );
+            },
+        );
+        ui.add_space(FOREGROUND_LAUNCHER_MENU_PADDING_Y);
+        return selected_launcher;
+    }
+
+    for (index, launcher) in launchers.iter().enumerate() {
+        let row_height = 24.0;
+        let full_row_rect =
+            egui::Rect::from_min_size(ui.cursor().min, egui::vec2(menu_width, row_height));
+        let row_rect = full_row_rect.shrink2(egui::vec2(FOREGROUND_LAUNCHER_MENU_PADDING_X, 0.0));
+        let is_hovered = ui.rect_contains_pointer(row_rect);
+        let row_bg = if is_hovered {
+            BTN_ICON_HOVER
+        } else {
+            SURFACE_BG_SOFT
+        };
+        ui.painter().rect_filled(row_rect, 6.0, row_bg);
+
+        let inner_response = ui.allocate_new_ui(
+            egui::UiBuilder::new()
+                .max_rect(row_rect)
+                .layout(Layout::left_to_right(Align::Center))
+                .sense(Sense::click()),
+            |ui| {
+                ui.add_space(6.0);
+                let _ = app.draw_launcher_icon(ui, launcher.icon_key, 16.0);
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&launcher.display_name)
+                            .strong()
+                            .color(TEXT_PRIMARY),
+                    )
+                    .selectable(false)
+                    .truncate(),
+                );
+                ui.response()
+            },
+        );
+        let row_response = inner_response.inner.on_hover_text(format!(
+            "{}\n{}",
+            launcher.display_name, launcher.launch_command
+        ));
+        if row_response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if row_response.clicked() {
+            selected_launcher = Some(launcher.id.clone());
+            ui.close_menu();
+        }
+        if index + 1 < launchers.len() {
+            ui.add_space(FOREGROUND_LAUNCHER_ROW_GAP);
+        }
+    }
+    ui.add_space(FOREGROUND_LAUNCHER_MENU_PADDING_Y);
+    selected_launcher
+}
+
 fn styled_launcher_menu_button(
     app: &mut AdeApp,
     ui: &mut Ui,
@@ -28059,92 +28674,10 @@ fn styled_launcher_menu_button(
                 with_minimal_button_chrome(ui, |ui| {
                     ui.menu_button(format!("{icon}"), |ui| {
                         with_minimal_button_chrome(ui, |ui| {
-                            let menu_width = FOREGROUND_LAUNCHER_MENU_WIDTH;
-                            ui.set_min_width(menu_width);
-                            ui.set_max_width(menu_width);
-                            ui.add_space(FOREGROUND_LAUNCHER_MENU_PADDING_Y);
-
-                            if launchers.is_empty() {
-                                let row_height = 24.0;
-                                let full_row_rect = egui::Rect::from_min_size(
-                                    ui.cursor().min,
-                                    egui::vec2(menu_width, row_height),
-                                );
-                                let row_rect = full_row_rect
-                                    .shrink2(egui::vec2(FOREGROUND_LAUNCHER_MENU_PADDING_X, 0.0));
-                                ui.painter().rect_filled(row_rect, 6.0, SURFACE_BG_SOFT);
-                                ui.allocate_new_ui(
-                                    egui::UiBuilder::new()
-                                        .max_rect(row_rect)
-                                        .layout(Layout::left_to_right(Align::Center)),
-                                    |ui| {
-                                        ui.add_space(6.0);
-                                        ui.label(
-                                            RichText::new(
-                                                "Enable a launcher in Settings > Launchers",
-                                            )
-                                            .small()
-                                            .color(TEXT_MUTED),
-                                        );
-                                    },
-                                );
-                                ui.add_space(FOREGROUND_LAUNCHER_MENU_PADDING_Y);
-                                return;
-                            }
-
-                            for (index, launcher) in launchers.iter().enumerate() {
-                                let row_height = 24.0;
-                                let full_row_rect = egui::Rect::from_min_size(
-                                    ui.cursor().min,
-                                    egui::vec2(menu_width, row_height),
-                                );
-                                let row_rect = full_row_rect
-                                    .shrink2(egui::vec2(FOREGROUND_LAUNCHER_MENU_PADDING_X, 0.0));
-                                let is_hovered = ui.rect_contains_pointer(row_rect);
-                                let row_bg = if is_hovered {
-                                    BTN_ICON_HOVER
-                                } else {
-                                    SURFACE_BG_SOFT
-                                };
-                                ui.painter().rect_filled(row_rect, 6.0, row_bg);
-
-                                let inner_response = ui.allocate_new_ui(
-                                    egui::UiBuilder::new()
-                                        .max_rect(row_rect)
-                                        .layout(Layout::left_to_right(Align::Center))
-                                        .sense(Sense::click()),
-                                    |ui| {
-                                        ui.add_space(6.0);
-                                        let _ = app.draw_launcher_icon(ui, launcher.icon_key, 16.0);
-                                        ui.add_space(6.0);
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(&launcher.display_name)
-                                                    .strong()
-                                                    .color(TEXT_PRIMARY),
-                                            )
-                                            .selectable(false)
-                                            .truncate(),
-                                        );
-                                        ui.response()
-                                    },
-                                );
-                                let row_response = inner_response.inner.on_hover_text(format!(
-                                    "{}\n{}",
-                                    launcher.display_name, launcher.launch_command
-                                ));
-                                if row_response.hovered() {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                }
-                                if row_response.clicked() {
-                                    selected_launcher = Some(launcher.id.clone());
-                                    ui.close_menu();
-                                }
-                                if index + 1 < launchers.len() {
-                                    ui.add_space(FOREGROUND_LAUNCHER_ROW_GAP);
-                                }
-                            }
-                            ui.add_space(FOREGROUND_LAUNCHER_MENU_PADDING_Y);
+                            let backing_rect = ui.available_rect_before_wrap();
+                            let rounding = ui.style().visuals.menu_rounding;
+                            ui.painter().rect_filled(backing_rect, rounding, SURFACE_BG);
+                            selected_launcher = draw_launcher_menu_contents(app, ui, launchers);
                         });
                     })
                 })
@@ -29492,6 +30025,21 @@ fn terminal_last_non_empty_row(snapshot: &TerminalSnapshot) -> Option<usize> {
     })
 }
 
+/// Returns the number of fully blank rows at the start of the snapshot.
+/// These rows often appear after OpenCode clears the display and redraws,
+/// leaving empty scrollback history above the actual TUI content.
+fn terminal_leading_blank_rows(snapshot: &TerminalSnapshot) -> usize {
+    snapshot
+        .lines
+        .iter()
+        .position(|line| {
+            line.runs
+                .iter()
+                .any(|run| !run.text.trim_end_matches(' ').is_empty())
+        })
+        .unwrap_or(snapshot.lines.len())
+}
+
 /// Extracts the text of the last non-empty line from a terminal snapshot.
 fn terminal_last_line_text(snapshot: &TerminalSnapshot) -> Option<String> {
     let row = terminal_last_non_empty_row(snapshot)?;
@@ -29953,20 +30501,21 @@ mod tests {
         terminal_activation_scroll_offset, terminal_cell_metric,
         terminal_cursor_blink_phase_visible, terminal_cursor_overlay_rect, terminal_font_family,
         terminal_font_id, terminal_grid_dimensions, terminal_has_windows_batch_terminate_prompt,
-        terminal_line_height, terminal_link_activation_modifiers, terminal_link_at_point,
-        terminal_logical_line, terminal_logical_line_byte_index, terminal_manager_actions_width,
-        terminal_manager_diff_summary_model, terminal_manager_diff_summary_visual,
-        terminal_manager_row_chrome, terminal_manager_row_widths,
-        terminal_output_mouse_wheel_enabled, terminal_output_scroll_behavior,
-        terminal_output_surface_size, terminal_output_viewport_size,
-        terminal_secondary_click_action, terminal_selection_autoscroll_delta,
-        terminal_selection_autoscroll_speed, terminal_selection_point_from_pointer,
-        terminal_selection_text, to_egui_color, update_stable_cursor_row, visible_terminal_cursor,
-        with_minimal_button_chrome, with_settings_text_edit_chrome, AdeApp, AiBadgeModel,
-        AiBadgeVisual, AppIcon, BrowserScopeKey, BrowserTabKind, BrowserVideoEncodeEvent,
-        CodexAttentionReason, CodexCliStatusSource, CodexTransportStatus, CtrlCAction,
-        DesignInspectDeliveryState, DirectoryIndexSnapshot, DirectoryIndexTruncationFlags,
-        DirectoryNode, FactoryDroidAttentionReason, FactoryDroidHookInboxEvent,
+        terminal_leading_blank_rows, terminal_line_height, terminal_link_activation_modifiers,
+        terminal_link_at_point, terminal_logical_line, terminal_logical_line_byte_index,
+        terminal_manager_actions_width, terminal_manager_diff_summary_model,
+        terminal_manager_diff_summary_visual, terminal_manager_row_chrome,
+        terminal_manager_row_widths, terminal_output_mouse_wheel_enabled,
+        terminal_output_scroll_behavior, terminal_output_surface_size,
+        terminal_output_viewport_size, terminal_secondary_click_action,
+        terminal_selection_autoscroll_delta, terminal_selection_autoscroll_speed,
+        terminal_selection_point_from_pointer, terminal_selection_text, to_egui_color,
+        update_stable_cursor_row, visible_terminal_cursor, with_minimal_button_chrome,
+        with_settings_text_edit_chrome, AdeApp, AiBadgeModel, AiBadgeVisual, AppIcon,
+        BrowserScopeKey, BrowserTabKind, BrowserVideoEncodeEvent, CodexAttentionReason,
+        CodexCliStatusSource, CodexTransportStatus, CtrlCAction, DesignInspectDeliveryState,
+        DirectoryIndexSnapshot, DirectoryIndexTruncationFlags, DirectoryNode,
+        FactoryDroidAttentionReason, FactoryDroidHookInboxEvent,
         FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
         FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, FileEditorState,
         OpenCodeAttentionReason, OpenCodeStatusSource, OpenCodeTransportStatus, OpenFileBuffer,
@@ -29987,7 +30536,7 @@ mod tests {
         SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG, TERMINAL_COPY_FEEDBACK_TEXT,
         TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS, TERMINAL_OUTPUT_BG,
         TEXT_MUTED, TEXT_PRIMARY, TRANSIENT_TOAST_MAX_WIDTH, TRANSIENT_TOAST_MIN_WIDTH,
-        TRANSIENT_TOAST_SCREEN_MARGIN, TRANSIENT_TOAST_SECS,
+        TRANSIENT_TOAST_SCREEN_MARGIN, TRANSIENT_TOAST_SECS, TRANSIENT_TOAST_TEXT_EXTRA_PADDING,
     };
     use crate::browser_video::BrowserVideoEncodeResult;
     use crate::codex::{CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
@@ -31799,27 +32348,63 @@ mod tests {
     }
 
     #[test]
-    fn transient_toast_content_width_uses_max_on_wide_screen() {
-        assert_eq!(
-            AdeApp::transient_toast_content_width(1920.0),
-            TRANSIENT_TOAST_MAX_WIDTH
+    fn transient_toast_content_width_uses_max_for_long_text_on_wide_screen() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+        let _ = ctx.run(egui::RawInput::default(), |_ctx| {});
+        let long_message = "a".repeat(300);
+        let width = AdeApp::transient_toast_content_width(&ctx, 1920.0, &long_message);
+        assert_eq!(width, TRANSIENT_TOAST_MAX_WIDTH);
+    }
+
+    #[test]
+    fn transient_toast_content_width_is_small_for_short_text_on_wide_screen() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+        let _ = ctx.run(egui::RawInput::default(), |_ctx| {});
+        let short_message = "Sent: /review-guard";
+        let width = AdeApp::transient_toast_content_width(&ctx, 1920.0, &short_message);
+        assert!(
+            width < TRANSIENT_TOAST_MAX_WIDTH,
+            "short message should not force max width, got {width}"
+        );
+        assert!(
+            width >= TRANSIENT_TOAST_MIN_WIDTH,
+            "width should respect minimum, got {width}"
         );
     }
 
     #[test]
     fn transient_toast_content_width_caps_at_screen_on_narrow_screen() {
-        assert_eq!(AdeApp::transient_toast_content_width(300.0), 300.0);
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+        let _ = ctx.run(egui::RawInput::default(), |_ctx| {});
+        let message = "a".repeat(300);
+        let width = AdeApp::transient_toast_content_width(&ctx, 300.0, &message);
+        assert!(width <= 300.0, "width {width} should not exceed screen");
     }
 
     #[test]
     fn transient_toast_content_width_never_exceeds_screen() {
-        assert_eq!(AdeApp::transient_toast_content_width(200.0), 200.0);
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+        let _ = ctx.run(egui::RawInput::default(), |_ctx| {});
+        let message = "a".repeat(300);
+        let width = AdeApp::transient_toast_content_width(&ctx, 200.0, &message);
+        assert!(width <= 200.0, "width {width} should not exceed screen");
     }
 
     #[test]
-    fn transient_toast_content_width_scales_between_min_and_max() {
-        // 600px screen -> 600 - 48 = 552, which is between 420 and 640
-        assert_eq!(AdeApp::transient_toast_content_width(600.0), 552.0);
+    fn transient_toast_content_width_scales_between_min_and_max_for_medium_text() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+        let _ = ctx.run(egui::RawInput::default(), |_ctx| {});
+        let message = "Sent: /prepare-fix-plan";
+        let width = AdeApp::transient_toast_content_width(&ctx, 600.0, &message);
+        assert!(
+            width > TRANSIENT_TOAST_MIN_WIDTH && width < TRANSIENT_TOAST_MAX_WIDTH,
+            "width {width} should be between min and max for medium text on 600px screen"
+        );
     }
 
     #[test]
@@ -33116,6 +33701,25 @@ mod tests {
     }
 
     #[test]
+    fn terminal_history_popup_renders_long_inputs_without_crash() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let mut app = terminal_manager_row_test_app(None);
+        let terminal = app.terminals.get_mut(&2).expect("terminal");
+        terminal.recent_inputs.push_back("a".repeat(2000));
+        terminal.recent_inputs.push_back(
+            "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10".to_owned(),
+        );
+
+        app.terminal_history_popup_open = Some(2);
+
+        let _ = draw_terminal_rows_in_test_ui(&ctx, RawInput::default(), &mut app);
+        // Should not panic; popup stays open
+        assert_eq!(app.terminal_history_popup_open, Some(2));
+    }
+
+    #[test]
     fn foreground_launcher_menu_text_hover_avoids_text_cursor() {
         // Regression test: hovering over launcher menu text should NOT show I-beam (text cursor).
         // This verifies .selectable(false) is applied to the labels.
@@ -33198,6 +33802,13 @@ mod tests {
                             ui.set_min_width(menu_width);
                             ui.set_max_width(menu_width);
                             ui.add_space(super::FOREGROUND_LAUNCHER_MENU_PADDING_Y);
+
+                            // Mirror production opaque backing
+                            let backing_rect = ui.available_rect_before_wrap();
+                            let rounding = ui.style().visuals.menu_rounding;
+                            ui.painter()
+                                .rect_filled(backing_rect, rounding, super::SURFACE_BG);
+
                             for (index, launcher) in launchers.iter().enumerate() {
                                 let row_height = 24.0;
                                 let full_row_rect = egui::Rect::from_min_size(
@@ -33326,6 +33937,31 @@ mod tests {
             !touches_edge,
             "launcher menu row background must be inset by at least {}px from menu edges (width <= {})",
             padding, expected_max_width
+        );
+    }
+
+    #[test]
+    fn foreground_launcher_menu_popup_has_opaque_backing() {
+        // Regression test: launcher menu popup must paint an opaque backing rect
+        // to prevent background elements from showing through.
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let launchers = vec![LauncherEntry {
+            id: "opencode".to_owned(),
+            builtin: Some(BuiltinLauncherKind::OpenCode),
+            display_name: "OpenCode".to_owned(),
+            launch_command: "opencode".to_owned(),
+            enabled: true,
+            icon_key: LauncherIconKey::OpenCode,
+        }];
+
+        let output =
+            draw_foreground_launcher_menu_in_test_ui(&ctx, RawInput::default(), &launchers);
+
+        assert!(
+            frame_contains_rect_filled(&output, super::SURFACE_BG),
+            "launcher menu popup must paint an opaque SURFACE_BG backing rect"
         );
     }
 
@@ -34907,6 +35543,66 @@ mod tests {
         AdeApp::flush_terminal_outbound(&mut terminal, &ctx, &mut outbound);
 
         assert!(!terminal.opencode_manual_scroll_detached);
+    }
+
+    #[test]
+    fn opencode_scroll_offset_clamps_past_leading_blank_rows() {
+        let snapshot = TerminalSnapshot {
+            lines: vec![
+                TerminalStyledLine::default(),
+                TerminalStyledLine::default(),
+                TerminalStyledLine {
+                    runs: vec![TerminalStyledRun {
+                        text: "real content".to_owned(),
+                        style: test_terminal_style(),
+                        column: 0,
+                        display_width: 12,
+                    }],
+                },
+            ],
+            cursor: None,
+            cursor_line: None,
+        };
+
+        let leading = terminal_leading_blank_rows(&snapshot);
+        assert_eq!(leading, 2, "should count two blank rows at top");
+    }
+
+    #[test]
+    fn non_opencode_scroll_does_not_clamp_leading_blanks() {
+        let snapshot = TerminalSnapshot {
+            lines: vec![
+                TerminalStyledLine::default(),
+                TerminalStyledLine {
+                    runs: vec![TerminalStyledRun {
+                        text: "content".to_owned(),
+                        style: test_terminal_style(),
+                        column: 0,
+                        display_width: 7,
+                    }],
+                },
+            ],
+            cursor: None,
+            cursor_line: None,
+        };
+
+        let leading = terminal_leading_blank_rows(&snapshot);
+        assert_eq!(leading, 1);
+    }
+
+    #[test]
+    fn scroll_clamp_noops_when_content_not_scrollable() {
+        // Helper only matters when content exceeds viewport; this test
+        // documents that leading_blank_rows is still computed correctly
+        // for short content.
+        let snapshot = TerminalSnapshot {
+            lines: vec![TerminalStyledLine::default(); 5],
+            cursor: None,
+            cursor_line: None,
+        };
+
+        let leading = terminal_leading_blank_rows(&snapshot);
+        assert_eq!(leading, 5, "all rows blank -> leading = entire snapshot");
     }
 
     #[test]
@@ -40046,6 +40742,9 @@ mod tests {
             opencode_last_hook_attention_at: None,
             opencode_last_turn_complete_at: None,
             opencode_attention_pending: false,
+            opencode_pending_question: None,
+            opencode_question_selected: Vec::new(),
+            opencode_question_custom: String::new(),
             pending_rerun_command: None,
             pending_rerun_since: None,
             pending_rerun_phase: None,
@@ -40773,6 +41472,102 @@ mod tests {
         // Test empty
         let empty = capped_hover_text("", 5);
         assert_eq!(empty, "");
+    }
+
+    #[test]
+    fn draw_clamped_scrollable_label_renders_without_crash() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let response = super::draw_clamped_scrollable_label(
+                    ui,
+                    "short text",
+                    super::TEXT_PRIMARY,
+                    12.0,
+                    100.0,
+                    egui::Sense::click(),
+                    0,
+                );
+                assert!(response.rect.is_positive());
+
+                let long_response = super::draw_clamped_scrollable_label(
+                    ui,
+                    &"a".repeat(2000),
+                    super::TEXT_PRIMARY,
+                    12.0,
+                    50.0,
+                    egui::Sense::click(),
+                    1,
+                );
+                assert!(long_response.rect.is_positive());
+            });
+        });
+    }
+
+    #[test]
+    fn draw_clamped_scrollable_label_short_text_does_not_reserve_max_height() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let before = ui.cursor().min.y;
+                let _response = super::draw_clamped_scrollable_label(
+                    ui,
+                    "short text",
+                    super::TEXT_PRIMARY,
+                    12.0,
+                    120.0,
+                    egui::Sense::click(),
+                    0,
+                );
+                let after = ui.cursor().min.y;
+                let allocated = after - before;
+                // Short text should not consume the full 120px cap
+                assert!(
+                    allocated < 60.0,
+                    "short text should shrink vertically, got allocated height {}",
+                    allocated
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn draw_clamped_scrollable_label_long_text_is_capped() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let before = ui.cursor().min.y;
+                let _response = super::draw_clamped_scrollable_label(
+                    ui,
+                    &("a\n".repeat(50)), // 50 lines exceeds 120px
+                    super::TEXT_PRIMARY,
+                    12.0,
+                    120.0,
+                    egui::Sense::click(),
+                    1,
+                );
+                let after = ui.cursor().min.y;
+                let allocated = after - before;
+                // Allow small tolerance for item_spacing added after the widget
+                assert!(
+                    allocated <= 124.0,
+                    "long text must be capped near max_height, got allocated height {}",
+                    allocated
+                );
+            });
+        });
     }
 
     #[test]
@@ -43459,7 +44254,8 @@ mod tests {
                 pos2(super::ACTIVITY_RAIL_WIDTH, 0.0),
                 egui::vec2(super::PROJECT_EXPLORER_WIDTH, 900.0),
             )),
-            None, // No right panel in this test
+            None, // No checklist panel
+            None, // No browser panel
         );
 
         assert_eq!(main_area_size, egui::vec2(1200.0, 900.0));
@@ -43483,6 +44279,7 @@ mod tests {
                 pos2(1600.0 - super::CHECKLIST_PANEL_WIDTH, 0.0),
                 egui::vec2(super::CHECKLIST_PANEL_WIDTH, 900.0),
             )),
+            None, // No browser panel
         );
 
         // 1600 - 48 (activity) - 352 (explorer) - 352 (checklist) = 848
@@ -43503,6 +44300,7 @@ mod tests {
                 pos2(super::ACTIVITY_RAIL_WIDTH, 0.0),
                 egui::vec2(super::PROJECT_EXPLORER_WIDTH, 900.0),
             )),
+            None, // No checklist panel
             Some(egui::Rect::from_min_size(
                 pos2(1600.0 - super::BROWSER_PANEL_WIDTH, 0.0),
                 egui::vec2(super::BROWSER_PANEL_WIDTH, 900.0),
@@ -43511,6 +44309,37 @@ mod tests {
 
         // 1600 - 48 (activity) - 352 (explorer) - 520 (browser) = 680
         assert_eq!(main_area_size, egui::vec2(680.0, 900.0));
+    }
+
+    #[test]
+    fn main_area_size_from_chrome_accounts_for_both_right_panels() {
+        let app = test_app([], None);
+
+        let main_area_size = app.main_area_size_from_chrome(
+            egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(1600.0, 900.0)),
+            Some(egui::Rect::from_min_size(
+                pos2(0.0, 0.0),
+                egui::vec2(super::ACTIVITY_RAIL_WIDTH, 900.0),
+            )),
+            Some(egui::Rect::from_min_size(
+                pos2(super::ACTIVITY_RAIL_WIDTH, 0.0),
+                egui::vec2(super::PROJECT_EXPLORER_WIDTH, 900.0),
+            )),
+            Some(egui::Rect::from_min_size(
+                pos2(
+                    1600.0 - super::CHECKLIST_PANEL_WIDTH - super::BROWSER_PANEL_WIDTH,
+                    0.0,
+                ),
+                egui::vec2(super::CHECKLIST_PANEL_WIDTH, 900.0),
+            )),
+            Some(egui::Rect::from_min_size(
+                pos2(1600.0 - super::BROWSER_PANEL_WIDTH, 0.0),
+                egui::vec2(super::BROWSER_PANEL_WIDTH, 900.0),
+            )),
+        );
+
+        // 1600 - 48 (activity) - 352 (explorer) - 352 (checklist) - 520 (browser) = 328
+        assert_eq!(main_area_size, egui::vec2(328.0, 900.0));
     }
 
     #[test]
@@ -44503,7 +45332,43 @@ mod tests {
     }
 
     #[test]
-    fn recover_config_collapses_empty_checklist_panel() {
+    fn format_checklist_for_clipboard_joins_items_with_blank_line() {
+        let items = vec![
+            "first item".to_owned(),
+            "second item".to_owned(),
+            "third item".to_owned(),
+        ];
+        let result = super::AdeApp::format_checklist_for_clipboard(&items);
+        assert_eq!(result, "first item\n\nsecond item\n\nthird item");
+    }
+
+    #[test]
+    fn format_checklist_for_clipboard_preserves_unicode_and_multiline() {
+        let items = vec!["Line 1\nLine 2".to_owned(), "Unicode: 日本語".to_owned()];
+        let result = super::AdeApp::format_checklist_for_clipboard(&items);
+        assert_eq!(result, "Line 1\nLine 2\n\nUnicode: 日本語");
+    }
+
+    #[test]
+    fn checklist_panel_renders_long_items_without_crash() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let mut app = test_app([(1, test_terminal_entry(1, 1))], Some(1));
+        app.projects.insert(
+            1,
+            test_project(1, "Demo", "C:/demo", &[], &[&"a".repeat(2000)]),
+        );
+        app.config.ui.checklist_panel_expanded = true;
+
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            app.draw_checklist_panel(ctx);
+        });
+        // Should not panic
+    }
+
+    #[test]
+    fn recover_config_keeps_checklist_panel_even_when_empty() {
         use crate::models::{AppConfig, UiConfig};
 
         let loaded_config = AppConfig {
@@ -44524,8 +45389,8 @@ mod tests {
         );
 
         assert!(
-            !recovered.ui.checklist_panel_expanded,
-            "Empty checklist panel should be collapsed on startup"
+            recovered.ui.checklist_panel_expanded,
+            "Checklist panel should remain open even when empty"
         );
     }
 
@@ -44573,12 +45438,12 @@ mod tests {
     }
 
     #[test]
-    fn checklist_panel_closes_when_last_item_removed() {
+    fn checklist_panel_remains_open_when_last_item_removed() {
         let mut app = test_app([(1, test_terminal_entry(1, 1))], Some(1));
         // Add project 1 with a checklist item
         app.projects
             .insert(1, test_project(1, "Demo", "C:/demo", &[], &["only_item"]));
-        // Open the checklist panel
+        // Panel is visible by default
         app.config.ui.checklist_panel_expanded = true;
 
         // Remove the last item
@@ -44586,14 +45451,10 @@ mod tests {
             project.checklist.clear();
         }
 
-        // Simulate the auto-close logic that runs on item removal
-        if app.projects.values().all(|p| p.checklist.is_empty()) {
-            app.config.ui.checklist_panel_expanded = false;
-        }
-
+        // Panel should stay open even when empty
         assert!(
-            !app.config.ui.checklist_panel_expanded,
-            "Panel should auto-close when last checklist item is removed"
+            app.config.ui.checklist_panel_expanded,
+            "Panel should remain open when last checklist item is removed"
         );
     }
 
@@ -47115,27 +47976,20 @@ mod tests {
     }
 
     #[test]
-    fn browser_panel_and_checklist_are_mutually_exclusive() {
+    fn browser_panel_and_checklist_can_coexist() {
         let mut app = test_app([], None);
         // Add a project and select it
         let project = test_project(1, "Demo", "C:/demo", &[], &[]);
         app.projects.insert(1, project);
         app.selected_project = Some(1);
 
-        // Initially both closed
-        assert!(!app.config.ui.checklist_panel_expanded);
-        assert!(!app.is_active_browser_panel_open());
-
-        // Open checklist - browser should stay closed
-        app.config.ui.checklist_panel_expanded = true;
-        app.set_active_browser_panel_open(false);
+        // Checklist is always visible by default
         assert!(app.config.ui.checklist_panel_expanded);
         assert!(!app.is_active_browser_panel_open());
 
-        // Open browser - simulate mutual exclusivity logic
+        // Open browser - checklist should remain open
         app.set_active_browser_panel_open(true);
-        app.config.ui.checklist_panel_expanded = false;
-        assert!(!app.config.ui.checklist_panel_expanded);
+        assert!(app.config.ui.checklist_panel_expanded);
         assert!(app.is_active_browser_panel_open());
     }
 
@@ -47512,9 +48366,9 @@ mod tests {
         app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
         capture.drain();
 
-        // Verify command is submitted immediately, with one delayed confirmation Enter pending.
+        // Verify command is submitted immediately, with two delayed confirmation Enters pending.
         assert_eq!(capture.bytes(), b"/prepare-fix-plan\r".to_vec());
-        assert_eq!(app.pending_second_enter.len(), 1);
+        assert_eq!(app.pending_second_enter.len(), 2);
         assert_eq!(app.status_line, "Sent: /prepare-fix-plan");
         assert!(app
             .terminals
@@ -47546,7 +48400,7 @@ mod tests {
             capture.bytes(),
             b"\x1b[200~/prepare-fix-plan\x1b[201~\r".to_vec()
         );
-        assert_eq!(app.pending_second_enter.len(), 1);
+        assert_eq!(app.pending_second_enter.len(), 2);
         assert_eq!(app.status_line, "Sent: /prepare-fix-plan");
         assert!(app
             .terminals
@@ -47556,8 +48410,8 @@ mod tests {
 
     #[test]
     fn handle_shortcuts_sends_immediate_enter_plus_delayed_confirmation() {
-        // Regression test: Terminal shortcuts should send command+Enter immediately,
-        // then send one delayed Enter for confirmation.
+        // Regression test: Slash terminal shortcuts should send command+Enter immediately,
+        // then schedule two additional delayed Enters for robust OpenCode slash-menu handling.
         let ctx = Context::default();
         let (runtime, capture) = test_terminal_runtime_with_capture();
         let mut app = test_app(
@@ -47577,17 +48431,89 @@ mod tests {
 
         assert_eq!(capture.bytes(), b"/prepare-fix-plan\r".to_vec());
 
-        assert_eq!(app.pending_second_enter.len(), 1);
+        assert_eq!(app.pending_second_enter.len(), 2);
         let (pending_terminal_id, _) = app.pending_second_enter[0];
         assert_eq!(pending_terminal_id, 1);
 
-        // Phase 2: Process delayed confirmation Enter.
+        // Phase 2: Process first delayed confirmation Enter.
         app.pending_second_enter[0].1 = Instant::now() - Duration::from_millis(1);
         app.process_pending_second_enters(&ctx);
         capture.drain();
 
         assert_eq!(capture.bytes(), b"/prepare-fix-plan\r\r".to_vec());
+        assert_eq!(app.pending_second_enter.len(), 1);
+
+        // Phase 3: Process second delayed confirmation Enter.
+        app.pending_second_enter[0].1 = Instant::now() - Duration::from_millis(1);
+        app.process_pending_second_enters(&ctx);
+        capture.drain();
+
+        assert_eq!(capture.bytes(), b"/prepare-fix-plan\r\r\r".to_vec());
         assert!(app.pending_second_enter.is_empty());
+    }
+
+    #[test]
+    fn handle_shortcuts_clears_stale_delayed_enters_for_slash_shortcut() {
+        // Regression test: When a new slash shortcut is executed on the same
+        // terminal, any pending delayed Enters from a previous shortcut must
+        // be cleared so they do not leak into the new command's state.
+        let ctx = Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+
+        // Simulate a stale pending second Enter from a previous shortcut
+        app.pending_second_enter
+            .push((1, Instant::now() + Duration::from_secs(60)));
+        assert_eq!(app.pending_second_enter.len(), 1);
+
+        app.buffered_terminal_command_shortcuts = vec![(
+            egui::Key::F7,
+            egui::Modifiers::default(),
+            "/review-guard".to_string(),
+        )];
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+        capture.drain();
+
+        // New slash shortcut should clear the stale enter and schedule 2 fresh ones
+        assert_eq!(capture.bytes(), b"/review-guard\r".to_vec());
+        assert_eq!(app.pending_second_enter.len(), 2);
+
+        // Fast-forward both delayed Enters
+        for i in 0..2 {
+            app.pending_second_enter[i].1 = Instant::now() - Duration::from_millis(1);
+        }
+        app.process_pending_second_enters(&ctx);
+        capture.drain();
+
+        assert_eq!(capture.bytes(), b"/review-guard\r\r\r".to_vec());
+        assert!(app.pending_second_enter.is_empty());
+    }
+
+    #[test]
+    fn handle_shortcuts_non_slash_keeps_single_delayed_confirmation() {
+        // Non-slash commands should not switch to the multi-Enter strategy.
+        let ctx = Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+
+        app.buffered_terminal_command_shortcuts = vec![(
+            egui::Key::F5,
+            egui::Modifiers::default(),
+            "cargo test".to_string(),
+        )];
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+        capture.drain();
+
+        assert_eq!(capture.bytes(), b"cargo test\r".to_vec());
+        assert_eq!(app.pending_second_enter.len(), 1);
     }
 
     #[test]
@@ -47666,8 +48592,8 @@ mod tests {
 
         // Browser panel should be open for project 1
         assert!(app.is_browser_panel_open_for_project(1));
-        // Checklist should be closed
-        assert!(!app.config.ui.checklist_panel_expanded);
+        // Checklist should remain open
+        assert!(app.config.ui.checklist_panel_expanded);
     }
 
     #[test]
@@ -50295,6 +51221,192 @@ mod tests {
     }
 
     #[test]
+    fn smart_input_ensure_focus_requests_draft_when_visible() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        assert!(!ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))));
+
+        app.ensure_smart_input_focus(&ctx);
+
+        assert!(ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))));
+    }
+
+    #[test]
+    fn smart_input_ensure_focus_does_not_steal_from_directory_search() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::directory_search_input_id());
+        });
+
+        app.ensure_smart_input_focus(&ctx);
+
+        assert!(ctx.memory(|mem| mem.has_focus(AdeApp::directory_search_input_id())));
+        assert!(!ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))));
+    }
+
+    #[test]
+    fn smart_input_ensure_focus_does_not_run_when_settings_popup_open() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        app.show_settings_popup = true;
+
+        app.ensure_smart_input_focus(&ctx);
+
+        assert!(!ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))));
+    }
+
+    #[test]
+    fn set_active_terminal_restores_smart_input_focus_when_visible() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        app.active_terminal = None;
+
+        app.set_active_terminal(&ctx, Some(1));
+
+        assert!(ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))));
+    }
+
+    #[test]
+    fn smart_input_ensure_focus_preserves_existing_edit_focus() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.smart_input.draft = "task".to_owned();
+            let task_id = terminal.smart_input.enqueue_draft().expect("task");
+            let _ = terminal.smart_input.start_edit(task_id);
+        }
+        let edit_id = AdeApp::smart_input_task_edit_input_id(1, 1);
+        ctx.memory_mut(|mem| {
+            mem.request_focus(edit_id);
+        });
+
+        app.ensure_smart_input_focus(&ctx);
+
+        assert!(ctx.memory(|mem| mem.has_focus(edit_id)));
+        assert!(!ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))));
+    }
+
+    #[test]
+    fn raw_input_hook_auto_focuses_smart_input_draft() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        let mut raw_input = RawInput {
+            events: vec![Event::Text("hello".to_owned())],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        // Focus should have been claimed by Smart Input
+        assert!(ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))));
+        // Text event should remain for egui TextEdit (not consumed by terminal)
+        assert!(
+            raw_input
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::Text(t) if t == "hello")),
+            "text event should remain for Smart Input TextEdit"
+        );
+    }
+
+    #[test]
+    fn smart_input_ensure_focus_does_not_focus_other_visible_smart_input_when_active_has_none() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(1),
+        );
+        // Only terminal 2 gets OpenCode attention (Smart Input visible)
+        seed_opencode_attention(&mut app, 2, OpenCodeAttentionReason::TurnComplete);
+
+        app.ensure_smart_input_focus(&ctx);
+
+        // Active terminal (1) has no Smart Input -> nothing should be focused
+        assert!(
+            !ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))),
+            "normal terminal should not get Smart Input focus"
+        );
+        assert!(
+            !ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(2))),
+            "non-active OpenCode terminal must not be auto-focused"
+        );
+    }
+
+    #[test]
+    fn set_active_terminal_focuses_new_terminal_smart_input_not_previous() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        seed_opencode_attention(&mut app, 2, OpenCodeAttentionReason::TurnComplete);
+
+        // Focus terminal 1 draft initially
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::smart_input_draft_input_id(1));
+        });
+        assert!(ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))));
+
+        app.set_active_terminal(&ctx, Some(2));
+
+        // After switching, terminal 2 draft should be focused
+        assert!(
+            ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(2))),
+            "newly active terminal's Smart Input must get focus"
+        );
+        assert!(
+            !ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))),
+            "previous terminal's Smart Input must lose focus"
+        );
+    }
+
+    #[test]
+    fn set_active_terminal_does_not_focus_other_smart_input_when_target_has_none() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(1),
+        );
+        // Terminal 2 has Smart Input but is not the target
+        seed_opencode_attention(&mut app, 2, OpenCodeAttentionReason::TurnComplete);
+
+        app.set_active_terminal(&ctx, Some(1));
+
+        // Terminal 1 has no Smart Input; nothing should be focused
+        assert!(
+            !ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))),
+            "target without Smart Input should not get focus"
+        );
+        assert!(
+            !ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(2))),
+            "other terminal's Smart Input must not be focused"
+        );
+    }
+
+    #[test]
     fn smart_input_tab_passthrough_sends_tab_to_terminal_when_draft_focused() {
         use egui::{Context, RawInput};
 
@@ -51708,6 +52820,56 @@ mod tests {
     }
 
     #[test]
+    fn smart_input_footer_user_height_takes_precedence_over_draft_height() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+        terminal.smart_input.draft_user_height = Some(50.0);
+        terminal.smart_input.user_height = Some(200.0);
+
+        let height = AdeApp::smart_input_footer_height(terminal, 400.0, 18.0);
+        assert_eq!(
+            height, 200.0,
+            "user_height must take precedence over draft_user_height"
+        );
+    }
+
+    #[test]
+    fn smart_input_footer_grip_drag_respects_max_and_min() {
+        let pane_height = 400.0;
+        let line_height = 18.0;
+        let max_footer = (pane_height
+            - super::TERMINAL_HEADER_HEIGHT
+            - super::TERMINAL_HEADER_GAP
+            - super::SMART_INPUT_FOOTER_GAP
+            - line_height * 3.0)
+            .max(0.0);
+
+        // Dragging down 50px from 150 should increase to 200
+        let current: f32 = 150.0;
+        let delta: f32 = 50.0;
+        let new_height = (current + delta)
+            .max(super::SMART_INPUT_MIN_FOOTER_HEIGHT)
+            .min(max_footer);
+        assert_eq!(new_height, 200.0);
+
+        // Dragging up 100px from 150 should decrease to 50, but clamped to min
+        let delta: f32 = -100.0;
+        let new_height = (current + delta)
+            .max(super::SMART_INPUT_MIN_FOOTER_HEIGHT)
+            .min(max_footer);
+        assert_eq!(new_height, super::SMART_INPUT_MIN_FOOTER_HEIGHT);
+
+        // Dragging down from near max should clamp to max
+        let current: f32 = max_footer - 10.0;
+        let delta: f32 = 50.0;
+        let new_height = (current + delta)
+            .max(super::SMART_INPUT_MIN_FOOTER_HEIGHT)
+            .min(max_footer);
+        assert_eq!(new_height, max_footer);
+    }
+
+    #[test]
     fn smart_input_steer_now_records_input_history() {
         use egui::Context;
         use std::path::PathBuf;
@@ -52460,6 +53622,48 @@ mod tests {
 
         // cleanup
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn parse_opencode_question_from_hook_event_shape() {
+        let raw = r#"{"status":"permission","event":{"type":"question.asked","properties":{"id":"req-1","sessionID":"sess-1","questions":[{"header":"Build","question":"Which model?","options":[{"label":"gpt-4","description":"Fast"}],"multiple":false,"custom":true}]}}}"#;
+        let info = super::AdeApp::parse_opencode_question_from_raw_json(raw);
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.request_id, "req-1");
+        assert_eq!(info.session_id, "sess-1");
+        assert_eq!(info.header, "Build");
+        assert_eq!(info.question, "Which model?");
+        assert!(!info.multiple);
+        assert!(info.custom);
+        assert_eq!(info.options.len(), 1);
+        assert_eq!(info.options[0].label, "gpt-4");
+        assert_eq!(info.options[0].description, "Fast");
+    }
+
+    #[test]
+    fn parse_opencode_question_from_notify_event_shape() {
+        let raw = r#"{"properties":{"id":"req-2","sessionID":"sess-2","questions":[{"header":"Test","question":"Continue?","options":[{"label":"Yes","description":"Proceed"},{"label":"No","description":"Stop"}],"multiple":false,"custom":false}]}}"#;
+        let info = super::AdeApp::parse_opencode_question_from_raw_json(raw);
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.request_id, "req-2");
+        assert_eq!(info.session_id, "sess-2");
+        assert_eq!(info.header, "Test");
+        assert_eq!(info.question, "Continue?");
+        assert!(!info.multiple);
+        assert!(!info.custom);
+        assert_eq!(info.options.len(), 2);
+        assert_eq!(info.options[0].label, "Yes");
+        assert_eq!(info.options[1].label, "No");
+    }
+
+    #[test]
+    fn parse_opencode_question_returns_none_for_invalid_json() {
+        assert!(super::AdeApp::parse_opencode_question_from_raw_json("not json").is_none());
+        assert!(
+            super::AdeApp::parse_opencode_question_from_raw_json(r#"{"status":"idle"}"#).is_none()
+        );
     }
 
     #[test]

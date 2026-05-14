@@ -399,7 +399,7 @@ impl Default for UiConfig {
             last_selected_project_id: None,
             main_visibility_mode: MainVisibilityMode::Global,
             left_sidebar_tab: LeftSidebarTab::Directory,
-            checklist_panel_expanded: false,
+            checklist_panel_expanded: true,
             browser_panel_expanded: false,
             checklist_panel_width: default_checklist_panel_width(),
             browser_panel_width: default_browser_panel_width(),

@@ -38,6 +38,7 @@ mod models;
 mod opencode;
 mod opencode_config;
 mod opencode_hook_service;
+mod path_utils;
 mod terminal;
 mod title;
 mod web_browser;

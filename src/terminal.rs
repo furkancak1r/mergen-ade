@@ -840,7 +840,9 @@ impl TerminalRuntime {
         let (program, args) = shell.command();
         let mut command = CommandBuilder::new(program);
         command.args(args.iter().copied());
-        command.cwd(working_directory);
+        let working_directory =
+            crate::path_utils::normalize_windows_verbatim_path_for_shell(&working_directory);
+        command.cwd(&working_directory);
         apply_terminal_path_hardening(&mut command);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
