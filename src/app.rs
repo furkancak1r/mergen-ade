@@ -13147,10 +13147,6 @@ impl AdeApp {
             return 0.0;
         }
 
-        if let Some(user_h) = terminal.smart_input.user_height {
-            return user_h.clamp(SMART_INPUT_MIN_FOOTER_HEIGHT, max_footer);
-        }
-
         let task_rows = if terminal.smart_input.expanded {
             terminal
                 .smart_input
@@ -13163,7 +13159,20 @@ impl AdeApp {
         let desired = SMART_INPUT_BASE_FOOTER_HEIGHT
             + task_rows as f32 * SMART_INPUT_TASK_ROW_HEIGHT
             + if task_rows > 0 { 6.0 } else { 0.0 };
-        desired.min(max_footer).max(SMART_INPUT_MIN_FOOTER_HEIGHT)
+
+        // Safe minimum: when tasks exist, reserve enough height for queue slot + draft.
+        let safe_min = if task_rows > 0 {
+            (SMART_INPUT_BASE_FOOTER_HEIGHT + task_rows as f32 * SMART_INPUT_TASK_ROW_HEIGHT + 60.0)
+                .max(SMART_INPUT_MIN_FOOTER_HEIGHT)
+        } else {
+            SMART_INPUT_MIN_FOOTER_HEIGHT
+        };
+
+        if let Some(user_h) = terminal.smart_input.user_height {
+            return user_h.clamp(safe_min, max_footer);
+        }
+
+        desired.min(max_footer).max(safe_min)
     }
 
     /// Returns true if an incoming OpenCode Idle/TurnComplete signal should be
@@ -22434,7 +22443,9 @@ impl AdeApp {
                     }
                 }
                 if smart_footer_height > 0.0 {
-                    // Draggable resize handle between terminal output and Smart Input footer
+                    // Draggable resize handle between terminal output and Smart Input footer.
+                    // Dragging is allowed again, but clamped to a safe minimum so the queue
+                    // and draft input are never crushed to zero.
                     let handle_height = SMART_INPUT_RESIZE_HANDLE_HEIGHT;
                     let available_width = ui.available_width();
                     let handle_size = egui::vec2(available_width, handle_height);
@@ -22472,11 +22483,14 @@ impl AdeApp {
                             - SMART_INPUT_FOOTER_GAP
                             - line_height * 3.0)
                             .max(0.0);
-                        // Subtract delta because screen Y grows downward:
-                        // dragging up (negative delta) should increase footer height.
-                        let new_height = (smart_footer_height - delta)
-                            .max(SMART_INPUT_MIN_FOOTER_HEIGHT)
-                            .min(max_footer);
+                        // Safe minimum: base footer + full queue slot + draft margin
+                        let safe_min = (SMART_INPUT_BASE_FOOTER_HEIGHT
+                            + SMART_INPUT_MAX_VISIBLE_TASK_ROWS as f32
+                                * SMART_INPUT_TASK_ROW_HEIGHT
+                            + 60.0)
+                            .max(SMART_INPUT_MIN_FOOTER_HEIGHT);
+                        let new_height =
+                            (smart_footer_height - delta).max(safe_min).min(max_footer);
                         terminal.smart_input.user_height = Some(new_height);
                         terminal.smart_input.draft_user_height = None;
                         ui.ctx().request_repaint();
@@ -27189,8 +27203,6 @@ fn draw_smart_input_footer(
                 ui.add_space(6.0);
                 ui.label(RichText::new(status_text).small().color(status_color));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // Push buttons a bit left so they don’t hug the far-right edge
-                    ui.add_space(100.0);
                     let toggle_label = if state.expanded { "Hide" } else { "Show" };
                     if ui
                         .button(RichText::new(toggle_label).small())
@@ -27341,287 +27353,233 @@ fn draw_smart_input_footer(
                     });
             }
 
-            if state.expanded && !state.tasks.is_empty() {
-                // Budget up to ~35% of footer height for queue, leaving more room for the
-                // multiline input field when the footer is expanded.
-                let queue_budget = (footer_size.y * 0.35 - 30.0)
-                    .max(SMART_INPUT_MAX_VISIBLE_TASK_ROWS as f32 * SMART_INPUT_TASK_ROW_HEIGHT);
-                let max_height = queue_budget;
+            // Queue area: always allocate a fixed slot below the mode row so tasks
+            // are visible regardless of dynamic footer height calculations.
+            let queue_slot_height = if state.expanded {
+                SMART_INPUT_MAX_VISIBLE_TASK_ROWS as f32 * SMART_INPUT_TASK_ROW_HEIGHT + 4.0
+            } else {
+                0.0
+            };
+            if queue_slot_height > 0.0 {
+                let (queue_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), queue_slot_height),
+                    egui::Sense::hover(),
+                );
+                let mut queue_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(queue_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                queue_ui.set_clip_rect(queue_rect);
                 let mut row_action: Option<(u64, &'static str)> = None;
-                let scroll_output = egui::ScrollArea::vertical()
-                    .id_salt(("smart_input_queue", terminal_id))
-                    .max_height(max_height)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        for index in 0..state.tasks.len() {
-                            let task_id = state.tasks[index].id;
-                            let task_text = state.tasks[index].text.clone();
-                            let is_editing = state.editing_task_id == Some(task_id);
+                for index in 0..state.tasks.len().min(SMART_INPUT_MAX_VISIBLE_TASK_ROWS) {
+                    let task_id = state.tasks[index].id;
+                    let task_text = state.tasks[index].text.clone();
+                    let is_editing = state.editing_task_id == Some(task_id);
 
-                            let row_ui = ui.horizontal(|ui| {
-                                ui.set_min_height(SMART_INPUT_TASK_ROW_HEIGHT);
-                                ui.label(
-                                    RichText::new(format!("{}.", index + 1)).color(TEXT_MUTED),
-                                );
+                    let (row_rect, _) = queue_ui.allocate_exact_size(
+                        egui::vec2(queue_rect.width(), SMART_INPUT_TASK_ROW_HEIGHT),
+                        egui::Sense::hover(),
+                    );
+                    let mut row_ui = queue_ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(row_rect)
+                            .layout(egui::Layout::left_to_right(egui::Align::Min)),
+                    );
+                    row_ui.set_clip_rect(row_rect);
+                    // Paint a subtle row background so the queue area is visible even
+                    // when the task text is empty.
+                    if index % 2 == 0 {
+                        row_ui
+                            .painter()
+                            .rect_filled(row_rect, 0.0, Color32::from_rgb(28, 28, 30));
+                    }
 
-                                if is_editing {
-                                    let edit_id = AdeApp::smart_input_task_edit_input_id(
-                                        terminal_id,
-                                        task_id,
-                                    );
-                                    // Preserve selection before right-click collapses it
-                                    let secondary_pressed =
-                                        ui.ctx().input(|input| input.pointer.secondary_pressed());
-                                    let pre_click_range =
-                                        egui::text_edit::TextEditState::load(ui.ctx(), edit_id)
-                                            .and_then(|s| s.cursor.char_range())
-                                            .filter(|range| range.primary != range.secondary);
-                                    if secondary_pressed && pre_click_range.is_some() {
-                                        state.edit_context_menu_selection_range = pre_click_range;
-                                    }
-                                    let edit_response = with_settings_text_edit_chrome(ui, |ui| {
-                                        let text_width = (ui.available_width() - 80.0).max(80.0);
-                                        ui.add_sized(
-                                            egui::vec2(text_width, 22.0),
-                                            egui::TextEdit::singleline(&mut state.edit_draft)
-                                                .id(edit_id)
-                                                .hint_text("Edit queued task"),
-                                        )
-                                    });
-                                    // Determine effective selection for context menu
-                                    let post_show_range =
-                                        egui::text_edit::TextEditState::load(ui.ctx(), edit_id)
-                                            .and_then(|s| s.cursor.char_range())
-                                            .filter(|range| range.primary != range.secondary);
-                                    let effective_range = state
-                                        .edit_context_menu_selection_range
-                                        .or(post_show_range)
-                                        .filter(|range| range.primary != range.secondary);
-                                    edit_response.context_menu(|ui| {
-                                        with_minimal_button_chrome(ui, |ui| {
-                                            let has_selection = effective_range.is_some();
+                    row_ui.label(RichText::new(format!("{}.", index + 1)).color(TEXT_MUTED));
 
-                                            ui.add_enabled_ui(has_selection, |ui| {
-                                                if ui
-                                                    .button(format!("{} Copy", icons::COPY))
-                                                    .clicked()
-                                                {
-                                                    if let Some(range) = effective_range {
-                                                        let copied = extract_text_from_char_range(
-                                                            &state.edit_draft,
-                                                            Some(range),
-                                                        );
-                                                        if let Some(text) = copied {
-                                                            ui.ctx().copy_text(text);
-                                                        }
-                                                    }
-                                                    ui.close_menu();
-                                                }
-                                            });
-
-                                            if ui.button(format!("{} Paste", icons::PLUS)).clicked()
-                                            {
-                                                if let Ok(mut clipboard) = Clipboard::new() {
-                                                    if let Ok(text) = clipboard.get_text() {
-                                                        if let Some(range) = effective_range {
-                                                            let [start, end] = range.sorted();
-                                                            let mut new_draft = String::new();
-                                                            let mut chars =
-                                                                state.edit_draft.chars();
-                                                            for _ in 0..start.index {
-                                                                if let Some(ch) = chars.next() {
-                                                                    new_draft.push(ch);
-                                                                }
-                                                            }
-                                                            for _ in start.index..end.index {
-                                                                chars.next();
-                                                            }
-                                                            new_draft.push_str(&text);
-                                                            for ch in chars {
-                                                                new_draft.push(ch);
-                                                            }
-                                                            state.edit_draft = new_draft;
-                                                        } else {
-                                                            state.edit_draft.push_str(&text);
-                                                        }
-                                                    }
-                                                }
-                                                ui.close_menu();
+                    if is_editing {
+                        let edit_id = AdeApp::smart_input_task_edit_input_id(terminal_id, task_id);
+                        let secondary_pressed = row_ui
+                            .ctx()
+                            .input(|input| input.pointer.secondary_pressed());
+                        let pre_click_range =
+                            egui::text_edit::TextEditState::load(row_ui.ctx(), edit_id)
+                                .and_then(|s| s.cursor.char_range())
+                                .filter(|range| range.primary != range.secondary);
+                        if secondary_pressed && pre_click_range.is_some() {
+                            state.edit_context_menu_selection_range = pre_click_range;
+                        }
+                        let edit_response = with_settings_text_edit_chrome(&mut row_ui, |ui| {
+                            let text_width = (ui.available_width() - 80.0).max(80.0);
+                            ui.add_sized(
+                                egui::vec2(text_width, 22.0),
+                                egui::TextEdit::singleline(&mut state.edit_draft)
+                                    .id(edit_id)
+                                    .hint_text("Edit queued task"),
+                            )
+                        });
+                        let post_show_range =
+                            egui::text_edit::TextEditState::load(row_ui.ctx(), edit_id)
+                                .and_then(|s| s.cursor.char_range())
+                                .filter(|range| range.primary != range.secondary);
+                        let effective_range = state
+                            .edit_context_menu_selection_range
+                            .or(post_show_range)
+                            .filter(|range| range.primary != range.secondary);
+                        edit_response.context_menu(|ui| {
+                            with_minimal_button_chrome(ui, |ui| {
+                                let has_selection = effective_range.is_some();
+                                ui.add_enabled_ui(has_selection, |ui| {
+                                    if ui.button(format!("{} Copy", icons::COPY)).clicked() {
+                                        if let Some(range) = effective_range {
+                                            let copied = extract_text_from_char_range(
+                                                &state.edit_draft,
+                                                Some(range),
+                                            );
+                                            if let Some(text) = copied {
+                                                ui.ctx().copy_text(text);
                                             }
-                                        });
-                                    });
-                                    // Restore stored selection so it remains visible while menu is open
-                                    if let Some(stored_range) =
-                                        state.edit_context_menu_selection_range
-                                    {
-                                        if stored_range.primary != stored_range.secondary {
-                                            if let Some(mut text_state) =
-                                                egui::text_edit::TextEditState::load(
-                                                    ui.ctx(),
-                                                    edit_id,
-                                                )
-                                            {
-                                                text_state
-                                                    .cursor
-                                                    .set_char_range(Some(stored_range));
-                                                text_state.store(ui.ctx(), edit_id);
+                                        }
+                                        ui.close_menu();
+                                    }
+                                });
+                                if ui.button(format!("{} Paste", icons::PLUS)).clicked() {
+                                    if let Ok(mut clipboard) = Clipboard::new() {
+                                        if let Ok(text) = clipboard.get_text() {
+                                            if let Some(range) = effective_range {
+                                                let [start, end] = range.sorted();
+                                                let mut new_draft = String::new();
+                                                let mut chars = state.edit_draft.chars();
+                                                for _ in 0..start.index {
+                                                    if let Some(ch) = chars.next() {
+                                                        new_draft.push(ch);
+                                                    }
+                                                }
+                                                for _ in start.index..end.index {
+                                                    chars.next();
+                                                }
+                                                new_draft.push_str(&text);
+                                                for ch in chars {
+                                                    new_draft.push(ch);
+                                                }
+                                                state.edit_draft = new_draft;
+                                            } else {
+                                                state.edit_draft.push_str(&text);
                                             }
                                         }
                                     }
-                                    let _removed_edit = draw_smart_input_attachments(
-                                        ui,
-                                        &mut state.edit_attachments,
-                                    );
-                                    if styled_icon_button(
-                                        ui,
-                                        icons::CHECK_CIRCLE,
-                                        BTN_SUBTLE,
-                                        BTN_TEAL_HOVER,
-                                        BTN_ICON_ACTIVE,
-                                        "Save",
-                                    ) {
-                                        row_action = Some((task_id, "save"));
-                                    }
-                                    if styled_icon_button(
-                                        ui,
-                                        icons::X,
-                                        BTN_SUBTLE,
-                                        BTN_RED_HOVER,
-                                        Color32::from_rgb(170, 50, 50),
-                                        "Cancel",
-                                    ) {
-                                        row_action = Some((task_id, "cancel"));
-                                    }
-                                } else {
-                                    let is_dragging_this = state.dragging_task_id == Some(task_id);
-                                    let text_color = if is_dragging_this {
-                                        TEXT_MUTED
-                                    } else {
-                                        TEXT_PRIMARY
-                                    };
-
-                                    // Prompt text on the left
-                                    let preview = capped_hover_text(&task_text, 72);
-                                    let label_response = ui
-                                        .add(
-                                            egui::Label::new(
-                                                RichText::new(preview).color(text_color),
-                                            )
-                                            .truncate(),
-                                        )
-                                        .on_hover_text(capped_hover_text(
-                                            &task_text,
-                                            SMART_INPUT_TOOLTIP_MAX_CHARS,
-                                        ));
-                                    if label_response.clicked() {
-                                        ui.ctx().copy_text(task_text.clone());
-                                    }
-                                    let task_attachments = &mut state.tasks[index].attachments;
-                                    let _removed =
-                                        draw_smart_input_attachments(ui, task_attachments);
-
-                                    // Small fixed gap so buttons sit near text instead of far right
-                                    ui.add_space(8.0);
-
-                                    // Action buttons
-                                    if styled_icon_button(
-                                        ui,
-                                        icons::ARROW_RIGHT,
-                                        BTN_SUBTLE,
-                                        BTN_BLUE_HOVER,
-                                        BTN_ICON_ACTIVE,
-                                        "Send task now",
-                                    ) {
-                                        let atts = state.tasks[index].attachments.clone();
-                                        action.send_task_now = Some((task_id, atts));
-                                    }
-                                    if styled_icon_button(
-                                        ui,
-                                        icons::COPY,
-                                        BTN_SUBTLE,
-                                        BTN_BLUE_HOVER,
-                                        BTN_ICON_ACTIVE,
-                                        "Copy prompt",
-                                    ) {
-                                        ui.ctx().copy_text(task_text.clone());
-                                    }
-                                    if styled_icon_button(
-                                        ui,
-                                        icons::CODE,
-                                        BTN_SUBTLE,
-                                        BTN_TEAL_HOVER,
-                                        BTN_ICON_ACTIVE,
-                                        "Edit",
-                                    ) {
-                                        row_action = Some((task_id, "edit"));
-                                    }
-                                    if styled_icon_button(
-                                        ui,
-                                        icons::TRASH,
-                                        BTN_SUBTLE,
-                                        BTN_RED_HOVER,
-                                        Color32::from_rgb(170, 50, 50),
-                                        "Delete",
-                                    ) {
-                                        row_action = Some((task_id, "delete"));
-                                    }
+                                    ui.close_menu();
                                 }
                             });
-                            let row_rect = row_ui.response.rect;
-
-                            let drag_response = row_ui.response.interact(Sense::drag());
-
-                            if drag_response.drag_started() {
-                                state.dragging_task_id = Some(task_id);
-                            }
-
-                            // Drop target indicator
-                            if let Some(dragged_id) = state.dragging_task_id {
-                                if dragged_id != task_id {
-                                    if let Some(pointer_pos) =
-                                        ui.input(|i| i.pointer.interact_pos())
-                                    {
-                                        if row_rect.contains(pointer_pos) {
-                                            let is_above_center =
-                                                pointer_pos.y < row_rect.center().y;
-                                            let line_y = if is_above_center {
-                                                row_rect.top()
-                                            } else {
-                                                row_rect.bottom()
-                                            };
-                                            ui.painter().line_segment(
-                                                [
-                                                    egui::pos2(row_rect.left(), line_y),
-                                                    egui::pos2(row_rect.right(), line_y),
-                                                ],
-                                                Stroke::new(2.0, Color32::from_rgb(90, 185, 90)),
-                                            );
-                                            state.drag_hover_index = Some(if is_above_center {
-                                                index
-                                            } else {
-                                                index + 1
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-
-                            if drag_response.drag_stopped() {
-                                if let Some(dragged_id) = state.dragging_task_id.take() {
-                                    if let Some(target_idx) = state.drag_hover_index.take() {
-                                        let _ = state.reorder_task_to_index(dragged_id, target_idx);
-                                    }
+                        });
+                        if let Some(stored_range) = state.edit_context_menu_selection_range {
+                            if stored_range.primary != stored_range.secondary {
+                                if let Some(mut text_state) =
+                                    egui::text_edit::TextEditState::load(row_ui.ctx(), edit_id)
+                                {
+                                    text_state.cursor.set_char_range(Some(stored_range));
+                                    text_state.store(row_ui.ctx(), edit_id);
                                 }
                             }
                         }
-                    });
+                        let _removed_edit =
+                            draw_smart_input_attachments(&mut row_ui, &mut state.edit_attachments);
+                        if styled_icon_button(
+                            &mut row_ui,
+                            icons::CHECK_CIRCLE,
+                            BTN_SUBTLE,
+                            BTN_TEAL_HOVER,
+                            BTN_ICON_ACTIVE,
+                            "Save",
+                        ) {
+                            row_action = Some((task_id, "save"));
+                        }
+                        if styled_icon_button(
+                            &mut row_ui,
+                            icons::X,
+                            BTN_SUBTLE,
+                            BTN_RED_HOVER,
+                            Color32::from_rgb(170, 50, 50),
+                            "Cancel",
+                        ) {
+                            row_action = Some((task_id, "cancel"));
+                        }
+                    } else {
+                        let is_dragging_this = state.dragging_task_id == Some(task_id);
+                        let text_color = if is_dragging_this {
+                            TEXT_MUTED
+                        } else {
+                            TEXT_PRIMARY
+                        };
 
-                // Scroll to the bottom when a new task was just added so it is visible
-                if state.queue_scroll_to_end {
-                    let mut scroll_state = scroll_output.state;
-                    scroll_state.offset.y = f32::MAX;
-                    scroll_state.store(ui.ctx(), scroll_output.id);
-                    state.queue_scroll_to_end = false;
+                        let preview = if task_text.trim().is_empty() {
+                            "(Image attachment)".to_owned()
+                        } else {
+                            capped_hover_text(&task_text, 72)
+                        };
+                        let action_reserved = CONTROL_ROW_HEIGHT * 4.0 + 48.0;
+                        let text_width = (row_ui.available_width() - action_reserved).max(60.0);
+                        let label_response = row_ui
+                            .add_sized(
+                                egui::vec2(text_width, SMART_INPUT_TASK_ROW_HEIGHT),
+                                egui::Label::new(RichText::new(&preview).color(text_color))
+                                    .truncate(),
+                            )
+                            .on_hover_text(if task_text.trim().is_empty() {
+                                "Queued image attachment".to_owned()
+                            } else {
+                                capped_hover_text(&task_text, SMART_INPUT_TOOLTIP_MAX_CHARS)
+                            });
+                        if label_response.clicked() {
+                            row_ui.ctx().copy_text(task_text.clone());
+                        }
+                        let task_attachments = &mut state.tasks[index].attachments;
+                        let _removed = draw_smart_input_attachments(&mut row_ui, task_attachments);
+
+                        row_ui.add_space(8.0);
+
+                        if styled_icon_button(
+                            &mut row_ui,
+                            icons::ARROW_RIGHT,
+                            BTN_SUBTLE,
+                            BTN_BLUE_HOVER,
+                            BTN_ICON_ACTIVE,
+                            "Send task now",
+                        ) {
+                            let atts = state.tasks[index].attachments.clone();
+                            action.send_task_now = Some((task_id, atts));
+                        }
+                        if styled_icon_button(
+                            &mut row_ui,
+                            icons::COPY,
+                            BTN_SUBTLE,
+                            BTN_BLUE_HOVER,
+                            BTN_ICON_ACTIVE,
+                            "Copy prompt",
+                        ) {
+                            row_ui.ctx().copy_text(task_text.clone());
+                        }
+                        if styled_icon_button(
+                            &mut row_ui,
+                            icons::CODE,
+                            BTN_SUBTLE,
+                            BTN_TEAL_HOVER,
+                            BTN_ICON_ACTIVE,
+                            "Edit",
+                        ) {
+                            row_action = Some((task_id, "edit"));
+                        }
+                        if styled_icon_button(
+                            &mut row_ui,
+                            icons::TRASH,
+                            BTN_SUBTLE,
+                            BTN_RED_HOVER,
+                            Color32::from_rgb(170, 50, 50),
+                            "Delete",
+                        ) {
+                            row_action = Some((task_id, "delete"));
+                        }
+                    }
                 }
 
                 if let Some((task_id, row_action)) = row_action {
@@ -27638,8 +27596,6 @@ fn draw_smart_input_footer(
                         }
                         _ => {}
                     }
-                    // Restore focus to the appropriate Smart Input field
-                    // after queue edit actions so typing continues there.
                     match row_action {
                         "edit" => {
                             let edit_id =
@@ -27660,13 +27616,11 @@ fn draw_smart_input_footer(
                 );
             }
 
+            // Draft input: use a fixed height so it never grows/shrinks dynamically and
+            // crowds out the queue area above it.
             ui.horizontal(|ui| {
                 let draft_id = AdeApp::smart_input_draft_input_id(terminal_id);
-                let available_h = ui.available_height().max(80.0);
-                let input_height = state
-                    .draft_user_height
-                    .unwrap_or(available_h)
-                    .clamp(40.0, available_h);
+                let input_height = 80.0f32;
                 let input_width = (ui.available_width() - 92.0).max(120.0);
                 // Preserve selection before right-click collapses it
                 let secondary_pressed = ui.ctx().input(|input| input.pointer.secondary_pressed());
@@ -27794,8 +27748,8 @@ fn draw_smart_input_footer(
                 });
 
                 // Draggable resize grip at the bottom-right of the draft text area.
-                // Positioned explicitly relative to the TextEdit rect so it stays
-                // anchored to the text corner instead of drifting to the panel edge.
+                // Dragging is allowed again but clamped to a safe minimum so the queue
+                // and draft input are never crushed.
                 let grip_size = 12.0;
                 let grip_rect = egui::Rect::from_min_size(
                     egui::pos2(
@@ -27834,9 +27788,11 @@ fn draw_smart_input_footer(
                         - SMART_INPUT_FOOTER_GAP
                         - line_height * 3.0)
                         .max(0.0);
-                    let new_height = (footer_size.y + delta)
-                        .max(SMART_INPUT_MIN_FOOTER_HEIGHT)
-                        .min(max_footer);
+                    let safe_min = (SMART_INPUT_BASE_FOOTER_HEIGHT
+                        + SMART_INPUT_MAX_VISIBLE_TASK_ROWS as f32 * SMART_INPUT_TASK_ROW_HEIGHT
+                        + 60.0)
+                        .max(SMART_INPUT_MIN_FOOTER_HEIGHT);
+                    let new_height = (footer_size.y + delta).max(safe_min).min(max_footer);
                     state.user_height = Some(new_height);
                     state.draft_user_height = None;
                     ui.ctx().request_repaint();
@@ -53392,7 +53348,7 @@ mod tests {
         let height = AdeApp::smart_input_footer_height(terminal, 400.0, 18.0);
         assert!(
             height >= 156.0,
-            "expanded empty queue footer should be at least base height (156), got {}",
+            "footer should be at least base height (156), got {}",
             height
         );
     }
@@ -53410,53 +53366,72 @@ mod tests {
     }
 
     #[test]
-    fn smart_input_footer_user_height_takes_precedence_over_draft_height() {
+    fn smart_input_footer_user_height_clamped_to_safe_min_when_tasks_exist() {
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
         seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
         let terminal = app.terminals.get_mut(&1).expect("terminal 1");
-        terminal.smart_input.draft_user_height = Some(50.0);
-        terminal.smart_input.user_height = Some(200.0);
+        terminal.smart_input.draft = "task".to_owned();
+        terminal.smart_input.enqueue_draft();
+        terminal.smart_input.user_height = Some(150.0);
 
         let height = AdeApp::smart_input_footer_height(terminal, 400.0, 18.0);
-        assert_eq!(
-            height, 200.0,
-            "user_height must take precedence over draft_user_height"
+        // With 1 task row, safe_min = 156 + 28 + 60 = 244, so user_height=150
+        // must be clamped upward to safe_min.
+        assert!(
+            height >= 244.0,
+            "footer height with queued task must be clamped to safe_min (>=244), got {}",
+            height
         );
     }
 
     #[test]
-    fn smart_input_footer_grip_drag_respects_max_and_min() {
-        let pane_height = 400.0;
-        let line_height = 18.0;
-        let max_footer = (pane_height
-            - super::TERMINAL_HEADER_HEIGHT
-            - super::TERMINAL_HEADER_GAP
-            - super::SMART_INPUT_FOOTER_GAP
-            - line_height * 3.0)
-            .max(0.0);
+    fn smart_input_queue_slot_is_visible_when_tasks_exist() {
+        use egui::{Context, RawInput};
 
-        // Dragging down 50px from 150 should increase to 200
-        let current: f32 = 150.0;
-        let delta: f32 = 50.0;
-        let new_height = (current + delta)
-            .max(super::SMART_INPUT_MIN_FOOTER_HEIGHT)
-            .min(max_footer);
-        assert_eq!(new_height, 200.0);
+        let ctx = Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
 
-        // Dragging up 100px from 150 should decrease to 50, but clamped to min
-        let delta: f32 = -100.0;
-        let new_height = (current + delta)
-            .max(super::SMART_INPUT_MIN_FOOTER_HEIGHT)
-            .min(max_footer);
-        assert_eq!(new_height, super::SMART_INPUT_MIN_FOOTER_HEIGHT);
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.smart_input.draft = "task one".to_owned();
+            terminal.smart_input.enqueue_draft();
+        }
 
-        // Dragging down from near max should clamp to max
-        let current: f32 = max_footer - 10.0;
-        let delta: f32 = 50.0;
-        let new_height = (current + delta)
-            .max(super::SMART_INPUT_MIN_FOOTER_HEIGHT)
-            .min(max_footer);
-        assert_eq!(new_height, max_footer);
+        let mut raw_input = RawInput::default();
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(400.0, 400.0),
+        ));
+        let output = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let footer_size = egui::vec2(400.0, 180.0);
+                let pane_height = 400.0;
+                let line_height = 18.0;
+                let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+                let _ = super::draw_smart_input_footer(
+                    ui,
+                    terminal,
+                    footer_size,
+                    pane_height,
+                    line_height,
+                );
+            });
+        });
+
+        // The queue row should produce at least one text shape containing the task text.
+        let task_text_found = output.shapes.iter().any(|shape| {
+            if let egui::epaint::Shape::Text(t) = &shape.shape {
+                t.galley.text().contains("task one")
+            } else {
+                false
+            }
+        });
+        assert!(
+            task_text_found,
+            "queued task 'task one' must be visible as a text shape in the footer"
+        );
     }
 
     #[test]
@@ -53517,6 +53492,59 @@ mod tests {
             max_grip_x < 350.0,
             "grip must sit near the TextEdit bottom-right (expected < 350), not drift to panel edge (got {})",
             max_grip_x
+        );
+    }
+
+    #[test]
+    fn smart_input_queue_row_does_not_expand_past_footer_width() {
+        // Regression test: a very long queued task must be truncated so the row
+        // stays within the footer width and action buttons remain visible.
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.smart_input.draft = "a".repeat(500);
+            terminal.smart_input.enqueue_draft();
+        }
+
+        let mut raw_input = RawInput::default();
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(400.0, 400.0),
+        ));
+        let output = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let footer_size = egui::vec2(400.0, 180.0);
+                let pane_height = 400.0;
+                let line_height = 18.0;
+                let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+                let _ = super::draw_smart_input_footer(
+                    ui,
+                    terminal,
+                    footer_size,
+                    pane_height,
+                    line_height,
+                );
+            });
+        });
+
+        // No text shape in the footer should exceed the 400px footer width.
+        let mut max_text_x = 0.0f32;
+        for shape in &output.shapes {
+            if let egui::epaint::Shape::Text(t) = &shape.shape {
+                let abs_max_x = t.pos.x + t.galley.rect.max.x;
+                max_text_x = max_text_x.max(abs_max_x);
+            }
+        }
+        assert!(
+            max_text_x <= 400.0,
+            "long queued task must be truncated; no text should exceed footer width (400), got max_text_x={}",
+            max_text_x
         );
     }
 

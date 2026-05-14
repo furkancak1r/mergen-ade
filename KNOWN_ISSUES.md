@@ -920,3 +920,33 @@
     - `embedded_browser_yields_to_ui_overlay_layers` updated with new parameter and test case for checklist floating open.
 - Files/Commands touched: `src/app.rs`, `src/models.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo check`, `cargo fmt`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User request 2026-05-14
+
+---
+
+#### Smart Input queued items invisible because queue row expanded past footer width {#smart-input-queue-row-overflow}
+- Date: 2026-05-14
+- Context: User reported that queued tasks added to Smart Input were not visible; the footer height changed (items were being added) but the content seemed to stretch to the right and disappear.
+- Error signature: `draw_smart_input_footer` drew queue rows inside a `ScrollArea::vertical` without capping the inner content width. A single long prompt caused the ScrollArea content width to expand, pushing action buttons (Send/Copy/Edit/Delete) far outside the visible viewport.
+- Symptoms/Impact:
+  1. Long queued tasks made the row extend horizontally beyond the footer boundary.
+  2. Action buttons became invisible because they were positioned off-screen to the right.
+  3. Users could not see or interact with queued items.
+- Root cause:
+  - `ScrollArea::vertical` inner `ui` did not have a finite `max_width`, so wide content widened the scrollable area.
+  - `Label::truncate()` inside `ui.horizontal` relied on `available_width`, which was unbounded in this context.
+  - Action buttons were placed after the label and were carried along with the expanding row.
+- Resolution:
+  - Inside `ScrollArea::show`, capture `queue_width = ui.available_width()` and call `ui.set_max_width(queue_width)` and `ui.set_min_width(queue_width)` to lock the scrollable content width to the viewport.
+  - Inside each row `ui.horizontal`, also call `ui.set_max_width(queue_width)` to enforce the bound.
+  - For the prompt label, switch from `ui.add(Label::truncate())` to `ui.add_sized(..., Label::truncate())` with an explicit width that reserves space for action buttons (`available_width - action_reserved`).
+  - When a queued task has empty text but contains image attachments, render a visible placeholder label "(Image attachment)" so the row is never blank.
+  - **v2 fix**: Replaced the dynamic `ScrollArea` queue with a fixed-height slot (`allocate_exact_size`) that always reserves space for up to 3 task rows. Added alternating row backgrounds so the queue area is visible even with empty text. Made the Smart Input footer height fixed (`SMART_INPUT_BASE_FOOTER_HEIGHT`) and ignored `user_height`/`draft_user_height`. Disabled both resize grips (footer handle and draft grip) by removing their drag logic so they are visual-only.
+  - **v3 fix**: Restored footer and draft resize handles with active drag logic, but clamped to a `safe_min` that guarantees queue slot + draft input fit. Footer height is now dynamic again but bounded: `user_height` is clamped upward to `safe_min` (base + task_rows * row_height + margin) and downward to `max_footer`. Queue row layout changed from `Align::Center` to `Align::Min` so task text is left-aligned. Header control buttons no longer have a 100px spacer pushing them right.
+- Prevent recurrence:
+  - Regression tests added:
+    - `smart_input_queue_row_does_not_expand_past_footer_width` — renders the footer with a 500-char queued task inside a 400px-wide viewport and asserts that no text shape exceeds the footer width.
+    - `smart_input_queue_slot_is_visible_when_tasks_exist` — renders the footer with a queued task and asserts the task text appears as a text shape.
+    - `smart_input_footer_user_height_clamped_to_safe_min_when_tasks_exist` — asserts that `user_height` below the safe minimum is clamped upward so the queue slot is not crushed.
+  - Added AGENTS.md guidelines: "Queue rows must cap content width...", "Smart Input queue area must use a fixed slot...", "Smart Input footer height must clamp to a safe minimum so queue and draft always fit...", "Footer height is user-resizable via a drag handle...", "Draft text area resize grip resizes the overall footer..."
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-14
