@@ -400,6 +400,7 @@ enum AppIcon {
     Eye,
     EyeOff,
     Folder,
+    Pencil,
     FolderOpen,
     FolderPlus,
     Gear,
@@ -425,7 +426,7 @@ enum AppIcon {
 }
 
 impl AppIcon {
-    const ALL: [Self; 35] = [
+    const ALL: [Self; 36] = [
         Self::ArrowClockwise,
         Self::ArrowLeft,
         Self::ArrowRight,
@@ -439,6 +440,7 @@ impl AppIcon {
         Self::Eye,
         Self::EyeOff,
         Self::Folder,
+        Self::Pencil,
         Self::FolderOpen,
         Self::FolderPlus,
         Self::Gear,
@@ -478,6 +480,7 @@ impl AppIcon {
             Self::Eye => "eye",
             Self::EyeOff => "eye-off",
             Self::Folder => "folder",
+            Self::Pencil => "pencil",
             Self::FolderOpen => "folder-open",
             Self::FolderPlus => "folder-plus",
             Self::Gear => "settings",
@@ -548,6 +551,7 @@ mod icons {
     pub const EYE: AppIcon = AppIcon::Eye;
     pub const EYE_OFF: AppIcon = AppIcon::EyeOff;
     pub const FOLDER: AppIcon = AppIcon::Folder;
+    pub const PENCIL: AppIcon = AppIcon::Pencil;
     pub const FOLDER_OPEN: AppIcon = AppIcon::FolderOpen;
     pub const FOLDER_PLUS: AppIcon = AppIcon::FolderPlus;
     pub const GEAR: AppIcon = AppIcon::Gear;
@@ -1859,7 +1863,7 @@ pub struct AdeApp {
     terminal_history_popup_open: Option<u64>,
     /// Tracks whether the history popup was just opened this frame (to prevent immediate close)
     terminal_history_popup_just_opened: bool,
-    /// Collapse/expand state per project in the Check-list panel (persisted implicitly via egui storage)
+    /// Collapse/expand state per project in the Check-list panel (runtime-only, not persisted across restarts)
     checklist_collapsed_by_project: BTreeMap<u64, bool>,
     /// File editor state (runtime only, not persisted)
     file_editor: FileEditorState,
@@ -7644,7 +7648,7 @@ impl AdeApp {
                 let (transport_status, reason_hint) = match event_kind {
                     "working" => (OpenCodeTransportStatus::Working, None),
                     "idle" | "session.idle" | "session_idle" | "session-idle" | "turn-complete"
-                    | "turn_complete" | "turn-complete" => (
+                    | "turn_complete" => (
                         OpenCodeTransportStatus::Idle,
                         Some(OpenCodeAttentionReason::TurnComplete),
                     ),
@@ -17023,29 +17027,12 @@ impl AdeApp {
                 self.note_ui_config_changed();
             }
 
-            // Overlay to soften egui's default bright white resize handle on the panel edge.
-            let explorer_rect = response.response.rect;
-            let resize_x = explorer_rect.max.x - 1.0;
-            let pointer = ctx.input(|i| i.pointer.hover_pos());
-            let near_resize = pointer.map_or(false, |p| {
-                (p.x - resize_x).abs() < 6.0 && explorer_rect.y_range().contains(p.y)
-            });
-            let color = if near_resize {
-                Color32::from_rgb(80, 80, 80) // slightly brighter on hover, still dim
-            } else {
-                Color32::from_rgb(45, 45, 45) // very dim separator
-            };
-            if !ctx.memory(|m| m.any_popup_open()) {
-                ctx.layer_painter(egui::LayerId::new(
-                    egui::Order::Foreground,
-                    egui::Id::new("project-explorer-resize-overlay"),
-                ))
-                .vline(
-                    resize_x,
-                    explorer_rect.y_range(),
-                    egui::Stroke::new(1.0, color),
-                );
-            }
+            paint_panel_resize_overlay(
+                ctx,
+                response.response.rect,
+                PanelResizeSide::Left,
+                "project-explorer",
+            );
 
             Some(response.response.rect)
         } else {
@@ -17407,6 +17394,8 @@ impl AdeApp {
                             let wt_project_id = wt.id;
                             let wt_path_str = wt.path.display().to_string();
                             let is_selected = self.selected_project == Some(wt_project_id);
+                            let wt_has_live_terminal =
+                                self.terminal_count_live_for_project_kind(wt_project_id, visible_kind) > 0;
                             let wt_diff_summary = terminal_manager_diff_summary_model(
                                 self.source_control_state.get(&wt_project_id),
                             );
@@ -17416,6 +17405,7 @@ impl AdeApp {
                                     ui,
                                     wt_name,
                                     is_selected,
+                                    wt_has_live_terminal,
                                     &wt_path_str,
                                     &foreground_launchers,
                                     visible_kind,
@@ -18677,81 +18667,132 @@ impl AdeApp {
                             });
                         } else {
                             for (project_id, project_name, checklist) in projects_with_checklist {
-                                // Project header with count
+                                let collapsed = self.checklist_collapsed_by_project.get(&project_id).copied().unwrap_or(false);
                                 ui.add_space(8.0);
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(format!("{} {}", icons::FOLDER_OPEN, project_name))
-                                            .strong()
-                                            .color(TEXT_PRIMARY),
-                                    );
-                                    ui.label(
-                                        RichText::new(format!("({})", checklist.len()))
-                                            .small()
-                                            .color(TEXT_MUTED),
-                                    );
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
+
+                                // Accordion header row
+                                let row_width = ui.available_width();
+                                let row_height = ui.spacing().interact_size.y.max(CONTROL_ROW_HEIGHT);
+                                let (_, row_rect) = ui.allocate_space(egui::vec2(row_width, row_height));
+
+                                let copy_button_width = CONTROL_ROW_HEIGHT;
+                                let body_width = (row_rect.width() - copy_button_width).max(0.0);
+                                let body_rect = egui::Rect::from_min_size(
+                                    row_rect.min,
+                                    egui::vec2(body_width, row_height),
+                                );
+                                let body_response = ui.interact(
+                                    body_rect,
+                                    ui.id().with(("checklist_header_body", project_id)),
+                                    Sense::click(),
+                                )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                                // Copy button on the right
+                                let copy_rect = egui::Rect::from_min_size(
+                                    egui::pos2(row_rect.right() - copy_button_width, row_rect.top()),
+                                    egui::vec2(copy_button_width, row_height),
+                                );
+                                let mut copy_clicked = false;
+                                ui.scope_builder(
+                                    egui::UiBuilder::new()
+                                        .max_rect(copy_rect)
+                                        .layout(Layout::right_to_left(Align::Center)),
+                                    |ui| {
+                                        if styled_icon_button(
+                                            ui,
+                                            icons::COPY,
+                                            BTN_ICON,
+                                            BTN_ICON_HOVER,
+                                            BTN_ICON_ACTIVE,
+                                            "Copy all checklist items",
+                                        ) {
+                                            copy_clicked = true;
+                                        }
+                                    },
+                                );
+
+                                // Header label
+                                if body_rect.width() > 0.0 && ui.is_rect_visible(body_rect) {
+                                    ui.scope_builder(
+                                        egui::UiBuilder::new()
+                                            .max_rect(body_rect)
+                                            .layout(Layout::left_to_right(Align::Center)),
                                         |ui| {
-                                            if styled_icon_button(
-                                                ui,
-                                                icons::COPY,
-                                                BTN_ICON,
-                                                BTN_ICON_HOVER,
-                                                BTN_ICON_ACTIVE,
-                                                "Copy all checklist items",
-                                            ) {
-                                                let text = Self::format_checklist_for_clipboard(&checklist);
-                                                ctx.copy_text(text);
-                                                self.show_status_feedback(
-                                                    ctx,
-                                                    &format!(
-                                                        "Copied {} checklist items",
-                                                        checklist.len()
-                                                    ),
-                                                );
-                                            }
+                                            let arrow = if collapsed { "▸" } else { "▾" };
+                                            let folder_icon = if collapsed { icons::FOLDER } else { icons::FOLDER_OPEN };
+                                            ui.label(
+                                                RichText::new(format!("{} {}", arrow, folder_icon))
+                                                    .color(TEXT_PRIMARY),
+                                            );
+                                            ui.add_space(4.0);
+                                            ui.label(
+                                                RichText::new(&project_name)
+                                                    .strong()
+                                                    .color(TEXT_PRIMARY),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!("({})", checklist.len()))
+                                                    .small()
+                                                    .color(TEXT_MUTED),
+                                            );
                                         },
                                     );
-                                });
-                                ui.add_space(4.0);
+                                }
 
-                                // Checklist items for this project
-                                ui.indent(Id::new(("checklist-items", project_id)), |ui| {
-                                    for (idx, message) in checklist.iter().enumerate() {
-                                        ui.horizontal_top(|ui| {
-                                            // Checkbox to uncheck item
-                                            let mut checked = true;
-                                            if ui.checkbox(&mut checked, "").changed() {
-                                            if let Some(p) = self.projects.get_mut(&project_id) {
-                                                p.checklist.retain(|m| m != message);
-                                                self.note_projects_changed();
-                                                self.persist_config();
-                                            }
-                                            }
+                                if body_response.clicked() {
+                                    let new_state = !collapsed;
+                                    self.checklist_collapsed_by_project.insert(project_id, new_state);
+                                }
 
-                                            // Clickable message label with scroll clamp
-                                            let msg_response = draw_clamped_scrollable_label(
-                                                ui,
-                                                message,
-                                                TEXT_PRIMARY,
-                                                12.0,
-                                                CHECKLIST_MESSAGE_MAX_HEIGHT,
-                                                egui::Sense::click(),
-                                                ("checklist_msg", idx),
-                                            )
-                                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                            .on_hover_text("Click to copy");
-                                            if msg_response.clicked() {
-                                                ctx.copy_text(message.to_string());
-                                                self.show_status_feedback(ctx, "Copied message");
+                                if copy_clicked {
+                                    let text = Self::format_checklist_for_clipboard(&checklist);
+                                    ctx.copy_text(text.clone());
+                                    self.show_status_feedback(
+                                        ctx,
+                                        &format!("Copied {} checklist items", checklist.len()),
+                                    );
+                                }
+
+                                // Checklist items for this project (only when expanded)
+                                if !collapsed {
+                                    ui.add_space(4.0);
+                                    ui.indent(Id::new(("checklist-items", project_id)), |ui| {
+                                        for (idx, message) in checklist.iter().enumerate() {
+                                            ui.horizontal_top(|ui| {
+                                                // Checkbox to uncheck item
+                                                let mut checked = true;
+                                                if ui.checkbox(&mut checked, "").changed() {
+                                                    if let Some(p) = self.projects.get_mut(&project_id) {
+                                                        p.checklist.retain(|m| m != message);
+                                                        self.note_projects_changed();
+                                                        self.persist_config();
+                                                    }
+                                                }
+
+                                                // Clickable message label with scroll clamp
+                                                let msg_response = draw_clamped_scrollable_label(
+                                                    ui,
+                                                    message,
+                                                    TEXT_PRIMARY,
+                                                    12.0,
+                                                    CHECKLIST_MESSAGE_MAX_HEIGHT,
+                                                    egui::Sense::click(),
+                                                    ("checklist_msg", idx),
+                                                )
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                .on_hover_text("Click to copy");
+                                                if msg_response.clicked() {
+                                                    ctx.copy_text(message.to_string());
+                                                    self.show_status_feedback(ctx, "Copied message");
+                                                }
+                                            });
+                                            if idx < checklist.len().saturating_sub(1) {
+                                                ui.add_space(2.0);
                                             }
-                                        });
-                                        if idx < checklist.len().saturating_sub(1) {
-                                            ui.add_space(2.0);
                                         }
-                                    }
-                                });
+                                    });
+                                }
                                 ui.add_space(8.0);
                             }
                         }
@@ -18763,6 +18804,13 @@ impl AdeApp {
             self.config.ui.checklist_panel_width = actual_width;
             self.note_ui_config_changed();
         }
+
+        paint_panel_resize_overlay(
+            ctx,
+            response.response.rect,
+            PanelResizeSide::Right,
+            "checklist-panel",
+        );
 
         Some(response.response.rect)
     }
@@ -20518,6 +20566,32 @@ impl AdeApp {
         }
     }
 
+    /// Returns the current known URL for a browser scope.
+    /// For project scopes: active tab URL, falling back to persisted project URL.
+    /// For terminal scopes: active tab URL only (project URL is not persisted for terminal scopes).
+    fn current_browser_url_for_scope(&self, scope: impl Into<BrowserScopeKey>) -> Option<String> {
+        let scope = scope.into();
+        if let Some(active_tab_id) = self.active_browser_tab_id(scope) {
+            if let Some(tabs) = self.browser_tabs_by_scope.get(&scope) {
+                if let Some(url) = tabs
+                    .iter()
+                    .find(|tab| tab.id == active_tab_id)
+                    .and_then(|tab| tab.url.clone())
+                {
+                    return Some(url);
+                }
+            }
+        }
+        // For project scopes only, fall back to persisted browser_last_url
+        if !scope.is_terminal() {
+            return self
+                .projects
+                .get(&scope.project_id())
+                .and_then(|project| project.browser_last_url.clone());
+        }
+        None
+    }
+
     fn forward_design_inspect_click_to_terminal(
         &mut self,
         ctx: &egui::Context,
@@ -20532,12 +20606,10 @@ impl AdeApp {
             return;
         }
 
-        if self.projects.get(&project_id).is_some_and(|project| {
-            project
-                .browser_last_url
-                .as_ref()
-                .is_some_and(|url| !design_inspect_matches_current_page(url, &element))
-        }) {
+        if self
+            .current_browser_url_for_scope(scope)
+            .is_some_and(|url| !design_inspect_matches_current_page(&url, &element))
+        {
             return;
         }
 
@@ -21354,11 +21426,7 @@ impl AdeApp {
                         } else {
                             "Design Inspect: OFF (click to enable)"
                         };
-                        let inspect_icon = if design_inspect_enabled {
-                            icons::EYE
-                        } else {
-                            icons::EYE_OFF
-                        };
+                        let inspect_icon = icons::PENCIL;
                         let inspect_response = browser_toolbar_toggle_button(
                             ui,
                             design_inspect_enabled,
@@ -21503,6 +21571,13 @@ impl AdeApp {
             self.config.ui.browser_panel_width = actual_width;
             self.note_ui_config_changed();
         }
+
+        paint_panel_resize_overlay(
+            ctx,
+            response.response.rect,
+            PanelResizeSide::Right,
+            "browser-panel",
+        );
 
         Some(response.response.rect)
     }
@@ -23657,6 +23732,46 @@ impl eframe::App for AdeApp {
 
         self.persist_config();
         self.persist_history();
+    }
+}
+
+/// Which edge of a panel the resize overlay should align to.
+enum PanelResizeSide {
+    Left,
+    Right,
+}
+
+/// Paint a dim resize overlay on the panel edge to override egui's default bright white
+/// separator (`fg_stroke`) with a theme-consistent dark color.
+fn paint_panel_resize_overlay(
+    ctx: &egui::Context,
+    panel_rect: egui::Rect,
+    side: PanelResizeSide,
+    id_suffix: &str,
+) {
+    let resize_x = match side {
+        PanelResizeSide::Left => panel_rect.max.x - 1.0,
+        PanelResizeSide::Right => panel_rect.min.x,
+    };
+    let pointer = ctx.input(|i| i.pointer.hover_pos());
+    let near_resize = pointer.map_or(false, |p| {
+        (p.x - resize_x).abs() < 6.0 && panel_rect.y_range().contains(p.y)
+    });
+    let color = if near_resize {
+        Color32::from_rgb(80, 80, 80) // slightly brighter on hover, still dim
+    } else {
+        Color32::from_rgb(45, 45, 45) // very dim separator
+    };
+    if !ctx.memory(|m| m.any_popup_open()) {
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new(format!("{}-resize-overlay", id_suffix)),
+        ))
+        .vline(
+            resize_x,
+            panel_rect.y_range(),
+            egui::Stroke::new(1.0, color),
+        );
     }
 }
 
@@ -26125,11 +26240,20 @@ fn draw_source_control_worktree_row(
 /// Draw a worktree row inside the Terminal Manager under its parent project (BOM-style tree).
 /// `action_kind` determines whether the row shows a foreground launcher menu or a background
 /// spawn button, matching the active Terminal Manager filter.
+fn worktree_row_text_color(is_selected: bool, has_live_terminal: bool) -> Color32 {
+    if is_selected && has_live_terminal {
+        TEXT_PRIMARY
+    } else {
+        with_alpha(ACCENT, 200)
+    }
+}
+
 fn draw_terminal_manager_worktree_row(
     app: &mut AdeApp,
     ui: &mut Ui,
     label: &str,
     is_selected: bool,
+    has_live_terminal: bool,
     tooltip: &str,
     foreground_launchers: &[LauncherEntry],
     action_kind: TerminalKind,
@@ -26149,11 +26273,7 @@ fn draw_terminal_manager_worktree_row(
         wrap_width,
         egui::TextStyle::Body,
     );
-    let text_color = if is_selected {
-        TEXT_PRIMARY
-    } else {
-        with_alpha(ACCENT, 200)
-    };
+    let text_color = worktree_row_text_color(is_selected, has_live_terminal);
     let desired_height = sidebar_row_desired_height(ui, galley.size().y, button_padding);
     let desired_size = egui::vec2(available_width, desired_height);
     let (rect, _response) = ui.allocate_exact_size(desired_size, Sense::hover());
@@ -26381,7 +26501,8 @@ fn capped_hover_text(text: &str, max_chars: usize) -> String {
 
 /// Draws a wrapped text label vertically clamped to `max_height`.
 /// If the wrapped text exceeds `max_height`, a vertical scrollbar appears.
-/// Returns the response of the inner label for click sensing.
+/// Returns a response anchored to the visible clamped area so that tooltips
+/// and click sensing use the on-screen viewport rather than the full content rect.
 fn draw_clamped_scrollable_label(
     ui: &mut Ui,
     text: &str,
@@ -26391,7 +26512,7 @@ fn draw_clamped_scrollable_label(
     sense: egui::Sense,
     id_salt: impl std::hash::Hash,
 ) -> egui::Response {
-    egui::ScrollArea::vertical()
+    let output = egui::ScrollArea::vertical()
         .id_salt(ui.id().with(id_salt))
         .max_height(max_height)
         .auto_shrink([false, true])
@@ -26401,8 +26522,22 @@ fn draw_clamped_scrollable_label(
                     .wrap()
                     .sense(sense),
             )
-        })
-        .inner
+        });
+
+    // The inner Label's response spans the full unclamped content rect.
+    // Patch it so that tooltip positioning and click sensing anchor to
+    // the visible ScrollArea viewport instead of the off-screen content.
+    // `output.inner_rect` is the initial allocated rect; apply auto-shrink
+    // by clamping height to the actual content size.
+    let visible_height = output.inner_rect.height().min(output.content_size.y);
+    let visible_rect = egui::Rect::from_min_size(
+        output.inner_rect.min,
+        egui::vec2(output.inner_rect.width(), visible_height),
+    );
+    let mut response = output.inner;
+    response.rect = visible_rect;
+    response.interact_rect = ui.clip_rect().intersect(visible_rect);
+    response
 }
 
 #[allow(dead_code)]
@@ -27600,49 +27735,54 @@ fn draw_smart_input_footer(
                     }
                 });
 
-                // Draggable resize grip at the bottom-right of the draft row.
-                // This resizes the overall Smart Input footer so the draft area can grow.
-                ui.with_layout(Layout::bottom_up(Align::Max), |ui| {
-                    let grip_size = 12.0;
-                    let grip_response =
-                        ui.allocate_response(egui::vec2(grip_size, grip_size), Sense::drag());
-                    let grip_rect = grip_response.rect;
-                    let grip_color = if grip_response.hovered() || grip_response.dragged() {
-                        Color32::from_rgb(160, 160, 160)
-                    } else {
-                        Color32::from_rgb(100, 100, 100)
-                    };
-                    let x0 = grip_rect.left() + 3.0;
-                    let y0 = grip_rect.top() + 3.0;
-                    let x1 = grip_rect.right() - 3.0;
-                    let y1 = grip_rect.bottom() - 3.0;
-                    ui.painter().line_segment(
-                        [egui::pos2(x0, y1), egui::pos2(x1, y0)],
-                        Stroke::new(1.5, grip_color),
-                    );
-                    ui.painter().line_segment(
-                        [egui::pos2(x0 + 3.0, y1), egui::pos2(x1, y0 + 3.0)],
-                        Stroke::new(1.5, grip_color),
-                    );
-                    if grip_response.hovered() || grip_response.dragged() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
-                    }
-                    if grip_response.dragged() {
-                        let delta = ui.ctx().input(|i| i.pointer.delta().y);
-                        let max_footer = (pane_height
-                            - TERMINAL_HEADER_HEIGHT
-                            - TERMINAL_HEADER_GAP
-                            - SMART_INPUT_FOOTER_GAP
-                            - line_height * 3.0)
-                            .max(0.0);
-                        let new_height = (footer_size.y + delta)
-                            .max(SMART_INPUT_MIN_FOOTER_HEIGHT)
-                            .min(max_footer);
-                        state.user_height = Some(new_height);
-                        state.draft_user_height = None;
-                        ui.ctx().request_repaint();
-                    }
-                });
+                // Draggable resize grip at the bottom-right of the draft text area.
+                // Positioned explicitly relative to the TextEdit rect so it stays
+                // anchored to the text corner instead of drifting to the panel edge.
+                let grip_size = 12.0;
+                let grip_rect = egui::Rect::from_min_size(
+                    egui::pos2(
+                        draft_response.rect.right() - grip_size,
+                        draft_response.rect.bottom() - grip_size,
+                    ),
+                    egui::vec2(grip_size, grip_size),
+                );
+                let grip_response =
+                    ui.interact(grip_rect, ui.id().with("draft_resize"), Sense::drag());
+                let grip_color = if grip_response.hovered() || grip_response.dragged() {
+                    Color32::from_rgb(160, 160, 160)
+                } else {
+                    Color32::from_rgb(100, 100, 100)
+                };
+                let x0 = grip_rect.left() + 3.0;
+                let y0 = grip_rect.top() + 3.0;
+                let x1 = grip_rect.right() - 3.0;
+                let y1 = grip_rect.bottom() - 3.0;
+                ui.painter().line_segment(
+                    [egui::pos2(x0, y1), egui::pos2(x1, y0)],
+                    Stroke::new(1.5, grip_color),
+                );
+                ui.painter().line_segment(
+                    [egui::pos2(x0 + 3.0, y1), egui::pos2(x1, y0 + 3.0)],
+                    Stroke::new(1.5, grip_color),
+                );
+                if grip_response.hovered() || grip_response.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                }
+                if grip_response.dragged() {
+                    let delta = ui.ctx().input(|i| i.pointer.delta().y);
+                    let max_footer = (pane_height
+                        - TERMINAL_HEADER_HEIGHT
+                        - TERMINAL_HEADER_GAP
+                        - SMART_INPUT_FOOTER_GAP
+                        - line_height * 3.0)
+                        .max(0.0);
+                    let new_height = (footer_size.y + delta)
+                        .max(SMART_INPUT_MIN_FOOTER_HEIGHT)
+                        .min(max_footer);
+                    state.user_height = Some(new_height);
+                    state.draft_user_height = None;
+                    ui.ctx().request_repaint();
+                }
             });
 
             // Clear stored context menu selections when menu closes
@@ -28569,12 +28709,24 @@ fn draw_launcher_menu_contents(
 ) -> Option<String> {
     let mut selected_launcher = None;
     let menu_width = FOREGROUND_LAUNCHER_MENU_WIDTH;
+    let row_height = 24.0;
+    let content_height = if launchers.is_empty() {
+        row_height
+    } else {
+        launchers.len() as f32 * row_height
+            + (launchers.len().saturating_sub(1)) as f32 * FOREGROUND_LAUNCHER_ROW_GAP
+    };
+    let total_height = FOREGROUND_LAUNCHER_MENU_PADDING_Y * 2.0 + content_height;
+    let backing_rect =
+        egui::Rect::from_min_size(ui.cursor().min, egui::vec2(menu_width, total_height));
+    let rounding = ui.style().visuals.menu_rounding;
+    ui.painter().rect_filled(backing_rect, rounding, SURFACE_BG);
+
     ui.set_min_width(menu_width);
     ui.set_max_width(menu_width);
     ui.add_space(FOREGROUND_LAUNCHER_MENU_PADDING_Y);
 
     if launchers.is_empty() {
-        let row_height = 24.0;
         let full_row_rect =
             egui::Rect::from_min_size(ui.cursor().min, egui::vec2(menu_width, row_height));
         let row_rect = full_row_rect.shrink2(egui::vec2(FOREGROUND_LAUNCHER_MENU_PADDING_X, 0.0));
@@ -28597,7 +28749,6 @@ fn draw_launcher_menu_contents(
     }
 
     for (index, launcher) in launchers.iter().enumerate() {
-        let row_height = 24.0;
         let full_row_rect =
             egui::Rect::from_min_size(ui.cursor().min, egui::vec2(menu_width, row_height));
         let row_rect = full_row_rect.shrink2(egui::vec2(FOREGROUND_LAUNCHER_MENU_PADDING_X, 0.0));
@@ -28674,9 +28825,6 @@ fn styled_launcher_menu_button(
                 with_minimal_button_chrome(ui, |ui| {
                     ui.menu_button(format!("{icon}"), |ui| {
                         with_minimal_button_chrome(ui, |ui| {
-                            let backing_rect = ui.available_rect_before_wrap();
-                            let rounding = ui.style().visuals.menu_rounding;
-                            ui.painter().rect_filled(backing_rect, rounding, SURFACE_BG);
                             selected_launcher = draw_launcher_menu_contents(app, ui, launchers);
                         });
                     })
@@ -33789,72 +33937,15 @@ mod tests {
         raw_input: RawInput,
         launchers: &[LauncherEntry],
     ) -> egui::FullOutput {
-        let _app = test_app(std::iter::empty(), None);
+        let mut app = test_app(std::iter::empty(), None);
         ctx.run(raw_input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.allocate_ui_with_layout(
                     egui::vec2(200.0, 200.0),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        // Just render the menu contents directly to test cursor behavior
                         with_minimal_button_chrome(ui, |ui| {
-                            let menu_width = super::FOREGROUND_LAUNCHER_MENU_WIDTH;
-                            ui.set_min_width(menu_width);
-                            ui.set_max_width(menu_width);
-                            ui.add_space(super::FOREGROUND_LAUNCHER_MENU_PADDING_Y);
-
-                            // Mirror production opaque backing
-                            let backing_rect = ui.available_rect_before_wrap();
-                            let rounding = ui.style().visuals.menu_rounding;
-                            ui.painter()
-                                .rect_filled(backing_rect, rounding, super::SURFACE_BG);
-
-                            for (index, launcher) in launchers.iter().enumerate() {
-                                let row_height = 24.0;
-                                let full_row_rect = egui::Rect::from_min_size(
-                                    ui.cursor().min,
-                                    egui::vec2(menu_width, row_height),
-                                );
-                                let row_rect = full_row_rect.shrink2(egui::vec2(
-                                    super::FOREGROUND_LAUNCHER_MENU_PADDING_X,
-                                    0.0,
-                                ));
-                                let is_hovered = ui.rect_contains_pointer(row_rect);
-                                let row_bg = if is_hovered {
-                                    super::BTN_ICON_HOVER
-                                } else {
-                                    super::SURFACE_BG_SOFT
-                                };
-                                ui.painter().rect_filled(row_rect, 6.0, row_bg);
-
-                                let inner_response = ui.allocate_new_ui(
-                                    egui::UiBuilder::new()
-                                        .max_rect(row_rect)
-                                        .layout(Layout::left_to_right(Align::Center))
-                                        .sense(Sense::click()),
-                                    |ui| {
-                                        ui.add_space(6.0);
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(&launcher.display_name)
-                                                    .strong()
-                                                    .color(super::TEXT_PRIMARY),
-                                            )
-                                            .selectable(false)
-                                            .truncate(),
-                                        );
-                                        ui.response()
-                                    },
-                                );
-                                let row_response = inner_response.inner;
-                                if row_response.hovered() {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                }
-                                if index + 1 < launchers.len() {
-                                    ui.add_space(super::FOREGROUND_LAUNCHER_ROW_GAP);
-                                }
-                            }
-                            ui.add_space(super::FOREGROUND_LAUNCHER_MENU_PADDING_Y);
+                            let _ = super::draw_launcher_menu_contents(&mut app, ui, launchers);
                         });
                     },
                 );
@@ -33943,7 +34034,7 @@ mod tests {
     #[test]
     fn foreground_launcher_menu_popup_has_opaque_backing() {
         // Regression test: launcher menu popup must paint an opaque backing rect
-        // to prevent background elements from showing through.
+        // that covers the full deterministic popup area (padding + rows + gaps).
         let ctx = Context::default();
         ctx.set_fonts(FontDefinitions::default());
 
@@ -33959,9 +34050,45 @@ mod tests {
         let output =
             draw_foreground_launcher_menu_in_test_ui(&ctx, RawInput::default(), &launchers);
 
+        let expected_total_height = super::FOREGROUND_LAUNCHER_MENU_PADDING_Y * 2.0
+            + launchers.len() as f32 * 24.0
+            + (launchers.len().saturating_sub(1)) as f32 * super::FOREGROUND_LAUNCHER_ROW_GAP;
+        let covers_full_popup = output.shapes.iter().any(|shape| {
+            if let egui::epaint::Shape::Rect(rect_shape) = &shape.shape {
+                rect_shape.fill == super::SURFACE_BG
+                    && rect_shape.rect.width() >= super::FOREGROUND_LAUNCHER_MENU_WIDTH - 1.0
+                    && rect_shape.rect.height() >= expected_total_height - 1.0
+            } else {
+                false
+            }
+        });
         assert!(
-            frame_contains_rect_filled(&output, super::SURFACE_BG),
-            "launcher menu popup must paint an opaque SURFACE_BG backing rect"
+            covers_full_popup,
+            "launcher menu popup backing must cover the full deterministic popup area"
+        );
+    }
+
+    #[test]
+    fn foreground_launcher_menu_empty_has_opaque_backing() {
+        // Regression test: empty launcher menu popup must also paint a full opaque backing.
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let output = draw_foreground_launcher_menu_in_test_ui(&ctx, RawInput::default(), &[]);
+
+        let expected_total_height = super::FOREGROUND_LAUNCHER_MENU_PADDING_Y * 2.0 + 24.0;
+        let covers_full_popup = output.shapes.iter().any(|shape| {
+            if let egui::epaint::Shape::Rect(rect_shape) = &shape.shape {
+                rect_shape.fill == super::SURFACE_BG
+                    && rect_shape.rect.width() >= super::FOREGROUND_LAUNCHER_MENU_WIDTH - 1.0
+                    && rect_shape.rect.height() >= expected_total_height - 1.0
+            } else {
+                false
+            }
+        });
+        assert!(
+            covers_full_popup,
+            "empty launcher menu popup backing must cover full deterministic popup area"
         );
     }
 
@@ -34304,6 +34431,7 @@ mod tests {
                         &mut child,
                         "feature-x",
                         false,
+                        false,
                         "/repo/wt",
                         &[],
                         TerminalKind::Background,
@@ -34341,6 +34469,7 @@ mod tests {
                         &mut child,
                         "feature-x",
                         false,
+                        false,
                         "/repo/wt",
                         &[],
                         TerminalKind::Foreground,
@@ -34356,6 +34485,38 @@ mod tests {
                 );
             });
         });
+    }
+
+    #[test]
+    fn worktree_row_text_color_selected_without_live_terminal_is_muted() {
+        assert_eq!(
+            super::worktree_row_text_color(true, false),
+            super::with_alpha(super::ACCENT, 200),
+            "selected but empty worktree must stay muted"
+        );
+    }
+
+    #[test]
+    fn worktree_row_text_color_selected_with_live_terminal_is_bright() {
+        assert_eq!(
+            super::worktree_row_text_color(true, true),
+            super::TEXT_PRIMARY,
+            "selected worktree with live terminal must be bright"
+        );
+    }
+
+    #[test]
+    fn worktree_row_text_color_unselected_is_always_muted() {
+        assert_eq!(
+            super::worktree_row_text_color(false, false),
+            super::with_alpha(super::ACCENT, 200),
+            "unselected worktree must be muted"
+        );
+        assert_eq!(
+            super::worktree_row_text_color(false, true),
+            super::with_alpha(super::ACCENT, 200),
+            "unselected worktree with live terminal must still be muted"
+        );
     }
 
     #[test]
@@ -41571,6 +41732,60 @@ mod tests {
     }
 
     #[test]
+    fn draw_clamped_scrollable_label_response_rect_capped_for_long_text() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let response = super::draw_clamped_scrollable_label(
+                    ui,
+                    &("a\n".repeat(50)), // 50 lines exceeds 120px
+                    super::TEXT_PRIMARY,
+                    12.0,
+                    120.0,
+                    egui::Sense::click(),
+                    1,
+                );
+                assert!(
+                    response.rect.height() <= 124.0,
+                    "response rect height should be capped near max_height, got {}",
+                    response.rect.height()
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn draw_clamped_scrollable_label_response_rect_shrinks_for_short_text() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let response = super::draw_clamped_scrollable_label(
+                    ui,
+                    "short text",
+                    super::TEXT_PRIMARY,
+                    12.0,
+                    120.0,
+                    egui::Sense::click(),
+                    0,
+                );
+                assert!(
+                    response.rect.height() < 60.0,
+                    "response rect height should shrink for short text, got {}",
+                    response.rect.height()
+                );
+            });
+        });
+    }
+
+    #[test]
     fn deduplicated_recent_handles_empty_and_single() {
         let empty: VecDeque<String> = VecDeque::new();
         assert!(deduplicated_recent_inputs(&empty).is_empty());
@@ -44343,6 +44558,106 @@ mod tests {
     }
 
     #[test]
+    fn panel_resize_overlay_right_uses_left_edge() {
+        let rect = egui::Rect::from_min_size(pos2(400.0, 0.0), egui::vec2(200.0, 600.0));
+        let resize_x = match super::PanelResizeSide::Right {
+            super::PanelResizeSide::Left => rect.max.x - 1.0,
+            super::PanelResizeSide::Right => rect.min.x,
+        };
+        assert_eq!(resize_x, 400.0);
+    }
+
+    #[test]
+    fn panel_resize_overlay_left_uses_right_edge() {
+        let rect = egui::Rect::from_min_size(pos2(100.0, 0.0), egui::vec2(200.0, 600.0));
+        let resize_x = match super::PanelResizeSide::Left {
+            super::PanelResizeSide::Left => rect.max.x - 1.0,
+            super::PanelResizeSide::Right => rect.min.x,
+        };
+        assert_eq!(resize_x, 299.0);
+    }
+
+    #[test]
+    fn paint_panel_resize_overlay_skips_when_popup_open() {
+        use egui::{Context, RawInput};
+        let ctx = Context::default();
+        let mut raw_input = RawInput::default();
+        raw_input
+            .events
+            .push(egui::Event::PointerMoved(pos2(400.0, 300.0)));
+        let output = ctx.run(raw_input, |ctx| {
+            ctx.memory_mut(|m| m.open_popup(egui::Id::new("dummy")));
+            let rect = egui::Rect::from_min_size(pos2(400.0, 0.0), egui::vec2(200.0, 600.0));
+            super::paint_panel_resize_overlay(
+                ctx,
+                rect,
+                super::PanelResizeSide::Right,
+                "test-skip",
+            );
+        });
+
+        let has_line = output
+            .shapes
+            .iter()
+            .any(|shape| matches!(shape.shape, egui::epaint::Shape::LineSegment { .. }));
+        assert!(!has_line, "overlay must not draw when popup is open");
+    }
+
+    #[test]
+    fn paint_panel_resize_overlay_uses_hover_color_when_near() {
+        use egui::{Context, RawInput};
+        let ctx = Context::default();
+        let mut raw_input = RawInput::default();
+        raw_input
+            .events
+            .push(egui::Event::PointerMoved(pos2(400.0, 300.0)));
+        let output = ctx.run(raw_input, |ctx| {
+            let rect = egui::Rect::from_min_size(pos2(400.0, 0.0), egui::vec2(200.0, 600.0));
+            super::paint_panel_resize_overlay(
+                ctx,
+                rect,
+                super::PanelResizeSide::Right,
+                "test-hover",
+            );
+        });
+
+        let hovered_line = output.shapes.iter().any(|shape| {
+            if let egui::epaint::Shape::LineSegment { stroke, .. } = &shape.shape {
+                stroke.color == egui::epaint::ColorMode::Solid(Color32::from_rgb(80, 80, 80))
+            } else {
+                false
+            }
+        });
+        assert!(
+            hovered_line,
+            "overlay must use hover color when pointer is near"
+        );
+    }
+
+    #[test]
+    fn paint_panel_resize_overlay_uses_dim_color_when_far() {
+        use egui::{Context, RawInput};
+        let ctx = Context::default();
+        let mut raw_input = RawInput::default();
+        raw_input
+            .events
+            .push(egui::Event::PointerMoved(pos2(500.0, 300.0)));
+        let output = ctx.run(raw_input, |ctx| {
+            let rect = egui::Rect::from_min_size(pos2(400.0, 0.0), egui::vec2(200.0, 600.0));
+            super::paint_panel_resize_overlay(ctx, rect, super::PanelResizeSide::Right, "test-far");
+        });
+
+        let dim_line = output.shapes.iter().any(|shape| {
+            if let egui::epaint::Shape::LineSegment { stroke, .. } = &shape.shape {
+                stroke.color == egui::epaint::ColorMode::Solid(Color32::from_rgb(45, 45, 45))
+            } else {
+                false
+            }
+        });
+        assert!(dim_line, "overlay must use dim color when pointer is far");
+    }
+
+    #[test]
     fn draw_terminal_status_badges_does_not_leave_leading_gap_when_ai_is_inactive() {
         let ctx = Context::default();
         ctx.set_fonts(FontDefinitions::default());
@@ -45316,6 +45631,56 @@ mod tests {
         let project = app.projects.get(&1).expect("project 1");
         assert_eq!(project.checklist.len(), 1);
         assert_eq!(project.checklist[0], "item from terminal");
+    }
+
+    #[test]
+    fn checklist_panel_project_collapsed_hides_items() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let mut app = test_app([(1, test_terminal_entry(1, 1))], Some(1));
+        app.projects.insert(
+            1,
+            test_project(1, "Demo", "C:/demo", &[], &["item a", "item b"]),
+        );
+        // Default not collapsed
+        assert!(!app
+            .checklist_collapsed_by_project
+            .get(&1)
+            .copied()
+            .unwrap_or(false));
+        // Toggle collapsed
+        app.checklist_collapsed_by_project.insert(1, true);
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            app.draw_checklist_panel(ctx);
+        });
+        // Should not panic when collapsed
+    }
+
+    #[test]
+    fn checklist_panel_project_collapse_state_isolated_per_project() {
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 1)),
+                (2, test_terminal_entry(2, 2)),
+            ],
+            Some(1),
+        );
+        app.projects
+            .insert(1, test_project(1, "A", "C:/a", &[], &["a1"]));
+        app.projects
+            .insert(2, test_project(2, "B", "C:/b", &[], &["b1"]));
+        app.checklist_collapsed_by_project.insert(1, true);
+        assert!(app
+            .checklist_collapsed_by_project
+            .get(&1)
+            .copied()
+            .unwrap_or(false));
+        assert!(!app
+            .checklist_collapsed_by_project
+            .get(&2)
+            .copied()
+            .unwrap_or(false));
     }
 
     #[test]
@@ -47862,6 +48227,78 @@ mod tests {
             design_inspect_delivery_signature(&first),
             design_inspect_delivery_signature(&second)
         );
+    }
+
+    #[test]
+    fn design_inspect_terminal_scope_uses_scope_tab_url_not_project_last_url() {
+        let ctx = Context::default();
+        let (runtime, _capture) = test_terminal_runtime_with_capture();
+        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
+        let mut app = test_app(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        let mut project = test_project(7, "Demo", "C:/demo", &[], &[]);
+        project.browser_last_url = Some("https://example.com/stale".to_owned());
+        app.projects.insert(7, project);
+        app.selected_project = Some(7);
+        app.set_browser_panel_open_for_project(7, true);
+
+        let terminal_scope = BrowserScopeKey::Terminal {
+            project_id: 7,
+            terminal_id: 1,
+        };
+        app.set_browser_design_inspect_enabled_for_scope(terminal_scope, true);
+
+        let _ = app.add_browser_tab(
+            terminal_scope,
+            Some("https://example.com/dashboard".to_owned()),
+            BrowserTabKind::Page,
+            None,
+        );
+
+        let mut info = test_design_element_info("main > button#save.primary");
+        info.page_url = "https://example.com/dashboard".to_owned();
+        info.url = "https://example.com/dashboard".to_owned();
+        app.forward_design_inspect_click_to_terminal(&ctx, terminal_scope, info);
+
+        assert_eq!(app.pending_terminal_pastes.len(), 1);
+        assert_eq!(app.pending_terminal_pastes[0].terminal_id, 1);
+    }
+
+    #[test]
+    fn design_inspect_terminal_scope_rejects_stale_scope_tab_url() {
+        let ctx = Context::default();
+        let (runtime, _capture) = test_terminal_runtime_with_capture();
+        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
+        let mut app = test_app(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        app.projects
+            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
+        app.selected_project = Some(7);
+        app.set_browser_panel_open_for_project(7, true);
+
+        let terminal_scope = BrowserScopeKey::Terminal {
+            project_id: 7,
+            terminal_id: 1,
+        };
+        app.set_browser_design_inspect_enabled_for_scope(terminal_scope, true);
+
+        let _ = app.add_browser_tab(
+            terminal_scope,
+            Some("https://example.com/current".to_owned()),
+            BrowserTabKind::Page,
+            None,
+        );
+
+        let mut info = test_design_element_info("main > button#save.primary");
+        info.page_url = "https://example.com/previous".to_owned();
+        info.url = "https://example.com/previous".to_owned();
+        app.forward_design_inspect_click_to_terminal(&ctx, terminal_scope, info);
+
+        assert!(app.pending_terminal_pastes.is_empty());
     }
 
     #[test]
@@ -52867,6 +53304,67 @@ mod tests {
             .max(super::SMART_INPUT_MIN_FOOTER_HEIGHT)
             .min(max_footer);
         assert_eq!(new_height, max_footer);
+    }
+
+    #[test]
+    fn smart_input_footer_grip_is_positioned_at_draft_bottom_right() {
+        // Regression test: the draft resize grip must sit at the bottom-right
+        // corner of the multiline TextEdit, not drift to the far-right edge
+        // of the footer row.
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        let output = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let footer_size = egui::vec2(400.0, 180.0);
+                let pane_height = 400.0;
+                let line_height = 18.0;
+                let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+                let _ = super::draw_smart_input_footer(
+                    ui,
+                    terminal,
+                    footer_size,
+                    pane_height,
+                    line_height,
+                );
+            });
+        });
+
+        // Collect diagonal line segments (the grip draws two diagonal lines).
+        // Other lines in the footer (resize handle, drop indicators) are horizontal
+        // or vertical, so we filter by both x and y changing between endpoints.
+        let mut grip_line_xs: Vec<f32> = Vec::new();
+        for shape in &output.shapes {
+            if let egui::epaint::Shape::LineSegment { points, .. } = &shape.shape {
+                let dx = (points[1].x - points[0].x).abs();
+                let dy = (points[1].y - points[0].y).abs();
+                if dx > 1.0 && dy > 1.0 {
+                    grip_line_xs.push(points[0].x);
+                    grip_line_xs.push(points[1].x);
+                }
+            }
+        }
+
+        assert!(
+            !grip_line_xs.is_empty(),
+            "grip diagonal line segments should be present in the output"
+        );
+
+        let max_grip_x = grip_line_xs.iter().copied().fold(0.0f32, f32::max);
+
+        // The TextEdit is sized to (available_width - 92.0) inside the 400px footer.
+        // With default margins, the text area right edge should be well under ~340px.
+        // The old buggy code placed the grip near the far-right edge (~390+ px).
+        assert!(
+            max_grip_x < 350.0,
+            "grip must sit near the TextEdit bottom-right (expected < 350), not drift to panel edge (got {})",
+            max_grip_x
+        );
     }
 
     #[test]

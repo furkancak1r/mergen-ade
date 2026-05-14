@@ -2,6 +2,51 @@
 
 ---
 
+#### Design Inspect icon changed to pencil and terminal-scope URL bug fixed {#design-inspect-pencil-and-url}
+- Date: 2026-05-14
+- Context: User requested that the Design Inspect toolbar icon be a pencil instead of an eye. Additionally, Design Inspect element clicks were not being sent to the terminal when using a terminal-scoped browser.
+- Error signature: `forward_design_inspect_click_to_terminal` compared the element’s page URL against `project.browser_last_url` for all scopes. For terminal-scoped browsers, the project-level persisted URL could be stale or different, causing valid element selections to be silently dropped.
+- Symptoms/Impact:
+  1. Browser toolbar showed an eye icon for Design Inspect instead of a pencil.
+  2. Selecting a page element in a terminal-scoped browser did not paste the design inspect context into the terminal.
+  3. The bug only manifested when the terminal-scoped browser was on a different URL than the project’s last persisted URL.
+- Root cause:
+  - Stale-URL validation was project-centric (`project.browser_last_url`) and ignored the active tab URL of the terminal-scoped browser instance.
+- Resolution:
+  - Added `AppIcon::Pencil` with Lucide glyph `"pencil"` and switched the Design Inspect toolbar icon to `icons::PENCIL`.
+  - Introduced `current_browser_url_for_scope()` helper that returns the active tab URL for any scope, falling back to `project.browser_last_url` only for project scopes.
+  - Replaced the stale-URL check in `forward_design_inspect_click_to_terminal` with the scope-aware helper.
+- Prevent recurrence:
+  - Added regression tests:
+    - `design_inspect_terminal_scope_uses_scope_tab_url_not_project_last_url`
+    - `design_inspect_terminal_scope_rejects_stale_scope_tab_url`
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-14
+
+---
+
+#### Smart Input draft resize grip drifted to panel edge {#smart-input-grip-drift}
+- Date: 2026-05-14
+- Context: User reported that the Smart Input metin alanı (draft text area) resize grip at the bottom-right had drifted to the far-right edge of the footer row and no longer sat next to the TextEdit.
+- Error signature: `draw_smart_input_footer` placed the grip using `ui.with_layout(Layout::bottom_up(Align::Max), |ui| { ui.allocate_response(...) })` inside the draft row's horizontal layout. In egui, this caused the grip widget to consume the remaining horizontal space and align to its far-right edge—sometimes hundreds of pixels away from the TextEdit.
+- Symptoms/Impact:
+  1. The diagonal grip icon visually detached from the text area and appeared near the submit button or beyond.
+  2. Users expected to grab the grip at the TextEdit corner, but it was nowhere near it.
+  3. The interaction area was still small (12 px) but positioned so far right that it could be missed entirely.
+- Root cause:
+  - `with_layout(Layout::bottom_up(Align::Max))` inside a horizontal row does not anchor a widget to the previous widget; it creates a new right-aligned sub-layout that takes whatever space is left.
+- Resolution:
+  - Replaced the layout-based grip with explicit rect positioning: compute `grip_rect` directly from `draft_response.rect.right() - grip_size` and `draft_response.rect.bottom() - grip_size`.
+  - Use `ui.interact(grip_rect, ui.id().with("draft_resize"), Sense::drag())` so egui routes drag events to the grip without relying on layout allocation semantics.
+  - Keep the existing resize behavior (update `user_height`, reset `draft_user_height`) intact.
+- Prevent recurrence:
+  - Added regression test:
+    - `smart_input_footer_grip_is_positioned_at_draft_bottom_right` — renders the footer and asserts the diagonal line segments (grip visual) have X coordinates within the TextEdit area, not at the panel edge.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-14
+
+---
+
 #### OpenCode question prompts required manual terminal TUI interaction {#opencode-question-terminal-fallback}
 - Date: 2026-05-14
 - Context: When OpenCode asked a question (e.g., model selection, confirmation), Mergen only detected the `Permission` attention state. Users had to read the question text in the terminal TUI and type answers directly into the PTY, bypassing Smart Input entirely.
@@ -665,3 +710,128 @@
     - `draw_clamped_scrollable_label_long_text_is_capped`
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: Code review 2026-05-14
+
+---
+
+#### Terminal Manager foreground launcher popup background bleed through gaps {#launcher-menu-background-bleed}
+- Date: 2026-05-14
+- Context: User reported that the Terminal Manager foreground launcher dropdown shows the background UI through gaps/margins inside the popup.
+- Error signature: The popup relied on `ui.available_rect_before_wrap()` to paint an opaque backing, but this did not deterministically cover all padding and row-gap areas, causing the Terminal Manager list behind the popup to remain visible.
+- Symptoms/Impact:
+  1. Background UI (Terminal Manager rows, sidebar) was visible through the popup.
+  2. The popup felt incomplete/non-opaque.
+- Root cause:
+  - `styled_launcher_menu_button` used `ui.available_rect_before_wrap()` at popup open time to paint a `SURFACE_BG` rect. This rect did not guarantee full coverage of the final content area after adding top/bottom padding and row gaps.
+- Resolution:
+  - Moved the opaque backing into `draw_launcher_menu_contents` where the total popup height is computed deterministically from row count, row height, row gap, and vertical padding.
+  - The backing rect is painted at the very beginning with `Rect::from_min_size(ui.cursor().min, vec2(menu_width, total_height))` using `SURFACE_BG`, ensuring every padding pixel and gap is covered.
+  - Removed the ad-hoc `available_rect_before_wrap()` backing from `styled_launcher_menu_button`.
+- Prevent recurrence:
+  - Regression tests updated:
+    - `foreground_launcher_menu_popup_has_opaque_backing` now asserts backing width and height cover the full deterministic popup area.
+    - Added `foreground_launcher_menu_empty_has_opaque_backing` for the empty-launcher state.
+    - Test helper refactored to call the production `draw_launcher_menu_contents` directly instead of duplicating its logic.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-14
+
+---
+
+#### Check-list panel hover tooltip misaligned after scroll {#checklist-hover-tooltip-misaligned}
+- Date: 2026-05-14
+- Context: User reported that when checklist items are long and scrolled, the hover tooltip "Click to copy" appears in the wrong place (shifted down, not next to the visible item).
+- Error signature: `draw_clamped_scrollable_label()` returned the inner `Label`'s response, whose `rect` reflected the full unclamped content height rather than the visible ScrollArea viewport. `on_hover_text()` positions the tooltip relative to `response.rect`, so it anchored far below the visible row.
+- Symptoms/Impact:
+  1. Hovering a scrolled checklist item showed the tooltip at the bottom of the full text instead of next to the visible line.
+  2. In extreme cases the tooltip could appear completely off-screen or over unrelated UI.
+- Root cause:
+  - `draw_clamped_scrollable_label()` returned `ScrollAreaOutput::inner` (the Label response) directly.
+  - The Label's `rect` spanned the entire wrapped text, not the capped 120px viewport.
+- Resolution:
+  - After `ScrollArea::show()`, compute a `visible_rect` by clamping the initial inner rect height to the actual content size (`min(inner_rect.height(), content_size.y)`).
+  - Patch the returned `Response` so that `rect` and `interact_rect` are set to the visible rect.
+  - Tooltip and click detection now anchor to the on-screen visible area.
+- Prevent recurrence:
+  - Regression tests added:
+    - `draw_clamped_scrollable_label_response_rect_capped_for_long_text`
+    - `draw_clamped_scrollable_label_response_rect_shrinks_for_short_text`
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-14
+
+---
+
+#### Check-list panel project headers gained accordion collapse/expand {#checklist-accordion-headers}
+- Date: 2026-05-14
+- Context: User requested that Check-list panel project names behave like an accordion so items can be hidden/shown per project, similar to foreground/background filter tabs.
+- Error signature: `draw_checklist_panel` rendered all checklist items for every project unconditionally. Project headers were static labels with no interaction, making long checklists hard to scan.
+- Symptoms/Impact:
+  1. Users could not collapse a project to hide its checklist items.
+  2. With many projects or long items, the panel became cluttered and hard to navigate.
+- Root cause:
+  - `draw_checklist_panel` used a plain `ui.horizontal` label block for the project header with no state tracking or toggle behavior.
+  - `checklist_collapsed_by_project` existed in `AdeApp` but was never read or written by the panel draw code.
+- Resolution:
+  - Replaced the static project header with an interactive accordion row: a clickable body area (left portion) and a separate copy button area (right portion).
+  - Added a visual arrow indicator (`▸` / `▾`) and folder icon (`icons::FOLDER` / `icons::FOLDER_OPEN`) to communicate collapse state.
+  - Clicking the body toggles `checklist_collapsed_by_project` for that project; the item list is only rendered when the project is expanded.
+  - The copy button uses its own interaction rect so it never triggers the accordion toggle.
+  - Default state remains expanded (not collapsed).
+- Prevent recurrence:
+  - Regression tests added:
+    - `checklist_panel_project_collapsed_hides_items` — verifies panel draw does not panic when a project is collapsed
+    - `checklist_panel_project_collapse_state_isolated_per_project` — verifies toggling one project does not affect another
+  - Added `Check-list Panel Guidelines` section to AGENTS.md documenting accordion behavior, per-project state, and copy button separation.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-14
+
+---
+
+#### Check-list and Browser panel resize handle flickered because missing dim overlay {#checklist-browser-resize-flicker}
+- Date: 2026-05-14
+- Context: User reported that the resize bar between the terminal and Check-list panel flickers rapidly when the mouse hovers over it.
+- Error signature: The default egui `SidePanel` resize separator uses `fg_stroke`, which in this dark theme is almost white (`TEXT_PRIMARY`). When the Check-list and Browser panels were resized, the bright separator could flash against the dark background because no custom dim overlay was applied to those panels.
+- Symptoms/Impact:
+  1. Mouse hovering the terminal–Check-list boundary caused rapid visual flicker.
+  2. The resize cursor felt unstable because the bright separator kept appearing and disappearing.
+  3. Browser panel (when open next to Check-list) had the same issue on its left edge.
+- Root cause:
+  - Project Explorer already had a custom dim resize overlay (`project-explorer-resize-overlay`) painted in `Order::Foreground` after the panel rendered.
+  - Check-list and Browser panels used `show_separator_line(false)` but did not replace the missing separator with the same dim overlay, leaving the default egui bright `fg_stroke` visible during hover.
+- Resolution:
+  - Extracted the overlay logic into a reusable free function `paint_panel_resize_overlay(ctx, panel_rect, side, id_suffix)` and a `PanelResizeSide` enum.
+  - Replaced the inline Project Explorer overlay with a call to the new helper.
+  - Added overlay calls at the end of `draw_checklist_panel` and `draw_browser_panel` so all three resizable side panels use the same visual treatment.
+  - Overlay colors remain: dim `Color32::from_rgb(45, 45, 45)` normally, slightly brighter `Color32::from_rgb(80, 80, 80)` on hover, and suppressed while any popup is open.
+- Prevent recurrence:
+  - Regression tests added:
+    - `panel_resize_overlay_right_uses_left_edge`
+    - `panel_resize_overlay_left_uses_right_edge`
+    - `paint_panel_resize_overlay_skips_when_popup_open`
+    - `paint_panel_resize_overlay_uses_hover_color_when_near`
+    - `paint_panel_resize_overlay_uses_dim_color_when_far`
+  - Updated AGENTS.md Resizable Panel Guidelines to state the overlay applies to **Project Explorer**, **Check-list**, and **Browser** panels.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-14
+
+---
+
+#### Terminal Manager empty worktree row turned bright white when selected {#worktree-empty-selected-bright}
+- Date: 2026-05-14
+- Context: User reported that clicking an empty worktree row in Terminal Manager made the label turn bright white even though the worktree had no live terminals, which felt misleading.
+- Error signature: `draw_terminal_manager_worktree_row` used `if is_selected { TEXT_PRIMARY } else { with_alpha(ACCENT, 200) }` for text color, ignoring whether the worktree actually had any live terminals.
+- Symptoms/Impact:
+  1. Empty worktree rows looked identical to active project headers after being clicked.
+  2. Users could not visually distinguish a selected but inactive worktree from one that had running terminals.
+- Root cause:
+  - The worktree row color logic only considered `is_selected` and did not gate brightness on `has_live_terminal`.
+- Resolution:
+  - Added `has_live_terminal: bool` to `draw_terminal_manager_worktree_row` signature.
+  - Introduced `worktree_row_text_color(is_selected, has_live_terminal)` helper that returns `TEXT_PRIMARY` only when `is_selected && has_live_terminal`, otherwise `with_alpha(ACCENT, 200)`.
+  - Call site in `draw_terminal_manager_contents` now computes `wt_has_live_terminal` from `terminal_count_live_for_project_kind` and passes it into the row draw function.
+- Prevent recurrence:
+  - Regression tests added:
+    - `worktree_row_text_color_selected_without_live_terminal_is_muted`
+    - `worktree_row_text_color_selected_with_live_terminal_is_bright`
+    - `worktree_row_text_color_unselected_is_always_muted`
+  - Added AGENTS.md guideline: "Worktree row text color must reflect live terminal presence".
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-14
