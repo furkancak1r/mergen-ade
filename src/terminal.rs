@@ -455,6 +455,12 @@ pub enum TerminalUiEventKind {
         terminal_id: u64,
         chunk: String,
     },
+    /// Raw PTY output bytes for external consumers (e.g. web mode)
+    #[allow(dead_code)]
+    RawOutput {
+        terminal_id: u64,
+        bytes: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3321,6 +3327,15 @@ fn spawn_reader_thread(
                         latest_seqno.store(terminal.current_seqno(), Ordering::Relaxed);
                     }
                     send_ui_event(terminal_id, TerminalUiEventKind::Wakeup, &tx, &repaint_ctx);
+                    send_ui_event(
+                        terminal_id,
+                        TerminalUiEventKind::RawOutput {
+                            terminal_id,
+                            bytes: bytes.to_vec(),
+                        },
+                        &tx,
+                        &repaint_ctx,
+                    );
 
                     // AI signal parsing uses ORIGINAL bytes (before filtering)
                     // to ensure hook-delimited signals are not corrupted

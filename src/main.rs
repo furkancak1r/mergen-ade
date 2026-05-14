@@ -42,6 +42,8 @@ mod path_utils;
 mod terminal;
 mod title;
 mod web_browser;
+mod web_protocol;
+mod web_server;
 mod worktree;
 
 use eframe::egui;
@@ -673,6 +675,17 @@ fn main() -> Result<(), eframe::Error> {
             "--browser-mcp-helper" => {
                 if let Err(err) = browser_mcp_helper::run() {
                     let _ = writeln!(std::io::stderr(), "Mergen Browser MCP failed: {err}");
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            "--web" => {
+                env_logger::Builder::from_env(
+                    env_logger::Env::default().default_filter_or("warn,mergen_ade=info"),
+                )
+                .init();
+                if let Err(err) = web_server::run_web_mode() {
+                    eprintln!("Mergen web mode failed: {err}");
                     std::process::exit(1);
                 }
                 return Ok(());

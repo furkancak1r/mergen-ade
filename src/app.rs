@@ -8618,6 +8618,9 @@ impl AdeApp {
                 TerminalUiEventKind::Wakeup => {
                     dirty_ids.insert(event.terminal_id);
                 }
+                TerminalUiEventKind::RawOutput { .. } => {
+                    // Desktop app renders via snapshots; raw bytes are for web mode
+                }
                 TerminalUiEventKind::ChildExit | TerminalUiEventKind::Exit => {
                     exited_ids.insert(event.terminal_id);
                     dirty_ids.insert(event.terminal_id);

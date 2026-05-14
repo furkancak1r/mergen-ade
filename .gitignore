@@ -23,3 +23,10 @@ Desktop.ini
 
 # Logs
 *.log
+
+# Web frontend
+/web/node_modules/
+/web/dist/
+
+# Python temp scripts
+check_braces.py

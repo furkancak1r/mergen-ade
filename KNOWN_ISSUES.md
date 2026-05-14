@@ -611,6 +611,30 @@
 
 ---
 
+#### Web mode headless server and React/xterm.js frontend added {#web-mode-added}
+- Date: 2026-05-14
+- Context: User requested a web mode for Mergen ADE to run headless with a browser-based terminal UI.
+- Error signature: N/A — new feature.
+- Symptoms/Impact:
+  1. Desktop app (`mergen-ade.exe` with no args) remains unchanged and opens native egui window.
+  2. `mergen-ade.exe --web` starts an Axum HTTP/WebSocket server on port 8765 (override via `MERGEN_WEB_PORT`).
+  3. Auth token auto-generated and printed to stdout; override via `MERGEN_WEB_AUTH_TOKEN`.
+  4. Frontend is React + xterm.js + Vite; built assets in `web/dist/` embedded via `rust-embed`.
+  5. WebSocket protocol: JSON text messages for UI events, binary frames for raw PTY data (first 8 LE bytes = terminal_id).
+  6. TerminalRuntime instances live in a dedicated `std::thread` (not `Send`) and are controlled via `crossbeam_channel`.
+  7. Desktop and web mode share the same `ProjectRecord` list, `AppConfig`, and `SavedMessage` systems.
+- Resolution:
+  - Added `src/web_protocol.rs` (JSON protocol types), `src/web_server.rs` (Axum server + WebSocket + static serving), `web/` (React frontend).
+  - Updated `src/main.rs` to dispatch `--web` CLI mode.
+  - `cargo check` passes; debug build succeeds; web server tested on `http://127.0.0.1:8766`.
+- Prevent recurrence:
+  - `cargo build` without `--web` still produces native desktop app.
+  - `cargo test` passes.
+- Files/Commands touched: `src/main.rs`, `src/web_protocol.rs`, `src/web_server.rs`, `Cargo.toml`, `web/`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo check`, `cargo build`, `cargo test`
+- References: User request 2026-05-14
+
+---
+
 #### Smart Input focus did not auto-claim when visible, causing typed text to leak to terminal PTY {#smart-input-auto-focus}
 - Date: 2026-05-14
 - Context: User reported that when the Smart Input area is open, focus should always be there so that typing goes directly into Smart Input instead of the terminal.

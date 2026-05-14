@@ -512,6 +512,19 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Bump the injected script version when Design Inspect behavior changes.** This prevents an existing `window.__mergenDesignInspect` implementation from short-circuiting around newer behavior.
 - **Add regression tests for Design Inspect behavior.** Cover click parsing, hover rejection, duplicate click dedupe, stale URL gating, iframe page URL gating, auto-disable after delivery, and user-facing enable/status copy.
 
+## Web Mode Guidelines
+
+- **Web mode is headless and optional.** `mergen-ade --web` starts an Axum HTTP/WebSocket server instead of the native egui desktop window. Desktop behavior (`cargo run` or `mergen-ade.exe` with no arguments) remains unchanged.
+- **Default web port is 8765.** Override via `MERGEN_WEB_PORT` environment variable.
+- **Auth token is required for all WebSocket and API access.** A random token is auto-generated on startup and printed to stdout. Override via `MERGEN_WEB_AUTH_TOKEN` environment variable for predictable testing.
+- **TerminalRuntime is not `Send`.** All `TerminalRuntime` instances live in a dedicated `std::thread` and are controlled via a `crossbeam_channel` command queue. The async WebSocket handler sends commands into this queue and receives UI events back through a `tokio::sync::broadcast` channel.
+- **WebSocket protocol uses JSON text messages and binary frames.** Text frames carry `ServerMessage`/`ClientMessage` JSON. Binary frames encode `terminal_id` as the first 8 little-endian bytes, followed by raw PTY data.
+- **Frontend is React + xterm.js + Vite.** Built assets in `web/dist/` are embedded into the binary via `rust-embed` and served at `/` by the Axum router.
+- **Web mode shares project config and terminals with desktop.** The same `ProjectRecord` list, `AppConfig`, and `SavedMessage` systems are available; only the UI layer differs.
+- **Web mode must not break desktop builds.** Gate all web-only dependencies behind `#[cfg(web)]` or module-level feature checks where possible. `cargo build` without web arguments should succeed and produce the native app.
+- **WebSocket handler uses `tokio::select!` loop.** Do not use `socket.split()` + `tokio::spawn` because `SplitSink` caused the async future to be non-`Send`, which `axum::WebSocketUpgrade::on_upgrade` rejects.
+- **Frontend token storage uses `localStorage` with URL hash fallback.** On reconnect, the frontend sends the token as the URL hash (`#token`) and the server validates it before upgrading the WebSocket.
+
 ## UI Popup & Overlay Guidelines
 
 - **Popup menus must have an explicit opaque backing.** Do not rely solely on `Frame::menu` fill; paint a full `SURFACE_BG` rect inside the popup closure before content rows. Compute the rect size deterministically from the expected content height (rows, gaps, padding) so the backing always covers the entire popup area and never leaves transparent gaps. This prevents background elements from bleeding through gaps or margins.

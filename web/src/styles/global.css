@@ -1,0 +1,45 @@
+:root {
+  /* WebKit scrollbars */
+  --scrollbar-track: #141414;
+  --scrollbar-thumb: #3a3a3a;
+  --scrollbar-thumb-hover: #555;
+  --scrollbar-width: 8px;
+}
+
+/* Global WebKit scrollbar override */
+::-webkit-scrollbar {
+  width: var(--scrollbar-width);
+  height: var(--scrollbar-width);
+}
+
+::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
+::-webkit-scrollbar-corner {
+  background: var(--scrollbar-track);
+}
+
+/* Firefox scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+}
+
+/* Ensure scrollable panels inherit */
+div[style*="overflow: auto"],
+div[style*="overflow:auto"],
+div[style*="overflow: hidden"],
+div[style*="overflow:hidden"] {
+  scrollbar-width: thin;
+}
