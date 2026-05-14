@@ -854,3 +854,37 @@
   - No new regression tests needed; existing accordion tests (`checklist_panel_project_collapsed_hides_items`, `checklist_panel_project_collapse_state_isolated_per_project`) continue to verify behavior.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-05-14
+
+---
+
+#### Check-list panel converted to floating bottom-right popup {#checklist-floating-popup}
+- Date: 2026-05-14
+- Context: User requested that the Check-list panel be changed from a fixed right-side panel to a floating bottom-right popup that opens when clicking the activity rail icon.
+- Error signature: `draw_checklist_panel` used `egui::SidePanel::right` which permanently reduced the main terminal area width and was always visible, cluttering the layout.
+- Symptoms/Impact:
+  1. The Check-list consumed ~352px of horizontal screen space at all times.
+  2. Users could not hide it without closing the entire right panel stack.
+  3. Terminal Manager tooltip right-edge calculations had to reserve space for the panel even when not needed.
+- Root cause:
+  - The Check-list was implemented as a persistent `SidePanel::right` with no toggle behavior.
+  - `main_area_size_from_chrome` subtracted `checklist_rect.width()` from the terminal area.
+  - Activity rail icon was pinned (always active) with no state tracking.
+- Resolution:
+  - Replaced `SidePanel::right` with `egui::Window::new("Check-list")` anchored to `Align2::RIGHT_BOTTOM` with `.open()` close button.
+  - Added runtime-only `checklist_floating_open: bool` state to `AdeApp`; activity rail icon now toggles this state.
+  - `draw_checklist_panel` returns `None` so it no longer affects main layout width.
+  - Removed checklist width subtraction from `main_area_size_from_chrome` call sites.
+  - Updated Terminal Manager tooltip `right_offset` to no longer reserve checklist width.
+  - Added `checklist_floating_open` to `embedded_browser_should_yield_to_ui_layer` and `terminal_output_mouse_wheel_enabled` predicates so the floating popup participates in overlay yield correctly.
+  - Sanitized legacy `UiConfig::checklist_panel_expanded` to `false` in defaults and recovery.
+- Prevent recurrence:
+  - Regression tests updated:
+    - `checklist_panel_project_collapsed_hides_items` and `checklist_panel_renders_long_items_without_crash` now set `checklist_floating_open = true` before rendering.
+    - `browser_panel_and_checklist_can_coexist` renamed to `browser_panel_and_floating_checklist_can_coexist` and updated to test floating state.
+    - `checklist_open_closes_only_active_browser_for_scope_state` updated to use floating state.
+    - `checklist_floating_remains_open_when_last_item_removed` verifies the popup stays open when emptied.
+    - `recover_config_keeps_checklist_panel_*` tests now assert legacy field is sanitized to `false`.
+    - `terminal_output_mouse_wheel_enabled_returns_false_when_checklist_floating_open` verifies wheel blocking.
+    - `embedded_browser_yields_to_ui_overlay_layers` updated with new parameter and test case for checklist floating open.
+- Files/Commands touched: `src/app.rs`, `src/models.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo check`, `cargo fmt`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-14

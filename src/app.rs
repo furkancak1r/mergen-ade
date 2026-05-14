@@ -1865,6 +1865,8 @@ pub struct AdeApp {
     terminal_history_popup_just_opened: bool,
     /// Collapse/expand state per project in the Check-list panel (runtime-only, not persisted across restarts)
     checklist_collapsed_by_project: BTreeMap<u64, bool>,
+    /// Whether the floating Check-list popup is currently open (runtime-only, not persisted)
+    checklist_floating_open: bool,
     /// File editor state (runtime only, not persisted)
     file_editor: FileEditorState,
     /// Browser URL draft input per scope (runtime only, not persisted).
@@ -4431,6 +4433,7 @@ impl AdeApp {
             terminal_history_popup_open: None,
             terminal_history_popup_just_opened: false,
             checklist_collapsed_by_project: BTreeMap::new(),
+            checklist_floating_open: false,
             file_editor: FileEditorState::default(),
             browser_url_draft_by_scope: BTreeMap::new(),
             embedded_browsers_by_scope: BTreeMap::new(),
@@ -10321,6 +10324,7 @@ fn embedded_browser_should_yield_to_ui_layer(
     browser_overlay_active: bool,
     foreground_message_popup_open: bool,
     create_worktree_popup_open: bool,
+    checklist_floating_open: bool,
 ) -> bool {
     show_settings_popup
         || show_exit_confirm_popup
@@ -10330,6 +10334,7 @@ fn embedded_browser_should_yield_to_ui_layer(
         || browser_overlay_active
         || foreground_message_popup_open
         || create_worktree_popup_open
+        || checklist_floating_open
 }
 
 /// Determine if terminal output mouse wheel events should be processed.
@@ -10341,12 +10346,14 @@ fn terminal_output_mouse_wheel_enabled(
     terminal_history_popup_open: bool,
     foreground_message_popup_open: bool,
     create_worktree_popup_open: bool,
+    checklist_floating_open: bool,
 ) -> bool {
     !(show_settings_popup
         || show_exit_confirm_popup
         || terminal_history_popup_open
         || foreground_message_popup_open
-        || create_worktree_popup_open)
+        || create_worktree_popup_open
+        || checklist_floating_open)
 }
 
 fn ui_owns_keyboard_state(
@@ -16085,13 +16092,15 @@ impl AdeApp {
                     }
 
                     ui.add_space(6.0);
-                    let _checklist_response = styled_icon_toggle(
+                    let checklist_active = self.checklist_floating_open;
+                    if styled_icon_toggle(
                         ui,
-                        true,
+                        checklist_active,
                         icons::CHECK_CIRCLE,
-                        "Check-list Panel (pinned)",
-                    );
-                    // Check-list is always visible; no toggle behavior
+                        "Toggle Check-list",
+                    ) {
+                        self.checklist_floating_open = !self.checklist_floating_open;
+                    }
 
                     ui.add_space(6.0);
                     let browser_panel_active = self.is_active_browser_panel_open();
@@ -17379,10 +17388,9 @@ impl AdeApp {
                 let _ = header_state.show_body_unindented(ui, |ui| {
                     ui.indent(Id::new(("terminal-manager-body", project_id)), |ui| {
                         ui.add_space(4.0);
-                        // Calculate max available tooltip right edge based on checklist panel
                         // Calculate max available tooltip right edge based on right panels
                         let screen_right = ui.ctx().screen_rect().right();
-                        let mut right_offset = self.config.ui.checklist_panel_width + 8.0;
+                        let mut right_offset = 8.0;
                         if self.is_active_browser_panel_open() {
                             right_offset += self.config.ui.browser_panel_width;
                         }
@@ -18606,9 +18614,13 @@ impl AdeApp {
         items.join("\n\n")
     }
 
-    /// Draw the Check-list panel on the right side.
-    /// Shows projects with checklist items.
+    /// Draw the Check-list as a floating bottom-right popup window.
+    /// Triggered by the activity rail icon. Does not affect main layout width.
     fn draw_checklist_panel(&mut self, ctx: &egui::Context) -> Option<egui::Rect> {
+        if !self.checklist_floating_open {
+            return None;
+        }
+
         // Collect projects with checklist items first (to avoid borrow issues)
         let projects_with_checklist: Vec<(u64, String, Vec<String>)> = {
             let mut projects: Vec<(u64, String, Vec<String>)> = Vec::new();
@@ -18617,17 +18629,17 @@ impl AdeApp {
                     projects.push((*project_id, project.name.clone(), project.checklist.clone()));
                 }
             }
-            // Sort by project id for stable ordering
             projects.sort_by(|a, b| a.0.cmp(&b.0));
             projects
         };
 
-        let response = egui::SidePanel::right("checklist_panel")
-            .resizable(true)
-            .default_width(self.config.ui.checklist_panel_width)
-            .min_width(280.0)
-            .max_width(560.0)
-            .show_separator_line(false)
+        let mut open = self.checklist_floating_open;
+        egui::Window::new("Check-list")
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-18.0, -80.0))
+            .order(egui::Order::Foreground)
+            .open(&mut open)
+            .max_size(egui::vec2(360.0, 500.0))
+            .default_size(egui::vec2(320.0, 400.0))
             .frame(
                 egui::Frame::none()
                     .fill(SURFACE_BG)
@@ -18636,23 +18648,11 @@ impl AdeApp {
                     .inner_margin(egui::Margin::same(10.0)),
             )
             .show(ctx, |ui| {
-                ui.set_width(ui.max_rect().width());
-
-                // Header
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Check-list")
-                            .strong()
-                            .size(15.0)
-                            .color(TEXT_PRIMARY),
-                    );
-                });
-                ui.separator();
-
                 // Wrap content in ScrollArea for long lists
                 egui::ScrollArea::vertical()
                     .id_salt("checklist_panel_scroll")
                     .auto_shrink([false, false])
+                    .max_height(450.0)
                     .show(ui, |ui| {
                         if projects_with_checklist.is_empty() {
                             ui.add_space(20.0);
@@ -18798,20 +18798,8 @@ impl AdeApp {
                     });
             });
 
-        let actual_width = response.response.rect.width();
-        if (actual_width - self.config.ui.checklist_panel_width).abs() > 0.5 {
-            self.config.ui.checklist_panel_width = actual_width;
-            self.note_ui_config_changed();
-        }
-
-        paint_panel_resize_overlay(
-            ctx,
-            response.response.rect,
-            PanelResizeSide::Right,
-            "checklist-panel",
-        );
-
-        Some(response.response.rect)
+        self.checklist_floating_open = open;
+        None
     }
 
     /// Set the browser URL for a scope and update the draft.
@@ -20954,6 +20942,7 @@ impl AdeApp {
             self.browser_panel_overlay_active,
             self.foreground_message_popup_open.is_some(),
             self.show_create_worktree_popup,
+            self.checklist_floating_open,
         )
     }
 
@@ -21964,6 +21953,7 @@ impl AdeApp {
                     self.terminal_history_popup_open.is_some(),
                     self.foreground_message_popup_open.is_some(),
                     self.show_create_worktree_popup,
+                    self.checklist_floating_open,
                 );
 
                 let mut scroll_area_output = scroll_area.show(&mut output_ui, |ui| {
@@ -23802,7 +23792,8 @@ fn recover_config_state(
     config.ui.show_project_explorer = current_config.ui.show_project_explorer;
     config.ui.show_terminal_manager = current_config.ui.show_terminal_manager;
     config.ui.main_visibility_mode = current_config.ui.main_visibility_mode;
-    config.ui.checklist_panel_expanded = current_config.ui.checklist_panel_expanded;
+    // Check-list panel is now a floating popup (runtime-only); sanitize legacy persisted flag to false
+    config.ui.checklist_panel_expanded = false;
     // Browser panel open state is runtime-only; sanitize legacy persisted flag to false
     config.ui.browser_panel_expanded = false;
 
@@ -41041,6 +41032,7 @@ mod tests {
             directory_index_generation: BTreeMap::new(),
             directory_index_subtree_loading_by_project: BTreeMap::new(),
             checklist_collapsed_by_project: BTreeMap::new(),
+            checklist_floating_open: false,
             history_path: test_temp_path("mergen-ade-test-history", "json"),
             input_history: AppHistory::default(),
             input_history_search_query: String::new(),
@@ -45650,6 +45642,7 @@ mod tests {
             .unwrap_or(false));
         // Toggle collapsed
         app.checklist_collapsed_by_project.insert(1, true);
+        app.checklist_floating_open = true;
         let _ = ctx.run(RawInput::default(), |ctx| {
             app.draw_checklist_panel(ctx);
         });
@@ -45723,7 +45716,7 @@ mod tests {
             1,
             test_project(1, "Demo", "C:/demo", &[], &[&"a".repeat(2000)]),
         );
-        app.config.ui.checklist_panel_expanded = true;
+        app.checklist_floating_open = true;
 
         let _ = ctx.run(RawInput::default(), |ctx| {
             app.draw_checklist_panel(ctx);
@@ -45753,8 +45746,8 @@ mod tests {
         );
 
         assert!(
-            recovered.ui.checklist_panel_expanded,
-            "Checklist panel should remain open even when empty"
+            !recovered.ui.checklist_panel_expanded,
+            "Legacy checklist_panel_expanded should be sanitized to false"
         );
     }
 
@@ -45796,29 +45789,29 @@ mod tests {
         );
 
         assert!(
-            recovered.ui.checklist_panel_expanded,
-            "Checklist panel should remain open when items exist"
+            !recovered.ui.checklist_panel_expanded,
+            "Legacy checklist_panel_expanded should be sanitized to false"
         );
     }
 
     #[test]
-    fn checklist_panel_remains_open_when_last_item_removed() {
+    fn checklist_floating_remains_open_when_last_item_removed() {
         let mut app = test_app([(1, test_terminal_entry(1, 1))], Some(1));
         // Add project 1 with a checklist item
         app.projects
             .insert(1, test_project(1, "Demo", "C:/demo", &[], &["only_item"]));
-        // Panel is visible by default
-        app.config.ui.checklist_panel_expanded = true;
+        // Floating window is open by default
+        app.checklist_floating_open = true;
 
         // Remove the last item
         if let Some(project) = app.projects.get_mut(&1) {
             project.checklist.clear();
         }
 
-        // Panel should stay open even when empty
+        // Floating window should stay open even when empty
         assert!(
-            app.config.ui.checklist_panel_expanded,
-            "Panel should remain open when last checklist item is removed"
+            app.checklist_floating_open,
+            "Floating checklist should remain open when last checklist item is removed"
         );
     }
 
@@ -48355,7 +48348,6 @@ mod tests {
             .insert(7, test_project(7, "Allowed", "C:/allowed", &[], &[]));
         app.projects
             .insert(8, test_project(8, "Blocked", "C:/blocked", &[], &[]));
-        app.config.ui.checklist_panel_expanded = true;
         let request = crate::browser_mcp_service::BrowserMcpIpcRequest {
             request_id: "request".to_owned(),
             terminal_id: Some(1),
@@ -48374,7 +48366,6 @@ mod tests {
 
         assert!(response.is_error);
         assert_eq!(response.text, "Browser MCP project authorization mismatch");
-        assert!(app.config.ui.checklist_panel_expanded);
         assert!(!app.browser_panel_open_projects.contains(&8));
         assert!(!app
             .embedded_browsers_by_scope
@@ -48412,20 +48403,21 @@ mod tests {
     }
 
     #[test]
-    fn browser_panel_and_checklist_can_coexist() {
+    fn browser_panel_and_floating_checklist_can_coexist() {
         let mut app = test_app([], None);
         // Add a project and select it
         let project = test_project(1, "Demo", "C:/demo", &[], &[]);
         app.projects.insert(1, project);
         app.selected_project = Some(1);
 
-        // Checklist is always visible by default
-        assert!(app.config.ui.checklist_panel_expanded);
+        // Floating checklist is closed by default
+        assert!(!app.checklist_floating_open);
         assert!(!app.is_active_browser_panel_open());
 
-        // Open browser - checklist should remain open
+        // Open browser and floating checklist - both can be open
         app.set_active_browser_panel_open(true);
-        assert!(app.config.ui.checklist_panel_expanded);
+        app.checklist_floating_open = true;
+        assert!(app.checklist_floating_open);
         assert!(app.is_active_browser_panel_open());
     }
 
@@ -49028,8 +49020,6 @@ mod tests {
 
         // Browser panel should be open for project 1
         assert!(app.is_browser_panel_open_for_project(1));
-        // Checklist should remain open
-        assert!(app.config.ui.checklist_panel_expanded);
     }
 
     #[test]
@@ -49359,42 +49349,46 @@ mod tests {
     #[test]
     fn embedded_browser_yields_to_ui_overlay_layers() {
         // Test the pure predicate for all overlay sources
-        // Parameters: settings, exit_confirm, terminal_history_popup, egui_popup, context_menu_open, context_menu_overlaps_browser, browser_overlay_active, foreground_message_popup_open, create_worktree_popup_open
+        // Parameters: settings, exit_confirm, terminal_history_popup, egui_popup, context_menu_open, context_menu_overlaps_browser, browser_overlay_active, foreground_message_popup_open, create_worktree_popup_open, checklist_floating_open
         assert!(embedded_browser_should_yield_to_ui_layer(
-            true, false, false, false, false, false, false, false, false
+            true, false, false, false, false, false, false, false, false, false
         ));
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, true, false, false, false, false, false, false, false
+            false, true, false, false, false, false, false, false, false, false
         ));
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, true, false, false, false, false, false, false
+            false, false, true, false, false, false, false, false, false, false
         ));
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, false, true, false, false, false, false, false
+            false, false, false, true, false, false, false, false, false, false
         ));
         // Context menu only yields when it overlaps with browser
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, true, true, false, false, false
+            false, false, false, false, true, true, false, false, false, false
         ));
         // Context menu does NOT yield when it doesn't overlap
         assert!(!embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, true, false, false, false, false
+            false, false, false, false, true, false, false, false, false, false
         ));
         // No overlays at all
         assert!(!embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, false, false, false, false, false
+            false, false, false, false, false, false, false, false, false, false
         ));
         // Browser overlay active (dropdown, tooltip, hover) should cause yield
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, false, false, true, false, false
+            false, false, false, false, false, false, true, false, false, false
         ));
         // Foreground message popup open should cause yield
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, false, false, false, true, false
+            false, false, false, false, false, false, false, true, false, false
         ));
         // Create worktree popup open should cause yield
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, false, false, false, false, true
+            false, false, false, false, false, false, false, false, true, false
+        ));
+        // Check-list floating open should cause yield
+        assert!(embedded_browser_should_yield_to_ui_layer(
+            false, false, false, false, false, false, false, false, false, true
         ));
     }
 
@@ -49714,7 +49708,7 @@ mod tests {
     fn terminal_output_mouse_wheel_enabled_returns_true_when_no_overlays() {
         // When no UI overlays are open, wheel handling should be enabled
         assert!(terminal_output_mouse_wheel_enabled(
-            false, false, false, false, false
+            false, false, false, false, false, false
         ));
     }
 
@@ -49722,7 +49716,7 @@ mod tests {
     fn terminal_output_mouse_wheel_enabled_returns_false_when_settings_open() {
         // Settings popup should disable terminal wheel handling
         assert!(!terminal_output_mouse_wheel_enabled(
-            true, false, false, false, false
+            true, false, false, false, false, false
         ));
     }
 
@@ -49730,7 +49724,7 @@ mod tests {
     fn terminal_output_mouse_wheel_enabled_returns_false_when_exit_confirm_open() {
         // Exit confirmation popup should disable terminal wheel handling
         assert!(!terminal_output_mouse_wheel_enabled(
-            false, true, false, false, false
+            false, true, false, false, false, false
         ));
     }
 
@@ -49738,7 +49732,7 @@ mod tests {
     fn terminal_output_mouse_wheel_enabled_returns_false_when_terminal_history_open() {
         // Terminal history popup should disable terminal wheel handling
         assert!(!terminal_output_mouse_wheel_enabled(
-            false, false, true, false, false
+            false, false, true, false, false, false
         ));
     }
 
@@ -49746,7 +49740,7 @@ mod tests {
     fn terminal_output_mouse_wheel_enabled_returns_false_when_foreground_message_open() {
         // Foreground message popup should disable terminal wheel handling
         assert!(!terminal_output_mouse_wheel_enabled(
-            false, false, false, true, false
+            false, false, false, true, false, false
         ));
     }
 
@@ -49754,7 +49748,15 @@ mod tests {
     fn terminal_output_mouse_wheel_enabled_returns_false_when_create_worktree_open() {
         // Create worktree popup should disable terminal wheel handling
         assert!(!terminal_output_mouse_wheel_enabled(
-            false, false, false, false, true
+            false, false, false, false, true, false
+        ));
+    }
+
+    #[test]
+    fn terminal_output_mouse_wheel_enabled_returns_false_when_checklist_floating_open() {
+        // Check-list floating popup should disable terminal wheel handling
+        assert!(!terminal_output_mouse_wheel_enabled(
+            false, false, false, false, false, true
         ));
     }
 
@@ -49762,16 +49764,16 @@ mod tests {
     fn terminal_output_mouse_wheel_enabled_returns_false_when_multiple_overlays() {
         // Any combination of overlays should disable wheel handling
         assert!(!terminal_output_mouse_wheel_enabled(
-            true, true, false, false, false
+            true, true, false, false, false, false
         ));
         assert!(!terminal_output_mouse_wheel_enabled(
-            true, false, true, false, false
+            true, false, true, false, false, false
         ));
         assert!(!terminal_output_mouse_wheel_enabled(
-            false, true, true, true, false
+            false, true, true, true, false, false
         ));
         assert!(!terminal_output_mouse_wheel_enabled(
-            true, true, true, true, false
+            true, true, true, true, false, false
         ));
     }
 
@@ -50688,10 +50690,10 @@ mod tests {
         app.set_browser_panel_open_for_project(1, true);
         app.set_browser_panel_open_for_project(2, true);
 
-        // Set active to project 1 and open checklist
+        // Set active to project 1 and open floating checklist
         app.active_terminal = Some(101);
-        app.config.ui.checklist_panel_expanded = true;
-        // Simulate checklist toggle behavior
+        app.checklist_floating_open = true;
+        // Simulate closing browser panel
         app.set_active_browser_panel_open(false);
 
         // Only active project (1) browser should close; project 2 remains open
