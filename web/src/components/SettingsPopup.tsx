@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { WebShortcut, WebLauncher } from '../types';
+import { Button, Icon } from '../components/ui';
 
 interface Props {
   shortcuts: WebShortcut[];
@@ -24,66 +25,126 @@ export const SettingsPopup: React.FC<Props> = ({ shortcuts, launchers, defaultSh
       <div style={{
         width: 600,
         maxHeight: '80vh',
-        background: '#1a1a1a',
-        border: '1px solid #444',
-        borderRadius: 8,
+        background: 'var(--bg-elevated)',
+        border: '1px solid var(--border-default)',
+        borderRadius: 'var(--radius-xl)',
         display: 'flex',
         flexDirection: 'column',
         overflow: 'hidden',
       }}>
-        <div style={{ padding: '12px 16px', borderBottom: '1px solid #333', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <strong style={{ color: '#e0e0e0' }}>Settings</strong>
-          <button onClick={onClose} style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 18 }}>×</button>
+        <div style={{
+          padding: 'var(--space-lg) var(--space-xl)',
+          borderBottom: '1px solid var(--border-subtle)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+        }}>
+          <strong style={{ color: 'var(--text-primary)', fontSize: 'var(--font-lg)' }}>Settings</strong>
+          <Button variant="ghost" onClick={onClose} style={{ fontSize: 'var(--font-xl)', padding: 'var(--space-xs)', minWidth: 32, minHeight: 32 }}>
+            <Icon symbol="✕" size={16} />
+          </Button>
         </div>
-        <div style={{ display: 'flex', borderBottom: '1px solid #333' }}>
-          {(['shortcuts', 'launchers', 'general'] as const).map(t => (
-            <button
-              key={t}
-              onClick={() => setTab(t)}
-              style={{
-                flex: 1,
-                padding: '8px 12px',
-                background: tab === t ? '#264f78' : 'transparent',
-                border: 'none',
-                color: tab === t ? '#4fc3f7' : '#888',
-                cursor: 'pointer',
-                fontSize: 12,
-                textTransform: 'capitalize',
-              }}
-            >
-              {t}
-            </button>
-          ))}
+
+        <div style={{ display: 'flex', borderBottom: '1px solid var(--border-subtle)' }}>
+          {(['shortcuts', 'launchers', 'general'] as const).map(t => {
+            const isActive = tab === t;
+            return (
+              <button
+                key={t}
+                onClick={() => setTab(t)}
+                style={{
+                  flex: 1,
+                  padding: 'var(--space-md) var(--space-lg)',
+                  background: isActive ? 'var(--bg-active)' : 'transparent',
+                  border: 'none',
+                  borderBottom: isActive ? '2px solid var(--accent)' : '2px solid transparent',
+                  color: isActive ? 'var(--accent)' : 'var(--text-secondary)',
+                  cursor: 'pointer',
+                  fontSize: 'var(--font-base)',
+                  textTransform: 'capitalize',
+                  fontWeight: isActive ? 600 : 400,
+                  transition: 'background 0.12s, color 0.12s',
+                }}
+                onMouseEnter={e => {
+                  if (!isActive) e.currentTarget.style.background = 'var(--bg-hover)';
+                }}
+                onMouseLeave={e => {
+                  if (!isActive) e.currentTarget.style.background = 'transparent';
+                }}
+              >
+                {t}
+              </button>
+            );
+          })}
         </div>
-        <div style={{ flex: 1, overflow: 'auto', padding: 12 }}>
+
+        <div style={{ flex: 1, overflow: 'auto', padding: 'var(--space-lg)' }}>
           {tab === 'shortcuts' && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)' }}>
               {shortcuts.map(s => (
-                <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px', background: '#222', borderRadius: 4 }}>
-                  <span style={{ fontSize: 11, color: '#4fc3f7', minWidth: 60 }}>{s.key}</span>
-                  <span style={{ fontSize: 11, color: '#e0e0e0', flex: 1 }}>{s.label}</span>
-                  <span style={{ fontSize: 10, color: '#888' }}>{s.command}</span>
-                  <span style={{ fontSize: 10, color: s.enabled ? '#4caf50' : '#f44336' }}>{s.enabled ? 'ON' : 'OFF'}</span>
+                <div
+                  key={s.id}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 'var(--space-md)',
+                    padding: 'var(--space-sm) var(--space-md)',
+                    background: 'var(--bg-hover)',
+                    borderRadius: 'var(--radius-md)',
+                  }}
+                >
+                  <span style={{ fontSize: 'var(--font-sm)', color: 'var(--accent)', minWidth: 60, fontWeight: 500 }}>
+                    {s.key}
+                  </span>
+                  <span style={{ fontSize: 'var(--font-sm)', color: 'var(--text-primary)', flex: 1 }}>
+                    {s.label}
+                  </span>
+                  <span style={{ fontSize: 'var(--font-xs)', color: 'var(--text-muted)' }}>
+                    {s.command}
+                  </span>
+                  <span style={{ fontSize: 'var(--font-xs)', color: s.enabled ? 'var(--success)' : 'var(--danger)', fontWeight: 600 }}>
+                    {s.enabled ? 'ON' : 'OFF'}
+                  </span>
                 </div>
               ))}
             </div>
           )}
           {tab === 'launchers' && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)' }}>
               {launchers.map(l => (
-                <div key={l.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px', background: '#222', borderRadius: 4 }}>
-                  <span style={{ fontSize: 11, color: '#e0e0e0', flex: 1 }}>{l.display_name}</span>
-                  <span style={{ fontSize: 10, color: '#888' }}>{l.command}</span>
-                  <span style={{ fontSize: 10, color: l.enabled ? '#4caf50' : '#f44336' }}>{l.enabled ? 'ON' : 'OFF'}</span>
+                <div
+                  key={l.id}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 'var(--space-md)',
+                    padding: 'var(--space-sm) var(--space-md)',
+                    background: 'var(--bg-hover)',
+                    borderRadius: 'var(--radius-md)',
+                  }}
+                >
+                  <span style={{ fontSize: 'var(--font-sm)', color: 'var(--text-primary)', flex: 1 }}>
+                    {l.display_name}
+                  </span>
+                  <span style={{ fontSize: 'var(--font-xs)', color: 'var(--text-muted)' }}>
+                    {l.command}
+                  </span>
+                  <span style={{ fontSize: 'var(--font-xs)', color: l.enabled ? 'var(--success)' : 'var(--danger)', fontWeight: 600 }}>
+                    {l.enabled ? 'ON' : 'OFF'}
+                  </span>
                 </div>
               ))}
             </div>
           )}
           {tab === 'general' && (
-            <div style={{ fontSize: 12, color: '#e0e0e0' }}>
-              <div style={{ marginBottom: 12 }}>
-                <div style={{ color: '#888', marginBottom: 4 }}>Default Shell</div>
-                <div>{defaultShell}</div>
+            <div style={{ fontSize: 'var(--font-base)', color: 'var(--text-primary)' }}>
+              <div style={{ marginBottom: 'var(--space-lg)' }}>
+                <div style={{ color: 'var(--text-secondary)', marginBottom: 'var(--space-sm)', fontSize: 'var(--font-sm)', fontWeight: 500 }}>
+                  Default Shell
+                </div>
+                <div style={{ background: 'var(--bg-hover)', padding: 'var(--space-sm) var(--space-md)', borderRadius: 'var(--radius-md)' }}>
+                  {defaultShell}
+                </div>
               </div>
             </div>
           )}

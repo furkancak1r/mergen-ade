@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { PanelHeader, Button, Input } from '../components/ui';
 
 interface Props {
   url: string;
@@ -24,19 +25,17 @@ export const BrowserPanel: React.FC<Props> = ({ url, onUrlChange }) => {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-      <div style={{ padding: 6, borderBottom: '1px solid #333', display: 'flex', gap: 4 }}>
-        <input
+      <div style={{ padding: 'var(--space-sm) var(--space-md)', borderBottom: '1px solid var(--border-subtle)', display: 'flex', gap: 'var(--space-sm)', flexShrink: 0 }}>
+        <Input
           value={inputUrl}
           onChange={e => setInputUrl(e.target.value)}
           onKeyDown={e => e.key === 'Enter' && handleNavigate()}
-          style={{ flex: 1, background: '#1a1a1a', border: '1px solid #444', color: '#e0e0e0', fontSize: 12, padding: '2px 6px' }}
+          placeholder="Enter URL…"
+          style={{ flex: 1 }}
         />
-        <button
-          onClick={handleNavigate}
-          style={{ background: '#1e3a5f', border: '1px solid #4fc3f7', color: '#4fc3f7', fontSize: 11, cursor: 'pointer', padding: '2px 8px' }}
-        >
+        <Button variant="primary" onClick={handleNavigate}>
           Go
-        </button>
+        </Button>
       </div>
       <div style={{ flex: 1, overflow: 'hidden' }}>
         {url ? (
@@ -49,7 +48,7 @@ export const BrowserPanel: React.FC<Props> = ({ url, onUrlChange }) => {
             title="Browser Panel"
           />
         ) : (
-          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#666', fontSize: 12 }}>
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', fontSize: 'var(--font-base)' }}>
             Enter a URL to browse
           </div>
         )}

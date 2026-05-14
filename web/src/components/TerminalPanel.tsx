@@ -4,6 +4,7 @@ import { FitAddon } from 'xterm-addon-fit';
 import { WebLinksAddon } from 'xterm-addon-web-links';
 import 'xterm/css/xterm.css';
 import { WebTerminal } from '../types';
+import { Icon } from '../components/ui';
 
 export interface TerminalPanelHandle {
   writeOutput: (data: Uint8Array) => void;
@@ -38,18 +39,18 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
         fontFamily: 'Consolas, "Courier New", monospace',
         fontSize: isSmallPhone ? 11 : isMobile ? 12 : 14,
         theme: {
-          background: '#0c0c0c',
-          foreground: '#e0e0e0',
-          cursor: '#4fc3f7',
-          selectionBackground: '#264f78',
+          background: 'var(--bg-base)',
+          foreground: 'var(--text-primary)',
+          cursor: 'var(--accent)',
+          selectionBackground: 'var(--bg-active)',
           black: '#0c0c0c',
-          red: '#f44336',
-          green: '#4caf50',
+          red: 'var(--danger)',
+          green: 'var(--success)',
           yellow: '#ffeb3b',
-          blue: '#4fc3f7',
+          blue: 'var(--accent)',
           magenta: '#e040fb',
           cyan: '#00bcd4',
-          white: '#e0e0e0',
+          white: 'var(--text-primary)',
           brightBlack: '#666',
           brightRed: '#ff5252',
           brightGreen: '#69f0ae',
@@ -68,7 +69,6 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
       term.loadAddon(new WebLinksAddon());
       term.open(containerRef.current);
 
-      // Fit after a short delay to let container settle
       requestAnimationFrame(() => {
         fit.fit();
         onResize(term.cols, term.rows);
@@ -104,19 +104,38 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
 
     return (
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-        <div style={{ height: 28, background: '#1a1a1a', borderBottom: '1px solid #333', display: 'flex', alignItems: 'center', padding: '0 8px', gap: 8, flexShrink: 0 }}>
-          <span style={{ fontSize: 12, color: '#aaa' }}>#{terminal.id}</span>
-          <span style={{ fontSize: 12, color: '#e0e0e0', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        <div style={{
+          height: 28,
+          background: 'var(--bg-elevated)',
+          borderBottom: '1px solid var(--border-subtle)',
+          display: 'flex',
+          alignItems: 'center',
+          padding: '0 var(--space-sm)',
+          gap: 'var(--space-sm)',
+          flexShrink: 0,
+        }}>
+          <span style={{ fontSize: 'var(--font-base)', color: 'var(--text-secondary)', fontVariantNumeric: 'tabular-nums' }}>
+            #{terminal.id}
+          </span>
+          <span style={{ fontSize: 'var(--font-base)', color: 'var(--text-primary)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {terminal.title}
           </span>
-          {terminal.exited && <span style={{ fontSize: 10, color: '#f44336', fontWeight: 'bold' }}>EXITED</span>}
+          {terminal.exited && (
+            <span style={{ fontSize: 'var(--font-xs)', color: 'var(--danger)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+              Exited
+            </span>
+          )}
           {terminal.ai_status && (
-            <span style={{ fontSize: 10, color: terminal.ai_status === 'Working' ? '#4fc3f7' : '#ff9800' }}>
+            <span style={{
+              fontSize: 'var(--font-xs)',
+              color: terminal.ai_status === 'Working' ? 'var(--accent)' : 'var(--warning)',
+              fontWeight: 500,
+            }}>
               {terminal.ai_status}
             </span>
           )}
         </div>
-        <div ref={containerRef} style={{ flex: 1, padding: 4 }} />
+        <div ref={containerRef} style={{ flex: 1, padding: 'var(--space-xs)' }} />
       </div>
     );
   }

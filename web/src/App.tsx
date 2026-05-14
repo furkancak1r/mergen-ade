@@ -13,6 +13,7 @@ import { ChecklistPanel } from './components/ChecklistPanel';
 import { SettingsPopup } from './components/SettingsPopup';
 import { SmartInput } from './components/SmartInput';
 import { InputHistoryPanel } from './components/InputHistoryPanel';
+import { Button, Input, EmptyState } from './components/ui';
 import {
   ServerMessage,
   WebProject,
@@ -103,7 +104,6 @@ export default function App() {
     handleTerminalOutput
   );
 
-  // Shared fetch options with auth token
   const fetchOpts = (method: string, body?: object): RequestInit => ({
     method,
     headers: {
@@ -218,41 +218,63 @@ export default function App() {
   const showSidebar = activePanel && activePanel !== 'browser' && activePanel !== 'checklist';
 
   return (
-    <div className="main-area" style={{ display: 'flex', flexDirection: 'column', width: '100vw', height: '100vh', overflow: 'hidden', background: '#0c0c0c' }}>
+    <div className="main-area" style={{
+      display: 'flex',
+      flexDirection: 'column',
+      width: '100vw',
+      height: '100vh',
+      overflow: 'hidden',
+      background: 'var(--bg-base)',
+    }}>
       {/* Top bar */}
-      <div className="top-bar" style={{ height: 40, background: '#1a1a1a', borderBottom: '1px solid #333', display: 'flex', alignItems: 'center', padding: '0 12px', gap: 12, flexShrink: 0 }}>
+      <div className="top-bar" style={{
+        height: 40,
+        background: 'var(--bg-elevated)',
+        borderBottom: '1px solid var(--border-subtle)',
+        display: 'flex',
+        alignItems: 'center',
+        padding: '0 var(--space-lg)',
+        gap: 'var(--space-lg)',
+        flexShrink: 0,
+      }}>
         {isMobile && (
-          <button
+          <Button
+            variant="ghost"
             onClick={() => setMobileSidebarOpen(v => !v)}
-            style={{ background: 'transparent', border: 'none', color: '#e0e0e0', fontSize: 20, cursor: 'pointer', minWidth: 44, minHeight: 44, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-            aria-label="Toggle menu"
+            style={{ fontSize: 20, minWidth: 44, minHeight: 44, padding: 0 }}
+            title="Toggle menu"
           >
             ☰
-          </button>
+          </Button>
         )}
-        <strong style={{ color: '#4fc3f7', fontSize: 14 }}>Mergen ADE</strong>
-        <span style={{ fontSize: 12, color: connected ? '#4caf50' : '#f44336' }}>
-          {connected ? '● Connected' : '● Disconnected'}
+        <strong style={{ color: 'var(--accent)', fontSize: 'var(--font-lg)' }}>Mergen ADE</strong>
+        <span style={{ fontSize: 'var(--font-base)', color: connected ? 'var(--success)' : 'var(--danger)', display: 'flex', alignItems: 'center', gap: 'var(--space-xs)' }}>
+          <span style={{ width: 8, height: 8, borderRadius: '50%', background: connected ? 'var(--success)' : 'var(--danger)', display: 'inline-block' }} />
+          {connected ? 'Connected' : 'Disconnected'}
         </span>
         <div style={{ flex: 1 }} />
         {!connected && (
-          <div style={{ display: 'flex', gap: 4 }}>
-            <input
+          <div style={{ display: 'flex', gap: 'var(--space-sm)', alignItems: 'center' }}>
+            <Input
               type="text"
               placeholder="Auth token"
               value={token}
               onChange={e => setToken(e.target.value)}
-              style={{ background: '#222', border: '1px solid #444', color: '#e0e0e0', padding: '2px 6px', fontSize: 12 }}
+              style={{ width: 200 }}
             />
-            <button
-              onClick={() => { localStorage.setItem('mergen_token', token); window.location.reload(); }}
-              style={{ background: '#333', border: '1px solid #555', color: '#e0e0e0', fontSize: 12, cursor: 'pointer', padding: '6px 12px' }}
-            >
+            <Button variant="secondary" onClick={() => { localStorage.setItem('mergen_token', token); window.location.reload(); }}>
               Connect
-            </button>
+            </Button>
           </div>
         )}
-        <span style={{ fontSize: 11, color: '#888', maxWidth: 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        <span style={{
+          fontSize: 'var(--font-sm)',
+          color: 'var(--text-secondary)',
+          maxWidth: 400,
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        }}>
           {statusLine}
         </span>
       </div>
@@ -281,31 +303,45 @@ export default function App() {
             style={{
               width: 280,
               flexShrink: 0,
-              background: '#141414',
-              borderRight: '1px solid #333',
+              background: 'var(--bg-surface)',
+              borderRight: '1px solid var(--border-subtle)',
               display: 'flex',
               flexDirection: 'column',
               overflow: 'hidden',
             }}
           >
             {selectedProject && (
-              <div style={{ padding: '8px 10px', borderBottom: '1px solid #333', background: '#1a1a1a' }}>
-                <div style={{ fontSize: 12, fontWeight: 'bold', color: '#e0e0e0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginBottom: 6 }}>
+              <div style={{
+                padding: 'var(--space-md) var(--space-lg)',
+                borderBottom: '1px solid var(--border-subtle)',
+                background: 'var(--bg-elevated)',
+              }}>
+                <div style={{
+                  fontSize: 'var(--font-base)',
+                  fontWeight: 700,
+                  color: 'var(--text-primary)',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                  marginBottom: 'var(--space-sm)',
+                }}>
                   {selectedProject.name}
                 </div>
-                <div style={{ display: 'flex', gap: 4 }}>
-                  <button
+                <div style={{ display: 'flex', gap: 'var(--space-sm)' }}>
+                  <Button
+                    variant="primary"
                     onClick={() => handleSpawnTerminal(selectedProject.id, 'powershell', 'foreground')}
-                    style={{ flex: 1, fontSize: 10, background: '#1e3a5f', border: '1px solid #4fc3f7', color: '#4fc3f7', cursor: 'pointer', padding: '6px 6px', borderRadius: 3, minHeight: 32 }}
+                    style={{ flex: 1, fontSize: 'var(--font-xs)', minHeight: 32 }}
                   >
                     + Foreground
-                  </button>
-                  <button
+                  </Button>
+                  <Button
+                    variant="secondary"
                     onClick={() => handleSpawnTerminal(selectedProject.id, 'powershell', 'background')}
-                    style={{ flex: 1, fontSize: 10, background: '#2a2a2a', border: '1px solid #888', color: '#888', cursor: 'pointer', padding: '6px 6px', borderRadius: 3, minHeight: 32 }}
+                    style={{ flex: 1, fontSize: 'var(--font-xs)', minHeight: 32 }}
                   >
                     + Background
-                  </button>
+                  </Button>
                 </div>
               </div>
             )}
@@ -338,15 +374,21 @@ export default function App() {
                   onResize={(cols, lines) => sendMessage({ kind: 'terminal_resize', terminal_id: activeTerminal.id, cols, lines })}
                 />
               ) : (
-                <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#666', fontSize: 14, textAlign: 'center', padding: 16 }}>
-                  No active terminal. Select a project and spawn a terminal.
-                </div>
+                <EmptyState message="No active terminal. Select a project and spawn a terminal." />
               )}
             </div>
 
             {/* Check-list panel (right side, hidden on mobile) */}
             {checklistOpen && !isMobile && (
-              <div style={{ width: 260, flexShrink: 0, background: '#141414', borderLeft: '1px solid #333', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+              <div style={{
+                width: 260,
+                flexShrink: 0,
+                background: 'var(--bg-surface)',
+                borderLeft: '1px solid var(--border-subtle)',
+                display: 'flex',
+                flexDirection: 'column',
+                overflow: 'hidden',
+              }}>
                 <ChecklistPanel
                   projects={projects}
                   onCopyItems={projectId => {
@@ -362,7 +404,15 @@ export default function App() {
 
             {/* Browser panel (right side, hidden on mobile) */}
             {browserOpen && !isMobile && (
-              <div style={{ width: 360, flexShrink: 0, background: '#141414', borderLeft: '1px solid #333', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+              <div style={{
+                width: 360,
+                flexShrink: 0,
+                background: 'var(--bg-surface)',
+                borderLeft: '1px solid var(--border-subtle)',
+                display: 'flex',
+                flexDirection: 'column',
+                overflow: 'hidden',
+              }}>
                 <BrowserPanel
                   url={browserUrl}
                   onUrlChange={setBrowserUrl}

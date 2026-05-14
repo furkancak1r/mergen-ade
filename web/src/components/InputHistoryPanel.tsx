@@ -1,5 +1,6 @@
 import React from 'react';
 import { WebTerminal } from '../types';
+import { PanelHeader, ScrollArea, EmptyState, Row } from '../components/ui';
 
 interface Props {
   terminals: WebTerminal[];
@@ -13,20 +14,22 @@ export const InputHistoryPanel: React.FC<Props> = ({ terminals, onSend }) => {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-      <div style={{ padding: 8, borderBottom: '1px solid #333', display: 'flex', alignItems: 'center', gap: 4 }}>
-        <strong style={{ fontSize: 12, color: '#aaa', flex: 1 }}>Input History</strong>
-      </div>
-      <div style={{ flex: 1, overflow: 'auto' }}>
-        {foreground.length === 0 && (
-          <div style={{ padding: 8, fontSize: 11, color: '#666' }}>No foreground terminals</div>
-        )}
-        {foreground.map(t => (
-          <div key={t.id} style={{ padding: '4px 8px', borderBottom: '1px solid #222' }}>
-            <div style={{ fontSize: 10, color: '#4fc3f7', marginBottom: 2 }}>#{t.id} {t.title}</div>
-            <div style={{ fontSize: 11, color: '#e0e0e0' }}>{t.ai_status || 'Idle'}</div>
-          </div>
-        ))}
-      </div>
+      <PanelHeader title="Input History" />
+      <ScrollArea>
+        <div style={{ padding: 'var(--space-xs)' }}>
+          {foreground.length === 0 && <EmptyState message="No foreground terminals" />}
+          {foreground.map(t => (
+            <Row key={t.id} style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 'var(--space-xs)' }}>
+              <div style={{ fontSize: 'var(--font-xs)', color: 'var(--accent)', fontWeight: 500 }}>
+                #{t.id} {t.title}
+              </div>
+              <div style={{ fontSize: 'var(--font-sm)', color: 'var(--text-primary)' }}>
+                {t.ai_status || 'Idle'}
+              </div>
+            </Row>
+          ))}
+        </div>
+      </ScrollArea>
     </div>
   );
 };

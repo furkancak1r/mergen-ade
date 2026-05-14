@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { WebTerminal } from '../types';
+import { Button, TextArea, Icon, PopupMenu, PopupMenuItem } from '../components/ui';
 
 interface Props {
   terminal: WebTerminal | null;
@@ -23,36 +24,74 @@ export const SmartInput: React.FC<Props> = ({ terminal, onSubmit }) => {
   if (!terminal || terminal.exited) return null;
 
   return (
-    <div style={{ borderTop: '1px solid #333', background: '#141414', padding: '6px 8px', flexShrink: 0 }}>
+    <div style={{ borderTop: '1px solid var(--border-subtle)', background: 'var(--bg-surface)', padding: 'var(--space-sm) var(--space-md)', flexShrink: 0 }}>
       {queue.length > 0 && (
-        <div style={{ marginBottom: 4, display: 'flex', flexDirection: 'column', gap: 2 }}>
+        <div style={{ marginBottom: 'var(--space-sm)', display: 'flex', flexDirection: 'column', gap: 'var(--space-xs)' }}>
           {queue.map((q, i) => (
-            <div key={i} style={{ fontSize: 10, color: '#888', padding: '2px 6px', background: '#1a1a1a', borderRadius: 2, display: 'flex', alignItems: 'center', gap: 4 }}>
-              <span style={{ color: '#ff9800' }}>⏳</span>
+            <div
+              key={i}
+              style={{
+                fontSize: 'var(--font-xs)',
+                color: 'var(--text-secondary)',
+                padding: 'var(--space-xs) var(--space-sm)',
+                background: 'var(--bg-elevated)',
+                borderRadius: 'var(--radius-sm)',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 'var(--space-sm)',
+              }}
+            >
+              <Icon symbol="⏳" size={10} color="var(--warning)" />
               <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{q}</span>
             </div>
           ))}
         </div>
       )}
-      <div style={{ display: 'flex', gap: 6, alignItems: 'flex-end' }}>
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 3 }}>
-          <div style={{ display: 'flex', gap: 12, fontSize: 10 }}>
+      <div style={{ display: 'flex', gap: 'var(--space-md)', alignItems: 'flex-end' }}>
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 'var(--space-xs)' }}>
+          <div style={{ display: 'flex', gap: 'var(--space-lg)', fontSize: 'var(--font-xs)' }}>
             <label
               onClick={() => setMode('steer_now')}
-              style={{ display: 'flex', alignItems: 'center', gap: 3, color: mode === 'steer_now' ? '#4fc3f7' : '#888', cursor: 'pointer', fontWeight: mode === 'steer_now' ? 'bold' : 'normal' }}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 'var(--space-xs)',
+                color: mode === 'steer_now' ? 'var(--accent)' : 'var(--text-secondary)',
+                cursor: 'pointer',
+                fontWeight: mode === 'steer_now' ? 600 : 400,
+              }}
             >
-              <span style={{ width: 6, height: 6, borderRadius: '50%', background: mode === 'steer_now' ? '#4fc3f7' : '#555', display: 'inline-block' }} />
+              <span style={{
+                width: 6,
+                height: 6,
+                borderRadius: '50%',
+                background: mode === 'steer_now' ? 'var(--accent)' : 'var(--text-muted)',
+                display: 'inline-block',
+              }} />
               Steer Now
             </label>
             <label
               onClick={() => setMode('after_done')}
-              style={{ display: 'flex', alignItems: 'center', gap: 3, color: mode === 'after_done' ? '#4fc3f7' : '#888', cursor: 'pointer', fontWeight: mode === 'after_done' ? 'bold' : 'normal' }}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 'var(--space-xs)',
+                color: mode === 'after_done' ? 'var(--accent)' : 'var(--text-secondary)',
+                cursor: 'pointer',
+                fontWeight: mode === 'after_done' ? 600 : 400,
+              }}
             >
-              <span style={{ width: 6, height: 6, borderRadius: '50%', background: mode === 'after_done' ? '#4fc3f7' : '#555', display: 'inline-block' }} />
+              <span style={{
+                width: 6,
+                height: 6,
+                borderRadius: '50%',
+                background: mode === 'after_done' ? 'var(--accent)' : 'var(--text-muted)',
+                display: 'inline-block',
+              }} />
               After Done
             </label>
           </div>
-          <textarea
+          <TextArea
             value={text}
             onChange={e => setText(e.target.value)}
             onKeyDown={e => {
@@ -61,40 +100,18 @@ export const SmartInput: React.FC<Props> = ({ terminal, onSubmit }) => {
                 handleSubmit();
               }
             }}
-            placeholder="Type a task for Smart Input..."
+            placeholder="Type a task for Smart Input…"
             rows={1}
             maxLength={4096}
-            style={{
-              background: '#1a1a1a',
-              border: '1px solid #444',
-              color: '#e0e0e0',
-              fontSize: 12,
-              padding: '4px 8px',
-              resize: 'vertical',
-              minHeight: 28,
-              maxHeight: 120,
-              fontFamily: 'inherit',
-              borderRadius: 3,
-            }}
           />
         </div>
-        <button
+        <Button
+          variant="primary"
           onClick={handleSubmit}
-          style={{
-            background: '#1e3a5f',
-            border: '1px solid #4fc3f7',
-            color: '#4fc3f7',
-            fontSize: 12,
-            cursor: 'pointer',
-            padding: '8px 16px',
-            borderRadius: 4,
-            fontWeight: 'bold',
-            minHeight: 44,
-            minWidth: 60,
-          }}
+          style={{ minHeight: 44, minWidth: 60, fontSize: 'var(--font-base)', fontWeight: 700 }}
         >
           Send
-        </button>
+        </Button>
       </div>
     </div>
   );

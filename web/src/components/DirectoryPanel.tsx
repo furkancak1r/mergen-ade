@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { WebDirectoryNode } from '../types';
+import { PanelHeader, Input, ScrollArea, EmptyState, LoadingState, Icon } from '../components/ui';
 
 interface Props {
   projectId: number | null;
@@ -50,19 +51,23 @@ export const DirectoryPanel: React.FC<Props> = ({ projectId, apiUrl }) => {
         <div
           onClick={() => node.is_dir && toggleExpand(node.path)}
           style={{
-            paddingLeft: 8 + depth * 16,
-            paddingRight: 8,
-            paddingTop: 2,
-            paddingBottom: 2,
+            paddingLeft: `calc(var(--space-sm) + ${depth * 16}px)`,
+            paddingRight: 'var(--space-sm)',
+            paddingTop: 'var(--space-xs)',
+            paddingBottom: 'var(--space-xs)',
             cursor: node.is_dir ? 'pointer' : 'default',
             display: 'flex',
             alignItems: 'center',
-            gap: 4,
-            fontSize: 12,
-            color: matches ? '#e0e0e0' : '#666',
+            gap: 'var(--space-xs)',
+            fontSize: 'var(--font-base)',
+            color: matches ? 'var(--text-primary)' : 'var(--text-muted)',
+            borderRadius: 'var(--radius-sm)',
+            transition: 'background 0.1s',
           }}
+          onMouseEnter={e => { if (node.is_dir) e.currentTarget.style.background = 'var(--bg-hover)'; }}
+          onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
         >
-          <span style={{ width: 14, textAlign: 'center', fontSize: 10 }}>
+          <span style={{ width: 14, textAlign: 'center', fontSize: 'var(--font-sm)', flexShrink: 0 }}>
             {node.is_dir ? (isExpanded ? '📂' : '📁') : '📄'}
           </span>
           <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -76,20 +81,23 @@ export const DirectoryPanel: React.FC<Props> = ({ projectId, apiUrl }) => {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-      <div style={{ padding: 8, borderBottom: '1px solid #333', display: 'flex', alignItems: 'center', gap: 4 }}>
-        <strong style={{ fontSize: 12, color: '#aaa', flex: 1 }}>Directory</strong>
+      <PanelHeader title="Directory" />
+      <div style={{ padding: 'var(--space-md)' }}>
+        <Input
+          placeholder="Search files…"
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+        />
       </div>
-      <input
-        placeholder="Search files..."
-        value={search}
-        onChange={e => setSearch(e.target.value)}
-        style={{ margin: 8, background: '#1a1a1a', border: '1px solid #444', color: '#e0e0e0', fontSize: 11, padding: '4px 6px' }}
-      />
-      <div style={{ flex: 1, overflow: 'auto' }}>
-        {loading && <div style={{ padding: 8, fontSize: 11, color: '#888' }}>Loading...</div>}
-        {!projectId && <div style={{ padding: 8, fontSize: 11, color: '#666' }}>Select a project</div>}
-        {root && renderNode(root, 0)}
-      </div>
+      <ScrollArea>
+        {loading && <LoadingState />}
+        {!projectId && <EmptyState message="Select a project" />}
+        {root && (
+          <div style={{ padding: '0 var(--space-xs)' }}>
+            {renderNode(root, 0)}
+          </div>
+        )}
+      </ScrollArea>
     </div>
   );
 };
