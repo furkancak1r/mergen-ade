@@ -2,6 +2,38 @@
 
 ---
 
+#### Smart Input focus was too aggressive and stole input from terminals and popups {#smart-input-focus-stealing}
+- Date: 2026-05-14
+- Context: User reported that Smart Input was so dominant that typing and paste went to Smart Input even when they clicked the terminal output or opened the Create Worktree popup. Keyboard input should go wherever the user last clicked.
+- Error signature: `ensure_smart_input_focus()` checked `smart_input_has_focus(ctx)` first and returned early, so once Smart Input was focused it never surrendered focus even when a modal/popup opened. `set_active_terminal()` unconditionally re-focused Smart Input for both same-terminal re-clicks and terminal switches, ignoring whether the user explicitly wanted to type in the terminal PTY.
+- Symptoms/Impact:
+  1. Create Worktree popup input fields could not receive keyboard input because Smart Input retained focus in the background.
+  2. Clicking on terminal output and typing still sent text to Smart Input instead of the terminal.
+  3. Ctrl+V paste went to Smart Input even when the user intended to paste into the terminal.
+- Root cause:
+  - `ensure_smart_input_focus()` had the `smart_input_has_focus` early-return guard before the popup/modal checks, so opening a popup never caused Smart Input to yield.
+  - `set_active_terminal()` always called `request_focus(draft_id)` for both same-terminal re-selections and new terminal activations, with no way to distinguish "user clicked terminal output to type there" from "user switched terminals via keyboard/manager".
+- Resolution:
+  - Moved modal/popup/context-menu checks to the TOP of `ensure_smart_input_focus()` so they take absolute precedence over the Smart Input keep-focus guard.
+  - Added `terminal_output_focus_override: Option<u64>` to `AdeApp` to track when the user explicitly clicks terminal output.
+  - `draw_terminal_pane()` now tracks `output_clicked` separately from `pane_clicked` and sets `terminal_output_focus_override` when the output surface is clicked.
+  - `set_active_terminal()` respects the override: for same-terminal re-clicks it skips Smart Input re-focus when the override is active; for terminal switches it clears the old override and only focuses Smart Input if there's no override for the new terminal.
+  - `ensure_smart_input_focus()` clears the override when Smart Input actually gains focus, and honors the override when deciding whether to auto-focus Smart Input.
+  - `close_terminal()` cleans up the override if the closed terminal had it.
+  - `surrender_ui_text_focus()` now also surrenders `smart_input_question_custom_input_id`.
+  - Create Worktree branch input now has an explicit `CREATE_WORKTREE_BRANCH_INPUT_ID` and receives `request_focus()` immediately when the popup opens from both the Source Control panel and Terminal Manager.
+- Prevent recurrence:
+  - Added regression tests:
+    - `ensure_smart_input_focus_surrenders_smart_input_when_create_worktree_popup_open`
+    - `set_active_terminal_respects_output_focus_override`
+    - `set_active_terminal_clears_output_override_when_switching_terminals`
+    - `close_terminal_clears_output_focus_override`
+  - Updated AGENTS.md Smart Input guidelines to document the terminal output click override and popup surrender behavior.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-14
+
+---
+
 #### Design Inspect icon changed to pencil and terminal-scope URL bug fixed {#design-inspect-pencil-and-url}
 - Date: 2026-05-14
 - Context: User requested that the Design Inspect toolbar icon be a pencil instead of an eye. Additionally, Design Inspect element clicks were not being sent to the terminal when using a terminal-scoped browser.

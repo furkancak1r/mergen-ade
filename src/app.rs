@@ -271,6 +271,7 @@ const FOREGROUND_MESSAGE_INPUT_ID: &str = "foreground-message-input";
 const SMART_INPUT_DRAFT_INPUT_ID: &str = "smart-input-draft";
 const SMART_INPUT_TASK_EDIT_INPUT_ID: &str = "smart-input-task-edit";
 const SMART_INPUT_QUESTION_CUSTOM_INPUT_ID: &str = "smart-input-question-custom";
+const CREATE_WORKTREE_BRANCH_INPUT_ID: &str = "create-worktree-branch-input";
 const SMART_INPUT_MIN_FOOTER_HEIGHT: f32 = 132.0;
 const SMART_INPUT_BASE_FOOTER_HEIGHT: f32 = 156.0;
 const SMART_INPUT_TASK_ROW_HEIGHT: f32 = 28.0;
@@ -1863,6 +1864,11 @@ pub struct AdeApp {
     terminal_history_popup_open: Option<u64>,
     /// Tracks whether the history popup was just opened this frame (to prevent immediate close)
     terminal_history_popup_just_opened: bool,
+    /// When the user explicitly clicks on a terminal output pane, keyboard input
+    /// should go to the terminal PTY rather than the Smart Input draft.
+    /// Cleared when Smart Input is clicked, the active terminal changes, or
+    /// the terminal exits.
+    terminal_output_focus_override: Option<u64>,
     /// Collapse/expand state per project in the Check-list panel (runtime-only, not persisted across restarts)
     checklist_collapsed_by_project: BTreeMap<u64, bool>,
     /// Whether the floating Check-list popup is currently open (runtime-only, not persisted)
@@ -4432,6 +4438,7 @@ impl AdeApp {
             input_history_selected_project_id: selected_project,
             terminal_history_popup_open: None,
             terminal_history_popup_just_opened: false,
+            terminal_output_focus_override: None,
             checklist_collapsed_by_project: BTreeMap::new(),
             checklist_floating_open: false,
             file_editor: FileEditorState::default(),
@@ -9836,19 +9843,40 @@ impl AdeApp {
     /// other UI text input or modal is claiming it. Only the active terminal's
     /// Smart Input (or the single visible terminal in single-view mode) is
     /// considered; never auto-focuses a different visible terminal's Smart Input.
-    fn ensure_smart_input_focus(&self, ctx: &egui::Context) {
-        // Already focused on some Smart Input field — keep it.
-        if self.smart_input_has_focus(ctx) {
-            return;
-        }
-        // Modal/popup/context menu open — don't steal focus.
+    fn ensure_smart_input_focus(&mut self, ctx: &egui::Context) {
+        // Modal/popup/context menu open — surrender Smart Input focus so
+        // typed text goes to the modal's inputs, not the Smart Input draft.
         if self.show_settings_popup
             || self.foreground_message_popup_open.is_some()
             || self.show_create_worktree_popup
             || ctx.memory(|mem| mem.any_popup_open())
             || ctx.is_context_menu_open()
         {
+            ctx.memory_mut(|mem| {
+                for (terminal_id, terminal) in &self.terminals {
+                    mem.surrender_focus(Self::smart_input_draft_input_id(*terminal_id));
+                    if let Some(task_id) = terminal.smart_input.editing_task_id {
+                        mem.surrender_focus(Self::smart_input_task_edit_input_id(
+                            *terminal_id,
+                            task_id,
+                        ));
+                    }
+                    mem.surrender_focus(Self::smart_input_question_custom_input_id(*terminal_id));
+                }
+            });
             return;
+        }
+        // If Smart Input is now focused, the user explicitly chose it;
+        // clear any terminal output override.
+        if self.smart_input_has_focus(ctx) {
+            self.terminal_output_focus_override = None;
+            return;
+        }
+        // If user explicitly clicked terminal output, don't auto-focus Smart Input.
+        if let Some(override_id) = self.terminal_output_focus_override {
+            if self.active_terminal == Some(override_id) {
+                return;
+            }
         }
         // Another non-Smart UI text input is focused — don't steal.
         if self.text_input_has_focus(ctx) {
@@ -9954,6 +9982,7 @@ impl AdeApp {
                         task_id,
                     ));
                 }
+                mem.surrender_focus(Self::smart_input_question_custom_input_id(*terminal_id));
             }
         });
     }
@@ -12032,6 +12061,9 @@ impl AdeApp {
         };
 
         self.clear_terminal_held_key_repeat_for_terminal(terminal_id);
+        if self.terminal_output_focus_override == Some(terminal_id) {
+            self.terminal_output_focus_override = None;
+        }
         self.clear_factory_droid_state(terminal_id);
         self.reset_factory_droid_hook_inbox(terminal_id);
         self.clear_codex_state(terminal_id);
@@ -12188,16 +12220,20 @@ impl AdeApp {
                 self.acknowledge_terminal_attention(terminal_id);
             }
             // Re-focus Smart Input for the already-active terminal so clicking
-            // the terminal pane always restores typing to the correct draft.
+            // the terminal pane always restores typing to the correct draft,
+            // unless the user explicitly clicked the terminal output and wants
+            // to type in the PTY instead.
             if let Some(tid) = terminal_id {
-                if let Some(terminal) = self.terminals.get(&tid) {
-                    if Self::terminal_smart_input_visible(terminal) {
-                        let draft_id = Self::smart_input_draft_input_id(tid);
-                        ctx.memory_mut(|mem| {
-                            if !mem.has_focus(draft_id) {
-                                mem.request_focus(draft_id);
-                            }
-                        });
+                if self.terminal_output_focus_override != Some(tid) {
+                    if let Some(terminal) = self.terminals.get(&tid) {
+                        if Self::terminal_smart_input_visible(terminal) {
+                            let draft_id = Self::smart_input_draft_input_id(tid);
+                            ctx.memory_mut(|mem| {
+                                if !mem.has_focus(draft_id) {
+                                    mem.request_focus(draft_id);
+                                }
+                            });
+                        }
                     }
                 }
             }
@@ -12226,16 +12262,27 @@ impl AdeApp {
         self.clear_terminal_held_key_repeat();
         self.clear_terminal_selections_except(terminal_id);
 
-        // After switching, focus the newly active terminal's Smart Input draft.
+        // When switching to a different terminal, clear any output-focus override
+        // from the previous terminal so the new terminal doesn't inherit it.
         if let Some(tid) = terminal_id {
-            if let Some(terminal) = self.terminals.get(&tid) {
-                if Self::terminal_smart_input_visible(terminal) {
-                    let draft_id = Self::smart_input_draft_input_id(tid);
-                    ctx.memory_mut(|mem| {
-                        if !mem.has_focus(draft_id) {
-                            mem.request_focus(draft_id);
-                        }
-                    });
+            if self.terminal_output_focus_override != Some(tid) {
+                self.terminal_output_focus_override = None;
+            }
+        }
+
+        // After switching, focus the newly active terminal's Smart Input draft
+        // unless the user explicitly wants to type in the terminal PTY.
+        if let Some(tid) = terminal_id {
+            if self.terminal_output_focus_override != Some(tid) {
+                if let Some(terminal) = self.terminals.get(&tid) {
+                    if Self::terminal_smart_input_visible(terminal) {
+                        let draft_id = Self::smart_input_draft_input_id(tid);
+                        ctx.memory_mut(|mem| {
+                            if !mem.has_focus(draft_id) {
+                                mem.request_focus(draft_id);
+                            }
+                        });
+                    }
                 }
             }
         }
@@ -16803,6 +16850,9 @@ impl AdeApp {
                                         if let Some((pid, _)) = selected_project_details {
                                             self.show_create_worktree_popup = true;
                                             self.create_worktree_project_id = Some(pid);
+                                            ui.ctx().memory_mut(|mem| {
+                                                mem.request_focus(egui::Id::new(CREATE_WORKTREE_BRANCH_INPUT_ID));
+                                            });
                                             self.create_worktree_branch_draft.clear();
                                             self.create_worktree_base_branch = self
                                                 .source_control_state
@@ -17373,6 +17423,9 @@ impl AdeApp {
             if create_worktree_clicked {
                 self.show_create_worktree_popup = true;
                 self.create_worktree_project_id = Some(project_id);
+                ctx.memory_mut(|mem| {
+                    mem.request_focus(egui::Id::new(CREATE_WORKTREE_BRANCH_INPUT_ID));
+                });
                 self.create_worktree_branch_draft.clear();
                 self.create_worktree_base_branch = self
                     .source_control_state
@@ -21605,6 +21658,7 @@ impl AdeApp {
 
         let (
             clicked,
+            output_clicked,
             close_requested,
             copied_selection,
             paste_requested,
@@ -21617,6 +21671,7 @@ impl AdeApp {
 
             let mut close_requested = false;
             let mut pane_clicked = false;
+            let mut output_clicked = false;
             let mut copied_selection = None;
             let mut paste_requested = false;
             let mut link_to_open = None;
@@ -21982,9 +22037,11 @@ impl AdeApp {
                         ui.painter().galley(rect.min, galley, TEXT_MUTED);
                         if response.clicked() {
                             pane_clicked = true;
+                            output_clicked = true;
                         }
                         if response.secondary_clicked() {
                             pane_clicked = true;
+                            output_clicked = true;
                         }
                         let can_paste = !terminal.exited;
                         if response.secondary_clicked() && can_paste {
@@ -22087,6 +22144,7 @@ impl AdeApp {
                         ui.painter().galley(rect.min, galley.clone(), TEXT_PRIMARY);
                         if response.is_pointer_button_down_on() && primary_down {
                             pane_clicked = true;
+                            output_clicked = true;
                         }
                         if primary_pressed_on_terminal {
                             if let Some(point) = pointer_point {
@@ -22140,6 +22198,7 @@ impl AdeApp {
                         }
                         if primary_clicked {
                             pane_clicked = true;
+                            output_clicked = true;
                             link_to_open = Self::take_terminal_primary_clicked_link(
                                 terminal,
                                 link_under_pointer.as_deref(),
@@ -22150,6 +22209,7 @@ impl AdeApp {
                             }
                         } else if response.clicked() {
                             pane_clicked = true;
+                            output_clicked = true;
                             Self::clear_terminal_selection(terminal);
                         }
                         if primary_released {
@@ -22168,6 +22228,7 @@ impl AdeApp {
                         let mut copy_requested = false;
                         let secondary_click_action = if response.secondary_clicked() {
                             pane_clicked = true;
+                            output_clicked = true;
                             terminal_secondary_click_action(has_selection, can_paste)
                         } else {
                             TerminalSecondaryClickAction::None
@@ -22443,6 +22504,7 @@ impl AdeApp {
 
             (
                 pane_clicked,
+                output_clicked,
                 close_requested,
                 copied_selection,
                 paste_requested,
@@ -22458,6 +22520,10 @@ impl AdeApp {
 
         if clicked {
             self.surrender_ui_text_focus(ui.ctx());
+        }
+
+        if output_clicked {
+            self.terminal_output_focus_override = Some(terminal_id);
         }
 
         if clicked || copied_selection.is_some() || paste_requested {
@@ -23033,9 +23099,11 @@ impl AdeApp {
                 }
 
                 ui.label(RichText::new("Branch name").small().color(TEXT_MUTED));
+                let branch_input_id = egui::Id::new(CREATE_WORKTREE_BRANCH_INPUT_ID);
                 ui.add_sized(
                     [ui.available_width(), CONTROL_ROW_HEIGHT],
                     egui::TextEdit::singleline(&mut self.create_worktree_branch_draft)
+                        .id(branch_input_id)
                         .hint_text("feature/my-task"),
                 );
                 ui.add_space(6.0);
@@ -41039,6 +41107,7 @@ mod tests {
             input_history_selected_project_id: None,
             terminal_history_popup_open: None,
             terminal_history_popup_just_opened: false,
+            terminal_output_focus_override: None,
             ai_hook_manager: None,
             file_editor: FileEditorState::default(),
             browser_url_draft_by_scope: BTreeMap::new(),
@@ -51842,6 +51911,89 @@ mod tests {
             !ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(2))),
             "other terminal's Smart Input must not be focused"
         );
+    }
+
+    #[test]
+    fn set_active_terminal_respects_output_focus_override() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        // Simulate user clicking terminal output
+        app.terminal_output_focus_override = Some(1);
+        ctx.memory_mut(|mem| {
+            mem.surrender_focus(AdeApp::smart_input_draft_input_id(1));
+        });
+
+        // Re-selecting same terminal should NOT re-focus Smart Input
+        app.set_active_terminal(&ctx, Some(1));
+
+        assert!(
+            !ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))),
+            "Smart Input must stay unfocused when output override is active"
+        );
+    }
+
+    #[test]
+    fn set_active_terminal_clears_output_override_when_switching_terminals() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        seed_opencode_attention(&mut app, 2, OpenCodeAttentionReason::TurnComplete);
+
+        // User clicked terminal 1 output
+        app.terminal_output_focus_override = Some(1);
+
+        // Switch to terminal 2 — override for terminal 1 should be cleared
+        app.set_active_terminal(&ctx, Some(2));
+
+        assert_eq!(app.terminal_output_focus_override, None);
+        // Terminal 2 Smart Input should be focused since no override exists
+        assert!(
+            ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(2))),
+            "new terminal's Smart Input should be focused after switch"
+        );
+    }
+
+    #[test]
+    fn ensure_smart_input_focus_surrenders_smart_input_when_create_worktree_popup_open() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        // Pre-focus Smart Input
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::smart_input_draft_input_id(1));
+        });
+        assert!(ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))));
+
+        // Open Create Worktree popup
+        app.show_create_worktree_popup = true;
+        app.ensure_smart_input_focus(&ctx);
+
+        // Smart Input focus should be surrendered
+        assert!(
+            !ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))),
+            "Smart Input must surrender focus when Create Worktree popup is open"
+        );
+    }
+
+    #[test]
+    fn close_terminal_clears_output_focus_override() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        app.terminal_output_focus_override = Some(1);
+        app.close_terminal(&ctx, 1);
+
+        assert_eq!(app.terminal_output_focus_override, None);
     }
 
     #[test]
