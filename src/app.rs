@@ -14566,14 +14566,30 @@ impl AdeApp {
                 .map(|(combo, _)| combo.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            ui.label(
-                RichText::new(format!(
+            let short_summary = capped_hover_text(&dup_summary, 40);
+            let label_text = if short_summary.len() < dup_summary.len() {
+                format!(
+                    "Warning: Duplicate key combinations detected: {}, ... . Conflicted shortcuts will not execute.",
+                    short_summary
+                )
+            } else {
+                format!(
                     "Warning: Duplicate key combinations detected: {}. Conflicted shortcuts will not execute.",
                     dup_summary
-                ))
-                .small()
-                .color(Color32::from_rgb(220, 170, 60)),
-            );
+                )
+            };
+            ui.add(
+                egui::Label::new(
+                    RichText::new(label_text)
+                        .small()
+                        .color(Color32::from_rgb(220, 170, 60)),
+                )
+                .truncate(),
+            )
+            .on_hover_text(format!(
+                "Duplicate combos: {}. Enable only one shortcut per combination.",
+                dup_summary
+            ));
             ui.add_space(8.0);
         }
 
