@@ -18719,10 +18719,9 @@ impl AdeApp {
                                             .max_rect(body_rect)
                                             .layout(Layout::left_to_right(Align::Center)),
                                         |ui| {
-                                            let arrow = if collapsed { "▸" } else { "▾" };
                                             let folder_icon = if collapsed { icons::FOLDER } else { icons::FOLDER_OPEN };
                                             ui.label(
-                                                RichText::new(format!("{} {}", arrow, folder_icon))
+                                                RichText::new(format!("{}", folder_icon))
                                                     .color(TEXT_PRIMARY),
                                             );
                                             ui.add_space(4.0);

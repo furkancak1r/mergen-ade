@@ -835,3 +835,22 @@
   - Added AGENTS.md guideline: "Worktree row text color must reflect live terminal presence".
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-05-14
+
+---
+
+#### Check-list panel project header arrow removed {#checklist-header-arrow-removed}
+- Date: 2026-05-14
+- Context: User requested that the collapse/expand arrow next to the folder icon in the Check-list panel project header be removed, keeping only the folder icon.
+- Error signature: `draw_checklist_panel` rendered an arrow indicator (`▸` / `▾`) next to the folder icon in the project accordion header.
+- Symptoms/Impact:
+  1. The arrow was visually redundant because the folder icon already changes between `icons::FOLDER` (collapsed) and `icons::FOLDER_OPEN` (expanded).
+  2. User found the arrow cluttered the header.
+- Root cause:
+  - The header label concatenated the arrow string and folder icon string.
+- Resolution:
+  - Removed the `arrow` variable and changed the header label to render only the `folder_icon`.
+  - Collapse/expand behavior remains intact; clicking the header still toggles `checklist_collapsed_by_project`.
+- Prevent recurrence:
+  - No new regression tests needed; existing accordion tests (`checklist_panel_project_collapsed_hides_items`, `checklist_panel_project_collapse_state_isolated_per_project`) continue to verify behavior.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-14
