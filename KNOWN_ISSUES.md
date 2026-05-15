@@ -1156,8 +1156,6 @@
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input -- --nocapture`, `cargo test --no-run`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User request 2026-05-15
 
----
-
 #### Smart Input queue rendered only the first visible rows {#smart-input-queue-scroll}
 - Date: 2026-05-15
 - Context: User reported that queued Smart Input prompts beyond the first 3-4 rows could not be seen because the queue area had no scroll.
@@ -1211,4 +1209,160 @@
 - Prevent recurrence:
   - Added a render regression test asserting the draft hint sits at least the configured gap below queued task text.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input -- --nocapture`, `cargo test --no-run`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
+
+---
+
+#### Smart Input global mode buttons duplicated row-level send controls {#smart-input-global-mode-buttons}
+- Date: 2026-05-15
+- Context: User wanted the top-level `After Done` / `Steer Now` buttons removed because draft input should queue by default, while immediate steering should remain available per queued row.
+- Error signature: `SmartInputState` stored a global `SmartInputMode`, and the draft submit button changed behavior based on that shared mode.
+- Symptoms/Impact:
+  1. The Smart Input footer exposed redundant global controls above the queue.
+  2. Users had to reason about a mode switch even though queued rows already had a send-now action.
+  3. The extra mode row consumed vertical space in the footer.
+- Root cause:
+  - Draft submission and immediate sending were modeled as a global footer mode instead of separating draft queueing from row-level dispatch.
+- Resolution:
+  - Removed the global Smart Input mode state and mode selector buttons.
+  - Made draft submit always queue the current draft and attachments.
+  - Kept immediate dispatch on the queued row arrow action and moved the queue count into the header.
+  - Reduced the Smart Input base footer height now that the mode row is gone.
+- Prevent recurrence:
+  - Added regression coverage that the footer no longer renders `After Done` / `Steer Now`, still shows the queued count, queues attachment-only drafts, and records history through row-level send-now.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input -- --nocapture`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
+
+---
+
+#### Codex integration tests depended on a developer desktop executable {#codex-tests-hardcoded-bridge}
+- Date: 2026-05-15
+- Context: Full `cargo test` failed in `inspect_codex_cli_integration_*` tests when `C:\Users\furkan.cakir\Desktop\mergen-ade.exe` did not exist.
+- Error signature: `inspect_codex_cli_integration_at_path()` returns `NeedsSetup` before parsing config if the bridge path is missing, so tests expecting `EnabledHealthy` or `ConfigReadError` failed for environmental reasons.
+- Symptoms/Impact:
+  1. Test results depended on one developer-specific desktop file.
+  2. Invalid TOML handling was not exercised when the bridge executable was absent.
+- Root cause:
+  - The tests used a hardcoded absolute executable path instead of creating an isolated test bridge file.
+- Resolution:
+  - Added a test helper that writes a fake bridge executable inside each temporary test directory.
+  - Updated the affected inspection tests to patch and inspect against that temp bridge path.
+- Prevent recurrence:
+  - Inspection tests now create all filesystem prerequisites they depend on.
+- Files/Commands touched: `src/codex.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: Local full test run 2026-05-15
+
+---
+
+#### Smart Input empty queue hint consumed footer space {#smart-input-empty-queue-hint-removed}
+- Date: 2026-05-15
+- Context: User wanted the `No queued tasks. Add a prompt below.` message removed from the Smart Input footer.
+- Error signature: Empty expanded queues rendered a visible hint and added `SMART_INPUT_EMPTY_QUEUE_HINT_HEIGHT` to the footer height calculations.
+- Symptoms/Impact:
+  1. The footer showed unnecessary instructional text when the queue was empty.
+  2. Removing only the label would have left a blank reserved gap.
+- Root cause:
+  - Empty queue state was treated as visible queue content instead of letting the draft input be the primary empty-state surface.
+- Resolution:
+  - Removed the empty queue hint label.
+  - Removed the empty hint height constant and its contribution to desired/safe-min footer height.
+- Prevent recurrence:
+  - Updated the empty queue render regression test to assert the hint stays hidden and row backgrounds are not painted.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input -- --nocapture`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
+
+---
+
+#### Smart Input empty queue header showed ready status and zero count {#smart-input-empty-header-status}
+- Date: 2026-05-15
+- Context: User wanted the `Ready - next queued task will run 0 queued` text removed from the Smart Input header.
+- Error signature: The footer header always rendered `smart_input_status_text()` and `{task_count} queued`, even when `task_count == 0`.
+- Symptoms/Impact:
+  1. Empty Smart Input showed a misleading ready-to-run message despite having no queued task.
+  2. The header still had instructional/status text after the empty queue hint was removed.
+- Root cause:
+  - Header status/count rendering did not distinguish empty queue state from queued-task state.
+- Resolution:
+  - Rendered the status label and queued count only when at least one Smart Input task is queued.
+- Prevent recurrence:
+  - Extended the empty queue render regression test to assert the ready status and `0 queued` count stay hidden.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input -- --nocapture`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
+
+---
+
+#### Smart Input exposed an unnecessary auto toggle {#smart-input-auto-toggle-removed}
+- Date: 2026-05-15
+- Context: User wanted the `Auto on` button/text removed because Smart Input should always run queued tasks automatically.
+- Error signature: `SmartInputState` carried `auto_run_enabled`, the header rendered `Auto on` / `Auto off`, and auto-dispatch checked that runtime flag.
+- Symptoms/Impact:
+  1. The header showed a control for a mode that should not be user-configurable.
+  2. A toggled-off runtime state could prevent queued tasks from dispatching.
+- Root cause:
+  - Auto-dispatch was implemented as a user-toggleable state instead of an always-on behavior.
+- Resolution:
+  - Removed the `auto_run_enabled` Smart Input state.
+  - Removed the `Auto on` / `Auto off` header button.
+  - Removed the auto-enabled guard from Smart Input queue dispatch.
+  - Renamed the permission status text to avoid exposing auto-mode wording.
+- Prevent recurrence:
+  - Extended Smart Input render tests to assert no `Auto on` / `Auto off` button is painted.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input -- --nocapture`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
+
+---
+
+#### Smart Input draft submit used an add icon {#smart-input-draft-submit-icon}
+- Date: 2026-05-15
+- Context: User wanted the draft input `+` button changed to a submit icon.
+- Error signature: The draft submit button used `icons::PLUS`, which visually suggested adding an item rather than submitting the draft.
+- Symptoms/Impact:
+  1. The draft action looked like a generic add control.
+  2. It was visually inconsistent with submit/send semantics.
+- Root cause:
+  - The app icon set did not include a dedicated submit/send glyph, so the draft submit button reused the plus icon.
+- Resolution:
+  - Added a Lucide `send-horizontal` icon to `AppIcon`.
+  - Switched the Smart Input draft submit button from `PLUS` to `SEND_HORIZONTAL`.
+  - Updated the tooltip from `Queue draft` to `Submit draft`.
+- Prevent recurrence:
+  - Added a regression test that verifies the submit icon resolves to a real Lucide glyph.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input -- --nocapture`, `cargo test submit_icon_resolves_to_lucide_glyph`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
+
+---
+
+#### Smart Input hide button sat too close to the right edge {#smart-input-hide-button-inset}
+- Date: 2026-05-15
+- Context: User wanted the Smart Input `Hide` button moved a little to the left.
+- Error signature: The header used a right-to-left layout with the `Hide` button as the first right-aligned widget, placing it flush against the available right edge.
+- Symptoms/Impact:
+  1. The button felt visually cramped against the footer border.
+  2. It did not align with the desired header breathing room after other header controls were removed.
+- Root cause:
+  - The right-aligned header control group had no explicit right inset.
+- Resolution:
+  - Added a small Smart Input header right inset before rendering the `Hide` / `Show` toggle.
+- Prevent recurrence:
+  - Extended the Smart Input footer render test to assert the `Hide` text is inset from the right edge.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input -- --nocapture`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
+
+---
+
+#### Foreground launcher list rows showed hover highlight {#foreground-launcher-row-hover-removed}
+- Date: 2026-05-15
+- Context: User wanted only the hover effect on foreground launcher list items removed.
+- Error signature: `draw_launcher_menu_contents()` switched row background from `SURFACE_BG_SOFT` to `BTN_ICON_HOVER` when the pointer was over a launcher row.
+- Symptoms/Impact:
+  1. Hovering OpenCode/Codex/Droid/Claude rows produced a visible background highlight.
+  2. The list item hover behavior was visually different from the requested static launcher popup list.
+- Root cause:
+  - Launcher row painting reused the same hover fill pattern as icon buttons.
+- Resolution:
+  - Kept foreground launcher rows painted with the normal row background regardless of pointer hover.
+  - Preserved row click behavior, pointer cursor, and launcher tooltip behavior.
+- Prevent recurrence:
+  - Updated the foreground launcher menu regression test to assert hover does not paint `BTN_ICON_HOVER`.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test foreground_launcher -- --nocapture`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User request 2026-05-15

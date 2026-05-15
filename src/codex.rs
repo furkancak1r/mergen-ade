@@ -1244,11 +1244,11 @@ notification_method = "desktop"
     fn inspect_codex_cli_integration_reports_enabled_healthy_when_all_requirements_match() {
         let temp = TestTempDir::new("codex-config-health");
         let path = temp.path.join("config.toml");
-        let executable = Path::new(r"C:\Users\furkan.cakir\Desktop\mergen-ade.exe");
+        let executable = test_bridge_executable(&temp);
 
         // First patch the config to set up hooks
         fs::write(&path, "").expect("write empty config");
-        patch_codex_config_file(&path, executable).expect("patch should create hooks");
+        patch_codex_config_file(&path, &executable).expect("patch should create hooks");
 
         // Also write the features section to config.toml
         let _config_content = fs::read_to_string(&path).expect("read config");
@@ -1256,7 +1256,7 @@ notification_method = "desktop"
 
         // Verify status is healthy (hooks configured but not yet runtime-verified)
         assert_eq!(
-            inspect_codex_cli_integration_at_path(path.clone(), executable),
+            inspect_codex_cli_integration_at_path(path.clone(), &executable),
             CodexIntegrationStatus::EnabledHealthy {
                 path,
                 hooks_runtime_verified: false
@@ -1271,6 +1271,7 @@ notification_method = "desktop"
     fn inspect_codex_cli_integration_reports_needs_setup_when_notify_is_missing() {
         let temp = TestTempDir::new("codex-config-missing-notify");
         let path = temp.path.join("config.toml");
+        let executable = test_bridge_executable(&temp);
         fs::write(
             &path,
             r#"
@@ -1281,9 +1282,8 @@ notifications = ["agent-turn-complete", "approval-requested", "user-input-reques
         )
         .expect("write config");
 
-        let executable = Path::new(r"C:\Users\furkan.cakir\Desktop\mergen-ade.exe");
         assert_eq!(
-            inspect_codex_cli_integration_at_path(path.clone(), executable),
+            inspect_codex_cli_integration_at_path(path.clone(), &executable),
             CodexIntegrationStatus::NeedsSetup { path }
         );
     }
@@ -1292,6 +1292,7 @@ notifications = ["agent-turn-complete", "approval-requested", "user-input-reques
     fn inspect_codex_cli_integration_reports_custom_notify_hook_when_notify_differs() {
         let temp = TestTempDir::new("codex-config-custom-inspect");
         let path = temp.path.join("config.toml");
+        let executable = test_bridge_executable(&temp);
         fs::write(
             &path,
             r#"
@@ -1304,15 +1305,13 @@ notifications = ["agent-turn-complete", "approval-requested", "user-input-reques
         )
         .expect("write config");
 
-        let executable = Path::new(r"C:\Users\furkan.cakir\Desktop\mergen-ade.exe");
-
         #[cfg(target_os = "windows")]
         {
             // On Windows, custom notify is treated as needing setup (will be overwritten)
             // because hooks are unsupported and notify is the only reliable completion signal
             assert!(
                 matches!(
-                    inspect_codex_cli_integration_at_path(path.clone(), executable),
+                    inspect_codex_cli_integration_at_path(path.clone(), &executable),
                     CodexIntegrationStatus::NeedsSetup { .. }
                 ),
                 "On Windows, custom notify should be treated as needing setup (will be overwritten)"
@@ -1325,7 +1324,7 @@ notifications = ["agent-turn-complete", "approval-requested", "user-input-reques
             // for hook-only integration (hooks.json replaces notify)
             assert!(
                 matches!(
-                    inspect_codex_cli_integration_at_path(path.clone(), executable),
+                    inspect_codex_cli_integration_at_path(path.clone(), &executable),
                     CodexIntegrationStatus::NeedsSetup { .. }
                 ),
                 "On non-Windows, custom notify should be treated as needing setup for hook-only integration"
@@ -1337,6 +1336,7 @@ notifications = ["agent-turn-complete", "approval-requested", "user-input-reques
     fn inspect_codex_cli_integration_reports_needs_setup_when_required_notifications_are_missing() {
         let temp = TestTempDir::new("codex-config-missing-events");
         let path = temp.path.join("config.toml");
+        let executable = test_bridge_executable(&temp);
         fs::write(
             &path,
             r#"
@@ -1349,9 +1349,8 @@ notifications = ["agent-turn-complete"]
         )
         .expect("write config");
 
-        let executable = Path::new(r"C:\Users\furkan.cakir\Desktop\mergen-ade.exe");
         assert_eq!(
-            inspect_codex_cli_integration_at_path(path.clone(), executable),
+            inspect_codex_cli_integration_at_path(path.clone(), &executable),
             CodexIntegrationStatus::NeedsSetup { path }
         );
     }
@@ -1360,10 +1359,10 @@ notifications = ["agent-turn-complete"]
     fn inspect_codex_cli_integration_reports_config_read_error_for_invalid_toml() {
         let temp = TestTempDir::new("codex-config-invalid");
         let path = temp.path.join("config.toml");
+        let executable = test_bridge_executable(&temp);
         fs::write(&path, "notify = [").expect("write invalid config");
 
-        let executable = Path::new(r"C:\Users\furkan.cakir\Desktop\mergen-ade.exe");
-        let status = inspect_codex_cli_integration_at_path(path.clone(), executable);
+        let status = inspect_codex_cli_integration_at_path(path.clone(), &executable);
 
         assert!(matches!(
             status,
@@ -1868,6 +1867,12 @@ alternate_screen = "never"
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn test_bridge_executable(temp: &TestTempDir) -> PathBuf {
+        let path = temp.path.join("mergen-ade.exe");
+        fs::write(&path, "fake bridge executable").expect("write fake bridge executable");
+        path
     }
 
     // Bridge install tests
