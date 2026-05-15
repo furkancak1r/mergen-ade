@@ -24,6 +24,8 @@ pub const MERGEN_AI_TOOL_HINT_ENV_VAR: &str = "MERGEN_AI_TOOL_HINT";
 pub const MERGEN_AI_TOOL_HINT_CODEX: &str = "codex";
 pub const MERGEN_ADE_CODEX_INBOX_TOKEN_ENV_VAR: &str = "MERGEN_ADE_CODEX_INBOX_TOKEN";
 const CODEX_MANAGED_HOOK_TIMEOUT_SECONDS: u64 = 10;
+const CODEX_HOOKS_FEATURE_KEY: &str = "hooks";
+const CODEX_LEGACY_HOOKS_FEATURE_KEY: &str = "codex_hooks";
 const CODEX_TOOL_HOOK_MATCHER: &str = "^(Bash|apply_patch|Edit|Write|mcp__.*)$";
 const CODEX_MANAGED_HOOK_EVENTS: [(&str, Option<&str>); 5] = [
     ("UserPromptSubmit", None),
@@ -393,7 +395,9 @@ pub fn patch_codex_config_file(
         )
     })?;
 
-    // Enable Codex hooks feature - hook-only integration
+    // Enable Codex hooks feature - hook-only integration.
+    // `codex_hooks` was renamed to `hooks`; remove the old alias to avoid
+    // startup deprecation warnings in current Codex CLI releases.
     let features_value = root
         .entry("features".to_owned())
         .or_insert_with(|| TomlValue::Table(Default::default()));
@@ -403,10 +407,11 @@ pub fn patch_codex_config_file(
             "[features] must be a TOML table",
         )
     })?;
-    let codex_hooks_enabled = TomlValue::Boolean(true);
-    if features.get("codex_hooks") != Some(&codex_hooks_enabled) {
-        features.insert("codex_hooks".to_owned(), codex_hooks_enabled);
+    let hooks_enabled = TomlValue::Boolean(true);
+    if features.get(CODEX_HOOKS_FEATURE_KEY) != Some(&hooks_enabled) {
+        features.insert(CODEX_HOOKS_FEATURE_KEY.to_owned(), hooks_enabled);
     }
+    features.remove(CODEX_LEGACY_HOOKS_FEATURE_KEY);
 
     // Update or create hooks.json with spinner events - hook-only integration
     let hooks_changed = update_codex_hooks_json(path, executable_path)?;
@@ -877,11 +882,13 @@ fn inspect_codex_cli_integration_at_path(
         };
     };
 
-    // Check if codex_hooks feature is enabled - hook-only integration
+    // Check if hooks feature is enabled - hook-only integration.
+    // The deprecated `codex_hooks` alias is intentionally not treated as
+    // healthy so the repair path rewrites config.toml and removes the warning.
     let hooks_enabled = root
         .get("features")
         .and_then(TomlValue::as_table)
-        .and_then(|f| f.get("codex_hooks"))
+        .and_then(|f| f.get(CODEX_HOOKS_FEATURE_KEY))
         .and_then(TomlValue::as_bool)
         == Some(true);
 
@@ -1368,7 +1375,7 @@ notifications = ["agent-turn-complete"]
     }
 
     #[test]
-    fn patch_codex_config_sets_codex_hooks_feature() {
+    fn patch_codex_config_sets_hooks_feature() {
         let temp = TestTempDir::new("codex-config-hooks");
         let path = temp.path.join("config.toml");
 
@@ -1381,8 +1388,11 @@ notifications = ["agent-turn-complete"]
         let rendered = fs::read_to_string(&path).expect("read config");
         let value = toml::from_str::<toml::Value>(&rendered).expect("parse patched config");
 
-        // Check features.codex_hooks is set to true
-        assert_eq!(value["features"]["codex_hooks"].as_bool(), Some(true));
+        assert_eq!(value["features"]["hooks"].as_bool(), Some(true));
+        assert!(
+            value["features"].get("codex_hooks").is_none(),
+            "deprecated features.codex_hooks should not be written"
+        );
     }
 
     #[test]
@@ -1792,7 +1802,11 @@ alternate_screen = "never"
             value.get("notify").is_none(),
             "notify should be removed in hook-only mode"
         );
-        assert_eq!(value["features"]["codex_hooks"].as_bool(), Some(true));
+        assert_eq!(value["features"]["hooks"].as_bool(), Some(true));
+        assert!(
+            value["features"].get("codex_hooks").is_none(),
+            "deprecated features.codex_hooks should be removed"
+        );
     }
 
     #[test]

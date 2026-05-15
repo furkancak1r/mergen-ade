@@ -950,3 +950,96 @@
   - Added AGENTS.md guidelines: "Queue rows must cap content width...", "Smart Input queue area must use a fixed slot...", "Smart Input footer height must clamp to a safe minimum so queue and draft always fit...", "Footer height is user-resizable via a drag handle...", "Draft text area resize grip resizes the overall footer..."
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-05-14
+
+---
+
+#### Smart Input draft input invisible when queue is empty and expanded {#smart-input-empty-queue-draft-clipped}
+- Date: 2026-05-15
+- Context: User reported that Smart Input was visible but the draft text input box was completely missing when the queue was empty and expanded.
+- Error signature: `draw_smart_input_footer` always allocated a full 3-row queue slot (`SMART_INPUT_MAX_VISIBLE_TASK_ROWS * SMART_INPUT_TASK_ROW_HEIGHT + 4.0 = 88px`) whenever `state.expanded` was true, even with zero queued tasks. Meanwhile, `smart_input_footer_height()` computed `desired = SMART_INPUT_BASE_FOOTER_HEIGHT` (156px) for the empty-queue case. The rendered content actually needed ~174px (header + mode + empty-queue hint + draft + margins), so the draft input overflowed the 156px footer and was clipped off-screen.
+- Symptoms/Impact:
+  1. The "No queued tasks. Add a prompt below." hint appeared, but the multiline draft TextEdit below it was invisible and unreachable.
+  2. Users could not type or paste into Smart Input when the queue was empty.
+  3. The footer looked like it had plenty of space, but the bottom ~80px of content (draft input + submit button) was hidden.
+- Root cause:
+  - Height calculation (`smart_input_footer_height`) and rendering (`draw_smart_input_footer`) were out of sync: the renderer reserved 88px for an empty 3-row slot while the height calculator assumed 0px for tasks.
+  - The empty-queue hint height was never accounted for in the footer height formula, causing a 18px deficit.
+- Resolution:
+  - Added `smart_input_visible_task_rows()` and `smart_input_queue_slot_height()` helpers so both the height calculator and the renderer use the exact same task-row count and slot size.
+  - Added `SMART_INPUT_EMPTY_QUEUE_HINT_HEIGHT` (18px) to the desired and safe-min calculations when `expanded` is true and no tasks exist.
+  - Updated both resize handles (main footer handle and draft grip) to use `smart_input_safe_min_footer_height()` so dragging never crushes the hint or draft.
+  - In `draw_smart_input_footer`, the queue slot is now sized to `smart_input_queue_slot_height(task_rows)`, which is `0px` when empty, allowing the hint and draft to fit within the calculated footer height.
+- Prevent recurrence:
+  - Added regression tests:
+    - `smart_input_footer_height_is_tall_enough_for_expanded_empty_queue` — asserts footer height >= base + empty hint (174px).
+    - `smart_input_empty_queue_does_not_allocate_three_row_slot` — renders footer with empty queue, asserts the "No queued tasks" hint is visible and no task row backgrounds are painted.
+    - `smart_input_footer_user_height_clamped_to_safe_min_when_tasks_exist` — updated to match actual slot height (base + rows*28+4 + 60).
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-15
+
+---
+
+#### OpenCode Smart Input questions were mouse-only {#opencode-smart-input-question-keyboard-navigation}
+- Date: 2026-05-15
+- Context: User reported that OpenCode questions already appeared inside Smart Input, but wanted an OpenCode-like selection flow that works with arrow keys and Enter instead of requiring mouse clicks.
+- Error signature: `draw_smart_input_footer` rendered question options as horizontal `selectable_label` widgets, while `raw_input_hook` only handled Smart Input draft/edit submit and history navigation. No terminal-scoped question focus state existed, so Arrow keys could fall through to Smart Input history or terminal routing instead of moving through question answers.
+- Symptoms/Impact:
+  1. Users had to click question options and the Submit/Reject buttons with the mouse.
+  2. Arrow keys could affect Smart Input draft history rather than the active question prompt.
+  3. The Smart Input question card did not visually match OpenCode's keyboard-first question prompt flow.
+- Root cause:
+  - Question state tracked selected labels and custom text, but not the currently highlighted answer row.
+  - `ensure_smart_input_focus()` could auto-focus the draft while a question was pending, stealing keyboard intent from the question card.
+  - The footer height calculation did not reserve additional space for the expanded question card.
+- Resolution:
+  - Added terminal-scoped `opencode_question_focus_index` and lifecycle helpers to initialize, clamp, and clear question focus alongside selected/custom answer state.
+  - Added question-specific keyboard routing in `raw_input_hook`: Up/Down and Left/Right move focus, Enter submits or focuses custom input, Space toggles multi-select answers, and Escape rejects.
+  - Reworked the Smart Input question card into a vertical OpenCode-style list with a highlighted row, selected markers, keyboard help text, and custom-answer focus behavior.
+  - Included question-card height in Smart Input footer desired/safe-min height so the prompt is less likely to clip the draft/queue controls.
+- Prevent recurrence:
+  - Added regression tests:
+    - `opencode_question_arrow_keys_move_focus_without_draft_history` — asserts ArrowDown is consumed by the question card and does not alter Smart Input draft history.
+    - `opencode_question_enter_submits_focused_option_answer` — asserts Enter submits the highlighted option through the hook answer bridge and clears question state.
+    - `opencode_question_escape_rejects_answer` — asserts Escape queues a rejected answer and clears the prompt.
+    - `opencode_question_keyboard_ignores_hidden_active_terminal` — asserts hidden/off-main terminals do not consume question keyboard input.
+    - `smart_input_footer_height_handles_question_safe_min_above_max_footer` — asserts question footer sizing does not panic when pane height is smaller than the safe minimum.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test opencode_question`, `cargo test smart_input_footer_height_handles_question_safe_min_above_max_footer`, `cargo test`
+- References: User request 2026-05-15
+
+---
+
+#### Smart Input footer content could paint past the allocated width {#smart-input-footer-inner-width-overflow}
+- Date: 2026-05-15
+- Context: Full `cargo test` after the Smart Input question work exposed `smart_input_queue_row_does_not_expand_past_footer_width` failing with text painted at x=412 inside a 400px footer.
+- Error signature: `draw_smart_input_footer()` set the framed content UI min/max width to the outer `footer_size.x` even though the frame also adds 8px horizontal inner margins. This allowed header/button/draft text shapes to render beyond the footer's allocated outer width.
+- Symptoms/Impact:
+  1. Long queued task scenarios could push visible text or action controls outside the footer bounds.
+  2. The queue row regression test caught text shapes extending past the 400px footer width.
+- Root cause:
+  - The footer frame's child UI used the outer size instead of subtracting the frame's horizontal and vertical margins.
+- Resolution:
+  - `draw_smart_input_footer()` now computes an inner size by subtracting 16px horizontal and 12px vertical frame margins before calling `ui.set_min_size()` and `ui.set_max_width()`.
+- Prevent recurrence:
+  - `smart_input_queue_row_does_not_expand_past_footer_width` is covered by the full `cargo test` suite and now passes.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input_queue_row_does_not_expand_past_footer_width`, `cargo test`
+- References: Full-suite validation 2026-05-15
+
+---
+
+#### Codex CLI showed deprecated `features.codex_hooks` warning {#codex-hooks-feature-flag-rename}
+- Date: 2026-05-15
+- Context: Codex CLI v0.130.0 warned that `[features].codex_hooks` is deprecated and should be replaced with `[features].hooks`.
+- Error signature: Mergen's Codex integration patcher wrote `features.codex_hooks = true` into `~/.codex/config.toml`, while current Codex docs list `features.hooks` as the stable lifecycle hook flag.
+- Symptoms/Impact:
+  1. Every `codex` launch could show a deprecation warning before starting MCP servers.
+  2. The warning made Mergen-managed Codex hook setup look stale even though `hooks.json` was otherwise valid.
+- Root cause:
+  - `patch_codex_config_file()` and integration health checks still used the old `codex_hooks` feature key.
+- Resolution:
+  - Updated Codex config patching to write `features.hooks = true`.
+  - Removed the deprecated `features.codex_hooks` key during repair.
+  - Updated inspection so configs that only contain the deprecated alias are repaired instead of reported healthy.
+- Prevent recurrence:
+  - Updated regression assertions to require `features.hooks = true` and verify that `features.codex_hooks` is not written or preserved.
+- Files/Commands touched: `src/codex.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test codex`, `cargo test`
+- References: User request 2026-05-15; OpenAI Codex config docs `https://developers.openai.com/codex/config-basic#supported-features`
