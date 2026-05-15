@@ -3843,11 +3843,22 @@ impl AdeApp {
         icon_key: LauncherIconKey,
         size: f32,
     ) -> egui::Response {
+        self.draw_launcher_icon_with_hover(ui, icon_key, size, false)
+    }
+
+    fn draw_launcher_icon_with_hover(
+        &mut self,
+        ui: &mut Ui,
+        icon_key: LauncherIconKey,
+        size: f32,
+        force_hover: bool,
+    ) -> egui::Response {
         let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
+        let hovered = force_hover || response.hovered();
         if let Some(texture) = self.builtin_launcher_icon_texture(ui.ctx(), icon_key) {
-            paint_builtin_launcher_icon(ui, rect, texture, response.hovered());
+            paint_builtin_launcher_icon(ui, rect, texture, hovered);
         } else {
-            paint_launcher_icon_badge(ui, rect, icon_key, response.hovered());
+            paint_launcher_icon_badge(ui, rect, icon_key, hovered);
         }
         response
     }
@@ -29188,6 +29199,7 @@ fn draw_launcher_menu_contents(
                 egui::Rect::from_min_size(ui.cursor().min, egui::vec2(menu_width, row_height));
             let row_rect =
                 full_row_rect.shrink2(egui::vec2(FOREGROUND_LAUNCHER_MENU_PADDING_X, 0.0));
+            let row_hovered = ui.rect_contains_pointer(row_rect);
             ui.painter().rect_filled(row_rect, 6.0, SURFACE_BG_SOFT);
 
             let inner_response = ui.allocate_new_ui(
@@ -29197,13 +29209,14 @@ fn draw_launcher_menu_contents(
                     .sense(Sense::click()),
                 |ui| {
                     ui.add_space(6.0);
-                    let _ = app.draw_launcher_icon(ui, launcher.icon_key, 16.0);
+                    let _ =
+                        app.draw_launcher_icon_with_hover(ui, launcher.icon_key, 16.0, row_hovered);
                     ui.add_space(6.0);
                     ui.add(
                         egui::Label::new(
                             RichText::new(&launcher.display_name)
                                 .strong()
-                                .color(TEXT_PRIMARY),
+                                .color(if row_hovered { ACCENT } else { TEXT_PRIMARY }),
                         )
                         .selectable(false)
                         .truncate(),
@@ -29211,11 +29224,8 @@ fn draw_launcher_menu_contents(
                     ui.response()
                 },
             );
-            let row_response = inner_response.inner.on_hover_text(format!(
-                "{}\n{}",
-                launcher.display_name, launcher.launch_command
-            ));
-            if row_response.hovered() {
+            let row_response = inner_response.inner;
+            if row_hovered {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
             if row_response.clicked() {
@@ -34332,9 +34342,9 @@ mod tests {
     }
 
     #[test]
-    fn foreground_launcher_menu_text_hover_avoids_text_cursor() {
-        // Regression test: hovering over launcher menu text should NOT show I-beam (text cursor).
-        // This verifies .selectable(false) is applied to the labels.
+    fn foreground_launcher_menu_text_hover_uses_pointing_hand_cursor() {
+        // Regression test: hovering a launcher menu row should show clickability
+        // without reverting to an I-beam text cursor.
         let ctx = Context::default();
         ctx.set_fonts(FontDefinitions::default());
 
@@ -34357,12 +34367,77 @@ mod tests {
             &launchers,
         );
 
-        // The key assertion: cursor should NOT be Text (I-beam/dik çubuk)
-        // which was the bug before adding .selectable(false)
         assert_ne!(
             output.platform_output.cursor_icon,
             egui::CursorIcon::Text,
             "hovering over launcher menu text should NOT use Text (I-beam) cursor"
+        );
+        assert_eq!(
+            output.platform_output.cursor_icon,
+            egui::CursorIcon::PointingHand,
+            "hovering over launcher menu text should use a pointing-hand row hover cursor"
+        );
+    }
+
+    fn text_shape_glyph_color(text_shape: &egui::epaint::TextShape) -> Option<Color32> {
+        if let Some(color) = text_shape.override_text_color {
+            return Some(color);
+        }
+        let row = text_shape.galley.rows.first()?;
+        let vertex_index = row.visuals.glyph_vertex_range.start;
+        let color = row.visuals.mesh.vertices.get(vertex_index)?.color;
+        if color == Color32::PLACEHOLDER {
+            Some(text_shape.fallback_color)
+        } else {
+            Some(color)
+        }
+    }
+
+    fn rendered_text_color(output: &egui::FullOutput, text: &str) -> Option<Color32> {
+        output.shapes.iter().find_map(|shape| {
+            let egui::epaint::Shape::Text(text_shape) = &shape.shape else {
+                return None;
+            };
+            (text_shape.galley.text() == text)
+                .then(|| text_shape_glyph_color(text_shape))
+                .flatten()
+        })
+    }
+
+    #[test]
+    fn foreground_launcher_menu_row_text_color_changes_on_hover() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let launchers = vec![LauncherEntry {
+            id: "opencode".to_owned(),
+            builtin: Some(BuiltinLauncherKind::OpenCode),
+            display_name: "OpenCode".to_owned(),
+            launch_command: "opencode".to_owned(),
+            enabled: true,
+            icon_key: LauncherIconKey::OpenCode,
+        }];
+
+        let idle_output =
+            draw_foreground_launcher_menu_in_test_ui(&ctx, RawInput::default(), &launchers);
+        assert_eq!(
+            rendered_text_color(&idle_output, "OpenCode"),
+            Some(super::TEXT_PRIMARY),
+            "idle launcher row text should use the normal text color"
+        );
+
+        let hover_output = draw_foreground_launcher_menu_in_test_ui(
+            &ctx,
+            RawInput {
+                events: vec![Event::PointerMoved(pos2(60.0, 16.0))],
+                ..RawInput::default()
+            },
+            &launchers,
+        );
+        assert_eq!(
+            rendered_text_color(&hover_output, "OpenCode"),
+            Some(super::ACCENT),
+            "hovered launcher row text should use the accent color"
         );
     }
 

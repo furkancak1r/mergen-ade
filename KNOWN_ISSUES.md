@@ -1366,3 +1366,63 @@
   - Updated the foreground launcher menu regression test to assert hover does not paint `BTN_ICON_HOVER`.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test foreground_launcher -- --nocapture`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User request 2026-05-15
+
+---
+
+#### Foreground launcher list rows still showed hover tooltip {#foreground-launcher-row-tooltip-removed}
+- Date: 2026-05-15
+- Context: User screenshot showed that hovering a foreground launcher row still displayed a tooltip such as `OpenCode` / `opencode` after the row highlight was removed.
+- Error signature: `draw_launcher_menu_contents()` still applied `.on_hover_text()` and set `CursorIcon::PointingHand` for hovered launcher rows.
+- Symptoms/Impact:
+  1. Hovering a launcher row produced a tooltip popup even though row hover feedback was meant to be removed.
+  2. The row cursor still changed on hover, leaving another hover affordance in the same list.
+- Root cause:
+  - The previous change only removed hover background painting and intentionally left tooltip/cursor behavior in place.
+- Resolution:
+  - Removed row-level launcher hover tooltip generation.
+  - Removed row-level pointing-hand cursor override.
+  - Preserved row click selection and popup close behavior.
+- Prevent recurrence:
+  - Extended the foreground launcher menu hover test to assert row hover does not use text or pointing-hand cursor.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test foreground_launcher -- --nocapture`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User screenshot 2026-05-15
+
+---
+
+#### Foreground launcher list rows needed clickable cursor {#foreground-launcher-row-click-cursor}
+- Date: 2026-05-15
+- Context: After removing row hover highlight and tooltip, user wanted the cursor to still change over launcher list rows so clickability is clear.
+- Error signature: `draw_launcher_menu_contents()` used a clickable row response but no longer applied a pointing-hand hover cursor.
+- Symptoms/Impact:
+  1. Launcher rows were clickable but did not visually communicate clickability through the cursor.
+  2. Removing all row hover affordances made the list feel static.
+- Root cause:
+  - The tooltip/cursor cleanup removed the pointing-hand cursor together with the unwanted tooltip.
+- Resolution:
+  - Restored only `.on_hover_cursor(CursorIcon::PointingHand)` on launcher row responses.
+  - Kept row hover background and row tooltip disabled.
+- Prevent recurrence:
+  - Updated the foreground launcher row hover test to require `PointingHand` while still avoiding text cursor behavior.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test foreground_launcher -- --nocapture`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
+
+---
+
+#### Foreground launcher row needed item color hover {#foreground-launcher-row-color-hover}
+- Date: 2026-05-15
+- Context: User wanted foreground launcher list items to visibly change color on hover while keeping the tooltip and row background hover removed.
+- Error signature: Launcher rows only changed cursor on hover; text and icon rendering used their non-hover colors unless hovering the icon itself.
+- Symptoms/Impact:
+  1. Rows communicated clickability through cursor only.
+  2. Hovering over the text area did not visually change the launcher item.
+- Root cause:
+  - Row hover state was not passed into the launcher item text/icon painting.
+- Resolution:
+  - Calculated row hover from the full launcher row rectangle.
+  - Applied `ACCENT` to launcher row text when hovered.
+  - Added forced-hover support for launcher icon painting so the icon reacts when any part of the row is hovered.
+  - Kept row background hover and row tooltip disabled.
+- Prevent recurrence:
+  - Added a foreground launcher render test for idle `TEXT_PRIMARY` and hovered `ACCENT` row text colors.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test foreground_launcher -- --nocapture`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
