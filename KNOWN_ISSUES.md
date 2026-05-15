@@ -1193,3 +1193,22 @@
   - Added regression coverage for row/viewport clip intersection and for visible queue task rows staying below the Smart Input header.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input_queue -- --nocapture`, `cargo test --no-run`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User screenshot 2026-05-15
+
+---
+
+#### Smart Input draft input sat too close to the queue rows {#smart-input-draft-top-gap}
+- Date: 2026-05-15
+- Context: User wanted the lower Smart Input draft field moved slightly downward after queued task rows.
+- Error signature: The draft input started after the queue area using only the shared `item_spacing.y` value.
+- Symptoms/Impact:
+  1. The draft input felt visually cramped against queued task rows.
+  2. The queue and draft regions were harder to scan as separate areas.
+- Root cause:
+  - There was no Smart Input-specific vertical gap between the queue viewport and the draft input row.
+- Resolution:
+  - Added a dedicated `SMART_INPUT_DRAFT_TOP_GAP` and applied it immediately before the draft input.
+  - Included the same gap in Smart Input desired and safe-min footer height calculations so the draft field is not clipped.
+- Prevent recurrence:
+  - Added a render regression test asserting the draft hint sits at least the configured gap below queued task text.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input -- --nocapture`, `cargo test --no-run`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15

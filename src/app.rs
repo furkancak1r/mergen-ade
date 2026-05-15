@@ -281,6 +281,7 @@ const SMART_INPUT_BASE_FOOTER_HEIGHT: f32 = 156.0;
 const SMART_INPUT_TASK_ROW_HEIGHT: f32 = 28.0;
 const SMART_INPUT_TASK_INDEX_WIDTH: f32 = 16.0;
 const SMART_INPUT_MAX_VISIBLE_TASK_ROWS: usize = 3;
+const SMART_INPUT_DRAFT_TOP_GAP: f32 = 8.0;
 const SMART_INPUT_FOOTER_GAP: f32 = 6.0;
 const SMART_INPUT_RESIZE_HANDLE_HEIGHT: f32 = 5.0;
 const SMART_INPUT_TOOLTIP_MAX_CHARS: usize = 140;
@@ -27593,7 +27594,11 @@ fn smart_input_desired_footer_height(state: &SmartInputState) -> f32 {
     } else {
         0.0
     };
-    SMART_INPUT_BASE_FOOTER_HEIGHT + queue_slot + hint_extra + if task_rows > 0 { 6.0 } else { 0.0 }
+    SMART_INPUT_BASE_FOOTER_HEIGHT
+        + queue_slot
+        + hint_extra
+        + SMART_INPUT_DRAFT_TOP_GAP
+        + if task_rows > 0 { 6.0 } else { 0.0 }
 }
 
 fn smart_input_safe_min_footer_height(state: &SmartInputState) -> f32 {
@@ -27605,11 +27610,13 @@ fn smart_input_safe_min_footer_height(state: &SmartInputState) -> f32 {
         0.0
     };
     if task_rows > 0 {
-        (SMART_INPUT_BASE_FOOTER_HEIGHT + queue_slot + 60.0).max(SMART_INPUT_MIN_FOOTER_HEIGHT)
+        (SMART_INPUT_BASE_FOOTER_HEIGHT + queue_slot + SMART_INPUT_DRAFT_TOP_GAP + 60.0)
+            .max(SMART_INPUT_MIN_FOOTER_HEIGHT)
     } else if state.expanded {
-        (SMART_INPUT_BASE_FOOTER_HEIGHT + hint_extra).max(SMART_INPUT_MIN_FOOTER_HEIGHT)
+        (SMART_INPUT_BASE_FOOTER_HEIGHT + hint_extra + SMART_INPUT_DRAFT_TOP_GAP)
+            .max(SMART_INPUT_MIN_FOOTER_HEIGHT)
     } else {
-        SMART_INPUT_MIN_FOOTER_HEIGHT
+        SMART_INPUT_MIN_FOOTER_HEIGHT + SMART_INPUT_DRAFT_TOP_GAP
     }
 }
 
@@ -28221,6 +28228,8 @@ fn draw_smart_input_footer(
                         .color(TEXT_MUTED),
                 );
             }
+
+            ui.add_space(SMART_INPUT_DRAFT_TOP_GAP);
 
             // Draft input: use a fixed height so it never grows/shrinks dynamically and
             // crowds out the queue area above it.
@@ -54543,7 +54552,9 @@ mod tests {
         seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
         let terminal = app.terminals.get(&1).expect("terminal 1");
         let height = AdeApp::smart_input_footer_height(terminal, 400.0, 18.0);
-        let expected_min = SMART_INPUT_BASE_FOOTER_HEIGHT + SMART_INPUT_EMPTY_QUEUE_HINT_HEIGHT;
+        let expected_min = SMART_INPUT_BASE_FOOTER_HEIGHT
+            + SMART_INPUT_EMPTY_QUEUE_HINT_HEIGHT
+            + super::SMART_INPUT_DRAFT_TOP_GAP;
         assert!(
             height >= expected_min,
             "footer should be at least base height + empty hint ({expected_min}), got {}",
@@ -54573,11 +54584,11 @@ mod tests {
         terminal.smart_input.user_height = Some(150.0);
 
         let height = AdeApp::smart_input_footer_height(terminal, 400.0, 18.0);
-        // With 1 task row, safe_min = 156 + (1*28+4) + 60 = 248, so user_height=150
-        // must be clamped upward to safe_min.
+        // With 1 task row, safe_min = 156 + (1*28+4) + 8 + 60 = 256,
+        // so user_height=150 must be clamped upward to safe_min.
         assert!(
-            height >= 248.0,
-            "footer height with queued task must be clamped to safe_min (>=248), got {}",
+            height >= 256.0,
+            "footer height with queued task must be clamped to safe_min (>=256), got {}",
             height
         );
     }
@@ -54903,6 +54914,69 @@ mod tests {
         assert!(
             task_text_found,
             "queued task 'task one' must be visible as a text shape in the footer"
+        );
+    }
+
+    #[test]
+    fn smart_input_draft_input_sits_below_queue_with_extra_gap() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.smart_input.draft = "task one".to_owned();
+            terminal.smart_input.enqueue_draft();
+        }
+
+        let mut raw_input = RawInput::default();
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(420.0, 420.0),
+        ));
+        let output = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let footer_size = egui::vec2(420.0, 260.0);
+                let pane_height = 420.0;
+                let line_height = 18.0;
+                let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+                let _ = super::draw_smart_input_footer(
+                    ui,
+                    terminal,
+                    footer_size,
+                    pane_height,
+                    line_height,
+                );
+            });
+        });
+
+        let mut queued_task_rect = None;
+        let mut draft_hint_rect = None;
+        for shape in &output.shapes {
+            let egui::epaint::Shape::Text(text_shape) = &shape.shape else {
+                continue;
+            };
+            let text = text_shape.galley.text();
+            let rect = egui::Rect::from_min_size(text_shape.pos, text_shape.galley.size());
+            if text == "task one" {
+                queued_task_rect = Some(rect);
+            } else if text.contains("Task for after done") {
+                draft_hint_rect = Some(rect);
+            }
+        }
+
+        let queued_task_rect = queued_task_rect.expect("queued task text");
+        let draft_hint_rect = draft_hint_rect.expect("draft input hint");
+        let gap = draft_hint_rect.top() - queued_task_rect.bottom();
+
+        assert!(
+            gap >= super::SMART_INPUT_DRAFT_TOP_GAP,
+            "draft input should sit at least the configured extra gap below queued rows (gap={}, expected>={})",
+            gap,
+            super::SMART_INPUT_DRAFT_TOP_GAP
         );
     }
 
