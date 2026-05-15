@@ -88,6 +88,38 @@
   box-sizing: border-box;
 }
 
+/* xterm.js needs content-box for accurate cell sizing */
+.xterm,
+.xterm * {
+  box-sizing: content-box !important;
+  touch-action: auto !important;
+  scrollbar-width: auto !important;
+  scrollbar-color: auto !important;
+}
+
+.xterm-viewport {
+  scrollbar-width: auto !important;
+  -ms-overflow-style: scrollbar !important;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar {
+  width: 10px !important;
+  height: 10px !important;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-track {
+  background: transparent !important;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-thumb {
+  background: #3a3a3a !important;
+  border-radius: 5px !important;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: #555 !important;
+}
+
 /* Ensure scrollable panels inherit */
 div[style*="overflow: auto"],
 div[style*="overflow:auto"],

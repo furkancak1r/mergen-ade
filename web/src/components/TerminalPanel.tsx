@@ -39,19 +39,19 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
         fontFamily: 'Consolas, "Courier New", monospace',
         fontSize: isSmallPhone ? 11 : isMobile ? 12 : 14,
         theme: {
-          background: 'var(--bg-base)',
-          foreground: 'var(--text-primary)',
-          cursor: 'var(--accent)',
-          selectionBackground: 'var(--bg-active)',
+          background: '#0c0c0c',
+          foreground: '#e0e0e0',
+          cursor: '#4fc3f7',
+          selectionBackground: '#264f78',
           black: '#0c0c0c',
-          red: 'var(--danger)',
-          green: 'var(--success)',
+          red: '#f44336',
+          green: '#4caf50',
           yellow: '#ffeb3b',
-          blue: 'var(--accent)',
+          blue: '#4fc3f7',
           magenta: '#e040fb',
           cyan: '#00bcd4',
-          white: 'var(--text-primary)',
-          brightBlack: '#666',
+          white: '#e0e0e0',
+          brightBlack: '#666666',
           brightRed: '#ff5252',
           brightGreen: '#69f0ae',
           brightYellow: '#ffff00',
@@ -62,7 +62,8 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
         },
         cursorBlink: true,
         scrollback: 5000,
-        convertEol: true,
+        rightClickSelectsWord: true,
+        windowsMode: true,
       });
       const fit = new FitAddon();
       term.loadAddon(fit);
@@ -96,8 +97,21 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
       };
       window.addEventListener('resize', handleResize);
 
+      // Observe container size changes (sidebar open/close, panel resize)
+      let resizeObserver: ResizeObserver | null = null;
+      if (containerRef.current && typeof ResizeObserver !== 'undefined') {
+        resizeObserver = new ResizeObserver(() => {
+          requestAnimationFrame(() => {
+            fit.fit();
+            onResize(term.cols, term.rows);
+          });
+        });
+        resizeObserver.observe(containerRef.current);
+      }
+
       return () => {
         window.removeEventListener('resize', handleResize);
+        resizeObserver?.disconnect();
         term.dispose();
       };
     }, [terminal.id]);
@@ -135,7 +149,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, Props>(
             </span>
           )}
         </div>
-        <div ref={containerRef} style={{ flex: 1, padding: 'var(--space-xs)' }} />
+        <div ref={containerRef} style={{ width: '100%', height: '100%', minHeight: 0, overflow: 'hidden', position: 'relative' }} />
       </div>
     );
   }

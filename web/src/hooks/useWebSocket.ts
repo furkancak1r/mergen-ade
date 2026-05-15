@@ -13,25 +13,31 @@ export function useWebSocket(
   onTerminalOutput?: TerminalOutputHandler
 ) {
   const wsRef = useRef<WebSocket | null>(null);
+  const tokenRef = useRef(token);
+  tokenRef.current = token;
+  const onMessageRef = useRef(onMessage);
+  onMessageRef.current = onMessage;
+  const onConnectedChangeRef = useRef(onConnectedChange);
+  onConnectedChangeRef.current = onConnectedChange;
   const onTerminalOutputRef = useRef(onTerminalOutput);
   onTerminalOutputRef.current = onTerminalOutput;
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectDelayRef = useRef(1000);
 
   useEffect(() => {
-    if (!token) return;
+    if (!tokenRef.current) return;
 
     const connect = () => {
-      const ws = new WebSocket(`${WS_URL}?token=${encodeURIComponent(token)}`);
+      const ws = new WebSocket(`${WS_URL}?token=${encodeURIComponent(tokenRef.current)}`);
       wsRef.current = ws;
 
       ws.onopen = () => {
         reconnectDelayRef.current = 1000;
-        onConnectedChange(true);
+        onConnectedChangeRef.current(true);
       };
 
       ws.onclose = () => {
-        onConnectedChange(false);
+        onConnectedChangeRef.current(false);
         // Auto-reconnect with exponential backoff (max 30s)
         reconnectDelayRef.current = Math.min(reconnectDelayRef.current * 2, 30000);
         reconnectTimerRef.current = setTimeout(connect, reconnectDelayRef.current);
@@ -44,9 +50,8 @@ export function useWebSocket(
             if (msg.kind === 'terminal_output') {
               onTerminalOutputRef.current?.(msg.terminal_id, new Uint8Array(msg.data));
             }
-            onMessage(msg);
+            onMessageRef.current(msg);
           } else if (event.data instanceof ArrayBuffer) {
-            // Binary frame: first 8 bytes = terminal_id LE, rest = raw PTY data
             const buf = new Uint8Array(event.data);
             if (buf.length >= 8) {
               const view = new DataView(buf.buffer);
@@ -55,7 +60,6 @@ export function useWebSocket(
               onTerminalOutputRef.current?.(terminalId, payload);
             }
           } else if (event.data instanceof Blob) {
-            // Convert Blob to ArrayBuffer then process
             const reader = new FileReader();
             reader.onload = () => {
               const buf = new Uint8Array(reader.result as ArrayBuffer);
@@ -85,11 +89,11 @@ export function useWebSocket(
         clearTimeout(reconnectTimerRef.current);
       }
       if (wsRef.current) {
-        wsRef.current.onclose = null; // prevent reconnect after intentional close
+        wsRef.current.onclose = null;
         wsRef.current.close();
       }
     };
-  }, [token]);
+  }, []);
 
   const sendMessage = useCallback((msg: ClientMessage) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
