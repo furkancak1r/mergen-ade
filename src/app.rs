@@ -23048,14 +23048,17 @@ impl AdeApp {
                     if handle_response.dragged() {
                         let delta = ui.ctx().input(|i| i.pointer.delta().y);
                         let max_footer = smart_input_max_footer_height(pane_height, line_height);
-                        let safe_min = smart_input_safe_min_footer_height(&terminal.smart_input)
-                            + smart_input_question_extra_height(
-                                terminal.opencode_pending_question.as_ref(),
-                            );
-                        let new_height =
-                            (smart_footer_height - delta).max(safe_min).min(max_footer);
+                        let question_extra = smart_input_question_extra_height(
+                            terminal.opencode_pending_question.as_ref(),
+                        );
+                        let new_height = smart_input_resize_footer_height(
+                            &mut terminal.smart_input,
+                            smart_footer_height,
+                            delta,
+                            max_footer,
+                            question_extra,
+                        );
                         terminal.smart_input.user_height = Some(new_height);
-                        terminal.smart_input.draft_user_height = None;
                         ui.ctx().request_repaint();
                     }
 
@@ -27735,6 +27738,9 @@ fn draw_smart_input_attachments(
                         egui::FontId::proportional(9.0),
                         Color32::from_rgb(232, 100, 100),
                     );
+                    if remove_response.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
                     if remove_response.clicked() {
                         to_remove.push(i);
                     }
@@ -27846,6 +27852,56 @@ fn smart_input_max_footer_height(pane_height: f32, line_height: f32) -> f32 {
         .max(0.0)
 }
 
+fn smart_input_safe_min_footer_height_without_draft_extra(state: &SmartInputState) -> f32 {
+    let draft_extra = smart_input_draft_extra_height(state);
+    (smart_input_safe_min_footer_height(state) - draft_extra).max(SMART_INPUT_MIN_FOOTER_HEIGHT)
+}
+
+fn smart_input_max_draft_height_for_footer(
+    state: &SmartInputState,
+    footer_height: f32,
+    question_extra_height: f32,
+) -> f32 {
+    let safe_min_without_draft_extra =
+        smart_input_safe_min_footer_height_without_draft_extra(state);
+    (footer_height - question_extra_height - safe_min_without_draft_extra
+        + SMART_INPUT_DRAFT_DEFAULT_HEIGHT)
+        .max(SMART_INPUT_DRAFT_MIN_HEIGHT)
+}
+
+fn smart_input_clamp_draft_height_to_footer(
+    state: &mut SmartInputState,
+    footer_height: f32,
+    question_extra_height: f32,
+) {
+    let Some(draft_user_height) = state.draft_user_height else {
+        return;
+    };
+    let max_draft_height =
+        smart_input_max_draft_height_for_footer(state, footer_height, question_extra_height);
+    state.draft_user_height = Some(
+        draft_user_height
+            .max(SMART_INPUT_DRAFT_MIN_HEIGHT)
+            .min(max_draft_height),
+    );
+}
+
+fn smart_input_resize_footer_height(
+    state: &mut SmartInputState,
+    current_footer_height: f32,
+    delta_y: f32,
+    max_footer_height: f32,
+    question_extra_height: f32,
+) -> f32 {
+    let min_footer =
+        smart_input_safe_min_footer_height_without_draft_extra(state) + question_extra_height;
+    let new_height = (current_footer_height - delta_y)
+        .max(min_footer)
+        .min(max_footer_height);
+    smart_input_clamp_draft_height_to_footer(state, new_height, question_extra_height);
+    new_height
+}
+
 fn smart_input_resize_draft_height(
     state: &mut SmartInputState,
     delta_y: f32,
@@ -27853,13 +27909,8 @@ fn smart_input_resize_draft_height(
     question_extra_height: f32,
 ) {
     let current_height = smart_input_draft_height(state);
-    let draft_extra = smart_input_draft_extra_height(state);
-    let safe_min_without_draft_extra = (smart_input_safe_min_footer_height(state) - draft_extra)
-        .max(SMART_INPUT_MIN_FOOTER_HEIGHT);
     let max_draft_height =
-        (max_footer_height - question_extra_height - safe_min_without_draft_extra
-            + SMART_INPUT_DRAFT_DEFAULT_HEIGHT)
-            .max(SMART_INPUT_DRAFT_MIN_HEIGHT);
+        smart_input_max_draft_height_for_footer(state, max_footer_height, question_extra_height);
 
     state.draft_user_height = Some(
         (current_height + delta_y)
@@ -55225,6 +55276,83 @@ mod tests {
     }
 
     #[test]
+    fn smart_input_footer_resize_grow_preserves_draft_height() {
+        let mut state = SmartInputState::default();
+        let draft_height = super::SMART_INPUT_DRAFT_DEFAULT_HEIGHT + 56.0;
+        state.draft_user_height = Some(draft_height);
+        let current_footer_height = super::smart_input_desired_footer_height(&state);
+
+        let new_footer_height = super::smart_input_resize_footer_height(
+            &mut state,
+            current_footer_height,
+            -44.0,
+            current_footer_height + 80.0,
+            0.0,
+        );
+
+        assert!(
+            new_footer_height > current_footer_height,
+            "footer drag should grow the Smart Input area"
+        );
+        assert_eq!(
+            state.draft_user_height,
+            Some(draft_height),
+            "growing the footer must not reset or shrink the resized draft input"
+        );
+    }
+
+    #[test]
+    fn smart_input_footer_resize_shrink_clamps_draft_only_when_needed() {
+        let mut state = SmartInputState::default();
+        let draft_height = super::SMART_INPUT_DRAFT_DEFAULT_HEIGHT + 80.0;
+        state.draft_user_height = Some(draft_height);
+        let current_footer_height = super::smart_input_desired_footer_height(&state);
+
+        let new_footer_height = super::smart_input_resize_footer_height(
+            &mut state,
+            current_footer_height,
+            70.0,
+            current_footer_height,
+            0.0,
+        );
+
+        let clamped_draft_height = state
+            .draft_user_height
+            .expect("manual draft height should remain tracked");
+        assert!(
+            new_footer_height < current_footer_height,
+            "footer drag should shrink the Smart Input area"
+        );
+        assert!(
+            clamped_draft_height < draft_height,
+            "draft height should shrink only to fit the smaller footer"
+        );
+        assert!(
+            clamped_draft_height >= super::SMART_INPUT_DRAFT_MIN_HEIGHT,
+            "draft height must stay above the minimum"
+        );
+    }
+
+    #[test]
+    fn smart_input_footer_resize_without_manual_draft_keeps_draft_height_unset() {
+        let mut state = SmartInputState::default();
+        let current_footer_height = super::smart_input_desired_footer_height(&state);
+
+        let _ = super::smart_input_resize_footer_height(
+            &mut state,
+            current_footer_height,
+            -24.0,
+            current_footer_height + 80.0,
+            0.0,
+        );
+
+        assert_eq!(
+            state.draft_user_height, None,
+            "footer resize must not create a manual draft height when the draft was never resized"
+        );
+    }
+
+    #[test]
     fn smart_input_footer_height_accounts_for_draft_user_height() {
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
         seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
@@ -56081,6 +56209,66 @@ mod tests {
             chip_height <= 22.0,
             "attachment chip should stay compact after shrinking the remove button (height={})",
             chip_height
+        );
+    }
+
+    #[test]
+    fn smart_input_attachment_remove_button_uses_pointing_cursor_on_hover() {
+        use egui::{Context, Event, RawInput};
+
+        fn render_attachment_chip(
+            ctx: &Context,
+            hover_pos: Option<egui::Pos2>,
+        ) -> eframe::egui::FullOutput {
+            let mut attachments = vec![SmartInputAttachment {
+                id: 1,
+                path: r"C:\test\Mergen_clipboard_image.png".to_owned(),
+            }];
+            let mut raw_input = RawInput::default();
+            raw_input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(260.0, 40.0),
+            ));
+            if let Some(pos) = hover_pos {
+                raw_input.events.push(Event::PointerMoved(pos));
+            }
+            ctx.run(raw_input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(egui::Rect::from_min_size(
+                                egui::pos2(0.0, 0.0),
+                                egui::vec2(260.0, 40.0),
+                            ))
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    let _ = super::draw_smart_input_attachments(&mut child, &mut attachments);
+                });
+            })
+        }
+
+        let ctx = Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+        let first_output = render_attachment_chip(&ctx, None);
+        let remove_center = first_output
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                let egui::epaint::Shape::Text(text_shape) = &shape.shape else {
+                    return None;
+                };
+                (text_shape.galley.text() == "x").then_some(
+                    egui::Rect::from_min_size(text_shape.pos, text_shape.galley.size()).center(),
+                )
+            })
+            .expect("remove x should render");
+
+        let hover_output = render_attachment_chip(&ctx, Some(remove_center));
+
+        assert_eq!(
+            hover_output.platform_output.cursor_icon,
+            egui::CursorIcon::PointingHand,
+            "hovering the attachment remove x should show a clickable cursor"
         );
     }
 

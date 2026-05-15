@@ -1614,3 +1614,23 @@
   - Added tests for no-op pane refresh, draft focus reclaim, edit input focus, and raw input routing after the override is cleared.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted smart_input focus tests, `cargo test smart_input -- --nocapture`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User request 2026-05-15
+
+---
+
+#### Smart Input footer resize reset manually resized draft input {#smart-input-footer-resize-reset-draft-height}
+- Date: 2026-05-15
+- Context: User resized the Smart Input draft input, then resized the full Smart Input panel. Growing the full panel unexpectedly returned the draft input to its default height.
+- Error signature: The full Smart Input resize handle assigned `draft_user_height = None` after every drag.
+- Symptoms/Impact:
+  1. A manually enlarged draft input collapsed back to its old/default height when the full Smart Input area was resized.
+  2. The draft resize preference was lost even when the full panel was being enlarged.
+- Root cause:
+  - Full footer resizing intentionally separated footer height from draft height, but still cleared the stored draft height on every drag.
+- Resolution:
+  - Preserve `draft_user_height` during full footer growth.
+  - Clamp `draft_user_height` only when the full footer is shrunk enough that the current draft height no longer fits.
+  - Added a pointing-hand cursor for Smart Input image attachment remove buttons.
+- Prevent recurrence:
+  - Added tests for footer growth preserving draft height, footer shrink clamping draft height only as needed, unset draft height staying unset, and remove-button hover cursor.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input -- --nocapture`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
