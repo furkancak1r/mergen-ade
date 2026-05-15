@@ -279,6 +279,7 @@ const CREATE_WORKTREE_PATH_INPUT_ID: &str = "create-worktree-path-input";
 const SMART_INPUT_MIN_FOOTER_HEIGHT: f32 = 132.0;
 const SMART_INPUT_BASE_FOOTER_HEIGHT: f32 = 156.0;
 const SMART_INPUT_TASK_ROW_HEIGHT: f32 = 28.0;
+const SMART_INPUT_TASK_INDEX_WIDTH: f32 = 16.0;
 const SMART_INPUT_MAX_VISIBLE_TASK_ROWS: usize = 3;
 const SMART_INPUT_FOOTER_GAP: f32 = 6.0;
 const SMART_INPUT_RESIZE_HANDLE_HEIGHT: f32 = 5.0;
@@ -1042,10 +1043,24 @@ struct SmartInputTask {
     attachments: Vec<SmartInputAttachment>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SmartInputDraftReturnTarget {
+    index: usize,
+    task_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmartInputDraftEditResult {
+    Moved,
+    DraftOccupied,
+    Missing,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct SmartInputState {
     draft: String,
     draft_attachments: Vec<SmartInputAttachment>,
+    draft_return_target: Option<SmartInputDraftReturnTarget>,
     mode: SmartInputMode,
     auto_run_enabled: bool,
     expanded: bool,
@@ -1086,6 +1101,7 @@ impl Default for SmartInputState {
         Self {
             draft: String::new(),
             draft_attachments: Vec::new(),
+            draft_return_target: None,
             mode: SmartInputMode::QueueAfterDone,
             auto_run_enabled: true,
             expanded: true,
@@ -1117,20 +1133,55 @@ impl SmartInputState {
             return None;
         }
 
-        let id = self.next_task_id;
-        self.next_task_id = self.next_task_id.saturating_add(1).max(1);
+        let return_target = self.draft_return_target.take();
+        let id = if let Some(target) = return_target {
+            target.task_id
+        } else {
+            let id = self.next_task_id;
+            self.next_task_id = self.next_task_id.saturating_add(1).max(1);
+            id
+        };
         let attachments = std::mem::take(&mut self.draft_attachments);
-        self.tasks.push(SmartInputTask {
+        let task = SmartInputTask {
             id,
             text: self.draft.clone(),
             attachments,
-        });
+        };
+        if let Some(target) = return_target {
+            let insert_index = target.index.min(self.tasks.len());
+            self.tasks.insert(insert_index, task);
+            self.queue_scroll_to_end = false;
+        } else {
+            self.tasks.push(task);
+            self.queue_scroll_to_end = true;
+        }
         self.draft.clear();
         self.history_nav_reset();
         self.draft_context_menu_selection_range = None;
         self.draft_context_menu_was_open = false;
-        self.queue_scroll_to_end = true;
         Some(id)
+    }
+
+    fn move_task_to_draft_for_edit(&mut self, task_id: u64) -> SmartInputDraftEditResult {
+        let Some(index) = self.tasks.iter().position(|task| task.id == task_id) else {
+            return SmartInputDraftEditResult::Missing;
+        };
+        if !self.draft.is_empty() || !self.draft_attachments.is_empty() {
+            return SmartInputDraftEditResult::DraftOccupied;
+        }
+
+        if self.editing_task_id.is_some() {
+            self.cancel_edit();
+        }
+        let task = self.tasks.remove(index);
+        self.draft = task.text;
+        self.draft_attachments = task.attachments;
+        self.draft_return_target = Some(SmartInputDraftReturnTarget { index, task_id });
+        self.mode = SmartInputMode::QueueAfterDone;
+        self.history_nav_reset();
+        self.draft_context_menu_selection_range = None;
+        self.draft_context_menu_was_open = false;
+        SmartInputDraftEditResult::Moved
     }
 
     fn remove_task(&mut self, task_id: u64) -> Option<String> {
@@ -1330,6 +1381,7 @@ enum SmartInputSubmitRequest {
 struct SmartInputPaneAction {
     send_draft_now: Option<(String, Vec<SmartInputAttachment>)>,
     send_task_now: Option<(u64, Vec<SmartInputAttachment>)>,
+    status_message: Option<String>,
     submit_question: bool,
     reject_question: bool,
 }
@@ -13665,6 +13717,7 @@ impl AdeApp {
                         if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                             terminal.smart_input.draft.clear();
                             terminal.smart_input.draft_attachments.clear();
+                            terminal.smart_input.draft_return_target = None;
                             terminal.smart_input.history_nav_reset();
                             terminal.smart_input.draft_context_menu_selection_range = None;
                             terminal.smart_input.draft_context_menu_was_open = false;
@@ -13680,6 +13733,7 @@ impl AdeApp {
                         if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                             terminal.smart_input.draft.clear();
                             terminal.smart_input.draft_attachments.clear();
+                            terminal.smart_input.draft_return_target = None;
                             terminal.smart_input.history_nav_reset();
                             terminal.smart_input.draft_context_menu_selection_range = None;
                             terminal.smart_input.draft_context_menu_was_open = false;
@@ -13790,6 +13844,9 @@ impl AdeApp {
         if action.reject_question {
             self.reject_opencode_question(terminal_id);
         }
+        if let Some(message) = action.status_message {
+            self.show_status_feedback(ctx, message);
+        }
 
         if let Some((text, attachments)) = action.send_draft_now {
             if text.trim().is_empty() && attachments.is_empty() {
@@ -13813,6 +13870,7 @@ impl AdeApp {
                     if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                         terminal.smart_input.draft.clear();
                         terminal.smart_input.draft_attachments.clear();
+                        terminal.smart_input.draft_return_target = None;
                         terminal.smart_input.draft_context_menu_selection_range = None;
                         terminal.smart_input.draft_context_menu_was_open = false;
                     }
@@ -13827,6 +13885,7 @@ impl AdeApp {
                     if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                         terminal.smart_input.draft.clear();
                         terminal.smart_input.draft_attachments.clear();
+                        terminal.smart_input.draft_return_target = None;
                         terminal.smart_input.draft_context_menu_selection_range = None;
                         terminal.smart_input.draft_context_menu_was_open = false;
                     }
@@ -27861,7 +27920,26 @@ fn draw_smart_input_footer(
                             .rect_filled(row_rect, 0.0, Color32::from_rgb(28, 28, 30));
                     }
 
-                    row_ui.label(RichText::new(format!("{}.", index + 1)).color(TEXT_MUTED));
+                    let index_text = format!("{}.", index + 1);
+                    let (index_rect, _) = row_ui.allocate_exact_size(
+                        egui::vec2(SMART_INPUT_TASK_INDEX_WIDTH, SMART_INPUT_TASK_ROW_HEIGHT),
+                        Sense::hover(),
+                    );
+                    if row_ui.is_rect_visible(index_rect) {
+                        let index_galley =
+                            WidgetText::from(RichText::new(&index_text).color(TEXT_MUTED))
+                                .into_galley(
+                                    &row_ui,
+                                    Some(TextWrapMode::Truncate),
+                                    index_rect.width(),
+                                    egui::TextStyle::Body,
+                                );
+                        let index_pos = egui::pos2(
+                            index_rect.left(),
+                            row_rect.center().y - (index_galley.size().y * 0.5),
+                        );
+                        row_ui.painter().galley(index_pos, index_galley, TEXT_MUTED);
+                    }
 
                     if is_editing {
                         let edit_id = AdeApp::smart_input_task_edit_input_id(terminal_id, task_id);
@@ -27985,13 +28063,27 @@ fn draw_smart_input_footer(
                         };
                         let action_reserved = CONTROL_ROW_HEIGHT * 4.0 + 48.0;
                         let text_width = (row_ui.available_width() - action_reserved).max(60.0);
-                        let label_response = row_ui
-                            .add_sized(
-                                egui::vec2(text_width, SMART_INPUT_TASK_ROW_HEIGHT),
-                                egui::Label::new(RichText::new(&preview).color(text_color))
-                                    .truncate(),
-                            )
-                            .on_hover_text(if task_text.trim().is_empty() {
+                        let (text_rect, label_response) = row_ui.allocate_exact_size(
+                            egui::vec2(text_width, SMART_INPUT_TASK_ROW_HEIGHT),
+                            Sense::click(),
+                        );
+                        if row_ui.is_rect_visible(text_rect) {
+                            let galley =
+                                WidgetText::from(RichText::new(&preview).color(text_color))
+                                    .into_galley(
+                                        &row_ui,
+                                        Some(TextWrapMode::Truncate),
+                                        text_rect.width(),
+                                        egui::TextStyle::Body,
+                                    );
+                            let text_pos = egui::pos2(
+                                text_rect.left(),
+                                row_rect.center().y - (galley.size().y * 0.5),
+                            );
+                            row_ui.painter().galley(text_pos, galley, text_color);
+                        }
+                        let label_response =
+                            label_response.on_hover_text(if task_text.trim().is_empty() {
                                 "Queued image attachment".to_owned()
                             } else {
                                 capped_hover_text(&task_text, SMART_INPUT_TOOLTIP_MAX_CHARS)
@@ -28055,24 +28147,28 @@ fn draw_smart_input_footer(
                         }
                         "cancel" => state.cancel_edit(),
                         "edit" => {
-                            let _ = state.start_edit(task_id);
+                            action.status_message = Some(
+                                match state.move_task_to_draft_for_edit(task_id) {
+                                    SmartInputDraftEditResult::Moved => {
+                                        "Smart Input queued task moved to draft".to_owned()
+                                    }
+                                    SmartInputDraftEditResult::DraftOccupied => {
+                                        "Draft dolu; düzenlemeden önce inputu boşalt veya kuyruğa ekle"
+                                            .to_owned()
+                                    }
+                                    SmartInputDraftEditResult::Missing => {
+                                        "Smart Input queued task no longer exists".to_owned()
+                                    }
+                                },
+                            );
                         }
                         "delete" => {
                             let _ = state.remove_task(task_id);
                         }
                         _ => {}
                     }
-                    match row_action {
-                        "edit" => {
-                            let edit_id =
-                                AdeApp::smart_input_task_edit_input_id(terminal_id, task_id);
-                            ui.ctx().memory_mut(|mem| mem.request_focus(edit_id));
-                        }
-                        _ => {
-                            let draft_id = AdeApp::smart_input_draft_input_id(terminal_id);
-                            ui.ctx().memory_mut(|mem| mem.request_focus(draft_id));
-                        }
-                    }
+                    let draft_id = AdeApp::smart_input_draft_input_id(terminal_id);
+                    ui.ctx().memory_mut(|mem| mem.request_focus(draft_id));
                 }
             } else if state.expanded {
                 ui.label(
@@ -53756,6 +53852,82 @@ mod tests {
     }
 
     #[test]
+    fn smart_input_edit_moves_task_to_draft_and_requeues_at_original_index() {
+        let mut state = SmartInputState::default();
+        state.draft = "first".to_owned();
+        let first_id = state.enqueue_draft().expect("first task");
+        state.draft = "second".to_owned();
+        state.draft_attachments.push(SmartInputAttachment {
+            id: 42,
+            path: "C:/tmp/second.png".to_owned(),
+        });
+        let second_id = state.enqueue_draft().expect("second task");
+        state.draft = "third".to_owned();
+        let third_id = state.enqueue_draft().expect("third task");
+
+        assert_eq!(
+            state.move_task_to_draft_for_edit(second_id),
+            super::SmartInputDraftEditResult::Moved
+        );
+        assert_eq!(state.draft, "second");
+        assert_eq!(
+            state.draft_attachments,
+            vec![SmartInputAttachment {
+                id: 42,
+                path: "C:/tmp/second.png".to_owned(),
+            }]
+        );
+        assert_eq!(state.mode, super::SmartInputMode::QueueAfterDone);
+        assert_eq!(
+            state.draft_return_target,
+            Some(super::SmartInputDraftReturnTarget {
+                index: 1,
+                task_id: second_id
+            })
+        );
+        assert_eq!(
+            state.tasks.iter().map(|task| task.id).collect::<Vec<_>>(),
+            vec![first_id, third_id]
+        );
+
+        state.draft = "edited second".to_owned();
+        assert_eq!(state.enqueue_draft(), Some(second_id));
+        assert_eq!(
+            state
+                .tasks
+                .iter()
+                .map(|task| (task.id, task.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (first_id, "first"),
+                (second_id, "edited second"),
+                (third_id, "third")
+            ]
+        );
+        assert_eq!(state.tasks[1].attachments.len(), 1);
+        assert_eq!(state.tasks[1].attachments[0].path, "C:/tmp/second.png");
+        assert!(state.draft_return_target.is_none());
+    }
+
+    #[test]
+    fn smart_input_edit_is_blocked_when_draft_has_content() {
+        let mut state = SmartInputState::default();
+        state.draft = "queued".to_owned();
+        let task_id = state.enqueue_draft().expect("queued task");
+        state.draft = "existing draft".to_owned();
+
+        assert_eq!(
+            state.move_task_to_draft_for_edit(task_id),
+            super::SmartInputDraftEditResult::DraftOccupied
+        );
+        assert_eq!(state.draft, "existing draft");
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.tasks[0].id, task_id);
+        assert_eq!(state.tasks[0].text, "queued");
+        assert!(state.draft_return_target.is_none());
+    }
+
+    #[test]
     fn smart_input_reorder_task_to_end() {
         let mut state = SmartInputState::default();
         state.draft = "first".to_owned();
@@ -54499,6 +54671,72 @@ mod tests {
         assert!(
             task_text_found,
             "queued task 'task one' must be visible as a text shape in the footer"
+        );
+    }
+
+    #[test]
+    fn smart_input_queue_task_text_starts_after_index_label() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.smart_input.draft = "test".to_owned();
+            terminal.smart_input.enqueue_draft();
+        }
+
+        let mut raw_input = RawInput::default();
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1200.0, 400.0),
+        ));
+        let output = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let footer_size = egui::vec2(1200.0, 180.0);
+                let pane_height = 400.0;
+                let line_height = 18.0;
+                let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+                let _ = super::draw_smart_input_footer(
+                    ui,
+                    terminal,
+                    footer_size,
+                    pane_height,
+                    line_height,
+                );
+            });
+        });
+
+        let mut index_rect = None;
+        let mut task_rect = None;
+        for shape in output.shapes {
+            if let egui::epaint::Shape::Text(text_shape) = shape.shape {
+                let text = text_shape.galley.text();
+                let rect = egui::Rect::from_min_size(text_shape.pos, text_shape.galley.size());
+                if text == "1." {
+                    index_rect = Some(rect);
+                } else if text == "test" {
+                    task_rect = Some(rect);
+                }
+            }
+        }
+
+        let index_rect = index_rect.expect("queued task index label");
+        let task_rect = task_rect.expect("queued task text");
+        assert!(
+            task_rect.left() <= index_rect.right() + 16.0,
+            "queued task text must start near the index label, not centered in the queue row (task_left={}, index_right={})",
+            task_rect.left(),
+            index_rect.right()
+        );
+        assert!(
+            (task_rect.center().y - index_rect.center().y).abs() <= 0.5,
+            "queued task text and index label must share the same vertical center (task_center_y={}, index_center_y={})",
+            task_rect.center().y,
+            index_rect.center().y
         );
     }
 

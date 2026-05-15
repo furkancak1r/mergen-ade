@@ -1099,3 +1099,59 @@
   - Added real-popup regression tests that compare the first row's top gap and the last row's bottom gap against the popup frame.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test foreground_launcher -- --nocapture`, `cargo test --no-run`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User screenshot 2026-05-15
+
+---
+
+#### Smart Input queued task text was centered in wide rows {#smart-input-queued-task-left-align}
+- Date: 2026-05-15
+- Context: User reported that the queued Smart Input task text in the row above the draft editor appeared centered instead of starting near the row number.
+- Error signature: The queued task preview used a fixed-width `Label`, letting egui position short text inside the whole reserved preview area.
+- Symptoms/Impact:
+  1. Short queued prompts such as `test` appeared in the middle of the Smart Input queue row.
+  2. The row number stayed left-aligned, making the prompt look detached from its queue index.
+- Root cause:
+  - The UI reserved a large preview rectangle to keep action buttons stable, but delegated text placement to `Label` instead of explicitly painting from the preview rectangle's left edge.
+- Resolution:
+  - Kept the same preview hit area and action-button reservation, but rendered the truncated task preview galley manually at the left edge of that area.
+- Prevent recurrence:
+  - Added a regression test that renders a wide Smart Input footer and asserts the queued task text starts near the `1.` index label.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input_queue -- --nocapture`, `cargo test --no-run`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User screenshot 2026-05-15
+
+---
+
+#### Smart Input queued task index and text used different vertical alignment paths {#smart-input-queued-task-index-baseline}
+- Date: 2026-05-15
+- Context: Follow-up screenshot showed the queued task text was no longer centered in the row, but it still did not line up with the visible `1.` queue index.
+- Error signature: The queue index was rendered with `row_ui.label(...)`, while the task preview was rendered manually as a galley using row-center positioning.
+- Symptoms/Impact:
+  1. The `1.` index and queued prompt appeared on slightly different vertical centers.
+  2. The queued task row looked visually uneven even though the text started near the left edge.
+- Root cause:
+  - The index label and task preview used different egui layout/painting paths, so their vertical placement was not computed from the same row geometry.
+- Resolution:
+  - Rendered the queue index and task preview with the same manual galley path, both centered against `SMART_INPUT_TASK_ROW_HEIGHT`.
+- Prevent recurrence:
+  - Extended the Smart Input queue regression test to assert that the index and task text share the same vertical center.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input_queue -- --nocapture`, `cargo test --no-run`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User screenshot 2026-05-15
+
+---
+
+#### Smart Input queued task edit opened a separate inline editor {#smart-input-edit-uses-draft}
+- Date: 2026-05-15
+- Context: User wanted the queued task `Edit` button to put the prompt back into the main Smart Input draft area instead of editing it in the queue row.
+- Error signature: Queue-row edit used `editing_task_id` and `edit_draft`, creating a second edit surface with separate focus and save/cancel controls.
+- Symptoms/Impact:
+  1. Editing a queued prompt required using a small inline field rather than the larger prompt input.
+  2. The normal Enter-to-queue draft workflow was bypassed for edits.
+- Root cause:
+  - The queue edit action was modeled as an inline row state instead of returning the task to the draft workflow.
+- Resolution:
+  - Changed the queue `Edit` action to move the task text and attachments into the main draft input.
+  - Stored the original queue index and task id so Enter re-queues the edited prompt at the same position.
+  - Blocked edit when the draft already has content or attachments, preserving both draft and queue state and showing a status/toast message.
+- Prevent recurrence:
+  - Added Smart Input state regression tests for draft edit transfer, original-index requeue, attachment preservation, and draft-occupied blocking.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input -- --nocapture`, `cargo test --no-run`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
