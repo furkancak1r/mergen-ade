@@ -21948,10 +21948,12 @@ impl AdeApp {
                                         let close_rect = browser_tab_close_rect(tab_rect);
                                         let close_hover_rect = browser_tab_close_hover_rect(tab_rect);
                                         let label_rect = browser_tab_label_rect(tab_rect);
-                                        let close_response =
-                                            browser_tab_close_interaction(ui, project_id, *tab_id, close_hover_rect);
-                                        // Show close tooltip above button to avoid WebView overlap
-                                        show_tooltip_above(ui, &close_response, "Close tab");
+                                        let close_response = browser_tab_close_interaction(
+                                            ui,
+                                            project_id,
+                                            *tab_id,
+                                            close_hover_rect,
+                                        );
                                         let close_hovered =
                                             close_response.hovered()
                                                 || set_pointing_hand_cursor_on_hover_rect(
@@ -21959,9 +21961,24 @@ impl AdeApp {
                                                     close_hover_rect,
                                                 );
 
-                                        // Show tab URL/title tooltip above the tab
-                                        let tab_url_tooltip = url.as_deref().unwrap_or(title.as_str());
-                                        show_tooltip_above(ui, &tab_response, tab_url_tooltip);
+                                        // Show tab URL/title tooltip above the tab body only.
+                                        // Compact action icons intentionally avoid text tooltips,
+                                        // because they overlap the tab and can flicker.
+                                        let tab_url_tooltip =
+                                            url.as_deref().unwrap_or(title.as_str());
+                                        let tab_body_tooltip_hovered = ctx
+                                            .input(|input| input.pointer.hover_pos())
+                                            .is_some_and(|pos| {
+                                                tab_rect.contains(pos)
+                                                    && !close_hover_rect.contains(pos)
+                                            });
+                                        show_tooltip_above_at(
+                                            ui,
+                                            tab_response.id,
+                                            tab_rect,
+                                            tab_url_tooltip,
+                                            tab_body_tooltip_hovered,
+                                        );
 
                                         let tab_hovered = tab_response.hovered() || close_hovered;
                                         let painted_fill = if *is_active {
@@ -22022,15 +22039,9 @@ impl AdeApp {
 
                                     // Add tab button inside ScrollArea, right after last tab
                                     ui.add_space(4.0);
-                                    let can_add_tab = tab_summaries.len() < BROWSER_MAX_TABS_PER_PROJECT;
+                                    let can_add_tab =
+                                        tab_summaries.len() < BROWSER_MAX_TABS_PER_PROJECT;
                                     let add_response = browser_tab_add_button(ui, can_add_tab);
-                                    // Show add tab tooltip above button to avoid WebView overlap
-                                    let add_tooltip = if can_add_tab {
-                                        "New tab"
-                                    } else {
-                                        "Tab limit reached"
-                                    };
-                                    show_tooltip_above(ui, &add_response, add_tooltip);
                                     if can_add_tab {
                                         set_pointing_hand_cursor_on_hover_rect(
                                             ctx,
@@ -29717,28 +29728,33 @@ fn browser_toolbar_toggle_button(
 /// Show a tooltip centered above the given widget response.
 /// Helper for custom buttons that need tooltip positioning centered above the widget.
 fn show_tooltip_above(ui: &mut Ui, response: &egui::Response, tooltip: &str) {
-    if response.hovered() {
-        let tooltip_id = ui.make_persistent_id(("browser_tooltip_above", response.id));
-        let tooltip_anchor =
-            response.rect.center_top() + egui::vec2(0.0, -BROWSER_TOOLBAR_TOOLTIP_GAP);
+    show_tooltip_above_at(ui, response.id, response.rect, tooltip, response.hovered());
+}
 
-        // Use Area with CENTER_BOTTOM pivot so tooltip is centered horizontally above the anchor.
-        // No .sense() is set so the tooltip does not capture hover; this prevents flicker
-        // caused by the tooltip stealing hover from the underlying widget.
-        let ctx = ui.ctx();
-        egui::Area::new(tooltip_id)
-            .kind(egui::UiKind::Tooltip)
-            .order(egui::Order::Tooltip)
-            .pivot(egui::Align2::CENTER_BOTTOM)
-            .fixed_pos(tooltip_anchor)
-            .default_width(ctx.style().spacing.tooltip_width)
-            .show(ctx, |ui| {
-                egui::Frame::popup(&ctx.style()).show(ui, |ui| {
-                    ui.style_mut().interaction.selectable_labels = false;
-                    ui.label(tooltip);
-                });
-            });
+fn show_tooltip_above_at(ui: &mut Ui, id: egui::Id, rect: egui::Rect, tooltip: &str, show: bool) {
+    if !show {
+        return;
     }
+
+    let tooltip_id = ui.make_persistent_id(("browser_tooltip_above", id));
+    let tooltip_anchor = rect.center_top() + egui::vec2(0.0, -BROWSER_TOOLBAR_TOOLTIP_GAP);
+
+    // Use Area with CENTER_BOTTOM pivot so tooltip is centered horizontally above the anchor.
+    // No .sense() is set so the tooltip does not capture hover; this prevents flicker
+    // caused by the tooltip stealing hover from the underlying widget.
+    let ctx = ui.ctx();
+    egui::Area::new(tooltip_id)
+        .kind(egui::UiKind::Tooltip)
+        .order(egui::Order::Tooltip)
+        .pivot(egui::Align2::CENTER_BOTTOM)
+        .fixed_pos(tooltip_anchor)
+        .default_width(ctx.style().spacing.tooltip_width)
+        .show(ctx, |ui| {
+            egui::Frame::popup(&ctx.style()).show(ui, |ui| {
+                ui.style_mut().interaction.selectable_labels = false;
+                ui.label(tooltip);
+            });
+        });
 }
 
 /// Variant of `styled_icon_button` that returns the full Response for hover tracking.
@@ -52219,6 +52235,157 @@ mod tests {
             output.platform_output.cursor_icon,
             egui::CursorIcon::PointingHand,
             "hovering the browser tab close x should show a clickable cursor"
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    struct BrowserTabTooltipTestRects {
+        tab_rect: egui::Rect,
+        close_hover_rect: egui::Rect,
+        add_rect: egui::Rect,
+    }
+
+    fn output_contains_text(output: &egui::FullOutput, needle: &str) -> bool {
+        output.shapes.iter().any(|shape| {
+            let egui::epaint::Shape::Text(text_shape) = &shape.shape else {
+                return false;
+            };
+            text_shape.galley.text().contains(needle)
+        })
+    }
+
+    fn draw_browser_tab_tooltip_test_ui(
+        ctx: &Context,
+        hover_pos: Option<egui::Pos2>,
+        can_add_tab: bool,
+    ) -> (egui::FullOutput, BrowserTabTooltipTestRects) {
+        const TAB_TOOLTIP: &str = "https://tooltip.example/browser-tab";
+
+        let mut raw_input = RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(320.0, 140.0),
+            )),
+            ..RawInput::default()
+        };
+        if let Some(pos) = hover_pos {
+            raw_input.events.push(Event::PointerMoved(pos));
+        }
+
+        let mut rects = None;
+        let output = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none())
+                .show(ctx, |ui| {
+                    ui.allocate_space(egui::vec2(20.0, 40.0));
+                    ui.horizontal(|ui| {
+                        let (tab_rect, tab_response) = ui.allocate_exact_size(
+                            egui::vec2(super::BROWSER_TAB_WIDTH, super::BROWSER_TAB_HEIGHT),
+                            egui::Sense::click(),
+                        );
+                        let close_hover_rect = super::browser_tab_close_hover_rect(tab_rect);
+                        let close_response =
+                            super::browser_tab_close_interaction(ui, 1, 2, close_hover_rect);
+                        let close_hovered = close_response.hovered()
+                            || super::set_pointing_hand_cursor_on_hover_rect(ctx, close_hover_rect);
+                        if !close_hovered {
+                            let tab_body_tooltip_hovered = ctx
+                                .input(|input| input.pointer.hover_pos())
+                                .is_some_and(|pos| {
+                                    tab_rect.contains(pos) && !close_hover_rect.contains(pos)
+                                });
+                            super::show_tooltip_above_at(
+                                ui,
+                                tab_response.id,
+                                tab_rect,
+                                TAB_TOOLTIP,
+                                tab_body_tooltip_hovered,
+                            );
+                        }
+
+                        ui.add_space(4.0);
+                        let add_response = super::browser_tab_add_button(ui, can_add_tab);
+                        if can_add_tab {
+                            super::set_pointing_hand_cursor_on_hover_rect(
+                                ctx,
+                                super::browser_tab_add_hover_rect(add_response.rect),
+                            );
+                        }
+
+                        rects = Some(BrowserTabTooltipTestRects {
+                            tab_rect,
+                            close_hover_rect,
+                            add_rect: add_response.rect,
+                        });
+                    });
+                });
+        });
+
+        (output, rects.expect("browser tab tooltip test rects"))
+    }
+
+    #[test]
+    fn browser_tab_close_hover_does_not_show_action_or_tab_tooltip() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+        let (_, rects) = draw_browser_tab_tooltip_test_ui(&ctx, None, true);
+
+        let _ = draw_browser_tab_tooltip_test_ui(&ctx, Some(rects.close_hover_rect.center()), true);
+        let (output, _) =
+            draw_browser_tab_tooltip_test_ui(&ctx, Some(rects.close_hover_rect.center()), true);
+
+        assert!(
+            !output_contains_text(&output, "Close tab"),
+            "close action hover should not render a text tooltip"
+        );
+        assert!(
+            !output_contains_text(&output, "https://tooltip.example/browser-tab"),
+            "close action hover should suppress the tab title/url tooltip"
+        );
+    }
+
+    #[test]
+    fn browser_tab_body_hover_still_shows_title_tooltip() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+        let (_, rects) = draw_browser_tab_tooltip_test_ui(&ctx, None, true);
+        let body_hover_pos = egui::pos2(
+            rects.tab_rect.left() + super::BROWSER_TAB_LABEL_LEFT_PADDING,
+            rects.tab_rect.center().y,
+        );
+
+        let _ = draw_browser_tab_tooltip_test_ui(&ctx, Some(body_hover_pos), true);
+        let (output, _) = draw_browser_tab_tooltip_test_ui(&ctx, Some(body_hover_pos), true);
+
+        assert!(
+            output_contains_text(&output, "https://tooltip.example/browser-tab"),
+            "hovering tab body should still render the tab title/url tooltip"
+        );
+    }
+
+    #[test]
+    fn browser_add_tab_hover_does_not_show_action_tooltip() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+        let (_, enabled_rects) = draw_browser_tab_tooltip_test_ui(&ctx, None, true);
+        let _ = draw_browser_tab_tooltip_test_ui(&ctx, Some(enabled_rects.add_rect.center()), true);
+        let (enabled_output, _) =
+            draw_browser_tab_tooltip_test_ui(&ctx, Some(enabled_rects.add_rect.center()), true);
+
+        assert!(
+            !output_contains_text(&enabled_output, "New tab"),
+            "enabled add-tab hover should not render a text tooltip"
+        );
+
+        let (_, disabled_rects) = draw_browser_tab_tooltip_test_ui(&ctx, None, false);
+        let _ =
+            draw_browser_tab_tooltip_test_ui(&ctx, Some(disabled_rects.add_rect.center()), false);
+        let (disabled_output, _) =
+            draw_browser_tab_tooltip_test_ui(&ctx, Some(disabled_rects.add_rect.center()), false);
+
+        assert!(
+            !output_contains_text(&disabled_output, "Tab limit reached"),
+            "disabled add-tab hover should not render a text tooltip"
         );
     }
 

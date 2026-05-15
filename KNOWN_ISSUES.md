@@ -1732,3 +1732,23 @@
   - Added regression tests for close action stable cursor feedback, enabled add-tab pointer feedback, and tab-limit default cursor behavior.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
 - References: User screenshot/request 2026-05-15
+
+---
+
+#### Browser tab action hover showed overlapping faded tooltips {#browser-tab-action-hover-tooltip-overlap}
+- Date: 2026-05-15
+- Context: User reported that hover over the browser tab close X looked faded and buggy even after cursor flicker was fixed.
+- Error signature: Compact tab action hover rendered text tooltips such as "Close tab" on top of the tab strip, and tab title tooltip could also trigger in the same area.
+- Symptoms/Impact:
+  1. Close X hover showed a translucent tooltip overlapping the tab label and icon.
+  2. The hover state looked unstable even when the cursor no longer flickered.
+- Root cause:
+  - Browser tab action buttons were too compact for centered-above text tooltips; the tooltip overlapped the tab row and competed with the tab title tooltip.
+- Resolution:
+  - Removed text tooltips from browser tab close and add-tab action icons.
+  - Suppressed the tab title/url tooltip while the pointer is over the close action area.
+  - Kept the visual hover highlight and stable pointing-hand cursor feedback.
+- Prevent recurrence:
+  - Added regression tests that close/add action hovers do not render action tooltips, and tab body hover still renders the tab title/url tooltip.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+- References: User screenshot/request 2026-05-15
