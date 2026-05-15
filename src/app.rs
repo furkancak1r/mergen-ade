@@ -272,6 +272,8 @@ const SMART_INPUT_DRAFT_INPUT_ID: &str = "smart-input-draft";
 const SMART_INPUT_TASK_EDIT_INPUT_ID: &str = "smart-input-task-edit";
 const SMART_INPUT_QUESTION_CUSTOM_INPUT_ID: &str = "smart-input-question-custom";
 const CREATE_WORKTREE_BRANCH_INPUT_ID: &str = "create-worktree-branch-input";
+const CREATE_WORKTREE_BASE_BRANCH_INPUT_ID: &str = "create-worktree-base-branch-input";
+const CREATE_WORKTREE_PATH_INPUT_ID: &str = "create-worktree-path-input";
 const SMART_INPUT_MIN_FOOTER_HEIGHT: f32 = 132.0;
 const SMART_INPUT_BASE_FOOTER_HEIGHT: f32 = 156.0;
 const SMART_INPUT_TASK_ROW_HEIGHT: f32 = 28.0;
@@ -10190,6 +10192,33 @@ impl AdeApp {
         })
     }
 
+    fn create_worktree_branch_input_id() -> Id {
+        Id::new(CREATE_WORKTREE_BRANCH_INPUT_ID)
+    }
+
+    fn create_worktree_base_branch_input_id() -> Id {
+        Id::new(CREATE_WORKTREE_BASE_BRANCH_INPUT_ID)
+    }
+
+    fn create_worktree_path_input_id() -> Id {
+        Id::new(CREATE_WORKTREE_PATH_INPUT_ID)
+    }
+
+    fn create_worktree_input_has_focus(ctx: &egui::Context) -> bool {
+        ctx.memory(|mem| {
+            mem.has_focus(Self::create_worktree_branch_input_id())
+                || mem.has_focus(Self::create_worktree_base_branch_input_id())
+                || mem.has_focus(Self::create_worktree_path_input_id())
+        })
+    }
+
+    fn ui_focus_should_yield_to_terminal_activation(&self) -> bool {
+        !(self.show_settings_popup
+            || self.show_exit_confirm_popup
+            || self.foreground_message_popup_open.is_some()
+            || self.show_create_worktree_popup)
+    }
+
     /// Returns true if any text input field currently has keyboard focus.
     fn text_input_has_focus_extended(&self, ctx: &egui::Context) -> bool {
         // Base text inputs
@@ -10246,6 +10275,9 @@ impl AdeApp {
             }
             // Surrender foreground message popup input focus
             mem.surrender_focus(Self::foreground_message_input_id());
+            mem.surrender_focus(Self::create_worktree_branch_input_id());
+            mem.surrender_focus(Self::create_worktree_base_branch_input_id());
+            mem.surrender_focus(Self::create_worktree_path_input_id());
             for (terminal_id, terminal) in &self.terminals {
                 mem.surrender_focus(Self::smart_input_draft_input_id(*terminal_id));
                 if let Some(task_id) = terminal.smart_input.editing_task_id {
@@ -12423,11 +12455,12 @@ impl AdeApp {
     }
 
     fn set_active_terminal(&mut self, ctx: &egui::Context, terminal_id: Option<u64>) {
+        let terminal_may_claim_keyboard = self.ui_focus_should_yield_to_terminal_activation();
         // Clear UI text input focus and restore window focus when activating any terminal.
         // This ensures browser URL input, directory search, and other text inputs yield
         // keyboard focus to the terminal. Must happen even when re-selecting the same terminal
         // to handle the case where user switches from browser panel back to terminal.
-        if terminal_id.is_some() {
+        if terminal_id.is_some() && terminal_may_claim_keyboard {
             self.surrender_ui_text_focus(ctx);
             self.restore_window_focus_for_terminal_input();
         }
@@ -12495,16 +12528,18 @@ impl AdeApp {
             // the terminal pane always restores typing to the correct draft,
             // unless the user explicitly clicked the terminal output and wants
             // to type in the PTY instead.
-            if let Some(tid) = terminal_id {
-                if self.terminal_output_focus_override != Some(tid) {
-                    if let Some(terminal) = self.terminals.get(&tid) {
-                        if Self::terminal_smart_input_visible(terminal) {
-                            let draft_id = Self::smart_input_draft_input_id(tid);
-                            ctx.memory_mut(|mem| {
-                                if !mem.has_focus(draft_id) {
-                                    mem.request_focus(draft_id);
-                                }
-                            });
+            if terminal_may_claim_keyboard {
+                if let Some(tid) = terminal_id {
+                    if self.terminal_output_focus_override != Some(tid) {
+                        if let Some(terminal) = self.terminals.get(&tid) {
+                            if Self::terminal_smart_input_visible(terminal) {
+                                let draft_id = Self::smart_input_draft_input_id(tid);
+                                ctx.memory_mut(|mem| {
+                                    if !mem.has_focus(draft_id) {
+                                        mem.request_focus(draft_id);
+                                    }
+                                });
+                            }
                         }
                     }
                 }
@@ -12544,16 +12579,18 @@ impl AdeApp {
 
         // After switching, focus the newly active terminal's Smart Input draft
         // unless the user explicitly wants to type in the terminal PTY.
-        if let Some(tid) = terminal_id {
-            if self.terminal_output_focus_override != Some(tid) {
-                if let Some(terminal) = self.terminals.get(&tid) {
-                    if Self::terminal_smart_input_visible(terminal) {
-                        let draft_id = Self::smart_input_draft_input_id(tid);
-                        ctx.memory_mut(|mem| {
-                            if !mem.has_focus(draft_id) {
-                                mem.request_focus(draft_id);
-                            }
-                        });
+        if terminal_may_claim_keyboard {
+            if let Some(tid) = terminal_id {
+                if self.terminal_output_focus_override != Some(tid) {
+                    if let Some(terminal) = self.terminals.get(&tid) {
+                        if Self::terminal_smart_input_visible(terminal) {
+                            let draft_id = Self::smart_input_draft_input_id(tid);
+                            ctx.memory_mut(|mem| {
+                                if !mem.has_focus(draft_id) {
+                                    mem.request_focus(draft_id);
+                                }
+                            });
+                        }
                     }
                 }
             }
@@ -13833,10 +13870,12 @@ impl AdeApp {
         }
         // Keep focus on the Smart Input draft after any pane action
         // so the user can continue typing without re-clicking.
-        if let Some(terminal) = self.terminals.get(&terminal_id) {
-            if Self::terminal_smart_input_visible(terminal) {
-                let draft_id = Self::smart_input_draft_input_id(terminal_id);
-                ctx.memory_mut(|mem| mem.request_focus(draft_id));
+        if self.ui_focus_should_yield_to_terminal_activation() {
+            if let Some(terminal) = self.terminals.get(&terminal_id) {
+                if Self::terminal_smart_input_visible(terminal) {
+                    let draft_id = Self::smart_input_draft_input_id(terminal_id);
+                    ctx.memory_mut(|mem| mem.request_focus(draft_id));
+                }
             }
         }
     }
@@ -17117,7 +17156,7 @@ impl AdeApp {
                                             self.show_create_worktree_popup = true;
                                             self.create_worktree_project_id = Some(pid);
                                             ui.ctx().memory_mut(|mem| {
-                                                mem.request_focus(egui::Id::new(CREATE_WORKTREE_BRANCH_INPUT_ID));
+                                                mem.request_focus(Self::create_worktree_branch_input_id());
                                             });
                                             self.create_worktree_branch_draft.clear();
                                             self.create_worktree_base_branch = self
@@ -17690,7 +17729,7 @@ impl AdeApp {
                 self.show_create_worktree_popup = true;
                 self.create_worktree_project_id = Some(project_id);
                 ctx.memory_mut(|mem| {
-                    mem.request_focus(egui::Id::new(CREATE_WORKTREE_BRANCH_INPUT_ID));
+                    mem.request_focus(Self::create_worktree_branch_input_id());
                 });
                 self.create_worktree_branch_draft.clear();
                 self.create_worktree_base_branch = self
@@ -23368,11 +23407,10 @@ impl AdeApp {
                 }
 
                 ui.label(RichText::new("Branch name").small().color(TEXT_MUTED));
-                let branch_input_id = egui::Id::new(CREATE_WORKTREE_BRANCH_INPUT_ID);
                 ui.add_sized(
                     [ui.available_width(), CONTROL_ROW_HEIGHT],
                     egui::TextEdit::singleline(&mut self.create_worktree_branch_draft)
-                        .id(branch_input_id)
+                        .id(Self::create_worktree_branch_input_id())
                         .hint_text("feature/my-task"),
                 );
                 ui.add_space(6.0);
@@ -23385,6 +23423,7 @@ impl AdeApp {
                 ui.add_sized(
                     [ui.available_width(), CONTROL_ROW_HEIGHT],
                     egui::TextEdit::singleline(&mut self.create_worktree_base_branch)
+                        .id(Self::create_worktree_base_branch_input_id())
                         .hint_text("main or origin/main"),
                 );
                 ui.add_space(6.0);
@@ -23397,6 +23436,7 @@ impl AdeApp {
                 ui.add_sized(
                     [ui.available_width(), CONTROL_ROW_HEIGHT],
                     egui::TextEdit::singleline(&mut self.create_worktree_path_draft)
+                        .id(Self::create_worktree_path_input_id())
                         .hint_text("auto-generated from branch")
                         .interactive(false),
                 );
@@ -23449,6 +23489,12 @@ impl AdeApp {
                         self.create_worktree_error = None;
                     }
                 });
+
+                if !Self::create_worktree_input_has_focus(ui.ctx()) {
+                    ui.ctx().memory_mut(|mem| {
+                        mem.request_focus(Self::create_worktree_branch_input_id())
+                    });
+                }
             });
 
         // Process one-click additions of existing worktrees
@@ -52495,6 +52541,110 @@ mod tests {
         assert!(
             !ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))),
             "Smart Input must surrender focus when Create Worktree popup is open"
+        );
+    }
+
+    #[test]
+    fn set_active_terminal_preserves_create_worktree_popup_input_focus() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        app.show_create_worktree_popup = true;
+        app.create_worktree_project_id = Some(7);
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::create_worktree_branch_input_id());
+        });
+
+        app.set_active_terminal(&ctx, Some(1));
+
+        assert!(
+            ctx.memory(|mem| mem.has_focus(AdeApp::create_worktree_branch_input_id())),
+            "Create Worktree branch input must keep focus while popup is open"
+        );
+        assert!(
+            !ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))),
+            "Smart Input must not be refocused while Create Worktree popup is open"
+        );
+    }
+
+    #[test]
+    fn raw_input_hook_leaves_create_worktree_popup_text_events_for_ui() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::smart_input_draft_input_id(1));
+        });
+        app.show_create_worktree_popup = true;
+        app.create_worktree_project_id = Some(7);
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::create_worktree_branch_input_id());
+        });
+
+        let mut raw_input = RawInput {
+            events: vec![Event::Text("feature/new-worktree".to_owned())],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert_eq!(raw_input.events.len(), 1);
+        assert!(
+            matches!(&raw_input.events[0], Event::Text(text) if text == "feature/new-worktree")
+        );
+        assert!(
+            app.buffered_terminal_input.is_empty(),
+            "Popup text must not be buffered for terminal input"
+        );
+        assert!(
+            ctx.memory(|mem| mem.has_focus(AdeApp::create_worktree_branch_input_id())),
+            "Create Worktree branch input must retain focus during raw input routing"
+        );
+        assert!(
+            !ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))),
+            "Smart Input must not recapture focus during popup text entry"
+        );
+    }
+
+    #[test]
+    fn smart_input_pane_action_preserves_create_worktree_popup_input_focus() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        app.show_create_worktree_popup = true;
+        app.create_worktree_project_id = Some(7);
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::create_worktree_branch_input_id());
+        });
+
+        app.handle_smart_input_pane_action(&ctx, 1, super::SmartInputPaneAction::default());
+
+        assert!(
+            ctx.memory(|mem| mem.has_focus(AdeApp::create_worktree_branch_input_id())),
+            "Smart Input pane refresh must not steal focus from Create Worktree input"
+        );
+        assert!(
+            !ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))),
+            "Smart Input draft must remain unfocused while Create Worktree popup is open"
+        );
+    }
+
+    #[test]
+    fn smart_input_pane_action_restores_draft_focus_without_modal() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        app.handle_smart_input_pane_action(&ctx, 1, super::SmartInputPaneAction::default());
+
+        assert!(
+            ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))),
+            "Smart Input draft should still be focused during normal terminal use"
         );
     }
 
