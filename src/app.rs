@@ -94,10 +94,12 @@ const BROWSER_RECORDING_PLAYBACK_RATE: f64 = 2.0;
 const BROWSER_MAX_TABS_PER_PROJECT: usize = 5;
 const BROWSER_TAB_WIDTH: f32 = 126.0;
 const BROWSER_TAB_HEIGHT: f32 = 22.0; // Compact tab height for more vertical space
+const BROWSER_ADD_TAB_BUTTON_WIDTH: f32 = 28.0;
 const BROWSER_TAB_CLOSE_SIZE: f32 = 16.0;
 const BROWSER_TAB_CLOSE_MARGIN: f32 = 3.0;
 const BROWSER_TAB_LABEL_LEFT_PADDING: f32 = 8.0;
 const BROWSER_TAB_LABEL_RIGHT_GAP: f32 = 3.0;
+const BROWSER_TAB_ACTION_HOVER_EXPANSION: f32 = 4.0;
 /// Grace period in milliseconds to keep WebView hidden after overlay closes.
 /// Prevents flickering when moving mouse from button to dropdown/tooltip.
 const BROWSER_OVERLAY_GRACE_PERIOD_MS: u64 = 150;
@@ -1761,6 +1763,23 @@ fn browser_tab_close_rect(tab_rect: egui::Rect) -> egui::Rect {
     )
 }
 
+fn clamp_rect_to_bounds(rect: egui::Rect, bounds: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(rect.left().max(bounds.left()), rect.top().max(bounds.top())),
+        egui::pos2(
+            rect.right().min(bounds.right()),
+            rect.bottom().min(bounds.bottom()),
+        ),
+    )
+}
+
+fn browser_tab_close_hover_rect(tab_rect: egui::Rect) -> egui::Rect {
+    clamp_rect_to_bounds(
+        browser_tab_close_rect(tab_rect).expand(BROWSER_TAB_ACTION_HOVER_EXPANSION),
+        tab_rect,
+    )
+}
+
 fn browser_tab_close_interaction(
     ui: &mut Ui,
     project_id: u64,
@@ -1773,6 +1792,36 @@ fn browser_tab_close_interaction(
         Sense::click(),
     )
     .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn browser_tab_add_button(ui: &mut Ui, can_add_tab: bool) -> egui::Response {
+    let add_button = egui::Button::new(RichText::new(format!("{}", icons::PLUS)).size(14.0).color(
+        if can_add_tab {
+            TEXT_PRIMARY
+        } else {
+            TEXT_MUTED
+        },
+    ))
+    .frame(false);
+
+    ui.add_sized(
+        [BROWSER_ADD_TAB_BUTTON_WIDTH, BROWSER_TAB_HEIGHT],
+        add_button,
+    )
+}
+
+fn browser_tab_add_hover_rect(add_rect: egui::Rect) -> egui::Rect {
+    add_rect
+}
+
+fn set_pointing_hand_cursor_on_hover_rect(ctx: &egui::Context, rect: egui::Rect) -> bool {
+    let hover_pos = ctx.input(|input| input.pointer.hover_pos());
+    if hover_pos.is_some_and(|hover_pos| rect.contains(hover_pos)) {
+        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        true
+    } else {
+        false
+    }
 }
 
 fn browser_tab_label_rect(tab_rect: egui::Rect) -> egui::Rect {
@@ -1817,10 +1866,7 @@ fn window_close_button_hover_rect(window_rect: egui::Rect, style: &egui::Style) 
 fn set_window_close_cursor_on_hover(ctx: &egui::Context, window_rect: egui::Rect) {
     let style = ctx.style();
     let close_rect = window_close_button_hover_rect(window_rect, &style);
-    let hover_pos = ctx.input(|input| input.pointer.hover_pos());
-    if hover_pos.is_some_and(|hover_pos| close_rect.contains(hover_pos)) {
-        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
+    set_pointing_hand_cursor_on_hover_rect(ctx, close_rect);
 }
 
 fn percent_encode_file_url_path(value: &str) -> String {
@@ -21874,10 +21920,8 @@ impl AdeApp {
                     let mut tab_to_close = None;
                     let mut add_tab_requested = false;
 
-                    // Compact tab strip - single row, non-wrapping
-                    // Add tab button is inside ScrollArea so it stays next to last tab
-                    const BROWSER_ADD_TAB_BUTTON_WIDTH: f32 = 28.0;
-
+                    // Compact tab strip - single row, non-wrapping.
+                    // Add tab button is inside ScrollArea so it stays next to last tab.
                     ui.horizontal(|ui| {
                         // Scrollable tab area including add button
                         egui::ScrollArea::horizontal()
@@ -21902,17 +21946,24 @@ impl AdeApp {
                                             Sense::click(),
                                         );
                                         let close_rect = browser_tab_close_rect(tab_rect);
+                                        let close_hover_rect = browser_tab_close_hover_rect(tab_rect);
                                         let label_rect = browser_tab_label_rect(tab_rect);
                                         let close_response =
-                                            browser_tab_close_interaction(ui, project_id, *tab_id, close_rect);
+                                            browser_tab_close_interaction(ui, project_id, *tab_id, close_hover_rect);
                                         // Show close tooltip above button to avoid WebView overlap
                                         show_tooltip_above(ui, &close_response, "Close tab");
+                                        let close_hovered =
+                                            close_response.hovered()
+                                                || set_pointing_hand_cursor_on_hover_rect(
+                                                    ctx,
+                                                    close_hover_rect,
+                                                );
 
                                         // Show tab URL/title tooltip above the tab
                                         let tab_url_tooltip = url.as_deref().unwrap_or(title.as_str());
                                         show_tooltip_above(ui, &tab_response, tab_url_tooltip);
 
-                                        let tab_hovered = tab_response.hovered() || close_response.hovered();
+                                        let tab_hovered = tab_response.hovered() || close_hovered;
                                         let painted_fill = if *is_active {
                                             fill
                                         } else if tab_hovered {
@@ -21942,7 +21993,7 @@ impl AdeApp {
                                             .selectable(false),
                                         );
 
-                                        if close_response.hovered() {
+                                        if close_hovered {
                                             ui.painter().rect_filled(
                                                 close_rect.shrink(1.0),
                                                 3.0,
@@ -21954,7 +22005,7 @@ impl AdeApp {
                                             egui::Align2::CENTER_CENTER,
                                             format!("{}", icons::X),
                                             FontId::proportional(10.0),
-                                            if close_response.hovered() {
+                                            if close_hovered {
                                                 TEXT_PRIMARY
                                             } else {
                                                 TEXT_MUTED
@@ -21972,18 +22023,7 @@ impl AdeApp {
                                     // Add tab button inside ScrollArea, right after last tab
                                     ui.add_space(4.0);
                                     let can_add_tab = tab_summaries.len() < BROWSER_MAX_TABS_PER_PROJECT;
-                                    let add_button = egui::Button::new(
-                                        RichText::new(format!("{}", icons::PLUS))
-                                            .size(14.0)
-                                            .color(if can_add_tab { TEXT_PRIMARY } else { TEXT_MUTED }),
-                                    )
-                                    .frame(false);
-                                    let add_response = ui
-                                        .add_sized(
-                                            [BROWSER_ADD_TAB_BUTTON_WIDTH, BROWSER_TAB_HEIGHT],
-                                            add_button,
-                                        )
-                                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                    let add_response = browser_tab_add_button(ui, can_add_tab);
                                     // Show add tab tooltip above button to avoid WebView overlap
                                     let add_tooltip = if can_add_tab {
                                         "New tab"
@@ -21991,6 +22031,12 @@ impl AdeApp {
                                         "Tab limit reached"
                                     };
                                     show_tooltip_above(ui, &add_response, add_tooltip);
+                                    if can_add_tab {
+                                        set_pointing_hand_cursor_on_hover_rect(
+                                            ctx,
+                                            browser_tab_add_hover_rect(add_response.rect),
+                                        );
+                                    }
                                     if add_response.clicked() && can_add_tab {
                                         add_tab_requested = true;
                                     }
@@ -52103,10 +52149,14 @@ mod tests {
         );
 
         let close_rect = super::browser_tab_close_rect(tab_rect);
+        let close_hover_rect = super::browser_tab_close_hover_rect(tab_rect);
         let label_rect = super::browser_tab_label_rect(tab_rect);
 
         assert!(tab_rect.contains(close_rect.min));
         assert!(tab_rect.contains(close_rect.max));
+        assert!(tab_rect.contains(close_hover_rect.min));
+        assert!(tab_rect.contains(close_hover_rect.max));
+        assert!(close_hover_rect.contains(close_rect.center()));
         assert_eq!(
             close_rect.right(),
             tab_rect.right() - super::BROWSER_TAB_CLOSE_MARGIN
@@ -52128,7 +52178,7 @@ mod tests {
             egui::pos2(20.0, 40.0),
             egui::vec2(super::BROWSER_TAB_WIDTH, super::BROWSER_TAB_HEIGHT),
         );
-        let close_rect = super::browser_tab_close_rect(tab_rect);
+        let close_rect = super::browser_tab_close_hover_rect(tab_rect);
 
         let mut observed_close_rect = None;
         let _ = ctx.run(RawInput::default(), |ctx| {
@@ -52159,6 +52209,7 @@ mod tests {
                     .show(ctx, |ui| {
                         ui.allocate_space(egui::vec2(260.0, 120.0));
                         let response = super::browser_tab_close_interaction(ui, 1, 2, close_rect);
+                        super::set_pointing_hand_cursor_on_hover_rect(ctx, close_rect);
                         assert!(response.hovered());
                     });
             },
@@ -52168,6 +52219,81 @@ mod tests {
             output.platform_output.cursor_icon,
             egui::CursorIcon::PointingHand,
             "hovering the browser tab close x should show a clickable cursor"
+        );
+    }
+
+    fn browser_add_tab_button_rect(ctx: &Context, can_add_tab: bool) -> egui::Rect {
+        let mut observed_add_rect = None;
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none())
+                .show(ctx, |ui| {
+                    ui.allocate_space(egui::vec2(180.0, 80.0));
+                    let response = super::browser_tab_add_button(ui, can_add_tab);
+                    observed_add_rect = Some(response.rect);
+                });
+        });
+        observed_add_rect.expect("browser add tab response rect")
+    }
+
+    fn draw_browser_add_tab_button_for_test(
+        ctx: &Context,
+        can_add_tab: bool,
+        hover_pos: egui::Pos2,
+    ) -> egui::FullOutput {
+        ctx.run(
+            RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(260.0, 120.0),
+                )),
+                events: vec![Event::PointerMoved(hover_pos)],
+                ..RawInput::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| {
+                        ui.allocate_space(egui::vec2(180.0, 80.0));
+                        let response = super::browser_tab_add_button(ui, can_add_tab);
+                        if can_add_tab {
+                            super::set_pointing_hand_cursor_on_hover_rect(
+                                ctx,
+                                super::browser_tab_add_hover_rect(response.rect),
+                            );
+                        }
+                    });
+            },
+        )
+    }
+
+    #[test]
+    fn browser_add_tab_hover_uses_pointing_hand_when_enabled() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+        let add_rect = browser_add_tab_button_rect(&ctx, true);
+
+        let output = draw_browser_add_tab_button_for_test(&ctx, true, add_rect.center());
+
+        assert_eq!(
+            output.platform_output.cursor_icon,
+            egui::CursorIcon::PointingHand,
+            "hovering enabled browser add tab button should show a clickable cursor"
+        );
+    }
+
+    #[test]
+    fn browser_add_tab_hover_keeps_default_cursor_when_limit_reached() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+        let add_rect = browser_add_tab_button_rect(&ctx, false);
+
+        let output = draw_browser_add_tab_button_for_test(&ctx, false, add_rect.center());
+
+        assert_eq!(
+            output.platform_output.cursor_icon,
+            egui::CursorIcon::Default,
+            "hovering disabled browser add tab button should not show a clickable cursor"
         );
     }
 

@@ -1712,3 +1712,23 @@
   - Added regression tests for window close hover geometry, shared window close cursor feedback, and browser tab close cursor feedback.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
 - References: User request 2026-05-15
+
+---
+
+#### Browser tab action cursor flickered between default and pointer {#browser-tab-action-cursor-flicker}
+- Date: 2026-05-15
+- Context: User reported rapid mouse cursor flicker between default and pointer over browser tab close X and new tab plus controls.
+- Error signature: Cursor feedback depended only on egui `Response::hovered()` for small tab action widgets.
+- Symptoms/Impact:
+  1. Hovering the browser tab close X caused the mouse cursor to alternate quickly.
+  2. Hovering the browser new tab plus had the same unstable cursor feedback.
+- Root cause:
+  - Small action hitboxes inside the tab strip could lose response hover for a frame during tooltip/scroll-area interaction, so cursor output fell back to default.
+- Resolution:
+  - Added stable hover rect helpers for browser tab close and add-tab actions.
+  - Set `PointingHand` from pointer position plus stable action rects after tooltip drawing.
+  - Kept the add-tab pointer disabled when the tab limit is reached.
+- Prevent recurrence:
+  - Added regression tests for close action stable cursor feedback, enabled add-tab pointer feedback, and tab-limit default cursor behavior.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+- References: User screenshot/request 2026-05-15
