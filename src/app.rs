@@ -264,6 +264,8 @@ const TERMINAL_MANAGER_WORKTREE_TERMINAL_EXTRA_INDENT: f32 = 10.0;
 const TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH: f32 = 32.0;
 const SOURCE_CONTROL_FILE_ICON_WIDTH: f32 = 16.0;
 const SOURCE_CONTROL_FILE_ICON_GAP: f32 = 6.0;
+const CREATE_WORKTREE_EXISTING_MAX_VISIBLE_ROWS: usize = 3;
+const CREATE_WORKTREE_EXISTING_ROW_GAP: f32 = 4.0;
 const DIRECTORY_SEARCH_INPUT_ID: &str = "directory-search-input";
 const SAVED_MESSAGE_DRAFT_INPUT_ID: &str = "saved-message-draft-input";
 const BROWSER_URL_INPUT_ID: &str = "browser-url-input";
@@ -10210,6 +10212,15 @@ impl AdeApp {
                 || mem.has_focus(Self::create_worktree_base_branch_input_id())
                 || mem.has_focus(Self::create_worktree_path_input_id())
         })
+    }
+
+    fn create_worktree_existing_list_height(row_count: usize) -> f32 {
+        if row_count == 0 {
+            return 0.0;
+        }
+        let visible_rows = row_count.min(CREATE_WORKTREE_EXISTING_MAX_VISIBLE_ROWS);
+        (visible_rows as f32 * CONTROL_ROW_HEIGHT)
+            + (visible_rows.saturating_sub(1) as f32 * CREATE_WORKTREE_EXISTING_ROW_GAP)
     }
 
     fn ui_focus_should_yield_to_terminal_activation(&self) -> bool {
@@ -23369,10 +23380,13 @@ impl AdeApp {
                             .strong(),
                     );
                     ui.add_space(4.0);
+                    let existing_list_height = Self::create_worktree_existing_list_height(
+                        self.create_worktree_existing_worktrees.len(),
+                    );
                     egui::ScrollArea::vertical()
                         .id_salt("existing-worktrees-scroll")
-                        .max_height(100.0)
-                        .auto_shrink([false, false])
+                        .max_height(existing_list_height)
+                        .auto_shrink([false, true])
                         .show(ui, |ui| {
                             for wt in &self.create_worktree_existing_worktrees {
                                 let label = wt.display_label();
@@ -52542,6 +52556,28 @@ mod tests {
             !ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))),
             "Smart Input must surrender focus when Create Worktree popup is open"
         );
+    }
+
+    #[test]
+    fn create_worktree_existing_list_height_matches_visible_rows() {
+        assert_eq!(AdeApp::create_worktree_existing_list_height(0), 0.0);
+        assert_eq!(
+            AdeApp::create_worktree_existing_list_height(1),
+            super::CONTROL_ROW_HEIGHT
+        );
+        assert_eq!(
+            AdeApp::create_worktree_existing_list_height(2),
+            (super::CONTROL_ROW_HEIGHT * 2.0) + super::CREATE_WORKTREE_EXISTING_ROW_GAP
+        );
+    }
+
+    #[test]
+    fn create_worktree_existing_list_height_caps_at_max_visible_rows() {
+        let capped = AdeApp::create_worktree_existing_list_height(
+            super::CREATE_WORKTREE_EXISTING_MAX_VISIBLE_ROWS,
+        );
+        assert_eq!(AdeApp::create_worktree_existing_list_height(10), capped);
+        assert!(AdeApp::create_worktree_existing_list_height(1) < capped);
     }
 
     #[test]
