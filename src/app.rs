@@ -256,6 +256,8 @@ const ACCENT: Color32 = Color32::from_rgb(170, 170, 170);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(244, 244, 244);
 const TEXT_MUTED: Color32 = Color32::from_rgb(138, 138, 138);
 const DIRECTORY_SEARCH_MATCH_COLOR: Color32 = Color32::from_rgb(255, 176, 64);
+const BROWSER_URL_SELECTION_BG: Color32 = BTN_BLUE;
+const BROWSER_URL_SELECTION_STROKE: Color32 = Color32::from_rgb(120, 170, 255);
 // Fallback defaults for persisted, resizable side panels.
 const PROJECT_EXPLORER_WIDTH: f32 = 352.0;
 const CHECKLIST_PANEL_WIDTH: f32 = 352.0;
@@ -2047,6 +2049,9 @@ pub struct AdeApp {
     /// Browser URL draft input per scope (runtime only, not persisted).
     /// Holds the text being typed in the browser panel URL input before submission.
     browser_url_draft_by_scope: BTreeMap<BrowserScopeKey, String>,
+    /// Last requested browser navigation URL per scope.
+    /// Used to queue first-load navigation once without repeating it every frame.
+    browser_navigation_requested_by_scope: BTreeMap<BrowserScopeKey, String>,
     /// Embedded browsers per scope for in-app web rendering (runtime only, not persisted).
     /// Each scope (project or terminal) has its own browser instance for proper isolation.
     embedded_browsers_by_scope: BTreeMap<BrowserScopeKey, web_browser::EmbeddedBrowser>,
@@ -4658,6 +4663,7 @@ impl AdeApp {
             checklist_floating_open: false,
             file_editor: FileEditorState::default(),
             browser_url_draft_by_scope: BTreeMap::new(),
+            browser_navigation_requested_by_scope: BTreeMap::new(),
             embedded_browsers_by_scope: BTreeMap::new(),
             browser_tabs_by_scope: BTreeMap::new(),
             active_browser_tab_by_scope: BTreeMap::new(),
@@ -4973,6 +4979,8 @@ impl AdeApp {
         self.browser_pending_screenshot_requests
             .retain(|_, (scope, _, _)| scope.project_id() != project_id);
         self.browser_url_draft_by_scope
+            .retain(|scope, _| scope.project_id() != project_id);
+        self.browser_navigation_requested_by_scope
             .retain(|scope, _| scope.project_id() != project_id);
         self.browser_tabs_by_scope
             .retain(|scope, _| scope.project_id() != project_id);
@@ -19575,6 +19583,17 @@ impl AdeApp {
         }
     }
 
+    fn request_browser_navigation(&mut self, scope: impl Into<BrowserScopeKey>, url: &str) {
+        let scope = scope.into();
+        self.browser_navigation_requested_by_scope
+            .insert(scope, url.to_owned());
+        self.browser_for_scope(scope).navigate(url);
+    }
+
+    fn refresh_browser_scope(&mut self, scope: impl Into<BrowserScopeKey>) {
+        self.browser_for_scope(scope).reload();
+    }
+
     /// Submit the browser URL for a project.
     /// Normalizes the URL, opens the browser panel, persists the URL, and navigates the browser.
     fn submit_browser_url(&mut self, ctx: &egui::Context, project_id: u64, url: &str) {
@@ -19591,7 +19610,7 @@ impl AdeApp {
         self.set_browser_panel_open_for_project(project_id, true);
         self.note_ui_config_changed();
         self.set_browser_url_for_scope(scope, normalized.clone());
-        self.browser_for_scope(scope).navigate(&normalized);
+        self.request_browser_navigation(scope, &normalized);
         ctx.request_repaint();
     }
 
@@ -19868,7 +19887,7 @@ impl AdeApp {
         self.browser_url_draft_by_scope.insert(scope, draft);
         if created_browser {
             if let Some(url) = url {
-                self.browser_for_scope(scope).navigate(&url);
+                self.request_browser_navigation(scope, &url);
             }
         }
         Ok(())
@@ -19914,7 +19933,7 @@ impl AdeApp {
             .and_then(|tabs| tabs.iter().find(|tab| tab.id == tab_id))
             .and_then(|tab| tab.url.clone())
         {
-            self.browser_for_scope(scope).navigate(&url);
+            self.request_browser_navigation(scope, &url);
         }
         Ok(tab_id)
     }
@@ -19966,6 +19985,7 @@ impl AdeApp {
             self.active_browser_tab_by_scope.remove(&scope);
             self.browser_tabs_by_scope.remove(&scope);
             self.browser_url_draft_by_scope.remove(&scope);
+            self.browser_navigation_requested_by_scope.remove(&scope);
             // Also clean up any inactive browsers for this scope
             self.inactive_browser_tab_browsers
                 .retain(|(s, _), _| s != &scope);
@@ -19984,6 +20004,28 @@ impl AdeApp {
                 self.activate_browser_tab(scope, replacement_id)?;
             }
         }
+        Ok(())
+    }
+
+    fn close_browser_panel_tab(
+        &mut self,
+        scope: impl Into<BrowserScopeKey>,
+        tab_id: u64,
+    ) -> Result<(), String> {
+        let scope = scope.into();
+        let project_id = scope.project_id();
+
+        self.close_browser_tab(scope, tab_id)?;
+
+        let tabs_empty = self
+            .browser_tabs_by_scope
+            .get(&scope)
+            .map(Vec::is_empty)
+            .unwrap_or(true);
+        if tabs_empty {
+            self.set_browser_panel_open_for_project(project_id, false);
+        }
+
         Ok(())
     }
 
@@ -20552,7 +20594,7 @@ impl AdeApp {
 
         match tab_result {
             Ok(tab_id) => {
-                self.browser_for_scope(event.project_id).navigate(&file_url);
+                self.request_browser_navigation(event.project_id, &file_url);
                 let data = Self::browser_video_result_data(&result, Some(&file_url), Some(tab_id));
                 let _ = event.respond_to.send(BrowserMcpIpcResponse::ok_with_data(
                     format!(
@@ -20891,7 +20933,7 @@ impl AdeApp {
                 };
                 if let Some(url) = normalized_url {
                     self.set_browser_url_for_scope(scope, url.clone());
-                    self.browser_for_scope(scope).navigate(&url);
+                    self.request_browser_navigation(scope, &url);
                 }
                 ctx.request_repaint();
                 let mut response = self.browser_tabs_response(scope);
@@ -20993,7 +21035,7 @@ impl AdeApp {
                     return error;
                 }
                 self.set_browser_url_for_scope(scope, normalized.clone());
-                self.browser_for_scope(scope).navigate(&normalized);
+                self.request_browser_navigation(scope, &normalized);
                 BrowserMcpIpcResponse::ok(format!(
                     "Navigating to {normalized}. The page will report readiness state via browser_page_summary."
                 ))
@@ -21020,7 +21062,7 @@ impl AdeApp {
                 if let Some(error) = self.prepare_browser_mcp_scope(scope) {
                     return error;
                 }
-                self.browser_for_scope(scope).reload();
+                self.refresh_browser_scope(scope);
                 BrowserMcpIpcResponse::ok("Reloaded. The page will report readiness when stable.")
             }
             _ => self.run_browser_mcp_tool_for_scope(scope, &request.tool, &request.params),
@@ -21327,6 +21369,37 @@ impl AdeApp {
                 .and_then(|project| project.browser_last_url.clone());
         }
         None
+    }
+
+    fn request_initial_browser_navigation_for_scope(&mut self, scope: impl Into<BrowserScopeKey>) {
+        let scope = scope.into();
+        let Some(url) = self.current_browser_url_for_scope(scope) else {
+            return;
+        };
+        if url.trim().is_empty() {
+            return;
+        }
+        if self
+            .browser_navigation_requested_by_scope
+            .get(&scope)
+            .is_some_and(|requested_url| requested_url == &url)
+        {
+            return;
+        }
+
+        let browser_status = self
+            .embedded_browsers_by_scope
+            .get(&scope)
+            .map(|browser| browser.status())
+            .unwrap_or(BrowserStatus::Uninitialized);
+        if matches!(
+            browser_status,
+            BrowserStatus::Ready | BrowserStatus::Failed(_) | BrowserStatus::Unsupported(_)
+        ) {
+            return;
+        }
+
+        self.request_browser_navigation(scope, &url);
     }
 
     fn forward_design_inspect_click_to_terminal(
@@ -21797,6 +21870,8 @@ impl AdeApp {
             browser.hide();
         }
 
+        self.request_initial_browser_navigation_for_scope(browser_scope);
+
         #[cfg(target_os = "windows")]
         let window_hwnd = self.window_hwnd;
         #[cfg(not(target_os = "windows"))]
@@ -22059,7 +22134,7 @@ impl AdeApp {
                     // because toolbar renders above WebView in egui layer.
 
                     if let Some(tab_id) = tab_to_close {
-                        if let Err(err) = self.close_browser_tab(browser_scope, tab_id) {
+                        if let Err(err) = self.close_browser_panel_tab(browser_scope, tab_id) {
                             self.status_line = err;
                         }
                         ctx.request_repaint();
@@ -22106,16 +22181,25 @@ impl AdeApp {
                     let url_input_id = Self::browser_url_input_id(browser_project_id);
 
                     // Collect UI action results to avoid closure borrowing issues
-                    let mut go_requested = false;
+                    let mut refresh_requested = false;
                     let mut clear_requested = false;
                     let mut inspect_toggle_requested = false;
                     let mut url_enter_pressed = false;
                     let mut double_clicked = false;
 
                     ui.horizontal(|ui| {
+                        // Refresh sits at the left of the URL field, matching browser chrome.
+                        let refresh_response =
+                            browser_toolbar_icon_button(ui, icons::ARROW_CLOCKWISE, "Refresh");
+                        if refresh_response.clicked() {
+                            refresh_requested = true;
+                        }
+
+                        ui.add_space(4.0);
+
                         // URL input takes most of the space
                         let available_width = ui.available_width();
-                        let button_count = 4.0; // Go, Clear, Inspect, Screenshot
+                        let button_count = 3.0; // Clear, Inspect, Screenshot
                         let button_spacing = 4.0 * (button_count - 1.0);
                         let button_width = CONTROL_ROW_HEIGHT * button_count;
                         let url_width = ((available_width - button_width - button_spacing - 8.0) * 0.70).max(100.0);
@@ -22125,10 +22209,10 @@ impl AdeApp {
                             .hint_text("Enter URL...")
                             .vertical_align(egui::Align::Center);
 
-                        let url_response = ui.add_sized(
-                            [url_width, CONTROL_ROW_HEIGHT],
-                            url_text_edit
-                        );
+                        let url_response = ui.scope(|ui| {
+                            apply_browser_url_selection_visuals(ui.style_mut());
+                            ui.add_sized([url_width, CONTROL_ROW_HEIGHT], url_text_edit)
+                        }).inner;
 
                         // Capture input events for processing after the borrow ends
                         if url_response.double_clicked() {
@@ -22136,18 +22220,6 @@ impl AdeApp {
                         }
                         if url_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             url_enter_pressed = true;
-                        }
-
-                        ui.add_space(4.0);
-
-                        // Go button
-                        let go_response = browser_toolbar_icon_button(
-                            ui,
-                            icons::ARROW_RIGHT,
-                            "Go to URL",
-                        );
-                        if go_response.clicked() {
-                            go_requested = true;
                         }
 
                         ui.add_space(4.0);
@@ -22215,8 +22287,14 @@ impl AdeApp {
                         }
                     }
 
-                    // Handle Go button
-                    if go_requested || url_enter_pressed {
+                    // Handle refresh button
+                    if refresh_requested {
+                        self.refresh_browser_scope(browser_scope);
+                        ctx.request_repaint();
+                    }
+
+                    // Handle URL submission from Enter.
+                    if url_enter_pressed {
                         self.submit_browser_url(ctx, browser_project_id, &draft);
                     }
 
@@ -22228,11 +22306,10 @@ impl AdeApp {
                             }
                             self.browser_url_draft_by_scope
                                 .remove(&browser_scope);
-                            if let Some(tab_id) = self.active_browser_tab_id(browser_scope)
-                            {
-                                if let Some(tab) =
-                                    self.browser_tab_mut(browser_scope, tab_id)
-                                {
+                            self.browser_navigation_requested_by_scope
+                                .remove(&browser_scope);
+                            if let Some(tab_id) = self.active_browser_tab_id(browser_scope) {
+                                if let Some(tab) = self.browser_tab_mut(browser_scope, tab_id) {
                                     tab.url = None;
                                     tab.draft.clear();
                                     tab.title = "New Tab".to_owned();
@@ -29669,6 +29746,12 @@ fn browser_toolbar_icon_button(ui: &mut Ui, icon: AppIcon, tooltip: &str) -> egu
     );
 
     response
+}
+
+fn apply_browser_url_selection_visuals(style: &mut egui::Style) {
+    style.visuals.selection.bg_fill = BROWSER_URL_SELECTION_BG;
+    style.visuals.selection.stroke = Stroke::new(1.0, BROWSER_URL_SELECTION_STROKE);
+    style.visuals.override_text_color = Some(TEXT_PRIMARY);
 }
 
 /// Browser toolbar toggle button with tooltip shown centered above.
@@ -42666,6 +42749,7 @@ mod tests {
             ai_hook_manager: None,
             file_editor: FileEditorState::default(),
             browser_url_draft_by_scope: BTreeMap::new(),
+            browser_navigation_requested_by_scope: BTreeMap::new(),
             embedded_browsers_by_scope: BTreeMap::new(),
             browser_tabs_by_scope: BTreeMap::new(),
             active_browser_tab_by_scope: BTreeMap::new(),
@@ -50826,6 +50910,72 @@ mod tests {
     }
 
     #[test]
+    fn initial_browser_navigation_queues_saved_url_once() {
+        let mut app = test_app([], None);
+        let mut project = test_project(1, "Demo", "C:/demo", &[], &[]);
+        project.browser_last_url = Some("https://saved.example.com".to_owned());
+        app.projects.insert(1, project);
+        let scope = BrowserScopeKey::Project(1);
+
+        app.request_initial_browser_navigation_for_scope(scope);
+        app.request_initial_browser_navigation_for_scope(scope);
+
+        let browser = app
+            .embedded_browsers_by_scope
+            .get(&scope)
+            .expect("initial navigation should create browser facade");
+        assert_eq!(
+            browser.test_navigations(),
+            &["https://saved.example.com".to_owned()]
+        );
+        assert_eq!(
+            app.browser_navigation_requested_by_scope.get(&scope),
+            Some(&"https://saved.example.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn refresh_browser_scope_reloads_without_submitting_url_draft() {
+        let mut app = test_app([], None);
+        let mut project = test_project(1, "Demo", "C:/demo", &[], &[]);
+        project.browser_last_url = Some("https://current.example.com".to_owned());
+        app.projects.insert(1, project);
+        let scope = BrowserScopeKey::Project(1);
+        app.browser_url_draft_by_scope
+            .insert(scope, "https://draft.example.com".to_owned());
+
+        app.refresh_browser_scope(scope);
+
+        let browser = app
+            .embedded_browsers_by_scope
+            .get(&scope)
+            .expect("refresh should create browser facade");
+        assert_eq!(browser.test_reload_count(), 1);
+        assert!(browser.test_navigations().is_empty());
+        assert_eq!(
+            app.projects.get(&1).unwrap().browser_last_url,
+            Some("https://current.example.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn browser_url_selection_visuals_use_high_contrast_colors() {
+        let mut style = egui::Style::default();
+
+        super::apply_browser_url_selection_visuals(&mut style);
+
+        assert_eq!(
+            style.visuals.selection.bg_fill,
+            super::BROWSER_URL_SELECTION_BG
+        );
+        assert_eq!(
+            style.visuals.selection.stroke.color,
+            super::BROWSER_URL_SELECTION_STROKE
+        );
+        assert_eq!(style.visuals.override_text_color, Some(super::TEXT_PRIMARY));
+    }
+
+    #[test]
     fn sync_embedded_browser_hides_when_panel_closed() {
         let ctx = egui::Context::default();
         let mut app = test_app([], None);
@@ -51708,6 +51858,49 @@ mod tests {
         let tabs_opt = app.browser_tabs_by_scope.get(&BrowserScopeKey::Project(1));
         assert!(tabs_opt.is_none() || tabs_opt.unwrap().is_empty());
         assert!(app.active_browser_tab_id(1).is_none());
+    }
+
+    #[test]
+    fn closing_last_browser_panel_tab_closes_panel() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        app.set_browser_panel_open_for_project(1, true);
+        let first_tab = app.ensure_browser_tab_state(1);
+
+        app.close_browser_panel_tab(1, first_tab)
+            .expect("last panel tab should close");
+
+        assert!(!app.is_browser_panel_open_for_project(1));
+        assert!(app.active_browser_tab_id(1).is_none());
+        assert!(app
+            .browser_tabs_by_scope
+            .get(&BrowserScopeKey::Project(1))
+            .is_none());
+    }
+
+    #[test]
+    fn closing_browser_panel_tab_keeps_panel_open_when_tabs_remain() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        app.set_browser_panel_open_for_project(1, true);
+        let first_tab = app.ensure_browser_tab_state(1);
+        let second_tab = app
+            .add_browser_tab(1, None, BrowserTabKind::Page, None)
+            .expect("second tab should open");
+
+        app.close_browser_panel_tab(1, second_tab)
+            .expect("panel tab should close");
+
+        assert!(app.is_browser_panel_open_for_project(1));
+        assert_eq!(app.active_browser_tab_id(1), Some(first_tab));
+        assert_eq!(
+            app.browser_tabs_by_scope
+                .get(&BrowserScopeKey::Project(1))
+                .map(Vec::len),
+            Some(1)
+        );
     }
 
     #[test]

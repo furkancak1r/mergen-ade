@@ -953,6 +953,10 @@ pub struct EmbeddedBrowser {
     current_readiness: PageReadiness,
     /// Pending operations waiting for readiness (operation_id -> (tool_name, start_time))
     pending_operations: BTreeMap<String, (String, Instant)>,
+    #[cfg(test)]
+    test_navigations: Vec<String>,
+    #[cfg(test)]
+    test_reload_count: usize,
     #[cfg(target_os = "windows")]
     inner: Option<WindowsWebView>,
     #[cfg(target_os = "windows")]
@@ -985,6 +989,10 @@ impl EmbeddedBrowser {
             user_data_folder,
             current_readiness: PageReadiness::default(),
             pending_operations: BTreeMap::new(),
+            #[cfg(test)]
+            test_navigations: Vec::new(),
+            #[cfg(test)]
+            test_reload_count: 0,
             #[cfg(target_os = "windows")]
             inner: None,
             #[cfg(target_os = "windows")]
@@ -1301,6 +1309,11 @@ impl EmbeddedBrowser {
 
     /// Navigate to the given URL.
     pub fn navigate(&mut self, url: &str) {
+        #[cfg(test)]
+        {
+            self.test_navigations.push(url.to_owned());
+        }
+
         #[cfg(target_os = "windows")]
         {
             if self.inner.is_some() {
@@ -1339,6 +1352,11 @@ impl EmbeddedBrowser {
 
     /// Reload the current page.
     pub fn reload(&mut self) {
+        #[cfg(test)]
+        {
+            self.test_reload_count = self.test_reload_count.saturating_add(1);
+        }
+
         #[cfg(target_os = "windows")]
         {
             if let Some(inner) = &self.inner {
@@ -1847,6 +1865,16 @@ impl EmbeddedBrowser {
     #[cfg(test)]
     pub fn requested_visible(&self) -> bool {
         self.requested_visible
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_navigations(&self) -> &[String] {
+        &self.test_navigations
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_reload_count(&self) -> usize {
+        self.test_reload_count
     }
 
     #[cfg(test)]

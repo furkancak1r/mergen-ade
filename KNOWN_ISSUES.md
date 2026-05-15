@@ -1752,3 +1752,45 @@
   - Added regression tests that close/add action hovers do not render action tooltips, and tab body hover still renders the tab title/url tooltip.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
 - References: User screenshot/request 2026-05-15
+
+---
+
+#### Browser panel stayed open after closing the last visible tab {#browser-panel-stayed-open-after-last-tab-close}
+- Date: 2026-05-15
+- Context: User wanted the right Browser panel to close when the final tab is closed from the tab strip X.
+- Error signature: UI tab close used the shared tab cleanup path, which removed tab state but did not update the per-project Browser panel open state.
+- Symptoms/Impact:
+  1. Closing the final visible tab left an empty Browser panel open on the right.
+  2. Users had to close the panel separately after closing the last tab.
+- Root cause:
+  - The shared `close_browser_tab` function intentionally only managed tab/browser scope state and did not know whether the close originated from the visible panel UI.
+- Resolution:
+  - Added a panel-specific tab close helper that delegates tab cleanup to `close_browser_tab`.
+  - The helper closes the project's Browser panel only when no tabs remain for the visible scope.
+  - MCP/API tab close behavior remains on the shared tab cleanup path.
+- Prevent recurrence:
+  - Added regression tests for closing the final panel tab and for keeping the panel open when other tabs remain.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+- References: User request 2026-05-15
+
+---
+
+#### Browser required Go click and URL selection was low contrast {#browser-url-first-open-refresh-selection}
+- Date: 2026-05-15
+- Context: User wanted Browser to behave more like Chrome: refresh button on the left of the URL field, Enter navigates, refresh only reloads, and first open should load the URL automatically.
+- Error signature: The toolbar exposed a Go arrow button, first-load URL state could exist without a queued WebView navigation, and URL text selection reused a muted global selection color.
+- Symptoms/Impact:
+  1. The user had to click the Go arrow to load the visible URL on first Browser open.
+  2. Refresh behavior was not presented like normal browser chrome.
+  3. Selected URL text was hard to distinguish from the dark input background.
+- Root cause:
+  - Browser tab metadata and URL draft state could be initialized before the WebView facade received a navigation request.
+  - URL input used the app-wide low-contrast selection visual.
+- Resolution:
+  - Track requested Browser navigation per scope and queue the active URL once during first Browser sync.
+  - Replace the Go arrow with a refresh button to the left of the URL input; Enter remains the URL navigation action.
+  - Apply a Browser URL input-local high-contrast selection style.
+- Prevent recurrence:
+  - Added regression tests for one-shot first-load navigation, refresh-not-submit behavior, and URL selection contrast.
+- Files/Commands touched: `src/app.rs`, `src/web_browser.rs`, `KNOWN_ISSUES.md`
+- References: User request 2026-05-15
