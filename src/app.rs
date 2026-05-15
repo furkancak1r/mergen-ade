@@ -27564,6 +27564,13 @@ fn smart_input_queue_slot_height(task_rows: usize) -> f32 {
     task_rows as f32 * SMART_INPUT_TASK_ROW_HEIGHT + 4.0
 }
 
+fn smart_input_queue_row_clip_rect(
+    row_rect: egui::Rect,
+    viewport_clip_rect: egui::Rect,
+) -> egui::Rect {
+    row_rect.intersect(viewport_clip_rect)
+}
+
 fn smart_input_question_extra_height(question: Option<&OpenCodeQuestionInfo>) -> f32 {
     let Some(question) = question else {
         return 0.0;
@@ -27897,248 +27904,285 @@ fn draw_smart_input_footer(
                 );
                 queue_ui.set_clip_rect(queue_rect);
                 let mut row_action: Option<(u64, &'static str)> = None;
-                for index in 0..task_rows {
-                    let task_id = state.tasks[index].id;
-                    let task_text = state.tasks[index].text.clone();
-                    let is_editing = state.editing_task_id == Some(task_id);
+                let should_scroll_to_end = state.queue_scroll_to_end;
+                state.queue_scroll_to_end = false;
+                egui::ScrollArea::vertical()
+                    .id_salt(("smart_input_queue", terminal_id))
+                    .max_height(queue_rect.height())
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(should_scroll_to_end)
+                    .show(&mut queue_ui, |ui| {
+                        ui.set_min_width(queue_rect.width());
+                        ui.set_max_width(queue_rect.width());
+                        for index in 0..state.tasks.len() {
+                            let task_id = state.tasks[index].id;
+                            let task_text = state.tasks[index].text.clone();
+                            let is_editing = state.editing_task_id == Some(task_id);
 
-                    let (row_rect, _) = queue_ui.allocate_exact_size(
-                        egui::vec2(queue_rect.width(), SMART_INPUT_TASK_ROW_HEIGHT),
-                        egui::Sense::hover(),
-                    );
-                    let mut row_ui = queue_ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(row_rect)
-                            .layout(egui::Layout::left_to_right(egui::Align::Min)),
-                    );
-                    row_ui.set_clip_rect(row_rect);
-                    // Paint a subtle row background so the queue area is visible even
-                    // when the task text is empty.
-                    if index % 2 == 0 {
-                        row_ui
-                            .painter()
-                            .rect_filled(row_rect, 0.0, Color32::from_rgb(28, 28, 30));
-                    }
-
-                    let index_text = format!("{}.", index + 1);
-                    let (index_rect, _) = row_ui.allocate_exact_size(
-                        egui::vec2(SMART_INPUT_TASK_INDEX_WIDTH, SMART_INPUT_TASK_ROW_HEIGHT),
-                        Sense::hover(),
-                    );
-                    if row_ui.is_rect_visible(index_rect) {
-                        let index_galley =
-                            WidgetText::from(RichText::new(&index_text).color(TEXT_MUTED))
-                                .into_galley(
-                                    &row_ui,
-                                    Some(TextWrapMode::Truncate),
-                                    index_rect.width(),
-                                    egui::TextStyle::Body,
+                            let (row_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(queue_rect.width(), SMART_INPUT_TASK_ROW_HEIGHT),
+                                egui::Sense::hover(),
+                            );
+                            let mut row_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(row_rect)
+                                    .layout(egui::Layout::left_to_right(egui::Align::Min)),
+                            );
+                            row_ui.set_clip_rect(smart_input_queue_row_clip_rect(
+                                row_rect,
+                                ui.clip_rect(),
+                            ));
+                            // Paint a subtle row background so the queue area is visible even
+                            // when the task text is empty.
+                            if index % 2 == 0 {
+                                row_ui.painter().rect_filled(
+                                    row_rect,
+                                    0.0,
+                                    Color32::from_rgb(28, 28, 30),
                                 );
-                        let index_pos = egui::pos2(
-                            index_rect.left(),
-                            row_rect.center().y - (index_galley.size().y * 0.5),
-                        );
-                        row_ui.painter().galley(index_pos, index_galley, TEXT_MUTED);
-                    }
+                            }
 
-                    if is_editing {
-                        let edit_id = AdeApp::smart_input_task_edit_input_id(terminal_id, task_id);
-                        let secondary_pressed = row_ui
-                            .ctx()
-                            .input(|input| input.pointer.secondary_pressed());
-                        let pre_click_range =
-                            egui::text_edit::TextEditState::load(row_ui.ctx(), edit_id)
-                                .and_then(|s| s.cursor.char_range())
-                                .filter(|range| range.primary != range.secondary);
-                        if secondary_pressed && pre_click_range.is_some() {
-                            state.edit_context_menu_selection_range = pre_click_range;
-                        }
-                        let edit_response = with_settings_text_edit_chrome(&mut row_ui, |ui| {
-                            let text_width = (ui.available_width() - 80.0).max(80.0);
-                            ui.add_sized(
-                                egui::vec2(text_width, 22.0),
-                                egui::TextEdit::singleline(&mut state.edit_draft)
-                                    .id(edit_id)
-                                    .hint_text("Edit queued task"),
-                            )
-                        });
-                        let post_show_range =
-                            egui::text_edit::TextEditState::load(row_ui.ctx(), edit_id)
-                                .and_then(|s| s.cursor.char_range())
-                                .filter(|range| range.primary != range.secondary);
-                        let effective_range = state
-                            .edit_context_menu_selection_range
-                            .or(post_show_range)
-                            .filter(|range| range.primary != range.secondary);
-                        edit_response.context_menu(|ui| {
-                            with_minimal_button_chrome(ui, |ui| {
-                                let has_selection = effective_range.is_some();
-                                ui.add_enabled_ui(has_selection, |ui| {
-                                    if ui.button(format!("{} Copy", icons::COPY)).clicked() {
-                                        if let Some(range) = effective_range {
-                                            let copied = extract_text_from_char_range(
-                                                &state.edit_draft,
-                                                Some(range),
-                                            );
-                                            if let Some(text) = copied {
-                                                ui.ctx().copy_text(text);
-                                            }
-                                        }
-                                        ui.close_menu();
-                                    }
-                                });
-                                if ui.button(format!("{} Paste", icons::PLUS)).clicked() {
-                                    if let Ok(mut clipboard) = Clipboard::new() {
-                                        if let Ok(text) = clipboard.get_text() {
-                                            if let Some(range) = effective_range {
-                                                let [start, end] = range.sorted();
-                                                let mut new_draft = String::new();
-                                                let mut chars = state.edit_draft.chars();
-                                                for _ in 0..start.index {
-                                                    if let Some(ch) = chars.next() {
-                                                        new_draft.push(ch);
+                            let index_text = format!("{}.", index + 1);
+                            let (index_rect, _) = row_ui.allocate_exact_size(
+                                egui::vec2(
+                                    SMART_INPUT_TASK_INDEX_WIDTH,
+                                    SMART_INPUT_TASK_ROW_HEIGHT,
+                                ),
+                                Sense::hover(),
+                            );
+                            if row_ui.is_rect_visible(index_rect) {
+                                let index_galley =
+                                    WidgetText::from(RichText::new(&index_text).color(TEXT_MUTED))
+                                        .into_galley(
+                                            &row_ui,
+                                            Some(TextWrapMode::Truncate),
+                                            index_rect.width(),
+                                            egui::TextStyle::Body,
+                                        );
+                                let index_pos = egui::pos2(
+                                    index_rect.left(),
+                                    row_rect.center().y - (index_galley.size().y * 0.5),
+                                );
+                                row_ui.painter().galley(index_pos, index_galley, TEXT_MUTED);
+                            }
+
+                            if is_editing {
+                                let edit_id =
+                                    AdeApp::smart_input_task_edit_input_id(terminal_id, task_id);
+                                let secondary_pressed = row_ui
+                                    .ctx()
+                                    .input(|input| input.pointer.secondary_pressed());
+                                let pre_click_range =
+                                    egui::text_edit::TextEditState::load(row_ui.ctx(), edit_id)
+                                        .and_then(|s| s.cursor.char_range())
+                                        .filter(|range| range.primary != range.secondary);
+                                if secondary_pressed && pre_click_range.is_some() {
+                                    state.edit_context_menu_selection_range = pre_click_range;
+                                }
+                                let edit_response =
+                                    with_settings_text_edit_chrome(&mut row_ui, |ui| {
+                                        let text_width =
+                                            (ui.available_width() - 80.0).max(80.0);
+                                        ui.add_sized(
+                                            egui::vec2(text_width, 22.0),
+                                            egui::TextEdit::singleline(&mut state.edit_draft)
+                                                .id(edit_id)
+                                                .hint_text("Edit queued task"),
+                                        )
+                                    });
+                                let post_show_range =
+                                    egui::text_edit::TextEditState::load(row_ui.ctx(), edit_id)
+                                        .and_then(|s| s.cursor.char_range())
+                                        .filter(|range| range.primary != range.secondary);
+                                let effective_range = state
+                                    .edit_context_menu_selection_range
+                                    .or(post_show_range)
+                                    .filter(|range| range.primary != range.secondary);
+                                edit_response.context_menu(|ui| {
+                                    with_minimal_button_chrome(ui, |ui| {
+                                        let has_selection = effective_range.is_some();
+                                        ui.add_enabled_ui(has_selection, |ui| {
+                                            if ui.button(format!("{} Copy", icons::COPY)).clicked()
+                                            {
+                                                if let Some(range) = effective_range {
+                                                    let copied = extract_text_from_char_range(
+                                                        &state.edit_draft,
+                                                        Some(range),
+                                                    );
+                                                    if let Some(text) = copied {
+                                                        ui.ctx().copy_text(text);
                                                     }
                                                 }
-                                                for _ in start.index..end.index {
-                                                    chars.next();
-                                                }
-                                                new_draft.push_str(&text);
-                                                for ch in chars {
-                                                    new_draft.push(ch);
-                                                }
-                                                state.edit_draft = new_draft;
-                                            } else {
-                                                state.edit_draft.push_str(&text);
+                                                ui.close_menu();
                                             }
+                                        });
+                                        if ui.button(format!("{} Paste", icons::PLUS)).clicked() {
+                                            if let Ok(mut clipboard) = Clipboard::new() {
+                                                if let Ok(text) = clipboard.get_text() {
+                                                    if let Some(range) = effective_range {
+                                                        let [start, end] = range.sorted();
+                                                        let mut new_draft = String::new();
+                                                        let mut chars = state.edit_draft.chars();
+                                                        for _ in 0..start.index {
+                                                            if let Some(ch) = chars.next() {
+                                                                new_draft.push(ch);
+                                                            }
+                                                        }
+                                                        for _ in start.index..end.index {
+                                                            chars.next();
+                                                        }
+                                                        new_draft.push_str(&text);
+                                                        for ch in chars {
+                                                            new_draft.push(ch);
+                                                        }
+                                                        state.edit_draft = new_draft;
+                                                    } else {
+                                                        state.edit_draft.push_str(&text);
+                                                    }
+                                                }
+                                            }
+                                            ui.close_menu();
+                                        }
+                                    });
+                                });
+                                if let Some(stored_range) = state.edit_context_menu_selection_range
+                                {
+                                    if stored_range.primary != stored_range.secondary {
+                                        if let Some(mut text_state) =
+                                            egui::text_edit::TextEditState::load(
+                                                row_ui.ctx(),
+                                                edit_id,
+                                            )
+                                        {
+                                            text_state.cursor.set_char_range(Some(stored_range));
+                                            text_state.store(row_ui.ctx(), edit_id);
                                         }
                                     }
-                                    ui.close_menu();
                                 }
-                            });
-                        });
-                        if let Some(stored_range) = state.edit_context_menu_selection_range {
-                            if stored_range.primary != stored_range.secondary {
-                                if let Some(mut text_state) =
-                                    egui::text_edit::TextEditState::load(row_ui.ctx(), edit_id)
-                                {
-                                    text_state.cursor.set_char_range(Some(stored_range));
-                                    text_state.store(row_ui.ctx(), edit_id);
+                                let _removed_edit = draw_smart_input_attachments(
+                                    &mut row_ui,
+                                    &mut state.edit_attachments,
+                                );
+                                if styled_icon_button(
+                                    &mut row_ui,
+                                    icons::CHECK_CIRCLE,
+                                    BTN_SUBTLE,
+                                    BTN_TEAL_HOVER,
+                                    BTN_ICON_ACTIVE,
+                                    "Save",
+                                ) {
+                                    row_action = Some((task_id, "save"));
+                                }
+                                if styled_icon_button(
+                                    &mut row_ui,
+                                    icons::X,
+                                    BTN_SUBTLE,
+                                    BTN_RED_HOVER,
+                                    Color32::from_rgb(170, 50, 50),
+                                    "Cancel",
+                                ) {
+                                    row_action = Some((task_id, "cancel"));
+                                }
+                            } else {
+                                let is_dragging_this = state.dragging_task_id == Some(task_id);
+                                let text_color = if is_dragging_this {
+                                    TEXT_MUTED
+                                } else {
+                                    TEXT_PRIMARY
+                                };
+
+                                let preview = if task_text.trim().is_empty() {
+                                    "(Image attachment)".to_owned()
+                                } else {
+                                    capped_hover_text(&task_text, 72)
+                                };
+                                let action_reserved = CONTROL_ROW_HEIGHT * 4.0 + 48.0;
+                                let text_width =
+                                    (row_ui.available_width() - action_reserved).max(60.0);
+                                let (text_rect, label_response) = row_ui.allocate_exact_size(
+                                    egui::vec2(text_width, SMART_INPUT_TASK_ROW_HEIGHT),
+                                    Sense::click(),
+                                );
+                                if row_ui.is_rect_visible(text_rect) {
+                                    let galley =
+                                        WidgetText::from(RichText::new(&preview).color(text_color))
+                                            .into_galley(
+                                                &row_ui,
+                                                Some(TextWrapMode::Truncate),
+                                                text_rect.width(),
+                                                egui::TextStyle::Body,
+                                            );
+                                    let text_pos = egui::pos2(
+                                        text_rect.left(),
+                                        row_rect.center().y - (galley.size().y * 0.5),
+                                    );
+                                    row_ui.painter().galley(text_pos, galley, text_color);
+                                }
+                                let label_response =
+                                    label_response.on_hover_text(if task_text.trim().is_empty() {
+                                        "Queued image attachment".to_owned()
+                                    } else {
+                                        capped_hover_text(
+                                            &task_text,
+                                            SMART_INPUT_TOOLTIP_MAX_CHARS,
+                                        )
+                                    });
+                                if label_response.clicked() {
+                                    row_ui.ctx().copy_text(task_text.clone());
+                                }
+                                let task_attachments = &mut state.tasks[index].attachments;
+                                let _removed =
+                                    draw_smart_input_attachments(&mut row_ui, task_attachments);
+
+                                row_ui.add_space(8.0);
+
+                                if styled_icon_button(
+                                    &mut row_ui,
+                                    icons::ARROW_RIGHT,
+                                    BTN_SUBTLE,
+                                    BTN_BLUE_HOVER,
+                                    BTN_ICON_ACTIVE,
+                                    "Send task now",
+                                ) {
+                                    let atts = state.tasks[index].attachments.clone();
+                                    action.send_task_now = Some((task_id, atts));
+                                }
+                                if styled_icon_button(
+                                    &mut row_ui,
+                                    icons::COPY,
+                                    BTN_SUBTLE,
+                                    BTN_BLUE_HOVER,
+                                    BTN_ICON_ACTIVE,
+                                    "Copy prompt",
+                                ) {
+                                    row_ui.ctx().copy_text(task_text.clone());
+                                }
+                                if styled_icon_button(
+                                    &mut row_ui,
+                                    icons::CODE,
+                                    BTN_SUBTLE,
+                                    BTN_TEAL_HOVER,
+                                    BTN_ICON_ACTIVE,
+                                    "Edit",
+                                ) {
+                                    row_action = Some((task_id, "edit"));
+                                }
+                                if styled_icon_button(
+                                    &mut row_ui,
+                                    icons::TRASH,
+                                    BTN_SUBTLE,
+                                    BTN_RED_HOVER,
+                                    Color32::from_rgb(170, 50, 50),
+                                    "Delete",
+                                ) {
+                                    row_action = Some((task_id, "delete"));
                                 }
                             }
                         }
-                        let _removed_edit =
-                            draw_smart_input_attachments(&mut row_ui, &mut state.edit_attachments);
-                        if styled_icon_button(
-                            &mut row_ui,
-                            icons::CHECK_CIRCLE,
-                            BTN_SUBTLE,
-                            BTN_TEAL_HOVER,
-                            BTN_ICON_ACTIVE,
-                            "Save",
-                        ) {
-                            row_action = Some((task_id, "save"));
+                        if should_scroll_to_end {
+                            ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
                         }
-                        if styled_icon_button(
-                            &mut row_ui,
-                            icons::X,
-                            BTN_SUBTLE,
-                            BTN_RED_HOVER,
-                            Color32::from_rgb(170, 50, 50),
-                            "Cancel",
-                        ) {
-                            row_action = Some((task_id, "cancel"));
-                        }
-                    } else {
-                        let is_dragging_this = state.dragging_task_id == Some(task_id);
-                        let text_color = if is_dragging_this {
-                            TEXT_MUTED
-                        } else {
-                            TEXT_PRIMARY
-                        };
-
-                        let preview = if task_text.trim().is_empty() {
-                            "(Image attachment)".to_owned()
-                        } else {
-                            capped_hover_text(&task_text, 72)
-                        };
-                        let action_reserved = CONTROL_ROW_HEIGHT * 4.0 + 48.0;
-                        let text_width = (row_ui.available_width() - action_reserved).max(60.0);
-                        let (text_rect, label_response) = row_ui.allocate_exact_size(
-                            egui::vec2(text_width, SMART_INPUT_TASK_ROW_HEIGHT),
-                            Sense::click(),
-                        );
-                        if row_ui.is_rect_visible(text_rect) {
-                            let galley =
-                                WidgetText::from(RichText::new(&preview).color(text_color))
-                                    .into_galley(
-                                        &row_ui,
-                                        Some(TextWrapMode::Truncate),
-                                        text_rect.width(),
-                                        egui::TextStyle::Body,
-                                    );
-                            let text_pos = egui::pos2(
-                                text_rect.left(),
-                                row_rect.center().y - (galley.size().y * 0.5),
-                            );
-                            row_ui.painter().galley(text_pos, galley, text_color);
-                        }
-                        let label_response =
-                            label_response.on_hover_text(if task_text.trim().is_empty() {
-                                "Queued image attachment".to_owned()
-                            } else {
-                                capped_hover_text(&task_text, SMART_INPUT_TOOLTIP_MAX_CHARS)
-                            });
-                        if label_response.clicked() {
-                            row_ui.ctx().copy_text(task_text.clone());
-                        }
-                        let task_attachments = &mut state.tasks[index].attachments;
-                        let _removed = draw_smart_input_attachments(&mut row_ui, task_attachments);
-
-                        row_ui.add_space(8.0);
-
-                        if styled_icon_button(
-                            &mut row_ui,
-                            icons::ARROW_RIGHT,
-                            BTN_SUBTLE,
-                            BTN_BLUE_HOVER,
-                            BTN_ICON_ACTIVE,
-                            "Send task now",
-                        ) {
-                            let atts = state.tasks[index].attachments.clone();
-                            action.send_task_now = Some((task_id, atts));
-                        }
-                        if styled_icon_button(
-                            &mut row_ui,
-                            icons::COPY,
-                            BTN_SUBTLE,
-                            BTN_BLUE_HOVER,
-                            BTN_ICON_ACTIVE,
-                            "Copy prompt",
-                        ) {
-                            row_ui.ctx().copy_text(task_text.clone());
-                        }
-                        if styled_icon_button(
-                            &mut row_ui,
-                            icons::CODE,
-                            BTN_SUBTLE,
-                            BTN_TEAL_HOVER,
-                            BTN_ICON_ACTIVE,
-                            "Edit",
-                        ) {
-                            row_action = Some((task_id, "edit"));
-                        }
-                        if styled_icon_button(
-                            &mut row_ui,
-                            icons::TRASH,
-                            BTN_SUBTLE,
-                            BTN_RED_HOVER,
-                            Color32::from_rgb(170, 50, 50),
-                            "Delete",
-                        ) {
-                            row_action = Some((task_id, "delete"));
-                        }
-                    }
-                }
+                    });
 
                 if let Some((task_id, row_action)) = row_action {
                     match row_action {
@@ -54567,6 +54611,31 @@ mod tests {
     }
 
     #[test]
+    fn smart_input_queue_footer_height_caps_visible_rows() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+        for index in 1..=3 {
+            terminal.smart_input.draft = format!("task {index}");
+            terminal.smart_input.enqueue_draft();
+        }
+        let three_task_height = AdeApp::smart_input_footer_height(terminal, 500.0, 18.0);
+
+        for index in 4..=5 {
+            terminal.smart_input.draft = format!("task {index}");
+            terminal.smart_input.enqueue_draft();
+        }
+        let five_task_height = AdeApp::smart_input_footer_height(terminal, 500.0, 18.0);
+
+        assert!(
+            (five_task_height - three_task_height).abs() <= 0.1,
+            "queue footer height should stay capped at visible row count (three={}, five={})",
+            three_task_height,
+            five_task_height
+        );
+    }
+
+    #[test]
     fn smart_input_empty_queue_does_not_allocate_three_row_slot() {
         use egui::{Context, RawInput};
 
@@ -54622,6 +54691,169 @@ mod tests {
             !row_bg_found,
             "empty queue must not paint task row backgrounds"
         );
+    }
+
+    #[test]
+    fn smart_input_queue_scroll_area_reaches_later_tasks() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            for index in 1..=5 {
+                terminal.smart_input.draft = format!("task {index}");
+                terminal.smart_input.enqueue_draft();
+            }
+        }
+
+        let render = |ctx: &egui::Context, app: &mut AdeApp| {
+            let mut raw_input = RawInput::default();
+            raw_input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(420.0, 420.0),
+            ));
+            ctx.run(raw_input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let footer_size = egui::vec2(420.0, 260.0);
+                    let pane_height = 420.0;
+                    let line_height = 18.0;
+                    let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+                    let _ = super::draw_smart_input_footer(
+                        ui,
+                        terminal,
+                        footer_size,
+                        pane_height,
+                        line_height,
+                    );
+                });
+            })
+        };
+
+        let _ = render(&ctx, &mut app);
+        let output = render(&ctx, &mut app);
+
+        let visible_task_five = output.shapes.iter().any(|shape| {
+            if let egui::epaint::Shape::Text(t) = &shape.shape {
+                t.galley.text() == "task 5"
+            } else {
+                false
+            }
+        });
+        assert!(
+            visible_task_five,
+            "queue scroll area should be able to reveal later queued tasks"
+        );
+    }
+
+    #[test]
+    fn smart_input_queue_scroll_clips_rows_to_queue_viewport() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            for index in 1..=8 {
+                terminal.smart_input.draft = format!("task {index}");
+                terminal.smart_input.enqueue_draft();
+            }
+        }
+
+        let render = |ctx: &egui::Context, app: &mut AdeApp| {
+            let mut raw_input = RawInput::default();
+            raw_input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(420.0, 420.0),
+            ));
+            ctx.run(raw_input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let footer_size = egui::vec2(420.0, 260.0);
+                    let pane_height = 420.0;
+                    let line_height = 18.0;
+                    let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+                    let _ = super::draw_smart_input_footer(
+                        ui,
+                        terminal,
+                        footer_size,
+                        pane_height,
+                        line_height,
+                    );
+                });
+            })
+        };
+
+        let _ = render(&ctx, &mut app);
+        let output = render(&ctx, &mut app);
+
+        let title_bottom = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::epaint::Shape::Text(text_shape) = &shape.shape {
+                    text_shape.galley.text().contains("Smart Input").then(|| {
+                        egui::Rect::from_min_size(text_shape.pos, text_shape.galley.size()).bottom()
+                    })
+                } else {
+                    None
+                }
+            })
+            .next()
+            .expect("Smart Input title text");
+
+        let visible_task_rects: Vec<(String, egui::Rect)> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                let egui::epaint::Shape::Text(text_shape) = &shape.shape else {
+                    return None;
+                };
+                let text = text_shape.galley.text();
+                if !text.starts_with("task ") {
+                    return None;
+                }
+                let text_rect = egui::Rect::from_min_size(text_shape.pos, text_shape.galley.size());
+                let clipped_rect = text_rect.intersect(shape.clip_rect);
+                (clipped_rect.width() > 0.5 && clipped_rect.height() > 0.5)
+                    .then(|| (text.to_owned(), clipped_rect))
+            })
+            .collect();
+
+        assert!(
+            visible_task_rects.iter().any(|(text, _)| text == "task 8"),
+            "queue scroll should reveal the final queued task"
+        );
+        assert!(
+            visible_task_rects.len() <= super::SMART_INPUT_MAX_VISIBLE_TASK_ROWS + 1,
+            "queue scroll should not visibly leak every queued row outside the viewport: {:?}",
+            visible_task_rects
+        );
+        assert!(
+            visible_task_rects
+                .iter()
+                .all(|(_, rect)| rect.top() >= title_bottom - 0.5),
+            "visible queued task rows must stay below the Smart Input header: {:?}",
+            visible_task_rects
+        );
+    }
+
+    #[test]
+    fn smart_input_queue_row_clip_intersects_scroll_viewport() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(400.0, 84.0));
+        let partial_row = egui::Rect::from_min_size(egui::pos2(0.0, 90.0), egui::vec2(400.0, 28.0));
+
+        let clipped = super::smart_input_queue_row_clip_rect(partial_row, viewport);
+
+        assert_eq!(clipped.top(), viewport.top());
+        assert_eq!(clipped.bottom(), partial_row.bottom());
+        assert_eq!(clipped.left(), partial_row.left());
+        assert_eq!(clipped.right(), partial_row.right());
     }
 
     #[test]

@@ -1155,3 +1155,41 @@
   - Added Smart Input state regression tests for draft edit transfer, original-index requeue, attachment preservation, and draft-occupied blocking.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input -- --nocapture`, `cargo test --no-run`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User request 2026-05-15
+
+---
+
+#### Smart Input queue rendered only the first visible rows {#smart-input-queue-scroll}
+- Date: 2026-05-15
+- Context: User reported that queued Smart Input prompts beyond the first 3-4 rows could not be seen because the queue area had no scroll.
+- Error signature: `draw_smart_input_footer()` computed a capped visible row count and iterated only `0..task_rows`, so later tasks were never rendered.
+- Symptoms/Impact:
+  1. Queued prompts after the capped visible row count were inaccessible in the UI.
+  2. The existing `queue_scroll_to_end` state had no effect because there was no queue `ScrollArea`.
+- Root cause:
+  - The queue slot height was correctly capped, but the render loop was also capped instead of drawing all tasks inside a scrollable viewport.
+- Resolution:
+  - Wrapped the queue rows in a fixed-height vertical `ScrollArea`.
+  - Kept the visible queue slot height capped while rendering the full task list inside the scroll area.
+  - Used `queue_scroll_to_end` to reveal newly appended tasks without forcing bottom-scroll for edits reinserted at their original index.
+- Prevent recurrence:
+  - Added Smart Input queue tests for capped footer height with 5 tasks and visibility of later tasks after queue scroll-to-end.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input_queue -- --nocapture`, `cargo test --no-run`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
+
+---
+
+#### Smart Input queue rows leaked outside the scroll viewport {#smart-input-queue-scroll-clip}
+- Date: 2026-05-15
+- Context: After adding queue scrolling, user screenshot showed queued rows painting over the terminal area and Smart Input header.
+- Error signature: Each queue row UI called `set_clip_rect(row_rect)`, replacing the active `ScrollArea` viewport clip.
+- Symptoms/Impact:
+  1. Offscreen queue rows remained visibly painted above the Smart Input queue area.
+  2. The Smart Input header and terminal content were visually overlapped by queued rows.
+- Root cause:
+  - Row-level clipping used only the row rectangle and did not intersect it with the ScrollArea viewport clip.
+- Resolution:
+  - Clip each queue row to `row_rect.intersect(ui.clip_rect())` so row rendering is constrained by both the row and the queue viewport.
+- Prevent recurrence:
+  - Added regression coverage for row/viewport clip intersection and for visible queue task rows staying below the Smart Input header.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input_queue -- --nocapture`, `cargo test --no-run`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User screenshot 2026-05-15
