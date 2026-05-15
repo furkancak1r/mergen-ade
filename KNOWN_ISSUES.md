@@ -1426,3 +1426,61 @@
   - Added a foreground launcher render test for idle `TEXT_PRIMARY` and hovered `ACCENT` row text colors.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test foreground_launcher -- --nocapture`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User request 2026-05-15
+
+---
+
+#### Smart Input draft grip resized the whole footer {#smart-input-draft-grip-resized-footer}
+- Date: 2026-05-15
+- Context: User expected the draft input's bottom-right grip to resize the draft text area, but dragging it changed the full Smart Input window height.
+- Error signature: The draft grip handler wrote `SmartInputState::user_height` and cleared `draft_user_height` instead of updating the draft-specific height.
+- Symptoms/Impact:
+  1. Dragging the textarea grip moved the Smart Input footer boundary.
+  2. The draft textarea itself stayed at its fixed 80px height.
+- Root cause:
+  - The draft resize path reused the footer resize state instead of the existing draft-specific state field.
+- Resolution:
+  - Added draft-height helpers and made the textarea render from `draft_user_height`.
+  - Updated the draft grip to mutate only `draft_user_height`.
+  - Kept the top Smart Input divider as the only direct footer resize control.
+- Prevent recurrence:
+  - Added regression tests for draft resize state isolation and footer height accounting for resized draft input.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input -- --nocapture`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
+
+---
+
+#### Smart Input empty queue still showed Hide/Show toggle {#smart-input-empty-queue-toggle-visible}
+- Date: 2026-05-15
+- Context: User wanted the Smart Input header to omit the Hide/Show button when there are no queued tasks.
+- Error signature: The header rendered the collapse/expand toggle unconditionally, even when `SmartInputState::tasks` was empty.
+- Symptoms/Impact:
+  1. Empty Smart Input showed a control that did not reveal any queued rows.
+  2. The header looked busier than needed after other empty-state labels were removed.
+- Root cause:
+  - The toggle render path was not tied to the existing queued-task count condition.
+- Resolution:
+  - Rendered the Hide/Show toggle only when at least one queued task exists.
+  - Preserved queued-task count/status and collapse behavior when the queue is non-empty.
+- Prevent recurrence:
+  - Extended the empty Smart Input render test to assert `Hide` and `Show` are absent when no tasks are queued.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input -- --nocapture`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
+
+---
+
+#### Smart Input queue rows sat too close to the header {#smart-input-queue-top-spacing}
+- Date: 2026-05-15
+- Context: User screenshot showed queued Smart Input rows starting too close to the header and `Hide` button.
+- Error signature: Queue rows were allocated immediately after the header with only the global small item spacing.
+- Symptoms/Impact:
+  1. The first visible queue row felt cramped against the header controls.
+  2. Hover/actions on the top row visually crowded the `Hide` button area.
+- Root cause:
+  - The queue slot had no dedicated top gap separating it from the header.
+- Resolution:
+  - Added a queue-only top gap when visible task rows exist.
+  - Included that gap in desired and safe minimum footer height calculations.
+- Prevent recurrence:
+  - Extended the queued Smart Input render test to assert minimum spacing between the header toggle and the first queued task.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input -- --nocapture`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User screenshot 2026-05-15

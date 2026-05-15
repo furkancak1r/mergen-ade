@@ -281,7 +281,10 @@ const SMART_INPUT_BASE_FOOTER_HEIGHT: f32 = 128.0;
 const SMART_INPUT_TASK_ROW_HEIGHT: f32 = 28.0;
 const SMART_INPUT_TASK_INDEX_WIDTH: f32 = 16.0;
 const SMART_INPUT_MAX_VISIBLE_TASK_ROWS: usize = 3;
+const SMART_INPUT_QUEUE_TOP_GAP: f32 = 8.0;
 const SMART_INPUT_DRAFT_TOP_GAP: f32 = 8.0;
+const SMART_INPUT_DRAFT_DEFAULT_HEIGHT: f32 = 80.0;
+const SMART_INPUT_DRAFT_MIN_HEIGHT: f32 = 48.0;
 const SMART_INPUT_FOOTER_GAP: f32 = 6.0;
 const SMART_INPUT_HEADER_RIGHT_INSET: f32 = 12.0;
 const SMART_INPUT_RESIZE_HANDLE_HEIGHT: f32 = 5.0;
@@ -13499,12 +13502,7 @@ impl AdeApp {
             return 0.0;
         }
 
-        let max_footer = (pane_height
-            - TERMINAL_HEADER_HEIGHT
-            - TERMINAL_HEADER_GAP
-            - SMART_INPUT_FOOTER_GAP
-            - line_height * 3.0)
-            .max(0.0);
+        let max_footer = smart_input_max_footer_height(pane_height, line_height);
         if max_footer < SMART_INPUT_MIN_FOOTER_HEIGHT {
             return 0.0;
         }
@@ -22718,12 +22716,7 @@ impl AdeApp {
                     }
                     if handle_response.dragged() {
                         let delta = ui.ctx().input(|i| i.pointer.delta().y);
-                        let max_footer = (pane_height
-                            - TERMINAL_HEADER_HEIGHT
-                            - TERMINAL_HEADER_GAP
-                            - SMART_INPUT_FOOTER_GAP
-                            - line_height * 3.0)
-                            .max(0.0);
+                        let max_footer = smart_input_max_footer_height(pane_height, line_height);
                         let safe_min = smart_input_safe_min_footer_height(&terminal.smart_input)
                             + smart_input_question_extra_height(
                                 terminal.opencode_pending_question.as_ref(),
@@ -27434,6 +27427,14 @@ fn smart_input_queue_slot_height(task_rows: usize) -> f32 {
     task_rows as f32 * SMART_INPUT_TASK_ROW_HEIGHT + 4.0
 }
 
+fn smart_input_queue_top_gap(task_rows: usize) -> f32 {
+    if task_rows == 0 {
+        0.0
+    } else {
+        SMART_INPUT_QUEUE_TOP_GAP
+    }
+}
+
 fn smart_input_queue_row_clip_rect(
     row_rect: egui::Rect,
     viewport_clip_rect: egui::Rect,
@@ -27455,23 +27456,74 @@ fn smart_input_question_extra_height(question: Option<&OpenCodeQuestionInfo>) ->
         }
 }
 
+fn smart_input_draft_height(state: &SmartInputState) -> f32 {
+    state
+        .draft_user_height
+        .unwrap_or(SMART_INPUT_DRAFT_DEFAULT_HEIGHT)
+        .max(SMART_INPUT_DRAFT_MIN_HEIGHT)
+}
+
+fn smart_input_draft_extra_height(state: &SmartInputState) -> f32 {
+    (smart_input_draft_height(state) - SMART_INPUT_DRAFT_DEFAULT_HEIGHT).max(0.0)
+}
+
+fn smart_input_max_footer_height(pane_height: f32, line_height: f32) -> f32 {
+    (pane_height
+        - TERMINAL_HEADER_HEIGHT
+        - TERMINAL_HEADER_GAP
+        - SMART_INPUT_FOOTER_GAP
+        - line_height * 3.0)
+        .max(0.0)
+}
+
+fn smart_input_resize_draft_height(
+    state: &mut SmartInputState,
+    delta_y: f32,
+    max_footer_height: f32,
+    question_extra_height: f32,
+) {
+    let current_height = smart_input_draft_height(state);
+    let draft_extra = smart_input_draft_extra_height(state);
+    let safe_min_without_draft_extra = (smart_input_safe_min_footer_height(state) - draft_extra)
+        .max(SMART_INPUT_MIN_FOOTER_HEIGHT);
+    let max_draft_height =
+        (max_footer_height - question_extra_height - safe_min_without_draft_extra
+            + SMART_INPUT_DRAFT_DEFAULT_HEIGHT)
+            .max(SMART_INPUT_DRAFT_MIN_HEIGHT);
+
+    state.draft_user_height = Some(
+        (current_height + delta_y)
+            .max(SMART_INPUT_DRAFT_MIN_HEIGHT)
+            .min(max_draft_height),
+    );
+}
+
 fn smart_input_desired_footer_height(state: &SmartInputState) -> f32 {
     let task_rows = smart_input_visible_task_rows(state);
     let queue_slot = smart_input_queue_slot_height(task_rows);
     SMART_INPUT_BASE_FOOTER_HEIGHT
         + queue_slot
+        + smart_input_queue_top_gap(task_rows)
         + SMART_INPUT_DRAFT_TOP_GAP
+        + smart_input_draft_extra_height(state)
         + if task_rows > 0 { 6.0 } else { 0.0 }
 }
 
 fn smart_input_safe_min_footer_height(state: &SmartInputState) -> f32 {
     let task_rows = smart_input_visible_task_rows(state);
     let queue_slot = smart_input_queue_slot_height(task_rows);
+    let queue_top_gap = smart_input_queue_top_gap(task_rows);
+    let draft_extra = smart_input_draft_extra_height(state);
     if task_rows > 0 {
-        (SMART_INPUT_BASE_FOOTER_HEIGHT + queue_slot + SMART_INPUT_DRAFT_TOP_GAP + 60.0)
+        (SMART_INPUT_BASE_FOOTER_HEIGHT
+            + queue_slot
+            + queue_top_gap
+            + SMART_INPUT_DRAFT_TOP_GAP
+            + 60.0
+            + draft_extra)
             .max(SMART_INPUT_MIN_FOOTER_HEIGHT)
     } else {
-        (SMART_INPUT_BASE_FOOTER_HEIGHT + SMART_INPUT_DRAFT_TOP_GAP)
+        (SMART_INPUT_BASE_FOOTER_HEIGHT + SMART_INPUT_DRAFT_TOP_GAP + draft_extra)
             .max(SMART_INPUT_MIN_FOOTER_HEIGHT)
     }
 }
@@ -27501,13 +27553,14 @@ fn draw_smart_input_footer(
             ui.set_max_width(inner_size.x);
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
 
+            let has_queued_tasks = !terminal.smart_input.tasks.is_empty();
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(format!("{} Smart Input", icons::CHAT_TEXT))
                         .strong()
                         .color(TEXT_PRIMARY),
                 );
-                if !terminal.smart_input.tasks.is_empty() {
+                if has_queued_tasks {
                     ui.add_space(6.0);
                     ui.label(RichText::new(status_text).small().color(status_color));
                     ui.add_space(6.0);
@@ -27517,21 +27570,23 @@ fn draw_smart_input_footer(
                             .color(TEXT_MUTED),
                     );
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add_space(SMART_INPUT_HEADER_RIGHT_INSET);
-                    let toggle_label = if terminal.smart_input.expanded {
-                        "Hide"
-                    } else {
-                        "Show"
-                    };
-                    if ui
-                        .button(RichText::new(toggle_label).small())
-                        .on_hover_text("Collapse or expand queued task rows")
-                        .clicked()
-                    {
-                        terminal.smart_input.expanded = !terminal.smart_input.expanded;
-                    }
-                });
+                if has_queued_tasks {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_space(SMART_INPUT_HEADER_RIGHT_INSET);
+                        let toggle_label = if terminal.smart_input.expanded {
+                            "Hide"
+                        } else {
+                            "Show"
+                        };
+                        if ui
+                            .button(RichText::new(toggle_label).small())
+                            .on_hover_text("Collapse or expand queued task rows")
+                            .clicked()
+                        {
+                            terminal.smart_input.expanded = !terminal.smart_input.expanded;
+                        }
+                    });
+                }
             });
 
             // Render active OpenCode question card if present
@@ -27718,6 +27773,7 @@ fn draw_smart_input_footer(
             let task_rows = smart_input_visible_task_rows(state);
             let queue_slot_height = smart_input_queue_slot_height(task_rows);
             if queue_slot_height > 0.0 {
+                ui.add_space(smart_input_queue_top_gap(task_rows));
                 let (queue_rect, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), queue_slot_height),
                     egui::Sense::hover(),
@@ -28043,11 +28099,10 @@ fn draw_smart_input_footer(
 
             ui.add_space(SMART_INPUT_DRAFT_TOP_GAP);
 
-            // Draft input: use a fixed height so it never grows/shrinks dynamically and
-            // crowds out the queue area above it.
+            // Draft input: keep its user resize separate from the full Smart Input footer resize.
             ui.horizontal(|ui| {
                 let draft_id = AdeApp::smart_input_draft_input_id(terminal_id);
-                let input_height = 80.0f32;
+                let input_height = smart_input_draft_height(state);
                 let input_width = (ui.available_width() - 92.0).max(120.0);
                 // Preserve selection before right-click collapses it
                 let secondary_pressed = ui.ctx().input(|input| input.pointer.secondary_pressed());
@@ -28193,17 +28248,13 @@ fn draw_smart_input_footer(
                 }
                 if grip_response.dragged() {
                     let delta = ui.ctx().input(|i| i.pointer.delta().y);
-                    let max_footer = (pane_height
-                        - TERMINAL_HEADER_HEIGHT
-                        - TERMINAL_HEADER_GAP
-                        - SMART_INPUT_FOOTER_GAP
-                        - line_height * 3.0)
-                        .max(0.0);
-                    let safe_min =
-                        smart_input_safe_min_footer_height(state) + question_extra_height;
-                    let new_height = (footer_size.y + delta).max(safe_min).min(max_footer);
-                    state.user_height = Some(new_height);
-                    state.draft_user_height = None;
+                    let max_footer = smart_input_max_footer_height(pane_height, line_height);
+                    smart_input_resize_draft_height(
+                        state,
+                        delta,
+                        max_footer,
+                        question_extra_height,
+                    );
                     ui.ctx().request_repaint();
                 }
             });
@@ -54459,6 +54510,42 @@ mod tests {
     }
 
     #[test]
+    fn smart_input_draft_resize_updates_draft_height_not_footer_user_height() {
+        let mut state = SmartInputState::default();
+        state.user_height = Some(180.0);
+
+        super::smart_input_resize_draft_height(&mut state, 36.0, 260.0, 0.0);
+
+        assert_eq!(
+            state.user_height,
+            Some(180.0),
+            "draft grip must not mutate the full Smart Input footer height"
+        );
+        assert_eq!(
+            state.draft_user_height,
+            Some(super::SMART_INPUT_DRAFT_DEFAULT_HEIGHT + 36.0),
+            "draft grip should resize the draft text area itself"
+        );
+    }
+
+    #[test]
+    fn smart_input_footer_height_accounts_for_draft_user_height() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+        let default_height = AdeApp::smart_input_footer_height(terminal, 500.0, 18.0);
+
+        terminal.smart_input.draft_user_height =
+            Some(super::SMART_INPUT_DRAFT_DEFAULT_HEIGHT + 42.0);
+        let resized_height = AdeApp::smart_input_footer_height(terminal, 500.0, 18.0);
+
+        assert!(
+            resized_height >= default_height + 41.0,
+            "footer must reserve space for the resized draft input (default={default_height}, resized={resized_height})"
+        );
+    }
+
+    #[test]
     fn smart_input_footer_height_handles_question_safe_min_above_max_footer() {
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
         seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::QuestionAsked);
@@ -54577,6 +54664,17 @@ mod tests {
             !auto_button_found,
             "Smart Input must not render an Auto on/off toggle"
         );
+        let empty_toggle_found = output.shapes.iter().any(|shape| {
+            if let egui::epaint::Shape::Text(t) = &shape.shape {
+                matches!(t.galley.text(), "Hide" | "Show")
+            } else {
+                false
+            }
+        });
+        assert!(
+            !empty_toggle_found,
+            "empty queue must not render the Hide/Show toggle"
+        );
 
         // No task row backgrounds (alternate grey rects) should be painted when empty.
         let row_bg_found = output.shapes.iter().any(|shape| {
@@ -54684,6 +54782,27 @@ mod tests {
             "Hide button should be inset from the right edge (right={}, inset={})",
             hide_rect.right(),
             super::SMART_INPUT_HEADER_RIGHT_INSET
+        );
+        let queued_task_rect = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::epaint::Shape::Text(text_shape) = &shape.shape {
+                    (text_shape.galley.text() == "queued task").then(|| {
+                        egui::Rect::from_min_size(text_shape.pos, text_shape.galley.size())
+                    })
+                } else {
+                    None
+                }
+            })
+            .next()
+            .expect("queued task text should render");
+        let header_to_queue_gap = queued_task_rect.top() - hide_rect.bottom();
+        assert!(
+            header_to_queue_gap >= super::SMART_INPUT_QUEUE_TOP_GAP - 1.0,
+            "queued task row should leave top spacing below the header (gap={}, expected>={})",
+            header_to_queue_gap,
+            super::SMART_INPUT_QUEUE_TOP_GAP
         );
     }
 
