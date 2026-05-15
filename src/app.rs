@@ -232,6 +232,13 @@ const DIRECTORY_ENTRY_TOOLTIP_MAX_CHARS: usize = 500;
 const TERMINAL_HOVER_WIDTH: f32 = 320.0;
 const TERMINAL_HISTORY_POPUP_MAX_HEIGHT: f32 = 400.0;
 const TERMINAL_HISTORY_MESSAGE_MAX_HEIGHT: f32 = 120.0;
+const TERMINAL_HISTORY_POPUP_LIST_AUTO_SHRINK: [bool; 2] = [false, true];
+const TERMINAL_HISTORY_POPUP_MAX_VISIBLE_ENTRIES: usize = 5;
+const TERMINAL_HISTORY_POPUP_ROW_GAP: f32 = 4.0;
+const TERMINAL_HISTORY_POPUP_CHROME_HEIGHT_ESTIMATE: f32 = 56.0;
+const TERMINAL_HISTORY_POPUP_ESTIMATED_CHAR_WIDTH: f32 = 7.0;
+const TERMINAL_HISTORY_POPUP_ESTIMATED_LINE_HEIGHT: f32 = 16.0;
+const TERMINAL_HISTORY_POPUP_HEIGHT_SCALE: f32 = 1.5;
 const CHECKLIST_MESSAGE_MAX_HEIGHT: f32 = 120.0;
 const TERMINAL_HEADER_HEIGHT: f32 = 38.0;
 const TERMINAL_HEADER_GAP: f32 = 6.0;
@@ -1754,6 +1761,20 @@ fn browser_tab_close_rect(tab_rect: egui::Rect) -> egui::Rect {
     )
 }
 
+fn browser_tab_close_interaction(
+    ui: &mut Ui,
+    project_id: u64,
+    tab_id: u64,
+    close_rect: egui::Rect,
+) -> egui::Response {
+    ui.interact(
+        close_rect,
+        ui.make_persistent_id(("browser-tab-close", project_id, tab_id)),
+        Sense::click(),
+    )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 fn browser_tab_label_rect(tab_rect: egui::Rect) -> egui::Rect {
     let close_rect = browser_tab_close_rect(tab_rect);
     egui::Rect::from_min_max(
@@ -1767,6 +1788,39 @@ fn browser_tab_label_rect(tab_rect: egui::Rect) -> egui::Rect {
             tab_rect.bottom(),
         ),
     )
+}
+
+fn window_close_button_hover_rect(window_rect: egui::Rect, style: &egui::Style) -> egui::Rect {
+    let margin = style.spacing.window_margin;
+    let heading_height = style
+        .text_styles
+        .get(&egui::TextStyle::Heading)
+        .map(|font_id| font_id.size)
+        .unwrap_or(style.spacing.interact_size.y);
+    let title_bar_height = (heading_height + margin.top + margin.bottom).max(CONTROL_ROW_HEIGHT);
+    let hover_width =
+        (margin.right + style.spacing.icon_width + style.spacing.item_spacing.x * 2.0)
+            .max(CONTROL_ROW_HEIGHT);
+
+    egui::Rect::from_min_max(
+        egui::pos2(
+            (window_rect.right() - hover_width).max(window_rect.left()),
+            window_rect.top(),
+        ),
+        egui::pos2(
+            window_rect.right(),
+            (window_rect.top() + title_bar_height).min(window_rect.bottom()),
+        ),
+    )
+}
+
+fn set_window_close_cursor_on_hover(ctx: &egui::Context, window_rect: egui::Rect) {
+    let style = ctx.style();
+    let close_rect = window_close_button_hover_rect(window_rect, &style);
+    let hover_pos = ctx.input(|input| input.pointer.hover_pos());
+    if hover_pos.is_some_and(|hover_pos| close_rect.contains(hover_pos)) {
+        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
 }
 
 fn percent_encode_file_url_path(value: &str) -> String {
@@ -18620,8 +18674,12 @@ impl AdeApp {
                     let popup_width = TERMINAL_HOVER_WIDTH
                         .min(max_tooltip_right - panel_right - tooltip_gap)
                         .max(200.0);
+                    let deduplicated = deduplicated_recent_inputs(&recent_inputs);
+                    let history_list_max_height =
+                        terminal_history_popup_list_max_height(&deduplicated, popup_width);
                     let viewport_rect = ctx.screen_rect();
-                    let popup_height_estimate = TERMINAL_HISTORY_POPUP_MAX_HEIGHT + 80.0;
+                    let popup_height_estimate =
+                        history_list_max_height + TERMINAL_HISTORY_POPUP_CHROME_HEIGHT_ESTIMATE;
                     let popup_y = row_rect
                         .top()
                         .min(viewport_rect.max.y - popup_height_estimate)
@@ -18659,9 +18717,6 @@ impl AdeApp {
                                     });
                                     ui.add_space(8.0);
 
-                                    // Deduplicated recent inputs with checkboxes for checklist
-                                    let deduplicated = deduplicated_recent_inputs(&recent_inputs);
-
                                     // Get project's checklist for this terminal's project
                                     let project_checklist: Vec<String> = self
                                         .projects
@@ -18671,8 +18726,8 @@ impl AdeApp {
 
                                     egui::ScrollArea::vertical()
                                         .id_salt("terminal_history_popup_list")
-                                        .max_height(TERMINAL_HISTORY_POPUP_MAX_HEIGHT)
-                                        .auto_shrink([false, false])
+                                        .max_height(history_list_max_height)
+                                        .auto_shrink(TERMINAL_HISTORY_POPUP_LIST_AUTO_SHRINK)
                                         .show(ui, |ui| {
                                             for (idx, message) in deduplicated.iter().enumerate() {
                                                 let is_checked = project_checklist
@@ -18933,7 +18988,10 @@ impl AdeApp {
                     .rounding(4.0)
                     .min_size(egui::vec2(28.0, 28.0));
 
-                    let close_response = ui.add(close_btn).on_hover_text("Close Editor");
+                    let close_response = ui
+                        .add(close_btn)
+                        .on_hover_text("Close Editor")
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
                     if close_response.clicked() {
                         close_editor = true;
                     }
@@ -18959,6 +19017,11 @@ impl AdeApp {
                         } else {
                             "No unsaved changes"
                         });
+                        let save_response = if can_save {
+                            save_response.on_hover_cursor(egui::CursorIcon::PointingHand)
+                        } else {
+                            save_response
+                        };
                         if save_response.clicked() {
                             save_file = true;
                         }
@@ -19266,7 +19329,7 @@ impl AdeApp {
         };
 
         let mut open = self.checklist_floating_open;
-        egui::Window::new("Check-list")
+        let checklist_window_response = egui::Window::new("Check-list")
             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-18.0, -80.0))
             .order(egui::Order::Foreground)
             .open(&mut open)
@@ -19429,6 +19492,15 @@ impl AdeApp {
                         }
                     });
             });
+        if let Some(window_response) = checklist_window_response.as_ref() {
+            set_window_close_cursor_on_hover(ctx, window_response.response.rect);
+        }
+        if checklist_window_response.is_some() {
+            if let Some(window_rect) = ctx.memory(|mem| mem.area_rect(egui::Id::new("Check-list")))
+            {
+                set_window_close_cursor_on_hover(ctx, window_rect);
+            }
+        }
 
         self.checklist_floating_open = open;
         None
@@ -21831,11 +21903,8 @@ impl AdeApp {
                                         );
                                         let close_rect = browser_tab_close_rect(tab_rect);
                                         let label_rect = browser_tab_label_rect(tab_rect);
-                                        let close_response = ui.interact(
-                                            close_rect,
-                                            ui.make_persistent_id(("browser-tab-close", project_id, tab_id)),
-                                            Sense::click(),
-                                        );
+                                        let close_response =
+                                            browser_tab_close_interaction(ui, project_id, *tab_id, close_rect);
                                         // Show close tooltip above button to avoid WebView overlap
                                         show_tooltip_above(ui, &close_response, "Close tab");
 
@@ -23175,7 +23244,7 @@ impl AdeApp {
         let diagnostics = self.factory_droid_transport_diagnostics();
         let shows_diagnostics_warning_badge = diagnostics.shows_settings_warning_badge();
 
-        egui::Window::new(format!("{} Settings", icons::GEAR))
+        let settings_window_response = egui::Window::new(format!("{} Settings", icons::GEAR))
             .id(egui::Id::new(SETTINGS_WINDOW_ID))
             .open(&mut open)
             .order(egui::Order::Foreground)
@@ -23264,7 +23333,6 @@ impl AdeApp {
                     );
                 }
             });
-
         // Keep the modal window above its dark backdrop overlay so that
         // reopening the popup never leaves the overlay on top of the window.
         let backdrop_layer =
@@ -23272,6 +23340,16 @@ impl AdeApp {
         let window_layer =
             egui::LayerId::new(egui::Order::Foreground, egui::Id::new(SETTINGS_WINDOW_ID));
         ctx.set_sublayer(backdrop_layer, window_layer);
+        if let Some(window_response) = settings_window_response.as_ref() {
+            set_window_close_cursor_on_hover(ctx, window_response.response.rect);
+        }
+        if settings_window_response.is_some() {
+            if let Some(window_rect) =
+                ctx.memory(|mem| mem.area_rect(egui::Id::new(SETTINGS_WINDOW_ID)))
+            {
+                set_window_close_cursor_on_hover(ctx, window_rect);
+            }
+        }
 
         self.show_settings_popup = open;
 
@@ -23412,7 +23490,7 @@ impl AdeApp {
         let popup_width = (screen_width - 64.0).clamp(480.0, 860.0);
         let window_size = egui::vec2(popup_width, 440.0);
 
-        egui::Window::new(title)
+        let foreground_message_window_response = egui::Window::new(title)
             .id(egui::Id::new("foreground_message_popup"))
             .open(&mut open)
             .order(egui::Order::Foreground)
@@ -23503,7 +23581,6 @@ impl AdeApp {
                     }
                 });
             });
-
         // Keep the modal window above its dark backdrop overlay so that
         // reopening the popup never leaves the overlay on top of the window.
         let backdrop_layer = egui::LayerId::new(
@@ -23515,6 +23592,16 @@ impl AdeApp {
             egui::Id::new("foreground_message_popup"),
         );
         ctx.set_sublayer(backdrop_layer, window_layer);
+        if let Some(window_response) = foreground_message_window_response.as_ref() {
+            set_window_close_cursor_on_hover(ctx, window_response.response.rect);
+        }
+        if foreground_message_window_response.is_some() {
+            if let Some(window_rect) =
+                ctx.memory(|mem| mem.area_rect(egui::Id::new("foreground_message_popup")))
+            {
+                set_window_close_cursor_on_hover(ctx, window_rect);
+            }
+        }
 
         if !open {
             self.close_foreground_message_popup();
@@ -23615,162 +23702,178 @@ impl AdeApp {
         };
         let mut worktrees_to_add: Vec<std::path::PathBuf> = Vec::new();
 
-        egui::Window::new(format!("{} Create Worktree", icons::PLUS))
-            .id(egui::Id::new("create_worktree_popup"))
-            .open(&mut open)
-            .order(egui::Order::Foreground)
-            .resizable(false)
-            .collapsible(false)
-            .movable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .fixed_size(egui::vec2(popup_width, 400.0))
-            .show(ctx, |ui| {
-                ui.label(
-                    RichText::new(format!("Repository: {}", project.name))
-                        .small()
-                        .color(TEXT_MUTED),
-                );
-                ui.add_space(8.0);
-
-                // Existing worktrees section
-                if !self.create_worktree_existing_worktrees.is_empty() {
+        let create_worktree_window_response =
+            egui::Window::new(format!("{} Create Worktree", icons::PLUS))
+                .id(egui::Id::new("create_worktree_popup"))
+                .open(&mut open)
+                .order(egui::Order::Foreground)
+                .resizable(false)
+                .collapsible(false)
+                .movable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .fixed_size(egui::vec2(popup_width, 400.0))
+                .show(ctx, |ui| {
                     ui.label(
-                        RichText::new("Existing worktrees not in Mergen")
+                        RichText::new(format!("Repository: {}", project.name))
                             .small()
-                            .color(TEXT_MUTED)
-                            .strong(),
+                            .color(TEXT_MUTED),
                     );
-                    ui.add_space(4.0);
-                    let existing_list_height = Self::create_worktree_existing_list_height(
-                        self.create_worktree_existing_worktrees.len(),
-                    );
-                    egui::ScrollArea::vertical()
-                        .id_salt("existing-worktrees-scroll")
-                        .max_height(existing_list_height)
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            for wt in &self.create_worktree_existing_worktrees {
-                                let label = wt.display_label();
-                                let tooltip = format!("{}", wt.path.display());
-                                let row_response = ui.horizontal(|ui| {
-                                    ui.label(RichText::new(&label).color(TEXT_PRIMARY).strong());
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        if ui.button("Add to Mergen").clicked() {
-                                            worktrees_to_add.push(wt.path.clone());
-                                        }
+                    ui.add_space(8.0);
+
+                    // Existing worktrees section
+                    if !self.create_worktree_existing_worktrees.is_empty() {
+                        ui.label(
+                            RichText::new("Existing worktrees not in Mergen")
+                                .small()
+                                .color(TEXT_MUTED)
+                                .strong(),
+                        );
+                        ui.add_space(4.0);
+                        let existing_list_height = Self::create_worktree_existing_list_height(
+                            self.create_worktree_existing_worktrees.len(),
+                        );
+                        egui::ScrollArea::vertical()
+                            .id_salt("existing-worktrees-scroll")
+                            .max_height(existing_list_height)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for wt in &self.create_worktree_existing_worktrees {
+                                    let label = wt.display_label();
+                                    let tooltip = format!("{}", wt.path.display());
+                                    let row_response = ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(&label).color(TEXT_PRIMARY).strong(),
+                                        );
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                if ui.button("Add to Mergen").clicked() {
+                                                    worktrees_to_add.push(wt.path.clone());
+                                                }
+                                            },
+                                        );
                                     });
-                                });
-                                let font_id = egui::TextStyle::Body.resolve(ui.style());
-                                let _ = with_truncation_tooltip(
-                                    ui,
-                                    row_response.response,
-                                    &tooltip,
-                                    &font_id,
-                                    TEXT_PRIMARY,
-                                    ui.available_width(),
-                                );
+                                    let font_id = egui::TextStyle::Body.resolve(ui.style());
+                                    let _ = with_truncation_tooltip(
+                                        ui,
+                                        row_response.response,
+                                        &tooltip,
+                                        &font_id,
+                                        TEXT_PRIMARY,
+                                        ui.available_width(),
+                                    );
+                                }
+                            });
+                        ui.separator();
+                        ui.label(
+                            RichText::new("Or create new worktree")
+                                .small()
+                                .color(TEXT_MUTED)
+                                .strong(),
+                        );
+                        ui.add_space(4.0);
+                    }
+
+                    ui.label(RichText::new("Branch name").small().color(TEXT_MUTED));
+                    ui.add_sized(
+                        [ui.available_width(), CONTROL_ROW_HEIGHT],
+                        egui::TextEdit::singleline(&mut self.create_worktree_branch_draft)
+                            .id(Self::create_worktree_branch_input_id())
+                            .hint_text("feature/my-task"),
+                    );
+                    ui.add_space(6.0);
+
+                    ui.label(
+                        RichText::new("Base branch (optional)")
+                            .small()
+                            .color(TEXT_MUTED),
+                    );
+                    ui.add_sized(
+                        [ui.available_width(), CONTROL_ROW_HEIGHT],
+                        egui::TextEdit::singleline(&mut self.create_worktree_base_branch)
+                            .id(Self::create_worktree_base_branch_input_id())
+                            .hint_text("main or origin/main"),
+                    );
+                    ui.add_space(6.0);
+
+                    ui.label(
+                        RichText::new("Worktree path (auto)")
+                            .small()
+                            .color(TEXT_MUTED),
+                    );
+                    ui.add_sized(
+                        [ui.available_width(), CONTROL_ROW_HEIGHT],
+                        egui::TextEdit::singleline(&mut self.create_worktree_path_draft)
+                            .id(Self::create_worktree_path_input_id())
+                            .hint_text("auto-generated from branch")
+                            .interactive(false),
+                    );
+                    ui.add_space(8.0);
+
+                    if let Some(ref error) = self.create_worktree_error {
+                        ui.colored_label(Color32::LIGHT_RED, error);
+                        ui.add_space(4.0);
+                    }
+
+                    let branch_owned = self.create_worktree_branch_draft.trim().to_owned();
+                    let path_owned = self.create_worktree_path_draft.trim().to_owned();
+                    let base_owned = self.create_worktree_base_branch.trim().to_owned();
+                    let can_create = !branch_owned.is_empty() && !path_owned.is_empty();
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_enabled_ui(can_create, |ui| {
+                            if ui.button("Create Worktree").clicked() {
+                                let base_opt = if base_owned.is_empty() {
+                                    None
+                                } else {
+                                    Some(base_owned.as_str())
+                                };
+                                match Self::run_git_worktree_add(
+                                    &project.path,
+                                    &path_owned,
+                                    &branch_owned,
+                                    base_opt,
+                                ) {
+                                    Ok(wt_path) => {
+                                        self.add_project_with_worktree(
+                                            wt_path,
+                                            Some(repo_root.clone()),
+                                            true,
+                                        );
+                                        self.show_create_worktree_popup = false;
+                                        self.create_worktree_error = None;
+                                        self.status_line =
+                                            "Worktree created and added as project".to_owned();
+                                    }
+                                    Err(err) => {
+                                        self.create_worktree_error = Some(err);
+                                    }
+                                }
                             }
                         });
-                    ui.separator();
-                    ui.label(
-                        RichText::new("Or create new worktree")
-                            .small()
-                            .color(TEXT_MUTED)
-                            .strong(),
-                    );
-                    ui.add_space(4.0);
-                }
 
-                ui.label(RichText::new("Branch name").small().color(TEXT_MUTED));
-                ui.add_sized(
-                    [ui.available_width(), CONTROL_ROW_HEIGHT],
-                    egui::TextEdit::singleline(&mut self.create_worktree_branch_draft)
-                        .id(Self::create_worktree_branch_input_id())
-                        .hint_text("feature/my-task"),
-                );
-                ui.add_space(6.0);
-
-                ui.label(
-                    RichText::new("Base branch (optional)")
-                        .small()
-                        .color(TEXT_MUTED),
-                );
-                ui.add_sized(
-                    [ui.available_width(), CONTROL_ROW_HEIGHT],
-                    egui::TextEdit::singleline(&mut self.create_worktree_base_branch)
-                        .id(Self::create_worktree_base_branch_input_id())
-                        .hint_text("main or origin/main"),
-                );
-                ui.add_space(6.0);
-
-                ui.label(
-                    RichText::new("Worktree path (auto)")
-                        .small()
-                        .color(TEXT_MUTED),
-                );
-                ui.add_sized(
-                    [ui.available_width(), CONTROL_ROW_HEIGHT],
-                    egui::TextEdit::singleline(&mut self.create_worktree_path_draft)
-                        .id(Self::create_worktree_path_input_id())
-                        .hint_text("auto-generated from branch")
-                        .interactive(false),
-                );
-                ui.add_space(8.0);
-
-                if let Some(ref error) = self.create_worktree_error {
-                    ui.colored_label(Color32::LIGHT_RED, error);
-                    ui.add_space(4.0);
-                }
-
-                let branch_owned = self.create_worktree_branch_draft.trim().to_owned();
-                let path_owned = self.create_worktree_path_draft.trim().to_owned();
-                let base_owned = self.create_worktree_base_branch.trim().to_owned();
-                let can_create = !branch_owned.is_empty() && !path_owned.is_empty();
-
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add_enabled_ui(can_create, |ui| {
-                        if ui.button("Create Worktree").clicked() {
-                            let base_opt = if base_owned.is_empty() {
-                                None
-                            } else {
-                                Some(base_owned.as_str())
-                            };
-                            match Self::run_git_worktree_add(
-                                &project.path,
-                                &path_owned,
-                                &branch_owned,
-                                base_opt,
-                            ) {
-                                Ok(wt_path) => {
-                                    self.add_project_with_worktree(
-                                        wt_path,
-                                        Some(repo_root.clone()),
-                                        true,
-                                    );
-                                    self.show_create_worktree_popup = false;
-                                    self.create_worktree_error = None;
-                                    self.status_line =
-                                        "Worktree created and added as project".to_owned();
-                                }
-                                Err(err) => {
-                                    self.create_worktree_error = Some(err);
-                                }
-                            }
+                        if ui.button("Cancel").clicked() {
+                            self.show_create_worktree_popup = false;
+                            self.create_worktree_error = None;
                         }
                     });
 
-                    if ui.button("Cancel").clicked() {
-                        self.show_create_worktree_popup = false;
-                        self.create_worktree_error = None;
+                    if !Self::create_worktree_input_has_focus(ui.ctx()) {
+                        ui.ctx().memory_mut(|mem| {
+                            mem.request_focus(Self::create_worktree_branch_input_id())
+                        });
                     }
                 });
-
-                if !Self::create_worktree_input_has_focus(ui.ctx()) {
-                    ui.ctx().memory_mut(|mem| {
-                        mem.request_focus(Self::create_worktree_branch_input_id())
-                    });
-                }
-            });
+        if let Some(window_response) = create_worktree_window_response.as_ref() {
+            set_window_close_cursor_on_hover(ctx, window_response.response.rect);
+        }
+        if create_worktree_window_response.is_some() {
+            if let Some(window_rect) =
+                ctx.memory(|mem| mem.area_rect(egui::Id::new("create_worktree_popup")))
+            {
+                set_window_close_cursor_on_hover(ctx, window_rect);
+            }
+        }
 
         // Process one-click additions of existing worktrees
         for wt_path in worktrees_to_add {
@@ -27205,6 +27308,41 @@ fn deduplicated_recent_inputs(recent_inputs: &VecDeque<String>) -> Vec<&String> 
         }
     }
     result
+}
+
+fn terminal_history_message_estimated_height(message: &str, popup_width: f32) -> f32 {
+    let message_width = (popup_width - CONTROL_ROW_HEIGHT - 18.0).max(80.0);
+    let chars_per_line =
+        (message_width / TERMINAL_HISTORY_POPUP_ESTIMATED_CHAR_WIDTH).max(1.0) as usize;
+    let visual_lines = message
+        .lines()
+        .map(|line| {
+            let chars = line.chars().count().max(1);
+            chars.div_ceil(chars_per_line)
+        })
+        .sum::<usize>()
+        .max(1);
+
+    (visual_lines as f32 * TERMINAL_HISTORY_POPUP_ESTIMATED_LINE_HEIGHT)
+        .max(CONTROL_ROW_HEIGHT)
+        .min(TERMINAL_HISTORY_MESSAGE_MAX_HEIGHT)
+}
+
+fn terminal_history_popup_list_max_height(messages: &[&String], popup_width: f32) -> f32 {
+    let visible_messages = messages
+        .iter()
+        .take(TERMINAL_HISTORY_POPUP_MAX_VISIBLE_ENTRIES);
+    let mut visible_count = 0usize;
+    let mut height = 0.0f32;
+    for message in visible_messages {
+        if visible_count > 0 {
+            height += TERMINAL_HISTORY_POPUP_ROW_GAP;
+        }
+        height += terminal_history_message_estimated_height(message.as_str(), popup_width);
+        visible_count += 1;
+    }
+
+    (height * TERMINAL_HISTORY_POPUP_HEIGHT_SCALE).min(TERMINAL_HISTORY_POPUP_MAX_HEIGHT)
 }
 
 #[allow(dead_code)]
@@ -32681,6 +32819,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn window_close_button_hover_rect_stays_in_titlebar_top_right() {
+        let style = egui::Style::default();
+        let window_rect =
+            egui::Rect::from_min_size(egui::pos2(120.0, 80.0), egui::vec2(420.0, 260.0));
+
+        let close_rect = super::window_close_button_hover_rect(window_rect, &style);
+
+        assert!(window_rect.contains(close_rect.min));
+        assert!(window_rect.contains(close_rect.max));
+        assert_eq!(close_rect.right(), window_rect.right());
+        assert_eq!(close_rect.top(), window_rect.top());
+        assert!(close_rect.width() >= super::CONTROL_ROW_HEIGHT);
+        assert!(close_rect.height() >= super::CONTROL_ROW_HEIGHT);
+        assert!(close_rect.left() > window_rect.center().x);
+        assert!(close_rect.bottom() < window_rect.center().y);
+    }
+
     fn draw_settings_popup_in_test_ui(
         ctx: &Context,
         raw_input: RawInput,
@@ -32887,6 +33043,34 @@ mod tests {
             Some(window_layer),
             "foreground message window should be above backdrop after reopen; got {:?}",
             layer_at_center
+        );
+    }
+
+    #[test]
+    fn window_close_button_hover_uses_pointing_hand() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+        let screen_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let window_rect =
+            egui::Rect::from_min_size(egui::pos2(180.0, 120.0), egui::vec2(440.0, 300.0));
+        let close_center =
+            super::window_close_button_hover_rect(window_rect, &ctx.style()).center();
+
+        let output = ctx.run(
+            RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![Event::PointerMoved(close_center)],
+                ..RawInput::default()
+            },
+            |ctx| {
+                super::set_window_close_cursor_on_hover(ctx, window_rect);
+            },
+        );
+
+        assert_eq!(
+            output.platform_output.cursor_icon,
+            egui::CursorIcon::PointingHand,
+            "hovering a window close x should show a clickable cursor"
         );
     }
 
@@ -34925,6 +35109,67 @@ mod tests {
         let _ = draw_terminal_rows_in_test_ui(&ctx, RawInput::default(), &mut app);
         // Should not panic; popup stays open
         assert_eq!(app.terminal_history_popup_open, Some(2));
+    }
+
+    #[test]
+    fn terminal_history_popup_list_shrinks_vertically() {
+        assert_eq!(
+            super::TERMINAL_HISTORY_POPUP_LIST_AUTO_SHRINK,
+            [false, true],
+            "history popup list should keep fixed width but shrink vertically for short histories"
+        );
+    }
+
+    #[test]
+    fn terminal_history_popup_list_height_caps_at_five_short_entries() {
+        let messages: Vec<String> = (0..8).map(|index| format!("cmd {index}")).collect();
+        let refs: Vec<&String> = messages.iter().collect();
+
+        let height_one = super::terminal_history_popup_list_max_height(&refs[..1], 320.0);
+        let height_three = super::terminal_history_popup_list_max_height(&refs[..3], 320.0);
+        let height_five = super::terminal_history_popup_list_max_height(&refs[..5], 320.0);
+        let height_eight = super::terminal_history_popup_list_max_height(&refs, 320.0);
+        let unscaled_five =
+            (super::CONTROL_ROW_HEIGHT * 5.0) + (super::TERMINAL_HISTORY_POPUP_ROW_GAP * 4.0);
+
+        assert!(
+            height_one < height_five,
+            "single-entry history popup should stay shorter than the five-entry cap"
+        );
+        assert!(
+            height_three < height_five,
+            "short history popup should grow until five entries are visible"
+        );
+        assert_eq!(
+            height_five,
+            unscaled_five * super::TERMINAL_HISTORY_POPUP_HEIGHT_SCALE,
+            "five short entries should use the scaled history popup height"
+        );
+        assert_eq!(
+            height_eight, height_five,
+            "history popup must stop growing after five visible entries"
+        );
+    }
+
+    #[test]
+    fn terminal_history_popup_list_height_caps_long_entries_to_max_height() {
+        let long = "long terminal history entry ".repeat(80);
+        let messages: Vec<String> = (0..5).map(|index| format!("{long}{index}")).collect();
+        let refs: Vec<&String> = messages.iter().collect();
+        let short_messages: Vec<String> = (0..5).map(|index| format!("cmd {index}")).collect();
+        let short_refs: Vec<&String> = short_messages.iter().collect();
+
+        let long_height = super::terminal_history_popup_list_max_height(&refs, 320.0);
+        let short_height = super::terminal_history_popup_list_max_height(&short_refs, 320.0);
+
+        assert!(
+            long_height > short_height,
+            "long wrapped entries should reserve more height than short one-line entries"
+        );
+        assert!(
+            long_height <= super::TERMINAL_HISTORY_POPUP_MAX_HEIGHT,
+            "long history popup list must still respect the global maximum height"
+        );
     }
 
     #[test]
@@ -51873,6 +52118,57 @@ mod tests {
         assert_eq!(close_rect.top(), expected_top);
         assert!(label_rect.right() <= close_rect.left() - super::BROWSER_TAB_LABEL_RIGHT_GAP);
         assert!(!label_rect.intersects(close_rect));
+    }
+
+    #[test]
+    fn browser_tab_close_hover_uses_pointing_hand_cursor() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+        let tab_rect = egui::Rect::from_min_size(
+            egui::pos2(20.0, 40.0),
+            egui::vec2(super::BROWSER_TAB_WIDTH, super::BROWSER_TAB_HEIGHT),
+        );
+        let close_rect = super::browser_tab_close_rect(tab_rect);
+
+        let mut observed_close_rect = None;
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none())
+                .show(ctx, |ui| {
+                    ui.allocate_space(egui::vec2(260.0, 120.0));
+                    let response = super::browser_tab_close_interaction(ui, 1, 2, close_rect);
+                    observed_close_rect = Some(response.rect);
+                });
+        });
+        let hover_pos = observed_close_rect
+            .expect("browser tab close response rect")
+            .center();
+
+        let output = ctx.run(
+            RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(260.0, 120.0),
+                )),
+                events: vec![Event::PointerMoved(hover_pos)],
+                ..RawInput::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| {
+                        ui.allocate_space(egui::vec2(260.0, 120.0));
+                        let response = super::browser_tab_close_interaction(ui, 1, 2, close_rect);
+                        assert!(response.hovered());
+                    });
+            },
+        );
+
+        assert_eq!(
+            output.platform_output.cursor_icon,
+            egui::CursorIcon::PointingHand,
+            "hovering the browser tab close x should show a clickable cursor"
+        );
     }
 
     #[test]

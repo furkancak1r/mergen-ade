@@ -1634,3 +1634,81 @@
   - Added tests for footer growth preserving draft height, footer shrink clamping draft height only as needed, unset draft height staying unset, and remove-button hover cursor.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input -- --nocapture`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User request 2026-05-15
+
+---
+
+#### Terminal Manager input history popup reserved empty vertical space {#terminal-history-popup-empty-space}
+- Date: 2026-05-15
+- Context: User reported that the Terminal Manager "Show input history" popup showed large empty space below a short list of recent inputs.
+- Error signature: The history popup list `ScrollArea` used `auto_shrink([false, false])`, so it reserved its maximum 400px height even when only a few entries were rendered.
+- Symptoms/Impact:
+  1. Short input history lists produced an oversized popup with unused blank area.
+  2. The popup visually obscured more terminal content than needed.
+- Root cause:
+  - Vertical auto-shrink was disabled for the popup list while the list also had a large max height for long histories.
+- Resolution:
+  - Enabled vertical auto-shrink for the history popup list so short histories size to content and long histories still cap at the configured maximum with scrolling.
+- Prevent recurrence:
+  - Added a render regression test that asserts a short history popup stays compact.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, terminal history popup test, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User screenshot/request 2026-05-15
+
+---
+
+#### Terminal Manager input history popup became too short {#terminal-history-popup-five-entry-cap}
+- Date: 2026-05-15
+- Context: After removing the large blank space, user reported the Terminal Manager "Show input history" popup became too short and should show five entries before scrolling.
+- Error signature: The popup list could shrink all the way to the current content height without a five-entry visible cap target.
+- Symptoms/Impact:
+  1. The popup felt undersized for normal history review.
+  2. Users could not see up to five recent inputs at once before scrolling.
+- Root cause:
+  - The popup had a binary max-height behavior: either old fixed 400px or content-only shrink. It did not compute a dynamic maximum from the first five history rows.
+- Resolution:
+  - Added a five-entry visible cap for deduplicated terminal history entries.
+  - The list now grows up to five entries, then stops growing and scrolls for additional history.
+  - Long wrapped entries still respect the existing global popup max height.
+- Prevent recurrence:
+  - Added helper tests for short history growth up to five entries, cap behavior beyond five, and long-entry max-height clamping.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, terminal history popup tests, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
+
+---
+
+#### Terminal Manager input history five-entry popup height was still too small {#terminal-history-popup-five-entry-height-scale}
+- Date: 2026-05-15
+- Context: User reported that after adding the five-entry cap, only about three history entries were visible and asked for the popup height to be increased by 1.5x while remaining dynamic for one-entry histories.
+- Error signature: The height estimator used raw row estimates as the popup max-height, but real checkbox/message row rendering needed more vertical breathing room.
+- Symptoms/Impact:
+  1. The popup scrolled too early and showed fewer than the intended five entries.
+  2. A fixed larger height would have made one-entry histories unnecessarily tall.
+- Root cause:
+  - The dynamic cap was correct in count, but the estimated row height was too tight for the rendered layout.
+- Resolution:
+  - Added a 1.5x scale factor to the computed dynamic history list height.
+  - Kept the five-entry cap and global max-height clamp unchanged.
+  - One-entry and short histories still shrink relative to the five-entry cap.
+- Prevent recurrence:
+  - Extended popup height tests to assert one-entry histories remain shorter, five short entries use the scaled height, and histories beyond five do not grow further.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, terminal history popup tests, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
+
+---
+
+#### Window close icons did not show clickable cursor {#window-close-icons-clickable-cursor}
+- Date: 2026-05-15
+- Context: User reported that the "Add New Task" close X did not change the mouse cursor, making it unclear that it was clickable.
+- Error signature: egui built-in `Window::open` close buttons and a few custom X icons did not apply `CursorIcon::PointingHand` on hover.
+- Symptoms/Impact:
+  1. Modal close icons looked clickable visually but kept the default cursor.
+  2. Some custom close icons had inconsistent cursor feedback compared with `styled_icon_button` controls.
+- Root cause:
+  - Built-in window title-bar close buttons are drawn by egui, outside Mergen's icon button helper.
+  - Browser tab and editor close icons used raw/custom responses without the shared pointing-hand cursor behavior.
+- Resolution:
+  - Added a shared title-bar close hover rect helper for egui windows and applied pointing-hand cursor feedback to Settings, Create Worktree, Add/Edit Task, and Check-list windows.
+  - Added pointing-hand cursor feedback to browser tab close and file editor header close/save icon controls.
+- Prevent recurrence:
+  - Added regression tests for window close hover geometry, shared window close cursor feedback, and browser tab close cursor feedback.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+- References: User request 2026-05-15
