@@ -285,6 +285,10 @@ const SMART_INPUT_QUEUE_TOP_GAP: f32 = 8.0;
 const SMART_INPUT_DRAFT_TOP_GAP: f32 = 8.0;
 const SMART_INPUT_DRAFT_DEFAULT_HEIGHT: f32 = 80.0;
 const SMART_INPUT_DRAFT_MIN_HEIGHT: f32 = 48.0;
+const SMART_INPUT_DRAFT_INNER_MARGIN_X: f32 = 6.0;
+const SMART_INPUT_DRAFT_INNER_MARGIN_Y: f32 = 5.0;
+const SMART_INPUT_DRAFT_ATTACHMENT_STRIP_HEIGHT: f32 = 20.0;
+const SMART_INPUT_ATTACHMENT_REMOVE_BUTTON_SIZE: f32 = 12.0;
 const SMART_INPUT_FOOTER_GAP: f32 = 6.0;
 const SMART_INPUT_HEADER_RIGHT_INSET: f32 = 12.0;
 const SMART_INPUT_RESIZE_HANDLE_HEIGHT: f32 = 5.0;
@@ -1359,12 +1363,34 @@ enum SmartInputSubmitRequest {
     Edit { terminal_id: u64, task_id: u64 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeImagePasteTarget {
+    Terminal(u64),
+    SmartInput(SmartInputSubmitRequest),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmartInputFocusTarget {
+    Draft,
+    Edit(u64),
+    QuestionCustom,
+}
+
 #[derive(Debug, Default)]
 struct SmartInputPaneAction {
     send_task_now: Option<(u64, Vec<SmartInputAttachment>)>,
     status_message: Option<String>,
     submit_question: bool,
     reject_question: bool,
+    claim_smart_input_keyboard: bool,
+    focus_target: Option<SmartInputFocusTarget>,
+}
+
+impl SmartInputPaneAction {
+    fn request_keyboard_focus(&mut self, target: SmartInputFocusTarget) {
+        self.claim_smart_input_keyboard = true;
+        self.focus_target = Some(target);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1844,6 +1870,7 @@ pub struct AdeApp {
     pending_second_enter: Vec<(u64, Instant)>,
     terminal_held_key_repeat: Option<TerminalHeldKeyRepeat>,
     allow_attention_terminal_input_routing_once: bool,
+    native_primary_paste_down: bool,
     pending_terminal_pastes: Vec<PendingTerminalPaste>,
     terminal_events_tx: Sender<TerminalUiEvent>,
     terminal_events_rx: Receiver<TerminalUiEvent>,
@@ -2270,6 +2297,38 @@ fn extract_text_from_char_range(
         .collect();
 
     (!extracted.is_empty()).then_some(extracted)
+}
+
+fn replace_text_range_or_append(
+    text: &mut String,
+    range: Option<egui::text::CCursorRange>,
+    replacement: &str,
+) {
+    let Some(range) = range else {
+        text.push_str(replacement);
+        return;
+    };
+    let [start, end] = range.sorted();
+    if start.index >= end.index {
+        text.push_str(replacement);
+        return;
+    }
+
+    let mut new_text = String::new();
+    let mut chars = text.chars();
+    for _ in 0..start.index {
+        if let Some(ch) = chars.next() {
+            new_text.push(ch);
+        }
+    }
+    for _ in start.index..end.index {
+        chars.next();
+    }
+    new_text.push_str(replacement);
+    for ch in chars {
+        new_text.push(ch);
+    }
+    *text = new_text;
 }
 
 /// Determines the effective context menu selection range for the file editor.
@@ -4420,6 +4479,7 @@ impl AdeApp {
             pending_second_enter: Vec::new(),
             terminal_held_key_repeat: None,
             allow_attention_terminal_input_routing_once: false,
+            native_primary_paste_down: false,
             pending_terminal_pastes: Vec::new(),
             terminal_events_tx,
             terminal_events_rx,
@@ -10112,6 +10172,15 @@ impl AdeApp {
         None
     }
 
+    fn active_smart_input_draft_request(&self) -> Option<SmartInputSubmitRequest> {
+        let terminal_id = self
+            .active_terminal
+            .or_else(|| self.single_terminal_id_for_main())?;
+        let terminal = self.terminals.get(&terminal_id)?;
+        Self::terminal_smart_input_visible(terminal)
+            .then_some(SmartInputSubmitRequest::Draft { terminal_id })
+    }
+
     fn smart_input_has_focus(&self, ctx: &egui::Context) -> bool {
         if self.focused_smart_input_submit_request(ctx).is_some() {
             return true;
@@ -10182,17 +10251,29 @@ impl AdeApp {
             return;
         }
 
+        // If user explicitly clicked terminal output, don't auto-focus Smart Input.
+        if let Some(override_id) = self.terminal_output_focus_override {
+            if self.active_terminal == Some(override_id) {
+                ctx.memory_mut(|mem| {
+                    mem.surrender_focus(Self::smart_input_draft_input_id(override_id));
+                    if let Some(terminal) = self.terminals.get(&override_id) {
+                        if let Some(task_id) = terminal.smart_input.editing_task_id {
+                            mem.surrender_focus(Self::smart_input_task_edit_input_id(
+                                override_id,
+                                task_id,
+                            ));
+                        }
+                    }
+                    mem.surrender_focus(Self::smart_input_question_custom_input_id(override_id));
+                });
+                return;
+            }
+        }
         // If Smart Input is now focused, the user explicitly chose it;
         // clear any terminal output override.
         if self.smart_input_has_focus(ctx) {
             self.terminal_output_focus_override = None;
             return;
-        }
-        // If user explicitly clicked terminal output, don't auto-focus Smart Input.
-        if let Some(override_id) = self.terminal_output_focus_override {
-            if self.active_terminal == Some(override_id) {
-                return;
-            }
         }
         // Another non-Smart UI text input is focused — don't steal.
         if self.text_input_has_focus(ctx) {
@@ -11490,6 +11571,11 @@ impl AdeApp {
             return;
         };
 
+        if events.is_empty() {
+            return;
+        }
+
+        let events = self.handle_terminal_clipboard_paste_events(ctx, active_terminal_id, events);
         if events.is_empty() {
             return;
         }
@@ -13027,42 +13113,268 @@ impl AdeApp {
             .and_then(|snapshot| terminal_selection_text(snapshot, terminal.selection.as_ref()))
     }
 
-    /// When Smart Input is focused and the user presses the primary paste shortcut
-    /// (Ctrl+V / Cmd+V), if the clipboard contains an image, synthesize an
-    /// `Event::Paste(image_path)` so egui's TextEdit inserts the path as text
-    /// instead of silently ignoring image-only clipboard data.
-    fn synthesize_smart_input_image_paste_events(&self, events: Vec<Event>) -> Vec<Event> {
-        Self::synthesize_smart_input_image_paste_events_with(events, || self.clipboard_image_path())
-    }
-
-    /// Testable variant that accepts a clipboard image path provider.
-    fn synthesize_smart_input_image_paste_events_with(
-        events: Vec<Event>,
-        mut get_image_path: impl FnMut() -> Option<String>,
-    ) -> Vec<Event> {
-        let mut image_path: Option<String> = None;
-        let mut out = Vec::with_capacity(events.len());
-        for event in events {
-            if let Event::Key {
+    fn event_is_primary_paste_shortcut(event: &Event) -> bool {
+        matches!(
+            event,
+            Event::Key {
                 key: Key::V,
                 pressed: true,
                 modifiers,
                 ..
-            } = &event
-            {
-                if primary_shortcut_modifier(*modifiers) && !modifiers.alt && !modifiers.shift {
-                    if image_path.is_none() {
-                        image_path = get_image_path();
-                    }
-                    if let Some(ref path) = image_path {
-                        out.push(Event::Paste(path.clone()));
-                        continue;
-                    }
+            } if primary_shortcut_modifier(*modifiers) && !modifiers.alt && !modifiers.shift
+        )
+    }
+
+    fn event_is_paste_payload(event: &Event) -> bool {
+        matches!(event, Event::Paste(_))
+    }
+
+    fn event_is_image_paste_trigger(event: &Event) -> bool {
+        Self::event_is_primary_paste_shortcut(event) || Self::event_is_paste_payload(event)
+    }
+
+    fn native_primary_paste_rising_edge(
+        native_down: bool,
+        egui_paste_event_present: bool,
+        previous_down: &mut bool,
+    ) -> bool {
+        if !native_down {
+            *previous_down = false;
+            return false;
+        }
+
+        let rising = !*previous_down && !egui_paste_event_present;
+        *previous_down = true;
+        rising
+    }
+
+    #[cfg(target_os = "windows")]
+    fn native_primary_paste_shortcut_down() -> bool {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetAsyncKeyState, VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_V,
+        };
+
+        fn key_down(key: VIRTUAL_KEY) -> bool {
+            (unsafe { GetAsyncKeyState(key.0 as i32) } as u16 & 0x8000) != 0
+        }
+
+        key_down(VK_V) && (key_down(VK_CONTROL) || key_down(VK_LCONTROL) || key_down(VK_RCONTROL))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn native_primary_paste_shortcut_down() -> bool {
+        false
+    }
+
+    fn consume_primary_paste_shortcuts(events: Vec<Event>) -> (bool, Vec<Event>) {
+        let mut consumed = false;
+        let mut remaining = Vec::with_capacity(events.len());
+        for event in events {
+            if Self::event_is_primary_paste_shortcut(&event) {
+                consumed = true;
+            } else {
+                remaining.push(event);
+            }
+        }
+        (consumed, remaining)
+    }
+
+    fn consume_image_paste_triggers(events: Vec<Event>) -> (bool, Vec<Event>) {
+        let mut consumed = false;
+        let mut remaining = Vec::with_capacity(events.len());
+        for event in events {
+            if Self::event_is_image_paste_trigger(&event) {
+                consumed = true;
+            } else {
+                remaining.push(event);
+            }
+        }
+        (consumed, remaining)
+    }
+
+    fn native_image_paste_target(
+        &self,
+        ctx: &egui::Context,
+        terminal_output_paste_target: Option<u64>,
+        smart_input_request: Option<SmartInputSubmitRequest>,
+        capture_keyboard: bool,
+    ) -> Option<NativeImagePasteTarget> {
+        if self.show_settings_popup
+            || self.show_exit_confirm_popup
+            || self.foreground_message_popup_open.is_some()
+            || self.show_create_worktree_popup
+            || self.active_opencode_question_terminal_id().is_some()
+            || self.text_input_has_focus(ctx)
+            || ctx.memory(|mem| mem.any_popup_open())
+            || ctx.is_context_menu_open()
+        {
+            return None;
+        }
+
+        if let Some(terminal_id) = terminal_output_paste_target {
+            return Some(NativeImagePasteTarget::Terminal(terminal_id));
+        }
+
+        if capture_keyboard {
+            if let Some(terminal_id) = self.active_terminal_accepts_input() {
+                return Some(NativeImagePasteTarget::Terminal(terminal_id));
+            }
+        }
+
+        smart_input_request.map(NativeImagePasteTarget::SmartInput)
+    }
+
+    fn handle_native_image_paste_fallback_with(
+        &mut self,
+        ctx: &egui::Context,
+        target: Option<NativeImagePasteTarget>,
+        mut get_image_path: impl FnMut() -> Option<String>,
+    ) -> bool {
+        let Some(target) = target else {
+            return false;
+        };
+        let Some(image_path) = get_image_path() else {
+            return false;
+        };
+
+        let handled = match target {
+            NativeImagePasteTarget::Terminal(terminal_id) => {
+                if self.queue_pasted_text_to_terminal(terminal_id, &image_path) {
+                    self.status_line = format!("Pasted image path: {}", image_path);
+                    true
+                } else {
+                    false
                 }
             }
-            out.push(event);
+            NativeImagePasteTarget::SmartInput(request) => {
+                self.add_smart_input_image_attachment(request, image_path)
+            }
+        };
+
+        if handled {
+            self.clear_terminal_held_key_repeat();
+            ctx.request_repaint();
         }
-        out
+        handled
+    }
+
+    fn handle_native_image_paste_fallback(
+        &mut self,
+        ctx: &egui::Context,
+        target: Option<NativeImagePasteTarget>,
+    ) -> bool {
+        Self::handle_native_image_paste_fallback_with(self, ctx, target, || {
+            Self::clipboard_image_path()
+        })
+    }
+
+    fn handle_terminal_clipboard_paste_events(
+        &mut self,
+        ctx: &egui::Context,
+        terminal_id: u64,
+        events: Vec<Event>,
+    ) -> Vec<Event> {
+        let has_primary_shortcut = events.iter().any(Self::event_is_primary_paste_shortcut);
+        let has_paste_payload = events.iter().any(Self::event_is_paste_payload);
+        if !has_primary_shortcut && !has_paste_payload {
+            return events;
+        }
+
+        if let Some(image_path) = Self::clipboard_image_path() {
+            if self.queue_pasted_text_to_terminal(terminal_id, &image_path) {
+                self.status_line = format!("Pasted image path: {}", image_path);
+            }
+            self.clear_terminal_held_key_repeat();
+            ctx.request_repaint();
+            return Self::consume_image_paste_triggers(events).1;
+        }
+
+        if has_primary_shortcut {
+            if !has_paste_payload {
+                self.paste_clipboard_to_terminal(terminal_id);
+                ctx.request_repaint();
+            }
+            self.clear_terminal_held_key_repeat();
+            return Self::consume_primary_paste_shortcuts(events).1;
+        }
+
+        events
+    }
+
+    fn add_smart_input_image_attachment(
+        &mut self,
+        request: SmartInputSubmitRequest,
+        path: String,
+    ) -> bool {
+        let terminal_id = match request {
+            SmartInputSubmitRequest::Draft { terminal_id }
+            | SmartInputSubmitRequest::Edit { terminal_id, .. } => terminal_id,
+        };
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+        if !Self::terminal_smart_input_visible(terminal) {
+            return false;
+        }
+
+        let state = &mut terminal.smart_input;
+        match request {
+            SmartInputSubmitRequest::Draft { .. } => {
+                push_smart_input_attachment(
+                    &mut state.next_attachment_id,
+                    &mut state.draft_attachments,
+                    path,
+                );
+                true
+            }
+            SmartInputSubmitRequest::Edit { task_id, .. } => {
+                if state.editing_task_id == Some(task_id) {
+                    push_smart_input_attachment(
+                        &mut state.next_attachment_id,
+                        &mut state.edit_attachments,
+                        path,
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn handle_smart_input_image_paste_shortcut(
+        &mut self,
+        ctx: &egui::Context,
+        request: SmartInputSubmitRequest,
+        events: Vec<Event>,
+    ) -> Vec<Event> {
+        Self::handle_smart_input_image_paste_events_with(ctx, self, request, events, || {
+            Self::clipboard_image_path()
+        })
+    }
+
+    fn handle_smart_input_image_paste_events_with(
+        ctx: &egui::Context,
+        app: &mut Self,
+        request: SmartInputSubmitRequest,
+        events: Vec<Event>,
+        mut get_image_path: impl FnMut() -> Option<String>,
+    ) -> Vec<Event> {
+        if !events.iter().any(Self::event_is_image_paste_trigger) {
+            return events;
+        }
+
+        let Some(path) = get_image_path() else {
+            return events;
+        };
+
+        if app.add_smart_input_image_attachment(request, path) {
+            ctx.request_repaint();
+            let (_, remaining) = Self::consume_image_paste_triggers(events);
+            remaining
+        } else {
+            events
+        }
     }
 
     /// Try to get an image path from clipboard for terminal paste.
@@ -13070,7 +13382,7 @@ impl AdeApp {
     /// 1. File path to image (Windows CF_HDROP)
     /// 2. Bitmap data that needs to be saved
     /// Returns Some(path) if an image was found/saved, None for normal text paste.
-    fn clipboard_image_path(&self) -> Option<String> {
+    fn clipboard_image_path() -> Option<String> {
         // First try Windows CF_HDROP for copied files from Explorer
         #[cfg(target_os = "windows")]
         {
@@ -13224,7 +13536,7 @@ impl AdeApp {
     }
 
     fn paste_clipboard_to_terminal(&mut self, terminal_id: u64) {
-        if let Some(image_path) = self.clipboard_image_path() {
+        if let Some(image_path) = Self::clipboard_image_path() {
             if self.queue_pasted_text_to_terminal(terminal_id, &image_path) {
                 self.status_line = format!("Pasted image path: {}", image_path);
             }
@@ -13811,13 +14123,32 @@ impl AdeApp {
                 }
             }
         }
-        // Keep focus on the Smart Input draft after any pane action
-        // so the user can continue typing without re-clicking.
-        if self.ui_focus_should_yield_to_terminal_activation() {
+        if action.claim_smart_input_keyboard && self.ui_focus_should_yield_to_terminal_activation()
+        {
             if let Some(terminal) = self.terminals.get(&terminal_id) {
                 if Self::terminal_smart_input_visible(terminal) {
-                    let draft_id = Self::smart_input_draft_input_id(terminal_id);
-                    ctx.memory_mut(|mem| mem.request_focus(draft_id));
+                    if self.terminal_output_focus_override == Some(terminal_id) {
+                        self.terminal_output_focus_override = None;
+                    }
+                    let focus_target = action.focus_target.unwrap_or(SmartInputFocusTarget::Draft);
+                    let focus_id = match focus_target {
+                        SmartInputFocusTarget::Draft => {
+                            Self::smart_input_draft_input_id(terminal_id)
+                        }
+                        SmartInputFocusTarget::Edit(task_id)
+                            if terminal.smart_input.editing_task_id == Some(task_id) =>
+                        {
+                            Self::smart_input_task_edit_input_id(terminal_id, task_id)
+                        }
+                        SmartInputFocusTarget::Edit(_) => {
+                            Self::smart_input_draft_input_id(terminal_id)
+                        }
+                        SmartInputFocusTarget::QuestionCustom => {
+                            Self::smart_input_question_custom_input_id(terminal_id)
+                        }
+                    };
+                    ctx.memory_mut(|mem| mem.request_focus(focus_id));
+                    ctx.request_repaint();
                 }
             }
         }
@@ -23586,82 +23917,80 @@ impl eframe::App for AdeApp {
         let mut events = std::mem::take(&mut raw_input.events);
         let global_modifiers = raw_input.modifiers;
         let single_view_shortcuts_enabled = !self.config.ui.multi_terminal_view_enabled;
+        let egui_paste_event_present = events.iter().any(Self::event_is_image_paste_trigger);
+        let native_primary_paste_requested = Self::native_primary_paste_rising_edge(
+            Self::native_primary_paste_shortcut_down(),
+            egui_paste_event_present,
+            &mut self.native_primary_paste_down,
+        );
 
         let capture_keyboard = self.should_capture_terminal_keyboard(ctx);
-        let smart_input_request = self.focused_smart_input_submit_request(ctx);
+        let terminal_output_paste_target = self
+            .active_terminal_accepts_input()
+            .filter(|terminal_id| self.terminal_output_focus_override == Some(*terminal_id));
+        let focused_smart_input_request = if terminal_output_paste_target.is_some() {
+            None
+        } else {
+            self.focused_smart_input_submit_request(ctx)
+        };
+        let smart_input_request = focused_smart_input_request;
+        let paste_smart_input_request = if terminal_output_paste_target.is_none()
+            && (egui_paste_event_present || native_primary_paste_requested)
+        {
+            smart_input_request.or_else(|| {
+                if self.active_opencode_question_terminal_id().is_none()
+                    && !self.text_input_has_focus(ctx)
+                    && !self.show_settings_popup
+                    && !self.show_exit_confirm_popup
+                    && self.foreground_message_popup_open.is_none()
+                    && !self.show_create_worktree_popup
+                    && !ctx.memory(|mem| mem.any_popup_open())
+                    && !ctx.is_context_menu_open()
+                {
+                    self.active_smart_input_draft_request()
+                } else {
+                    None
+                }
+            })
+        } else {
+            smart_input_request
+        };
 
         if let Some(terminal_id) = self.active_opencode_question_terminal_id() {
             events = self.handle_opencode_question_keyboard_events(ctx, terminal_id, events);
+        }
+
+        if native_primary_paste_requested {
+            let target = self.native_image_paste_target(
+                ctx,
+                terminal_output_paste_target,
+                paste_smart_input_request,
+                capture_keyboard,
+            );
+            let _ = self.handle_native_image_paste_fallback(ctx, target);
+        }
+
+        if let Some(terminal_id) = terminal_output_paste_target {
+            events = self.handle_terminal_clipboard_paste_events(ctx, terminal_id, events);
         }
 
         // Capture terminal command shortcuts when terminal owns keyboard,
         // OR when Smart Input draft/edit is focused so shortcuts redirect
         // into the focused field. If another UI text input owns keyboard
         // (Settings, popup), leave shortcut key events for the UI.
-        if capture_keyboard || smart_input_request.is_some() {
-            // When Smart Input is focused, intercept primary paste shortcut
-            // (Ctrl+V / Cmd+V) and synthesize a text paste event if the
-            // clipboard contains an image path. This handles image-only
-            // clipboard data that egui does not emit as Event::Paste.
-            if smart_input_request.is_some() {
-                // Only probe clipboard when the actual paste key is present in
-                // the current frame, preventing duplicate attachment creation
-                // on every input frame while Smart Input remains focused.
-                let has_paste_key = events.iter().any(|e| {
-                    if let Event::Key {
-                        key: Key::V,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } = e
-                    {
-                        primary_shortcut_modifier(*modifiers) && !modifiers.alt && !modifiers.shift
-                    } else {
-                        false
-                    }
-                });
-                let clipboard_image = if has_paste_key {
-                    self.clipboard_image_path()
-                } else {
-                    None
-                };
-                if let Some(ref path) = clipboard_image {
-                    if let Some(request) = smart_input_request {
-                        let terminal_id = match request {
-                            SmartInputSubmitRequest::Draft { terminal_id } => terminal_id,
-                            SmartInputSubmitRequest::Edit { terminal_id, .. } => terminal_id,
-                        };
-                        if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
-                            if Self::terminal_smart_input_visible(terminal) {
-                                let att_id = terminal.smart_input.next_attachment_id;
-                                terminal.smart_input.next_attachment_id += 1;
-                                match request {
-                                    SmartInputSubmitRequest::Draft { .. } => {
-                                        terminal.smart_input.draft_attachments.push(
-                                            SmartInputAttachment {
-                                                id: att_id,
-                                                path: path.clone(),
-                                            },
-                                        );
-                                    }
-                                    SmartInputSubmitRequest::Edit { task_id, .. } => {
-                                        if terminal.smart_input.editing_task_id == Some(task_id) {
-                                            terminal.smart_input.edit_attachments.push(
-                                                SmartInputAttachment {
-                                                    id: att_id,
-                                                    path: path.clone(),
-                                                },
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+        if capture_keyboard || smart_input_request.is_some() || paste_smart_input_request.is_some()
+        {
+            if capture_keyboard {
+                if let Some(terminal_id) = self.active_terminal_accepts_input() {
+                    events = self.handle_terminal_clipboard_paste_events(ctx, terminal_id, events);
                 }
-                events = Self::synthesize_smart_input_image_paste_events_with(events, || {
-                    clipboard_image.clone()
-                });
+            }
+
+            // When Smart Input is focused, image-only clipboard data does not
+            // arrive as a normal TextEdit paste. Convert it to an attachment
+            // and consume the paste key so the image path is not inserted as text.
+            if let Some(request) = paste_smart_input_request {
+                events = self.handle_smart_input_image_paste_shortcut(ctx, request, events);
             }
             let (command_shortcuts, remaining, conflict_messages) =
                 self.partition_terminal_command_shortcuts(events);
@@ -27372,17 +27701,19 @@ fn draw_smart_input_attachments(
     }
     let chip_bg = Color32::from_rgb(44, 44, 48);
     let chip_stroke = Stroke::new(1.0, Color32::from_rgb(90, 90, 95));
-    let chip_radius = 6.0;
+    let chip_radius = 4.0;
     let mut to_remove: Vec<usize> = Vec::new();
     for (i, att) in attachments.iter().enumerate() {
         let chip = egui::Frame::none()
             .fill(chip_bg)
             .stroke(chip_stroke)
             .rounding(chip_radius)
-            .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+            .inner_margin(egui::Margin::symmetric(5.0, 2.0))
             .show(ui, |ui| {
-                ui.set_min_height(16.0);
+                ui.set_min_height(14.0);
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                    ui.spacing_mut().button_padding = egui::Vec2::ZERO;
                     ui.label(RichText::new("Img:").small().color(TEXT_PRIMARY));
                     let fname = std::path::Path::new(&att.path)
                         .file_name()
@@ -27390,14 +27721,21 @@ fn draw_smart_input_attachments(
                         .unwrap_or(&att.path);
                     let short = capped_hover_text(fname, 24);
                     ui.label(RichText::new(short).small().color(TEXT_PRIMARY));
-                    if ui
-                        .button(
-                            RichText::new("x")
-                                .small()
-                                .color(Color32::from_rgb(232, 100, 100)),
-                        )
-                        .clicked()
-                    {
+                    let (remove_rect, remove_response) = ui.allocate_exact_size(
+                        egui::vec2(
+                            SMART_INPUT_ATTACHMENT_REMOVE_BUTTON_SIZE,
+                            SMART_INPUT_ATTACHMENT_REMOVE_BUTTON_SIZE,
+                        ),
+                        Sense::click(),
+                    );
+                    ui.painter().text(
+                        remove_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "x",
+                        egui::FontId::proportional(9.0),
+                        Color32::from_rgb(232, 100, 100),
+                    );
+                    if remove_response.clicked() {
                         to_remove.push(i);
                     }
                 });
@@ -27411,6 +27749,38 @@ fn draw_smart_input_attachments(
         }
     }
     removed
+}
+
+fn draw_smart_input_attachments_wrapped(
+    ui: &mut Ui,
+    attachments: &mut Vec<SmartInputAttachment>,
+    max_height: f32,
+) -> Vec<u64> {
+    if attachments.is_empty() {
+        return Vec::new();
+    }
+
+    let mut removed = Vec::new();
+    egui::ScrollArea::vertical()
+        .max_height(max_height)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.set_max_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                removed = draw_smart_input_attachments(ui, attachments);
+            });
+        });
+    removed
+}
+
+fn push_smart_input_attachment(
+    next_attachment_id: &mut u64,
+    attachments: &mut Vec<SmartInputAttachment>,
+    path: String,
+) {
+    let id = *next_attachment_id;
+    *next_attachment_id += 1;
+    attachments.push(SmartInputAttachment { id, path });
 }
 
 fn smart_input_visible_task_rows(state: &SmartInputState) -> usize {
@@ -27584,6 +27954,7 @@ fn draw_smart_input_footer(
                             .clicked()
                         {
                             terminal.smart_input.expanded = !terminal.smart_input.expanded;
+                            action.request_keyboard_focus(SmartInputFocusTarget::Draft);
                         }
                     });
                 }
@@ -27615,6 +27986,7 @@ fn draw_smart_input_footer(
                                     .clicked()
                                 {
                                     action.reject_question = true;
+                                    action.request_keyboard_focus(SmartInputFocusTarget::Draft);
                                 }
                             });
                         });
@@ -27677,6 +28049,7 @@ fn draw_smart_input_footer(
                             if row_response.clicked() {
                                 terminal.opencode_question_focus_index = index;
                                 AdeApp::select_focused_opencode_question_choice(terminal);
+                                action.request_keyboard_focus(SmartInputFocusTarget::Draft);
                             }
                         }
 
@@ -27727,7 +28100,9 @@ fn draw_smart_input_footer(
                             if row_response.clicked() {
                                 terminal.opencode_question_focus_index = index;
                                 terminal.opencode_question_selected.clear();
-                                AdeApp::focus_opencode_question_custom_input(ui.ctx(), terminal_id);
+                                action.request_keyboard_focus(
+                                    SmartInputFocusTarget::QuestionCustom,
+                                );
                             }
 
                             if focused || has_custom {
@@ -27735,13 +28110,19 @@ fn draw_smart_input_footer(
                                     ui.label(RichText::new("Custom:").small().color(TEXT_MUTED));
                                     let custom_id =
                                         AdeApp::smart_input_question_custom_input_id(terminal_id);
-                                    ui.add_sized(
+                                    let custom_response = ui.add_sized(
                                         egui::vec2((ui.available_width() - 8.0).max(120.0), 22.0),
                                         egui::TextEdit::singleline(
                                             &mut terminal.opencode_question_custom,
                                         )
                                         .id(custom_id),
                                     );
+                                    if custom_response.clicked() || custom_response.gained_focus()
+                                    {
+                                        action.request_keyboard_focus(
+                                            SmartInputFocusTarget::QuestionCustom,
+                                        );
+                                    }
                                 });
                             }
                         }
@@ -27758,6 +28139,7 @@ fn draw_smart_input_footer(
                             ui.add_enabled_ui(can_submit, |ui| {
                                 if ui.button(RichText::new("Submit Answer").strong()).clicked() {
                                     action.submit_question = true;
+                                    action.request_keyboard_focus(SmartInputFocusTarget::Draft);
                                 }
                             });
                         });
@@ -27871,6 +28253,11 @@ fn draw_smart_input_footer(
                                                 .hint_text("Edit queued task"),
                                         )
                                     });
+                                if edit_response.clicked() || edit_response.gained_focus() {
+                                    action.request_keyboard_focus(SmartInputFocusTarget::Edit(
+                                        task_id,
+                                    ));
+                                }
                                 let post_show_range =
                                     egui::text_edit::TextEditState::load(row_ui.ctx(), edit_id)
                                         .and_then(|s| s.cursor.char_range())
@@ -27885,6 +28272,9 @@ fn draw_smart_input_footer(
                                         ui.add_enabled_ui(has_selection, |ui| {
                                             if ui.button(format!("{} Copy", icons::COPY)).clicked()
                                             {
+                                                action.request_keyboard_focus(
+                                                    SmartInputFocusTarget::Edit(task_id),
+                                                );
                                                 if let Some(range) = effective_range {
                                                     let copied = extract_text_from_char_range(
                                                         &state.edit_draft,
@@ -27898,28 +28288,22 @@ fn draw_smart_input_footer(
                                             }
                                         });
                                         if ui.button(format!("{} Paste", icons::PLUS)).clicked() {
-                                            if let Ok(mut clipboard) = Clipboard::new() {
+                                            action.request_keyboard_focus(
+                                                SmartInputFocusTarget::Edit(task_id),
+                                            );
+                                            if let Some(path) = AdeApp::clipboard_image_path() {
+                                                push_smart_input_attachment(
+                                                    &mut state.next_attachment_id,
+                                                    &mut state.edit_attachments,
+                                                    path,
+                                                );
+                                            } else if let Ok(mut clipboard) = Clipboard::new() {
                                                 if let Ok(text) = clipboard.get_text() {
-                                                    if let Some(range) = effective_range {
-                                                        let [start, end] = range.sorted();
-                                                        let mut new_draft = String::new();
-                                                        let mut chars = state.edit_draft.chars();
-                                                        for _ in 0..start.index {
-                                                            if let Some(ch) = chars.next() {
-                                                                new_draft.push(ch);
-                                                            }
-                                                        }
-                                                        for _ in start.index..end.index {
-                                                            chars.next();
-                                                        }
-                                                        new_draft.push_str(&text);
-                                                        for ch in chars {
-                                                            new_draft.push(ch);
-                                                        }
-                                                        state.edit_draft = new_draft;
-                                                    } else {
-                                                        state.edit_draft.push_str(&text);
-                                                    }
+                                                    replace_text_range_or_append(
+                                                        &mut state.edit_draft,
+                                                        effective_range,
+                                                        &text,
+                                                    );
                                                 }
                                             }
                                             ui.close_menu();
@@ -27940,10 +28324,15 @@ fn draw_smart_input_footer(
                                         }
                                     }
                                 }
-                                let _removed_edit = draw_smart_input_attachments(
+                                let removed_edit = draw_smart_input_attachments(
                                     &mut row_ui,
                                     &mut state.edit_attachments,
                                 );
+                                if !removed_edit.is_empty() {
+                                    action.request_keyboard_focus(SmartInputFocusTarget::Edit(
+                                        task_id,
+                                    ));
+                                }
                                 if styled_icon_button(
                                     &mut row_ui,
                                     icons::CHECK_CIRCLE,
@@ -27953,6 +28342,7 @@ fn draw_smart_input_footer(
                                     "Save",
                                 ) {
                                     row_action = Some((task_id, "save"));
+                                    action.request_keyboard_focus(SmartInputFocusTarget::Draft);
                                 }
                                 if styled_icon_button(
                                     &mut row_ui,
@@ -27963,6 +28353,7 @@ fn draw_smart_input_footer(
                                     "Cancel",
                                 ) {
                                     row_action = Some((task_id, "cancel"));
+                                    action.request_keyboard_focus(SmartInputFocusTarget::Draft);
                                 }
                             } else {
                                 let is_dragging_this = state.dragging_task_id == Some(task_id);
@@ -28010,10 +28401,14 @@ fn draw_smart_input_footer(
                                     });
                                 if label_response.clicked() {
                                     row_ui.ctx().copy_text(task_text.clone());
+                                    action.request_keyboard_focus(SmartInputFocusTarget::Draft);
                                 }
                                 let task_attachments = &mut state.tasks[index].attachments;
-                                let _removed =
+                                let removed =
                                     draw_smart_input_attachments(&mut row_ui, task_attachments);
+                                if !removed.is_empty() {
+                                    action.request_keyboard_focus(SmartInputFocusTarget::Draft);
+                                }
 
                                 row_ui.add_space(8.0);
 
@@ -28027,6 +28422,7 @@ fn draw_smart_input_footer(
                                 ) {
                                     let atts = state.tasks[index].attachments.clone();
                                     action.send_task_now = Some((task_id, atts));
+                                    action.request_keyboard_focus(SmartInputFocusTarget::Draft);
                                 }
                                 if styled_icon_button(
                                     &mut row_ui,
@@ -28037,6 +28433,7 @@ fn draw_smart_input_footer(
                                     "Copy prompt",
                                 ) {
                                     row_ui.ctx().copy_text(task_text.clone());
+                                    action.request_keyboard_focus(SmartInputFocusTarget::Draft);
                                 }
                                 if styled_icon_button(
                                     &mut row_ui,
@@ -28047,6 +28444,7 @@ fn draw_smart_input_footer(
                                     "Edit",
                                 ) {
                                     row_action = Some((task_id, "edit"));
+                                    action.request_keyboard_focus(SmartInputFocusTarget::Draft);
                                 }
                                 if styled_icon_button(
                                     &mut row_ui,
@@ -28057,6 +28455,7 @@ fn draw_smart_input_footer(
                                     "Delete",
                                 ) {
                                     row_action = Some((task_id, "delete"));
+                                    action.request_keyboard_focus(SmartInputFocusTarget::Draft);
                                 }
                             }
                         }
@@ -28092,8 +28491,7 @@ fn draw_smart_input_footer(
                         }
                         _ => {}
                     }
-                    let draft_id = AdeApp::smart_input_draft_input_id(terminal_id);
-                    ui.ctx().memory_mut(|mem| mem.request_focus(draft_id));
+                    action.request_keyboard_focus(SmartInputFocusTarget::Draft);
                 }
             }
 
@@ -28103,7 +28501,7 @@ fn draw_smart_input_footer(
             ui.horizontal(|ui| {
                 let draft_id = AdeApp::smart_input_draft_input_id(terminal_id);
                 let input_height = smart_input_draft_height(state);
-                let input_width = (ui.available_width() - 92.0).max(120.0);
+                let input_width = (ui.available_width() - 44.0).max(120.0);
                 // Preserve selection before right-click collapses it
                 let secondary_pressed = ui.ctx().input(|input| input.pointer.secondary_pressed());
                 let pre_click_range = egui::text_edit::TextEditState::load(ui.ctx(), draft_id)
@@ -28112,24 +28510,88 @@ fn draw_smart_input_footer(
                 if secondary_pressed && pre_click_range.is_some() {
                     state.draft_context_menu_selection_range = pre_click_range;
                 }
-                let draft_response = with_settings_text_edit_chrome(ui, |ui| {
-                    ui.add_sized(
-                        egui::vec2(input_width, input_height),
-                        egui::TextEdit::multiline(&mut state.draft)
-                            .id(draft_id)
-                            .desired_width(input_width)
-                            .hint_text(
-                                RichText::new(
-                                    "Task for after done (Enter queues, Ctrl+Enter newline)",
-                                )
+                let chrome = settings_text_edit_chrome();
+                let draft_has_focus = ui.ctx().memory(|mem| mem.has_focus(draft_id));
+                let draft_stroke = if draft_has_focus {
+                    chrome.focus_stroke
+                } else {
+                    chrome.stroke
+                };
+                let (draft_frame_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(input_width, input_height), Sense::hover());
+                ui.painter()
+                    .rect_filled(draft_frame_rect, 2.0, chrome.fill);
+                ui.painter()
+                    .rect_stroke(draft_frame_rect, 2.0, draft_stroke);
+                let content_rect = draft_frame_rect.shrink2(egui::vec2(
+                    SMART_INPUT_DRAFT_INNER_MARGIN_X,
+                    SMART_INPUT_DRAFT_INNER_MARGIN_Y,
+                ));
+                let attachment_space = if state.draft_attachments.is_empty() {
+                    0.0
+                } else {
+                    SMART_INPUT_DRAFT_ATTACHMENT_STRIP_HEIGHT
+                };
+                let attachment_gap = if state.draft_attachments.is_empty() {
+                    0.0
+                } else {
+                    4.0
+                };
+                let text_height =
+                    (content_rect.height() - attachment_space - attachment_gap).max(18.0);
+                let text_rect = egui::Rect::from_min_size(
+                    content_rect.min,
+                    egui::vec2(content_rect.width(), text_height.min(content_rect.height())),
+                );
+                let mut draft_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(text_rect)
+                        .layout(Layout::top_down(Align::Min)),
+                );
+                draft_ui.set_clip_rect(text_rect);
+                draft_ui.set_min_size(text_rect.size());
+                draft_ui.set_max_width(text_rect.width());
+                let inner_width = text_rect.width().max(60.0);
+                let draft_response = draft_ui.add_sized(
+                    egui::vec2(inner_width, text_height),
+                    egui::TextEdit::multiline(&mut state.draft)
+                        .id(draft_id)
+                        .desired_width(inner_width)
+                        .frame(false)
+                        .hint_text(
+                            RichText::new("Task for after done (Enter queues, Ctrl+Enter newline)")
                                 .color(TEXT_MUTED),
-                            )
-                            .return_key(egui::KeyboardShortcut::new(
-                                egui::Modifiers::CTRL,
-                                egui::Key::Enter,
-                            )),
-                    )
-                });
+                        )
+                        .return_key(egui::KeyboardShortcut::new(
+                            egui::Modifiers::CTRL,
+                            egui::Key::Enter,
+                        )),
+                );
+                if draft_response.clicked() || draft_response.gained_focus() {
+                    action.request_keyboard_focus(SmartInputFocusTarget::Draft);
+                }
+                if !state.draft_attachments.is_empty() {
+                    let attachment_rect = egui::Rect::from_min_size(
+                        egui::pos2(content_rect.left(), content_rect.bottom() - attachment_space),
+                        egui::vec2(content_rect.width(), attachment_space),
+                    );
+                    let mut attachment_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(attachment_rect)
+                            .layout(Layout::top_down(Align::Min)),
+                    );
+                    attachment_ui.set_clip_rect(attachment_rect);
+                    attachment_ui.set_min_size(attachment_rect.size());
+                    attachment_ui.set_max_width(attachment_rect.width());
+                    let removed_draft = draw_smart_input_attachments_wrapped(
+                        &mut attachment_ui,
+                        &mut state.draft_attachments,
+                        attachment_space,
+                    );
+                    if !removed_draft.is_empty() {
+                        action.request_keyboard_focus(SmartInputFocusTarget::Draft);
+                    }
+                }
                 // Determine effective selection for context menu
                 let post_show_range = egui::text_edit::TextEditState::load(ui.ctx(), draft_id)
                     .and_then(|s| s.cursor.char_range())
@@ -28144,6 +28606,7 @@ fn draw_smart_input_footer(
 
                         ui.add_enabled_ui(has_selection, |ui| {
                             if ui.button(format!("{} Copy", icons::COPY)).clicked() {
+                                action.request_keyboard_focus(SmartInputFocusTarget::Draft);
                                 if let Some(range) = effective_range {
                                     let copied =
                                         extract_text_from_char_range(&state.draft, Some(range));
@@ -28156,28 +28619,20 @@ fn draw_smart_input_footer(
                         });
 
                         if ui.button(format!("{} Paste", icons::PLUS)).clicked() {
-                            if let Ok(mut clipboard) = Clipboard::new() {
+                            action.request_keyboard_focus(SmartInputFocusTarget::Draft);
+                            if let Some(path) = AdeApp::clipboard_image_path() {
+                                push_smart_input_attachment(
+                                    &mut state.next_attachment_id,
+                                    &mut state.draft_attachments,
+                                    path,
+                                );
+                            } else if let Ok(mut clipboard) = Clipboard::new() {
                                 if let Ok(text) = clipboard.get_text() {
-                                    if let Some(range) = effective_range {
-                                        let [start, end] = range.sorted();
-                                        let mut new_draft = String::new();
-                                        let mut chars = state.draft.chars();
-                                        for _ in 0..start.index {
-                                            if let Some(ch) = chars.next() {
-                                                new_draft.push(ch);
-                                            }
-                                        }
-                                        for _ in start.index..end.index {
-                                            chars.next();
-                                        }
-                                        new_draft.push_str(&text);
-                                        for ch in chars {
-                                            new_draft.push(ch);
-                                        }
-                                        state.draft = new_draft;
-                                    } else {
-                                        state.draft.push_str(&text);
-                                    }
+                                    replace_text_range_or_append(
+                                        &mut state.draft,
+                                        effective_range,
+                                        &text,
+                                    );
                                 }
                             }
                             ui.close_menu();
@@ -28196,8 +28651,6 @@ fn draw_smart_input_footer(
                     }
                 }
 
-                let _removed_draft = draw_smart_input_attachments(ui, &mut state.draft_attachments);
-
                 let can_submit =
                     !state.draft.trim().is_empty() || !state.draft_attachments.is_empty();
                 ui.add_enabled_ui(can_submit, |ui| {
@@ -28210,6 +28663,7 @@ fn draw_smart_input_footer(
                         "Submit draft",
                     ) {
                         let _ = state.enqueue_draft();
+                        action.request_keyboard_focus(SmartInputFocusTarget::Draft);
                     }
                 });
 
@@ -28219,8 +28673,8 @@ fn draw_smart_input_footer(
                 let grip_size = 12.0;
                 let grip_rect = egui::Rect::from_min_size(
                     egui::pos2(
-                        draft_response.rect.right() - grip_size,
-                        draft_response.rect.bottom() - grip_size,
+                        draft_frame_rect.right() - grip_size,
+                        draft_frame_rect.bottom() - grip_size,
                     ),
                     egui::vec2(grip_size, grip_size),
                 );
@@ -31191,11 +31645,11 @@ mod tests {
         FactoryDroidAttentionReason, FactoryDroidHookInboxEvent,
         FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
         FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, FileEditorState,
-        OpenCodeAttentionReason, OpenCodeQuestionInfo, OpenCodeQuestionOption,
-        OpenCodeStatusSource, OpenCodeTransportStatus, OsNotificationKind, PendingConfigChanges,
-        PendingOsNotification, PendingRerunPhase, PendingTerminalLinkClick, SettingsSection,
-        SmartInputAttachment, SmartInputState, SmartInputSubmitRequest, SmartInputTask,
-        SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
+        NativeImagePasteTarget, OpenCodeAttentionReason, OpenCodeQuestionInfo,
+        OpenCodeQuestionOption, OpenCodeStatusSource, OpenCodeTransportStatus, OsNotificationKind,
+        PendingConfigChanges, PendingOsNotification, PendingRerunPhase, PendingTerminalLinkClick,
+        SettingsSection, SmartInputAttachment, SmartInputState, SmartInputSubmitRequest,
+        SmartInputTask, SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
         SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
         TerminalOutputScrollBehavior, TerminalSecondaryClickAction, TerminalSelection,
@@ -32503,6 +32957,36 @@ mod tests {
         let terminal = app.terminals.get(&1).expect("terminal 1");
         assert_eq!(terminal.pending_line_for_title, "git status");
         assert!(terminal.dirty);
+    }
+
+    #[test]
+    fn route_active_terminal_input_consumes_ctrl_v_without_control_byte() {
+        let ctx = Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![Event::Key {
+                key: Key::V,
+                physical_key: Some(Key::V),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+            }],
+        );
+        capture.drain();
+
+        assert!(
+            capture.bytes().is_empty(),
+            "Ctrl+V must be paste routing, not raw 0x16 terminal input"
+        );
     }
 
     #[test]
@@ -38049,6 +38533,37 @@ mod tests {
     }
 
     #[test]
+    fn raw_input_hook_consumes_terminal_ctrl_v_as_clipboard_paste() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+
+        let mut raw_input = RawInput {
+            events: vec![Event::Key {
+                key: egui::Key::V,
+                physical_key: Some(egui::Key::V),
+                pressed: true,
+                modifiers: egui::Modifiers {
+                    ctrl: true,
+                    ..egui::Modifiers::default()
+                },
+                repeat: false,
+            }],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(
+            raw_input.events.is_empty(),
+            "terminal Ctrl+V should be consumed by clipboard paste routing"
+        );
+        assert!(
+            app.buffered_terminal_input.is_empty(),
+            "terminal Ctrl+V must not be forwarded as a raw 0x16 control byte"
+        );
+    }
+
+    #[test]
     fn raw_input_hook_does_not_buffer_terminal_shortcuts_when_settings_owns_keyboard() {
         let ctx = Context::default();
         let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
@@ -41735,6 +42250,7 @@ mod tests {
             pending_second_enter: Vec::new(),
             terminal_held_key_repeat: None,
             allow_attention_terminal_input_routing_once: false,
+            native_primary_paste_down: false,
             pending_terminal_pastes: Vec::new(),
             terminal_events_tx,
             terminal_events_rx,
@@ -52809,6 +53325,113 @@ mod tests {
     }
 
     #[test]
+    fn ensure_smart_input_focus_surrenders_when_output_override_is_active() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::smart_input_draft_input_id(1));
+        });
+        app.terminal_output_focus_override = Some(1);
+
+        app.ensure_smart_input_focus(&ctx);
+
+        assert_eq!(app.terminal_output_focus_override, Some(1));
+        assert!(
+            !ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))),
+            "terminal output override must make Smart Input yield focus"
+        );
+        assert!(
+            app.should_capture_terminal_keyboard(&ctx),
+            "terminal should capture keyboard after Smart Input yields"
+        );
+    }
+
+    #[test]
+    fn raw_input_hook_routes_text_to_terminal_when_output_override_is_active() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::smart_input_draft_input_id(1));
+        });
+        app.terminal_output_focus_override = Some(1);
+
+        let mut raw_input = RawInput {
+            events: vec![Event::Text("a".to_owned())],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(raw_input.events.is_empty());
+        assert_eq!(
+            app.buffered_terminal_input,
+            vec![Event::Text("a".to_owned())]
+        );
+        assert!(
+            !ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))),
+            "Smart Input must not reclaim focus after terminal output click"
+        );
+        assert!(
+            app.terminals
+                .get(&1)
+                .expect("terminal 1")
+                .smart_input
+                .draft
+                .is_empty(),
+            "normal text should not be routed to Smart Input draft while output override is active"
+        );
+    }
+
+    #[test]
+    fn raw_input_hook_routes_ctrl_v_to_terminal_when_output_override_is_active() {
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::smart_input_draft_input_id(1));
+            mem.surrender_focus(AdeApp::smart_input_draft_input_id(1));
+        });
+        app.terminal_output_focus_override = Some(1);
+
+        let mut raw_input = RawInput {
+            events: vec![Event::Key {
+                key: egui::Key::V,
+                physical_key: Some(egui::Key::V),
+                pressed: true,
+                modifiers: egui::Modifiers {
+                    ctrl: true,
+                    ..egui::Modifiers::default()
+                },
+                repeat: false,
+            }],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+        capture.drain();
+
+        assert!(
+            raw_input.events.is_empty(),
+            "terminal output override should consume Ctrl+V before Smart Input"
+        );
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(
+            terminal.smart_input.draft_attachments.is_empty(),
+            "terminal paste must not create Smart Input attachments"
+        );
+        assert!(
+            !capture.bytes().contains(&0x16),
+            "terminal Ctrl+V must not be forwarded as a raw control byte"
+        );
+    }
+
+    #[test]
     fn set_active_terminal_clears_output_override_when_switching_terminals() {
         let ctx = egui::Context::default();
         let mut app = test_app_with_ai_hooks(
@@ -52971,16 +53594,89 @@ mod tests {
     }
 
     #[test]
-    fn smart_input_pane_action_restores_draft_focus_without_modal() {
+    fn smart_input_pane_action_without_focus_claim_keeps_output_override() {
         let ctx = egui::Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
         seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        app.terminal_output_focus_override = Some(1);
 
         app.handle_smart_input_pane_action(&ctx, 1, super::SmartInputPaneAction::default());
 
+        assert_eq!(app.terminal_output_focus_override, Some(1));
+        assert!(
+            !ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))),
+            "no-op Smart Input refresh must not steal focus back from terminal output"
+        );
+    }
+
+    #[test]
+    fn smart_input_focus_claim_clears_output_override_and_focuses_draft() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        app.terminal_output_focus_override = Some(1);
+
+        let mut action = super::SmartInputPaneAction::default();
+        action.request_keyboard_focus(super::SmartInputFocusTarget::Draft);
+        app.handle_smart_input_pane_action(&ctx, 1, action);
+
+        assert_eq!(app.terminal_output_focus_override, None);
         assert!(
             ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))),
-            "Smart Input draft should still be focused during normal terminal use"
+            "explicit Smart Input interaction should return typing to the draft"
+        );
+    }
+
+    #[test]
+    fn smart_input_focus_claim_can_focus_edit_field() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        let task_id = {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.smart_input.draft = "queued".to_owned();
+            let task_id = terminal.smart_input.enqueue_draft().expect("task");
+            assert!(terminal.smart_input.start_edit(task_id));
+            task_id
+        };
+        app.terminal_output_focus_override = Some(1);
+
+        let mut action = super::SmartInputPaneAction::default();
+        action.request_keyboard_focus(super::SmartInputFocusTarget::Edit(task_id));
+        app.handle_smart_input_pane_action(&ctx, 1, action);
+
+        assert_eq!(app.terminal_output_focus_override, None);
+        assert!(
+            ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_task_edit_input_id(1, task_id))),
+            "edit interaction should focus the active edit input"
+        );
+        assert!(
+            !ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))),
+            "edit interaction should not force focus back to the draft"
+        );
+    }
+
+    #[test]
+    fn raw_input_hook_leaves_text_for_smart_input_after_focus_claim_clears_override() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        app.terminal_output_focus_override = Some(1);
+        let mut action = super::SmartInputPaneAction::default();
+        action.request_keyboard_focus(super::SmartInputFocusTarget::Draft);
+        app.handle_smart_input_pane_action(&ctx, 1, action);
+
+        let mut raw_input = RawInput {
+            events: vec![Event::Text("a".to_owned())],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert_eq!(raw_input.events, vec![Event::Text("a".to_owned())]);
+        assert!(
+            app.buffered_terminal_input.is_empty(),
+            "Smart Input text must not be routed to terminal after the user clicks the draft"
         );
     }
 
@@ -55199,13 +55895,192 @@ mod tests {
 
         let max_grip_x = grip_line_xs.iter().copied().fold(0.0f32, f32::max);
 
-        // The TextEdit is sized to (available_width - 92.0) inside the 400px footer.
-        // With default margins, the text area right edge should be well under ~340px.
-        // The old buggy code placed the grip near the far-right edge (~390+ px).
+        // The draft frame leaves room for the submit button. The old buggy code
+        // placed the grip near the far-right panel edge (~390+ px).
         assert!(
-            max_grip_x < 350.0,
-            "grip must sit near the TextEdit bottom-right (expected < 350), not drift to panel edge (got {})",
+            max_grip_x < 380.0,
+            "grip must sit near the draft bottom-right, not drift to panel edge (got {})",
             max_grip_x
+        );
+    }
+
+    #[test]
+    fn smart_input_draft_attachment_renders_inside_draft_box() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal
+                .smart_input
+                .draft_attachments
+                .push(SmartInputAttachment {
+                    id: 1,
+                    path: r"C:\test\Mergen_clipboard_image.png".to_owned(),
+                });
+        }
+
+        let mut raw_input = RawInput::default();
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(420.0, 420.0),
+        ));
+        let output = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let footer_size = egui::vec2(420.0, 220.0);
+                let pane_height = 420.0;
+                let line_height = 18.0;
+                let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+                let _ = super::draw_smart_input_footer(
+                    ui,
+                    terminal,
+                    footer_size,
+                    pane_height,
+                    line_height,
+                );
+            });
+        });
+
+        let mut hint_rect = None;
+        let mut image_label_rect = None;
+        for shape in &output.shapes {
+            let egui::epaint::Shape::Text(text_shape) = &shape.shape else {
+                continue;
+            };
+            let rect = egui::Rect::from_min_size(text_shape.pos, text_shape.galley.size());
+            let text = text_shape.galley.text();
+            if text.contains("Task for after done") {
+                hint_rect = Some(rect);
+            } else if text == "Img:" {
+                image_label_rect = Some(rect);
+            }
+        }
+
+        let hint_rect = hint_rect.expect("draft hint should render");
+        let image_label_rect = image_label_rect.expect("image attachment label should render");
+        assert!(
+            image_label_rect.left() <= hint_rect.left() + 14.0,
+            "image attachment should start inside the draft box, near the text input (img_left={}, hint_left={})",
+            image_label_rect.left(),
+            hint_rect.left()
+        );
+        assert!(
+            image_label_rect.right() <= 420.0,
+            "image attachment label must not overflow the footer width (right={})",
+            image_label_rect.right()
+        );
+    }
+
+    #[test]
+    fn smart_input_draft_attachment_does_not_move_grip_down() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let render_grip_bottom = |ctx: &Context, with_attachment: bool| {
+            let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+            seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+            if with_attachment {
+                let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+                terminal
+                    .smart_input
+                    .draft_attachments
+                    .push(SmartInputAttachment {
+                        id: 1,
+                        path: r"C:\test\Mergen_clipboard_image.png".to_owned(),
+                    });
+            }
+            let mut raw_input = RawInput::default();
+            raw_input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(420.0, 420.0),
+            ));
+            let output = ctx.run(raw_input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let footer_size = egui::vec2(420.0, 220.0);
+                    let pane_height = 420.0;
+                    let line_height = 18.0;
+                    let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+                    let _ = super::draw_smart_input_footer(
+                        ui,
+                        terminal,
+                        footer_size,
+                        pane_height,
+                        line_height,
+                    );
+                });
+            });
+
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::epaint::Shape::LineSegment { points, .. } = &shape.shape {
+                        let dx = (points[1].x - points[0].x).abs();
+                        let dy = (points[1].y - points[0].y).abs();
+                        (dx > 1.0 && dy > 1.0).then(|| points[0].y.max(points[1].y))
+                    } else {
+                        None
+                    }
+                })
+                .fold(0.0f32, f32::max)
+        };
+
+        let without_attachment = render_grip_bottom(&ctx, false);
+        let with_attachment = render_grip_bottom(&ctx, true);
+        assert!(
+            (with_attachment - without_attachment).abs() <= 0.5,
+            "adding an image attachment must not grow the draft frame or move the grip down (without={}, with={})",
+            without_attachment,
+            with_attachment
+        );
+    }
+
+    #[test]
+    fn smart_input_attachment_chip_remove_button_stays_compact() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+        let mut attachments = vec![SmartInputAttachment {
+            id: 1,
+            path: r"C:\test\Mergen_clipboard_image.png".to_owned(),
+        }];
+
+        let output = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(260.0, 40.0),
+                        ))
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                let _ = super::draw_smart_input_attachments(&mut child, &mut attachments);
+            });
+        });
+
+        let chip_height = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::epaint::Shape::Rect(rect) = &shape.shape {
+                    (rect.fill == Color32::from_rgb(44, 44, 48)).then(|| rect.rect.height())
+                } else {
+                    None
+                }
+            })
+            .fold(0.0f32, f32::max);
+        assert!(
+            chip_height <= 22.0,
+            "attachment chip should stay compact after shrinking the remove button (height={})",
+            chip_height
         );
     }
 
@@ -55640,7 +56515,7 @@ mod tests {
     }
 
     #[test]
-    fn smart_input_synthesizes_image_paste_on_primary_paste_key() {
+    fn primary_paste_shortcut_consumer_removes_ctrl_v() {
         let events = vec![Event::Key {
             key: Key::V,
             physical_key: Some(Key::V),
@@ -55651,15 +56526,13 @@ mod tests {
                 ..Modifiers::default()
             },
         }];
-        let result = AdeApp::synthesize_smart_input_image_paste_events_with(events, || {
-            Some(r"C:\test\image.png".to_owned())
-        });
-        assert_eq!(result.len(), 1);
-        assert!(matches!(&result[0], Event::Paste(text) if text == r"C:\test\image.png"));
+        let (consumed, remaining) = AdeApp::consume_primary_paste_shortcuts(events);
+        assert!(consumed);
+        assert!(remaining.is_empty());
     }
 
     #[test]
-    fn smart_input_leaves_non_paste_keys_untouched() {
+    fn primary_paste_shortcut_consumer_leaves_non_paste_keys_untouched() {
         let events = vec![Event::Key {
             key: Key::A,
             physical_key: Some(Key::A),
@@ -55667,14 +56540,13 @@ mod tests {
             repeat: false,
             modifiers: Modifiers::default(),
         }];
-        let result = AdeApp::synthesize_smart_input_image_paste_events_with(events.clone(), || {
-            Some(r"C:\test\image.png".to_owned())
-        });
-        assert_eq!(result, events);
+        let (consumed, remaining) = AdeApp::consume_primary_paste_shortcuts(events.clone());
+        assert!(!consumed);
+        assert_eq!(remaining, events);
     }
 
     #[test]
-    fn smart_input_leaves_shift_ctrl_v_untouched() {
+    fn primary_paste_shortcut_consumer_leaves_shift_ctrl_v_untouched() {
         let events = vec![Event::Key {
             key: Key::V,
             physical_key: Some(Key::V),
@@ -55686,27 +56558,214 @@ mod tests {
                 ..Modifiers::default()
             },
         }];
-        let result = AdeApp::synthesize_smart_input_image_paste_events_with(events.clone(), || {
-            Some(r"C:\test\image.png".to_owned())
-        });
-        assert_eq!(result, events);
+        let (consumed, remaining) = AdeApp::consume_primary_paste_shortcuts(events.clone());
+        assert!(!consumed);
+        assert_eq!(remaining, events);
     }
 
     #[test]
-    fn smart_input_falls_back_to_normal_key_when_no_clipboard_image() {
-        let events = vec![Event::Key {
-            key: Key::V,
-            physical_key: Some(Key::V),
-            pressed: true,
-            repeat: false,
-            modifiers: Modifiers {
-                ctrl: true,
-                ..Modifiers::default()
+    fn image_paste_trigger_consumer_removes_paste_payload() {
+        let events = vec![
+            Event::Paste("ignored text payload".to_owned()),
+            Event::Text("kept".to_owned()),
+        ];
+
+        let (consumed, remaining) = AdeApp::consume_image_paste_triggers(events);
+
+        assert!(consumed);
+        assert_eq!(remaining, vec![Event::Text("kept".to_owned())]);
+    }
+
+    #[test]
+    fn native_primary_paste_rising_edge_triggers_once_without_egui_paste_event() {
+        let mut previous_down = false;
+
+        assert!(AdeApp::native_primary_paste_rising_edge(
+            true,
+            false,
+            &mut previous_down
+        ));
+        assert!(previous_down);
+        assert!(!AdeApp::native_primary_paste_rising_edge(
+            true,
+            false,
+            &mut previous_down
+        ));
+        assert!(!AdeApp::native_primary_paste_rising_edge(
+            false,
+            false,
+            &mut previous_down
+        ));
+        assert!(!previous_down);
+    }
+
+    #[test]
+    fn native_primary_paste_rising_edge_suppresses_when_egui_paste_event_exists() {
+        let mut previous_down = false;
+
+        assert!(!AdeApp::native_primary_paste_rising_edge(
+            true,
+            true,
+            &mut previous_down
+        ));
+        assert!(previous_down);
+        assert!(!AdeApp::native_primary_paste_rising_edge(
+            true,
+            false,
+            &mut previous_down
+        ));
+    }
+
+    #[test]
+    fn native_image_paste_target_prefers_terminal_then_smart_input() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        assert_eq!(
+            app.native_image_paste_target(
+                &ctx,
+                Some(1),
+                Some(SmartInputSubmitRequest::Draft { terminal_id: 1 }),
+                false,
+            ),
+            Some(NativeImagePasteTarget::Terminal(1))
+        );
+        assert_eq!(
+            app.native_image_paste_target(
+                &ctx,
+                None,
+                Some(SmartInputSubmitRequest::Draft { terminal_id: 1 }),
+                false,
+            ),
+            Some(NativeImagePasteTarget::SmartInput(
+                SmartInputSubmitRequest::Draft { terminal_id: 1 }
+            ))
+        );
+        app.show_create_worktree_popup = true;
+        assert_eq!(
+            app.native_image_paste_target(
+                &ctx,
+                Some(1),
+                Some(SmartInputSubmitRequest::Draft { terminal_id: 1 }),
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn native_image_paste_fallback_queues_terminal_image_path() {
+        let ctx = Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+
+        let handled = app.handle_native_image_paste_fallback_with(
+            &ctx,
+            Some(NativeImagePasteTarget::Terminal(1)),
+            || Some(r"C:\test\image.png".to_owned()),
+        );
+
+        assert!(handled);
+        assert_eq!(app.pending_terminal_pastes.len(), 1);
+        assert_eq!(app.pending_terminal_pastes[0].terminal_id, 1);
+        assert_eq!(app.pending_terminal_pastes[0].text, r"C:\test\image.png");
+    }
+
+    #[test]
+    fn native_image_paste_fallback_adds_smart_input_attachment() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        let handled = app.handle_native_image_paste_fallback_with(
+            &ctx,
+            Some(NativeImagePasteTarget::SmartInput(
+                SmartInputSubmitRequest::Draft { terminal_id: 1 },
+            )),
+            || Some(r"C:\test\image.png".to_owned()),
+        );
+
+        assert!(handled);
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(terminal.smart_input.draft.is_empty());
+        assert_eq!(terminal.smart_input.draft_attachments.len(), 1);
+        assert_eq!(
+            terminal.smart_input.draft_attachments[0].path,
+            r"C:\test\image.png"
+        );
+    }
+
+    #[test]
+    fn smart_input_image_paste_payload_adds_attachment_without_draft_text() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        let remaining = AdeApp::handle_smart_input_image_paste_events_with(
+            &ctx,
+            &mut app,
+            SmartInputSubmitRequest::Draft { terminal_id: 1 },
+            vec![Event::Paste("clipboard text fallback".to_owned())],
+            || Some(r"C:\test\image.png".to_owned()),
+        );
+
+        assert!(remaining.is_empty());
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(terminal.smart_input.draft.is_empty());
+        assert_eq!(terminal.smart_input.draft_attachments.len(), 1);
+        assert_eq!(
+            terminal.smart_input.draft_attachments[0].path,
+            r"C:\test\image.png"
+        );
+    }
+
+    #[test]
+    fn smart_input_image_attachment_does_not_write_draft_text() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        let added = app.add_smart_input_image_attachment(
+            SmartInputSubmitRequest::Draft { terminal_id: 1 },
+            r"C:\test\image.png".to_owned(),
+        );
+
+        assert!(added);
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(terminal.smart_input.draft.is_empty());
+        assert_eq!(terminal.smart_input.draft_attachments.len(), 1);
+        assert_eq!(
+            terminal.smart_input.draft_attachments[0].path,
+            r"C:\test\image.png"
+        );
+    }
+
+    #[test]
+    fn smart_input_image_attachment_supports_edit_draft() {
+        let mut state = SmartInputState::default();
+        state.draft = "queued".to_owned();
+        let task_id = state.enqueue_draft().expect("queued task");
+        assert!(state.start_edit(task_id), "start edit");
+
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        app.terminals.get_mut(&1).expect("terminal 1").smart_input = state;
+
+        let added = app.add_smart_input_image_attachment(
+            SmartInputSubmitRequest::Edit {
+                terminal_id: 1,
+                task_id,
             },
-        }];
-        let result = AdeApp::synthesize_smart_input_image_paste_events_with(events, || None);
-        assert_eq!(result.len(), 1);
-        assert!(matches!(&result[0], Event::Key { key: Key::V, .. }));
+            r"C:\test\edit.png".to_owned(),
+        );
+
+        assert!(added);
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.smart_input.edit_draft, "queued");
+        assert_eq!(terminal.smart_input.edit_attachments.len(), 1);
+        assert_eq!(
+            terminal.smart_input.edit_attachments[0].path,
+            r"C:\test\edit.png"
+        );
     }
 
     fn codex_reason_to_kind(reason: CodexAttentionReason) -> OsNotificationKind {

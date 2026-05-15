@@ -1484,3 +1484,133 @@
   - Extended the queued Smart Input render test to assert minimum spacing between the header toggle and the first queued task.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test smart_input -- --nocapture`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User screenshot 2026-05-15
+
+---
+
+#### Clipboard images did not paste consistently {#clipboard-image-paste-routing}
+- Date: 2026-05-15
+- Context: User could paste a copied screenshot into the terminal via right-click, but `Ctrl+V` did not paste it in terminal/OpenCode and Smart Input did not accept it from shortcut or context menu.
+- Error signature: Terminal `Ctrl+V` was routed as a terminal control key, while Smart Input converted image paste into text events instead of treating the image path as an attachment.
+- Symptoms/Impact:
+  1. Screenshot clipboard data pasted through terminal secondary-click but not through the keyboard shortcut.
+  2. Smart Input did not reliably add copied screenshots as image attachments.
+  3. Image paths could be inserted as draft text instead of remaining attachment metadata.
+- Root cause:
+  - Terminal and Smart Input used different paste paths.
+  - Smart Input image paste synthesis produced `Event::Paste(path)` after also adding attachment state.
+- Resolution:
+  - Routed terminal `Ctrl+V` through the same clipboard paste path as right-click.
+  - Converted Smart Input image paste shortcuts directly into attachments and consumed the key event.
+  - Added image-aware paste handling to Smart Input draft/edit context menus.
+- Prevent recurrence:
+  - Added tests for primary paste shortcut consumption, terminal Ctrl+V routing, and Smart Input draft/edit image attachment insertion.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted paste tests, `cargo test smart_input -- --nocapture`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
+
+---
+
+#### Smart Input image attachment chip overflowed outside draft input {#smart-input-image-attachment-overflow}
+- Date: 2026-05-15
+- Context: User reported that pasting a copied screenshot into Smart Input created an image chip on the far right, outside the visible draft input area.
+- Error signature: Draft attachments were rendered as a sibling after the multiline TextEdit in the footer row, so the chip used remaining horizontal space instead of belonging to the draft field.
+- Symptoms/Impact:
+  1. Image chip appeared near the right edge and could overflow off screen.
+  2. The draft input did not visually own pasted images, making it unclear what would be submitted.
+  3. Terminal `Ctrl+V` could still be stolen by Smart Input focus when the terminal output was the intended paste target.
+- Root cause:
+  - The draft TextEdit chrome did not include the attachment strip.
+  - Terminal output focus override was not consulted before Smart Input paste handling.
+- Resolution:
+  - Wrapped the draft TextEdit and attachment strip in one framed draft area.
+  - Rendered draft attachments in a bounded wrapped strip inside that frame.
+  - Let terminal output focus override consume primary paste shortcuts before Smart Input handling.
+- Prevent recurrence:
+  - Added render coverage that asserts the `Img:` chip starts near the draft hint instead of at the footer edge.
+  - Added raw input coverage for terminal-output override paste routing.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted paste/smart_input tests, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User screenshot/request 2026-05-15
+
+---
+
+#### Ctrl+V image paste missed paste payload events {#ctrl-v-image-paste-payload-events}
+- Date: 2026-05-15
+- Context: User reported that copied screenshots pasted only from right-click or context-menu Paste, while `Ctrl+V` did not paste images into terminal/OpenCode or Smart Input.
+- Error signature: Keyboard image paste handling only recognized primary `V` key events. Some platforms/egui paths expose paste as `Event::Paste(_)`, and Smart Input first-frame focus can leave no focused draft request even though the active terminal has visible Smart Input.
+- Symptoms/Impact:
+  1. `Ctrl+V` did not add Smart Input image attachments.
+  2. `Ctrl+V` did not paste image paths into the terminal.
+  3. Right-click paste worked because it called the clipboard path directly.
+- Root cause:
+  - Image paste routing was tied too narrowly to key events.
+  - Draft attachment layout let the chip consume extra vertical content and push the footer downward.
+- Resolution:
+  - Treat both primary paste key events and `Event::Paste(_)` as image paste triggers.
+  - Route terminal image paste through the same clipboard path before normal text paste handling.
+  - Allow visible active Smart Input to receive image paste even before egui focus memory has caught up.
+  - Draw draft input as a fixed-size frame with a clipped attachment strip and compact remove button.
+- Prevent recurrence:
+  - Add tests for paste payload image attachment, terminal image paste trigger filtering, fixed draft frame height, and compact chip rendering.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted paste/smart_input tests, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
+
+---
+
+#### Egui did not always surface Ctrl+V for image clipboard paste {#native-ctrl-v-image-paste-fallback}
+- Date: 2026-05-15
+- Context: User reported that image paste still worked only through right-click/context-menu paste, while `Ctrl+V` produced no image attachment/path.
+- Error signature: The existing fix handled `Event::Key(Ctrl+V)` and `Event::Paste(_)`, but the user's Windows runtime path did not reliably deliver either event for image-only clipboard data.
+- Symptoms/Impact:
+  1. Smart Input did not receive pasted screenshot attachments via keyboard.
+  2. Terminal/OpenCode did not receive pasted screenshot paths via keyboard.
+  3. Right-click paste continued to work because it bypassed egui input events.
+- Root cause:
+  - Image-only clipboard paste can be swallowed before egui exposes a paste/key event to `raw_input_hook`.
+- Resolution:
+  - Added a Windows-native `GetAsyncKeyState` rising-edge fallback for `Ctrl+V`.
+  - Native fallback runs only when egui did not already expose a paste/key event and only acts if the clipboard contains an image.
+  - Popup/settings/create-worktree and non-Smart text inputs block the fallback to avoid stealing normal text input.
+- Prevent recurrence:
+  - Added tests for native paste rising-edge suppression, target selection, terminal image path queueing, and Smart Input attachment insertion.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted paste/smart_input/ctrl_v tests, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
+
+---
+
+#### Smart Input reclaimed focus after terminal output click {#smart-input-reclaimed-terminal-output-focus}
+- Date: 2026-05-15
+- Context: After the image paste fallback started working, user reported that clicking the terminal while Smart Input was open no longer allowed typing into the terminal.
+- Error signature: `ensure_smart_input_focus()` checked existing Smart Input focus before honoring `terminal_output_focus_override`, so the focused draft cleared the override and kept keyboard ownership.
+- Symptoms/Impact:
+  1. User clicked terminal output but normal text still failed to reach the PTY.
+  2. Smart Input stayed focused despite the explicit terminal-output click.
+- Root cause:
+  - Terminal output override was evaluated after Smart Input focus, letting stale Smart Input focus win.
+  - Active-but-unfocused Smart Input paste fallback was also available to normal input routing.
+- Resolution:
+  - Make terminal output override surrender Smart Input focus before checking `smart_input_has_focus()`.
+  - Keep active Smart Input fallback only for image paste/native paste handling, not normal text routing.
+- Prevent recurrence:
+  - Added tests for Smart Input yielding when output override is active and for normal text routing to terminal after output click.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted smart_input/ctrl_v/paste tests, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
+
+---
+
+#### Smart Input could not regain focus after terminal output focus override {#smart-input-could-not-regain-focus-after-output-override}
+- Date: 2026-05-15
+- Context: After fixing terminal typing while Smart Input was open, user reported that Smart Input itself could no longer accept typed text.
+- Error signature: `terminal_output_focus_override` correctly made Smart Input yield after a terminal-output click, but later Smart Input pane refreshes had no explicit signal that the user clicked back into Smart Input.
+- Symptoms/Impact:
+  1. Clicking the Smart Input draft after typing in terminal did not reliably return keyboard ownership to the draft.
+  2. Text continued to route away from Smart Input until focus state changed indirectly.
+- Root cause:
+  - The previous fix made terminal-output override win before stale Smart Input focus, but Smart Input pane actions always requested draft focus too broadly and did not distinguish real user interaction from normal redraw.
+  - Because redraw actions had no explicit focus target, the code could either steal focus back from terminal or refuse to clear the override for Smart Input.
+- Resolution:
+  - Added explicit Smart Input focus-claim actions with draft/edit/custom targets.
+  - Clear `terminal_output_focus_override` only when the user interacts with Smart Input, then request focus for the intended input.
+  - Leave no-op pane refreshes unable to reclaim focus from terminal output.
+- Prevent recurrence:
+  - Added tests for no-op pane refresh, draft focus reclaim, edit input focus, and raw input routing after the override is cleared.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted smart_input focus tests, `cargo test smart_input -- --nocapture`, `cargo test`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
