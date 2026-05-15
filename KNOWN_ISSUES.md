@@ -1043,3 +1043,59 @@
   - Updated regression assertions to require `features.hooks = true` and verify that `features.codex_hooks` is not written or preserved.
 - Files/Commands touched: `src/codex.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test codex`, `cargo test`
 - References: User request 2026-05-15; OpenAI Codex config docs `https://developers.openai.com/codex/config-basic#supported-features`
+
+---
+
+#### Foreground launcher popup could show Terminal Manager dividers through its margin {#foreground-launcher-popup-margin-opaque-backing}
+- Date: 2026-05-15
+- Context: User reported that the Terminal Manager foreground launcher menu (OpenCode, Codex, Droid, Claude) let the right-side Terminal Manager background/divider remain visible behind the dropdown.
+- Error signature: `draw_launcher_menu_contents()` painted an opaque backing only over the deterministic content rectangle, while egui's `Frame::menu` adds a menu margin around that content.
+- Symptoms/Impact:
+  1. Divider lines from the Terminal Manager could remain visible inside the popup margin.
+  2. The launcher dropdown looked partially transparent even though row backgrounds were opaque.
+- Root cause:
+  - The custom launcher-menu backing rectangle did not include `ui.spacing().menu_margin`, so the frame margin depended on the surrounding popup/frame paint and could visually blend with underlying UI lines.
+- Resolution:
+  - Added launcher-menu sizing helpers and expanded the custom backing rectangle by the active egui menu margin.
+  - Drew the expanded backing with the normal popup border before painting launcher rows.
+- Prevent recurrence:
+  - Added initial content-level regression coverage for opaque backing; later follow-up replaced this with real popup-frame coverage after screenshots showed the issue persisted through the `menu_button` path.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test foreground_launcher_menu -- --nocapture`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-05-15
+
+---
+
+#### Foreground launcher popup frame was only visually solid while hovering rows {#foreground-launcher-custom-opaque-popup}
+- Date: 2026-05-15
+- Context: Follow-up screenshots showed the foreground launcher dropdown still revealed Terminal Manager dividers in its default open state, while row hover made the popup look solid.
+- Error signature: The prior fix painted content-level backing, but the real `ui.menu_button` popup path still depended on egui menu-frame behavior and transparent minimal button chrome.
+- Symptoms/Impact:
+  1. Default open launcher popup could show vertical Terminal Manager lines through row gaps and popup edges.
+  2. Hovering a row hid the issue because the hovered row painted a stronger fill.
+- Root cause:
+  - The launcher dropdown mixed custom row painting with egui's standard `menu_button` popup frame, so the outer popup surface was not controlled by the launcher widget itself.
+- Resolution:
+  - Replaced the launcher-only `ui.menu_button` usage with a custom `egui::Area` popup.
+  - The custom popup uses an always-opaque `Frame` with `SURFACE_BG`, border stroke, menu rounding, and popup shadow before drawing launcher rows.
+- Prevent recurrence:
+  - Added regression coverage that opens the real launcher popup from its button and asserts an opaque fixed-width popup frame exists without hovering any row.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test foreground_launcher_menu -- --nocapture`, `cargo test --no-run`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User screenshots 2026-05-15
+
+---
+
+#### Foreground launcher popup had larger bottom padding than top padding {#foreground-launcher-equal-vertical-padding}
+- Date: 2026-05-15
+- Context: After the popup became fully opaque, user reported the top and bottom empty space around launcher rows should be equal.
+- Error signature: `draw_launcher_menu_contents()` explicitly added equal top/bottom padding, but each row was drawn with `allocate_new_ui()`, which advanced the parent cursor by egui's default `item_spacing.y` after the row.
+- Symptoms/Impact:
+  1. Bottom padding looked larger than top padding.
+  2. The popup frame height was a few pixels taller than the deterministic `padding + rows + row gaps` formula.
+- Root cause:
+  - Launcher row spacing mixed explicit `FOREGROUND_LAUNCHER_ROW_GAP` / `FOREGROUND_LAUNCHER_MENU_PADDING_Y` with implicit egui item spacing.
+- Resolution:
+  - Temporarily set `item_spacing.y = 0.0` while drawing launcher menu contents, then restore the previous spacing.
+- Prevent recurrence:
+  - Added real-popup regression tests that compare the first row's top gap and the last row's bottom gap against the popup frame.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test foreground_launcher -- --nocapture`, `cargo test --no-run`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User screenshot 2026-05-15

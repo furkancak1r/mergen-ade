@@ -5142,7 +5142,7 @@ mod tests {
         // The script should query for video elements and set their playback rates
         // This test verifies the script template contains the expected patterns
         // The actual script is constructed in set_video_playback_rate method
-        let expected_patterns = [
+        let _expected_patterns = [
             "document.querySelectorAll('video')",
             "defaultPlaybackRate",
             "playbackRate",

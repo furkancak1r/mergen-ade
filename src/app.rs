@@ -293,6 +293,7 @@ const FOREGROUND_LAUNCHER_MENU_WIDTH: f32 = 168.0; // Fixed width for foreground
 const FOREGROUND_LAUNCHER_MENU_PADDING_X: f32 = 4.0; // Horizontal padding between menu border and row backgrounds
 const FOREGROUND_LAUNCHER_MENU_PADDING_Y: f32 = 4.0; // Vertical padding before first row / after last row
 const FOREGROUND_LAUNCHER_ROW_GAP: f32 = 2.0; // Gap between launcher rows
+const FOREGROUND_LAUNCHER_ROW_HEIGHT: f32 = 24.0;
 const FOREGROUND_MESSAGE_TEXT_MAX_HEIGHT: f32 = 320.0; // Max height for popup text input area
 const FOREGROUND_TASK_TOOLTIP_MAX_CHARS: usize = 100; // Max chars for task tooltip
 const SETTINGS_NAV_WIDTH: f32 = 144.0;
@@ -29179,6 +29180,37 @@ fn terminal_manager_test_done_toggle(ui: &mut Ui, test_done: bool) -> bool {
     response.clicked()
 }
 
+fn foreground_launcher_menu_content_height(launcher_count: usize) -> f32 {
+    if launcher_count == 0 {
+        FOREGROUND_LAUNCHER_ROW_HEIGHT
+    } else {
+        launcher_count as f32 * FOREGROUND_LAUNCHER_ROW_HEIGHT
+            + launcher_count.saturating_sub(1) as f32 * FOREGROUND_LAUNCHER_ROW_GAP
+    }
+}
+
+fn foreground_launcher_menu_total_height(launcher_count: usize) -> f32 {
+    FOREGROUND_LAUNCHER_MENU_PADDING_Y * 2.0
+        + foreground_launcher_menu_content_height(launcher_count)
+}
+
+fn foreground_launcher_popup_frame(ui: &Ui) -> egui::Frame {
+    egui::Frame::none()
+        .fill(SURFACE_BG)
+        .stroke(egui::Stroke::new(1.0, BORDER_COLOR))
+        .rounding(ui.style().visuals.menu_rounding)
+        .shadow(ui.style().visuals.popup_shadow)
+        .inner_margin(egui::Margin::ZERO)
+}
+
+fn foreground_launcher_popup_position(ui: &Ui, response: &egui::Response) -> egui::Pos2 {
+    let mut pos = response.rect.left_bottom() + egui::vec2(0.0, ui.spacing().menu_spacing);
+    if let Some(transform) = ui.memory(|mem| mem.layer_transforms.get(&ui.layer_id()).copied()) {
+        pos = transform * pos;
+    }
+    pos
+}
+
 fn draw_launcher_menu_contents(
     app: &mut AdeApp,
     ui: &mut Ui,
@@ -29186,18 +29218,9 @@ fn draw_launcher_menu_contents(
 ) -> Option<String> {
     let mut selected_launcher = None;
     let menu_width = FOREGROUND_LAUNCHER_MENU_WIDTH;
-    let row_height = 24.0;
-    let content_height = if launchers.is_empty() {
-        row_height
-    } else {
-        launchers.len() as f32 * row_height
-            + (launchers.len().saturating_sub(1)) as f32 * FOREGROUND_LAUNCHER_ROW_GAP
-    };
-    let total_height = FOREGROUND_LAUNCHER_MENU_PADDING_Y * 2.0 + content_height;
-    let backing_rect =
-        egui::Rect::from_min_size(ui.cursor().min, egui::vec2(menu_width, total_height));
-    let rounding = ui.style().visuals.menu_rounding;
-    ui.painter().rect_filled(backing_rect, rounding, SURFACE_BG);
+    let row_height = FOREGROUND_LAUNCHER_ROW_HEIGHT;
+    let previous_item_spacing_y = ui.spacing().item_spacing.y;
+    ui.spacing_mut().item_spacing.y = 0.0;
 
     ui.set_min_width(menu_width);
     ui.set_max_width(menu_width);
@@ -29214,66 +29237,73 @@ fn draw_launcher_menu_contents(
                 .layout(Layout::left_to_right(Align::Center)),
             |ui| {
                 ui.add_space(6.0);
-                ui.label(
-                    RichText::new("Enable a launcher in Settings > Launchers")
-                        .small()
-                        .color(TEXT_MUTED),
-                );
-            },
-        );
-        ui.add_space(FOREGROUND_LAUNCHER_MENU_PADDING_Y);
-        return selected_launcher;
-    }
-
-    for (index, launcher) in launchers.iter().enumerate() {
-        let full_row_rect =
-            egui::Rect::from_min_size(ui.cursor().min, egui::vec2(menu_width, row_height));
-        let row_rect = full_row_rect.shrink2(egui::vec2(FOREGROUND_LAUNCHER_MENU_PADDING_X, 0.0));
-        let is_hovered = ui.rect_contains_pointer(row_rect);
-        let row_bg = if is_hovered {
-            BTN_ICON_HOVER
-        } else {
-            SURFACE_BG_SOFT
-        };
-        ui.painter().rect_filled(row_rect, 6.0, row_bg);
-
-        let inner_response = ui.allocate_new_ui(
-            egui::UiBuilder::new()
-                .max_rect(row_rect)
-                .layout(Layout::left_to_right(Align::Center))
-                .sense(Sense::click()),
-            |ui| {
-                ui.add_space(6.0);
-                let _ = app.draw_launcher_icon(ui, launcher.icon_key, 16.0);
-                ui.add_space(6.0);
                 ui.add(
                     egui::Label::new(
-                        RichText::new(&launcher.display_name)
-                            .strong()
-                            .color(TEXT_PRIMARY),
+                        RichText::new("Enable a launcher in Settings > Launchers")
+                            .small()
+                            .color(TEXT_MUTED),
                     )
                     .selectable(false)
                     .truncate(),
                 );
-                ui.response()
             },
         );
-        let row_response = inner_response.inner.on_hover_text(format!(
-            "{}\n{}",
-            launcher.display_name, launcher.launch_command
-        ));
-        if row_response.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        if row_response.clicked() {
-            selected_launcher = Some(launcher.id.clone());
-            ui.close_menu();
-        }
-        if index + 1 < launchers.len() {
-            ui.add_space(FOREGROUND_LAUNCHER_ROW_GAP);
+    } else {
+        for (index, launcher) in launchers.iter().enumerate() {
+            let full_row_rect =
+                egui::Rect::from_min_size(ui.cursor().min, egui::vec2(menu_width, row_height));
+            let row_rect =
+                full_row_rect.shrink2(egui::vec2(FOREGROUND_LAUNCHER_MENU_PADDING_X, 0.0));
+            let is_hovered = ui.rect_contains_pointer(row_rect);
+            let row_bg = if is_hovered {
+                BTN_ICON_HOVER
+            } else {
+                SURFACE_BG_SOFT
+            };
+            ui.painter().rect_filled(row_rect, 6.0, row_bg);
+
+            let inner_response = ui.allocate_new_ui(
+                egui::UiBuilder::new()
+                    .max_rect(row_rect)
+                    .layout(Layout::left_to_right(Align::Center))
+                    .sense(Sense::click()),
+                |ui| {
+                    ui.add_space(6.0);
+                    let _ = app.draw_launcher_icon(ui, launcher.icon_key, 16.0);
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&launcher.display_name)
+                                .strong()
+                                .color(TEXT_PRIMARY),
+                        )
+                        .selectable(false)
+                        .truncate(),
+                    );
+                    ui.response()
+                },
+            );
+            let row_response = inner_response.inner.on_hover_text(format!(
+                "{}\n{}",
+                launcher.display_name, launcher.launch_command
+            ));
+            if row_response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if row_response.clicked() {
+                selected_launcher = Some(launcher.id.clone());
+                ui.memory_mut(|mem| mem.close_popup());
+                ui.close_menu();
+            }
+            if index + 1 < launchers.len() {
+                ui.add_space(FOREGROUND_LAUNCHER_ROW_GAP);
+            }
         }
     }
+
     ui.add_space(FOREGROUND_LAUNCHER_MENU_PADDING_Y);
+    ui.spacing_mut().item_spacing.y = previous_item_spacing_y;
+
     selected_launcher
 }
 
@@ -29288,40 +29318,73 @@ fn styled_launcher_menu_button(
     launchers: &[LauncherEntry],
 ) -> Option<String> {
     let mut selected_launcher = None;
-    let (slot_rect, slot_response) = ui.allocate_exact_size(
+    let (button_rect, button_response) = ui.allocate_exact_size(
         egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT),
-        Sense::hover(),
+        Sense::click(),
     );
-    let slot_response = slot_response.on_hover_cursor(egui::CursorIcon::PointingHand);
-    let menu = ui
-        .scope_builder(
-            egui::UiBuilder::new()
-                .max_rect(slot_rect)
-                .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
-            |ui| {
-                with_minimal_button_chrome(ui, |ui| {
-                    ui.menu_button(format!("{icon}"), |ui| {
-                        with_minimal_button_chrome(ui, |ui| {
-                            selected_launcher = draw_launcher_menu_contents(app, ui, launchers);
-                        });
-                    })
-                })
-            },
-        )
-        .inner;
-
-    let response = menu
-        .response
+    let response = button_response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text(if launchers.is_empty() {
             "No foreground launchers enabled"
         } else {
             tooltip
-        })
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .union(slot_response);
+        });
+    let popup_id = response.id.with("foreground_launcher_popup");
+
+    if response.clicked() {
+        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+    }
+
+    let popup_open = ui.memory(|mem| mem.is_popup_open(popup_id));
+    if response.hovered() || response.is_pointer_button_down_on() || popup_open {
+        ui.painter().rect_filled(
+            button_rect.shrink(1.0),
+            8.0,
+            with_alpha(BTN_ICON_HOVER, 110),
+        );
+    }
+
+    let icon_color = if response.hovered() || response.is_pointer_button_down_on() || popup_open {
+        TEXT_PRIMARY
+    } else {
+        with_alpha(TEXT_PRIMARY, 170)
+    };
+    ui.painter().text(
+        button_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        format!("{icon}"),
+        egui::FontId::proportional(14.0),
+        icon_color,
+    );
 
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    if popup_open {
+        let ctx = ui.ctx().clone();
+        let popup_pos = foreground_launcher_popup_position(ui, &response);
+        let popup_response = egui::Area::new(popup_id)
+            .kind(egui::UiKind::Popup)
+            .order(egui::Order::Foreground)
+            .fixed_pos(popup_pos)
+            .fade_in(false)
+            .show(&ctx, |ui| {
+                foreground_launcher_popup_frame(ui).show(ui, |ui| {
+                    ui.set_min_width(FOREGROUND_LAUNCHER_MENU_WIDTH);
+                    ui.set_max_width(FOREGROUND_LAUNCHER_MENU_WIDTH);
+                    selected_launcher = draw_launcher_menu_contents(app, ui, launchers);
+                });
+            });
+
+        let clicked_outside =
+            response.clicked_elsewhere() && popup_response.response.clicked_elsewhere();
+        if selected_launcher.is_some()
+            || clicked_outside
+            || ctx.input(|input| input.key_pressed(egui::Key::Escape))
+        {
+            ctx.memory_mut(|mem| mem.close_popup());
+        }
     }
 
     selected_launcher
@@ -31095,26 +31158,22 @@ fn normalize_terminal_background(color: TerminalColor) -> Color32 {
 mod tests {
     use std::collections::BTreeSet;
 
-    use egui::{Align, Layout};
-
     use super::{
         ai_badge_tooltip_lines, ai_badge_visual, ai_cli_logo_key_for_terminal,
         average_terminal_cell_width, build_terminal_cursor_overlay, build_terminal_render,
         collect_source_control_line_totals, collect_source_control_snapshot,
         configure_terminal_font_family, count_text_line_bytes, cursor_hidden_by_row_filter,
         deduplicated_recent_inputs, default_app_open_command, design_inspect_delivery_signature,
-        design_inspect_matches_current_page, design_inspect_should_deliver,
-        detach_terminal_prompt_scroll_anchor_on_manual_scroll, draw_ai_badge,
-        draw_terminal_manager_title_and_diff_summary, draw_terminal_manager_worktree_row,
-        draw_terminal_status_badges, embedded_browser_should_yield_to_ui_layer,
-        file_editor_selection_drag_active_after_input, force_terminal_pane_width,
-        format_design_inspect_terminal_text, install_terminal_font_family,
-        launcher_icon_for_ai_tool, merge_source_control_refresh_result,
-        next_active_terminal_after_close, next_terminal_in_direction,
-        next_terminal_in_linear_direction, normalize_terminal_background, parse_branch_header,
-        parse_git_numstat_totals, primary_shortcut_modifier, project_group_header_action_spec,
-        recent_inputs_tooltip_text, recover_config_state, resolve_ctrl_c_action,
-        sanitize_design_inspect_value, selection_edge_autoscroll_delta,
+        design_inspect_should_deliver, detach_terminal_prompt_scroll_anchor_on_manual_scroll,
+        draw_ai_badge, draw_terminal_manager_title_and_diff_summary, draw_terminal_status_badges,
+        embedded_browser_should_yield_to_ui_layer, file_editor_selection_drag_active_after_input,
+        force_terminal_pane_width, format_design_inspect_terminal_text,
+        install_terminal_font_family, launcher_icon_for_ai_tool,
+        merge_source_control_refresh_result, next_active_terminal_after_close,
+        next_terminal_in_direction, next_terminal_in_linear_direction,
+        normalize_terminal_background, parse_branch_header, parse_git_numstat_totals,
+        primary_shortcut_modifier, recent_inputs_tooltip_text, recover_config_state,
+        resolve_ctrl_c_action, sanitize_design_inspect_value, selection_edge_autoscroll_delta,
         selection_edge_autoscroll_speed, settings_accordion_disclosure_icon_rect,
         settings_diagnostics_accordion_header_layout, settings_diagnostics_uses_single_column,
         settings_general_inline_control_width, settings_general_uses_stacked_layout,
@@ -31144,10 +31203,10 @@ mod tests {
         FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
         FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, FileEditorState,
         OpenCodeAttentionReason, OpenCodeQuestionInfo, OpenCodeQuestionOption,
-        OpenCodeStatusSource, OpenCodeTransportStatus, OpenFileBuffer, OsNotificationKind,
-        PendingConfigChanges, PendingOsNotification, PendingRerunPhase, PendingTerminalLinkClick,
-        SettingsSection, SmartInputAttachment, SmartInputState, SmartInputSubmitRequest,
-        SmartInputTask, SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
+        OpenCodeStatusSource, OpenCodeTransportStatus, OsNotificationKind, PendingConfigChanges,
+        PendingOsNotification, PendingRerunPhase, PendingTerminalLinkClick, SettingsSection,
+        SmartInputAttachment, SmartInputState, SmartInputSubmitRequest, SmartInputTask,
+        SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
         SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
         TerminalOutputScrollBehavior, TerminalSecondaryClickAction, TerminalSelection,
@@ -31160,10 +31219,9 @@ mod tests {
         PENDING_RERUN_BATCH_PROMPT_WAIT_MS, PENDING_RERUN_SETTLE_MS,
         SMART_INPUT_AUTO_DISPATCH_SETTLE_MS, SMART_INPUT_BASE_FOOTER_HEIGHT,
         SMART_INPUT_EMPTY_QUEUE_HINT_HEIGHT, SOURCE_CONTROL_CHANNEL_CAPACITY,
-        SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, SURFACE_BG, TERMINAL_COPY_FEEDBACK_TEXT,
+        SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, TERMINAL_COPY_FEEDBACK_TEXT,
         TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS, TERMINAL_OUTPUT_BG,
-        TEXT_MUTED, TEXT_PRIMARY, TRANSIENT_TOAST_MAX_WIDTH, TRANSIENT_TOAST_MIN_WIDTH,
-        TRANSIENT_TOAST_SCREEN_MARGIN, TRANSIENT_TOAST_SECS, TRANSIENT_TOAST_TEXT_EXTRA_PADDING,
+        TRANSIENT_TOAST_MAX_WIDTH, TRANSIENT_TOAST_MIN_WIDTH, TRANSIENT_TOAST_SECS,
     };
     use crate::browser_video::BrowserVideoEncodeResult;
     use crate::codex::{CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
@@ -31175,8 +31233,7 @@ mod tests {
     use crate::layout;
     use crate::models::{
         AppConfig, AppHistory, BuiltinLauncherKind, LauncherEntry, LauncherIconKey, LeftSidebarTab,
-        MainVisibilityMode, ProjectRecord, ShellKind, ShortcutModifiers, TerminalKind,
-        TerminalManagerFilter, TerminalShortcutEntry,
+        MainVisibilityMode, ProjectRecord, ShellKind, TerminalKind, TerminalManagerFilter,
     };
     use crate::opencode::{OpenCodeNotifyInboxEvent, OPENCODE_SESSION_IDLE_EVENT};
     use crate::terminal::{
@@ -31190,7 +31247,7 @@ mod tests {
     use eframe::egui::text::{LayoutJob, TextFormat};
     use eframe::egui::{
         self, pos2, Color32, Context, Event, FontDefinitions, FontFamily, Galley, Id, Key,
-        Modifiers, RawInput, RichText, Sense, Stroke,
+        Modifiers, RawInput, Stroke,
     };
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
@@ -34432,6 +34489,62 @@ mod tests {
         })
     }
 
+    fn draw_foreground_launcher_button_in_test_ui(
+        ctx: &Context,
+        raw_input: RawInput,
+        launchers: &[LauncherEntry],
+    ) -> egui::FullOutput {
+        let mut app = test_app(std::iter::empty(), None);
+        ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(240.0, 180.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        let _ = super::styled_launcher_menu_button(
+                            &mut app,
+                            ui,
+                            AppIcon::Terminal,
+                            super::BTN_BLUE,
+                            super::BTN_BLUE_HOVER,
+                            super::BTN_ICON_ACTIVE,
+                            "Open Foreground Launcher",
+                            launchers,
+                        );
+                    },
+                );
+            });
+        })
+    }
+
+    fn draw_open_foreground_launcher_popup_in_test_ui(
+        ctx: &Context,
+        launchers: &[LauncherEntry],
+    ) -> egui::FullOutput {
+        let click_pos = pos2(22.0, 22.0);
+        let _ = draw_foreground_launcher_button_in_test_ui(
+            ctx,
+            RawInput {
+                events: vec![Event::PointerMoved(click_pos)],
+                ..RawInput::default()
+            },
+            launchers,
+        );
+        let _ = draw_foreground_launcher_button_in_test_ui(
+            ctx,
+            terminal_manager_filter_click_input(click_pos),
+            launchers,
+        );
+        draw_foreground_launcher_button_in_test_ui(
+            ctx,
+            RawInput {
+                events: vec![Event::PointerMoved(click_pos)],
+                ..RawInput::default()
+            },
+            launchers,
+        )
+    }
+
     #[test]
     fn foreground_launcher_menu_row_does_not_exceed_fixed_width() {
         // Regression test: launcher menu rows must not exceed the fixed menu width
@@ -34511,9 +34624,9 @@ mod tests {
     }
 
     #[test]
-    fn foreground_launcher_menu_popup_has_opaque_backing() {
-        // Regression test: launcher menu popup must paint an opaque backing rect
-        // that covers the full deterministic popup area (padding + rows + gaps).
+    fn foreground_launcher_popup_default_open_has_opaque_frame() {
+        // Regression test: opening the real foreground launcher popup must paint
+        // an opaque frame even when no launcher row is hovered.
         let ctx = Context::default();
         ctx.set_fonts(FontDefinitions::default());
 
@@ -34526,48 +34639,140 @@ mod tests {
             icon_key: LauncherIconKey::OpenCode,
         }];
 
-        let output =
-            draw_foreground_launcher_menu_in_test_ui(&ctx, RawInput::default(), &launchers);
+        let output = draw_open_foreground_launcher_popup_in_test_ui(&ctx, &launchers);
 
-        let expected_total_height = super::FOREGROUND_LAUNCHER_MENU_PADDING_Y * 2.0
-            + launchers.len() as f32 * 24.0
-            + (launchers.len().saturating_sub(1)) as f32 * super::FOREGROUND_LAUNCHER_ROW_GAP;
-        let covers_full_popup = output.shapes.iter().any(|shape| {
-            if let egui::epaint::Shape::Rect(rect_shape) = &shape.shape {
-                rect_shape.fill == super::SURFACE_BG
-                    && rect_shape.rect.width() >= super::FOREGROUND_LAUNCHER_MENU_WIDTH - 1.0
-                    && rect_shape.rect.height() >= expected_total_height - 1.0
-            } else {
-                false
-            }
+        let expected_total_height = super::foreground_launcher_menu_total_height(launchers.len());
+        let covers_full_popup = frame_contains_rect_matching(&output, |rect_shape| {
+            rect_shape.fill == super::SURFACE_BG
+                && (rect_shape.rect.width() - super::FOREGROUND_LAUNCHER_MENU_WIDTH).abs() <= 1.0
+                && rect_shape.rect.height() >= expected_total_height - 1.0
         });
         assert!(
             covers_full_popup,
-            "launcher menu popup backing must cover the full deterministic popup area"
+            "launcher popup must paint an opaque frame at its fixed width before hover"
         );
     }
 
     #[test]
-    fn foreground_launcher_menu_empty_has_opaque_backing() {
-        // Regression test: empty launcher menu popup must also paint a full opaque backing.
+    fn foreground_launcher_empty_popup_default_open_has_opaque_frame() {
+        // Regression test: empty launcher popup must also paint an opaque frame.
         let ctx = Context::default();
         ctx.set_fonts(FontDefinitions::default());
 
-        let output = draw_foreground_launcher_menu_in_test_ui(&ctx, RawInput::default(), &[]);
+        let output = draw_open_foreground_launcher_popup_in_test_ui(&ctx, &[]);
 
-        let expected_total_height = super::FOREGROUND_LAUNCHER_MENU_PADDING_Y * 2.0 + 24.0;
-        let covers_full_popup = output.shapes.iter().any(|shape| {
-            if let egui::epaint::Shape::Rect(rect_shape) = &shape.shape {
-                rect_shape.fill == super::SURFACE_BG
-                    && rect_shape.rect.width() >= super::FOREGROUND_LAUNCHER_MENU_WIDTH - 1.0
-                    && rect_shape.rect.height() >= expected_total_height - 1.0
-            } else {
-                false
-            }
+        let expected_total_height = super::foreground_launcher_menu_total_height(0);
+        let covers_full_popup = frame_contains_rect_matching(&output, |rect_shape| {
+            rect_shape.fill == super::SURFACE_BG
+                && (rect_shape.rect.width() - super::FOREGROUND_LAUNCHER_MENU_WIDTH).abs() <= 1.0
+                && rect_shape.rect.height() >= expected_total_height - 1.0
         });
         assert!(
             covers_full_popup,
-            "empty launcher menu popup backing must cover full deterministic popup area"
+            "empty launcher popup must paint an opaque frame at its fixed width"
+        );
+    }
+
+    #[test]
+    fn foreground_launcher_popup_has_equal_vertical_padding() {
+        // Regression test: popup top and bottom padding should be visually equal.
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let launchers = vec![
+            LauncherEntry {
+                id: "opencode".to_owned(),
+                builtin: Some(BuiltinLauncherKind::OpenCode),
+                display_name: "OpenCode".to_owned(),
+                launch_command: "opencode".to_owned(),
+                enabled: true,
+                icon_key: LauncherIconKey::OpenCode,
+            },
+            LauncherEntry {
+                id: "codex".to_owned(),
+                builtin: Some(BuiltinLauncherKind::Codex),
+                display_name: "Codex".to_owned(),
+                launch_command: "codex".to_owned(),
+                enabled: true,
+                icon_key: LauncherIconKey::Codex,
+            },
+            LauncherEntry {
+                id: "droid".to_owned(),
+                builtin: Some(BuiltinLauncherKind::Droid),
+                display_name: "Droid".to_owned(),
+                launch_command: "droid".to_owned(),
+                enabled: true,
+                icon_key: LauncherIconKey::Droid,
+            },
+            LauncherEntry {
+                id: "claude".to_owned(),
+                builtin: Some(BuiltinLauncherKind::Claude),
+                display_name: "Claude".to_owned(),
+                launch_command: "claude".to_owned(),
+                enabled: true,
+                icon_key: LauncherIconKey::Claude,
+            },
+        ];
+
+        let output = draw_open_foreground_launcher_popup_in_test_ui(&ctx, &launchers);
+
+        assert_foreground_launcher_vertical_padding(&output, launchers.len());
+    }
+
+    #[test]
+    fn foreground_launcher_empty_popup_has_equal_vertical_padding() {
+        // Regression test: empty popup uses the same top/bottom padding contract.
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+
+        let output = draw_open_foreground_launcher_popup_in_test_ui(&ctx, &[]);
+
+        assert_foreground_launcher_vertical_padding(&output, 1);
+    }
+
+    fn assert_foreground_launcher_vertical_padding(
+        output: &egui::FullOutput,
+        expected_row_count: usize,
+    ) {
+        let expected_frame_height =
+            super::foreground_launcher_menu_total_height(expected_row_count);
+        let frame_rect = collect_rects_matching(output, |rect_shape| {
+            rect_shape.fill == super::SURFACE_BG
+                && (rect_shape.rect.width() - super::FOREGROUND_LAUNCHER_MENU_WIDTH).abs() <= 1.0
+                && (rect_shape.rect.height() - expected_frame_height).abs() <= 1.0
+        })
+        .into_iter()
+        .max_by(|a, b| a.area().total_cmp(&b.area()))
+        .expect("foreground launcher popup frame rect");
+
+        let expected_row_width =
+            super::FOREGROUND_LAUNCHER_MENU_WIDTH - 2.0 * super::FOREGROUND_LAUNCHER_MENU_PADDING_X;
+        let mut row_rects = collect_rects_matching(output, |rect_shape| {
+            rect_shape.fill == super::SURFACE_BG_SOFT
+                && (rect_shape.rect.width() - expected_row_width).abs() <= 1.0
+                && (rect_shape.rect.height() - super::FOREGROUND_LAUNCHER_ROW_HEIGHT).abs() <= 1.0
+        });
+        row_rects.sort_by(|a, b| a.top().total_cmp(&b.top()));
+
+        assert_eq!(
+            row_rects.len(),
+            expected_row_count,
+            "launcher popup should have {expected_row_count} row backgrounds"
+        );
+
+        let top_gap = row_rects.first().expect("first row").top() - frame_rect.top();
+        let bottom_gap = frame_rect.bottom() - row_rects.last().expect("last row").bottom();
+        assert!(
+            (top_gap - bottom_gap).abs() <= 0.5,
+            "top and bottom padding must match; top={top_gap}, bottom={bottom_gap}, frame={frame_rect:?}, rows={row_rects:?}"
+        );
+        assert!(
+            (top_gap - super::FOREGROUND_LAUNCHER_MENU_PADDING_Y).abs() <= 0.5,
+            "top padding should match configured padding"
+        );
+        assert!(
+            (bottom_gap - super::FOREGROUND_LAUNCHER_MENU_PADDING_Y).abs() <= 0.5,
+            "bottom padding should match configured padding"
         );
     }
 
@@ -41612,6 +41817,58 @@ mod tests {
             .any(|shape| shape_contains_rect_filled(&shape.shape, fill))
     }
 
+    fn shape_contains_rect_matching(
+        shape: &egui::epaint::Shape,
+        matches: &mut impl FnMut(&egui::epaint::RectShape) -> bool,
+    ) -> bool {
+        match shape {
+            egui::epaint::Shape::Rect(rect_shape) => matches(rect_shape),
+            egui::epaint::Shape::Vec(shapes) => shapes
+                .iter()
+                .any(|shape| shape_contains_rect_matching(shape, matches)),
+            _ => false,
+        }
+    }
+
+    fn frame_contains_rect_matching(
+        output: &egui::FullOutput,
+        mut matches: impl FnMut(&egui::epaint::RectShape) -> bool,
+    ) -> bool {
+        output
+            .shapes
+            .iter()
+            .any(|shape| shape_contains_rect_matching(&shape.shape, &mut matches))
+    }
+
+    fn collect_shape_rects_matching(
+        shape: &egui::epaint::Shape,
+        matches: &mut impl FnMut(&egui::epaint::RectShape) -> bool,
+        rects: &mut Vec<egui::Rect>,
+    ) {
+        match shape {
+            egui::epaint::Shape::Rect(rect_shape) if matches(rect_shape) => {
+                rects.push(rect_shape.rect);
+            }
+            egui::epaint::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_shape_rects_matching(shape, matches, rects);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_rects_matching(
+        output: &egui::FullOutput,
+        mut matches: impl FnMut(&egui::epaint::RectShape) -> bool,
+    ) -> Vec<egui::Rect> {
+        let mut rects = Vec::new();
+        for shape in &output.shapes {
+            collect_shape_rects_matching(&shape.shape, &mut matches, &mut rects);
+        }
+        rects
+    }
+
     fn snapshot_codex_launch_baseline(
         app: &AdeApp,
         terminal_id: u64,
@@ -42524,10 +42781,7 @@ mod tests {
     #[test]
     fn directory_index_snapshot_with_partial_warning_still_has_children() {
         // Regression test: ensure partial_warning doesn't prevent tree rendering
-        use super::{
-            DirectoryIndexSnapshot, DirectoryIndexTruncationFlags, DirectoryNode,
-            DirectorySubtreeResult,
-        };
+        use super::{DirectoryIndexSnapshot, DirectoryIndexTruncationFlags, DirectoryNode};
         use std::path::PathBuf;
 
         // Create a snapshot with partial warning and children
@@ -42613,8 +42867,7 @@ mod tests {
     fn initial_directory_scan_defers_all_child_directories() {
         // Regression test: InitialRoot mode should defer ALL directories, not just heavy ones
         use super::{
-            build_directory_node_from_entry, DirectoryIndexBuildState,
-            DirectoryIndexTruncationFlags, DirectoryScanMode,
+            build_directory_node_from_entry, DirectoryIndexBuildState, DirectoryScanMode,
             DIRECTORY_INDEX_FULL_SCAN_TIME_BUDGET_MS,
         };
         use std::path::PathBuf;
@@ -42693,7 +42946,7 @@ mod tests {
     #[test]
     fn build_state_should_stop_respects_time_budget() {
         // Test that should_stop() correctly detects time budget exhaustion
-        use super::{DirectoryIndexBuildState, DIRECTORY_INDEX_FULL_SCAN_TIME_BUDGET_MS};
+        use super::DirectoryIndexBuildState;
 
         // Create a build state with a very short time budget
         let mut build_state = DirectoryIndexBuildState::new(1); // 1ms budget
@@ -42796,7 +43049,6 @@ mod tests {
         // Regression test: When searching, deferred directories whose names DON'T match
         // the query should still be queued for loading, because matches may exist inside them.
         use super::{collect_search_deferred_directory_paths, DirectoryNode};
-        use std::collections::HashSet;
         use std::path::PathBuf;
 
         // Create a deferred src directory (name doesn't match "foo")
@@ -43132,9 +43384,7 @@ mod tests {
     #[test]
     fn directory_search_should_load_deferred_counts_chars_not_bytes() {
         // Regression test: Unicode queries should use character count, not byte count
-        use super::{
-            directory_search_should_load_deferred, DIRECTORY_SEARCH_MIN_DEFERRED_QUERY_CHARS,
-        };
+        use super::directory_search_should_load_deferred;
 
         let now = 10.0;
         let stable_time = now - 1.0; // Well past debounce
@@ -43331,7 +43581,7 @@ mod tests {
         ctx.set_fonts(egui::FontDefinitions::default());
 
         let mut job_result = None;
-        ctx.run(egui::RawInput::default(), |ctx| {
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 job_result = Some(directory_search_highlight_layout_job(
                     ui,
@@ -43359,7 +43609,7 @@ mod tests {
         ctx.set_fonts(egui::FontDefinitions::default());
 
         let mut job_result = None;
-        ctx.run(egui::RawInput::default(), |ctx| {
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 job_result = Some(directory_search_highlight_layout_job(
                     ui,
@@ -43496,7 +43746,7 @@ mod tests {
     #[test]
     fn directory_index_drain_stale_commands_prefers_latest_full() {
         // Test that drain_stale_directory_commands prefers the latest Full command
-        use super::{drain_stale_directory_commands, DirectoryIndexCommand, DirectoryScanMode};
+        use super::{drain_stale_directory_commands, DirectoryIndexCommand};
         use crossbeam_channel::unbounded;
         use std::path::PathBuf;
 
@@ -43551,7 +43801,7 @@ mod tests {
     fn drain_stale_commands_prioritizes_subtree_over_full() {
         // Regression test: Subtree commands should be processed before Full commands
         // to ensure deferred loading doesn't get dropped
-        use super::{drain_stale_directory_commands, DirectoryIndexCommand, DirectoryScanMode};
+        use super::{drain_stale_directory_commands, DirectoryIndexCommand};
         use crossbeam_channel::unbounded;
         use std::path::PathBuf;
 
@@ -43675,7 +43925,7 @@ mod tests {
         assert_eq!(pixel_width, 400);
         assert_eq!(pixel_height, 300);
         // A 5px height difference (within one cell) keeps the same pixel_height.
-        let (cols2, lines2) = terminal_grid_dimensions(egui::vec2(400.0, 305.0), 10.0, 20.0);
+        let (_cols2, lines2) = terminal_grid_dimensions(egui::vec2(400.0, 305.0), 10.0, 20.0);
         let pixel_height2 = (lines2 as f32 * 20.0).round() as u16;
         assert_eq!(pixel_height2, 300);
         assert_eq!(
@@ -47285,8 +47535,8 @@ mod tests {
         // Regression test: TextEdit::multiline must have enough rows for long files
         // to allow ScrollArea to scroll. Previously desired_rows was fixed to visible
         // viewport, causing scroll to not work for files longer than screen height.
-        use super::{OpenFileBuffer, FILE_EDITOR_INPUT_ID};
-        use egui::{Context, FontDefinitions, RawInput};
+        use super::OpenFileBuffer;
+        use egui::{Context, FontDefinitions};
 
         let ctx = Context::default();
         ctx.set_fonts(FontDefinitions::default());
@@ -48147,8 +48397,7 @@ mod tests {
         // Regression test: Normal deferred directories should NOT have visible placeholder children.
         // Placeholders are only for exceptional states (truncation, errors), not normal lazy-load.
         use super::{
-            build_directory_node_from_entry, DirectoryIndexBuildState,
-            DirectoryIndexTruncationFlags, DirectoryScanMode,
+            build_directory_node_from_entry, DirectoryIndexBuildState, DirectoryScanMode,
             DIRECTORY_INDEX_FULL_SCAN_TIME_BUDGET_MS,
         };
         use std::path::PathBuf;
@@ -48197,7 +48446,7 @@ mod tests {
     fn drain_stale_commands_preserves_multiple_subtrees() {
         // Regression test: All distinct Subtree commands must be preserved, never dropped.
         // Previously, drain_stale_directory_commands returned only one command.
-        use super::{drain_stale_directory_commands, DirectoryIndexCommand, DirectoryScanMode};
+        use super::{drain_stale_directory_commands, DirectoryIndexCommand};
         use crossbeam_channel::unbounded;
         use std::path::PathBuf;
 
@@ -48255,7 +48504,7 @@ mod tests {
     #[test]
     fn drain_stale_commands_keeps_latest_full_per_project() {
         // Regression test: Multiple Full commands for same project should keep only latest.
-        use super::{drain_stale_directory_commands, DirectoryIndexCommand, DirectoryScanMode};
+        use super::{drain_stale_directory_commands, DirectoryIndexCommand};
         use crossbeam_channel::unbounded;
         use std::path::PathBuf;
 
@@ -50310,7 +50559,6 @@ mod tests {
 
     #[test]
     fn browser_url_changed_event_updates_draft_and_project_url() {
-        let ctx = egui::Context::default();
         let mut app = test_app([], None);
 
         // Add a project and set initial URL
@@ -50916,7 +51164,6 @@ mod tests {
 
     #[test]
     fn browser_recording_load_finished_requests_playback_rate_for_mp4() {
-        let ctx = egui::Context::default();
         let mut app = test_app([], None);
         app.projects
             .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
@@ -50946,7 +51193,6 @@ mod tests {
 
     #[test]
     fn browser_page_load_finished_does_not_request_playback_rate() {
-        let ctx = egui::Context::default();
         let mut app = test_app([], None);
         app.projects
             .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
@@ -51038,7 +51284,6 @@ mod tests {
 
     #[test]
     fn browser_url_changed_event_is_project_scoped() {
-        let ctx = egui::Context::default();
         let mut app = test_app([], None);
 
         // Add two projects with different URLs
@@ -51085,7 +51330,6 @@ mod tests {
 
     #[test]
     fn browser_url_changed_event_persists_only_when_url_changes() {
-        let ctx = egui::Context::default();
         let mut app = test_app([], None);
 
         // Add a project
@@ -51202,7 +51446,6 @@ mod tests {
 
     #[test]
     fn checklist_open_closes_only_active_browser_for_scope_state() {
-        let ctx = egui::Context::default();
         let mut app = test_app([], None);
 
         // Add two projects
@@ -51253,7 +51496,6 @@ mod tests {
     #[test]
     fn browser_panel_open_state_does_not_change_config() {
         // Regression test: Runtime browser open state must not be mirrored to config.
-        let ctx = egui::Context::default();
         let mut app = test_app([], None);
         let project = test_project(1, "Demo", "C:/demo", &[], &[]);
         app.projects.insert(1, project);
@@ -51274,7 +51516,7 @@ mod tests {
     #[test]
     fn config_recovery_sanitizes_browser_panel_expanded() {
         // Regression test: recover_config_state must reset browser_panel_expanded to false.
-        use crate::models::{AppConfig, UiConfig};
+        use crate::models::AppConfig;
 
         let current_config = AppConfig::default();
         let current_projects = std::collections::BTreeMap::new();
@@ -51679,7 +51921,6 @@ mod tests {
     fn directory_search_tracking_resets_on_project_change() {
         // Regression test: Changing selected project must reset directory search tracking
         // so the same query re-runs for the new project.
-        let ctx = Context::default();
         let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
         app.projects
             .insert(7, test_project(7, "Project1", "C:/proj1", &[], &[]));
@@ -53776,7 +54017,6 @@ mod tests {
     #[test]
     fn foreground_message_popup_execute_save_adds_new_task() {
         // Test that execute_foreground_message_popup_save adds a new task
-        let ctx = egui::Context::default();
         let mut app = test_app([], None);
         app.projects
             .insert(7, test_project(7, "TestProject", "C:/test", &[], &[]));
@@ -53802,7 +54042,6 @@ mod tests {
     #[test]
     fn foreground_message_popup_execute_save_edits_existing_task() {
         // Test that execute_foreground_message_popup_save edits an existing task
-        let ctx = egui::Context::default();
         let mut app = test_app([], None);
         let mut project = test_project(7, "TestProject", "C:/test", &[], &[]);
         project
@@ -53830,7 +54069,6 @@ mod tests {
     #[test]
     fn foreground_message_popup_execute_save_skips_empty_draft() {
         // Test that execute_foreground_message_popup_save does nothing with empty draft
-        let ctx = egui::Context::default();
         let mut app = test_app([], None);
         app.projects
             .insert(7, test_project(7, "TestProject", "C:/test", &[], &[]));
@@ -53854,7 +54092,6 @@ mod tests {
     #[test]
     fn foreground_message_popup_execute_delete_removes_task() {
         // Test that execute_foreground_message_popup_delete removes the task
-        let ctx = egui::Context::default();
         let mut app = test_app([], None);
         let mut project = test_project(7, "TestProject", "C:/test", &[], &[]);
         project
@@ -54553,7 +54790,6 @@ mod tests {
 
     #[test]
     fn smart_input_up_arrow_cycles_through_recent_inputs() {
-        let ctx = egui::Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
         app.projects
             .insert(7, test_project(7, "Test", "C:/test", &[], &[]));
@@ -54596,7 +54832,6 @@ mod tests {
 
     #[test]
     fn smart_input_down_arrow_restores_stash_at_newest_entry() {
-        let ctx = egui::Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
         app.projects
             .insert(7, test_project(7, "Test", "C:/test", &[], &[]));
@@ -54996,7 +55231,6 @@ mod tests {
 
                 // Simulate root indent (as in Terminal Manager body)
                 child.indent(egui::Id::new("root-body"), |ui| {
-                    let before = ui.max_rect().min.x;
                     // Allocate a dummy row to capture starting x without extra indent
                     let (row_rect, _) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width().max(0.0), super::CONTROL_ROW_HEIGHT),
