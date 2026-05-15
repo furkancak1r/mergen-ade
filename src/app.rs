@@ -2500,6 +2500,9 @@ struct TerminalEntry {
     codex_last_status_source: Option<CodexCliStatusSource>,
     codex_attention_reason: Option<CodexAttentionReason>,
     codex_prompt_submit_since: Option<Instant>,
+    /// When Codex last entered Running state from any source. Mirrors OpenCode's
+    /// status timing so visible status recovery uses the same grace behavior.
+    codex_running_since: Option<Instant>,
     /// Codex CLI normalized transport status (working | idle | permission)
     /// This preserves Orca-compatible semantics through the state machine
     codex_normalized_status: Option<CodexTransportStatus>,
@@ -5191,6 +5194,7 @@ impl AdeApp {
             codex_last_status_source: None,
             codex_attention_reason: None,
             codex_prompt_submit_since: None,
+            codex_running_since: None,
             // Codex CLI semantic state (Orca-compatible)
             codex_normalized_status: None,
             codex_last_title_working_at: None,
@@ -6091,9 +6095,26 @@ impl AdeApp {
     }
 
     fn should_accept_codex_turn_complete_chunk(entry: &TerminalEntry) -> bool {
-        entry.codex_normalized_status == Some(CodexTransportStatus::Working)
-            || entry.ai_session.status == AiCliStatus::Running
-            || entry.codex_prompt_submit_since.is_some()
+        if entry.codex_normalized_status != Some(CodexTransportStatus::Working) {
+            return entry.ai_session.status == AiCliStatus::Running
+                || entry.codex_prompt_submit_since.is_some();
+        }
+
+        if !matches!(
+            entry.codex_last_status_source,
+            Some(CodexCliStatusSource::Hook | CodexCliStatusSource::Notify)
+        ) {
+            return true;
+        }
+
+        let running_stale = entry
+            .codex_running_since
+            .is_some_and(|since| since.elapsed() >= Duration::from_millis(CODEX_RUNNING_GRACE_MS));
+        let title_working_stale = entry
+            .codex_last_title_working_at
+            .is_some_and(|since| since.elapsed() >= Duration::from_millis(CODEX_RUNNING_GRACE_MS));
+
+        running_stale || title_working_stale
     }
 
     fn should_accept_opencode_turn_complete_chunk(entry: &TerminalEntry) -> bool {
@@ -6213,6 +6234,7 @@ impl AdeApp {
         entry.codex_process_missing_since = None;
         entry.codex_attention_reason = None;
         entry.codex_pending_stop_since = None;
+        entry.codex_running_since = None;
         entry.dirty = true;
         changed
     }
@@ -6235,6 +6257,7 @@ impl AdeApp {
             || entry.codex_last_status_source.is_some()
             || entry.codex_attention_reason.is_some()
             || entry.codex_prompt_submit_since.is_some()
+            || entry.codex_running_since.is_some()
             || entry.codex_pending_stop_since.is_some();
 
         if entry.ai_session.tool == Some(AiCliTool::CodexCli) {
@@ -6250,6 +6273,7 @@ impl AdeApp {
         entry.codex_last_status_source = None;
         entry.codex_attention_reason = None;
         entry.codex_prompt_submit_since = None;
+        entry.codex_running_since = None;
         entry.codex_pending_stop_since = None;
         entry.dirty = true;
         changed
@@ -6625,6 +6649,10 @@ impl AdeApp {
         // Record prompt submit timestamp for Running state
         if session_status == AiCliStatus::Running && source == CodexCliStatusSource::PromptSubmit {
             entry.codex_prompt_submit_since = Some(now);
+            changed = true;
+        }
+        if session_status == AiCliStatus::Running {
+            entry.codex_running_since = Some(now);
             changed = true;
         }
 
@@ -7828,7 +7856,7 @@ impl AdeApp {
                 None => {
                     if tool_is_codex && status == AiCliStatus::Running {
                         let should_clear = self.terminals.get(&terminal_id).is_some_and(|entry| {
-                            entry.codex_prompt_submit_since.is_some_and(|since| {
+                            entry.codex_running_since.is_some_and(|since| {
                                 since.elapsed() >= Duration::from_millis(CODEX_RUNNING_GRACE_MS)
                             })
                         });
@@ -31989,16 +32017,16 @@ mod tests {
         TerminalOutputScrollBehavior, TerminalSecondaryClickAction, TerminalSelection,
         TerminalSelectionPoint, TransientToast, BROWSER_MAX_TABS_PER_PROJECT,
         BROWSER_SCREENSHOT_REQUEST_PREFIX, CODEX_NOTIFY_POLL_MS, CODEX_PROCESS_POLL_MS,
-        CODEX_STOP_SETTLE_MS, CODEX_TRAILING_OUTPUT_GRACE_MS, DESIGN_INSPECT_DELIVERY_DEDUPE_MS,
-        DESIGN_INSPECT_TARGET_SWITCH_QUIET_MS, DIRECTORY_INDEX_CHANNEL_CAPACITY,
-        FACTORY_DROID_HOOK_POLL_MS, OPENCODE_PROCESS_POLL_MS, OPENCODE_RUNNING_GRACE_MS,
-        OPENCODE_TRAILING_OUTPUT_GRACE_MS, PENDING_RERUN_BATCH_CONFIRM_SETTLE_MS,
-        PENDING_RERUN_BATCH_PROMPT_WAIT_MS, PENDING_RERUN_SETTLE_MS,
-        SMART_INPUT_AUTO_DISPATCH_SETTLE_MS, SMART_INPUT_BASE_FOOTER_HEIGHT,
-        SOURCE_CONTROL_CHANNEL_CAPACITY, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT,
-        TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS,
-        TERMINAL_OUTPUT_BG, TRANSIENT_TOAST_MAX_WIDTH, TRANSIENT_TOAST_MIN_WIDTH,
-        TRANSIENT_TOAST_SECS,
+        CODEX_RUNNING_GRACE_MS, CODEX_STOP_SETTLE_MS, CODEX_TRAILING_OUTPUT_GRACE_MS,
+        DESIGN_INSPECT_DELIVERY_DEDUPE_MS, DESIGN_INSPECT_TARGET_SWITCH_QUIET_MS,
+        DIRECTORY_INDEX_CHANNEL_CAPACITY, FACTORY_DROID_HOOK_POLL_MS, OPENCODE_PROCESS_POLL_MS,
+        OPENCODE_RUNNING_GRACE_MS, OPENCODE_TRAILING_OUTPUT_GRACE_MS,
+        PENDING_RERUN_BATCH_CONFIRM_SETTLE_MS, PENDING_RERUN_BATCH_PROMPT_WAIT_MS,
+        PENDING_RERUN_SETTLE_MS, SMART_INPUT_AUTO_DISPATCH_SETTLE_MS,
+        SMART_INPUT_BASE_FOOTER_HEIGHT, SOURCE_CONTROL_CHANNEL_CAPACITY,
+        SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, TERMINAL_COPY_FEEDBACK_TEXT,
+        TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS, TERMINAL_OUTPUT_BG,
+        TRANSIENT_TOAST_MAX_WIDTH, TRANSIENT_TOAST_MIN_WIDTH, TRANSIENT_TOAST_SECS,
     };
     use crate::browser_video::BrowserVideoEncodeResult;
     use crate::codex::{CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
@@ -41156,6 +41184,80 @@ mod tests {
     }
 
     #[test]
+    fn visible_codex_turn_complete_suppressed_for_fresh_hook_working() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+            entry.codex_normalized_status = Some(CodexTransportStatus::Working);
+            entry.codex_last_status_source = Some(CodexCliStatusSource::Hook);
+            entry.codex_running_since = Some(Instant::now());
+            entry.codex_last_title_working_at = Some(Instant::now());
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "codex-turn-complete".to_owned(),
+                },
+            })
+            .expect("send visible turn complete chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+        assert_eq!(
+            terminal.codex_normalized_status,
+            Some(CodexTransportStatus::Working)
+        );
+        assert!(!terminal.codex_attention_pending);
+        assert_eq!(terminal.codex_attention_reason, None);
+    }
+
+    #[test]
+    fn visible_codex_turn_complete_recovers_stale_hook_working() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let stale_since = Instant::now() - Duration::from_millis(CODEX_RUNNING_GRACE_MS + 100);
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+            entry.codex_normalized_status = Some(CodexTransportStatus::Working);
+            entry.codex_last_status_source = Some(CodexCliStatusSource::Hook);
+            entry.codex_running_since = Some(stale_since);
+            entry.codex_last_title_working_at = Some(stale_since);
+        }
+
+        app.terminal_events_tx
+            .send(TerminalUiEvent {
+                terminal_id: 1,
+                kind: TerminalUiEventKind::AiRawChunk {
+                    terminal_id: 1,
+                    chunk: "codex-turn-complete".to_owned(),
+                },
+            })
+            .expect("send visible turn complete chunk");
+        app.process_terminal_events(&ctx);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert_eq!(
+            terminal.codex_normalized_status,
+            Some(CodexTransportStatus::Idle)
+        );
+        assert!(terminal.codex_attention_pending);
+        assert_eq!(
+            terminal.codex_attention_reason,
+            Some(CodexAttentionReason::TurnComplete)
+        );
+    }
+
+    #[test]
     fn sticky_codex_attention_does_not_reprobe_unrelated_node_after_grace() {
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
@@ -42568,6 +42670,7 @@ mod tests {
             codex_last_status_source: None,
             codex_attention_reason: None,
             codex_prompt_submit_since: None,
+            codex_running_since: None,
             // Codex CLI semantic state (Orca-compatible)
             codex_normalized_status: None,
             codex_last_title_working_at: None,
@@ -47044,6 +47147,31 @@ mod tests {
             AiCliStatus::Running,
             "Running should be allowed for non-interactive attention"
         );
+    }
+
+    #[test]
+    fn codex_running_without_process_tracking_clears_after_grace() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let running_since = Instant::now() - Duration::from_millis(CODEX_RUNNING_GRACE_MS + 100);
+
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::CodexCli);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.codex_session_active = true;
+            entry.codex_normalized_status = Some(CodexTransportStatus::Working);
+            entry.codex_running_since = Some(running_since);
+            entry.codex_prompt_submit_since = None;
+            entry.codex_process_identity = None;
+        }
+
+        app.codex_process_last_poll_at =
+            Some(Instant::now() - Duration::from_millis(CODEX_PROCESS_POLL_MS + 1));
+        app.poll_codex_processes(&ctx);
+
+        let entry_after = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(entry_after.ai_session.status, AiCliStatus::Inactive);
+        assert!(!entry_after.codex_session_active);
     }
 
     #[test]

@@ -1794,3 +1794,23 @@
   - Added regression tests for one-shot first-load navigation, refresh-not-submit behavior, and URL selection contrast.
 - Files/Commands touched: `src/app.rs`, `src/web_browser.rs`, `KNOWN_ISSUES.md`
 - References: User request 2026-05-15
+
+---
+
+#### Codex visible status did not use OpenCode stale-working timing {#codex-visible-status-stale-working-timing}
+- Date: 2026-05-15
+- Context: User wanted the visible Codex terminal status behavior to match OpenCode while Codex is working.
+- Error signature: Codex did not track a generic running timestamp, and visible turn-complete chunks were accepted without the same fresh/stale hook-working gate used by OpenCode.
+- Symptoms/Impact:
+  1. Codex could transition visible status differently from OpenCode when hook working and visible terminal status signals overlapped.
+  2. Codex running cleanup without process tracking depended only on prompt-submit timing, not any running source.
+- Root cause:
+  - OpenCode had `opencode_running_since` and stale hook-working recovery checks, while Codex only tracked prompt-submit and title timestamps.
+- Resolution:
+  - Added `codex_running_since` and updated it whenever Codex enters Running.
+  - Applied OpenCode-style stale hook-working gating to visible Codex turn-complete chunks.
+  - Used the running timestamp for Codex process-tracking fallback cleanup.
+- Prevent recurrence:
+  - Added regression tests for fresh hook-working suppression, stale hook-working recovery, and running cleanup without process tracking.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+- References: User request 2026-05-15
