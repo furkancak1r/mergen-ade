@@ -24414,6 +24414,9 @@ impl AdeApp {
                 .movable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .fixed_size(egui::vec2(popup_width, 400.0))
+                .frame(create_worktree_window_frame(
+                    ctx.style().spacing.window_margin,
+                ))
                 .show(ctx, |ui| {
                     ui.label(
                         RichText::new(format!("Repository: {}", project.name))
@@ -30984,6 +30987,14 @@ fn settings_surface_frame(fill: Color32, margin: f32) -> egui::Frame {
         .stroke(Stroke::new(1.0, BORDER_COLOR))
         .rounding(12.0)
         .inner_margin(egui::Margin::same(margin))
+}
+
+fn create_worktree_window_frame(window_margin: egui::Margin) -> egui::Frame {
+    egui::Frame::none()
+        .fill(SURFACE_BG)
+        .stroke(Stroke::new(1.0, BORDER_COLOR))
+        .rounding(10.0)
+        .inner_margin(window_margin)
 }
 
 fn settings_window_size_for_screen(screen_size: Vec2, window_margin: egui::Margin) -> Vec2 {
@@ -55633,6 +55644,15 @@ mod tests {
         assert!(!AdeApp::create_worktree_can_submit(false, false));
         assert!(AdeApp::create_worktree_can_close(false));
         assert!(!AdeApp::create_worktree_can_close(true));
+    }
+
+    #[test]
+    fn create_worktree_window_frame_is_opaque() {
+        let frame = super::create_worktree_window_frame(egui::Margin::same(10.0));
+
+        assert_eq!(frame.fill, super::SURFACE_BG);
+        assert_eq!(frame.fill.a(), 255);
+        assert_eq!(frame.stroke.color, super::BORDER_COLOR);
     }
 
     #[test]

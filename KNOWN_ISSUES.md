@@ -1992,3 +1992,21 @@
   - Added regression coverage for OpenCode wheel fallback being enabled only while running and disabled after turn complete/inactive states.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
 - References: User request 2026-05-18
+
+---
+
+#### Create Worktree popup background was translucent {#create-worktree-popup-translucent-background}
+- Date: 2026-05-18
+- Context: User reported that the Create Worktree window background was transparent enough to show Terminal Manager behind it.
+- Error signature: The popup relied on the default `egui::Window` frame instead of explicitly painting the same opaque surface used by fixed popups.
+- Symptoms/Impact:
+  1. Terminal Manager content remained visible through the Create Worktree modal.
+  2. The modal looked inconsistent with the foreground launcher opacity fix.
+- Root cause:
+  - The Create Worktree window did not set an explicit opaque frame fill.
+- Resolution:
+  - Apply an explicit `SURFACE_BG` window frame with the normal border to Create Worktree.
+- Prevent recurrence:
+  - Added regression coverage that the Create Worktree popup paints an opaque `SURFACE_BG` frame.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+- References: User request 2026-05-18
