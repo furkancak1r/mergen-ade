@@ -1838,6 +1838,26 @@
 
 ---
 
+#### Terminal Manager keyboard navigation drifted after adding worktrees {#terminal-manager-worktree-navigation-order}
+- Date: 2026-05-18
+- Context: User reported that arrow/Ctrl navigation in Terminal Manager no longer followed the visible row order once worktrees were present.
+- Error signature: Single-view navigation flattened terminals by sorted project records, while Terminal Manager rendered root projects with child worktree rows and worktree terminals before the root terminals.
+- Symptoms/Impact:
+  1. Keyboard navigation could jump in an order different from the rows shown on screen.
+  2. Worktree terminals made the mismatch obvious because the visible hierarchy did not match the flattened project list.
+- Root cause:
+  - Rendering and keyboard navigation used separate ordering rules.
+- Resolution:
+  - Build single-view navigation from the same Terminal Manager hierarchy used for rendering.
+  - Respect expanded/collapsed project groups when Terminal Manager is visible.
+  - Keep exited terminals in the navigation list for recovery while only selecting live terminals.
+- Prevent recurrence:
+  - Added regression coverage for worktree render order, collapsed groups, and filter cycling to the first visible worktree terminal.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+- References: User request 2026-05-18
+
+---
+
 #### Saved messages edits did not propagate to worktrees {#saved-messages-worktree-family-edit-sync}
 - Date: 2026-05-18
 - Context: User updated a normal project's saved messages by deleting the old prompt and adding a new one, but the related worktree still showed the old saved message.
@@ -1951,5 +1971,24 @@
   - Process success/failure on the main thread so project records are still mutated only from the UI loop.
 - Prevent recurrence:
   - Added regression coverage for pending button/close state plus success and error event handling.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+- References: User request 2026-05-18
+
+---
+
+#### OpenCode terminal scroll was trapped after a turn completed {#opencode-idle-wheel-fallback-blocked-scrollback}
+- Date: 2026-05-18
+- Context: User reported that after an OpenCode task finished, scrolling up did not move the terminal scrollback.
+- Error signature: OpenCode wheel fallback could still forward wheel events to the OpenCode TUI when mouse reporting remained active after the turn completed.
+- Symptoms/Impact:
+  1. Users could not reliably scroll up through Mergen terminal output after OpenCode finished.
+  2. Wheel input could be consumed by the idle OpenCode TUI instead of Mergen scrollback.
+- Root cause:
+  - The fallback path treated OpenCode mouse reporting as authoritative even outside active running work.
+- Resolution:
+  - Restrict OpenCode wheel fallback to `AiCliStatus::Running`.
+  - Leave turn-complete, attention, and inactive OpenCode wheel input with Mergen scrollback.
+- Prevent recurrence:
+  - Added regression coverage for OpenCode wheel fallback being enabled only while running and disabled after turn complete/inactive states.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
 - References: User request 2026-05-18

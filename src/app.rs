@@ -426,6 +426,10 @@ fn sorted_projects(projects: &BTreeMap<u64, ProjectRecord>) -> Vec<&ProjectRecor
     sorted
 }
 
+fn terminal_manager_project_group_header_id(project_id: u64) -> Id {
+    Id::new(("terminal-manager-project-group", project_id))
+}
+
 /// Returns true if any project has at least one checklist item.
 fn has_any_checklist_items(projects: &[ProjectRecord]) -> bool {
     projects.iter().any(|p| !p.checklist.is_empty())
@@ -10081,8 +10085,8 @@ impl AdeApp {
             for shortcut in buffered_shortcuts {
                 match shortcut {
                     TerminalNavigationShortcut::SingleViewLinear(direction) => {
-                        let terminal_ids = self.terminal_ids_for_single_view_navigation();
-                        if let Some(next_terminal) = next_terminal_in_linear_direction(
+                        let terminal_ids = self.terminal_ids_for_single_view_navigation(ctx);
+                        if let Some(next_terminal) = next_terminal_in_visible_linear_direction(
                             self.single_view_navigation_anchor(),
                             &terminal_ids,
                             |terminal_id| {
@@ -10131,8 +10135,8 @@ impl AdeApp {
                 TerminalNavigationShortcut::SingleViewLinear(direction)
                     if !self.config.ui.multi_terminal_view_enabled =>
                 {
-                    let terminal_ids = self.terminal_ids_for_single_view_navigation();
-                    if let Some(next_terminal) = next_terminal_in_linear_direction(
+                    let terminal_ids = self.terminal_ids_for_single_view_navigation(ctx);
+                    if let Some(next_terminal) = next_terminal_in_visible_linear_direction(
                         self.single_view_navigation_anchor(),
                         &terminal_ids,
                         |terminal_id| {
@@ -10182,7 +10186,7 @@ impl AdeApp {
 
         let new_kind = next_filter.terminal_kind();
         let first_of_kind = self
-            .terminal_ids_for_single_view_navigation()
+            .terminal_ids_for_single_view_navigation(ctx)
             .into_iter()
             .find(|id| {
                 self.terminals
@@ -11866,12 +11870,10 @@ impl AdeApp {
         ids
     }
 
-    fn terminal_ids_for_single_view_navigation(&self) -> Vec<u64> {
-        // Return all terminals matching the current filter, across all projects,
-        // in visual order (sorted projects, then terminals within each project).
-        // This enables Ctrl+Alt+Arrow to navigate across project boundaries
-        // following the same order as the Terminal Manager UI.
-        // Include exited terminals so recovery from an exited terminal works.
+    fn terminal_ids_for_single_view_navigation(&self, ctx: &egui::Context) -> Vec<u64> {
+        // Return all terminals matching the current filter in the same hierarchy
+        // drawn by Terminal Manager: root project, child worktrees, then root
+        // terminals. Include exited terminals so recovery from an exited terminal works.
         let kind = self.config.ui.terminal_manager_filter.terminal_kind();
 
         // Fallback: if no projects exist but terminals do (e.g., some test cases),
@@ -11885,18 +11887,89 @@ impl AdeApp {
                 .collect();
         }
 
+        let respect_visible_groups = self.terminal_manager_panel_visible();
+        let open_state_ctx = respect_visible_groups.then_some(ctx);
+        self.terminal_ids_in_terminal_manager_order(kind, open_state_ctx)
+    }
+
+    fn terminal_manager_panel_visible(&self) -> bool {
+        self.config.ui.show_project_explorer
+            && self.config.ui.project_explorer_expanded
+            && self.config.ui.left_sidebar_tab == LeftSidebarTab::TerminalManager
+    }
+
+    fn terminal_ids_in_terminal_manager_order(
+        &self,
+        kind: TerminalKind,
+        open_state_ctx: Option<&egui::Context>,
+    ) -> Vec<u64> {
+        let hide_inactive = self.config.ui.terminal_manager_hide_inactive_projects;
         let mut result = Vec::new();
-        for project in sorted_projects(&self.projects) {
-            // Collect terminals for this project in their natural BTreeMap order
-            let mut project_terminals: Vec<u64> = self
-                .terminals
+        for project in sorted_projects(&self.projects)
+            .into_iter()
+            .filter(|project| !project.is_worktree)
+        {
+            let project_id = project.id;
+            let child_worktree_ids = self
+                .projects
+                .values()
+                .filter(|candidate| {
+                    candidate.is_worktree
+                        && candidate
+                            .repo_root
+                            .as_ref()
+                            .is_some_and(|root| root == &project.path)
+                })
+                .map(|worktree| worktree.id)
+                .collect::<Vec<_>>();
+
+            let visible_count = self.terminal_count_for_project_kind(project_id, kind);
+            let has_live_terminal = self.terminal_count_live_for_project_kind(project_id, kind) > 0;
+            let worktree_visible_count = child_worktree_ids
                 .iter()
-                .filter(|(_, terminal)| terminal.project_id == project.id && terminal.kind == kind)
-                .map(|(id, _)| *id)
-                .collect();
-            // Sort by terminal ID to ensure stable ordering within project
-            project_terminals.sort_unstable();
-            result.extend(project_terminals);
+                .map(|worktree_id| self.terminal_count_for_project_kind(*worktree_id, kind))
+                .sum::<usize>();
+            let worktree_has_live = child_worktree_ids.iter().any(|worktree_id| {
+                self.terminal_count_live_for_project_kind(*worktree_id, kind) > 0
+            });
+
+            if hide_inactive
+                && !has_live_terminal
+                && !worktree_has_live
+                && child_worktree_ids.is_empty()
+            {
+                continue;
+            }
+
+            let has_children =
+                visible_count > 0 || !child_worktree_ids.is_empty() || worktree_visible_count > 0;
+            if !has_children {
+                continue;
+            }
+
+            if let Some(ctx) = open_state_ctx {
+                let header_state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ctx,
+                    terminal_manager_project_group_header_id(project_id),
+                    false,
+                );
+                if !header_state.is_open() {
+                    continue;
+                }
+            }
+
+            for worktree_id in child_worktree_ids {
+                result.extend(terminal_ids_for_project_kind(
+                    &self.terminals,
+                    worktree_id,
+                    kind,
+                ));
+            }
+            result.extend(terminal_ids_for_project_kind(
+                &self.terminals,
+                project_id,
+                kind,
+            ));
         }
         result
     }
@@ -18477,7 +18550,7 @@ impl AdeApp {
                 .cloned()
                 .collect();
 
-            let header_id = ui.make_persistent_id(format!("project-group-{project_id}"));
+            let header_id = terminal_manager_project_group_header_id(project_id);
             let mut header_state = egui::collapsing_header::CollapsingState::load_with_default_open(
                 ui.ctx(),
                 header_id,
@@ -23563,10 +23636,6 @@ impl AdeApp {
                                                 as usize;
                                             opencode_pending_wheel =
                                                 Some((direction, pointer_pos, cell_x, cell_y));
-                                            // Detach prompt anchor for manual scroll behavior
-                                            detach_terminal_prompt_scroll_anchor_on_manual_scroll(
-                                                terminal,
-                                            );
                                         }
                                     }
                                 }
@@ -23599,10 +23668,14 @@ impl AdeApp {
                             });
                         } else {
                             // Mergen could not scroll on the relevant axis:
-                            // forward to OpenCode runtime as fallback
+                            // forward to OpenCode runtime as fallback only while OpenCode is
+                            // actively running. Once a turn is complete, wheel should stay with
+                            // Mergen scrollback instead of the idle TUI.
                             let mouse_reporting_active =
                                 terminal.runtime.is_mouse_reporting_active();
-                            if mouse_reporting_active {
+                            if mouse_reporting_active
+                                && opencode_terminal_wheel_fallback_enabled(terminal)
+                            {
                                 terminal.runtime.send_mouse_wheel(TerminalWheelEvent {
                                     direction,
                                     x: cell_x,
@@ -27041,6 +27114,39 @@ fn next_terminal_in_linear_direction(
                     .find(|terminal_id| is_selectable(*terminal_id))
             })
         }
+        _ => None,
+    }
+}
+
+fn next_terminal_in_visible_linear_direction(
+    active_terminal: Option<u64>,
+    terminal_ids: &[u64],
+    is_selectable: impl Fn(u64) -> bool,
+    direction: TerminalNavigationDirection,
+) -> Option<u64> {
+    let active_terminal = active_terminal?;
+    if terminal_ids
+        .iter()
+        .any(|terminal_id| *terminal_id == active_terminal)
+    {
+        return next_terminal_in_linear_direction(
+            Some(active_terminal),
+            terminal_ids,
+            is_selectable,
+            direction,
+        );
+    }
+
+    match direction {
+        TerminalNavigationDirection::Up => terminal_ids
+            .iter()
+            .rev()
+            .copied()
+            .find(|terminal_id| is_selectable(*terminal_id)),
+        TerminalNavigationDirection::Down => terminal_ids
+            .iter()
+            .copied()
+            .find(|terminal_id| is_selectable(*terminal_id)),
         _ => None,
     }
 }
@@ -31991,6 +32097,11 @@ fn detach_terminal_prompt_scroll_anchor_on_manual_scroll(terminal: &mut Terminal
 
 fn reset_opencode_manual_scroll_detached(terminal: &mut TerminalEntry) {
     terminal.opencode_manual_scroll_detached = false;
+}
+
+fn opencode_terminal_wheel_fallback_enabled(terminal: &TerminalEntry) -> bool {
+    terminal.ai_session.tool == Some(AiCliTool::OpenCode)
+        && terminal.ai_session.status == AiCliStatus::Running
 }
 
 fn terminal_activation_scroll_offset(
@@ -37771,6 +37882,44 @@ mod tests {
     }
 
     #[test]
+    fn opencode_wheel_fallback_enabled_only_while_running() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.ai_session.tool = Some(AiCliTool::OpenCode);
+        terminal.ai_session.status = AiCliStatus::Running;
+
+        assert!(super::opencode_terminal_wheel_fallback_enabled(&terminal));
+    }
+
+    #[test]
+    fn opencode_wheel_fallback_disabled_after_turn_complete_attention() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.ai_session.tool = Some(AiCliTool::OpenCode);
+        terminal.ai_session.status = AiCliStatus::Attention;
+        terminal.opencode_attention_reason = Some(OpenCodeAttentionReason::TurnComplete);
+
+        assert!(!super::opencode_terminal_wheel_fallback_enabled(&terminal));
+    }
+
+    #[test]
+    fn opencode_wheel_fallback_disabled_when_inactive() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.ai_session.tool = Some(AiCliTool::OpenCode);
+        terminal.ai_session.status = AiCliStatus::Inactive;
+        terminal.opencode_session_active = true;
+
+        assert!(!super::opencode_terminal_wheel_fallback_enabled(&terminal));
+    }
+
+    #[test]
+    fn wheel_fallback_disabled_for_non_opencode_terminal() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.ai_session.tool = Some(AiCliTool::CodexCli);
+        terminal.ai_session.status = AiCliStatus::Running;
+
+        assert!(!super::opencode_terminal_wheel_fallback_enabled(&terminal));
+    }
+
+    #[test]
     fn terminal_selection_autoscroll_delta_returns_zero_inside_safe_zone() {
         let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(200.0, 150.0));
         let line_height = 10.0;
@@ -38206,6 +38355,30 @@ mod tests {
                 TerminalNavigationDirection::Up,
             ),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn next_terminal_in_visible_linear_direction_enters_order_when_anchor_is_hidden() {
+        let ids = [1, 2, 3];
+
+        assert_eq!(
+            super::next_terminal_in_visible_linear_direction(
+                Some(99),
+                &ids,
+                |_| true,
+                TerminalNavigationDirection::Down,
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            super::next_terminal_in_visible_linear_direction(
+                Some(99),
+                &ids,
+                |_| true,
+                TerminalNavigationDirection::Up,
+            ),
+            Some(3)
         );
     }
 
@@ -38741,6 +38914,138 @@ mod tests {
         app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
 
         assert_eq!(app.active_terminal, Some(1));
+    }
+
+    fn set_terminal_manager_project_group_open(ctx: &Context, project_id: u64, open: bool) {
+        let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            ctx,
+            super::terminal_manager_project_group_header_id(project_id),
+            false,
+        );
+        state.set_open(open);
+        state.store(ctx);
+    }
+
+    fn show_terminal_manager_for_navigation(app: &mut AdeApp) {
+        app.config.ui.show_project_explorer = true;
+        app.config.ui.project_explorer_expanded = true;
+        app.config.ui.left_sidebar_tab = LeftSidebarTab::TerminalManager;
+    }
+
+    #[test]
+    fn terminal_manager_navigation_matches_visible_worktree_order() {
+        let ctx = Context::default();
+        let root_path = "C:/repo";
+        let mut app = test_app(
+            [
+                (10, test_terminal_entry(10, 1)),
+                (20, test_terminal_entry(20, 2)),
+                (30, test_terminal_entry(30, 3)),
+            ],
+            Some(20),
+        );
+        app.projects
+            .insert(1, test_project(1, "Repo", root_path, &[], &[]));
+        app.projects.insert(
+            2,
+            test_worktree_project(2, "feature-a", "C:/worktrees/a", root_path, &[]),
+        );
+        app.projects.insert(
+            3,
+            test_worktree_project(3, "feature-b", "C:/worktrees/b", root_path, &[]),
+        );
+        show_terminal_manager_for_navigation(&mut app);
+        set_terminal_manager_project_group_open(&ctx, 1, true);
+
+        assert_eq!(
+            app.terminal_ids_for_single_view_navigation(&ctx),
+            vec![20, 30, 10]
+        );
+
+        app.buffered_terminal_navigation = vec![TerminalNavigationShortcut::SingleViewLinear(
+            TerminalNavigationDirection::Down,
+        )];
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(app.active_terminal, Some(30));
+    }
+
+    #[test]
+    fn terminal_manager_navigation_skips_collapsed_project_groups() {
+        let ctx = Context::default();
+        let root_path = "C:/repo";
+        let mut app = test_app(
+            [
+                (10, test_terminal_entry(10, 1)),
+                (20, test_terminal_entry(20, 2)),
+            ],
+            Some(20),
+        );
+        app.projects
+            .insert(1, test_project(1, "Repo", root_path, &[], &[]));
+        app.projects.insert(
+            2,
+            test_worktree_project(2, "feature-a", "C:/worktrees/a", root_path, &[]),
+        );
+        show_terminal_manager_for_navigation(&mut app);
+        set_terminal_manager_project_group_open(&ctx, 1, false);
+
+        assert!(app.terminal_ids_for_single_view_navigation(&ctx).is_empty());
+
+        app.config.ui.left_sidebar_tab = LeftSidebarTab::Directory;
+
+        assert_eq!(
+            app.terminal_ids_for_single_view_navigation(&ctx),
+            vec![20, 10]
+        );
+    }
+
+    #[test]
+    fn terminal_manager_filter_cycle_selects_first_visible_worktree_terminal() {
+        let ctx = Context::default();
+        let root_path = "C:/repo";
+        let mut root_background = test_terminal_entry_with_kind(11, 1, TerminalKind::Background);
+        root_background.title = "Root Background".to_owned();
+        let mut worktree_background =
+            test_terminal_entry_with_kind(21, 2, TerminalKind::Background);
+        worktree_background.title = "Worktree Background".to_owned();
+        let mut app = test_app(
+            [
+                (10, test_terminal_entry(10, 1)),
+                (11, root_background),
+                (21, worktree_background),
+            ],
+            Some(10),
+        );
+        app.projects
+            .insert(1, test_project(1, "Repo", root_path, &[], &[]));
+        app.projects.insert(
+            2,
+            test_worktree_project(2, "feature-a", "C:/worktrees/a", root_path, &[]),
+        );
+        show_terminal_manager_for_navigation(&mut app);
+        set_terminal_manager_project_group_open(&ctx, 1, true);
+
+        ctx.input_mut(|input| {
+            input.events = vec![Event::Key {
+                key: Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+            }];
+        });
+
+        app.handle_shortcuts(&ctx, egui::vec2(1200.0, 800.0));
+
+        assert_eq!(
+            app.config.ui.terminal_manager_filter,
+            TerminalManagerFilter::Background
+        );
+        assert_eq!(app.active_terminal, Some(21));
     }
 
     #[test]
