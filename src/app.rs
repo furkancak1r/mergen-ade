@@ -143,6 +143,9 @@ const OPENCODE_HOOK_POLL_MS: u64 = 100;
 /// Prevents stale delayed Idle events from the previous turn from immediately triggering
 /// back-to-back dispatch of the next queued task.
 const SMART_INPUT_AUTO_DISPATCH_SETTLE_MS: u64 = 300;
+/// Settle duration after OpenCode slash commands that do not start work, such as /new.
+/// Keeps queued Smart Input tasks from racing the slash-menu confirmation Enters.
+const OPENCODE_NON_WORK_SLASH_SETTLE_MS: u64 = SHORTCUT_SECOND_ENTER_DELAY_MS * 2 + 100;
 const CURSOR_BLINK_STEP_SECS: f64 = 0.6;
 const TRANSIENT_TOAST_SECS: f64 = 1.75;
 const TRANSIENT_TOAST_MIN_WIDTH: f32 = 140.0;
@@ -541,7 +544,7 @@ impl AppIcon {
             Self::File => "file",
             Self::FileText => "file-text",
             Self::FileCode => "file-code",
-            Self::FileJson => "file-json",
+            Self::FileJson => "file-braces",
             Self::FileImage => "file-image",
             Self::FileArchive => "file-archive",
             Self::Database => "database",
@@ -2179,6 +2182,9 @@ pub struct AdeApp {
     create_worktree_error: Option<String>,
     /// Existing git worktrees discovered when popup opened (not yet in Mergen).
     create_worktree_existing_worktrees: Vec<crate::worktree::GitWorktreeInfo>,
+    create_worktree_in_progress: Option<CreateWorktreePending>,
+    create_worktree_events_tx: Sender<CreateWorktreeEvent>,
+    create_worktree_events_rx: Receiver<CreateWorktreeEvent>,
 }
 
 /// Represents a single open file buffer in the built-in editor.
@@ -2605,6 +2611,9 @@ struct TerminalEntry {
     /// When we last entered Running state (from any source). Used for grace-based
     /// cleanup when process tracking is unavailable.
     opencode_running_since: Option<Instant>,
+    /// Until this instant, a recent non-work OpenCode slash command (for example /new)
+    /// should block automatic Smart Input dispatch.
+    opencode_non_work_slash_settle_until: Option<Instant>,
     /// Evidence-based timestamps for OpenCode state resolution
     opencode_last_prompt_submit_at: Option<Instant>,
     opencode_last_title_working_at: Option<Instant>,
@@ -2814,6 +2823,22 @@ struct SourceControlFile {
 struct SourceControlEvent {
     project_id: u64,
     snapshot: SourceControlSnapshot,
+}
+
+#[derive(Debug, Clone)]
+struct CreateWorktreePending {
+    project_id: u64,
+    repo_root: PathBuf,
+    branch: String,
+    worktree_path: String,
+}
+
+#[derive(Debug)]
+struct CreateWorktreeEvent {
+    project_id: u64,
+    repo_root: PathBuf,
+    worktree_path: String,
+    result: Result<PathBuf, String>,
 }
 
 #[derive(Debug)]
@@ -4585,6 +4610,7 @@ impl AdeApp {
         let (directory_index_events_tx, directory_index_events_rx) = crossbeam_channel::unbounded();
         let (browser_video_encode_events_tx, browser_video_encode_events_rx) =
             crossbeam_channel::unbounded();
+        let (create_worktree_events_tx, create_worktree_events_rx) = crossbeam_channel::unbounded();
         spawn_source_control_worker(source_control_commands_rx, source_control_events_tx.clone());
         spawn_directory_index_worker(
             directory_index_commands_rx,
@@ -4768,6 +4794,9 @@ impl AdeApp {
             create_worktree_path_draft: String::new(),
             create_worktree_error: None,
             create_worktree_existing_worktrees: Vec::new(),
+            create_worktree_in_progress: None,
+            create_worktree_events_tx,
+            create_worktree_events_rx,
         };
         // Do NOT seed runtime browser state from legacy config.
         // Browser panel open state is now runtime-only per project.
@@ -5348,6 +5377,7 @@ impl AdeApp {
             opencode_normalized_status: None,
             opencode_prompt_submit_since: None,
             opencode_running_since: None,
+            opencode_non_work_slash_settle_until: None,
             opencode_last_prompt_submit_at: None,
             opencode_last_title_working_at: None,
             opencode_last_title_idle_at: None,
@@ -6942,7 +6972,8 @@ impl AdeApp {
             || entry.opencode_last_status_source.is_some()
             || entry.opencode_attention_reason.is_some()
             || entry.opencode_prompt_submit_since.is_some()
-            || entry.opencode_running_since.is_some();
+            || entry.opencode_running_since.is_some()
+            || entry.opencode_non_work_slash_settle_until.is_some();
 
         if entry.ai_session.tool == Some(AiCliTool::OpenCode) {
             entry.ai_session = AiCliSession::default();
@@ -6959,6 +6990,7 @@ impl AdeApp {
         entry.opencode_attention_reason = None;
         entry.opencode_prompt_submit_since = None;
         entry.opencode_running_since = None;
+        entry.opencode_non_work_slash_settle_until = None;
         Self::clear_opencode_pending_question_state(entry);
         entry.dirty = true;
         changed
@@ -9419,6 +9451,45 @@ impl AdeApp {
         }
     }
 
+    fn process_create_worktree_events(&mut self, ctx: &egui::Context) {
+        let mut changed = false;
+        while let Ok(event) = self.create_worktree_events_rx.try_recv() {
+            let Some(pending) = self.create_worktree_in_progress.take() else {
+                continue;
+            };
+            if pending.project_id != event.project_id
+                || pending.repo_root != event.repo_root
+                || pending.worktree_path != event.worktree_path
+            {
+                self.create_worktree_in_progress = Some(pending);
+                continue;
+            }
+
+            match event.result {
+                Ok(wt_path) => {
+                    self.add_project_with_worktree(wt_path, Some(event.repo_root), true);
+                    self.show_create_worktree_popup = false;
+                    self.create_worktree_error = None;
+                    self.status_line =
+                        format!("Worktree '{}' created and added as project", pending.branch);
+                }
+                Err(err) => {
+                    self.show_create_worktree_popup = true;
+                    self.create_worktree_error = Some(err);
+                    self.status_line = format!("Failed to create worktree '{}'", pending.branch);
+                }
+            }
+            changed = true;
+        }
+
+        if self.create_worktree_in_progress.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+        if changed {
+            ctx.request_repaint();
+        }
+    }
+
     fn request_source_control_refresh(&mut self, project_id: u64, run_fetch: bool, manual: bool) {
         if !self.projects.contains_key(&project_id) {
             return;
@@ -10756,6 +10827,10 @@ impl AdeApp {
                     ctx,
                 );
             }
+            if Self::is_opencode_non_work_slash_command(trimmed) {
+                let _ = self.clear_opencode_attention_on_interaction(terminal_id);
+                let _ = self.mark_opencode_non_work_slash_submitted(terminal_id);
+            }
             self.show_status_feedback(ctx, &format!("Sent: {command}"));
             true
         } else {
@@ -11892,6 +11967,7 @@ impl AdeApp {
         let mut submitted_factory_prompt = false;
         let mut submitted_codex_prompt = false;
         let mut submitted_opencode_prompt = false;
+        let mut submitted_opencode_non_work_slash = false;
         let mut committed_codex_reply = false;
         let mut cancelled_factory_interactive_prompt = false;
         let mut sent_terminal_input = false;
@@ -12015,6 +12091,9 @@ impl AdeApp {
                                 launched_claude = true;
                             }
                             let sanitized_line = terminal_title_candidate(&line);
+                            let opencode_non_work_slash_command =
+                                Self::is_opencode_non_work_slash_command(&line);
+                            let has_non_empty_raw_line = !line.trim().is_empty();
                             let has_non_empty_line = sanitized_line
                                 .as_ref()
                                 .is_some_and(|candidate| !candidate.trim().is_empty());
@@ -12081,8 +12160,18 @@ impl AdeApp {
                                 && !launched_codex_cli
                                 && !launched_opencode
                                 && submitted_opencode_interaction
+                                && !opencode_non_work_slash_command
                             {
                                 submitted_opencode_prompt = true;
+                            }
+                            if terminal.ai_session.tool == Some(AiCliTool::OpenCode)
+                                && !launched_factory_droid
+                                && !launched_codex_cli
+                                && !launched_opencode
+                                && has_non_empty_raw_line
+                                && opencode_non_work_slash_command
+                            {
+                                submitted_opencode_non_work_slash = true;
                             }
                             // Record to persistent input history from the raw history buffer.
                             // This preserves multi-line and Unicode content unlike the title buffer.
@@ -12260,6 +12349,11 @@ impl AdeApp {
             )
         {
             ctx.request_repaint();
+        }
+        if submitted_opencode_non_work_slash {
+            if self.mark_opencode_non_work_slash_submitted(active_terminal_id) {
+                ctx.request_repaint();
+            }
         }
         // Use transport status for OpenCode submit to properly set normalized state
         if submitted_opencode_prompt
@@ -13875,7 +13969,9 @@ impl AdeApp {
         let mut submitted_factory_prompt = false;
         let mut submitted_codex_prompt = false;
         let mut submitted_opencode_prompt = false;
+        let mut submitted_opencode_non_work_slash = false;
         let mut committed_codex_reply = false;
+        let opencode_non_work_slash = Self::is_opencode_non_work_slash_command(message);
         let destination_title = {
             let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
                 self.status_line = "Target terminal not found".to_owned();
@@ -13925,7 +14021,11 @@ impl AdeApp {
                 submitted_codex_prompt = true;
             }
             if terminal.ai_session.tool == Some(AiCliTool::OpenCode) && has_non_empty_line {
-                submitted_opencode_prompt = true;
+                if opencode_non_work_slash {
+                    submitted_opencode_non_work_slash = true;
+                } else {
+                    submitted_opencode_prompt = true;
+                }
             }
 
             if options.set_visible_in_main {
@@ -13994,6 +14094,10 @@ impl AdeApp {
 
         if committed_codex_reply && !submitted_codex_prompt {
             let _ = self.clear_codex_attention_on_commit(terminal_id);
+        }
+        if submitted_opencode_non_work_slash {
+            let _ = self.clear_opencode_attention_on_interaction(terminal_id);
+            let _ = self.mark_opencode_non_work_slash_submitted(terminal_id);
         }
         if submitted_factory_prompt {
             let _ = self.apply_factory_droid_status(
@@ -14097,6 +14201,25 @@ impl AdeApp {
             && terminal.opencode_session_active
     }
 
+    fn is_opencode_non_work_slash_command(text: &str) -> bool {
+        let trimmed = text.trim();
+        trimmed.eq_ignore_ascii_case("/n") || trimmed.eq_ignore_ascii_case("/new")
+    }
+
+    fn mark_opencode_non_work_slash_submitted(&mut self, terminal_id: u64) -> bool {
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+        if entry.ai_session.tool != Some(AiCliTool::OpenCode) {
+            return false;
+        }
+
+        entry.opencode_non_work_slash_settle_until =
+            Some(Instant::now() + Duration::from_millis(OPENCODE_NON_WORK_SLASH_SETTLE_MS));
+        entry.dirty = true;
+        true
+    }
+
     fn smart_input_footer_height(
         terminal: &TerminalEntry,
         pane_height: f32,
@@ -14160,6 +14283,12 @@ impl AdeApp {
             return false;
         }
         if !terminal.opencode_session_active {
+            return false;
+        }
+        if terminal
+            .opencode_non_work_slash_settle_until
+            .is_some_and(|until| Instant::now() < until)
+        {
             return false;
         }
         if terminal.opencode_normalized_status != Some(OpenCodeTransportStatus::Idle) {
@@ -24104,6 +24233,65 @@ impl AdeApp {
         }
     }
 
+    fn create_worktree_submit_button_label(in_progress: bool) -> &'static str {
+        if in_progress {
+            "Creating..."
+        } else {
+            "Create Worktree"
+        }
+    }
+
+    fn create_worktree_can_submit(has_required_fields: bool, in_progress: bool) -> bool {
+        has_required_fields && !in_progress
+    }
+
+    fn create_worktree_can_close(in_progress: bool) -> bool {
+        !in_progress
+    }
+
+    fn start_create_worktree(
+        &mut self,
+        ctx: &egui::Context,
+        project_id: u64,
+        repo_path: PathBuf,
+        repo_root: PathBuf,
+        worktree_path: String,
+        branch: String,
+        base_branch: Option<String>,
+    ) -> bool {
+        if self.create_worktree_in_progress.is_some() {
+            return false;
+        }
+
+        self.create_worktree_in_progress = Some(CreateWorktreePending {
+            project_id,
+            repo_root: repo_root.clone(),
+            branch: branch.clone(),
+            worktree_path: worktree_path.clone(),
+        });
+        self.create_worktree_error = None;
+        self.status_line = "Creating worktree...".to_owned();
+
+        let tx = self.create_worktree_events_tx.clone();
+        std::thread::spawn(move || {
+            let result = Self::run_git_worktree_add(
+                &repo_path,
+                &worktree_path,
+                &branch,
+                base_branch.as_deref(),
+            );
+            let _ = tx.send(CreateWorktreeEvent {
+                project_id,
+                repo_root,
+                worktree_path,
+                result,
+            });
+        });
+
+        ctx.request_repaint_after(Duration::from_millis(50));
+        true
+    }
+
     fn draw_create_worktree_popup(&mut self, ctx: &egui::Context) {
         if !self.show_create_worktree_popup {
             return;
@@ -24141,6 +24329,7 @@ impl AdeApp {
             project.path.clone()
         };
         let mut worktrees_to_add: Vec<std::path::PathBuf> = Vec::new();
+        let create_in_progress = self.create_worktree_in_progress.is_some();
 
         let create_worktree_window_response =
             egui::Window::new(format!("{} Create Worktree", icons::PLUS))
@@ -24187,7 +24376,13 @@ impl AdeApp {
                                         ui.with_layout(
                                             Layout::right_to_left(Align::Center),
                                             |ui| {
-                                                if ui.button("Add to Mergen").clicked() {
+                                                if ui
+                                                    .add_enabled(
+                                                        !create_in_progress,
+                                                        egui::Button::new("Add to Mergen"),
+                                                    )
+                                                    .clicked()
+                                                {
                                                     worktrees_to_add.push(wt.path.clone());
                                                 }
                                             },
@@ -24215,12 +24410,14 @@ impl AdeApp {
                     }
 
                     ui.label(RichText::new("Branch name").small().color(TEXT_MUTED));
-                    ui.add_sized(
-                        [ui.available_width(), CONTROL_ROW_HEIGHT],
-                        egui::TextEdit::singleline(&mut self.create_worktree_branch_draft)
-                            .id(Self::create_worktree_branch_input_id())
-                            .hint_text("feature/my-task"),
-                    );
+                    ui.add_enabled_ui(!create_in_progress, |ui| {
+                        ui.add_sized(
+                            [ui.available_width(), CONTROL_ROW_HEIGHT],
+                            egui::TextEdit::singleline(&mut self.create_worktree_branch_draft)
+                                .id(Self::create_worktree_branch_input_id())
+                                .hint_text("feature/my-task"),
+                        );
+                    });
                     ui.add_space(6.0);
 
                     ui.label(
@@ -24228,12 +24425,14 @@ impl AdeApp {
                             .small()
                             .color(TEXT_MUTED),
                     );
-                    ui.add_sized(
-                        [ui.available_width(), CONTROL_ROW_HEIGHT],
-                        egui::TextEdit::singleline(&mut self.create_worktree_base_branch)
-                            .id(Self::create_worktree_base_branch_input_id())
-                            .hint_text("main or origin/main"),
-                    );
+                    ui.add_enabled_ui(!create_in_progress, |ui| {
+                        ui.add_sized(
+                            [ui.available_width(), CONTROL_ROW_HEIGHT],
+                            egui::TextEdit::singleline(&mut self.create_worktree_base_branch)
+                                .id(Self::create_worktree_base_branch_input_id())
+                                .hint_text("main or origin/main"),
+                        );
+                    });
                     ui.add_space(6.0);
 
                     ui.label(
@@ -24241,64 +24440,72 @@ impl AdeApp {
                             .small()
                             .color(TEXT_MUTED),
                     );
-                    ui.add_sized(
-                        [ui.available_width(), CONTROL_ROW_HEIGHT],
-                        egui::TextEdit::singleline(&mut self.create_worktree_path_draft)
-                            .id(Self::create_worktree_path_input_id())
-                            .hint_text("auto-generated from branch")
-                            .interactive(false),
-                    );
+                    ui.add_enabled_ui(!create_in_progress, |ui| {
+                        ui.add_sized(
+                            [ui.available_width(), CONTROL_ROW_HEIGHT],
+                            egui::TextEdit::singleline(&mut self.create_worktree_path_draft)
+                                .id(Self::create_worktree_path_input_id())
+                                .hint_text("auto-generated from branch")
+                                .interactive(false),
+                        );
+                    });
                     ui.add_space(8.0);
 
                     if let Some(ref error) = self.create_worktree_error {
                         ui.colored_label(Color32::LIGHT_RED, error);
+                        ui.add_space(4.0);
+                    } else if create_in_progress {
+                        ui.label(
+                            RichText::new("Creating worktree...")
+                                .small()
+                                .color(TEXT_MUTED),
+                        );
                         ui.add_space(4.0);
                     }
 
                     let branch_owned = self.create_worktree_branch_draft.trim().to_owned();
                     let path_owned = self.create_worktree_path_draft.trim().to_owned();
                     let base_owned = self.create_worktree_base_branch.trim().to_owned();
-                    let can_create = !branch_owned.is_empty() && !path_owned.is_empty();
+                    let has_required_fields = !branch_owned.is_empty() && !path_owned.is_empty();
+                    let can_create =
+                        Self::create_worktree_can_submit(has_required_fields, create_in_progress);
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add_enabled_ui(can_create, |ui| {
-                            if ui.button("Create Worktree").clicked() {
-                                let base_opt = if base_owned.is_empty() {
-                                    None
-                                } else {
-                                    Some(base_owned.as_str())
-                                };
-                                match Self::run_git_worktree_add(
-                                    &project.path,
-                                    &path_owned,
-                                    &branch_owned,
+                            if ui
+                                .button(Self::create_worktree_submit_button_label(
+                                    create_in_progress,
+                                ))
+                                .clicked()
+                            {
+                                let base_opt = (!base_owned.is_empty()).then_some(base_owned);
+                                self.start_create_worktree(
+                                    ui.ctx(),
+                                    project_id,
+                                    project.path.clone(),
+                                    repo_root.clone(),
+                                    path_owned.clone(),
+                                    branch_owned.clone(),
                                     base_opt,
-                                ) {
-                                    Ok(wt_path) => {
-                                        self.add_project_with_worktree(
-                                            wt_path,
-                                            Some(repo_root.clone()),
-                                            true,
-                                        );
-                                        self.show_create_worktree_popup = false;
-                                        self.create_worktree_error = None;
-                                        self.status_line =
-                                            "Worktree created and added as project".to_owned();
-                                    }
-                                    Err(err) => {
-                                        self.create_worktree_error = Some(err);
-                                    }
+                                );
+                                if !Self::create_worktree_input_has_focus(ui.ctx()) {
+                                    ui.ctx().memory_mut(|mem| {
+                                        mem.request_focus(Self::create_worktree_branch_input_id())
+                                    });
                                 }
                             }
                         });
 
-                        if ui.button("Cancel").clicked() {
+                        if ui
+                            .add_enabled(!create_in_progress, egui::Button::new("Cancel"))
+                            .clicked()
+                        {
                             self.show_create_worktree_popup = false;
                             self.create_worktree_error = None;
                         }
                     });
 
-                    if !Self::create_worktree_input_has_focus(ui.ctx()) {
+                    if !create_in_progress && !Self::create_worktree_input_has_focus(ui.ctx()) {
                         ui.ctx().memory_mut(|mem| {
                             mem.request_focus(Self::create_worktree_branch_input_id())
                         });
@@ -24323,7 +24530,7 @@ impl AdeApp {
             self.status_line = format!("Added existing worktree '{}' to Mergen", wt_path.display());
         }
 
-        if !open {
+        if !open && Self::create_worktree_can_close(create_in_progress) {
             self.show_create_worktree_popup = false;
             self.create_worktree_error = None;
         }
@@ -24855,6 +25062,7 @@ impl eframe::App for AdeApp {
         // Phase 3d: Process pending second Enter presses for terminal shortcuts.
         self.process_pending_second_enters(ctx);
 
+        self.process_create_worktree_events(ctx);
         self.process_source_control_events(ctx);
         self.process_directory_index_events(ctx);
         self.process_browser_events(ctx);
@@ -26376,29 +26584,30 @@ fn draw_folder_tree(
             if search_active {
                 header_state.set_open(true);
             }
-            let folder_is_open = header_state.is_open();
 
-            let (_, header_response, _) = header_state
-                .show_header(ui, |ui| {
-                    draw_directory_folder_row(ui, &item.name, folder_is_open, search_query)
-                })
-                .body(|ui| {
-                    let (_, child_state_changed, child_deferred, child_file_open) =
-                        draw_folder_tree(
-                            ui,
-                            item,
-                            status_line_update,
-                            search_query,
-                            show_all_descendants,
-                            matching_directories,
-                            search_visible_paths,
-                        );
-                    folder_state_changed |= child_state_changed;
-                    deferred_to_load.extend(child_deferred);
-                    if child_file_open.is_some() {
-                        file_to_open = child_file_open;
-                    }
-                });
+            let header_response = draw_directory_folder_header(
+                ui,
+                &mut header_state,
+                &item.name,
+                search_query,
+                search_active,
+            );
+            header_state.show_body_indented(&header_response, ui, |ui| {
+                let (_, child_state_changed, child_deferred, child_file_open) = draw_folder_tree(
+                    ui,
+                    item,
+                    status_line_update,
+                    search_query,
+                    show_all_descendants,
+                    matching_directories,
+                    search_visible_paths,
+                );
+                folder_state_changed |= child_state_changed;
+                deferred_to_load.extend(child_deferred);
+                if child_file_open.is_some() {
+                    file_to_open = child_file_open;
+                }
+            });
             if search_active {
                 if let Some(previous_open_state) = previous_open_state {
                     let mut restore_state =
@@ -26410,17 +26619,6 @@ fn draw_folder_tree(
                     restore_state.set_open(previous_open_state);
                     restore_state.store(ui.ctx());
                 }
-            }
-
-            if !search_active && header_response.inner.clicked() {
-                let mut clicked_state =
-                    egui::collapsing_header::CollapsingState::load_with_default_open(
-                        ui.ctx(),
-                        directory_tree_folder_state_id(&item.path),
-                        false,
-                    );
-                clicked_state.toggle(ui);
-                clicked_state.store(ui.ctx());
             }
 
             if let Some(initial_open_state) = initial_open_state {
@@ -26435,7 +26633,7 @@ fn draw_folder_tree(
                     folder_state_changed = true;
                 }
             }
-            header_response.response.context_menu(|ui| {
+            header_response.context_menu(|ui| {
                 with_minimal_button_chrome(ui, |ui| {
                     if ui.button(format!("{} Copy Path", icons::COPY)).clicked() {
                         let item_path_text = item.path.display().to_string();
@@ -27125,6 +27323,21 @@ fn directory_search_highlight_layout_job(
     }
 
     layout_job
+}
+
+fn draw_directory_folder_header(
+    ui: &mut Ui,
+    header_state: &mut egui::collapsing_header::CollapsingState,
+    text: &str,
+    search_query: Option<&str>,
+    search_active: bool,
+) -> egui::Response {
+    let response = draw_directory_folder_row(ui, text, header_state.is_open(), search_query);
+    if !search_active && response.clicked() {
+        header_state.toggle(ui);
+        header_state.store(ui.ctx());
+    }
+    response
 }
 
 fn draw_directory_file_row(ui: &mut Ui, text: &str, search_query: Option<&str>) -> egui::Response {
@@ -43123,6 +43336,7 @@ mod tests {
             opencode_normalized_status: None,
             opencode_prompt_submit_since: None,
             opencode_running_since: None,
+            opencode_non_work_slash_settle_until: None,
             opencode_last_prompt_submit_at: None,
             opencode_last_title_working_at: None,
             opencode_last_title_idle_at: None,
@@ -43179,6 +43393,7 @@ mod tests {
             crossbeam_channel::bounded(DIRECTORY_INDEX_CHANNEL_CAPACITY);
         let (browser_video_encode_events_tx, browser_video_encode_events_rx) =
             crossbeam_channel::unbounded();
+        let (create_worktree_events_tx, create_worktree_events_rx) = crossbeam_channel::unbounded();
 
         AdeApp {
             config_path: test_temp_path("mergen-ade-test-config", "toml"),
@@ -43315,6 +43530,9 @@ mod tests {
             create_worktree_path_draft: String::new(),
             create_worktree_error: None,
             create_worktree_existing_worktrees: Vec::new(),
+            create_worktree_in_progress: None,
+            create_worktree_events_tx,
+            create_worktree_events_rx,
             browser_video_encode_events_tx,
             browser_video_encode_events_rx,
         }
@@ -45556,6 +45774,75 @@ mod tests {
     }
 
     #[test]
+    fn directory_folder_header_uses_full_width_without_disclosure_slot_and_toggles() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+        let folder_path = PathBuf::from("/project/src");
+
+        let draw_header =
+            |ctx: &Context, raw_input: RawInput, observed_rect: &mut Option<egui::Rect>| -> bool {
+                let mut open_after_draw = false;
+                let _ = ctx.run(raw_input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let rect =
+                            egui::Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(320.0, 80.0));
+                        let mut child = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(rect)
+                                .layout(egui::Layout::top_down(egui::Align::Min)),
+                        );
+                        let mut state =
+                            egui::collapsing_header::CollapsingState::load_with_default_open(
+                                child.ctx(),
+                                super::directory_tree_folder_state_id(&folder_path),
+                                false,
+                            );
+                        let response = super::draw_directory_folder_header(
+                            &mut child, &mut state, "src", None, false,
+                        );
+                        *observed_rect = Some(response.rect);
+                        open_after_draw = state.is_open();
+                    });
+                });
+                open_after_draw
+            };
+
+        let mut first_rect = None;
+        let initially_open = draw_header(&ctx, RawInput::default(), &mut first_rect);
+        let first_rect = first_rect.expect("folder header rect should be observed");
+        assert_eq!(first_rect.left(), 0.0);
+        assert_eq!(first_rect.width(), 320.0);
+        assert!(!initially_open);
+
+        let click_pos = first_rect.center();
+        let click_input = RawInput {
+            events: vec![
+                Event::PointerMoved(click_pos),
+                Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::default(),
+                },
+                Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::default(),
+                },
+            ],
+            ..RawInput::default()
+        };
+
+        let mut clicked_rect = None;
+        let open_after_click = draw_header(&ctx, click_input, &mut clicked_rect);
+        let clicked_rect = clicked_rect.expect("clicked folder header rect should be observed");
+        assert_eq!(clicked_rect.left(), 0.0);
+        assert_eq!(clicked_rect.width(), 320.0);
+        assert!(open_after_click);
+    }
+
+    #[test]
     fn source_control_file_row_uses_full_available_width() {
         let ctx = Context::default();
         ctx.set_fonts(FontDefinitions::default());
@@ -45679,6 +45966,14 @@ mod tests {
             super::AppIcon::FileJson
         );
         assert_eq!(
+            super::file_icon_for_extension("package.json"),
+            super::AppIcon::FileJson
+        );
+        assert_eq!(
+            super::file_icon_for_extension("docker-compose.yml"),
+            super::AppIcon::FileJson
+        );
+        assert_eq!(
             super::file_icon_for_extension("notes.md"),
             super::AppIcon::FileText
         );
@@ -45703,6 +45998,11 @@ mod tests {
     #[test]
     fn submit_icon_resolves_to_lucide_glyph() {
         assert_ne!(super::icon_glyph(super::icons::SEND_HORIZONTAL), "?");
+    }
+
+    #[test]
+    fn file_icon_for_json_resolves_to_lucide_glyph() {
+        assert_ne!(super::icon_glyph(super::AppIcon::FileJson), "?");
     }
 
     #[test]
@@ -55014,6 +55314,100 @@ mod tests {
     }
 
     #[test]
+    fn create_worktree_pending_changes_submit_label_and_blocks_submit_close() {
+        assert_eq!(
+            AdeApp::create_worktree_submit_button_label(false),
+            "Create Worktree"
+        );
+        assert_eq!(
+            AdeApp::create_worktree_submit_button_label(true),
+            "Creating..."
+        );
+        assert!(AdeApp::create_worktree_can_submit(true, false));
+        assert!(!AdeApp::create_worktree_can_submit(true, true));
+        assert!(!AdeApp::create_worktree_can_submit(false, false));
+        assert!(AdeApp::create_worktree_can_close(false));
+        assert!(!AdeApp::create_worktree_can_close(true));
+    }
+
+    #[test]
+    fn create_worktree_success_event_adds_project_and_closes_popup() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(7, test_project(7, "Repo", "C:/repo", &["shared"], &[]));
+        app.show_create_worktree_popup = true;
+        app.create_worktree_project_id = Some(7);
+        app.create_worktree_in_progress = Some(super::CreateWorktreePending {
+            project_id: 7,
+            repo_root: PathBuf::from("C:/repo"),
+            branch: "feature/fix".to_owned(),
+            worktree_path: "C:/repo/worktrees/fix".to_owned(),
+        });
+        app.create_worktree_events_tx
+            .send(super::CreateWorktreeEvent {
+                project_id: 7,
+                repo_root: PathBuf::from("C:/repo"),
+                worktree_path: "C:/repo/worktrees/fix".to_owned(),
+                result: Ok(PathBuf::from("C:/repo/worktrees/fix")),
+            })
+            .expect("send create worktree event");
+
+        app.process_create_worktree_events(&ctx);
+
+        assert!(app.create_worktree_in_progress.is_none());
+        assert!(!app.show_create_worktree_popup);
+        assert!(app.create_worktree_error.is_none());
+        let worktree = app
+            .projects
+            .values()
+            .find(|project| project.is_worktree)
+            .expect("created worktree project");
+        assert_eq!(worktree.repo_root, Some(PathBuf::from("C:/repo")));
+        assert_eq!(worktree.saved_messages, vec!["shared".to_owned()]);
+        assert!(
+            app.status_line.contains("feature/fix"),
+            "success status should name the created branch"
+        );
+    }
+
+    #[test]
+    fn create_worktree_error_event_keeps_popup_open_and_reenables_submit() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        app.show_create_worktree_popup = true;
+        app.create_worktree_project_id = Some(7);
+        app.create_worktree_in_progress = Some(super::CreateWorktreePending {
+            project_id: 7,
+            repo_root: PathBuf::from("C:/repo"),
+            branch: "feature/fail".to_owned(),
+            worktree_path: "C:/repo/worktrees/fail".to_owned(),
+        });
+        app.create_worktree_events_tx
+            .send(super::CreateWorktreeEvent {
+                project_id: 7,
+                repo_root: PathBuf::from("C:/repo"),
+                worktree_path: "C:/repo/worktrees/fail".to_owned(),
+                result: Err("git worktree add failed: branch exists".to_owned()),
+            })
+            .expect("send create worktree event");
+
+        app.process_create_worktree_events(&ctx);
+
+        assert!(app.create_worktree_in_progress.is_none());
+        assert!(app.show_create_worktree_popup);
+        assert_eq!(
+            app.create_worktree_error.as_deref(),
+            Some("git worktree add failed: branch exists")
+        );
+        assert!(AdeApp::create_worktree_can_submit(true, false));
+        assert!(
+            app.projects.values().all(|project| !project.is_worktree),
+            "failed create must not add a worktree project"
+        );
+    }
+
+    #[test]
     fn set_active_terminal_preserves_create_worktree_popup_input_focus() {
         let ctx = egui::Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
@@ -55514,6 +55908,126 @@ mod tests {
             b"\x1b[200~/first\x1b[201~\r".to_vec(),
             "second queued task must wait for the next turn-complete signal"
         );
+    }
+
+    #[test]
+    fn opencode_non_work_slash_command_matches_only_new_chat_commands() {
+        assert!(AdeApp::is_opencode_non_work_slash_command("/n"));
+        assert!(AdeApp::is_opencode_non_work_slash_command(" /new "));
+        assert!(AdeApp::is_opencode_non_work_slash_command("/NEW"));
+        assert!(!AdeApp::is_opencode_non_work_slash_command("/new task"));
+        assert!(!AdeApp::is_opencode_non_work_slash_command("/notnew"));
+        assert!(!AdeApp::is_opencode_non_work_slash_command(
+            "/prepare-fix-plan"
+        ));
+    }
+
+    #[test]
+    fn smart_input_new_chat_slash_does_not_mark_opencode_working() {
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.smart_input.draft = "/n".to_owned();
+            terminal.smart_input.enqueue_draft();
+            terminal.smart_input.draft = "next task".to_owned();
+            terminal.smart_input.enqueue_draft();
+        }
+
+        app.process_smart_input_queues(&ctx);
+        capture.drain();
+
+        assert_eq!(capture.bytes(), b"\x1b[200~/n\x1b[201~\r".to_vec());
+        assert_eq!(
+            app.pending_second_enter.len(),
+            2,
+            "/n still needs the robust slash-menu confirmation Enters"
+        );
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.opencode_normalized_status,
+            Some(OpenCodeTransportStatus::Idle)
+        );
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert!(!terminal.opencode_attention_pending);
+        assert!(
+            terminal.opencode_prompt_submit_since.is_none(),
+            "/n must not be recorded as a prompt submit"
+        );
+        assert!(terminal.opencode_non_work_slash_settle_until.is_some());
+        assert_eq!(terminal.smart_input.tasks.len(), 1);
+        assert_eq!(terminal.smart_input.tasks[0].text, "next task");
+
+        app.process_smart_input_queues(&ctx);
+        capture.drain();
+        assert_eq!(
+            capture.bytes(),
+            b"\x1b[200~/n\x1b[201~\r".to_vec(),
+            "queued task must wait while /n confirmation Enters are settling"
+        );
+
+        app.terminals
+            .get_mut(&1)
+            .expect("terminal 1")
+            .opencode_non_work_slash_settle_until = Some(Instant::now() - Duration::from_millis(1));
+        app.process_smart_input_queues(&ctx);
+        capture.drain();
+
+        assert_eq!(
+            capture.bytes(),
+            b"\x1b[200~/n\x1b[201~\r\x1b[200~next task\x1b[201~\r".to_vec(),
+            "queued task may dispatch after the /n settle guard expires"
+        );
+        assert_eq!(
+            app.terminals
+                .get(&1)
+                .expect("terminal 1")
+                .opencode_normalized_status,
+            Some(OpenCodeTransportStatus::Working)
+        );
+    }
+
+    #[test]
+    fn terminal_new_chat_slash_does_not_mark_opencode_working() {
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        app.route_active_terminal_input(
+            &ctx,
+            vec![
+                Event::Text("/new".to_owned()),
+                Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: Some(egui::Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        capture.drain();
+
+        assert_eq!(capture.bytes(), b"/new\r".to_vec());
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.opencode_normalized_status,
+            Some(OpenCodeTransportStatus::Idle)
+        );
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Attention);
+        assert!(!terminal.opencode_attention_pending);
+        assert!(terminal.opencode_prompt_submit_since.is_none());
+        assert!(terminal.opencode_non_work_slash_settle_until.is_some());
     }
 
     #[test]

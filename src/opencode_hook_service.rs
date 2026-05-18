@@ -681,7 +681,9 @@ async function pollForAnswers(client) {
     });
     if (res.status === 200) {
       const answer = await res.json();
-      if (answer?.request_id && pendingQuestions.has(answer.request_id) && !ackedAnswers.has(answer.request_id)) {
+      // pendingQuestions tracks prompts observed by this plugin instance, but
+      // answer delivery must not depend on that volatile UI event cache.
+      if (answer?.request_id && !ackedAnswers.has(answer.request_id)) {
         let delivered = false;
         try {
           if (answer.rejected && canReject) {
@@ -1041,6 +1043,28 @@ mod tests {
         assert_eq!(state.peek_answer(7).unwrap().request_id, "req-2");
         state.ack_answer(7);
         assert!(state.peek_answer(7).is_none());
+    }
+
+    #[test]
+    fn plugin_answer_polling_does_not_require_seen_pending_question() {
+        let source = get_opencode_plugin_source();
+
+        assert!(
+            source.contains("if (answer?.request_id && !ackedAnswers.has(answer.request_id))"),
+            "plugin should deliver queued answers by request id without requiring cached question metadata"
+        );
+        assert!(
+            !source.contains("pendingQuestions.has(answer.request_id) &&"),
+            "pendingQuestions cache must not block Smart Input answer delivery"
+        );
+        assert!(
+            source.contains("pendingQuestions.delete(answer.request_id);"),
+            "successful delivery should still clean pending question metadata"
+        );
+        assert!(
+            source.contains("await ackAnswer(answer.request_id);"),
+            "successful delivery should still acknowledge the server queue"
+        );
     }
 
     #[test]

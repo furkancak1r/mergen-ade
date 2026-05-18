@@ -1856,3 +1856,100 @@
   - Added regression tests for root-to-worktree add, root removal cleaning stale worktree messages, worktree-to-root/sibling propagation, and duplicate prevention.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
 - References: User request 2026-05-18
+
+---
+
+#### OpenCode /new from Smart Input left spinner running {#opencode-new-chat-smart-input-spinner}
+- Date: 2026-05-18
+- Context: User typed `/n` in Smart Input after an OpenCode turn finished; OpenCode selected `/new` and opened a blank chat, but Mergen kept showing the working spinner.
+- Error signature: Smart Input classified every non-empty OpenCode submission as a prompt submit and forced `OpenCodeTransportStatus::Working`, including non-work slash commands.
+- Symptoms/Impact:
+  1. Opening a new empty OpenCode chat through `/n` or `/new` could leave the terminal badge spinning.
+  2. Queued Smart Input tasks could race the slash-menu confirmation Enters after `/new`.
+- Root cause:
+  - `/n` and `/new` are OpenCode session/navigation commands, not task prompts, but Mergen used the same status transition as normal prompts.
+- Resolution:
+  - Treat exact `/n` and `/new` as non-work OpenCode slash commands.
+  - Preserve the paste/Enter delivery path, but do not mark OpenCode as Working for those commands.
+  - Add a short runtime settle guard so queued tasks wait until `/new` confirmation Enters finish.
+- Prevent recurrence:
+  - Added regression tests for Smart Input `/n`, direct terminal `/new`, exact command classification, and queued-task settle behavior.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+- References: User request 2026-05-18
+
+---
+
+#### Directory JSON/YAML files showed question mark icon {#directory-json-yaml-question-icon}
+- Date: 2026-05-18
+- Context: User reported that Directory panel icons for `.json` and YAML files appeared as question marks.
+- Error signature: Extension mapping returned `AppIcon::FileJson`, but the Lucide icon name for that enum was `file-json`, which is unavailable in the bundled `iconflow` Lucide map.
+- Symptoms/Impact:
+  1. `.json`, `.yaml`, and `.yml` files displayed `?` instead of a file-type icon.
+  2. Directory rows looked like unknown or broken file types despite being recognized.
+- Root cause:
+  - The icon glyph lookup falls back to `?` when `try_icon` cannot resolve the configured Lucide name.
+- Resolution:
+  - Changed `AppIcon::FileJson` to use the available Lucide `file-braces` icon.
+- Prevent recurrence:
+  - Added regression coverage for JSON/YAML extension mapping and `FileJson` glyph resolution.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+- References: User request 2026-05-18
+
+---
+
+#### Directory folder rows showed redundant disclosure triangles {#directory-folder-redundant-triangles}
+- Date: 2026-05-18
+- Context: User wanted Directory folder structure to rely on folder icons instead of showing separate triangles next to every folder.
+- Error signature: Directory folders used `egui::CollapsingState::show_header`, which automatically paints a disclosure triangle before the custom folder row.
+- Symptoms/Impact:
+  1. Folder rows had both a disclosure triangle and a folder/folder-open icon.
+  2. The duplicate visual made the Directory tree noisier than needed.
+- Root cause:
+  - The tree reused egui's default collapsing header renderer instead of drawing a custom full-width folder row backed by the same open/closed state.
+- Resolution:
+  - Draw Directory folder headers with the existing folder row renderer and manually toggle the same `CollapsingState` on row click.
+  - Keep child indentation, search expansion, lazy loading, and context menu behavior intact.
+- Prevent recurrence:
+  - Added regression coverage for full-width folder headers without a disclosure slot and click-to-toggle behavior.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+- References: User request 2026-05-18
+
+---
+
+#### OpenCode Smart Input Submit Answer required a second terminal Enter {#opencode-smart-input-question-answer-second-enter}
+- Date: 2026-05-18
+- Context: User reported that Smart Input's `Submit Answer` button sent an OpenCode question answer, but the answer only took effect after focusing the terminal and pressing Enter again.
+- Error signature: The managed OpenCode plugin polled Mergen's answer queue but delivered answers only when its runtime `pendingQuestions` cache already contained the request id.
+- Symptoms/Impact:
+  1. Smart Input appeared to submit the answer, but OpenCode stayed on the question prompt.
+  2. Users had to manually focus the terminal and press Enter, defeating the one-click Smart Input flow.
+- Root cause:
+  - `pendingQuestions` is volatile plugin-side metadata. If the plugin missed or had not retained the `question.asked` event, the queued Smart Input answer remained blocked even though Mergen had the request id.
+- Resolution:
+  - Allow the plugin to deliver queued answers by request id without requiring `pendingQuestions.has(...)`.
+  - Keep `pendingQuestions` cleanup and server-side answer acknowledgement after successful SDK delivery.
+- Prevent recurrence:
+  - Added regression coverage that the generated plugin source does not gate answer delivery on the volatile pending-question cache.
+- Files/Commands touched: `src/opencode_hook_service.rs`, `KNOWN_ISSUES.md`
+- References: User request 2026-05-18
+
+---
+
+#### Create Worktree froze briefly and allowed repeated clicks {#create-worktree-ui-thread-freeze}
+- Date: 2026-05-18
+- Context: User reported that pressing `Create Worktree` caused a short freeze and the button still looked clickable.
+- Error signature: The popup called `git worktree add` synchronously from the egui render callback.
+- Symptoms/Impact:
+  1. The UI could stall while Git created the worktree and copied root `.env*` files.
+  2. The submit button did not clearly enter a busy state.
+  3. Repeated clicks could be attempted while the operation was still in progress.
+- Root cause:
+  - Blocking process execution ran on the UI thread instead of returning a completion event to the main loop.
+- Resolution:
+  - Move worktree creation to a background thread and deliver results through a UI event channel.
+  - Track a create-worktree pending state that disables inputs/actions and changes the submit label to `Creating...`.
+  - Process success/failure on the main thread so project records are still mutated only from the UI loop.
+- Prevent recurrence:
+  - Added regression coverage for pending button/close state plus success and error event handling.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+- References: User request 2026-05-18
