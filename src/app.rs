@@ -4940,16 +4940,16 @@ impl AdeApp {
         self.add_project_with_worktree(path, None, false);
     }
 
-    fn saved_messages_family_root_path(project: &ProjectRecord) -> PathBuf {
+    fn project_family_root_path(project: &ProjectRecord) -> PathBuf {
         let family_root = project.repo_root.as_ref().unwrap_or(&project.path);
         crate::path_utils::normalize_windows_verbatim_path_for_shell(family_root)
     }
 
-    fn saved_messages_family_project_ids(&self, project_id: u64) -> Vec<u64> {
+    fn project_family_project_ids(&self, project_id: u64) -> Vec<u64> {
         let Some(family_root) = self
             .projects
             .get(&project_id)
-            .map(Self::saved_messages_family_root_path)
+            .map(Self::project_family_root_path)
         else {
             return Vec::new();
         };
@@ -4957,10 +4957,102 @@ impl AdeApp {
         self.projects
             .iter()
             .filter_map(|(member_id, project)| {
-                (Self::saved_messages_family_root_path(project) == family_root)
-                    .then_some(*member_id)
+                (Self::project_family_root_path(project) == family_root).then_some(*member_id)
             })
             .collect()
+    }
+
+    fn project_family_root_project_id(&self, project_id: u64) -> Option<u64> {
+        let family_root = self
+            .projects
+            .get(&project_id)
+            .map(Self::project_family_root_path)?;
+
+        self.projects.iter().find_map(|(member_id, project)| {
+            (!project.is_worktree && Self::project_family_root_path(project) == family_root)
+                .then_some(*member_id)
+        })
+    }
+
+    fn browser_profile_project_id(&self, project_id: u64) -> u64 {
+        self.project_family_root_project_id(project_id)
+            .unwrap_or(project_id)
+    }
+
+    fn browser_last_url_for_project_family(&self, project_id: u64) -> Option<String> {
+        let member_ids = self.project_family_project_ids(project_id);
+        if member_ids.is_empty() {
+            return None;
+        }
+
+        self.project_family_root_project_id(project_id)
+            .and_then(|root_id| {
+                self.projects
+                    .get(&root_id)
+                    .and_then(|project| project.browser_last_url.clone())
+            })
+            .or_else(|| {
+                self.projects
+                    .get(&project_id)
+                    .and_then(|project| project.browser_last_url.clone())
+            })
+            .or_else(|| {
+                member_ids.into_iter().find_map(|member_id| {
+                    self.projects
+                        .get(&member_id)
+                        .and_then(|project| project.browser_last_url.clone())
+                })
+            })
+    }
+
+    fn set_browser_last_url_for_project_family(&mut self, project_id: u64, url: String) -> bool {
+        let member_ids = self.project_family_project_ids(project_id);
+        if member_ids.is_empty() {
+            return false;
+        }
+
+        let mut changed = false;
+        for member_id in member_ids {
+            let Some(project) = self.projects.get_mut(&member_id) else {
+                continue;
+            };
+            if project.browser_last_url.as_deref() == Some(url.as_str()) {
+                continue;
+            }
+            project.browser_last_url = Some(url.clone());
+            changed = true;
+        }
+        if changed {
+            self.note_projects_changed();
+        }
+        changed
+    }
+
+    fn clear_browser_last_url_for_project_family(&mut self, project_id: u64) -> bool {
+        let member_ids = self.project_family_project_ids(project_id);
+        if member_ids.is_empty() {
+            return false;
+        }
+
+        let mut changed = false;
+        for member_id in member_ids {
+            let Some(project) = self.projects.get_mut(&member_id) else {
+                continue;
+            };
+            if project.browser_last_url.is_none() {
+                continue;
+            }
+            project.browser_last_url = None;
+            changed = true;
+        }
+        if changed {
+            self.note_projects_changed();
+        }
+        changed
+    }
+
+    fn saved_messages_family_project_ids(&self, project_id: u64) -> Vec<u64> {
+        self.project_family_project_ids(project_id)
     }
 
     fn add_saved_message_to_project_family(&mut self, project_id: u64, message: String) -> bool {
@@ -5036,8 +5128,8 @@ impl AdeApp {
                 .unwrap_or_else(|| path.display().to_string())
         };
 
-        // Family-shared saved messages: worktrees inherit root project's saved messages
-        let (saved_messages, foreground_saved_messages) = if is_worktree {
+        // Family-shared state: worktrees inherit root project's saved messages and browser URL.
+        let (saved_messages, foreground_saved_messages, browser_last_url) = if is_worktree {
             if let Some(ref root_path) = repo_root {
                 self.projects
                     .values()
@@ -5046,14 +5138,15 @@ impl AdeApp {
                         (
                             root_project.saved_messages.clone(),
                             root_project.foreground_saved_messages.clone(),
+                            root_project.browser_last_url.clone(),
                         )
                     })
                     .unwrap_or_default()
             } else {
-                (Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), None)
             }
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), None)
         };
 
         let project = ProjectRecord {
@@ -5063,7 +5156,7 @@ impl AdeApp {
             saved_messages,
             ai_config: crate::hooks::ProjectAiConfig::default(),
             checklist: Vec::new(),
-            browser_last_url: None,
+            browser_last_url,
             foreground_saved_messages,
             repo_root,
             is_worktree,
@@ -20082,12 +20175,8 @@ impl AdeApp {
             tab.kind = BrowserTabKind::Page;
         }
         self.browser_url_draft_by_scope.insert(scope, url.clone());
-        if !scope.is_terminal() {
-            if let Some(project) = self.projects.get_mut(&project_id) {
-                project.browser_last_url = Some(url);
-                self.note_projects_changed();
-                self.persist_config();
-            }
+        if !scope.is_terminal() && self.set_browser_last_url_for_project_family(project_id, url) {
+            self.persist_config();
         }
     }
 
@@ -20127,38 +20216,21 @@ impl AdeApp {
         scope: impl Into<BrowserScopeKey>,
     ) -> web_browser::EmbeddedBrowser {
         let scope = scope.into();
-        let user_data_folder = match scope {
-            BrowserScopeKey::Project(project_id) => {
-                match config::browser_user_data_dir_path(project_id) {
-                    Ok(path) => Some(path),
-                    Err(err) => {
-                        log::error!(
-                            "Browser profile folder setup failed for project {}: {}",
-                            project_id,
-                            err
-                        );
-                        self.status_line =
-                        "Browser profile folder could not be prepared; passwords may not persist"
-                            .to_owned();
-                        None
-                    }
-                }
-            }
-            BrowserScopeKey::Terminal { project_id, .. } => {
-                match config::browser_user_data_dir_path(project_id) {
-                    Ok(path) => Some(path),
-                    Err(err) => {
-                        log::error!(
-                            "Browser profile folder setup failed for project {} terminal scope: {}",
-                            project_id,
-                            err
-                        );
-                        self.status_line =
-                        "Browser profile folder could not be prepared; passwords may not persist"
-                            .to_owned();
-                        None
-                    }
-                }
+        let project_id = scope.project_id();
+        let profile_project_id = self.browser_profile_project_id(project_id);
+        let user_data_folder = match config::browser_user_data_dir_path(profile_project_id) {
+            Ok(path) => Some(path),
+            Err(err) => {
+                log::error!(
+                    "Browser profile folder setup failed for project {} using profile project {}: {}",
+                    project_id,
+                    profile_project_id,
+                    err
+                );
+                self.status_line =
+                    "Browser profile folder could not be prepared; passwords may not persist"
+                        .to_owned();
+                None
             }
         };
         web_browser::EmbeddedBrowser::new_with_user_data_folder(user_data_folder)
@@ -20177,10 +20249,7 @@ impl AdeApp {
             }
         }
 
-        let initial_url = self
-            .projects
-            .get(&project_id)
-            .and_then(|project| project.browser_last_url.clone());
+        let initial_url = self.browser_last_url_for_project_family(project_id);
         let tab_id = self.next_browser_tab_id;
         self.next_browser_tab_id = self.next_browser_tab_id.saturating_add(1).max(1);
         let tab = BrowserTabState::new_page(tab_id, initial_url.clone());
@@ -21788,17 +21857,8 @@ impl AdeApp {
         }
 
         // Update the persisted project URL (only for project-scoped browsers)
-        if !scope.is_terminal() {
-            if let Some(project) = self.projects.get_mut(&project_id) {
-                match &project.browser_last_url {
-                    Some(existing) if existing == &url => {}
-                    _ => {
-                        project.browser_last_url = Some(url);
-                        self.note_projects_changed();
-                        changed = true;
-                    }
-                }
-            }
+        if !scope.is_terminal() && self.set_browser_last_url_for_project_family(project_id, url) {
+            changed = true;
         }
 
         if changed {
@@ -21871,10 +21931,7 @@ impl AdeApp {
         }
         // For project scopes only, fall back to persisted browser_last_url
         if !scope.is_terminal() {
-            return self
-                .projects
-                .get(&scope.project_id())
-                .and_then(|project| project.browser_last_url.clone());
+            return self.browser_last_url_for_project_family(scope.project_id());
         }
         None
     }
@@ -22468,11 +22525,12 @@ impl AdeApp {
                     (
                         browser_project_id,
                         p.name.clone(),
-                        p.browser_last_url.clone(),
                     )
                 });
 
-                if let Some((project_id, _project_name, browser_last_url)) = selected_project_info {
+                if let Some((project_id, _project_name)) = selected_project_info {
+                    let browser_last_url =
+                        self.browser_last_url_for_project_family(browser_project_id);
                     let browser_status = self
                         .embedded_browsers_by_scope
                         .get(&browser_scope)
@@ -22809,9 +22867,8 @@ impl AdeApp {
                     // Handle Clear URL button
                     if clear_requested {
                         if self.projects.contains_key(&browser_project_id) {
-                            if let Some(project) = self.projects.get_mut(&browser_project_id) {
-                                project.browser_last_url = None;
-                            }
+                            let browser_last_url_changed =
+                                self.clear_browser_last_url_for_project_family(browser_project_id);
                             self.browser_url_draft_by_scope
                                 .remove(&browser_scope);
                             self.browser_navigation_requested_by_scope
@@ -22824,8 +22881,9 @@ impl AdeApp {
                                     tab.kind = BrowserTabKind::Page;
                                 }
                             }
-                            self.note_projects_changed();
-                            self.persist_config();
+                            if browser_last_url_changed {
+                                self.persist_config();
+                            }
                         }
                     }
 
@@ -52963,6 +53021,129 @@ mod tests {
     }
 
     #[test]
+    fn worktree_browser_url_change_syncs_repo_family() {
+        let mut app = test_app([], None);
+        let mut root = test_project(1, "Repo", "C:/repo", &[], &[]);
+        root.browser_last_url = Some("https://old.example.com".to_owned());
+        let mut sibling =
+            test_worktree_project(3, "Repo · b", "C:/repo-worktrees/b", "C:/repo", &[]);
+        sibling.browser_last_url = Some("https://stale.example.com".to_owned());
+
+        app.projects.insert(1, root);
+        app.projects.insert(
+            2,
+            test_worktree_project(2, "Repo · a", "C:/repo-worktrees/a", "C:/repo", &[]),
+        );
+        app.projects.insert(3, sibling);
+        app.projects
+            .insert(4, test_project(4, "Other", "C:/other", &[], &[]));
+
+        app.set_browser_url_for_scope(
+            BrowserScopeKey::Project(2),
+            "https://shared.example.com".to_owned(),
+        );
+
+        for project_id in [1, 2, 3] {
+            assert_eq!(
+                app.projects.get(&project_id).unwrap().browser_last_url,
+                Some("https://shared.example.com".to_owned())
+            );
+        }
+        assert_eq!(app.projects.get(&4).unwrap().browser_last_url, None);
+    }
+
+    #[test]
+    fn observed_worktree_browser_url_syncs_repo_family() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Repo", "C:/repo", &[], &[]));
+        app.projects.insert(
+            2,
+            test_worktree_project(
+                2,
+                "Repo · feature",
+                "C:/repo-worktrees/feature",
+                "C:/repo",
+                &[],
+            ),
+        );
+
+        let changed = app.apply_browser_observed_url(2, "https://observed.example.com".to_owned());
+
+        assert!(changed);
+        for project_id in [1, 2] {
+            assert_eq!(
+                app.projects.get(&project_id).unwrap().browser_last_url,
+                Some("https://observed.example.com".to_owned())
+            );
+        }
+        assert_eq!(
+            app.browser_url_draft_by_scope
+                .get(&BrowserScopeKey::Project(2)),
+            Some(&"https://observed.example.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn worktree_browser_url_falls_back_to_root_family_url() {
+        let mut app = test_app([], None);
+        let mut root = test_project(1, "Repo", "C:/repo", &[], &[]);
+        root.browser_last_url = Some("https://root.example.com".to_owned());
+        app.projects.insert(1, root);
+        app.projects.insert(
+            2,
+            test_worktree_project(
+                2,
+                "Repo · feature",
+                "C:/repo-worktrees/feature",
+                "C:/repo",
+                &[],
+            ),
+        );
+
+        let scope = BrowserScopeKey::Project(2);
+        let tab_id = app.ensure_browser_tab_state(scope);
+
+        assert_eq!(
+            app.current_browser_url_for_scope(scope),
+            Some("https://root.example.com".to_owned())
+        );
+        assert_eq!(
+            app.browser_url_draft_by_scope.get(&scope),
+            Some(&"https://root.example.com".to_owned())
+        );
+        assert_eq!(
+            app.browser_tabs_by_scope
+                .get(&scope)
+                .and_then(|tabs| tabs.iter().find(|tab| tab.id == tab_id))
+                .and_then(|tab| tab.url.clone()),
+            Some("https://root.example.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn clear_worktree_browser_url_clears_repo_family() {
+        let mut app = test_app([], None);
+        let mut root = test_project(1, "Repo", "C:/repo", &[], &[]);
+        root.browser_last_url = Some("https://root.example.com".to_owned());
+        let mut worktree = test_worktree_project(
+            2,
+            "Repo · feature",
+            "C:/repo-worktrees/feature",
+            "C:/repo",
+            &[],
+        );
+        worktree.browser_last_url = Some("https://worktree.example.com".to_owned());
+        app.projects.insert(1, root);
+        app.projects.insert(2, worktree);
+
+        assert!(app.clear_browser_last_url_for_project_family(2));
+
+        assert_eq!(app.projects.get(&1).unwrap().browser_last_url, None);
+        assert_eq!(app.projects.get(&2).unwrap().browser_last_url, None);
+    }
+
+    #[test]
     fn process_browser_events_ignores_unsupported_sources() {
         let ctx = egui::Context::default();
         let mut app = test_app([], None);
@@ -54501,6 +54682,61 @@ mod tests {
     }
 
     #[test]
+    fn worktree_browser_scopes_use_root_project_profile_folder() {
+        let mut app = test_app([(1, test_terminal_entry(1, 8))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "Repo", "C:/repo", &[], &[]));
+        app.projects.insert(
+            8,
+            test_worktree_project(
+                8,
+                "Repo · feature",
+                "C:/repo-worktrees/feature",
+                "C:/repo",
+                &[],
+            ),
+        );
+        app.active_terminal = Some(1);
+
+        let expected = config::browser_user_data_dir_path(7).unwrap();
+        let project_scope = BrowserScopeKey::Project(8);
+        let terminal_scope = BrowserScopeKey::Terminal {
+            project_id: 8,
+            terminal_id: 1,
+        };
+
+        {
+            let browser = app.browser_for_scope(project_scope);
+            assert_eq!(browser.user_data_folder(), Some(&expected));
+        }
+        {
+            let browser = app.browser_for_scope(terminal_scope);
+            assert_eq!(browser.user_data_folder(), Some(&expected));
+        }
+    }
+
+    #[test]
+    fn worktree_browser_profile_falls_back_to_own_folder_without_registered_root() {
+        let mut app = test_app([(1, test_terminal_entry(1, 8))], Some(1));
+        app.projects.insert(
+            8,
+            test_worktree_project(
+                8,
+                "Repo · feature",
+                "C:/repo-worktrees/feature",
+                "C:/repo",
+                &[],
+            ),
+        );
+
+        let expected = config::browser_user_data_dir_path(8).unwrap();
+        let scope = BrowserScopeKey::Project(8);
+
+        let browser = app.browser_for_scope(scope);
+        assert_eq!(browser.user_data_folder(), Some(&expected));
+    }
+
+    #[test]
     fn same_project_terminals_share_browser_profile_folder() {
         let mut app = test_app(
             [
@@ -55659,8 +55895,9 @@ mod tests {
     fn create_worktree_success_event_adds_project_and_closes_popup() {
         let ctx = egui::Context::default();
         let mut app = test_app([], None);
-        app.projects
-            .insert(7, test_project(7, "Repo", "C:/repo", &["shared"], &[]));
+        let mut root_project = test_project(7, "Repo", "C:/repo", &["shared"], &[]);
+        root_project.browser_last_url = Some("https://root.example.com".to_owned());
+        app.projects.insert(7, root_project);
         app.show_create_worktree_popup = true;
         app.create_worktree_project_id = Some(7);
         app.create_worktree_in_progress = Some(super::CreateWorktreePending {
@@ -55690,6 +55927,10 @@ mod tests {
             .expect("created worktree project");
         assert_eq!(worktree.repo_root, Some(PathBuf::from("C:/repo")));
         assert_eq!(worktree.saved_messages, vec!["shared".to_owned()]);
+        assert_eq!(
+            worktree.browser_last_url,
+            Some("https://root.example.com".to_owned())
+        );
         assert!(
             app.status_line.contains("feature/fix"),
             "success status should name the created branch"

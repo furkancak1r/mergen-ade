@@ -2010,3 +2010,25 @@
   - Added regression coverage that the Create Worktree popup paints an opaque `SURFACE_BG` frame.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
 - References: User request 2026-05-18
+
+---
+
+#### Worktrees did not inherit browser sessions and URLs {#worktree-browser-profile-url-not-shared}
+- Date: 2026-05-18
+- Context: User reported that worktrees did not inherit Browser history, saved passwords, or links from the normal project.
+- Error signature: Worktree browser panels used a WebView2 user-data folder keyed by the worktree `ProjectRecord` id and persisted `browser_last_url` only on that individual worktree record.
+- Symptoms/Impact:
+  1. Browser history, cookies, sessions, and saved passwords had to be recreated for each worktree.
+  2. Root project and worktree browser URL fields could drift apart.
+  3. Newly added worktrees opened without the root project's last browser URL.
+- Root cause:
+  - Browser profile and last URL state were project-id scoped, while worktree projects are intended to behave as members of the root repo family.
+- Resolution:
+  - Resolve worktree browser WebView2 profiles to the registered root project profile folder.
+  - Share project-scoped `browser_last_url` updates and clears across the repo family.
+  - Copy the root project's last browser URL when adding a new worktree record.
+  - Avoid copying or deleting existing WebView2 profile folders so locked browser profile data is not corrupted.
+- Prevent recurrence:
+  - Added regression coverage for worktree profile-folder selection, root URL fallback, URL sync, URL clearing, and create-worktree inheritance.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+- References: User request 2026-05-18
