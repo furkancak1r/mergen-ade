@@ -290,6 +290,7 @@ const CREATE_WORKTREE_PATH_INPUT_ID: &str = "create-worktree-path-input";
 const SMART_INPUT_MIN_FOOTER_HEIGHT: f32 = 132.0;
 const SMART_INPUT_BASE_FOOTER_HEIGHT: f32 = 128.0;
 const SMART_INPUT_TASK_ROW_HEIGHT: f32 = 28.0;
+const SMART_INPUT_TASK_DRAG_HANDLE_WIDTH: f32 = 18.0;
 const SMART_INPUT_TASK_INDEX_WIDTH: f32 = 16.0;
 const SMART_INPUT_MAX_VISIBLE_TASK_ROWS: usize = 3;
 const SMART_INPUT_QUEUE_TOP_GAP: f32 = 8.0;
@@ -436,6 +437,7 @@ enum AppIcon {
     Gear,
     GitBranch,
     Globe,
+    GripVertical,
     List,
     Plus,
     Question,
@@ -457,7 +459,7 @@ enum AppIcon {
 }
 
 impl AppIcon {
-    const ALL: [Self; 37] = [
+    const ALL: [Self; 38] = [
         Self::ArrowClockwise,
         Self::ArrowLeft,
         Self::ArrowRight,
@@ -477,6 +479,7 @@ impl AppIcon {
         Self::Gear,
         Self::GitBranch,
         Self::Globe,
+        Self::GripVertical,
         Self::List,
         Self::Plus,
         Self::Question,
@@ -518,6 +521,7 @@ impl AppIcon {
             Self::Gear => "settings",
             Self::GitBranch => "git-branch",
             Self::Globe => "globe",
+            Self::GripVertical => "grip-vertical",
             Self::List => "list",
             Self::Plus => "plus",
             Self::Question => "help-circle",
@@ -590,6 +594,7 @@ mod icons {
     pub const GEAR: AppIcon = AppIcon::Gear;
     pub const GIT_BRANCH: AppIcon = AppIcon::GitBranch;
     pub const GLOBE: AppIcon = AppIcon::Globe;
+    pub const GRIP_VERTICAL: AppIcon = AppIcon::GripVertical;
     pub const LIST: AppIcon = AppIcon::List;
     pub const PLUS: AppIcon = AppIcon::Plus;
     pub const QUESTION: AppIcon = AppIcon::Question;
@@ -1168,6 +1173,7 @@ impl SmartInputState {
             return SmartInputDraftEditResult::DraftOccupied;
         }
 
+        self.clear_drag_for_task(task_id);
         if self.editing_task_id.is_some() {
             self.cancel_edit();
         }
@@ -1186,6 +1192,7 @@ impl SmartInputState {
         if self.editing_task_id == Some(task_id) {
             self.cancel_edit();
         }
+        self.clear_drag_for_task(task_id);
         Some(self.tasks.remove(index).text)
     }
 
@@ -1230,9 +1237,12 @@ impl SmartInputState {
         let Some(task) = self.tasks.iter().find(|task| task.id == task_id) else {
             return false;
         };
+        let text = task.text.clone();
+        let attachments = task.attachments.clone();
+        self.clear_drag_for_task(task_id);
         self.editing_task_id = Some(task_id);
-        self.edit_draft = task.text.clone();
-        self.edit_attachments = task.attachments.clone();
+        self.edit_draft = text;
+        self.edit_attachments = attachments;
         self.edit_context_menu_selection_range = None;
         self.edit_context_menu_was_open = false;
         true
@@ -1268,6 +1278,17 @@ impl SmartInputState {
             attachments: Vec::new(),
         });
         self.queue_scroll_to_end = true;
+    }
+
+    fn clear_drag_state(&mut self) {
+        self.dragging_task_id = None;
+        self.drag_hover_index = None;
+    }
+
+    fn clear_drag_for_task(&mut self, task_id: u64) {
+        if self.dragging_task_id == Some(task_id) {
+            self.clear_drag_state();
+        }
     }
 
     /// Navigate up in combined history (newest queued tasks first, then older terminal inputs).
@@ -13995,6 +14016,9 @@ impl AdeApp {
             return false;
         }
         if terminal.smart_input.tasks.is_empty() {
+            return false;
+        }
+        if terminal.smart_input.dragging_task_id.is_some() {
             return false;
         }
         if terminal.opencode_pending_question.is_some() {
@@ -28118,6 +28142,21 @@ fn smart_input_queue_row_clip_rect(
     row_rect.intersect(viewport_clip_rect)
 }
 
+fn smart_input_drag_target_index(
+    row_index: usize,
+    row_rect: egui::Rect,
+    pointer_pos: Option<egui::Pos2>,
+) -> usize {
+    let Some(pos) = pointer_pos else {
+        return row_index;
+    };
+    if pos.y > row_rect.center().y {
+        row_index.saturating_add(1)
+    } else {
+        row_index
+    }
+}
+
 fn smart_input_question_extra_height(question: Option<&OpenCodeQuestionInfo>) -> f32 {
     let Some(question) = question else {
         return 0.0;
@@ -28518,7 +28557,8 @@ fn draw_smart_input_footer(
                 );
                 queue_ui.set_clip_rect(queue_rect);
                 let mut row_action: Option<(u64, &'static str)> = None;
-                let should_scroll_to_end = state.queue_scroll_to_end;
+                let should_scroll_to_end =
+                    state.queue_scroll_to_end && state.dragging_task_id.is_none();
                 state.queue_scroll_to_end = false;
                 egui::ScrollArea::vertical()
                     .id_salt(("smart_input_queue", terminal_id))
@@ -28528,7 +28568,16 @@ fn draw_smart_input_footer(
                     .show(&mut queue_ui, |ui| {
                         ui.set_min_width(queue_rect.width());
                         ui.set_max_width(queue_rect.width());
-                        for index in 0..state.tasks.len() {
+                        let pointer_pos =
+                            ui.ctx().input(|input| input.pointer.interact_pos());
+                        let primary_down =
+                            ui.ctx().input(|input| input.pointer.primary_down());
+                        if state.dragging_task_id.is_none() {
+                            state.drag_hover_index = None;
+                        }
+                        let task_count = state.tasks.len();
+                        let mut last_row_rect = None;
+                        for index in 0..task_count {
                             let task_id = state.tasks[index].id;
                             let task_text = state.tasks[index].text.clone();
                             let is_editing = state.editing_task_id == Some(task_id);
@@ -28542,10 +28591,16 @@ fn draw_smart_input_footer(
                                     .max_rect(row_rect)
                                     .layout(egui::Layout::left_to_right(egui::Align::Min)),
                             );
-                            row_ui.set_clip_rect(smart_input_queue_row_clip_rect(
-                                row_rect,
-                                ui.clip_rect(),
-                            ));
+                            let row_clip_rect =
+                                smart_input_queue_row_clip_rect(row_rect, ui.clip_rect());
+                            row_ui.set_clip_rect(row_clip_rect);
+                            last_row_rect = Some(row_rect);
+                            if state.dragging_task_id.is_some()
+                                && pointer_pos.is_some_and(|pos| row_clip_rect.contains(pos))
+                            {
+                                state.drag_hover_index =
+                                    Some(smart_input_drag_target_index(index, row_rect, pointer_pos));
+                            }
                             // Paint a subtle row background so the queue area is visible even
                             // when the task text is empty.
                             if index % 2 == 0 {
@@ -28554,6 +28609,72 @@ fn draw_smart_input_footer(
                                     0.0,
                                     Color32::from_rgb(28, 28, 30),
                                 );
+                            }
+                            if state.dragging_task_id.is_some() {
+                                let drag_line_color = Color32::from_rgb(95, 150, 255);
+                                if state.drag_hover_index == Some(index) {
+                                    row_ui.painter().line_segment(
+                                        [row_rect.left_top(), row_rect.right_top()],
+                                        Stroke::new(2.0, drag_line_color),
+                                    );
+                                }
+                                if index + 1 == task_count
+                                    && state.drag_hover_index == Some(task_count)
+                                {
+                                    row_ui.painter().line_segment(
+                                        [row_rect.left_bottom(), row_rect.right_bottom()],
+                                        Stroke::new(2.0, drag_line_color),
+                                    );
+                                }
+                            }
+
+                            let is_dragging_this = state.dragging_task_id == Some(task_id);
+                            if !is_editing {
+                                let (drag_rect, drag_response) = row_ui.allocate_exact_size(
+                                    egui::vec2(
+                                        SMART_INPUT_TASK_DRAG_HANDLE_WIDTH,
+                                        SMART_INPUT_TASK_ROW_HEIGHT,
+                                    ),
+                                    Sense::drag(),
+                                );
+                                if row_ui.is_rect_visible(drag_rect) {
+                                    let icon_color = if is_dragging_this
+                                        || drag_response.is_pointer_button_down_on()
+                                        || drag_response.hovered()
+                                    {
+                                        TEXT_PRIMARY
+                                    } else {
+                                        with_alpha(TEXT_PRIMARY, 150)
+                                    };
+                                    row_ui.painter().text(
+                                        drag_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        format!("{}", icons::GRIP_VERTICAL),
+                                        egui::FontId::proportional(14.0),
+                                        icon_color,
+                                    );
+                                }
+                                if is_dragging_this || drag_response.dragged() {
+                                    row_ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                                } else if drag_response.hovered() {
+                                    row_ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                                }
+                                if drag_response.drag_started_by(egui::PointerButton::Primary) {
+                                    state.dragging_task_id = Some(task_id);
+                                    state.drag_hover_index = Some(index);
+                                    action.request_keyboard_focus(SmartInputFocusTarget::Draft);
+                                }
+                                if state.dragging_task_id == Some(task_id)
+                                    && (drag_response.dragged_by(egui::PointerButton::Primary)
+                                        || primary_down)
+                                {
+                                    state.drag_hover_index = Some(smart_input_drag_target_index(
+                                        index,
+                                        row_rect,
+                                        pointer_pos,
+                                    ));
+                                    row_ui.ctx().request_repaint_after(Duration::from_millis(16));
+                                }
                             }
 
                             let index_text = format!("{}.", index + 1);
@@ -28707,7 +28828,6 @@ fn draw_smart_input_footer(
                                     action.request_keyboard_focus(SmartInputFocusTarget::Draft);
                                 }
                             } else {
-                                let is_dragging_this = state.dragging_task_id == Some(task_id);
                                 let text_color = if is_dragging_this {
                                     TEXT_MUTED
                                 } else {
@@ -28810,10 +28930,51 @@ fn draw_smart_input_footer(
                                 }
                             }
                         }
+                        if let Some(dragging_task_id) = state.dragging_task_id {
+                            if let Some(pos) = pointer_pos {
+                                if pos.x >= queue_rect.left() && pos.x <= queue_rect.right() {
+                                    if pos.y < queue_rect.top() {
+                                        state.drag_hover_index = Some(0);
+                                    } else if last_row_rect
+                                        .is_some_and(|last_rect| pos.y > last_rect.bottom())
+                                    {
+                                        state.drag_hover_index = Some(state.tasks.len());
+                                    }
+                                }
+                            }
+                            if primary_down {
+                                let autoscroll_delta = selection_edge_autoscroll_delta(
+                                    pointer_pos,
+                                    queue_rect,
+                                    SMART_INPUT_TASK_ROW_HEIGHT,
+                                );
+                                if autoscroll_delta != 0.0 {
+                                    ui.scroll_with_delta(egui::vec2(0.0, autoscroll_delta));
+                                    ui.ctx().request_repaint_after(Duration::from_millis(16));
+                                }
+                                if state.tasks.iter().all(|task| task.id != dragging_task_id) {
+                                    state.clear_drag_state();
+                                }
+                            }
+                        }
                         if should_scroll_to_end {
                             ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
                         }
                     });
+
+                let primary_down = ui.ctx().input(|input| input.pointer.primary_down());
+                if !primary_down {
+                    let dragging_task_id = state.dragging_task_id;
+                    let drag_hover_index = state.drag_hover_index;
+                    state.clear_drag_state();
+                    if let (Some(task_id), Some(target_index)) =
+                        (dragging_task_id, drag_hover_index)
+                    {
+                        if state.reorder_task_to_index(task_id, target_index) {
+                            action.request_keyboard_focus(SmartInputFocusTarget::Draft);
+                        }
+                    }
+                }
 
                 if let Some((task_id, row_action)) = row_action {
                     match row_action {
@@ -55574,6 +55735,62 @@ mod tests {
     }
 
     #[test]
+    fn smart_input_drag_target_index_uses_row_half() {
+        let row_rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(300.0, 28.0));
+
+        assert_eq!(
+            super::smart_input_drag_target_index(2, row_rect, Some(egui::pos2(20.0, 24.0))),
+            2
+        );
+        assert_eq!(
+            super::smart_input_drag_target_index(2, row_rect, Some(egui::pos2(20.0, 46.0))),
+            3
+        );
+    }
+
+    #[test]
+    fn smart_input_drag_state_clears_when_task_is_removed() {
+        let mut state = SmartInputState::default();
+        state.draft = "first".to_owned();
+        let first_id = state.enqueue_draft().expect("first task");
+        state.draft = "second".to_owned();
+        state.enqueue_draft().expect("second task");
+        state.dragging_task_id = Some(first_id);
+        state.drag_hover_index = Some(1);
+
+        assert_eq!(state.remove_task(first_id), Some("first".to_owned()));
+        assert_eq!(state.dragging_task_id, None);
+        assert_eq!(state.drag_hover_index, None);
+    }
+
+    #[test]
+    fn smart_input_dragging_queue_blocks_auto_dispatch() {
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.smart_input.draft = "first".to_owned();
+            let first_id = terminal.smart_input.enqueue_draft().expect("first task");
+            terminal.smart_input.dragging_task_id = Some(first_id);
+            terminal.smart_input.drag_hover_index = Some(0);
+        }
+
+        app.process_smart_input_queues(&ctx);
+        capture.drain();
+
+        assert!(capture.bytes().is_empty());
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.smart_input.tasks.len(), 1);
+        assert_eq!(terminal.smart_input.tasks[0].text, "first");
+    }
+
+    #[test]
     fn smart_input_queue_command_task_adds_task_without_draft() {
         let mut state = SmartInputState::default();
         state.draft = "keep this".to_owned();
@@ -56879,6 +57096,61 @@ mod tests {
             "queued task text and index label must share the same vertical center (task_center_y={}, index_center_y={})",
             task_rect.center().y,
             index_rect.center().y
+        );
+    }
+
+    #[test]
+    fn smart_input_queue_drag_handle_renders_before_index_label() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.smart_input.draft = "test".to_owned();
+            terminal.smart_input.enqueue_draft();
+        }
+
+        let output = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+                let _ = super::draw_smart_input_footer(
+                    ui,
+                    terminal,
+                    egui::vec2(500.0, 180.0),
+                    400.0,
+                    18.0,
+                );
+            });
+        });
+
+        let mut index_rect = None;
+        let mut same_row_text_rects = Vec::new();
+        for shape in output.shapes {
+            if let egui::epaint::Shape::Text(text_shape) = shape.shape {
+                let text = text_shape.galley.text();
+                let rect = egui::Rect::from_min_size(text_shape.pos, text_shape.galley.size());
+                if text == "1." {
+                    index_rect = Some(rect);
+                }
+                same_row_text_rects.push((text.to_owned(), rect));
+            }
+        }
+
+        let index_rect = index_rect.expect("queued task index label");
+        let has_left_handle = same_row_text_rects.iter().any(|(text, rect)| {
+            text != "1."
+                && text != "test"
+                && rect.center().y - index_rect.center().y <= 1.0
+                && index_rect.center().y - rect.center().y <= 1.0
+                && rect.left() < index_rect.left()
+        });
+        assert!(
+            has_left_handle,
+            "queue row should render a drag handle before the index label"
         );
     }
 
