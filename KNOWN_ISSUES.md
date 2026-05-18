@@ -1814,3 +1814,45 @@
   - Added regression tests for fresh hook-working suppression, stale hook-working recovery, and running cleanup without process tracking.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
 - References: User request 2026-05-15
+
+---
+
+#### Windows OS notification click did not focus source terminal {#windows-notification-click-terminal-focus}
+- Date: 2026-05-18
+- Context: User reported that clicking an OpenCode "finished" Windows notification did not focus the related terminal inside Mergen.
+- Error signature: Mergen showed Windows tray balloon notifications with `NIF_INFO`, but the tray icon had no callback message and the app did not remember which terminal produced the latest clickable notification.
+- Symptoms/Impact:
+  1. Clicking the OS notification brought no useful in-app navigation.
+  2. Users had to manually find the terminal that finished.
+- Root cause:
+  - The tray icon registration omitted `NIF_MESSAGE/uCallbackMessage`, so `NIN_BALLOONUSERCLICK` was never observed.
+  - Notification dispatch did not retain a terminal activation target for later click handling.
+- Resolution:
+  - Register a Windows tray callback message and subclass the main window proc to detect balloon clicks.
+  - Store the terminal id for the latest successful balloon notification.
+  - On click, restore the Mergen window, switch Terminal Manager to the target terminal kind, and activate the target terminal.
+- Prevent recurrence:
+  - Added regression tests for notification-click terminal activation, foreground/background filter sync, missing-terminal handling, and Windows balloon click message recognition.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+- References: User request 2026-05-18
+
+---
+
+#### Saved messages edits did not propagate to worktrees {#saved-messages-worktree-family-edit-sync}
+- Date: 2026-05-18
+- Context: User updated a normal project's saved messages by deleting the old prompt and adding a new one, but the related worktree still showed the old saved message.
+- Error signature: Worktrees inherited `saved_messages` only when added. Settings > Saved Messages add/remove actions mutated only the currently rendered `ProjectRecord`, leaving previously copied worktree lists stale.
+- Symptoms/Impact:
+  1. Root repo and worktree saved message menus diverged.
+  2. Deleted prompts could remain visible in worktrees.
+  3. Users had to manually update each worktree record.
+- Root cause:
+  - Saved messages are intended to be repo-family shared, but the Settings mutation path did not operate on the root repo + worktree family.
+- Resolution:
+  - Added saved-message family helpers based on root project path / worktree `repo_root`.
+  - Settings add/remove now applies to every project in the repo family.
+  - Removal uses message text rather than local index so stale worktree copies are cleaned even when lists already differ.
+- Prevent recurrence:
+  - Added regression tests for root-to-worktree add, root removal cleaning stale worktree messages, worktree-to-root/sibling propagation, and duplicate prevention.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
+- References: User request 2026-05-18

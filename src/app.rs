@@ -8,6 +8,8 @@ use std::ops::Range;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicBool, AtomicIsize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -88,6 +90,16 @@ const TERMINAL_FALLBACK_REFRESH_MAX_MS: u64 = 64;
 const BROWSER_MCP_PENDING_POLL_MS: u64 = 16;
 const BROWSER_VIDEO_FPS: u32 = 10;
 const BROWSER_VIDEO_FRAME_INTERVAL_MS: u64 = 100;
+
+#[cfg(target_os = "windows")]
+const MERGEN_TRAY_ICON_ID: u32 = 1;
+#[cfg(target_os = "windows")]
+const MERGEN_TRAY_CALLBACK_MESSAGE: u32 =
+    windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 0x04D3;
+#[cfg(target_os = "windows")]
+static MERGEN_TRAY_BALLOON_CLICKED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "windows")]
+static MERGEN_TRAY_PREVIOUS_WNDPROC: AtomicIsize = AtomicIsize::new(0);
 const BROWSER_VIDEO_FRAME_REQUEST_PREFIX: &str = "browser-video-frame";
 const BROWSER_SCREENSHOT_REQUEST_PREFIX: &str = "browser-ui-screenshot";
 const BROWSER_RECORDING_PLAYBACK_RATE: f64 = 2.0;
@@ -1017,6 +1029,36 @@ fn notification_title_and_body(
             format!("{} error", agent),
             "An error occurred. Please review the terminal output.".to_owned(),
         ),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn is_tray_balloon_user_click_message(message: u32, icon_id: usize, event: isize) -> bool {
+    message == MERGEN_TRAY_CALLBACK_MESSAGE
+        && icon_id == MERGEN_TRAY_ICON_ID as usize
+        && event as u32 == windows::Win32::UI::Shell::NIN_BALLOONUSERCLICK
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn mergen_tray_window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CallWindowProcW, DefWindowProcW, WNDPROC};
+
+    if is_tray_balloon_user_click_message(message, wparam, lparam) {
+        MERGEN_TRAY_BALLOON_CLICKED.store(true, Ordering::SeqCst);
+        return 0;
+    }
+
+    let previous = MERGEN_TRAY_PREVIOUS_WNDPROC.load(Ordering::SeqCst);
+    if previous != 0 {
+        let previous_proc: WNDPROC = std::mem::transmute(previous);
+        CallWindowProcW(previous_proc, hwnd, message, wparam, lparam)
+    } else {
+        DefWindowProcW(hwnd, message, wparam, lparam)
     }
 }
 
@@ -2119,11 +2161,15 @@ pub struct AdeApp {
     os_notification_last_by_terminal: BTreeMap<u64, Instant>,
     /// Pending OS notification to dispatch in the next update frame.
     pending_os_notification: Option<PendingOsNotification>,
+    /// Terminal targeted by the latest clickable OS notification balloon.
+    os_notification_click_terminal_id: Option<u64>,
     /// Windows tray icon state
     #[cfg(target_os = "windows")]
     tray_icon_added: bool,
     #[cfg(target_os = "windows")]
     tray_icon_hicon: Option<isize>,
+    #[cfg(target_os = "windows")]
+    tray_wndproc_subclassed: bool,
     /// Create worktree popup state
     show_create_worktree_popup: bool,
     create_worktree_project_id: Option<u64>,
@@ -4708,10 +4754,13 @@ impl AdeApp {
             browser_video_encode_events_rx,
             os_notification_last_by_terminal: BTreeMap::new(),
             pending_os_notification: None,
+            os_notification_click_terminal_id: None,
             #[cfg(target_os = "windows")]
             tray_icon_added: false,
             #[cfg(target_os = "windows")]
             tray_icon_hicon: None,
+            #[cfg(target_os = "windows")]
+            tray_wndproc_subclassed: false,
             show_create_worktree_popup: false,
             create_worktree_project_id: None,
             create_worktree_branch_draft: String::new(),
@@ -4856,6 +4905,67 @@ impl AdeApp {
 
     fn add_project(&mut self, path: PathBuf) {
         self.add_project_with_worktree(path, None, false);
+    }
+
+    fn saved_messages_family_root_path(project: &ProjectRecord) -> PathBuf {
+        let family_root = project.repo_root.as_ref().unwrap_or(&project.path);
+        crate::path_utils::normalize_windows_verbatim_path_for_shell(family_root)
+    }
+
+    fn saved_messages_family_project_ids(&self, project_id: u64) -> Vec<u64> {
+        let Some(family_root) = self
+            .projects
+            .get(&project_id)
+            .map(Self::saved_messages_family_root_path)
+        else {
+            return Vec::new();
+        };
+
+        self.projects
+            .iter()
+            .filter_map(|(member_id, project)| {
+                (Self::saved_messages_family_root_path(project) == family_root)
+                    .then_some(*member_id)
+            })
+            .collect()
+    }
+
+    fn add_saved_message_to_project_family(&mut self, project_id: u64, message: String) -> bool {
+        let member_ids = self.saved_messages_family_project_ids(project_id);
+        let mut changed = false;
+        for member_id in member_ids {
+            let Some(project) = self.projects.get_mut(&member_id) else {
+                continue;
+            };
+            if project
+                .saved_messages
+                .iter()
+                .any(|existing| existing == &message)
+            {
+                continue;
+            }
+            project.saved_messages.push(message.clone());
+            changed = true;
+        }
+        changed
+    }
+
+    fn remove_saved_message_from_project_family(&mut self, project_id: u64, message: &str) -> bool {
+        let member_ids = self.saved_messages_family_project_ids(project_id);
+        let mut changed = false;
+        for member_id in member_ids {
+            let Some(project) = self.projects.get_mut(&member_id) else {
+                continue;
+            };
+            let original_len = project.saved_messages.len();
+            project
+                .saved_messages
+                .retain(|existing| existing.as_str() != message);
+            if project.saved_messages.len() != original_len {
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn add_project_with_worktree(
@@ -12431,6 +12541,31 @@ impl AdeApp {
     #[cfg(not(target_os = "windows"))]
     fn restore_window_focus_for_terminal_input(&self) {}
 
+    #[cfg(target_os = "windows")]
+    fn restore_window_for_os_notification_click(&self) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SetForegroundWindow, ShowWindow, SW_RESTORE,
+        };
+
+        let Some(hwnd_value) = self.window_hwnd else {
+            return;
+        };
+
+        let hwnd = hwnd_value as HWND;
+        if hwnd.is_null() {
+            return;
+        }
+
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = SetForegroundWindow(hwnd);
+        }
+        self.restore_window_focus_for_terminal_input();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn restore_window_for_os_notification_click(&self) {}
+
     #[cfg(not(target_os = "windows"))]
     fn apply_initial_window_icon(&mut self, _ctx: &egui::Context) {}
 
@@ -15538,7 +15673,7 @@ impl AdeApp {
             };
 
             let mut add_message: Option<String> = None;
-            let mut remove_message_index: Option<usize> = None;
+            let mut remove_message: Option<String> = None;
             let mut send_message_request: Option<String> = None;
             let send_target_terminal = self.preferred_terminal_for_project(project_id);
             let message_count = project_snapshot.saved_messages.len();
@@ -15590,9 +15725,7 @@ impl AdeApp {
                                 settings_saved_message_card_width(ui.available_width());
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing = egui::vec2(0.0, 8.0);
-                                for (index, message) in
-                                    project_snapshot.saved_messages.iter().enumerate()
-                                {
+                                for message in &project_snapshot.saved_messages {
                                     let (send_clicked, remove_clicked) =
                                         draw_settings_saved_message_card(
                                             ui,
@@ -15604,7 +15737,7 @@ impl AdeApp {
                                         send_message_request = Some(message.clone());
                                     }
                                     if remove_clicked {
-                                        remove_message_index = Some(index);
+                                        remove_message = Some(message.clone());
                                     }
                                 }
                             });
@@ -15675,16 +15808,14 @@ impl AdeApp {
             });
             ui.add_space(12.0);
 
-            if let Some(project) = self.projects.get_mut(&project_id) {
-                if let Some(message) = add_message {
-                    project.saved_messages.push(message);
+            if let Some(message) = add_message {
+                if self.add_saved_message_to_project_family(project_id, message) {
                     changes.note_projects_change();
                 }
-                if let Some(index) = remove_message_index {
-                    if index < project.saved_messages.len() {
-                        project.saved_messages.remove(index);
-                        changes.note_projects_change();
-                    }
+            }
+            if let Some(message) = remove_message {
+                if self.remove_saved_message_from_project_family(project_id, &message) {
+                    changes.note_projects_change();
                 }
             }
 
@@ -16054,6 +16185,59 @@ impl AdeApp {
 
     /// Process pending OS notifications for AI attention events.
     /// This should be called from the main update loop.
+    fn activate_terminal_from_os_notification_click(
+        &mut self,
+        ctx: &egui::Context,
+        terminal_id: u64,
+    ) -> bool {
+        let Some(kind) = self
+            .terminals
+            .get(&terminal_id)
+            .map(|terminal| terminal.kind)
+        else {
+            return false;
+        };
+
+        let target_filter = match kind {
+            TerminalKind::Foreground => TerminalManagerFilter::Foreground,
+            TerminalKind::Background => TerminalManagerFilter::Background,
+        };
+        if self.config.ui.terminal_manager_filter != target_filter {
+            self.config.ui.terminal_manager_filter = target_filter;
+            self.note_ui_config_changed();
+            self.persist_config();
+        }
+
+        self.set_active_terminal(ctx, Some(terminal_id));
+        self.status_line = "Focused notification terminal".to_owned();
+        true
+    }
+
+    #[cfg(target_os = "windows")]
+    fn take_os_notification_click_signal() -> bool {
+        MERGEN_TRAY_BALLOON_CLICKED.swap(false, Ordering::SeqCst)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn take_os_notification_click_signal() -> bool {
+        false
+    }
+
+    fn process_os_notification_click(&mut self, ctx: &egui::Context) {
+        if !Self::take_os_notification_click_signal() {
+            return;
+        }
+
+        let Some(terminal_id) = self.os_notification_click_terminal_id.take() else {
+            return;
+        };
+
+        self.restore_window_for_os_notification_click();
+        if self.activate_terminal_from_os_notification_click(ctx, terminal_id) {
+            ctx.request_repaint();
+        }
+    }
+
     fn process_pending_os_notifications(&mut self, ctx: &egui::Context) {
         let Some(notification) = self.pending_os_notification.take() else {
             return;
@@ -16108,6 +16292,7 @@ impl AdeApp {
             if self.init_tray_icon_if_needed(hwnd) {
                 if self.show_tray_balloon(hwnd, &title, &body) {
                     fallback_to_flash = false;
+                    self.os_notification_click_terminal_id = Some(notification.terminal_id);
                     self.status_line = "OS notification sent".to_owned();
                 }
             }
@@ -16136,9 +16321,73 @@ impl AdeApp {
     }
 
     #[cfg(target_os = "windows")]
+    fn install_tray_click_handler_if_needed(&mut self, hwnd_raw: isize) -> bool {
+        if self.tray_wndproc_subclassed {
+            return true;
+        }
+
+        let hwnd = hwnd_raw as HWND;
+        if hwnd.is_null() {
+            return false;
+        }
+
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_WNDPROC};
+
+            let previous = SetWindowLongPtrW(
+                hwnd,
+                GWLP_WNDPROC,
+                mergen_tray_window_proc as *const () as usize as isize,
+            );
+            if previous == 0 {
+                log::warn!("Failed to install Windows tray click handler");
+                return false;
+            }
+            MERGEN_TRAY_PREVIOUS_WNDPROC.store(previous, Ordering::SeqCst);
+        }
+
+        self.tray_wndproc_subclassed = true;
+        true
+    }
+
+    #[cfg(target_os = "windows")]
+    fn restore_tray_click_handler(&mut self) {
+        if !self.tray_wndproc_subclassed {
+            return;
+        }
+
+        let Some(hwnd_raw) = self.window_hwnd else {
+            self.tray_wndproc_subclassed = false;
+            MERGEN_TRAY_PREVIOUS_WNDPROC.store(0, Ordering::SeqCst);
+            return;
+        };
+
+        let hwnd = hwnd_raw as HWND;
+        if !hwnd.is_null() {
+            let previous = MERGEN_TRAY_PREVIOUS_WNDPROC.swap(0, Ordering::SeqCst);
+            if previous != 0 {
+                unsafe {
+                    use windows_sys::Win32::UI::WindowsAndMessaging::{
+                        SetWindowLongPtrW, GWLP_WNDPROC,
+                    };
+                    let _ = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, previous);
+                }
+            }
+        } else {
+            MERGEN_TRAY_PREVIOUS_WNDPROC.store(0, Ordering::SeqCst);
+        }
+
+        self.tray_wndproc_subclassed = false;
+    }
+
+    #[cfg(target_os = "windows")]
     fn init_tray_icon_if_needed(&mut self, hwnd_raw: isize) -> bool {
         if self.tray_icon_added {
-            return true;
+            return self.install_tray_click_handler_if_needed(hwnd_raw);
+        }
+
+        if !self.install_tray_click_handler_if_needed(hwnd_raw) {
+            return false;
         }
 
         let hicon = self.create_app_hicon(16).unwrap_or(0);
@@ -16152,8 +16401,11 @@ impl AdeApp {
         let mut data: windows::Win32::UI::Shell::NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
         data.cbSize = std::mem::size_of::<windows::Win32::UI::Shell::NOTIFYICONDATAW>() as u32;
         data.hWnd = hwnd;
-        data.uID = 1;
-        data.uFlags = windows::Win32::UI::Shell::NIF_ICON | windows::Win32::UI::Shell::NIF_TIP;
+        data.uID = MERGEN_TRAY_ICON_ID;
+        data.uFlags = windows::Win32::UI::Shell::NIF_ICON
+            | windows::Win32::UI::Shell::NIF_TIP
+            | windows::Win32::UI::Shell::NIF_MESSAGE;
+        data.uCallbackMessage = MERGEN_TRAY_CALLBACK_MESSAGE;
         data.hIcon = windows::Win32::UI::WindowsAndMessaging::HICON(hicon as *mut std::ffi::c_void);
         data.szTip = tip;
 
@@ -16170,6 +16422,7 @@ impl AdeApp {
             }
             true
         } else {
+            self.restore_tray_click_handler();
             false
         }
     }
@@ -16193,7 +16446,7 @@ impl AdeApp {
         let mut data: windows::Win32::UI::Shell::NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
         data.cbSize = std::mem::size_of::<windows::Win32::UI::Shell::NOTIFYICONDATAW>() as u32;
         data.hWnd = hwnd;
-        data.uID = 1;
+        data.uID = MERGEN_TRAY_ICON_ID;
         data.uFlags = windows::Win32::UI::Shell::NIF_INFO;
         data.szInfoTitle = info_title;
         data.szInfo = info;
@@ -16221,7 +16474,7 @@ impl AdeApp {
                 unsafe { std::mem::zeroed() };
             data.cbSize = std::mem::size_of::<windows::Win32::UI::Shell::NOTIFYICONDATAW>() as u32;
             data.hWnd = hwnd;
-            data.uID = 1;
+            data.uID = MERGEN_TRAY_ICON_ID;
             unsafe {
                 let _ = windows::Win32::UI::Shell::Shell_NotifyIconW(
                     windows::Win32::UI::Shell::NIM_DELETE,
@@ -16237,6 +16490,7 @@ impl AdeApp {
             }
         }
         self.tray_icon_added = false;
+        self.restore_tray_click_handler();
     }
 
     #[cfg(target_os = "windows")]
@@ -24560,6 +24814,8 @@ impl eframe::App for AdeApp {
                 // Continue rendering - popup will be drawn by draw_exit_confirm_popup()
             }
         }
+
+        self.process_os_notification_click(ctx);
 
         // Phase 1: Capture and route input BEFORE polling/rendering
         // This reduces input→echo latency by handling input before heavy per-frame work
@@ -42739,6 +42995,19 @@ mod tests {
         }
     }
 
+    fn test_worktree_project(
+        id: u64,
+        name: &str,
+        path: &str,
+        repo_root: &str,
+        saved_messages: &[&str],
+    ) -> ProjectRecord {
+        let mut project = test_project(id, name, path, saved_messages, &[]);
+        project.repo_root = Some(PathBuf::from(repo_root));
+        project.is_worktree = true;
+        project
+    }
+
     fn test_source_control_snapshot(
         branch: &str,
         files: &[(&str, &'static str, bool)],
@@ -43032,10 +43301,13 @@ mod tests {
             browser_video_recordings_by_scope: BTreeMap::new(),
             os_notification_last_by_terminal: BTreeMap::new(),
             pending_os_notification: None,
+            os_notification_click_terminal_id: None,
             #[cfg(target_os = "windows")]
             tray_icon_added: false,
             #[cfg(target_os = "windows")]
             tray_icon_hicon: None,
+            #[cfg(target_os = "windows")]
+            tray_wndproc_subclassed: false,
             show_create_worktree_popup: false,
             create_worktree_project_id: None,
             create_worktree_branch_draft: String::new(),
@@ -47773,6 +48045,122 @@ mod tests {
         assert_eq!(merged_checklist.len(), 2);
         assert!(merged_checklist.contains(&"loaded_item".to_owned()));
         assert!(merged_checklist.contains(&"current_item".to_owned()));
+    }
+
+    #[test]
+    fn saved_message_add_propagates_from_root_to_worktree_family() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Repo", "C:/repo", &["old"], &[]));
+        app.projects.insert(
+            2,
+            test_worktree_project(
+                2,
+                "Repo · feature",
+                "C:/repo-worktrees/feature",
+                "C:/repo",
+                &[],
+            ),
+        );
+        app.projects
+            .insert(3, test_project(3, "Other", "C:/other", &[], &[]));
+
+        assert!(app.add_saved_message_to_project_family(1, "new".to_owned()));
+
+        assert_eq!(
+            app.projects.get(&1).unwrap().saved_messages,
+            vec!["old".to_owned(), "new".to_owned()]
+        );
+        assert_eq!(
+            app.projects.get(&2).unwrap().saved_messages,
+            vec!["new".to_owned()]
+        );
+        assert!(app.projects.get(&3).unwrap().saved_messages.is_empty());
+    }
+
+    #[test]
+    fn saved_message_remove_from_root_cleans_stale_worktree_copy() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Repo", "C:/repo", &["new"], &[]));
+        app.projects.insert(
+            2,
+            test_worktree_project(
+                2,
+                "Repo · feature",
+                "C:/repo-worktrees/feature",
+                "C:/repo",
+                &["old", "new"],
+            ),
+        );
+
+        assert!(app.remove_saved_message_from_project_family(1, "old"));
+
+        assert_eq!(
+            app.projects.get(&1).unwrap().saved_messages,
+            vec!["new".to_owned()]
+        );
+        assert_eq!(
+            app.projects.get(&2).unwrap().saved_messages,
+            vec!["new".to_owned()]
+        );
+    }
+
+    #[test]
+    fn saved_message_worktree_edit_propagates_to_root_and_sibling_worktrees() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Repo", "C:/repo", &[], &[]));
+        app.projects.insert(
+            2,
+            test_worktree_project(2, "Repo · a", "C:/repo-worktrees/a", "C:/repo", &[]),
+        );
+        app.projects.insert(
+            3,
+            test_worktree_project(3, "Repo · b", "C:/repo-worktrees/b", "C:/repo", &[]),
+        );
+        app.projects.insert(
+            4,
+            test_worktree_project(4, "Other · c", "C:/other-worktrees/c", "C:/other", &[]),
+        );
+
+        assert!(app.add_saved_message_to_project_family(2, "shared".to_owned()));
+
+        for project_id in [1, 2, 3] {
+            assert_eq!(
+                app.projects.get(&project_id).unwrap().saved_messages,
+                vec!["shared".to_owned()]
+            );
+        }
+        assert!(app.projects.get(&4).unwrap().saved_messages.is_empty());
+    }
+
+    #[test]
+    fn saved_message_family_add_does_not_duplicate_existing_message() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Repo", "C:/repo", &["shared"], &[]));
+        app.projects.insert(
+            2,
+            test_worktree_project(
+                2,
+                "Repo · feature",
+                "C:/repo-worktrees/feature",
+                "C:/repo",
+                &["shared"],
+            ),
+        );
+
+        assert!(!app.add_saved_message_to_project_family(1, "shared".to_owned()));
+
+        assert_eq!(
+            app.projects.get(&1).unwrap().saved_messages,
+            vec!["shared".to_owned()]
+        );
+        assert_eq!(
+            app.projects.get(&2).unwrap().saved_messages,
+            vec!["shared".to_owned()]
+        );
     }
 
     #[test]
@@ -58302,6 +58690,75 @@ mod tests {
         app.process_pending_os_notifications(&egui::Context::default());
         // Should still only have one entry (the first one)
         assert_eq!(app.os_notification_last_by_terminal.len(), 1);
+    }
+
+    #[test]
+    fn os_notification_click_activates_background_terminal_and_filter() {
+        let ctx = egui::Context::default();
+        let foreground = test_terminal_entry_with_kind(1, 7, TerminalKind::Foreground);
+        let background = test_terminal_entry_with_kind(2, 7, TerminalKind::Background);
+        let mut app = test_app([(1, foreground), (2, background)], Some(1));
+        app.config.ui.terminal_manager_filter = TerminalManagerFilter::Foreground;
+
+        assert!(app.activate_terminal_from_os_notification_click(&ctx, 2));
+
+        assert_eq!(app.active_terminal, Some(2));
+        assert_eq!(
+            app.config.ui.terminal_manager_filter,
+            TerminalManagerFilter::Background
+        );
+    }
+
+    #[test]
+    fn os_notification_click_activates_foreground_terminal_and_filter() {
+        let ctx = egui::Context::default();
+        let foreground = test_terminal_entry_with_kind(1, 7, TerminalKind::Foreground);
+        let background = test_terminal_entry_with_kind(2, 7, TerminalKind::Background);
+        let mut app = test_app([(1, foreground), (2, background)], Some(2));
+        app.config.ui.terminal_manager_filter = TerminalManagerFilter::Background;
+
+        assert!(app.activate_terminal_from_os_notification_click(&ctx, 1));
+
+        assert_eq!(app.active_terminal, Some(1));
+        assert_eq!(
+            app.config.ui.terminal_manager_filter,
+            TerminalManagerFilter::Foreground
+        );
+    }
+
+    #[test]
+    fn os_notification_click_ignores_missing_terminal() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.config.ui.terminal_manager_filter = TerminalManagerFilter::Foreground;
+
+        assert!(!app.activate_terminal_from_os_notification_click(&ctx, 99));
+
+        assert_eq!(app.active_terminal, Some(1));
+        assert_eq!(
+            app.config.ui.terminal_manager_filter,
+            TerminalManagerFilter::Foreground
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn tray_callback_message_recognizes_balloon_user_click_only() {
+        assert!(super::is_tray_balloon_user_click_message(
+            super::MERGEN_TRAY_CALLBACK_MESSAGE,
+            super::MERGEN_TRAY_ICON_ID as usize,
+            windows::Win32::UI::Shell::NIN_BALLOONUSERCLICK as isize
+        ));
+        assert!(!super::is_tray_balloon_user_click_message(
+            super::MERGEN_TRAY_CALLBACK_MESSAGE + 1,
+            super::MERGEN_TRAY_ICON_ID as usize,
+            windows::Win32::UI::Shell::NIN_BALLOONUSERCLICK as isize
+        ));
+        assert!(!super::is_tray_balloon_user_click_message(
+            super::MERGEN_TRAY_CALLBACK_MESSAGE,
+            (super::MERGEN_TRAY_ICON_ID + 1) as usize,
+            windows::Win32::UI::Shell::NIN_BALLOONUSERCLICK as isize
+        ));
     }
 
     #[test]
