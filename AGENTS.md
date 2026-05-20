@@ -505,6 +505,7 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Tray icon lifecycle**: A hidden tray icon is added lazily on first notification via `NIM_ADD`, updated with `NIM_MODIFY` + `NIF_INFO` for each balloon, and removed with `NIM_DELETE` on app exit (`on_exit`).
 - **Config structure**: `OsNotificationConfig` contains `enabled`, `only_when_unfocused`, `on_permission`, `on_turn_complete`, `on_session_error`, and `cooldown_secs` fields.
 - **Settings UI**: Notifications section accessible via Settings popup with toggle for each trigger type and cooldown duration control. Description text must mention both the Windows notification popup and the taskbar flash fallback.
+- **Notification click must preserve window state**: `restore_window_for_os_notification_click()` must only call `ShowWindow(hwnd, SW_RESTORE)` when the window is currently minimized (`IsIconic(hwnd) != 0`). Calling `SW_RESTORE` on a visible maximized or normal window un-maximizes/resizes it. After restoring (if needed), always call `SetForegroundWindow(hwnd)` to bring the app to the foreground without changing its size.
 
 ## Browser Design Inspect Guidelines
 

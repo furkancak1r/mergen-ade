@@ -1,4 +1,24 @@
   
+ 
+---
+
+#### OS notification click resized the window regardless of its current state {#os-notification-click-resize}
+- Date: 2026-05-20
+- Context: User reported that clicking the Windows system notification balloon resized/unmaximized Mergen even when it was already visible.
+- Error signature: `restore_window_for_os_notification_click()` unconditionally called `ShowWindow(hwnd, SW_RESTORE)`. `SW_RESTORE` restores a maximized window to its original (non-maximized) size, and a normal window to its original position, so every notification click caused a resize.
+- Symptoms/Impact:
+  1. A maximized Mergen window was unmaximized when the user clicked a notification.
+  2. A normal-sized window could jump or resize unexpectedly.
+- Root cause:
+  - The restore function did not check whether the window was actually minimized before issuing `SW_RESTORE`.
+- Resolution:
+  - Guard `ShowWindow(hwnd, SW_RESTORE)` with `IsIconic(hwnd) != 0` so it only restores when the window is minimized.
+  - When the window is already visible (normal or maximized), only `SetForegroundWindow(hwnd)` is called, bringing the app to the foreground without changing its size.
+- Prevent recurrence:
+  - Added regression test `notification_click_show_command_only_restores_when_minimized` that verifies the decision helper returns `SW_RESTORE` only for minimized windows.
+  - Updated AGENTS.md OS Notifications Guidelines to document the window-state preservation rule.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-20
 
 ---
 

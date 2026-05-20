@@ -12824,10 +12824,23 @@ impl AdeApp {
     #[cfg(not(target_os = "windows"))]
     fn restore_window_focus_for_terminal_input(&self) {}
 
+    /// Returns the ShowWindow command to use when handling an OS notification click.
+    /// `SW_RESTORE` is returned only when the window is minimized so that a
+    /// currently-maximized or normal window is not accidentally resized.
+    #[cfg(target_os = "windows")]
+    fn notification_click_show_command(is_minimized: bool) -> Option<i32> {
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_RESTORE;
+        if is_minimized {
+            Some(SW_RESTORE)
+        } else {
+            None
+        }
+    }
+
     #[cfg(target_os = "windows")]
     fn restore_window_for_os_notification_click(&self) {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            SetForegroundWindow, ShowWindow, SW_RESTORE,
+            IsIconic, SetForegroundWindow, ShowWindow,
         };
 
         let Some(hwnd_value) = self.window_hwnd else {
@@ -12840,7 +12853,9 @@ impl AdeApp {
         }
 
         unsafe {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
+            if let Some(cmd) = Self::notification_click_show_command(IsIconic(hwnd) != 0) {
+                let _ = ShowWindow(hwnd, cmd);
+            }
             let _ = SetForegroundWindow(hwnd);
         }
         self.restore_window_focus_for_terminal_input();
@@ -60246,6 +60261,17 @@ mod tests {
             (super::MERGEN_TRAY_ICON_ID + 1) as usize,
             windows::Win32::UI::Shell::NIN_BALLOONUSERCLICK as isize
         ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn notification_click_show_command_only_restores_when_minimized() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_RESTORE;
+        assert_eq!(
+            super::AdeApp::notification_click_show_command(true),
+            Some(SW_RESTORE)
+        );
+        assert_eq!(super::AdeApp::notification_click_show_command(false), None);
     }
 
     #[test]
