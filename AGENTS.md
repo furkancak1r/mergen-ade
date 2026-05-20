@@ -485,6 +485,7 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Avoid per-frame config writes.** Persist resized panel widths only when width changes meaningfully to prevent excessive disk writes.
 - **Config recovery must preserve persisted panel width fields.** Ensure `recover_config_state()` preserves `project_explorer_width`, `checklist_panel_width`, and `browser_panel_width` when `pending_config_changes.ui` is true.
 - **Resize handle visuals must match the dark theme on every resizable panel.** Override egui's default bright white resize handle (`fg_stroke`) with a dim overlay (`Color32::from_rgb(45, 45, 45)`) on the panel edge so the separator does not appear harsh against the dark background. The overlay must be painted in the foreground layer after the panel renders for **Project Explorer**, **Check-list**, and **Browser** panels.
+- **Panel resize chrome must be disabled while any modal or popup is open.** Use a centralized helper (e.g., `panel_resize_chrome_enabled`) that checks Settings, exit confirmation, terminal history, foreground message, create worktree, checklist floating, egui popup, and context menu state. Gate both `SidePanel::resizable` and the custom overlay paint so the resize handle does not compete with overlay interactions.
 
 ## Directory Icons Guidelines
 - **Directory rows must include stable icons.** File and folder rows should render IDE-like icons without changing lazy loading, search filtering, or row ordering behavior.

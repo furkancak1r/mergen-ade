@@ -2,6 +2,32 @@
 
 ---
 
+#### Panel resize handle remained active when modal popups were open {#panel-resize-modal-gate}
+- Date: 2026-05-20
+- Context: User reported that the Project Explorer and Browser panel resize handles stayed visible and interactive even when modal popups like Settings were open.
+- Error signature: `paint_panel_resize_overlay` and `draw_sidebar_seam_fix` both gated on `ctx.memory(|m| m.any_popup_open())`. `draw_project_explorer` and `draw_browser_panel` used `.resizable(true)` unconditionally. Since egui `Window` (used for Settings, exit confirm, etc.) is not a "popup" in `any_popup_open`, the resize handles remained active.
+- Symptoms/Impact:
+  1. Resize handle on Project Explorer and Browser panels was visible and draggable while Settings popup was open.
+  2. `draw_sidebar_seam_fix` painted its overlay seam even when a modal was open, potentially interfering with modal visuals.
+  3. Users could accidentally resize panels while interacting with a modal.
+- Root cause:
+  - `paint_panel_resize_overlay` only checked `any_popup_open()`, which misses egui `Window` modals.
+  - No centralized helper existed to detect all modal/popup states.
+- Resolution:
+  - Introduced `panel_resize_chrome_enabled` helper that checks `show_settings_popup`, `show_exit_confirm_popup`, `terminal_history_popup_open`, `egui_popup_open`, `context_menu_open`, `foreground_message_popup_open`, `create_worktree_popup_open`, and `checklist_floating_open`.
+  - Applied the helper to `draw_project_explorer` (sets `.resizable(resize_enabled)` and gates `paint_panel_resize_overlay`).
+  - Applied the helper to `draw_browser_panel` (same).
+  - Applied the helper to `draw_sidebar_seam_fix` (returns early when disabled).
+  - Removed the redundant `any_popup_open` check from `paint_panel_resize_overlay` so the caller is the single source of truth.
+- Prevent recurrence:
+  - Added regression tests for `panel_resize_chrome_enabled` covering each modal source and combinations.
+  - Replaced `paint_panel_resize_overlay_skips_when_popup_open` with tests for the new helper.
+  - Updated AGENTS.md Resizable Panel Guidelines to document modal-aware gating.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-20
+
+---
+
 #### Smart Input focus was too aggressive and stole input from terminals and popups {#smart-input-focus-stealing}
 - Date: 2026-05-14
 - Context: User reported that Smart Input was so dominant that typing and paste went to Smart Input even when they clicked the terminal output or opened the Create Worktree popup. Keyboard input should go wherever the user last clicked.

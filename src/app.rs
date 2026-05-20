@@ -11265,6 +11265,29 @@ fn terminal_output_mouse_wheel_enabled(
         || checklist_floating_open)
 }
 
+/// Determine if panel resize chrome (resize handle and overlay) should be active.
+/// Returns false when any modal, popup, context menu, or overlay is open so that
+/// the resize handle does not compete with overlay interactions.
+fn panel_resize_chrome_enabled(
+    show_settings_popup: bool,
+    show_exit_confirm_popup: bool,
+    terminal_history_popup_open: bool,
+    egui_popup_open: bool,
+    context_menu_open: bool,
+    foreground_message_popup_open: bool,
+    create_worktree_popup_open: bool,
+    checklist_floating_open: bool,
+) -> bool {
+    !(show_settings_popup
+        || show_exit_confirm_popup
+        || terminal_history_popup_open
+        || egui_popup_open
+        || context_menu_open
+        || foreground_message_popup_open
+        || create_worktree_popup_open
+        || checklist_floating_open)
+}
+
 fn ui_owns_keyboard_state(
     text_input_has_focus: bool,
     popup_open: bool,
@@ -17481,8 +17504,19 @@ impl AdeApp {
             return None;
         }
 
+        let resize_enabled = panel_resize_chrome_enabled(
+            self.show_settings_popup,
+            self.show_exit_confirm_popup,
+            self.terminal_history_popup_open.is_some(),
+            ctx.memory(|mem| mem.any_popup_open()),
+            ctx.is_context_menu_open(),
+            self.foreground_message_popup_open.is_some(),
+            self.show_create_worktree_popup,
+            self.checklist_floating_open,
+        );
+
         let response = egui::SidePanel::left("project_explorer")
-            .resizable(true)
+            .resizable(resize_enabled)
             .default_width(self.config.ui.project_explorer_width)
             .min_width(260.0)
             .max_width(560.0)
@@ -18374,12 +18408,14 @@ impl AdeApp {
                 self.note_ui_config_changed();
             }
 
-            paint_panel_resize_overlay(
-                ctx,
-                response.response.rect,
-                PanelResizeSide::Left,
-                "project-explorer",
-            );
+            if resize_enabled {
+                paint_panel_resize_overlay(
+                    ctx,
+                    response.response.rect,
+                    PanelResizeSide::Left,
+                    "project-explorer",
+                );
+            }
 
             Some(response.response.rect)
         } else {
@@ -19944,18 +19980,30 @@ impl AdeApp {
             return;
         }
 
+        let resize_enabled = panel_resize_chrome_enabled(
+            self.show_settings_popup,
+            self.show_exit_confirm_popup,
+            self.terminal_history_popup_open.is_some(),
+            ctx.memory(|mem| mem.any_popup_open()),
+            ctx.is_context_menu_open(),
+            self.foreground_message_popup_open.is_some(),
+            self.show_create_worktree_popup,
+            self.checklist_floating_open,
+        );
+        if !resize_enabled {
+            return;
+        }
+
         let seam_left = explorer_rect.max.x.min(terminal_rect.min.x) - 1.0;
         let seam_right = explorer_rect.max.x.max(terminal_rect.min.x) + 1.0;
         let seam_rect =
             egui::Rect::from_min_max(egui::pos2(seam_left, top), egui::pos2(seam_right, bottom));
 
-        if !ctx.memory(|m| m.any_popup_open()) {
-            ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
-                egui::Id::new("sidebar-seam-fix"),
-            ))
-            .rect_filled(seam_rect, 0.0, SURFACE_BG);
-        }
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("sidebar-seam-fix"),
+        ))
+        .rect_filled(seam_rect, 0.0, SURFACE_BG);
     }
 
     /// Join checklist items into a clipboard-friendly string.
@@ -22504,8 +22552,19 @@ impl AdeApp {
         let browser_scope = self.active_browser_scope();
         let browser_project_id = browser_scope.project_id();
 
+        let resize_enabled = panel_resize_chrome_enabled(
+            self.show_settings_popup,
+            self.show_exit_confirm_popup,
+            self.terminal_history_popup_open.is_some(),
+            ctx.memory(|mem| mem.any_popup_open()),
+            ctx.is_context_menu_open(),
+            self.foreground_message_popup_open.is_some(),
+            self.show_create_worktree_popup,
+            self.checklist_floating_open,
+        );
+
         let response = egui::SidePanel::right("browser_panel")
-            .resizable(true)
+            .resizable(resize_enabled)
             .default_width(self.config.ui.browser_panel_width)
             .min_width(360.0)
             .max_width(820.0)
@@ -22961,12 +23020,14 @@ impl AdeApp {
             self.note_ui_config_changed();
         }
 
-        paint_panel_resize_overlay(
-            ctx,
-            response.response.rect,
-            PanelResizeSide::Right,
-            "browser-panel",
-        );
+        if resize_enabled {
+            paint_panel_resize_overlay(
+                ctx,
+                response.response.rect,
+                PanelResizeSide::Right,
+                "browser-panel",
+            );
+        }
 
         Some(response.response.rect)
     }
@@ -25298,17 +25359,15 @@ fn paint_panel_resize_overlay(
     } else {
         Color32::from_rgb(45, 45, 45) // very dim separator
     };
-    if !ctx.memory(|m| m.any_popup_open()) {
-        ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new(format!("{}-resize-overlay", id_suffix)),
-        ))
-        .vline(
-            resize_x,
-            panel_rect.y_range(),
-            egui::Stroke::new(1.0, color),
-        );
-    }
+    ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new(format!("{}-resize-overlay", id_suffix)),
+    ))
+    .vline(
+        resize_x,
+        panel_rect.y_range(),
+        egui::Stroke::new(1.0, color),
+    );
 }
 
 fn recover_config_state(
@@ -47577,29 +47636,79 @@ mod tests {
     }
 
     #[test]
-    fn paint_panel_resize_overlay_skips_when_popup_open() {
-        use egui::{Context, RawInput};
-        let ctx = Context::default();
-        let mut raw_input = RawInput::default();
-        raw_input
-            .events
-            .push(egui::Event::PointerMoved(pos2(400.0, 300.0)));
-        let output = ctx.run(raw_input, |ctx| {
-            ctx.memory_mut(|m| m.open_popup(egui::Id::new("dummy")));
-            let rect = egui::Rect::from_min_size(pos2(400.0, 0.0), egui::vec2(200.0, 600.0));
-            super::paint_panel_resize_overlay(
-                ctx,
-                rect,
-                super::PanelResizeSide::Right,
-                "test-skip",
-            );
-        });
+    fn panel_resize_chrome_enabled_returns_true_when_no_modal_open() {
+        assert!(super::panel_resize_chrome_enabled(
+            false, false, false, false, false, false, false, false
+        ));
+    }
 
-        let has_line = output
-            .shapes
-            .iter()
-            .any(|shape| matches!(shape.shape, egui::epaint::Shape::LineSegment { .. }));
-        assert!(!has_line, "overlay must not draw when popup is open");
+    #[test]
+    fn panel_resize_chrome_enabled_returns_false_when_settings_open() {
+        assert!(!super::panel_resize_chrome_enabled(
+            true, false, false, false, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn panel_resize_chrome_enabled_returns_false_when_exit_confirm_open() {
+        assert!(!super::panel_resize_chrome_enabled(
+            false, true, false, false, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn panel_resize_chrome_enabled_returns_false_when_terminal_history_open() {
+        assert!(!super::panel_resize_chrome_enabled(
+            false, false, true, false, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn panel_resize_chrome_enabled_returns_false_when_egui_popup_open() {
+        assert!(!super::panel_resize_chrome_enabled(
+            false, false, false, true, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn panel_resize_chrome_enabled_returns_false_when_context_menu_open() {
+        assert!(!super::panel_resize_chrome_enabled(
+            false, false, false, false, true, false, false, false
+        ));
+    }
+
+    #[test]
+    fn panel_resize_chrome_enabled_returns_false_when_foreground_message_open() {
+        assert!(!super::panel_resize_chrome_enabled(
+            false, false, false, false, false, true, false, false
+        ));
+    }
+
+    #[test]
+    fn panel_resize_chrome_enabled_returns_false_when_create_worktree_open() {
+        assert!(!super::panel_resize_chrome_enabled(
+            false, false, false, false, false, false, true, false
+        ));
+    }
+
+    #[test]
+    fn panel_resize_chrome_enabled_returns_false_when_checklist_floating_open() {
+        assert!(!super::panel_resize_chrome_enabled(
+            false, false, false, false, false, false, false, true
+        ));
+    }
+
+    #[test]
+    fn panel_resize_chrome_enabled_returns_false_when_multiple_modals_open() {
+        assert!(!super::panel_resize_chrome_enabled(
+            true, true, false, false, false, false, false, false
+        ));
+        assert!(!super::panel_resize_chrome_enabled(
+            false, false, true, true, false, false, false, false
+        ));
+        assert!(!super::panel_resize_chrome_enabled(
+            true, false, false, false, true, true, false, false
+        ));
     }
 
     #[test]
