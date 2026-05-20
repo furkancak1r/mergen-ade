@@ -75,8 +75,8 @@ use crate::opencode_hook_service::{OpenCodeHookService, OpenCodeQuestionAnswer};
 use crate::terminal::{
     try_terminal_selection_snapshot, try_terminal_snapshots, TerminalColor, TerminalCursor,
     TerminalCursorShape, TerminalDimensions, TerminalRuntime, TerminalSelectionLine,
-    TerminalSelectionSnapshot, TerminalSnapshot, TerminalUiEvent, TerminalUiEventKind,
-    TerminalWheelEvent, TrackedProcessIdentity, WheelDirection,
+    TerminalSelectionSnapshot, TerminalSnapshot, TerminalStyle, TerminalStyledRun, TerminalUiEvent,
+    TerminalUiEventKind, TerminalWheelEvent, TrackedProcessIdentity, WheelDirection,
 };
 use crate::title::{terminal_title_candidate, update_terminal_title};
 use crate::web_browser::{self, BrowserStatus};
@@ -23864,6 +23864,15 @@ impl AdeApp {
                         }
                     }
                 }
+                // Terminal output ScrollArea is vertical-only; diagonal touchpad or
+                // horizontal wheel events must not shift content sideways.
+                if scroll_area_output.state.offset.x != 0.0 {
+                    scroll_area_output.state.offset.x = 0.0;
+                    scroll_area_output
+                        .state
+                        .store(ui.ctx(), scroll_area_output.id);
+                    ui.ctx().request_repaint();
+                }
                 if smart_footer_height > 0.0 {
                     // Draggable resize handle between terminal output and Smart Input footer.
                     // Dragging is allowed again, but clamped to a safe minimum so the queue
@@ -32589,6 +32598,29 @@ fn paint_terminal_selection(
     }
 }
 
+fn append_terminal_line_runs(job: &mut LayoutJob, runs: &[TerminalStyledRun], font_id: &FontId) {
+    let mut next_column = 0usize;
+    for run in runs {
+        if run.column > next_column {
+            let gap = run.column - next_column;
+            append_terminal_text(
+                job,
+                &" ".repeat(gap),
+                TerminalStyle {
+                    fg: TerminalColor { r: 0, g: 0, b: 0 },
+                    bg: TerminalColor { r: 0, g: 0, b: 0 },
+                    italic: false,
+                    underline: false,
+                    strike: false,
+                },
+                font_id,
+            );
+        }
+        append_terminal_text(job, &run.text, run.style, font_id);
+        next_column = run.column + run.display_width;
+    }
+}
+
 fn build_terminal_render(
     snapshot: &TerminalSnapshot,
     font_id: &FontId,
@@ -32624,9 +32656,7 @@ fn build_terminal_render(
                     append_terminal_text(&mut job, &cell.rendered_text(), style, font_id);
                 }
             } else {
-                for run in &line.runs {
-                    append_terminal_text(&mut job, &run.text, run.style, font_id);
-                }
+                append_terminal_line_runs(&mut job, &line.runs, font_id);
             }
         } else if let Some(cursor_line) = snapshot.cursor_line.as_ref() {
             if cursor_line.row == line_index {
@@ -32634,14 +32664,10 @@ fn build_terminal_render(
                     append_terminal_text(&mut job, &cell.rendered_text(), cell.style, font_id);
                 }
             } else {
-                for run in &line.runs {
-                    append_terminal_text(&mut job, &run.text, run.style, font_id);
-                }
+                append_terminal_line_runs(&mut job, &line.runs, font_id);
             }
         } else {
-            for run in &line.runs {
-                append_terminal_text(&mut job, &run.text, run.style, font_id);
-            }
+            append_terminal_line_runs(&mut job, &line.runs, font_id);
         }
 
         if line_index + 1 < snapshot.lines.len() {
@@ -38384,6 +38410,95 @@ mod tests {
 
         let leading = terminal_leading_blank_rows(&snapshot);
         assert_eq!(leading, 5, "all rows blank -> leading = entire snapshot");
+    }
+
+    #[test]
+    fn terminal_pane_clamps_horizontal_scroll_offset_to_zero() {
+        // Regression test: diagonal touchpad / horizontal wheel must not
+        // slide terminal content sideways in the vertical-only ScrollArea.
+        let ctx = Context::default();
+        let mut fonts = FontDefinitions::default();
+        configure_terminal_font_family(&mut fonts);
+        ctx.set_fonts(fonts);
+
+        let (runtime, _capture) = test_terminal_runtime_with_capture();
+        let mut terminal = test_terminal_entry_with_runtime(1, 7, runtime);
+        terminal.kind = TerminalKind::Foreground;
+        terminal.ai_session.tool = Some(AiCliTool::OpenCode);
+        terminal.ai_session.status = AiCliStatus::Running;
+        terminal.opencode_session_active = true;
+
+        // Populate render cache with wide content so content width > viewport width
+        let mut wide_line = TerminalStyledLine::default();
+        wide_line.runs.push(TerminalStyledRun {
+            text: "a".repeat(200),
+            style: test_terminal_style(),
+            column: 0,
+            display_width: 200,
+        });
+        terminal.render_cache = TerminalSnapshot {
+            lines: vec![wide_line; 20],
+            cursor: Some(TerminalCursor {
+                x: 0,
+                y: 10,
+                shape: TerminalCursorShape::Block,
+                blinking: false,
+            }),
+            cursor_line: None,
+        };
+
+        let mut app = test_app([(1, terminal)], Some(1));
+
+        let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+
+        // First frame: render to initialize ScrollArea state
+        let raw_input = RawInput {
+            screen_rect: Some(screen_rect),
+            events: vec![Event::PointerMoved(pos2(200.0, 100.0))],
+            ..RawInput::default()
+        };
+
+        let _ = ctx.run(raw_input, |ctx| {
+            egui::Area::new("test".into()).show(ctx, |ui| {
+                app.draw_terminal_pane(ui, 1, vec2(400.0, 300.0));
+            });
+        });
+
+        // Inject a non-zero horizontal offset into the ScrollArea state
+        // The ScrollArea ID chain is: Area.id -> new_child("child") -> ScrollArea.id_salt("term-output-1")
+        // `new_child` uses `Id::new("child")` as the salt, so we must match that exactly.
+        let scroll_area_id = Id::new("test")
+            .with(Id::new("child"))
+            .with(Id::new("term-output-1"));
+        if let Some(mut state) = egui::scroll_area::State::load(&ctx, scroll_area_id) {
+            state.offset.x = 50.0;
+            state.store(&ctx, scroll_area_id);
+        }
+
+        // Second frame: render again; fix should clamp offset.x to 0
+        let raw_input2 = RawInput {
+            screen_rect: Some(screen_rect),
+            events: vec![Event::PointerMoved(pos2(200.0, 100.0))],
+            ..RawInput::default()
+        };
+
+        let _ = ctx.run(raw_input2, |ctx| {
+            egui::Area::new("test".into()).show(ctx, |ui| {
+                app.draw_terminal_pane(ui, 1, vec2(400.0, 300.0));
+            });
+        });
+
+        // Verify horizontal offset is clamped to zero
+        let state = egui::scroll_area::State::load(&ctx, scroll_area_id);
+        assert!(
+            state.is_some(),
+            "ScrollArea state should exist after rendering"
+        );
+        assert_eq!(
+            state.unwrap().offset.x,
+            0.0,
+            "Terminal output horizontal scroll offset must be clamped to 0"
+        );
     }
 
     #[test]
@@ -46686,6 +46801,30 @@ mod tests {
         assert!(render.cursor_overlay.is_none());
         assert_eq!(section.format.color, to_egui_color(style.bg));
         assert_eq!(section.format.background, to_egui_color(style.fg));
+    }
+
+    #[test]
+    fn build_terminal_render_pads_sparse_run_start_with_blanks() {
+        let snapshot = TerminalSnapshot {
+            lines: vec![TerminalStyledLine {
+                runs: vec![TerminalStyledRun {
+                    text: "text".to_owned(),
+                    style: test_terminal_style(),
+                    column: 4,
+                    display_width: 4,
+                }],
+            }],
+            cursor: None,
+            cursor_line: None,
+        };
+        let font_id = terminal_font_id(&egui::Style::default());
+        let render =
+            build_terminal_render(&snapshot, &font_id, false, ShellKind::PowerShell, None, 0.0);
+        assert!(
+            render.layout_job.text.starts_with("    text"),
+            "Sparse leading run must be padded so content stays aligned: got {:?}",
+            render.layout_job.text
+        );
     }
 
     #[test]

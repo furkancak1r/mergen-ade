@@ -2081,3 +2081,25 @@
   - Added regression coverage for worktree profile-folder selection, root URL fallback, URL sync, URL clearing, and create-worktree inheritance.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`
 - References: User request 2026-05-18
+
+---
+
+#### Terminal output slid left due to horizontal ScrollArea offset from diagonal wheel {#terminal-horizontal-scroll-offset}
+- Date: 2026-05-20
+- Context: User reported that the left side of the OpenCode terminal occasionally slides/shifts, leaving stray characters on the far left and making the TUI look misaligned.
+- Error signature: `draw_terminal_pane` uses a vertical-only `ScrollArea` for terminal output, but diagonal touchpad or horizontal wheel events can introduce a non-zero `offset.x`. Because the content coordinate system inside a ScrollArea is translated by the offset, a positive `offset.x` shifts all terminal content left, clipping the first columns.
+- Symptoms/Impact:
+  1. Terminal content appears to slide left, with the leftmost characters missing or replaced by fragments from previous wrapped lines.
+  2. The TUI looks broken or misaligned, especially during heavy OpenCode redraws.
+- Root cause:
+  - `ScrollArea::vertical()` does not forcibly disable horizontal offset changes on all egui backends/input devices. Diagonal scroll deltas or touchpad gestures can leave `state.offset.x != 0.0`.
+  - `build_terminal_render` previously assumed runs always started at column 0 and were contiguous, so it did not defensively pad leading/inter-run gaps.
+- Resolution:
+  - After `ScrollArea` processes each frame in `draw_terminal_pane`, clamp `scroll_area_output.state.offset.x` to `0.0` and persist the corrected state.
+  - Added `append_terminal_line_runs` helper to `build_terminal_render` that pads missing leading/inter-run column gaps with blank spaces, preserving column alignment even for sparse snapshots.
+- Prevent recurrence:
+  - Added regression tests:
+    - `terminal_pane_clamps_horizontal_scroll_offset_to_zero` — injects a non-zero x offset and verifies it is reset after rendering.
+    - `build_terminal_render_pads_sparse_run_start_with_blanks` — verifies defensive blank padding for runs that do not start at column 0.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-20
