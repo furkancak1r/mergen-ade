@@ -2,6 +2,29 @@
 
 ---
 
+#### OpenCode terminal scroll prioritized Mergen instead of OpenCode TUI {#opencode-wheel-mergen-first}
+- Date: 2026-05-20
+- Context: User reported that scrolling with the mouse wheel over an OpenCode terminal scrolled the Mergen terminal scrollback instead of OpenCode's own TUI content.
+- Error signature: `draw_terminal_pane` deferred OpenCode wheel handling to after the Mergen `ScrollArea` processed it. Wheel events were always offered to Mergen first; only when Mergen could not scroll were they forwarded to OpenCode. This meant OpenCode's TUI never received scroll events while Mergen scrollback had room to move.
+- Symptoms/Impact:
+  1. OpenCode TUI content (e.g., file listings, plan previews) could not be scrolled with the mouse wheel.
+  2. Mergen terminal scrollback scrolled instead, moving the user away from the active OpenCode prompt.
+- Root cause:
+  - OpenCode wheel handling used Mergen-first fallback logic inherited from non-TUI terminals. The OpenCode branch captured wheel data inside the `ScrollArea` closure and only forwarded it after verifying Mergen did not consume the delta.
+- Resolution:
+  - Changed OpenCode wheel handling to direct-forward when `mouse_reporting_active && opencode_terminal_wheel_fallback_enabled(terminal)` (i.e., OpenCode is `Running`). Wheel events are sent immediately to the OpenCode runtime TUI and `smooth_scroll_delta` is cleared so Mergen `ScrollArea` does not consume them.
+  - Non-Running OpenCode states (`TurnComplete`, `Attention`, `Inactive`) keep the existing Mergen-first fallback so users can review scrollback after a turn finishes.
+  - Non-OpenCode mouse-reporting apps continue to use the existing immediate-send path unchanged.
+- Prevent recurrence:
+  - Added regression tests:
+    - `opencode_running_wheel_forwarded_directly_to_runtime`
+    - `opencode_turn_complete_wheel_not_forwarded_directly`
+  - Updated AGENTS.md OpenCode scroll guidelines to document the new Running-first / idle-fallback behavior.
+- Files/Commands touched: `src/app.rs`, `src/terminal.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-20
+
+---
+
 #### Panel resize handle remained active when modal popups were open {#panel-resize-modal-gate}
 - Date: 2026-05-20
 - Context: User reported that the Project Explorer and Browser panel resize handles stayed visible and interactive even when modal popups like Settings were open.
