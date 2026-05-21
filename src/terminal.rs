@@ -675,6 +675,20 @@ fn apply_terminal_path_hardening(command: &mut CommandBuilder) {
 #[cfg(not(target_os = "windows"))]
 fn apply_terminal_path_hardening(_command: &mut CommandBuilder) {}
 
+/// Remove stale Anthropic env vars that can conflict with project-level
+/// Claude Code settings (e.g., Fireworks apiKeyHelper vs ANTHROPIC_AUTH_TOKEN).
+fn sanitize_claude_auth_env_vars(command: &mut CommandBuilder) {
+    command.env_remove("ANTHROPIC_AUTH_TOKEN");
+    command.env_remove("ANTHROPIC_API_KEY");
+    command.env_remove("ANTHROPIC_BASE_URL");
+    command.env_remove("ANTHROPIC_MODEL");
+    command.env_remove("ANTHROPIC_SMALL_FAST_MODEL");
+    command.env_remove("ANTHROPIC_DEFAULT_SONNET_MODEL");
+    command.env_remove("ANTHROPIC_DEFAULT_HAIKU_MODEL");
+    command.env_remove("ANTHROPIC_DEFAULT_OPUS_MODEL");
+    command.env_remove("CLAUDE_CODE_SUBAGENT_MODEL");
+}
+
 #[cfg(target_os = "windows")]
 fn hardened_terminal_path_env() -> Option<OsString> {
     let path_values = [
@@ -850,6 +864,7 @@ impl TerminalRuntime {
         command.env("CLICOLOR_FORCE", "1");
         command.env("FORCE_COLOR", "1");
         command.env("TERM_PROGRAM", "MergenADE");
+        sanitize_claude_auth_env_vars(&mut command);
         if let (Some(_), Some(hooks_dir), Some(inbox_token)) = (
             &ai_hook_manager,
             factory_droid_hooks_dir.as_deref(),

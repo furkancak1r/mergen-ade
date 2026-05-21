@@ -5540,11 +5540,16 @@ impl AdeApp {
                 _ => {}
             }
 
+            let launch_command = if launcher.builtin == Some(BuiltinLauncherKind::Claude) {
+                Self::sanitized_claude_launch_command(shell)
+            } else {
+                launcher.launch_command.clone()
+            };
             let sent = self
                 .terminals
                 .get_mut(&terminal_id)
                 .is_some_and(|terminal| {
-                    Self::send_command_to_terminal(terminal, &launcher.launch_command, ctx)
+                    Self::send_command_to_terminal(terminal, &launch_command, ctx)
                 });
 
             if sent {
@@ -14855,6 +14860,21 @@ impl AdeApp {
         terminal.dirty = true;
         ctx.request_repaint();
         true
+    }
+
+    /// Return a sanitized launch command for Claude that bypasses shell
+    /// aliases/wrappers and clears stale Anthropic env vars before invoking
+    /// the real npm-installed `claude.cmd`.
+    fn sanitized_claude_launch_command(shell: ShellKind) -> String {
+        match shell {
+            ShellKind::PowerShell => {
+                "Remove-Item Env:ANTHROPIC_AUTH_TOKEN,Env:ANTHROPIC_API_KEY,Env:ANTHROPIC_BASE_URL,Env:ANTHROPIC_MODEL,Env:ANTHROPIC_SMALL_FAST_MODEL,Env:ANTHROPIC_DEFAULT_SONNET_MODEL,Env:ANTHROPIC_DEFAULT_HAIKU_MODEL,Env:ANTHROPIC_DEFAULT_OPUS_MODEL,Env:CLAUDE_CODE_SUBAGENT_MODEL -ErrorAction SilentlyContinue; & \"$env:APPDATA\\npm\\claude.cmd\"".to_owned()
+            }
+            ShellKind::Cmd => {
+                "set ANTHROPIC_AUTH_TOKEN= & set ANTHROPIC_API_KEY= & set ANTHROPIC_BASE_URL= & set ANTHROPIC_MODEL= & set ANTHROPIC_SMALL_FAST_MODEL= & set ANTHROPIC_DEFAULT_SONNET_MODEL= & set ANTHROPIC_DEFAULT_HAIKU_MODEL= & set ANTHROPIC_DEFAULT_OPUS_MODEL= & set CLAUDE_CODE_SUBAGENT_MODEL= & \"%APPDATA%\\npm\\claude.cmd\"".to_owned()
+            }
+            ShellKind::Zsh => "claude".to_owned(),
+        }
     }
 
     fn send_shortcut_command_to_terminal(
@@ -47483,6 +47503,38 @@ mod tests {
             launcher_icon_for_ai_tool(None, AiCliStatus::Attention),
             None
         );
+    }
+
+    #[test]
+    fn sanitized_claude_launch_command_powershell_clears_env_and_calls_claude_cmd() {
+        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::PowerShell);
+        assert!(
+            cmd.contains("Remove-Item Env:ANTHROPIC_AUTH_TOKEN"),
+            "PowerShell command should clear ANTHROPIC_AUTH_TOKEN"
+        );
+        assert!(
+            cmd.contains("& \"$env:APPDATA\\npm\\claude.cmd\""),
+            "PowerShell command should invoke real claude.cmd"
+        );
+    }
+
+    #[test]
+    fn sanitized_claude_launch_command_cmd_clears_env_and_calls_claude_cmd() {
+        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Cmd);
+        assert!(
+            cmd.contains("set ANTHROPIC_AUTH_TOKEN="),
+            "CMD command should clear ANTHROPIC_AUTH_TOKEN"
+        );
+        assert!(
+            cmd.contains("\"%APPDATA%\\npm\\claude.cmd\""),
+            "CMD command should invoke real claude.cmd"
+        );
+    }
+
+    #[test]
+    fn sanitized_claude_launch_command_zsh_keeps_plain_claude() {
+        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Zsh);
+        assert_eq!(cmd, "claude");
     }
 
     // Tests for ai_cli_logo_key_for_terminal - logo visibility based on session liveness

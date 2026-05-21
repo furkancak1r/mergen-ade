@@ -106,11 +106,11 @@
 #### Design Inspect icon changed to pencil and terminal-scope URL bug fixed {#design-inspect-pencil-and-url}
 - Date: 2026-05-14
 - Context: User requested that the Design Inspect toolbar icon be a pencil instead of an eye. Additionally, Design Inspect element clicks were not being sent to the terminal when using a terminal-scoped browser.
-- Error signature: `forward_design_inspect_click_to_terminal` compared the element’s page URL against `project.browser_last_url` for all scopes. For terminal-scoped browsers, the project-level persisted URL could be stale or different, causing valid element selections to be silently dropped.
+- Error signature: `forward_design_inspect_click_to_terminal` compared the elementÔÇÖs page URL against `project.browser_last_url` for all scopes. For terminal-scoped browsers, the project-level persisted URL could be stale or different, causing valid element selections to be silently dropped.
 - Symptoms/Impact:
   1. Browser toolbar showed an eye icon for Design Inspect instead of a pencil.
   2. Selecting a page element in a terminal-scoped browser did not paste the design inspect context into the terminal.
-  3. The bug only manifested when the terminal-scoped browser was on a different URL than the project’s last persisted URL.
+  3. The bug only manifested when the terminal-scoped browser was on a different URL than the projectÔÇÖs last persisted URL.
 - Root cause:
   - Stale-URL validation was project-centric (`project.browser_last_url`) and ignored the active tab URL of the terminal-scoped browser instance.
 - Resolution:
@@ -128,8 +128,8 @@
 
 #### Smart Input draft resize grip drifted to panel edge {#smart-input-grip-drift}
 - Date: 2026-05-14
-- Context: User reported that the Smart Input metin alanı (draft text area) resize grip at the bottom-right had drifted to the far-right edge of the footer row and no longer sat next to the TextEdit.
-- Error signature: `draw_smart_input_footer` placed the grip using `ui.with_layout(Layout::bottom_up(Align::Max), |ui| { ui.allocate_response(...) })` inside the draft row's horizontal layout. In egui, this caused the grip widget to consume the remaining horizontal space and align to its far-right edge—sometimes hundreds of pixels away from the TextEdit.
+- Context: User reported that the Smart Input metin alan─▒ (draft text area) resize grip at the bottom-right had drifted to the far-right edge of the footer row and no longer sat next to the TextEdit.
+- Error signature: `draw_smart_input_footer` placed the grip using `ui.with_layout(Layout::bottom_up(Align::Max), |ui| { ui.allocate_response(...) })` inside the draft row's horizontal layout. In egui, this caused the grip widget to consume the remaining horizontal space and align to its far-right edgeÔÇösometimes hundreds of pixels away from the TextEdit.
 - Symptoms/Impact:
   1. The diagonal grip icon visually detached from the text area and appeared near the submit button or beyond.
   2. Users expected to grab the grip at the TextEdit corner, but it was nowhere near it.
@@ -142,7 +142,7 @@
   - Keep the existing resize behavior (update `user_height`, reset `draft_user_height`) intact.
 - Prevent recurrence:
   - Added regression test:
-    - `smart_input_footer_grip_is_positioned_at_draft_bottom_right` — renders the footer and asserts the diagonal line segments (grip visual) have X coordinates within the TextEdit area, not at the panel edge.
+    - `smart_input_footer_grip_is_positioned_at_draft_bottom_right` ÔÇö renders the footer and asserts the diagonal line segments (grip visual) have X coordinates within the TextEdit area, not at the panel edge.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-05-14
 
@@ -199,7 +199,7 @@
 
 #### Check-list panel made permanently visible and stacked left of Browser panel {#checklist-always-visible}
 - Date: 2026-05-14
-- Context: User requested that the Check-list panel be always visible and that the right-side panel order be Terminal → Check-list → Browser.
+- Context: User requested that the Check-list panel be always visible and that the right-side panel order be Terminal ÔåÆ Check-list ÔåÆ Browser.
 - Error signature: Previously the Check-list and Browser panels were mutually exclusive; opening one closed the other. The Check-list also auto-collapsed when empty or when the last item was removed.
 - Symptoms/Impact:
   1. Users could not keep the Check-list open while browsing.
@@ -248,7 +248,7 @@
 
 #### Smart Input caused OpenCode terminal black areas, scroll lock, and mid-viewport jumps {#smart-input-opencode-scroll-issues}
 - Date: 2026-05-12
-- Context: User reported that since Smart Input arrived, OpenCode terminal view broke: "bazen yukarısı siyah oluyor hiçbir şey göstermiyor, bazen scroll yapamıyorum, bazen de ortasına atıyor beni en aşağı scroll yapmak zorunda kalıyorum."
+- Context: User reported that since Smart Input arrived, OpenCode terminal view broke: "bazen yukar─▒s─▒ siyah oluyor hi├ğbir ┼şey g├Âstermiyor, bazen scroll yapam─▒yorum, bazen de ortas─▒na at─▒yor beni en a┼şa─ş─▒ scroll yapmak zorunda kal─▒yorum."
 - Error signature: Smart Input footer presence caused PTY resize jitter, activation scroll aligned to prompt row instead of bottom, and manual-scroll detach never re-enabled bottom-stick.
 - Symptoms/Impact:
   1. **Black top area**: Smart Input footer height changes triggered PTY resize. OpenCode cleared/redrew on resize, but `activation_scroll_align_pending` jumped the viewport to the prompt row (middle of long output) instead of the bottom, showing blank uncleared rows.
@@ -264,9 +264,9 @@
   - After `ScrollArea` processes each frame, check if the OpenCode viewport is at the bottom (`content_size <= viewport` or `offset >= content - viewport`). If so, clear `opencode_manual_scroll_detached` so `stick_to_bottom` resumes.
 - Prevent recurrence:
   - Added regression tests:
-    - `terminal_resize_pixel_dimensions_quantized_to_cell_boundaries` — 5px height change within one cell keeps same `lines`
-    - `set_active_terminal_skips_activation_scroll_align_for_opencode` — OpenCode activation does not set `activation_scroll_align_pending`
-    - `opencode_output_scroll_behavior_sticks_to_bottom_when_not_detached` — verifies `stick_to_bottom` is true when detach is false
+    - `terminal_resize_pixel_dimensions_quantized_to_cell_boundaries` ÔÇö 5px height change within one cell keeps same `lines`
+    - `set_active_terminal_skips_activation_scroll_align_for_opencode` ÔÇö OpenCode activation does not set `activation_scroll_align_pending`
+    - `opencode_output_scroll_behavior_sticks_to_bottom_when_not_detached` ÔÇö verifies `stick_to_bottom` is true when detach is false
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo test`
 - References: User request 2026-05-12
 
@@ -287,9 +287,9 @@
   - After `ScrollArea` processes each frame for an OpenCode terminal with detached scroll, clamp the scroll offset to `leading_blank_rows * line_height` so the user cannot scroll above the first real content row.
 - Prevent recurrence:
   - Added regression tests:
-    - `opencode_scroll_offset_clamps_past_leading_blank_rows` — counts blank prefix correctly
-    - `non_opencode_scroll_does_not_clamp_leading_blanks` — ensures clamping does not affect other terminals
-    - `scroll_clamp_noops_when_content_not_scrollable` — short / all-blank snapshots are handled safely
+    - `opencode_scroll_offset_clamps_past_leading_blank_rows` ÔÇö counts blank prefix correctly
+    - `non_opencode_scroll_does_not_clamp_leading_blanks` ÔÇö ensures clamping does not affect other terminals
+    - `scroll_clamp_noops_when_content_not_scrollable` ÔÇö short / all-blank snapshots are handled safely
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo test`
 - References: User request 2026-05-14
 
@@ -435,8 +435,8 @@
   - Launcher names and commands use `.truncate()` with a hover tooltip for the full text.
 - Prevent recurrence:
   - Added regression tests:
-    - `foreground_launcher_menu_row_does_not_exceed_fixed_width` — width cap
-    - `foreground_launcher_menu_row_is_inset_from_menu_edges` — padding/inset verification
+    - `foreground_launcher_menu_row_does_not_exceed_fixed_width` ÔÇö width cap
+    - `foreground_launcher_menu_row_is_inset_from_menu_edges` ÔÇö padding/inset verification
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo test`
 - References: User request 2026-05-13
 
@@ -444,7 +444,7 @@
 
 #### Foreground launcher menu minimalized and aligned {#launcher-menu-minimal}
 - Date: 2026-05-13
-- Context: User asked to "adam gibi hizala ve küçült şunları minimal olsun" for the foreground launcher dropdown.
+- Context: User asked to "adam gibi hizala ve k├╝├ğ├╝lt ┼şunlar─▒ minimal olsun" for the foreground launcher dropdown.
 - Error signature: The menu was too wide (220 px), padding too large (6 px), rows too tall (32 px), and the small `launch_command` label repeated the tool name, cluttering the UI.
 - Symptoms/Impact:
   1. Menu felt bulky compared to the rest of the minimal UI.
@@ -500,7 +500,7 @@
 - Context: User reported that when Terminal Manager filter was set to Background, worktree rows still showed "Open Foreground Launcher" menu instead of a background spawn button.
 - Error signature: `draw_terminal_manager_worktree_row` always rendered a foreground launcher menu and hard-coded `TerminalKind::Foreground` when spawning.
 - Symptoms/Impact:
-  1. Background filter active → clicking worktree action opened a foreground launcher dropdown.
+  1. Background filter active ÔåÆ clicking worktree action opened a foreground launcher dropdown.
   2. Spawned terminals for worktrees were always Foreground even when user expected Background.
 - Root cause:
   - `draw_terminal_manager_worktree_row` did not accept the active `TerminalKind` filter.
@@ -511,8 +511,8 @@
   - The call site now routes worktree spawn through `match visible_kind`, spawning `TerminalKind::Background` with no launcher when the filter is Background.
 - Prevent recurrence:
   - Regression tests:
-    - `draw_terminal_manager_worktree_row_background_returns_no_launcher` — verifies Background row returns `None` launcher and no auto-click
-    - `draw_terminal_manager_worktree_row_foreground_returns_no_launcher_without_interaction` — verifies Foreground row shape
+    - `draw_terminal_manager_worktree_row_background_returns_no_launcher` ÔÇö verifies Background row returns `None` launcher and no auto-click
+    - `draw_terminal_manager_worktree_row_foreground_returns_no_launcher_without_interaction` ÔÇö verifies Foreground row shape
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-05-14
 
@@ -530,7 +530,7 @@
   - A second `Event::Paste` interception block (labeled "Smart Input image paste: ...") ran after the primary synthesize block. It used `filter` to drop the paste event when any image was found, assuming raw image bytes were being pasted. This was wrong because the synthesized event already carried the saved path string, which should go to the TextEdit.
 - Resolution:
   - Removed the second interception block entirely. Attachment creation and `Event::Paste(path)` synthesis now live in a single place in `raw_input_hook`, so the paste event survives to the TextEdit.
-  - Verified that `clipboard_image_path()` already handles Win+Shift+S bitmaps via `arboard.get_image()` → `save_clipboard_image()` → `Pictures/Screenshots/Mergen_clipboard_*.png`.
+  - Verified that `clipboard_image_path()` already handles Win+Shift+S bitmaps via `arboard.get_image()` ÔåÆ `save_clipboard_image()` ÔåÆ `Pictures/Screenshots/Mergen_clipboard_*.png`.
 - Prevent recurrence:
   - Existing tests cover synthesized paste events (`smart_input_synthesizes_image_paste_on_primary_paste_key`, `smart_input_falls_back_to_normal_key_when_no_clipboard_image`).
   - Full `raw_input_hook` integration is covered by focus/navigation tests that exercise the same event pipeline.
@@ -556,11 +556,11 @@
   - Updated `draw_transient_toast` to pass the message into the width helper.
 - Prevent recurrence:
   - Regression tests:
-    - `transient_toast_content_width_is_small_for_short_text_on_wide_screen` — asserts width stays below max and above min for short messages.
-    - `transient_toast_content_width_uses_max_for_long_text_on_wide_screen` — asserts long text still hits the 640 px cap.
-    - `transient_toast_content_width_caps_at_screen_on_narrow_screen` — asserts viewport overflow protection.
-    - `transient_toast_content_width_never_exceeds_screen` — asserts small-screen clamp.
-    - `transient_toast_content_width_scales_between_min_and_max_for_medium_text` — asserts medium text scales dynamically.
+    - `transient_toast_content_width_is_small_for_short_text_on_wide_screen` ÔÇö asserts width stays below max and above min for short messages.
+    - `transient_toast_content_width_uses_max_for_long_text_on_wide_screen` ÔÇö asserts long text still hits the 640 px cap.
+    - `transient_toast_content_width_caps_at_screen_on_narrow_screen` ÔÇö asserts viewport overflow protection.
+    - `transient_toast_content_width_never_exceeds_screen` ÔÇö asserts small-screen clamp.
+    - `transient_toast_content_width_scales_between_min_and_max_for_medium_text` ÔÇö asserts medium text scales dynamically.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-05-14
 
@@ -585,11 +585,11 @@
   - This aligns terminal shortcut confirmation with the already-proven Smart Input strategy.
 - Prevent recurrence:
   - Regression tests updated:
-    - `handle_shortcuts_executes_terminal_shortcut_from_config` — asserts 2 pending delayed Enters for slash commands.
-    - `handle_shortcuts_uses_bracketed_paste_for_slash_shortcut` — asserts 2 pending delayed Enters.
-    - `handle_shortcuts_sends_immediate_enter_plus_delayed_confirmation` — processes both delayed Enters and asserts total output `\r\r\r`.
-    - `handle_shortcuts_clears_stale_delayed_enters_for_slash_shortcut` — simulates a stale pending Enter and verifies it is replaced by 2 fresh ones.
-    - `handle_shortcuts_non_slash_keeps_single_delayed_confirmation` — verifies non-slash shortcuts still get only 1 delayed Enter.
+    - `handle_shortcuts_executes_terminal_shortcut_from_config` ÔÇö asserts 2 pending delayed Enters for slash commands.
+    - `handle_shortcuts_uses_bracketed_paste_for_slash_shortcut` ÔÇö asserts 2 pending delayed Enters.
+    - `handle_shortcuts_sends_immediate_enter_plus_delayed_confirmation` ÔÇö processes both delayed Enters and asserts total output `\r\r\r`.
+    - `handle_shortcuts_clears_stale_delayed_enters_for_slash_shortcut` ÔÇö simulates a stale pending Enter and verifies it is replaced by 2 fresh ones.
+    - `handle_shortcuts_non_slash_keeps_single_delayed_confirmation` ÔÇö verifies non-slash shortcuts still get only 1 delayed Enter.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-05-14
 
@@ -616,9 +616,9 @@
   - Applied `draw_clamped_scrollable_label()` to both the popup per-message labels and the Check-list per-item labels.
 - Prevent recurrence:
   - Regression tests:
-    - `draw_clamped_scrollable_label_renders_without_crash` — short and long text both render safely
-    - `terminal_history_popup_renders_long_inputs_without_crash` — 2000-char input + 10-line input do not panic
-    - `checklist_panel_renders_long_items_without_crash` — 2000-char checklist item renders safely
+    - `draw_clamped_scrollable_label_renders_without_crash` ÔÇö short and long text both render safely
+    - `terminal_history_popup_renders_long_inputs_without_crash` ÔÇö 2000-char input + 10-line input do not panic
+    - `checklist_panel_renders_long_items_without_crash` ÔÇö 2000-char checklist item renders safely
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-05-14
 
@@ -657,7 +657,7 @@
 
 #### Smart Input draft textarea resize grip did not work due to TextEdit overlap {#smart-input-draft-grip-overlap}
 - Date: 2026-05-14
-- Context: User reported that the Smart Input metin alanı (draft text area) did not grow or shrink when dragging the bottom-right resize grip.
+- Context: User reported that the Smart Input metin alan─▒ (draft text area) did not grow or shrink when dragging the bottom-right resize grip.
 - Error signature: The bottom-right diagonal grip was drawn as a floating overlay using `ui.interact` inside the same `ui.horizontal` that contained the `TextEdit`. Because `TextEdit` was added first in the layout and occupied the same rect, it consumed all pointer events, making the grip un-draggable.
 - Symptoms/Impact:
   1. Dragging the grip had no visible effect on the text area size.
@@ -673,8 +673,8 @@
   - Updated `draw_smart_input_footer` signature to accept `pane_height` and `line_height` so the grip can compute the same `max_footer` clamp used by the main handle.
 - Prevent recurrence:
   - Regression tests:
-    - `smart_input_footer_user_height_takes_precedence_over_draft_height` — verifies that `user_height` controls the footer regardless of `draft_user_height`
-    - `smart_input_footer_grip_drag_respects_max_and_min` — verifies drag math clamps to min/max footer bounds
+    - `smart_input_footer_user_height_takes_precedence_over_draft_height` ÔÇö verifies that `user_height` controls the footer regardless of `draft_user_height`
+    - `smart_input_footer_grip_drag_respects_max_and_min` ÔÇö verifies drag math clamps to min/max footer bounds
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-05-14
 
@@ -695,19 +695,19 @@
 - Resolution:
   - Added `AdeApp::ensure_smart_input_focus()` helper with strict guards: only runs when no Smart Input field is already focused, no modal/popup is open, and no other UI text input owns focus.
   - Called `ensure_smart_input_focus()` at three critical points:
-    1. **Start of `raw_input_hook()`** — before event routing, so the first keystroke is directed to the Smart Input `TextEdit` rather than the terminal.
-    2. **Inside `set_active_terminal()`** — after `surrender_ui_text_focus()`, so switching to a terminal with visible Smart Input immediately restores draft focus.
-    3. **After `draw_main_area()`** in `update()` — safety net every frame.
+    1. **Start of `raw_input_hook()`** ÔÇö before event routing, so the first keystroke is directed to the Smart Input `TextEdit` rather than the terminal.
+    2. **Inside `set_active_terminal()`** ÔÇö after `surrender_ui_text_focus()`, so switching to a terminal with visible Smart Input immediately restores draft focus.
+    3. **After `draw_main_area()`** in `update()` ÔÇö safety net every frame.
   - In `draw_smart_input_footer()`, after queue edit actions (`edit` / `save` / `cancel` / `delete`), restored focus to the edit input or draft input respectively.
   - In `handle_smart_input_pane_action()`, after `send_draft_now` or `send_task_now`, restored focus to the draft input so the user can keep typing.
 - Prevent recurrence:
   - Regression tests:
-    - `smart_input_ensure_focus_requests_draft_when_visible` — unfocused visible Smart Input gets draft focus
-    - `smart_input_ensure_focus_does_not_steal_from_directory_search` — respects existing non-Smart UI focus
-    - `smart_input_ensure_focus_does_not_run_when_settings_popup_open` — blocked by modal
-    - `set_active_terminal_restores_smart_input_focus_when_visible` — activation restores focus
-    - `smart_input_ensure_focus_preserves_existing_edit_focus` — does not steal from edit field
-    - `raw_input_hook_auto_focuses_smart_input_draft` — first keystroke claims focus and text event survives for TextEdit
+    - `smart_input_ensure_focus_requests_draft_when_visible` ÔÇö unfocused visible Smart Input gets draft focus
+    - `smart_input_ensure_focus_does_not_steal_from_directory_search` ÔÇö respects existing non-Smart UI focus
+    - `smart_input_ensure_focus_does_not_run_when_settings_popup_open` ÔÇö blocked by modal
+    - `set_active_terminal_restores_smart_input_focus_when_visible` ÔÇö activation restores focus
+    - `smart_input_ensure_focus_preserves_existing_edit_focus` ÔÇö does not steal from edit field
+    - `raw_input_hook_auto_focuses_smart_input_draft` ÔÇö first keystroke claims focus and text event survives for TextEdit
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-05-14
 
@@ -729,8 +729,8 @@
   - Existing per-item copy and checkbox-to-remove behaviors are unchanged.
 - Prevent recurrence:
   - Regression tests:
-    - `format_checklist_for_clipboard_joins_items_with_blank_line` — verifies ordering and blank-line separation
-    - `format_checklist_for_clipboard_preserves_unicode_and_multiline` — verifies Unicode and multi-line content safety
+    - `format_checklist_for_clipboard_joins_items_with_blank_line` ÔÇö verifies ordering and blank-line separation
+    - `format_checklist_for_clipboard_preserves_unicode_and_multiline` ÔÇö verifies Unicode and multi-line content safety
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-05-14
 
@@ -872,14 +872,14 @@
   - `checklist_collapsed_by_project` existed in `AdeApp` but was never read or written by the panel draw code.
 - Resolution:
   - Replaced the static project header with an interactive accordion row: a clickable body area (left portion) and a separate copy button area (right portion).
-  - Added a visual arrow indicator (`▸` / `▾`) and folder icon (`icons::FOLDER` / `icons::FOLDER_OPEN`) to communicate collapse state.
+  - Added a visual arrow indicator (`Ôû©` / `Ôû¥`) and folder icon (`icons::FOLDER` / `icons::FOLDER_OPEN`) to communicate collapse state.
   - Clicking the body toggles `checklist_collapsed_by_project` for that project; the item list is only rendered when the project is expanded.
   - The copy button uses its own interaction rect so it never triggers the accordion toggle.
   - Default state remains expanded (not collapsed).
 - Prevent recurrence:
   - Regression tests added:
-    - `checklist_panel_project_collapsed_hides_items` — verifies panel draw does not panic when a project is collapsed
-    - `checklist_panel_project_collapse_state_isolated_per_project` — verifies toggling one project does not affect another
+    - `checklist_panel_project_collapsed_hides_items` ÔÇö verifies panel draw does not panic when a project is collapsed
+    - `checklist_panel_project_collapse_state_isolated_per_project` ÔÇö verifies toggling one project does not affect another
   - Added `Check-list Panel Guidelines` section to AGENTS.md documenting accordion behavior, per-project state, and copy button separation.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-05-14
@@ -891,7 +891,7 @@
 - Context: User reported that the resize bar between the terminal and Check-list panel flickers rapidly when the mouse hovers over it.
 - Error signature: The default egui `SidePanel` resize separator uses `fg_stroke`, which in this dark theme is almost white (`TEXT_PRIMARY`). When the Check-list and Browser panels were resized, the bright separator could flash against the dark background because no custom dim overlay was applied to those panels.
 - Symptoms/Impact:
-  1. Mouse hovering the terminal–Check-list boundary caused rapid visual flicker.
+  1. Mouse hovering the terminalÔÇôCheck-list boundary caused rapid visual flicker.
   2. The resize cursor felt unstable because the bright separator kept appearing and disappearing.
   3. Browser panel (when open next to Check-list) had the same issue on its left edge.
 - Root cause:
@@ -942,7 +942,7 @@
 #### Check-list panel project header arrow removed {#checklist-header-arrow-removed}
 - Date: 2026-05-14
 - Context: User requested that the collapse/expand arrow next to the folder icon in the Check-list panel project header be removed, keeping only the folder icon.
-- Error signature: `draw_checklist_panel` rendered an arrow indicator (`▸` / `▾`) next to the folder icon in the project accordion header.
+- Error signature: `draw_checklist_panel` rendered an arrow indicator (`Ôû©` / `Ôû¥`) next to the folder icon in the project accordion header.
 - Symptoms/Impact:
   1. The arrow was visually redundant because the folder icon already changes between `icons::FOLDER` (collapsed) and `icons::FOLDER_OPEN` (expanded).
   2. User found the arrow cluttered the header.
@@ -1013,9 +1013,9 @@
   - **v3 fix**: Restored footer and draft resize handles with active drag logic, but clamped to a `safe_min` that guarantees queue slot + draft input fit. Footer height is now dynamic again but bounded: `user_height` is clamped upward to `safe_min` (base + task_rows * row_height + margin) and downward to `max_footer`. Queue row layout changed from `Align::Center` to `Align::Min` so task text is left-aligned. Header control buttons no longer have a 100px spacer pushing them right.
 - Prevent recurrence:
   - Regression tests added:
-    - `smart_input_queue_row_does_not_expand_past_footer_width` — renders the footer with a 500-char queued task inside a 400px-wide viewport and asserts that no text shape exceeds the footer width.
-    - `smart_input_queue_slot_is_visible_when_tasks_exist` — renders the footer with a queued task and asserts the task text appears as a text shape.
-    - `smart_input_footer_user_height_clamped_to_safe_min_when_tasks_exist` — asserts that `user_height` below the safe minimum is clamped upward so the queue slot is not crushed.
+    - `smart_input_queue_row_does_not_expand_past_footer_width` ÔÇö renders the footer with a 500-char queued task inside a 400px-wide viewport and asserts that no text shape exceeds the footer width.
+    - `smart_input_queue_slot_is_visible_when_tasks_exist` ÔÇö renders the footer with a queued task and asserts the task text appears as a text shape.
+    - `smart_input_footer_user_height_clamped_to_safe_min_when_tasks_exist` ÔÇö asserts that `user_height` below the safe minimum is clamped upward so the queue slot is not crushed.
   - Added AGENTS.md guidelines: "Queue rows must cap content width...", "Smart Input queue area must use a fixed slot...", "Smart Input footer height must clamp to a safe minimum so queue and draft always fit...", "Footer height is user-resizable via a drag handle...", "Draft text area resize grip resizes the overall footer..."
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-05-14
@@ -1040,9 +1040,9 @@
   - In `draw_smart_input_footer`, the queue slot is now sized to `smart_input_queue_slot_height(task_rows)`, which is `0px` when empty, allowing the hint and draft to fit within the calculated footer height.
 - Prevent recurrence:
   - Added regression tests:
-    - `smart_input_footer_height_is_tall_enough_for_expanded_empty_queue` — asserts footer height >= base + empty hint (174px).
-    - `smart_input_empty_queue_does_not_allocate_three_row_slot` — renders footer with empty queue, asserts the "No queued tasks" hint is visible and no task row backgrounds are painted.
-    - `smart_input_footer_user_height_clamped_to_safe_min_when_tasks_exist` — updated to match actual slot height (base + rows*28+4 + 60).
+    - `smart_input_footer_height_is_tall_enough_for_expanded_empty_queue` ÔÇö asserts footer height >= base + empty hint (174px).
+    - `smart_input_empty_queue_does_not_allocate_three_row_slot` ÔÇö renders footer with empty queue, asserts the "No queued tasks" hint is visible and no task row backgrounds are painted.
+    - `smart_input_footer_user_height_clamped_to_safe_min_when_tasks_exist` ÔÇö updated to match actual slot height (base + rows*28+4 + 60).
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-05-15
 
@@ -1067,11 +1067,11 @@
   - Included question-card height in Smart Input footer desired/safe-min height so the prompt is less likely to clip the draft/queue controls.
 - Prevent recurrence:
   - Added regression tests:
-    - `opencode_question_arrow_keys_move_focus_without_draft_history` — asserts ArrowDown is consumed by the question card and does not alter Smart Input draft history.
-    - `opencode_question_enter_submits_focused_option_answer` — asserts Enter submits the highlighted option through the hook answer bridge and clears question state.
-    - `opencode_question_escape_rejects_answer` — asserts Escape queues a rejected answer and clears the prompt.
-    - `opencode_question_keyboard_ignores_hidden_active_terminal` — asserts hidden/off-main terminals do not consume question keyboard input.
-    - `smart_input_footer_height_handles_question_safe_min_above_max_footer` — asserts question footer sizing does not panic when pane height is smaller than the safe minimum.
+    - `opencode_question_arrow_keys_move_focus_without_draft_history` ÔÇö asserts ArrowDown is consumed by the question card and does not alter Smart Input draft history.
+    - `opencode_question_enter_submits_focused_option_answer` ÔÇö asserts Enter submits the highlighted option through the hook answer bridge and clears question state.
+    - `opencode_question_escape_rejects_answer` ÔÇö asserts Escape queues a rejected answer and clears the prompt.
+    - `opencode_question_keyboard_ignores_hidden_active_terminal` ÔÇö asserts hidden/off-main terminals do not consume question keyboard input.
+    - `smart_input_footer_height_handles_question_safe_min_above_max_footer` ÔÇö asserts question footer sizing does not panic when pane height is smaller than the safe minimum.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test opencode_question`, `cargo test smart_input_footer_height_handles_question_safe_min_above_max_footer`, `cargo test`
 - References: User request 2026-05-15
 
@@ -2119,7 +2119,7 @@
   - Added `append_terminal_line_runs` helper to `build_terminal_render` that pads missing leading/inter-run column gaps with blank spaces, preserving column alignment even for sparse snapshots.
 - Prevent recurrence:
   - Added regression tests:
-    - `terminal_pane_clamps_horizontal_scroll_offset_to_zero` — injects a non-zero x offset and verifies it is reset after rendering.
-    - `build_terminal_render_pads_sparse_run_start_with_blanks` — verifies defensive blank padding for runs that do not start at column 0.
+    - `terminal_pane_clamps_horizontal_scroll_offset_to_zero` ÔÇö injects a non-zero x offset and verifies it is reset after rendering.
+    - `build_terminal_render_pads_sparse_run_start_with_blanks` ÔÇö verifies defensive blank padding for runs that do not start at column 0.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-05-20
