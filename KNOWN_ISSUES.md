@@ -31,26 +31,20 @@
 
 ---
 
-#### Zed keymap and OpenCode command frontmatter added for agent shortcuts {#zed-keymap-agent-shortcuts}
+#### OpenCode command frontmatter and Zed skills added for slash commands {#zed-skills-frontmatter}
 - Date: 2026-05-21
-- Context: User asked how to get Mergen-style F-key shortcuts (F5→`/gt`, F6→`/prepare-fix-plan`, F7→`/review-guard`, F11→`/implement-plan`) and custom slash commands to appear in Zed's Agent Panel when typing `/`.
-- Error signature: Zed `keymap.json` was empty and OpenCode custom command files (`~/.config/opencode/commands/*.md`) had inconsistent frontmatter, causing the ACP adapter to parse some commands with fallback filenames instead of structured metadata.
+- Context: User wanted custom slash commands (`/gt`, `/prepare-fix-plan`, `/review-guard`, `/implement-plan`) to appear in Zed's Agent Panel when typing `/`.
+- Error signature: OpenCode custom command files (`~/.config/opencode/commands/*.md`) had inconsistent frontmatter, causing the ACP adapter to parse some commands with fallback filenames instead of structured metadata.
 - Symptoms/Impact:
-  1. No keyboard shortcuts existed to quickly submit slash commands in Zed's Agent Panel.
-  2. Some `/` commands might not appear or display with missing descriptions in Zed.
+  1. Some `/` commands might not appear or display with missing descriptions in Zed.
 - Resolution:
-  - Wrote `%APPDATA%/Zed/keymap.json` with `AgentPanel` context bindings:
-    - `f5` → `/gt enter`
-    - `f6` → `/prepare-fix-plan enter`
-    - `f7` → `/review-guard enter`
-    - `f11` → `/implement-plan enter`
   - Added consistent YAML frontmatter (`name`, `description`) to all OpenCode command files:
     - `gt.md`, `implement-plan.md`, `prepare-fix-plan.md`, `review-guard.md`
   - Added `.zed/skills/<skill-name>/SKILL.md` directories in the project root for Zed-native skill discovery.
 - Prevent recurrence:
-  - Documented the keymap format and frontmatter requirement in AGENTS.md.
+  - Documented the frontmatter requirement in AGENTS.md.
   - Recorded the change in KNOWN_ISSUES.md.
-- Files/Commands touched: `%APPDATA%/Zed/keymap.json`, `~/.config/opencode/commands/*.md`, `.zed/skills/*`, `AGENTS.md`, `KNOWN_ISSUES.md`
+- Files/Commands touched: `~/.config/opencode/commands/*.md`, `.zed/skills/*`, `AGENTS.md`, `KNOWN_ISSUES.md`
 - References: User request 2026-05-21
 
 ---
