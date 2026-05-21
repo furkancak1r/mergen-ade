@@ -560,3 +560,10 @@ If `cargo` is not on PATH in PowerShell, use:
   ```
   Then verify with `claude --version`. Persistent failures can be diagnosed with `claude doctor`.
 - **Secret handling**: `~/.claude/settings.json`, `.claude/settings.local.json`, and `.claude/state/` are ignored by git (via `.gitignore`). No API keys or tokens are committed to the repository.
+
+## Cross-Tool Project Configuration
+- When a project is used in both Mergen and Zed, keep terminal commands in sync.
+- Mergen `ProjectRecord::saved_messages` should be mirrored as `.zed/tasks.json` entries so the same commands are available in Zed's task picker.
+- Zed tasks use `$ZED_WORKTREE_ROOT` for `cwd` and should be placed in the project root under `.zed/tasks.json`.
+- MCP servers configured in OpenCode (`~/.config/opencode/opencode.json`) should also be registered in Zed (`context_servers` in Zed settings) so agents in both environments share the same tool set.
+- Do not add Mergen-specific MCPs (e.g., `mergen-browser`) to Zed; use standard MCPs such as Playwright for browser automation in Zed.

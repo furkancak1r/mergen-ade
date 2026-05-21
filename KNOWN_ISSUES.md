@@ -2,6 +2,35 @@
  
 ---
 
+#### Mergen saved messages and OpenCode MCPs migrated to Zed {#mergen-to-zed-migration}
+- Date: 2026-05-21
+- Context: User requested that Mergen project saved messages be copied to Zed as project tasks, and that OpenCode MCP servers be synchronized into Zed's `context_servers` (excluding Mergen-specific browser MCP, using Playwright instead).
+- Error signature: Mergen and Zed were maintained as separate tool configurations with no shared project task or MCP definitions, causing duplicated setup effort and drift between the two environments.
+- Symptoms/Impact:
+  1. Saved terminal commands in Mergen projects were not available in Zed's task picker.
+  2. Zed's MCP list was missing `dbhubmssqlprs6` and had a stale `dbhubmssqlsap` DSN compared to OpenCode.
+  3. Playwright MCP in Zed lacked the `--caps=devtools` argument used in OpenCode.
+- Root cause:
+  - No migration step existed to keep Zed project tasks and MCPs in sync with Mergen/OpenCode configurations.
+- Resolution:
+  - Created `.zed/tasks.json` for projects with non-empty Mergen `saved_messages`:
+    - `ProsoLocal`: dev:client, dev:server, vite:host, deploy:prosolocal
+    - `promes`: added deploy:promes and dev:client-host to existing tasks
+    - `Mergen-ADE`: cargo run
+  - Updated Zed `settings.json` `context_servers`:
+    - Replaced bare `mcp-server-playwright` config with explicit `npx -y @playwright/mcp@latest --caps=devtools` command.
+    - Added `dbhubmssqlprs6` with DSN `ZTEST-20260120-PRS6`.
+    - Updated `dbhubmssqlsap` DSN from `PROSO` to `ZTEST-20260513-PROSO` to match OpenCode.
+    - Preserved existing `appwrite_talep_takip`, `dbhubpromestest`, `dbhubprosotest`, `dbhubmssqlinkool`, and `openaiDeveloperDocs` entries.
+    - Did **not** add Mergen-specific `mergen-browser` MCP.
+- Prevent recurrence:
+  - Added note to AGENTS.md that project saved messages should be mirrored in `.zed/tasks.json` when the project is used in Zed.
+  - Documented the migration in KNOWN_ISSUES.md so future drift can be detected.
+- Files/Commands touched: `ProsoLocal/.zed/tasks.json`, `promes/.zed/tasks.json`, `Mergen-ADE/.zed/tasks.json`, `%APPDATA%/Zed/settings.json`, `AGENTS.md`, `KNOWN_ISSUES.md`
+- References: User request 2026-05-21
+
+---
+
 #### OS notification click resized the window regardless of its current state {#os-notification-click-resize}
 - Date: 2026-05-20
 - Context: User reported that clicking the Windows system notification balloon resized/unmaximized Mergen even when it was already visible.
