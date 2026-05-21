@@ -567,3 +567,19 @@ If `cargo` is not on PATH in PowerShell, use:
 - Zed tasks use `$ZED_WORKTREE_ROOT` for `cwd` and should be placed in the project root under `.zed/tasks.json`.
 - MCP servers configured in OpenCode (`~/.config/opencode/opencode.json`) should also be registered in Zed (`context_servers` in Zed settings) so agents in both environments share the same tool set.
 - Do not add Mergen-specific MCPs (e.g., `mergen-browser`) to Zed; use standard MCPs such as Playwright for browser automation in Zed.
+- **Custom agent commands / skills**: When using OpenCode via ACP in Zed, custom slash commands should be defined as OpenCode commands (`~/.config/opencode/commands/*.md`) with frontmatter (`name`, `description`). The custom ACP adapter forwards these to Zed as `available_commands_update` so they appear when typing `/` in the Agent Panel.
+- **Zed keymap for agent shortcuts**: Bind F-keys to `workspace::SendKeystrokes` within the `AgentPanel` context so Mergen-style shortcuts (e.g., F5→`/gt`, F6→`/prepare-fix-plan`, F7→`/review-guard`, F11→`/implement-plan`) work inside Zed's Agent Panel without terminal emulation. Example:
+  ```json
+  [
+    {
+      "context": "AgentPanel",
+      "bindings": {
+        "f5": ["workspace::SendKeystrokes", "/gt enter"],
+        "f6": ["workspace::SendKeystrokes", "/prepare-fix-plan enter"],
+        "f7": ["workspace::SendKeystrokes", "/review-guard enter"],
+        "f11": ["workspace::SendKeystrokes", "/implement-plan enter"]
+      }
+    }
+  ]
+  ```
+- **Zed skills directory**: For Zed-native agent skill discovery, place `SKILL.md` files under `.zed/skills/<skill-name>/SKILL.md`. This mirrors the open SKILL.md standard and keeps project-specific agent instructions version-controlled.
