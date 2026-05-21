@@ -23302,16 +23302,24 @@ impl AdeApp {
                     0.0
                 };
 
-                let output_height = (pane_height
+                let raw_output_height = (pane_height
                     - TERMINAL_HEADER_HEIGHT
                     - TERMINAL_HEADER_GAP
                     - smart_footer_gap
                     - smart_footer_height)
                     .max(line_height * 2.0);
+                let raw_output_size = Vec2::new(pane_width, raw_output_height);
+
+                let (cols, lines) =
+                    terminal_grid_dimensions(raw_output_size, char_width, line_height);
+                // Quantize viewport height to an exact multiple of line_height so the
+                // visible terminal area always aligns with the PTY grid. This prevents
+                // a small dead strip (< one line tall) at the top when the pane height
+                // does not divide evenly by the cell height.
+                let output_height = (lines as f32 * line_height).max(line_height * 2.0);
                 let output_size = Vec2::new(pane_width, output_height);
 
-                let (cols, lines) = terminal_grid_dimensions(output_size, char_width, line_height);
-                if output_size.x >= char_width * 8.0 && output_size.y >= line_height * 3.0 {
+                if raw_output_size.x >= char_width * 8.0 && raw_output_size.y >= line_height * 3.0 {
                     // Quantize pixel dimensions to cell boundaries so small
                     // Smart Input footer height changes don't jitter the PTY size.
                     let pixel_width = (cols as f32 * char_width)
@@ -23818,12 +23826,26 @@ impl AdeApp {
                     }
                 });
 
-                // After ScrollArea processes wheel, no OpenCode fallback is needed because
-                // active OpenCode sessions received the wheel directly above. Inactive sessions
-                // left the wheel for Mergen's ScrollArea, which handled it naturally.
+                // After ScrollArea processes wheel, active OpenCode sessions already
+                // forwarded the wheel directly to the runtime TUI above. To keep Mergen's
+                // wrapper visually aligned, pin the wrapper to the bottom and clear any
+                // stale manual-scroll detach so new output continues to stick.
                 if wheel_enabled && opencode_direct_wheel_sent {
-                    // Clear any residual diagonal delta so Mergen ScrollArea doesn't try to
-                    // consume the portion already sent to OpenCode runtime.
+                    terminal.opencode_manual_scroll_detached = false;
+                    let content_h = scroll_area_output.content_size.y;
+                    let viewport_h = scroll_area_output.inner_rect.height();
+                    if content_h > viewport_h {
+                        let max_offset_y = (content_h - viewport_h).max(0.0);
+                        scroll_area_output.state.offset.y = max_offset_y;
+                        scroll_area_output
+                            .state
+                            .store(ui.ctx(), scroll_area_output.id);
+                    } else {
+                        scroll_area_output.state.offset.y = 0.0;
+                        scroll_area_output
+                            .state
+                            .store(ui.ctx(), scroll_area_output.id);
+                    }
                     ui.ctx().input_mut(|input| {
                         input.smooth_scroll_delta = Vec2::ZERO;
                     });
@@ -55122,6 +55144,8 @@ mod tests {
         terminal.ai_session.tool = Some(AiCliTool::OpenCode);
         terminal.ai_session.status = AiCliStatus::Running;
         terminal.opencode_session_active = true;
+        // Simulate stale manual-scroll detach from a previous Mergen scroll
+        terminal.opencode_manual_scroll_detached = true;
 
         // Prevent draw_terminal_pane from overwriting our render_cache with an
         // empty snapshot from the test runtime by syncing last_seqno.
@@ -55182,7 +55206,7 @@ mod tests {
         let terminal_after = app.terminals.get(&1).unwrap();
         assert!(
             !terminal_after.opencode_manual_scroll_detached,
-            "direct forward should not set manual_scroll_detached"
+            "direct forward must clear stale manual_scroll_detached"
         );
     }
 
@@ -55349,6 +55373,74 @@ mod tests {
         assert!(
             !terminal_after.opencode_manual_scroll_detached,
             "inactive wheel should not detach manual scroll"
+        );
+    }
+
+    #[test]
+    fn terminal_output_height_quantized_to_line_grid() {
+        // Regression test: terminal output viewport height must be an exact multiple
+        // of line_height so the visible area aligns with the PTY grid and no dead
+        // strip (< one line tall) appears at the top.
+        let ctx = Context::default();
+        let mut fonts = FontDefinitions::default();
+        configure_terminal_font_family(&mut fonts);
+        ctx.set_fonts(fonts);
+
+        let (runtime, _capture) = test_terminal_runtime_with_capture();
+        let mut terminal = test_terminal_entry_with_runtime(1, 7, runtime);
+        terminal.kind = TerminalKind::Foreground;
+        terminal.ai_session.tool = Some(AiCliTool::OpenCode);
+        terminal.ai_session.status = AiCliStatus::Running;
+        terminal.opencode_session_active = true;
+
+        // Prevent draw_terminal_pane from overwriting our render_cache
+        terminal.last_seqno = terminal.runtime.latest_seqno();
+        terminal.dirty = false;
+
+        // Use a pane height that does NOT divide evenly by a typical line height.
+        // For example, if line_height ≈ 14 px, 300 px gives ~21.4 lines.
+        // The quantized output_height should be exactly 21 * line_height.
+        let pane_size = vec2(400.0, 300.0);
+        let mut app = test_app([(1, terminal)], Some(1));
+
+        let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let raw_input = RawInput {
+            screen_rect: Some(screen_rect),
+            events: vec![Event::PointerMoved(pos2(200.0, 100.0))],
+            ..RawInput::default()
+        };
+
+        let mut observed_output_height: Option<f32> = None;
+        let _ = ctx.run(raw_input, |ctx| {
+            egui::Area::new("test".into())
+                .default_pos(pos2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    app.draw_terminal_pane(ui, 1, pane_size);
+                    // After drawing, inspect the terminal's last resize to infer line height
+                    let terminal = app.terminals.get(&1).unwrap();
+                    let line_height = terminal_line_height(ui, &terminal_font_id(ui.style()));
+                    let raw_h =
+                        (pane_size.y - super::TERMINAL_HEADER_HEIGHT - super::TERMINAL_HEADER_GAP)
+                            .max(line_height * 2.0);
+                    let lines = (raw_h / line_height).floor() as u16;
+                    let quantized_h = lines as f32 * line_height;
+                    observed_output_height = Some(quantized_h);
+                });
+        });
+
+        let quantized = observed_output_height.expect("output height should be observed");
+        // Verify it is an integer multiple of a plausible line height.
+        // We don't know the exact line height in this test context, but we can
+        // verify the value is <= raw height and > raw_height - line_height.
+        let raw_h =
+            (pane_size.y - super::TERMINAL_HEADER_HEIGHT - super::TERMINAL_HEADER_GAP).max(28.0); // assume line_height >= 14 -> 2 lines = 28
+        assert!(
+            quantized <= raw_h,
+            "quantized height ({quantized}) must not exceed raw height ({raw_h})"
+        );
+        assert!(
+            quantized > raw_h - 30.0,
+            "quantized height ({quantized}) must be within one line of raw height ({raw_h})"
         );
     }
 

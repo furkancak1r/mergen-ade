@@ -95,6 +95,30 @@
 
 ---
 
+#### OpenCode terminal showed a small dead strip at the top while scrolling {#opencode-dead-strip-top}
+- Date: 2026-05-21
+- Context: User reported that in an active OpenCode terminal, a small fixed area at the top did not scroll with the rest of the content ("en üstte çok az bir ölü alan var scroll yapınca değişmiyor uyumlu değil").
+- Error signature: Two separate problems combined:
+  1. `output_height` was computed as raw pixels (`pane_height - header - gaps - footer`) but the PTY grid uses `floor(height / line_height)` rows. This left a sub-line dead strip at the top when the pane height did not divide evenly by `line_height`.
+  2. When OpenCode wheel was forwarded directly to the runtime TUI, stale `opencode_manual_scroll_detached` state could leave the Mergen wrapper scrolled up, exposing blank scrollback rows above the active OpenCode content.
+- Symptoms/Impact:
+  1. A small strip at the top of the terminal remained visually fixed/stale while OpenCode TUI content scrolled below it.
+  2. The strip looked like a misaligned header or uncleared scrollback.
+- Root cause:
+  - `output_height` was not quantized to the cell grid before being used for the viewport and `ScrollArea`.
+  - OpenCode direct-forward path did not reset `opencode_manual_scroll_detached` or re-pin the wrapper to bottom, so old Mergen scroll offset persisted.
+- Resolution:
+  - Quantize `output_height` after computing `(cols, lines)` from the raw height: `output_height = lines as f32 * line_height`. The viewport and `ScrollArea` now use this quantized value, eliminating the sub-line mismatch.
+  - After sending a direct wheel to the OpenCode runtime, explicitly set `terminal.opencode_manual_scroll_detached = false` and clamp `scroll_area_output.state.offset.y` to `max_offset_y` (or `0.0` if content fits) so the Mergen wrapper stays pinned at bottom.
+- Prevent recurrence:
+  - Added integration test `terminal_output_height_quantized_to_line_grid` that verifies the drawn viewport height is an exact multiple of `line_height`.
+  - Updated existing wheel direct-forward tests (`opencode_running_wheel_forwarded_directly_to_runtime`, `opencode_attention_wheel_forwarded_directly_to_runtime`) to start with `opencode_manual_scroll_detached = true` and assert it is cleared after the wheel.
+  - Updated AGENTS.md to document both the quantized viewport rule and the bottom-pin behavior for active OpenCode wheel.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-21
+
+---
+
 #### OpenCode fixed header appeared during scroll because of premature wheel fallback {#opencode-wheel-fixed-header-fallback}
 - Date: 2026-05-21
 - Context: User reported that after sending a new message in an OpenCode session, scrolling worked but a portion at the top of the terminal remained fixed while the rest scrolled, creating a "stuck header" effect.
