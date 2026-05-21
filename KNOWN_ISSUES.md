@@ -45,6 +45,104 @@
 
 ---
 
+#### OpenCode wheel fallback refined for old/idle sessions {#opencode-wheel-idle-fallback}
+- Date: 2026-05-21
+- Context: User reported that scrolling did not work in OpenCode sessions that were not actively `Running` (e.g., idle/attention/TurnComplete states in an old session). The previous fix (2026-05-20) disabled runtime fallback for non-Running states entirely, but this prevented users from scrolling OpenCode's TUI content after a turn completed while Mergen had no scrollback.
+- Error signature: `opencode_terminal_wheel_fallback_enabled` returned `true` only when `status == Running`. For `Attention`/`TurnComplete` states, wheel events were trapped by Mergen scrollback even when Mergen had no visible content to scroll.
+- Symptoms/Impact:
+  1. In old/idle OpenCode sessions with `TurnComplete` attention, mouse wheel did nothing (Mergen had no scrollback, OpenCode got no fallback).
+  2. Users could not scroll OpenCode's own TUI history or content after a turn finished.
+- Root cause:
+  - The fallback was gated too narrowly to `Running` only. `Attention` and `TurnComplete` are still active OpenCode sessions where the TUI may have scrollable content.
+- Resolution:
+  - Expanded `opencode_terminal_wheel_fallback_enabled` to return `true` for any non-`Inactive` OpenCode session (`Running` or `Attention`).
+  - Introduced `opencode_wheel_mergen_consumed` helper to precisely detect whether Mergen actually consumed the wheel on visible scrollback content (delta cleared AND viewport is not trapped in blank leading rows). Only when Mergen did NOT consume the wheel does the fallback forward to OpenCode runtime.
+  - Blank leading rows left by OpenCode `ED2` clears are detected via `terminal_leading_blank_rows`; the viewport clamping ensures the wheel falls back to OpenCode when the user is stuck in blank rows.
+- Prevent recurrence:
+  - Added unit tests for `opencode_wheel_mergen_consumed`:
+    - `opencode_wheel_mergen_consumed_when_delta_cleared_and_visible`
+    - `opencode_wheel_mergen_not_consumed_when_delta_remains`
+    - `opencode_wheel_mergen_not_consumed_when_stuck_at_blank_boundary`
+    - `opencode_wheel_mergen_not_consumed_when_content_fits`
+  - Retained integration tests `opencode_running_wheel_fallback_when_scrollback_exhausted` and `opencode_running_wheel_blank_prefix_triggers_fallback`.
+  - Updated AGENTS.md OpenCode wheel guidelines to document the new non-Inactive fallback behavior.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-21
+
+---
+
+#### OpenCode mouse wheel Up could not scroll terminal history {#opencode-wheel-up-no-scroll}
+- Date: 2026-05-21
+- Context: User reported that in an OpenCode terminal, scrolling up with the mouse wheel did not move the terminal scrollback ("yok çıkmıyorum yukarıya").
+- Error signature: After `draw_terminal_pane` processed a wheel Up event, `opencode_wheel_mergen_consumed` returned `false` because the ScrollArea did not fully clear `remaining_delta` (e.g., near a scroll boundary). The wheel then fell back to the OpenCode runtime TUI, which either did not scroll visibly or scrolled its own internal content while keeping a fixed header, making the terminal appear stuck.
+- Symptoms/Impact:
+  1. Mouse wheel Up in an OpenCode terminal did nothing or caused a "fixed header" visual artifact.
+  2. Users could not review earlier terminal output history by scrolling up.
+- Root cause:
+  - The fallback logic treated any un-consumed delta as a signal to forward the wheel to OpenCode, even when Mergen had scrollable terminal history. The ScrollArea might not consume the full delta at boundaries, but the user still intends to scroll Mergen history, not OpenCode's TUI.
+- Resolution:
+  - For `WheelDirection::Up`, if the terminal snapshot contains real text lines whose total height exceeds the viewport (`real_content_h > viewport_h`), the wheel is forced to Mergen consumption. If the ScrollArea did not consume the delta, the code manually adjusts `scroll_area_output.state.offset.y` upward and clears the delta.
+  - `mergen_scrollable` is computed from real (non-blank) text lines only, using `line_height * real_line_count`. This prevents blank lines or ScrollArea padding from being misclassified as scrollable content.
+  - `mergen_consumed` from `opencode_wheel_mergen_consumed` is gated with `&& mergen_scrollable` so that a ScrollArea-consumed delta on empty/short content does not accidentally block OpenCode fallback.
+- Prevent recurrence:
+  - Added integration test `opencode_wheel_up_forces_mergen_when_scrollable` that verifies wheel Up does not fallback to OpenCode runtime when the terminal has scrollable real content.
+  - Retained existing integration tests `opencode_running_wheel_fallback_when_scrollback_exhausted` and `opencode_running_wheel_blank_prefix_triggers_fallback` to ensure fallback still works when no real scrollback exists.
+  - Added `terminal.last_seqno = terminal.runtime.latest_seqno()` to all wheel integration tests to prevent `draw_terminal_pane` from overwriting the test render_cache with an empty runtime snapshot.
+  - Updated `opencode_wheel_mergen_consumed` threshold from `0.0` to `1.0` to ignore tiny scrollable ranges caused by floating-point padding.
+  - Updated AGENTS.md to document the forced-Mergen-Up rule.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-21
+
+---
+
+#### OpenCode fixed header appeared during scroll because of premature wheel fallback {#opencode-wheel-fixed-header-fallback}
+- Date: 2026-05-21
+- Context: User reported that after sending a new message in an OpenCode session, scrolling worked but a portion at the top of the terminal remained fixed while the rest scrolled, creating a "stuck header" effect.
+- Error signature: `opencode_wheel_mergen_consumed` checked `clamped_offset > effective_min_offset + 1.0` in addition to `remaining_delta == 0`. When the viewport was near the blank-prefix clamp boundary (e.g., after scrolling up through history), `clamped_offset` could be within 1 pixel of `effective_min_offset`, causing the function to return `false` even though the ScrollArea had consumed the delta. The wheel then fell back to the OpenCode runtime TUI, which scrolled its internal content while keeping its own header fixed.
+- Symptoms/Impact:
+  1. Scrolling in an active OpenCode session showed a fixed header at the top while the content below moved.
+  2. Users expected the entire terminal output to scroll uniformly (Mergen scrollback behavior), not a mixed scroll where OpenCode's header stayed fixed.
+- Root cause:
+  - The `clamped_offset > effective_min_offset + 1.0` check treated the blank-prefix clamp boundary as a signal to forward the wheel to OpenCode. But the blank clamp is purely a visual guard to hide empty rows; it should not affect whether Mergen "consumed" the wheel.
+- Resolution:
+  - Simplified `opencode_wheel_mergen_consumed` to only two checks: (1) `remaining_delta` on the relevant axis is zero (ScrollArea processed the delta), and (2) `content_h > viewport_h` (there is actual scrollable content). Removed `clamped_offset`, `leading_blank_rows`, and `line_height` parameters entirely.
+  - The blank-prefix clamp code remains in place as a visual guard after ScrollArea processing, but it no longer influences the fallback decision.
+- Prevent recurrence:
+  - Updated unit tests:
+    - `opencode_wheel_mergen_consumed_when_delta_cleared_and_visible` — verifies consumption when delta is cleared
+    - `opencode_wheel_mergen_consumed_when_delta_cleared_even_at_blank_boundary` — verifies consumption even when viewport is at blank clamp
+    - `opencode_wheel_mergen_not_consumed_when_delta_remains` — verifies no consumption when delta remains
+    - `opencode_wheel_mergen_not_consumed_when_content_fits` — verifies no consumption when content fits viewport
+  - Updated AGENTS.md to clarify that the blank-leading-rows clamp is a visual guard and must not trigger premature fallback.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-21
+
+---
+
+#### OpenCode wheel forced to Mergen scrollback broke TUI scrolling {#opencode-wheel-mergen-first-reverted}
+- Date: 2026-05-21
+- Context: User reported that in an OpenCode terminal they could not scroll OpenCode's own TUI content with the mouse wheel because wheel events were being trapped by Mergen scrollback instead of reaching the OpenCode runtime.
+- Error signature: `draw_terminal_pane` captured OpenCode wheel events as `opencode_pending_wheel`, deferred them past the `ScrollArea`, and then either (a) declared Mergen consumed them when the delta was cleared, or (b) forced them to Mergen on `WheelDirection::Up` when `real_content_h > viewport_h`. In both cases the OpenCode runtime TUI never received the wheel, so OpenCode's internal content (e.g., file listings, plan previews) could not be scrolled.
+- Symptoms/Impact:
+  1. Scrolling in an active OpenCode session did nothing for OpenCode's own content; only Mergen terminal scrollback moved (or tried to).
+  2. Users expected OpenCode's TUI to scroll naturally, not Mergen's history.
+- Root cause:
+  - The Mergen-first fallback model was inverted for OpenCode. OpenCode is a mouse-reporting TUI application; when active, its own content should receive wheel events directly, just like vim, htop, or other TUIs. Treating OpenCode as a special case that must defer to Mergen scrollback broke the TUI contract.
+- Resolution:
+  - Reverted OpenCode wheel handling to direct-forward when the session is active (`Running` or `Attention`, i.e., `status != Inactive`) and mouse reporting is enabled. Wheel events are sent immediately via `terminal.runtime.send_mouse_wheel()` and `smooth_scroll_delta` is cleared so Mergen's `ScrollArea` does not consume them.
+  - Removed `opencode_pending_wheel` capture, post-ScrollArea fallback evaluation, `opencode_wheel_mergen_consumed` helper, forced-Up branch, and `real_lines` scrollability calculation.
+  - Inactive OpenCode sessions continue to leave wheel events for Mergen's `ScrollArea` naturally (runtime fallback is disabled).
+- Prevent recurrence:
+  - Added/updated integration tests:
+    - `opencode_running_wheel_forwarded_directly_to_runtime`
+    - `opencode_attention_wheel_forwarded_directly_to_runtime`
+    - `opencode_inactive_wheel_not_forwarded_to_runtime`
+  - Updated AGENTS.md OpenCode wheel guidelines to document the active-direct-forward / inactive-Mergen model.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-21
+
+---
+
 #### Panel resize handle remained active when modal popups were open {#panel-resize-modal-gate}
 - Date: 2026-05-20
 - Context: User reported that the Project Explorer and Browser panel resize handles stayed visible and interactive even when modal popups like Settings were open.
@@ -2119,7 +2217,29 @@
   - Added `append_terminal_line_runs` helper to `build_terminal_render` that pads missing leading/inter-run column gaps with blank spaces, preserving column alignment even for sparse snapshots.
 - Prevent recurrence:
   - Added regression tests:
-    - `terminal_pane_clamps_horizontal_scroll_offset_to_zero` ÔÇö injects a non-zero x offset and verifies it is reset after rendering.
-    - `build_terminal_render_pads_sparse_run_start_with_blanks` ÔÇö verifies defensive blank padding for runs that do not start at column 0.
+    - `terminal_pane_clamps_horizontal_scroll_offset_to_zero` — injects a non-zero x offset and verifies it is reset after rendering.
+    - `build_terminal_render_pads_sparse_run_start_with_blanks` — verifies defensive blank padding for runs that do not start at column 0.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-05-20
+
+---
+
+#### OpenCode terminal direct wheel forward blocked Mergen scrollback {#opencode-wheel-mergen-first-reverted}
+- Date: 2026-05-21
+- Context: User reported that in an OpenCode terminal they could not scroll up through Mergen terminal history with the mouse wheel because wheel events were being forwarded directly to the OpenCode TUI instead of Mergen scrollback.
+- Error signature: `draw_terminal_pane` sent wheel events directly to the OpenCode runtime when `mouse_reporting_active && opencode_terminal_wheel_fallback_enabled(terminal)` was true (Running state). This bypassed Mergen's `ScrollArea` entirely, preventing terminal scrollback from receiving scroll input.
+- Symptoms/Impact:
+  1. Scrolling up in an OpenCode terminal did nothing if OpenCode's own TUI did not consume the wheel (e.g., when reviewing past output).
+  2. Users expected Mergen terminal scrollback to scroll first, with OpenCode TUI only receiving wheel events as a fallback when scrollback was exhausted.
+- Root cause:
+  - Commit 4a56cc0 introduced direct forwarding for OpenCode Running state to prioritize OpenCode TUI scrolling. This broke the Mergen-first scroll model that users expected.
+- Resolution:
+  - Removed the direct-forward branch for OpenCode in `draw_terminal_pane`. OpenCode wheel events are now always captured as `opencode_pending_wheel` inside the `ScrollArea` closure and evaluated after `ScrollArea` processes the delta.
+  - If Mergen `ScrollArea` consumes the wheel (remaining delta on the relevant axis is zero), `opencode_manual_scroll_detached` is set and no wheel event reaches the OpenCode runtime.
+  - If Mergen cannot scroll on the relevant axis, the existing fallback logic forwards the wheel to the OpenCode runtime TUI—but only while OpenCode is actively `Running` and mouse reporting is active.
+  - Non-Running OpenCode states (`TurnComplete`, `Attention`, `Inactive`) already used this fallback path and remain unchanged.
+- Prevent recurrence:
+  - Updated regression test `opencode_running_wheel_forwarded_directly_to_runtime` renamed to `opencode_running_wheel_mergen_first_consumes_scrollback` and changed assertions to verify Mergen-first consumption.
+  - Added regression test `opencode_running_wheel_fallback_when_scrollback_exhausted` to verify that the wheel still reaches OpenCode runtime when Mergen cannot scroll.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-05-21

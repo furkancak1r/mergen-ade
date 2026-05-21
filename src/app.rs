@@ -23438,12 +23438,12 @@ impl AdeApp {
                     scroll_area = scroll_area.vertical_scroll_offset(offset);
                 }
 
-                // OpenCode wheel fallback: capture wheel data inside closure but defer decision
-                // until after ScrollArea processes it. If ScrollArea consumes the delta, we set
-                // manual_scroll_detached. If not consumed and mouse reporting active, we forward
-                // to OpenCode runtime as fallback.
-                let mut opencode_pending_wheel: Option<(WheelDirection, egui::Pos2, usize, usize)> =
-                    None;
+                // OpenCode wheel handling: when the OpenCode session is active (non-Inactive)
+                // and mouse reporting is on, wheel events are forwarded directly to the OpenCode
+                // runtime TUI so OpenCode's own content scrolls naturally. Inactive sessions
+                // leave wheel events for Mergen's ScrollArea so users can review terminal
+                // scrollback without interference.
+                let mut opencode_direct_wheel_sent = false;
 
                 // Determine if wheel handling should be enabled (disabled when UI overlays open)
                 let wheel_enabled = terminal_output_mouse_wheel_enabled(
@@ -23771,10 +23771,8 @@ impl AdeApp {
                                                 input.smooth_scroll_delta = Vec2::ZERO;
                                             });
                                         } else if is_opencode && !is_selection_drag {
-                                            // OpenCode wheel: when actively running and mouse
-                                            // reporting is on, forward directly to the OpenCode
-                                            // TUI so it scrolls its own content. Otherwise defer
-                                            // to Mergen-first fallback.
+                                            // OpenCode wheel: forward directly to runtime TUI
+                                            // when the session is active (non-Inactive).
                                             let direction = if wheel_delta.y > 0.0 {
                                                 WheelDirection::Up
                                             } else if wheel_delta.y < 0.0 {
@@ -23793,9 +23791,11 @@ impl AdeApp {
                                                 as usize;
                                             let mouse_reporting_active =
                                                 terminal.runtime.is_mouse_reporting_active();
-                                            let opencode_wheel_enabled =
-                                                opencode_terminal_wheel_fallback_enabled(terminal);
-                                            if mouse_reporting_active && opencode_wheel_enabled {
+                                            if mouse_reporting_active
+                                                && opencode_terminal_wheel_fallback_enabled(
+                                                    terminal,
+                                                )
+                                            {
                                                 terminal.runtime.send_mouse_wheel(
                                                     TerminalWheelEvent {
                                                         direction,
@@ -23808,9 +23808,7 @@ impl AdeApp {
                                                 ui.ctx().input_mut(|input| {
                                                     input.smooth_scroll_delta = Vec2::ZERO;
                                                 });
-                                            } else {
-                                                opencode_pending_wheel =
-                                                    Some((direction, pointer_pos, cell_x, cell_y));
+                                                opencode_direct_wheel_sent = true;
                                             }
                                         }
                                     }
@@ -23820,51 +23818,15 @@ impl AdeApp {
                     }
                 });
 
-                // After ScrollArea processes wheel, decide OpenCode fallback
-                // Only process if wheel handling is enabled (no UI overlays open)
-                if wheel_enabled {
-                    if let Some((direction, _pointer_pos, cell_x, cell_y)) = opencode_pending_wheel
-                    {
-                        let remaining_delta = ui.ctx().input(|input| input.smooth_scroll_delta);
-                        // Determine if Mergen consumed the wheel based on the scroll axis:
-                        // Vertical ScrollArea consumes y; horizontal wheel would leave x.
-                        // Diagonal touchpad can leave x while y is consumed - do not forward then.
-                        let mergen_consumed = match direction {
-                            WheelDirection::Up | WheelDirection::Down => remaining_delta.y == 0.0,
-                            WheelDirection::Left | WheelDirection::Right => {
-                                remaining_delta.x == 0.0
-                            }
-                        };
-                        if mergen_consumed {
-                            // Mergen ScrollArea consumed the wheel on the relevant axis:
-                            // mark manual scroll and clear any leftover diagonal delta
-                            terminal.opencode_manual_scroll_detached = true;
-                            ui.ctx().input_mut(|input| {
-                                input.smooth_scroll_delta = Vec2::ZERO;
-                            });
-                        } else {
-                            // Mergen could not scroll on the relevant axis:
-                            // forward to OpenCode runtime as fallback only while OpenCode is
-                            // actively running. Once a turn is complete, wheel should stay with
-                            // Mergen scrollback instead of the idle TUI.
-                            let mouse_reporting_active =
-                                terminal.runtime.is_mouse_reporting_active();
-                            if mouse_reporting_active
-                                && opencode_terminal_wheel_fallback_enabled(terminal)
-                            {
-                                terminal.runtime.send_mouse_wheel(TerminalWheelEvent {
-                                    direction,
-                                    x: cell_x,
-                                    y: cell_y,
-                                    x_pixel_offset: 0,
-                                    y_pixel_offset: 0,
-                                });
-                                ui.ctx().input_mut(|input| {
-                                    input.smooth_scroll_delta = Vec2::ZERO;
-                                });
-                            }
-                        }
-                    }
+                // After ScrollArea processes wheel, no OpenCode fallback is needed because
+                // active OpenCode sessions received the wheel directly above. Inactive sessions
+                // left the wheel for Mergen's ScrollArea, which handled it naturally.
+                if wheel_enabled && opencode_direct_wheel_sent {
+                    // Clear any residual diagonal delta so Mergen ScrollArea doesn't try to
+                    // consume the portion already sent to OpenCode runtime.
+                    ui.ctx().input_mut(|input| {
+                        input.smooth_scroll_delta = Vec2::ZERO;
+                    });
                 }
                 // If OpenCode viewport is already at the bottom (content fits or
                 // scroll offset is at max), clear manual scroll detach so new
@@ -23881,6 +23843,8 @@ impl AdeApp {
                 }
                 // Clamp scroll offset so blank leading rows (left by OpenCode
                 // display clears) are not exposed when the user scrolls up.
+                // The clamp must not exceed max_offset, otherwise it would lock
+                // the viewport when all visible content is blank.
                 if terminal.ai_session.tool == Some(AiCliTool::OpenCode)
                     && terminal.opencode_manual_scroll_detached
                 {
@@ -23889,7 +23853,9 @@ impl AdeApp {
                     if content_h > viewport_h {
                         let leading_blank_rows =
                             terminal_leading_blank_rows(&terminal.render_cache);
-                        let min_offset_y = leading_blank_rows as f32 * line_height;
+                        let max_offset_y = (content_h - viewport_h).max(0.0);
+                        let min_offset_y =
+                            (leading_blank_rows as f32 * line_height).min(max_offset_y);
                         if scroll_area_output.state.offset.y < min_offset_y {
                             scroll_area_output.state.offset.y = min_offset_y;
                             scroll_area_output
@@ -32295,7 +32261,7 @@ fn reset_opencode_manual_scroll_detached(terminal: &mut TerminalEntry) {
 
 fn opencode_terminal_wheel_fallback_enabled(terminal: &TerminalEntry) -> bool {
     terminal.ai_session.tool == Some(AiCliTool::OpenCode)
-        && terminal.ai_session.status == AiCliStatus::Running
+        && terminal.ai_session.status != AiCliStatus::Inactive
 }
 
 fn terminal_activation_scroll_offset(
@@ -38102,13 +38068,13 @@ mod tests {
     }
 
     #[test]
-    fn opencode_wheel_fallback_disabled_after_turn_complete_attention() {
+    fn opencode_wheel_fallback_enabled_for_turn_complete_attention() {
         let mut terminal = test_terminal_entry(1, 7);
         terminal.ai_session.tool = Some(AiCliTool::OpenCode);
         terminal.ai_session.status = AiCliStatus::Attention;
         terminal.opencode_attention_reason = Some(OpenCodeAttentionReason::TurnComplete);
 
-        assert!(!super::opencode_terminal_wheel_fallback_enabled(&terminal));
+        assert!(super::opencode_terminal_wheel_fallback_enabled(&terminal));
     }
 
     #[test]
@@ -55134,66 +55100,17 @@ mod tests {
         }
     }
 
-    // OpenCode Wheel Fallback Tests
-
-    #[test]
-    fn opencode_wheel_fallback_axis_aware_vertical_consumed_horizontal_leftover() {
-        // Regression test: vertical ScrollArea consuming y should count as Mergen-consumed
-        // even if diagonal touchpad leaves x != 0.
-        // Note: This tests the logic behavior; full wheel handling requires egui context.
-        use super::WheelDirection;
-
-        // Simulate: y=0 (consumed), x=5.0 (leftover from diagonal)
-        let remaining_y = 0.0;
-        let direction = WheelDirection::Up;
-        let mergen_consumed = match direction {
-            WheelDirection::Up | WheelDirection::Down => remaining_y == 0.0,
-            WheelDirection::Left | WheelDirection::Right => panic!("unexpected direction"),
-        };
-        assert!(
-            mergen_consumed,
-            "vertical wheel consumed when y == 0 even if x remains"
-        );
-
-        // Simulate: y != 0 (not consumed)
-        let remaining_y = 3.0;
-        let mergen_consumed = match direction {
-            WheelDirection::Up | WheelDirection::Down => remaining_y == 0.0,
-            WheelDirection::Left | WheelDirection::Right => panic!("unexpected direction"),
-        };
-        assert!(!mergen_consumed, "vertical wheel NOT consumed when y != 0");
-    }
-
-    #[test]
-    fn opencode_wheel_fallback_axis_aware_horizontal_consumed() {
-        // Regression test: horizontal wheel should check remaining_delta.x
-        use super::WheelDirection;
-
-        // Horizontal ScrollArea (if it existed) consumes x
-        let remaining_x = 0.0;
-        let direction = WheelDirection::Left;
-        let mergen_consumed = match direction {
-            WheelDirection::Left | WheelDirection::Right => remaining_x == 0.0,
-            WheelDirection::Up | WheelDirection::Down => panic!("unexpected direction"),
-        };
-        assert!(mergen_consumed, "horizontal wheel consumed when x == 0");
-
-        let remaining_x = 2.0;
-        let mergen_consumed = match direction {
-            WheelDirection::Left | WheelDirection::Right => remaining_x == 0.0,
-            WheelDirection::Up | WheelDirection::Down => panic!("unexpected direction"),
-        };
-        assert!(
-            !mergen_consumed,
-            "horizontal wheel NOT consumed when x != 0"
-        );
-    }
+    // OpenCode Wheel Tests
+    //
+    // Active OpenCode sessions (Running or Attention) forward wheel events directly
+    // to the OpenCode runtime TUI. Inactive sessions leave wheel events for Mergen's
+    // ScrollBack so users can review terminal output history.
 
     #[test]
     fn opencode_running_wheel_forwarded_directly_to_runtime() {
         // Regression test: when OpenCode is Running and mouse reporting is active,
-        // wheel events should go directly to the OpenCode TUI, not deferred through
-        // Mergen scrollback.
+        // wheel events should go directly to the OpenCode TUI so OpenCode scrolls its
+        // own content, regardless of Mergen scrollback state.
         let ctx = Context::default();
         let mut fonts = FontDefinitions::default();
         configure_terminal_font_family(&mut fonts);
@@ -55206,18 +55123,24 @@ mod tests {
         terminal.ai_session.status = AiCliStatus::Running;
         terminal.opencode_session_active = true;
 
-        // Enable mouse reporting in the terminal
+        // Prevent draw_terminal_pane from overwriting our render_cache with an
+        // empty snapshot from the test runtime by syncing last_seqno.
+        terminal.last_seqno = terminal.runtime.latest_seqno();
+        terminal.dirty = false;
+
+        // Enable mouse reporting
         terminal
             .runtime
             .advance_terminal_bytes_for_test(b"\x1b[?1000h");
         assert!(terminal.runtime.is_mouse_reporting_active());
 
-        // Populate render cache so wheel handling runs in the non-empty branch
+        // Minimal snapshot (2 lines) — even when Mergen scrollback is "exhausted",
+        // the wheel must still go to OpenCode runtime because OpenCode is active.
         terminal.render_cache = TerminalSnapshot {
-            lines: vec![TerminalStyledLine::default(); 20],
+            lines: vec![TerminalStyledLine::default(); 2],
             cursor: Some(TerminalCursor {
                 x: 0,
-                y: 10,
+                y: 1,
                 shape: TerminalCursorShape::Block,
                 blinking: false,
             }),
@@ -55241,9 +55164,11 @@ mod tests {
         };
 
         let _ = ctx.run(raw_input, |ctx| {
-            egui::Area::new("test".into()).show(ctx, |ui| {
-                app.draw_terminal_pane(ui, 1, vec2(400.0, 300.0));
-            });
+            egui::Area::new("test".into())
+                .default_pos(pos2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    app.draw_terminal_pane(ui, 1, vec2(400.0, 300.0));
+                });
         });
 
         let wheel_events = capture.take_mouse_wheel_events();
@@ -55254,7 +55179,6 @@ mod tests {
         );
         assert_eq!(wheel_events[0].direction, WheelDirection::Up);
 
-        // manual_scroll_detached should NOT be set because we forwarded directly
         let terminal_after = app.terminals.get(&1).unwrap();
         assert!(
             !terminal_after.opencode_manual_scroll_detached,
@@ -55263,9 +55187,9 @@ mod tests {
     }
 
     #[test]
-    fn opencode_turn_complete_wheel_not_forwarded_directly() {
-        // Regression test: when OpenCode is in TurnComplete state, wheel events
-        // should NOT be forwarded directly; they stay with Mergen scrollback.
+    fn opencode_attention_wheel_forwarded_directly_to_runtime() {
+        // Regression test: when OpenCode is in Attention/TurnComplete state and mouse
+        // reporting is active, wheel events should also go directly to the OpenCode TUI.
         let ctx = Context::default();
         let mut fonts = FontDefinitions::default();
         configure_terminal_font_family(&mut fonts);
@@ -55279,12 +55203,18 @@ mod tests {
         terminal.opencode_attention_reason = Some(OpenCodeAttentionReason::TurnComplete);
         terminal.opencode_session_active = true;
 
+        // Prevent draw_terminal_pane from overwriting our render_cache with an
+        // empty snapshot from the test runtime by syncing last_seqno.
+        terminal.last_seqno = terminal.runtime.latest_seqno();
+        terminal.dirty = false;
+
         // Enable mouse reporting
         terminal
             .runtime
             .advance_terminal_bytes_for_test(b"\x1b[?1000h");
         assert!(terminal.runtime.is_mouse_reporting_active());
 
+        // Blank snapshot — Mergen has no visible scrollback, but OpenCode is still active
         terminal.render_cache = TerminalSnapshot {
             lines: vec![TerminalStyledLine::default(); 20],
             cursor: Some(TerminalCursor {
@@ -55313,16 +55243,112 @@ mod tests {
         };
 
         let _ = ctx.run(raw_input, |ctx| {
-            egui::Area::new("test".into()).show(ctx, |ui| {
-                app.draw_terminal_pane(ui, 1, vec2(400.0, 300.0));
-            });
+            egui::Area::new("test".into())
+                .default_pos(pos2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    app.draw_terminal_pane(ui, 1, vec2(400.0, 300.0));
+                });
+        });
+
+        let wheel_events = capture.take_mouse_wheel_events();
+        assert_eq!(
+            wheel_events.len(),
+            1,
+            "OpenCode attention wheel should be forwarded directly to runtime"
+        );
+        assert_eq!(wheel_events[0].direction, WheelDirection::Up);
+
+        let terminal_after = app.terminals.get(&1).unwrap();
+        assert!(
+            !terminal_after.opencode_manual_scroll_detached,
+            "direct forward should not set manual_scroll_detached"
+        );
+    }
+
+    #[test]
+    fn opencode_inactive_wheel_not_forwarded_to_runtime() {
+        // Regression test: when OpenCode is Inactive, wheel events should NOT be
+        // forwarded to the OpenCode runtime; they stay with Mergen scrollback.
+        let ctx = Context::default();
+        let mut fonts = FontDefinitions::default();
+        configure_terminal_font_family(&mut fonts);
+        ctx.set_fonts(fonts);
+
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut terminal = test_terminal_entry_with_runtime(1, 7, runtime);
+        terminal.kind = TerminalKind::Foreground;
+        terminal.ai_session.tool = Some(AiCliTool::OpenCode);
+        terminal.ai_session.status = AiCliStatus::Inactive;
+        terminal.opencode_session_active = false;
+
+        // Prevent draw_terminal_pane from overwriting our render_cache with an
+        // empty snapshot from the test runtime by syncing last_seqno.
+        terminal.last_seqno = terminal.runtime.latest_seqno();
+        terminal.dirty = false;
+
+        // Enable mouse reporting
+        terminal
+            .runtime
+            .advance_terminal_bytes_for_test(b"\x1b[?1000h");
+        assert!(terminal.runtime.is_mouse_reporting_active());
+
+        // Scrollable snapshot — wheel should remain for Mergen scrollback
+        terminal.render_cache = TerminalSnapshot {
+            lines: vec![
+                TerminalStyledLine {
+                    runs: vec![TerminalStyledRun {
+                        text: "real content".to_owned(),
+                        style: test_terminal_style(),
+                        column: 0,
+                        display_width: 12,
+                    }],
+                };
+                300
+            ],
+            cursor: Some(TerminalCursor {
+                x: 0,
+                y: 10,
+                shape: TerminalCursorShape::Block,
+                blinking: false,
+            }),
+            cursor_line: None,
+        };
+
+        let mut app = test_app([(1, terminal)], Some(1));
+
+        let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let raw_input = RawInput {
+            screen_rect: Some(screen_rect),
+            events: vec![
+                Event::PointerMoved(pos2(200.0, 100.0)),
+                Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: vec2(0.0, 3.0),
+                    modifiers: Default::default(),
+                },
+            ],
+            ..RawInput::default()
+        };
+
+        let _ = ctx.run(raw_input, |ctx| {
+            egui::Area::new("test".into())
+                .default_pos(pos2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    app.draw_terminal_pane(ui, 1, vec2(400.0, 300.0));
+                });
         });
 
         let wheel_events = capture.take_mouse_wheel_events();
         assert_eq!(
             wheel_events.len(),
             0,
-            "TurnComplete OpenCode wheel should NOT be forwarded to runtime"
+            "Inactive OpenCode wheel should NOT be forwarded to runtime"
+        );
+
+        let terminal_after = app.terminals.get(&1).unwrap();
+        assert!(
+            !terminal_after.opencode_manual_scroll_detached,
+            "inactive wheel should not detach manual scroll"
         );
     }
 
