@@ -2314,3 +2314,48 @@
   - Added regression test `opencode_running_wheel_fallback_when_scrollback_exhausted` to verify that the wheel still reaches OpenCode runtime when Mergen cannot scroll.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-05-21
+
+---
+
+#### OpenCode ACP Chat spawned wrong binary path causing "not recognized" error {#opencode-acp-chat-binary-path}
+- Date: 2026-06-01
+- Context: User reported that ACP Chat failed with error: `C:\Users\...\AppData\Roaming\Mergen\MergenADE\config\runtime\opencode.cmd` is not recognized as an internal or external command.
+- Error signature: `spawn_acp_chat_for_project()` used `opencode_cli_runtime_dir()` (which returns a config directory) as the binary path, constructing `C:\...\MergenADE\config\runtime\opencode.cmd`.
+- Symptoms/Impact:
+  1. ACP Chat process failed to spawn immediately with a "not recognized" error.
+  2. Chat panel showed "Starting..." indefinitely because the process never started.
+  3. The error was hidden in stderr unless `Stdio::null()` was replaced.
+- Root cause:
+  - `opencode_cli_runtime_dir()` is a config directory, not a binary directory. It was incorrectly used as the binary path for spawning the ACP process.
+  - `spawn_acp_chat_for_project()` did not use the correct binary path resolution logic.
+- Resolution:
+  - Changed `spawn_acp_chat_for_project()` to use `crate::opencode::opencode_bin_path()` for the `opencode_bin` parameter, which correctly resolves to the actual OpenCode executable.
+  - `spawn_opencode_acp()` now accepts an optional `opencode_bin` parameter; if `None`, it falls back to `"opencode"` via PATH.
+  - Added regression test `acp_spawn_opencode_acp_uses_custom_bin_path` that verifies the function works with a valid custom binary path.
+- Prevent recurrence:
+  - `cargo test` passes (1352 tests).
+  - Documented in AGENTS.md that ACP chat must resolve the executable via `opencode_bin_path()` or PATH fallback.
+- Files/Commands touched: `src/app.rs`, `src/opencode_acp.rs`, `src/opencode.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-01
+
+---
+
+#### OpenCode ACP Chat spawned a visible console window on Windows {#opencode-acp-chat-console-window}
+- Date: 2026-06-01
+- Context: User reported that after fixing the binary path issue, the ACP Chat started working but opened a visible black console window on Windows.
+- Error signature: `spawn_opencode_acp()` spawned `opencode acp` with `Stdio::piped()` but without `CREATE_NO_WINDOW` on Windows. Since `opencode.exe` is a console-subsystem binary, Windows created a visible console window.
+- Symptoms/Impact:
+  1. A visible black terminal/console window appeared every time the ACP Chat was opened.
+  2. The window was empty and distracting, but the ACP process worked correctly behind it.
+- Root cause:
+  - `spawn_opencode_acp()` did not set `CREATE_NO_WINDOW` on Windows, which is required for GUI applications to spawn console subprocesses without creating a visible console window.
+  - The `opencode acp` command is a console-subsystem binary, so Windows defaults to creating a console window.
+- Resolution:
+  - Added `#[cfg(target_os = "windows")] use std::os::windows::process::CommandExt;` and `const CREATE_NO_WINDOW: u32 = 0x0800_0000;` to `src/opencode_acp.rs`.
+  - Set `command.creation_flags(CREATE_NO_WINDOW);` in `spawn_opencode_acp()` before spawning.
+  - The ACP process now runs silently with piped stdio (stdout/stderr/stdin) without a visible console window.
+- Prevent recurrence:
+  - `cargo test` passes (1352 tests).
+  - Documented in AGENTS.md that ACP chat must not spawn an external console window.
+- Files/Commands touched: `src/opencode_acp.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-01

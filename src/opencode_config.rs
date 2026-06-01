@@ -438,6 +438,7 @@ mod tests {
             terminal_id: 42,
             project_id: Some(7),
             session_id: None,
+            acp_chat_id: None,
         };
 
         let config_dir = write_terminal_runtime_config_with_browser_mcp(
@@ -529,6 +530,7 @@ mod tests {
             terminal_id: 99,
             project_id: Some(1),
             session_id: None,
+            acp_chat_id: None,
         };
 
         let config_dir = write_terminal_runtime_config_with_browser_mcp(
@@ -591,6 +593,7 @@ mod tests {
             terminal_id: 99,
             project_id: Some(1),
             session_id: None,
+            acp_chat_id: None,
         };
 
         let config_dir = write_terminal_runtime_config_with_browser_mcp(

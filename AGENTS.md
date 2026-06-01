@@ -18,6 +18,7 @@
 - `src/config.rs` + `src/models.rs`: persisted TOML config schema and load/save behavior.
 - `src/worktree.rs`: git worktree discovery (`git worktree list --porcelain` parser), worktree metadata, and create/remove helpers.
 - `src/path_utils.rs`: cross-platform path helpers, including Windows verbatim/extended-length path normalization for shell compatibility.
+- `src/opencode_acp.rs`: OpenCode ACP Chat integration (terminal-less chat panel via `opencode acp`).
 - `.github/workflows/release.yml`: GitHub release pipeline for Windows ZIP and signed/notarized macOS ARM64 DMG assets.
 - Build artifacts are in `target/` (do not commit).
 - **Do not watch the GitHub release workflow via CLI.** Once the release is triggered by pushing a version tag, the workflow runs asynchronously on GitHub Actions. There is no need to poll or watch it with `gh run watch` / `gh run list`; the user can track progress through the GitHub web interface if desired.
@@ -140,6 +141,20 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Plan mode skill restriction:** If you are Codex, OpenCode, or Droid, do not use the plan mode skill from Claude Code's configuration. The plan mode skill is exclusively for `cc` (Claude Code) sessions only.
 - **OpenCode model slot button must always be clickable.** When a user edits the model identifier for the active build slot in Settings, the active slot button must remain interactive so the updated model can be re-applied to both the global OpenCode config and all active terminal runtime configs. Do not guard the button with `&& !is_slot_active`; always allow clicking to trigger `switch_opencode_build_model_slot`.
 - **OpenCode build model must be written to both `agent.build.model` and `mode.build.model`.** OpenCode's global config and runtime terminal configs use `agent.build.model`, but build mode also checks `mode.build.model`. When patching or writing OpenCode config, always set both fields to the same selected model so build mode cannot drift from the active slot.
+
+## OpenCode ACP Chat Protocol Guidelines
+- **ACP `session/new` must include `cwd` and `mcpServers`.** The `cwd` parameter must be the project path as a string, and `mcpServers` must be an array (even if empty `[]`). Missing these fields causes OpenCode to fail silently or return errors that are not visible in the UI.
+- **Prompt sending must be blocked until `sessionId` is received.** The UI must not allow sending a `session/prompt` before the `SessionCreated` event arrives. The input field should show a "Waiting for session..." hint and be disabled until the session is ready.
+- **Status lifecycle: `Starting` → `Connected` → `SessionCreated` → `Idle`.** After `initialize` response, the status stays `Starting` while `session/new` is in flight. Only when `SessionCreated` arrives does the status transition to `Idle`, making the chat ready for user input.
+- **Parse `configOptions` from `session/new` response.** OpenCode returns an array of `{configId, value}` objects in the `session/new` response. These must be applied to `session.config_options` so the UI can display the current model, mode, and effort.
+- **ACP `current_mode_update` uses `currentModeId` field.** Per the ACP spec, the mode update notification contains `currentModeId`, not `modeId`. The parser must check both for backward compatibility.
+- **ACP `available_commands_update` uses `availableCommands` field.** Per the ACP spec, the commands update notification contains `availableCommands`, not `commands`. The parser must check both for backward compatibility.
+- **ACP `config_option_update` uses `configOptions` array.** Per the ACP spec, the config update notification contains `configOptions` (array of `{configId, value}`), not a single `category`/`value` pair. The parser must handle both the array format and the legacy single-field format.
+- **Permission `request_id` must be a `String`.** The ACP spec allows JSON-RPC `id` to be a string or number. The permission response must preserve the exact `id` from the request and return it as a string in the response.
+- **Stderr must be captured and surfaced.** The `opencode acp` process stderr is redirected to a reader thread that sends each line as an `AcpChatEvent::Error`. This makes authentication failures, missing models, or MCP errors visible in the chat UI instead of being lost to `Stdio::null()`.
+- **ACP chat must resolve the correct OpenCode executable.** `spawn_acp_chat_for_project()` must use `crate::opencode::opencode_bin_path()` to resolve the actual OpenCode binary, not `opencode_cli_runtime_dir()` (which is a config directory). `spawn_opencode_acp()` accepts an optional `opencode_bin` parameter; if `None`, it falls back to `"opencode"` via PATH.
+- **ACP chat must not spawn an external console window.** On Windows, `spawn_opencode_acp()` must set `CREATE_NO_WINDOW` (0x08000000) on the `Command` before spawning so the `opencode acp` child runs with piped stdio without opening a visible terminal window.
+- **Add regression tests for all ACP protocol parsers.** Every update field (`configOptions`, `currentModeId`, `availableCommands`, permission id types) must have a unit test in `src/opencode_acp.rs`.
 
 ## File Editor Guidelines
 - Long editor content must be wrapped in a stable-id `ScrollArea` (e.g., `FILE_EDITOR_SCROLL_ID`).

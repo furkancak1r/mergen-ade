@@ -477,6 +477,15 @@ enum AppIcon {
     X,
 }
 
+/// Action returned from the foreground launcher menu.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ForegroundLauncherAction {
+    /// Spawn a terminal with the given launcher ID.
+    TerminalLauncher(String),
+    /// Open a terminal-less OpenCode ACP chat session.
+    OpenCodeChat,
+}
+
 impl AppIcon {
     const ALL: [Self; 38] = [
         Self::ArrowClockwise,
@@ -2189,6 +2198,20 @@ pub struct AdeApp {
     create_worktree_in_progress: Option<CreateWorktreePending>,
     create_worktree_events_tx: Sender<CreateWorktreeEvent>,
     create_worktree_events_rx: Receiver<CreateWorktreeEvent>,
+    /// ACP chat sessions (OpenCode ACP) per chat ID.
+    acp_chat_sessions: BTreeMap<u64, crate::opencode_acp::AcpChatSession>,
+    /// Chat IDs grouped by project (for multi-thread model).
+    acp_chat_ids_by_project: BTreeMap<u64, Vec<u64>>,
+    /// Active chat ID per project (which thread is visible for each project).
+    active_acp_chat_by_project: BTreeMap<u64, u64>,
+    /// Sender for ACP chat events (cloned per spawn).
+    acp_chat_events_tx: Sender<crate::opencode_acp::AcpChatEvent>,
+    /// Receiver for ACP chat events from the agent threads.
+    acp_chat_events_rx: Receiver<crate::opencode_acp::AcpChatEvent>,
+    /// Currently active ACP chat session ID (replaces terminal grid in main area).
+    active_acp_chat: Option<u64>,
+    /// Next ACP chat ID counter.
+    next_acp_chat_id: u64,
 }
 
 /// Represents a single open file buffer in the built-in editor.
@@ -4616,6 +4639,7 @@ impl AdeApp {
         let (browser_video_encode_events_tx, browser_video_encode_events_rx) =
             crossbeam_channel::unbounded();
         let (create_worktree_events_tx, create_worktree_events_rx) = crossbeam_channel::unbounded();
+        let (acp_chat_events_tx, acp_chat_events_rx) = crossbeam_channel::unbounded();
         spawn_source_control_worker(source_control_commands_rx, source_control_events_tx.clone());
         spawn_directory_index_worker(
             directory_index_commands_rx,
@@ -4802,6 +4826,13 @@ impl AdeApp {
             create_worktree_in_progress: None,
             create_worktree_events_tx,
             create_worktree_events_rx,
+            acp_chat_sessions: BTreeMap::new(),
+            acp_chat_ids_by_project: BTreeMap::new(),
+            active_acp_chat_by_project: BTreeMap::new(),
+            acp_chat_events_tx,
+            acp_chat_events_rx,
+            active_acp_chat: None,
+            next_acp_chat_id: 1,
         };
         // Do NOT seed runtime browser state from legacy config.
         // Browser panel open state is now runtime-only per project.
@@ -4911,6 +4942,18 @@ impl AdeApp {
         self.pending_config_changes.selection = true;
         // Reset Directory search tracking so the same query re-runs for the new project.
         self.reset_directory_search_tracking_for_project(self.selected_project);
+        // Restore the active ACP chat for the newly selected project.
+        if let Some(project_id) = self.selected_project {
+            if let Some(&chat_id) = self.active_acp_chat_by_project.get(&project_id) {
+                if self.acp_chat_sessions.contains_key(&chat_id) {
+                    self.active_acp_chat = Some(chat_id);
+                }
+            } else {
+                // If no active chat for this project, clear the global active chat
+                // so terminals show instead of a stale chat from another project.
+                self.active_acp_chat = None;
+            }
+        }
     }
 
     fn bump_layout_epoch(&mut self) {
@@ -7025,6 +7068,7 @@ impl AdeApp {
                         terminal_id,
                         Some(entry.project_id),
                         Some(&new_session_id),
+                        None,
                     ),
                 )
             });
@@ -7032,14 +7076,14 @@ impl AdeApp {
                 crate::opencode_config::write_terminal_runtime_config_with_browser_mcp(
                     opencode_runtime_dir,
                     terminal_id,
-                    &build_model,
+                    build_model,
                     Some((exe_path.as_path(), endpoint.clone())),
                 )
             } else {
                 crate::opencode_config::write_terminal_runtime_config(
                     opencode_runtime_dir,
                     terminal_id,
-                    &build_model,
+                    build_model,
                 )
             };
             if let Err(err) = write_result {
@@ -9596,6 +9640,294 @@ impl AdeApp {
         if changed {
             ctx.request_repaint();
         }
+    }
+
+    fn process_acp_chat_events(&mut self, ctx: &egui::Context) {
+        let mut changed = false;
+        while let Ok(event) = self.acp_chat_events_rx.try_recv() {
+            match event {
+                crate::opencode_acp::AcpChatEvent::Connected { chat_id } => {
+                    if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+                        session.updated_at = Instant::now();
+                        // After initialize response, send session/new
+                        session.send_session_new();
+                    }
+                    self.status_line = format!("ACP chat {chat_id} connected");
+                }
+                crate::opencode_acp::AcpChatEvent::SessionCreated {
+                    chat_id,
+                    session_id,
+                } => {
+                    if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+                        session.session_id = Some(session_id.clone());
+                        session.status = crate::opencode_acp::AcpChatStatus::Idle;
+                        session.is_running = false;
+                        session.updated_at = Instant::now();
+                    }
+                    self.status_line = format!("ACP chat {chat_id} session created");
+                }
+                crate::opencode_acp::AcpChatEvent::AgentMessageChunk { chat_id, text } => {
+                    if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+                        if let Some(crate::opencode_acp::AcpChatMessage::Agent {
+                            text: ref mut existing,
+                        }) = session.messages.last_mut()
+                        {
+                            existing.push_str(&text);
+                        } else {
+                            session
+                                .messages
+                                .push(crate::opencode_acp::AcpChatMessage::Agent { text });
+                        }
+                        session.updated_at = Instant::now();
+                    }
+                    changed = true;
+                }
+                crate::opencode_acp::AcpChatEvent::UserMessageChunk { chat_id, text } => {
+                    if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+                        if let Some(crate::opencode_acp::AcpChatMessage::User {
+                            text: ref mut existing,
+                        }) = session.messages.last_mut()
+                        {
+                            existing.push_str(&text);
+                        } else {
+                            session
+                                .messages
+                                .push(crate::opencode_acp::AcpChatMessage::User { text });
+                        }
+                        session.updated_at = Instant::now();
+                    }
+                    changed = true;
+                }
+                crate::opencode_acp::AcpChatEvent::ToolCall {
+                    chat_id,
+                    tool_call_id,
+                    title,
+                    kind,
+                    status,
+                } => {
+                    if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+                        session
+                            .messages
+                            .push(crate::opencode_acp::AcpChatMessage::ToolCall {
+                                id: tool_call_id,
+                                title,
+                                kind,
+                                status,
+                                content: None,
+                            });
+                        session.updated_at = Instant::now();
+                    }
+                    changed = true;
+                }
+                crate::opencode_acp::AcpChatEvent::ToolCallUpdate {
+                    chat_id,
+                    tool_call_id,
+                    status: new_status,
+                    content: new_content,
+                } => {
+                    if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+                        if let Some(msg) = session.messages.iter_mut().find(|m| matches!(m, crate::opencode_acp::AcpChatMessage::ToolCall { id, .. } if id == &tool_call_id)) {
+                            if let crate::opencode_acp::AcpChatMessage::ToolCall { ref mut status, ref mut content, .. } = msg {
+                                *status = new_status.clone();
+                                *content = new_content.clone();
+                            }
+                        }
+                        session.updated_at = Instant::now();
+                    }
+                    changed = true;
+                }
+                crate::opencode_acp::AcpChatEvent::Plan { chat_id, entries } => {
+                    if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+                        for entry in entries {
+                            session
+                                .messages
+                                .push(crate::opencode_acp::AcpChatMessage::System {
+                                    text: format!(
+                                        "[{}] {} (priority: {})",
+                                        entry.status, entry.content, entry.priority
+                                    ),
+                                });
+                        }
+                        session.updated_at = Instant::now();
+                    }
+                    changed = true;
+                }
+                crate::opencode_acp::AcpChatEvent::CurrentModeUpdate { chat_id, mode_id } => {
+                    if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+                        session.modes.retain(|m| m.id != mode_id);
+                        session.modes.push(crate::opencode_acp::AcpMode {
+                            id: mode_id.clone(),
+                            name: mode_id.clone(),
+                        });
+                        session.updated_at = Instant::now();
+                    }
+                    changed = true;
+                }
+                crate::opencode_acp::AcpChatEvent::ConfigOptionUpdate {
+                    chat_id,
+                    category,
+                    value,
+                } => {
+                    if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+                        session.config_options.insert(category, value);
+                        session.updated_at = Instant::now();
+                    }
+                    changed = true;
+                }
+                crate::opencode_acp::AcpChatEvent::AvailableCommandsUpdate {
+                    chat_id,
+                    commands,
+                } => {
+                    if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+                        session.available_commands = commands;
+                        session.updated_at = Instant::now();
+                    }
+                    changed = true;
+                }
+                crate::opencode_acp::AcpChatEvent::PromptResponse {
+                    chat_id,
+                    stop_reason,
+                } => {
+                    if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+                        session.status = crate::opencode_acp::AcpChatStatus::Idle;
+                        session.is_running = false;
+                        session.updated_at = Instant::now();
+                    }
+                    self.status_line = format!("ACP chat {chat_id} stopped: {stop_reason}");
+                    changed = true;
+                }
+                crate::opencode_acp::AcpChatEvent::PermissionRequest {
+                    chat_id,
+                    request_id,
+                    options,
+                    tool_call,
+                } => {
+                    if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+                        session.status = crate::opencode_acp::AcpChatStatus::Permission;
+                        session.pending_permission =
+                            Some(crate::opencode_acp::AcpPendingPermission {
+                                request_id,
+                                options,
+                                tool_call,
+                            });
+                        session.updated_at = Instant::now();
+                    }
+                    changed = true;
+                }
+                crate::opencode_acp::AcpChatEvent::Error { chat_id, message } => {
+                    if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+                        session.status = crate::opencode_acp::AcpChatStatus::Error;
+                        session
+                            .messages
+                            .push(crate::opencode_acp::AcpChatMessage::System {
+                                text: format!("Error: {message}"),
+                            });
+                        session.updated_at = Instant::now();
+                    }
+                    self.status_line = format!("ACP chat {chat_id} error: {message}");
+                    changed = true;
+                }
+                crate::opencode_acp::AcpChatEvent::Disconnected { chat_id } => {
+                    if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+                        session.status = crate::opencode_acp::AcpChatStatus::Exited;
+                        session.is_running = false;
+                        session.updated_at = Instant::now();
+                    }
+                    self.status_line = format!("ACP chat {chat_id} disconnected");
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            ctx.request_repaint();
+        }
+    }
+
+    fn spawn_acp_chat_for_project(&mut self, project_id: u64) -> Option<u64> {
+        let project = self.projects.get(&project_id)?;
+        // If project already has chats, activate the most recent one.
+        if let Some(chat_ids) = self.acp_chat_ids_by_project.get(&project_id) {
+            if let Some(&last_chat_id) = chat_ids.last() {
+                if self.acp_chat_sessions.contains_key(&last_chat_id) {
+                    self.active_acp_chat_by_project
+                        .insert(project_id, last_chat_id);
+                    self.active_acp_chat = Some(last_chat_id);
+                    self.status_line = format!("Switched to ACP chat for {}", project.name);
+                    return Some(last_chat_id);
+                }
+            }
+        }
+        // Otherwise create a new chat thread.
+        let chat_id = self.next_acp_chat_id;
+        self.next_acp_chat_id += 1;
+        let opencode_bin = crate::opencode::opencode_bin_path();
+        let build_model = {
+            let model = self.config.opencode.active_build_model();
+            if model.is_empty() {
+                None
+            } else {
+                Some(model.to_owned())
+            }
+        };
+        let browser_mcp_env = self
+            .browser_mcp_service
+            .as_ref()
+            .map(|service| service.build_pty_env(chat_id, Some(project_id), None, Some(chat_id)))
+            .unwrap_or_default();
+        let event_tx = self.acp_chat_events_tx.clone();
+        match crate::opencode_acp::spawn_opencode_acp(
+            chat_id,
+            project_id,
+            project.path.clone(),
+            opencode_bin,
+            build_model,
+            browser_mcp_env,
+            event_tx,
+        ) {
+            Ok(session) => {
+                self.acp_chat_sessions.insert(chat_id, session);
+                self.acp_chat_ids_by_project
+                    .entry(project_id)
+                    .or_default()
+                    .push(chat_id);
+                self.active_acp_chat_by_project.insert(project_id, chat_id);
+                self.active_acp_chat = Some(chat_id);
+                self.status_line = format!("Started ACP chat for {}", project.name);
+                Some(chat_id)
+            }
+            Err(err) => {
+                self.status_line = format!("Failed to start ACP chat: {err}");
+                None
+            }
+        }
+    }
+
+    fn kill_acp_chat(&mut self, chat_id: u64) {
+        if let Some(session) = self.acp_chat_sessions.remove(&chat_id) {
+            let _ = session.send_cancel();
+            if let Some(ref service) = self.browser_mcp_service {
+                service.revoke_acp_chat(chat_id);
+            }
+        }
+        // Remove chat_id from project tracking.
+        for (_, ids) in self.acp_chat_ids_by_project.iter_mut() {
+            ids.retain(|&id| id != chat_id);
+        }
+        self.active_acp_chat_by_project
+            .retain(|_, &mut id| id != chat_id);
+        if self.active_acp_chat == Some(chat_id) {
+            self.active_acp_chat = None;
+        }
+    }
+
+    fn kill_acp_chat_for_project(&mut self, project_id: u64) {
+        if let Some(chat_ids) = self.acp_chat_ids_by_project.get(&project_id).cloned() {
+            for chat_id in chat_ids {
+                self.kill_acp_chat(chat_id);
+            }
+        }
+        self.acp_chat_ids_by_project.remove(&project_id);
+        self.active_acp_chat_by_project.remove(&project_id);
     }
 
     fn request_source_control_refresh(&mut self, project_id: u64, run_fetch: bool, manual: bool) {
@@ -15968,7 +16300,7 @@ impl AdeApp {
             let browser_mcp = self.browser_mcp_service.as_ref().map(|service| {
                 (
                     self.current_executable_path.clone(),
-                    service.endpoint_env(*terminal_id, Some(terminal.project_id), None),
+                    service.endpoint_env(*terminal_id, Some(terminal.project_id), None, None),
                 )
             });
             let write_result = if let Some((exe_path, endpoint)) = browser_mcp.as_ref() {
@@ -18747,7 +19079,7 @@ impl AdeApp {
             let has_children =
                 visible_count > 0 || worktree_count > 0 || worktree_visible_count > 0;
             let mut create_worktree_clicked = false;
-            let (header_response, spawn_clicked, selected_launcher_id, header_clicked) =
+            let (header_response, spawn_clicked, selected_action, header_clicked) =
                 draw_project_group_header(
                     self,
                     ui,
@@ -18763,14 +19095,21 @@ impl AdeApp {
                 );
             let spawn_succeeded = match visible_kind {
                 TerminalKind::Foreground => {
-                    selected_launcher_id.as_deref().is_some_and(|launcher_id| {
-                        self.spawn_terminal_for_project(
-                            ctx,
-                            project_id,
-                            visible_kind,
-                            Some(launcher_id),
-                        )
-                    })
+                    match selected_action {
+                        Some(ForegroundLauncherAction::TerminalLauncher(launcher_id)) => {
+                            self.spawn_terminal_for_project(
+                                ctx,
+                                project_id,
+                                visible_kind,
+                                Some(&launcher_id),
+                            )
+                        }
+                        Some(ForegroundLauncherAction::OpenCodeChat) => {
+                            self.spawn_acp_chat_for_project(project_id);
+                            false
+                        }
+                        None => false,
+                    }
                 }
                 TerminalKind::Background => {
                     spawn_clicked
@@ -18825,7 +19164,7 @@ impl AdeApp {
                             let wt_diff_summary = terminal_manager_diff_summary_model(
                                 self.source_control_state.get(&wt_project_id),
                             );
-                            let (row_response, spawn_clicked, selected_launcher_id) =
+                                let (row_response, spawn_clicked, selected_action) =
                                 draw_terminal_manager_worktree_row(
                                     self,
                                     ui,
@@ -18844,14 +19183,21 @@ impl AdeApp {
                             }
                             let _spawn_succeeded = match visible_kind {
                                 TerminalKind::Foreground => {
-                                    selected_launcher_id.as_deref().is_some_and(|launcher_id| {
-                                        self.spawn_terminal_for_project(
-                                            ctx,
-                                            wt_project_id,
-                                            TerminalKind::Foreground,
-                                            Some(launcher_id),
-                                        )
-                                    })
+                                    match selected_action {
+                                        Some(ForegroundLauncherAction::TerminalLauncher(launcher_id)) => {
+                                            self.spawn_terminal_for_project(
+                                                ctx,
+                                                wt_project_id,
+                                                TerminalKind::Foreground,
+                                                Some(&launcher_id),
+                                            )
+                                        }
+                                        Some(ForegroundLauncherAction::OpenCodeChat) => {
+                                            self.spawn_acp_chat_for_project(wt_project_id);
+                                            false
+                                        }
+                                        None => false,
+                                    }
                                 }
                                 TerminalKind::Background => {
                                     spawn_clicked
@@ -19552,6 +19898,440 @@ impl AdeApp {
         }
     }
 
+    fn draw_acp_chat_panel(&mut self, ctx: &egui::Context, chat_id: u64) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(APP_BG))
+            .show(ctx, |ui| {
+                let margin = egui::Margin::symmetric(16.0, 12.0);
+                let content_rect = ui
+                    .available_rect_before_wrap()
+                    .shrink2(margin.left_top() + margin.right_bottom());
+
+                let thread_selector_height = 32.0;
+                let header_height = 36.0;
+                let input_height = 120.0;
+                let messages_height = (content_rect.height()
+                    - thread_selector_height
+                    - header_height
+                    - input_height
+                    - 24.0)
+                    .max(80.0);
+
+                // --- Thread selector bar ---
+                let thread_selector_rect = egui::Rect::from_min_size(
+                    content_rect.min,
+                    egui::vec2(content_rect.width(), thread_selector_height),
+                );
+                let mut thread_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(thread_selector_rect)
+                        .layout(Layout::left_to_right(Align::Center)),
+                );
+                thread_ui.spacing_mut().item_spacing.x = 8.0;
+                // Project thread list
+                let project_id = self
+                    .acp_chat_sessions
+                    .get(&chat_id)
+                    .map(|s| s.project_id)
+                    .unwrap_or(0);
+                if let Some(chat_ids) = self.acp_chat_ids_by_project.get(&project_id).cloned() {
+                    for cid in chat_ids {
+                        if let Some(session) = self.acp_chat_sessions.get(&cid) {
+                            let is_active = cid == chat_id;
+                            let label = format!("{} {}", icons::CHAT_TEXT, session.title);
+                            let btn = thread_ui.add(
+                                egui::Button::new(
+                                    RichText::new(label).size(12.0).color(if is_active {
+                                        TEXT_PRIMARY
+                                    } else {
+                                        TEXT_MUTED
+                                    }),
+                                )
+                                .fill(if is_active {
+                                    SURFACE_BG_SOFT
+                                } else {
+                                    Color32::TRANSPARENT
+                                })
+                                .stroke(Stroke::NONE),
+                            );
+                            if btn.clicked() {
+                                self.active_acp_chat = Some(cid);
+                                self.active_acp_chat_by_project.insert(project_id, cid);
+                            }
+                        }
+                    }
+                }
+                if thread_ui
+                    .button(
+                        RichText::new(format!("{} New Chat", icons::PLUS))
+                            .size(12.0)
+                            .color(TEXT_MUTED),
+                    )
+                    .clicked()
+                {
+                    self.spawn_acp_chat_for_project(project_id);
+                }
+                thread_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .button(
+                            RichText::new(format!("{}", icons::X))
+                                .size(12.0)
+                                .color(TEXT_MUTED),
+                        )
+                        .clicked()
+                    {
+                        self.kill_acp_chat(chat_id);
+                    }
+                });
+                ui.allocate_rect(thread_selector_rect, Sense::hover());
+
+                // --- Header controls ---
+                let header_rect = egui::Rect::from_min_size(
+                    egui::pos2(content_rect.min.x, thread_selector_rect.max.y + 4.0),
+                    egui::vec2(content_rect.width(), header_height),
+                );
+                let mut header_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(header_rect)
+                        .layout(Layout::left_to_right(Align::Center)),
+                );
+                header_ui.spacing_mut().item_spacing.x = 8.0;
+                header_ui.label(
+                    RichText::new(format!("{} OpenCode ACP", icons::CHAT_TEXT))
+                        .size(16.0)
+                        .strong()
+                        .color(TEXT_PRIMARY),
+                );
+                if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+                    let status_text = match session.status {
+                        crate::opencode_acp::AcpChatStatus::Starting => "Starting...",
+                        crate::opencode_acp::AcpChatStatus::Idle => "Idle",
+                        crate::opencode_acp::AcpChatStatus::Running => "Running...",
+                        crate::opencode_acp::AcpChatStatus::Permission => "Permission",
+                        crate::opencode_acp::AcpChatStatus::Error => "Error",
+                        crate::opencode_acp::AcpChatStatus::Exited => "Disconnected",
+                    };
+                    let status_color = match session.status {
+                        crate::opencode_acp::AcpChatStatus::Running => {
+                            Color32::from_rgb(100, 200, 100)
+                        }
+                        crate::opencode_acp::AcpChatStatus::Error => BTN_RED,
+                        crate::opencode_acp::AcpChatStatus::Permission => {
+                            Color32::from_rgb(255, 200, 100)
+                        }
+                        _ => TEXT_MUTED,
+                    };
+                    header_ui.label(RichText::new(status_text).size(12.0).color(status_color));
+                    // Mode selector if modes available
+                    if !session.modes.is_empty() {
+                        let mode_id = session.selected_mode_id.clone().unwrap_or_else(|| {
+                            session
+                                .modes
+                                .first()
+                                .map(|m| m.id.clone())
+                                .unwrap_or_default()
+                        });
+                        let mode_label = session
+                            .modes
+                            .iter()
+                            .find(|m| m.id == mode_id)
+                            .map(|m| m.name.clone())
+                            .unwrap_or_else(|| mode_id.clone());
+                        let mut selected_mode_id = session.selected_mode_id.clone();
+                        egui::ComboBox::from_id_salt("acp_mode_selector")
+                            .selected_text(RichText::new(mode_label).size(12.0).color(TEXT_PRIMARY))
+                            .width(120.0)
+                            .show_ui(&mut header_ui, |ui| {
+                                for mode in &session.modes {
+                                    ui.selectable_value(
+                                        &mut selected_mode_id,
+                                        Some(mode.id.clone()),
+                                        RichText::new(&mode.name).size(12.0).color(TEXT_PRIMARY),
+                                    );
+                                }
+                            });
+                        session.selected_mode_id = selected_mode_id;
+                    }
+                    // Model display from config_options
+                    if let Some(model) = session.config_options.get("model") {
+                        header_ui.label(
+                            RichText::new(format!("Model: {model}"))
+                                .size(11.0)
+                                .color(TEXT_MUTED),
+                        );
+                    }
+                }
+                header_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if let Some(session) = self.acp_chat_sessions.get(&chat_id) {
+                        let is_running = session.is_running
+                            || matches!(
+                                session.status,
+                                crate::opencode_acp::AcpChatStatus::Running
+                            );
+                        if is_running {
+                            if ui.button(format!("{} Cancel", icons::X)).clicked() {
+                                if let Some(s) = self.acp_chat_sessions.get_mut(&chat_id) {
+                                    s.send_cancel();
+                                    s.is_running = false;
+                                    s.status = crate::opencode_acp::AcpChatStatus::Idle;
+                                }
+                            }
+                        }
+                    }
+                });
+                ui.allocate_rect(header_rect, Sense::hover());
+
+                // --- Messages area ---
+                let messages_rect = egui::Rect::from_min_size(
+                    egui::pos2(content_rect.min.x, header_rect.max.y + 8.0),
+                    egui::vec2(content_rect.width(), messages_height),
+                );
+                let mut messages_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(messages_rect)
+                        .layout(Layout::top_down(Align::Min)),
+                );
+                messages_ui.set_clip_rect(messages_rect);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(&mut messages_ui, |ui| {
+                        if let Some(session) = self.acp_chat_sessions.get(&chat_id) {
+                            for msg in &session.messages {
+                                match msg {
+                                    crate::opencode_acp::AcpChatMessage::User { text } => {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(
+                                                RichText::new("You: ").strong().color(TEXT_PRIMARY),
+                                            );
+                                            ui.label(RichText::new(text).color(TEXT_PRIMARY));
+                                        });
+                                    }
+                                    crate::opencode_acp::AcpChatMessage::Agent { text } => {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(
+                                                RichText::new("Agent: ")
+                                                    .strong()
+                                                    .color(Color32::from_rgb(100, 200, 255)),
+                                            );
+                                            ui.label(RichText::new(text).color(TEXT_PRIMARY));
+                                        });
+                                    }
+                                    crate::opencode_acp::AcpChatMessage::ToolCall {
+                                        id: _id,
+                                        title,
+                                        kind,
+                                        status,
+                                        content,
+                                    } => {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(
+                                                RichText::new(format!("Tool [{kind}] "))
+                                                    .strong()
+                                                    .color(Color32::from_rgb(255, 200, 100)),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!("{title} ({status})"))
+                                                    .color(TEXT_MUTED),
+                                            );
+                                        });
+                                        if let Some(c) = content {
+                                            ui.label(RichText::new(c).color(TEXT_MUTED).small());
+                                        }
+                                    }
+                                    crate::opencode_acp::AcpChatMessage::System { text } => {
+                                        ui.label(RichText::new(text).color(TEXT_MUTED).small());
+                                    }
+                                }
+                                ui.add_space(4.0);
+                            }
+                            let is_running = session.is_running
+                                || matches!(
+                                    session.status,
+                                    crate::opencode_acp::AcpChatStatus::Running
+                                );
+                            if is_running {
+                                let thinking_text = {
+                                    let t = ctx.input(|i| i.time);
+                                    let dots = ((t % 2.0) * 2.0).floor() as usize;
+                                    format!("Thinking{}", ".".repeat(dots + 1))
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!("{} ", icons::CLOCK))
+                                            .color(Color32::from_rgb(100, 200, 100)),
+                                    );
+                                    ui.label(
+                                        RichText::new(thinking_text)
+                                            .color(Color32::from_rgb(100, 200, 100))
+                                            .italics(),
+                                    );
+                                });
+                                ui.scroll_to_cursor(None);
+                            } else if session.messages.is_empty() {
+                                ui.label(
+                                    RichText::new("Send a message to start the conversation...")
+                                        .color(TEXT_MUTED)
+                                        .italics(),
+                                );
+                            }
+                        }
+                    });
+                ui.allocate_rect(messages_rect, Sense::hover());
+
+                // --- Input area ---
+                let input_rect = egui::Rect::from_min_size(
+                    egui::pos2(content_rect.min.x, messages_rect.max.y + 8.0),
+                    egui::vec2(content_rect.width(), input_height),
+                );
+                let mut input_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(input_rect)
+                        .layout(Layout::top_down(Align::Min)),
+                );
+                input_ui.set_clip_rect(input_rect);
+                if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+                    let is_running = session.is_running
+                        || matches!(session.status, crate::opencode_acp::AcpChatStatus::Running);
+                    let session_ready = session.session_id.is_some()
+                        && !matches!(session.status, crate::opencode_acp::AcpChatStatus::Starting);
+                    let draft = session.prompt_input.clone();
+                    let text_edit = egui::TextEdit::multiline(&mut session.prompt_input)
+                        .desired_rows(4)
+                        .hint_text(if session_ready {
+                            "Type a message... (Enter to send, Ctrl+Enter for newline)"
+                        } else {
+                            "Waiting for session..."
+                        })
+                        .interactive(!is_running && session_ready)
+                        .return_key(egui::KeyboardShortcut::new(
+                            egui::Modifiers::CTRL,
+                            egui::Key::Enter,
+                        ));
+                    let response = input_ui.add_sized(
+                        egui::vec2(input_rect.width(), input_height - 32.0),
+                        text_edit,
+                    );
+                    // Detect plain Enter to submit
+                    let plain_enter = input_ui.input(|i| {
+                        i.events.iter().any(|e| {
+                            matches!(
+                                e,
+                                Event::Key {
+                                    key: Key::Enter,
+                                    modifiers,
+                                    pressed: true,
+                                    ..
+                                } if modifiers.is_none()
+                            )
+                        })
+                    });
+                    if response.changed() {
+                        ctx.request_repaint();
+                    }
+                    let can_send =
+                        !session.prompt_input.trim().is_empty() && !is_running && session_ready;
+                    if (plain_enter || response.lost_focus()) && can_send {
+                        let text = session.prompt_input.trim().to_owned();
+                        session.prompt_input.clear();
+                        session
+                            .messages
+                            .push(crate::opencode_acp::AcpChatMessage::User { text: text.clone() });
+                        session.is_running = true;
+                        session.status = crate::opencode_acp::AcpChatStatus::Running;
+                        session.send_prompt(&text);
+                        ctx.request_repaint();
+                    }
+                    input_ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add_enabled(
+                                    can_send,
+                                    egui::Button::new(format!("{} Send", icons::SEND_HORIZONTAL)),
+                                )
+                                .clicked()
+                            {
+                                let text = session.prompt_input.trim().to_owned();
+                                session.prompt_input.clear();
+                                session
+                                    .messages
+                                    .push(crate::opencode_acp::AcpChatMessage::User {
+                                        text: text.clone(),
+                                    });
+                                session.is_running = true;
+                                session.status = crate::opencode_acp::AcpChatStatus::Running;
+                                session.send_prompt(&text);
+                                ctx.request_repaint();
+                            }
+                        });
+                    });
+                    // Permission card
+                    if let Some(permission) = session.pending_permission.take() {
+                        input_ui.separator();
+                        input_ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Permission: {}",
+                                    permission.tool_call.title
+                                ))
+                                .strong()
+                                .color(TEXT_PRIMARY),
+                            );
+                        });
+                        for opt in &permission.options {
+                            if ui
+                                .button(format!("{} {}", icons::CHECK_CIRCLE, opt.name))
+                                .clicked()
+                            {
+                                session.send_permission_response(
+                                    &permission.request_id,
+                                    &opt.option_id,
+                                );
+                                session.status = crate::opencode_acp::AcpChatStatus::Running;
+                            }
+                        }
+                        if session.pending_permission.is_none() {
+                            session.pending_permission = Some(permission);
+                        }
+                    }
+                    // Slash command hint
+                    if !session.available_commands.is_empty() {
+                        let query = session.prompt_input.trim();
+                        if query.starts_with('/') && query.len() > 1 {
+                            let prefix = &query[1..];
+                            let matches: Vec<_> = session
+                                .available_commands
+                                .iter()
+                                .filter(|c| c.name.starts_with(prefix))
+                                .collect();
+                            if !matches.is_empty() {
+                                input_ui.separator();
+                                input_ui
+                                    .label(RichText::new("Commands:").small().color(TEXT_MUTED));
+                                for cmd in matches.iter().take(5) {
+                                    input_ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(format!("/{}", cmd.name))
+                                                .strong()
+                                                .color(ACCENT),
+                                        );
+                                        ui.label(
+                                            RichText::new(&cmd.description)
+                                                .small()
+                                                .color(TEXT_MUTED),
+                                        );
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    if draft != session.prompt_input {
+                        ctx.request_repaint();
+                    }
+                }
+                ui.allocate_rect(input_rect, Sense::hover());
+            });
+    }
+
     fn draw_main_area(&mut self, ctx: &egui::Context) {
         // Check if file editor is visible - if so, show editor instead of terminals.
         // Note: editor can be "open" (has active buffer) but not "visible"
@@ -19559,6 +20339,16 @@ impl AdeApp {
         if self.file_editor.is_visible() {
             self.draw_file_editor(ctx);
             return;
+        }
+
+        // If an ACP chat is active, show it instead of the terminal grid.
+        if let Some(chat_id) = self.active_acp_chat {
+            if self.acp_chat_sessions.contains_key(&chat_id) {
+                self.draw_acp_chat_panel(ctx, chat_id);
+                return;
+            } else {
+                self.active_acp_chat = None;
+            }
         }
 
         egui::CentralPanel::default()
@@ -25318,6 +26108,7 @@ impl eframe::App for AdeApp {
         self.process_pending_second_enters(ctx);
 
         self.process_create_worktree_events(ctx);
+        self.process_acp_chat_events(ctx);
         self.process_source_control_events(ctx);
         self.process_directory_index_events(ctx);
         self.process_browser_events(ctx);
@@ -25382,6 +26173,11 @@ impl eframe::App for AdeApp {
         // Shutdown all embedded browsers to release native resources
         for (_, browser) in &mut self.embedded_browsers_by_scope {
             browser.shutdown();
+        }
+
+        // Kill all ACP chat sessions
+        for chat_id in self.acp_chat_sessions.keys().copied().collect::<Vec<_>>() {
+            self.kill_acp_chat(chat_id);
         }
 
         #[cfg(target_os = "windows")]
@@ -27952,10 +28748,13 @@ fn draw_terminal_manager_worktree_row(
     foreground_launchers: &[LauncherEntry],
     action_kind: TerminalKind,
     diff_summary: &TerminalManagerDiffSummaryModel,
-) -> (egui::Response, bool, Option<String>) {
+) -> (egui::Response, bool, Option<ForegroundLauncherAction>) {
     let button_padding = ui.spacing().button_padding;
     let available_width = ui.available_width().max(0.0);
-    let actions_width = CONTROL_ROW_HEIGHT;
+    let actions_width = match action_kind {
+        TerminalKind::Foreground => CONTROL_ROW_HEIGHT,
+        TerminalKind::Background => CONTROL_ROW_HEIGHT,
+    };
     let section_gap = ui.spacing().item_spacing.x;
     let label_width = (available_width - actions_width - section_gap).max(0.0);
     let wrap_width = sidebar_row_wrap_width(label_width, button_padding).max(0.0);
@@ -27987,7 +28786,7 @@ fn draw_terminal_manager_worktree_row(
     let body_response = body_response.on_hover_cursor(egui::CursorIcon::PointingHand);
 
     let mut spawn_clicked = false;
-    let mut selected_launcher_id = None;
+    let mut selected_action = None;
 
     if ui.is_rect_visible(rect) {
         if body_response.hovered() || body_response.highlighted() || body_response.has_focus() {
@@ -28020,10 +28819,10 @@ fn draw_terminal_manager_worktree_row(
         ui.scope_builder(
             egui::UiBuilder::new()
                 .max_rect(actions_rect)
-                .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
+                .layout(Layout::right_to_left(Align::Center)),
             |ui| {
                 if action_kind == TerminalKind::Foreground {
-                    selected_launcher_id = styled_launcher_menu_button(
+                    selected_action = styled_launcher_menu_button(
                         app,
                         ui,
                         icons::TERMINAL,
@@ -28053,7 +28852,7 @@ fn draw_terminal_manager_worktree_row(
         TEXT_PRIMARY,
         wrap_width,
     );
-    (response, spawn_clicked, selected_launcher_id)
+    (response, spawn_clicked, selected_action)
 }
 
 fn directory_file_row_hover_fill(is_hovered: bool) -> Option<Color32> {
@@ -30477,7 +31276,7 @@ fn draw_project_group_header(
     diff_summary: &TerminalManagerDiffSummaryModel,
     has_live_terminal: bool,
     create_worktree_clicked: &mut bool,
-) -> (egui::Response, bool, Option<String>, bool) {
+) -> (egui::Response, bool, Option<ForegroundLauncherAction>, bool) {
     let row_width = ui.available_width();
     let section_gap = ui.spacing().item_spacing.x;
     let (_label_width, actions_width) =
@@ -30530,7 +31329,7 @@ fn draw_project_group_header(
     };
 
     let mut spawn_clicked = false;
-    let mut selected_launcher_id = None;
+    let mut selected_action = None;
 
     // Draw label content
     let label_rect = egui::Rect::from_min_size(
@@ -30566,7 +31365,7 @@ fn draw_project_group_header(
         |ui| {
             let (icon, bg, hover_bg, tooltip) = project_group_header_action_spec(action_kind);
             if action_kind == TerminalKind::Foreground {
-                selected_launcher_id = styled_launcher_menu_button(
+                selected_action = styled_launcher_menu_button(
                     app,
                     ui,
                     icon,
@@ -30595,13 +31394,13 @@ fn draw_project_group_header(
     // Determine header click - only if body was clicked and no action was taken
     let header_clicked = body_response.clicked()
         && !spawn_clicked
-        && selected_launcher_id.is_none()
+        && selected_action.is_none()
         && !*create_worktree_clicked;
 
     (
         body_response,
         spawn_clicked,
-        selected_launcher_id,
+        selected_action,
         header_clicked,
     )
 }
@@ -30908,18 +31707,22 @@ fn terminal_manager_test_done_toggle(ui: &mut Ui, test_done: bool) -> bool {
     response.clicked()
 }
 
-fn foreground_launcher_menu_content_height(launcher_count: usize) -> f32 {
-    if launcher_count == 0 {
+fn foreground_launcher_menu_content_height(total_rows: usize) -> f32 {
+    if total_rows == 0 {
         FOREGROUND_LAUNCHER_ROW_HEIGHT
     } else {
-        launcher_count as f32 * FOREGROUND_LAUNCHER_ROW_HEIGHT
-            + launcher_count.saturating_sub(1) as f32 * FOREGROUND_LAUNCHER_ROW_GAP
+        total_rows as f32 * FOREGROUND_LAUNCHER_ROW_HEIGHT
+            + total_rows.saturating_sub(1) as f32 * FOREGROUND_LAUNCHER_ROW_GAP
     }
 }
 
 fn foreground_launcher_menu_total_height(launcher_count: usize) -> f32 {
-    FOREGROUND_LAUNCHER_MENU_PADDING_Y * 2.0
-        + foreground_launcher_menu_content_height(launcher_count)
+    let total_rows = if launcher_count == 0 {
+        2 // OpenCode Chat + hint row
+    } else {
+        launcher_count + 1 // OpenCode Chat + launchers
+    };
+    FOREGROUND_LAUNCHER_MENU_PADDING_Y * 2.0 + foreground_launcher_menu_content_height(total_rows)
 }
 
 fn foreground_launcher_popup_frame(ui: &Ui) -> egui::Frame {
@@ -30943,8 +31746,8 @@ fn draw_launcher_menu_contents(
     app: &mut AdeApp,
     ui: &mut Ui,
     launchers: &[LauncherEntry],
-) -> Option<String> {
-    let mut selected_launcher = None;
+) -> Option<ForegroundLauncherAction> {
+    let mut selected_action = None;
     let menu_width = FOREGROUND_LAUNCHER_MENU_WIDTH;
     let row_height = FOREGROUND_LAUNCHER_ROW_HEIGHT;
     let previous_item_spacing_y = ui.spacing().item_spacing.y;
@@ -30954,29 +31757,47 @@ fn draw_launcher_menu_contents(
     ui.set_max_width(menu_width);
     ui.add_space(FOREGROUND_LAUNCHER_MENU_PADDING_Y);
 
-    if launchers.is_empty() {
-        let full_row_rect =
-            egui::Rect::from_min_size(ui.cursor().min, egui::vec2(menu_width, row_height));
-        let row_rect = full_row_rect.shrink2(egui::vec2(FOREGROUND_LAUNCHER_MENU_PADDING_X, 0.0));
-        ui.painter().rect_filled(row_rect, 6.0, SURFACE_BG_SOFT);
-        ui.allocate_new_ui(
-            egui::UiBuilder::new()
-                .max_rect(row_rect)
-                .layout(Layout::left_to_right(Align::Center)),
-            |ui| {
-                ui.add_space(6.0);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new("Enable a launcher in Settings > Launchers")
-                            .small()
-                            .color(TEXT_MUTED),
-                    )
-                    .selectable(false)
-                    .truncate(),
-                );
-            },
-        );
-    } else {
+    // Synthetic OpenCode Chat row (always shown, non-persisted)
+    let full_row_rect =
+        egui::Rect::from_min_size(ui.cursor().min, egui::vec2(menu_width, row_height));
+    let row_rect = full_row_rect.shrink2(egui::vec2(FOREGROUND_LAUNCHER_MENU_PADDING_X, 0.0));
+    let row_hovered = ui.rect_contains_pointer(row_rect);
+    ui.painter().rect_filled(row_rect, 6.0, SURFACE_BG_SOFT);
+
+    let inner_response = ui.allocate_new_ui(
+        egui::UiBuilder::new()
+            .max_rect(row_rect)
+            .layout(Layout::left_to_right(Align::Center))
+            .sense(Sense::click()),
+        |ui| {
+            ui.add_space(6.0);
+            let _ =
+                app.draw_launcher_icon_with_hover(ui, LauncherIconKey::OpenCode, 16.0, row_hovered);
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new("OpenCode Chat")
+                        .strong()
+                        .color(if row_hovered { ACCENT } else { TEXT_PRIMARY }),
+                )
+                .selectable(false)
+                .truncate(),
+            );
+            ui.response()
+        },
+    );
+    let row_response = inner_response.inner;
+    if row_hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if row_response.clicked() {
+        selected_action = Some(ForegroundLauncherAction::OpenCodeChat);
+        ui.memory_mut(|mem| mem.close_popup());
+        ui.close_menu();
+    }
+
+    if !launchers.is_empty() {
+        ui.add_space(FOREGROUND_LAUNCHER_ROW_GAP);
         for (index, launcher) in launchers.iter().enumerate() {
             let full_row_rect =
                 egui::Rect::from_min_size(ui.cursor().min, egui::vec2(menu_width, row_height));
@@ -31012,7 +31833,9 @@ fn draw_launcher_menu_contents(
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
             if row_response.clicked() {
-                selected_launcher = Some(launcher.id.clone());
+                selected_action = Some(ForegroundLauncherAction::TerminalLauncher(
+                    launcher.id.clone(),
+                ));
                 ui.memory_mut(|mem| mem.close_popup());
                 ui.close_menu();
             }
@@ -31020,12 +31843,36 @@ fn draw_launcher_menu_contents(
                 ui.add_space(FOREGROUND_LAUNCHER_ROW_GAP);
             }
         }
+    } else {
+        // When no launchers are enabled, show a hint row after OpenCode Chat
+        ui.add_space(FOREGROUND_LAUNCHER_ROW_GAP);
+        let full_row_rect =
+            egui::Rect::from_min_size(ui.cursor().min, egui::vec2(menu_width, row_height));
+        let row_rect = full_row_rect.shrink2(egui::vec2(FOREGROUND_LAUNCHER_MENU_PADDING_X, 0.0));
+        ui.painter().rect_filled(row_rect, 6.0, SURFACE_BG_SOFT);
+        ui.allocate_new_ui(
+            egui::UiBuilder::new()
+                .max_rect(row_rect)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new("Enable a launcher in Settings > Launchers")
+                            .small()
+                            .color(TEXT_MUTED),
+                    )
+                    .selectable(false)
+                    .truncate(),
+                );
+            },
+        );
     }
 
     ui.add_space(FOREGROUND_LAUNCHER_MENU_PADDING_Y);
     ui.spacing_mut().item_spacing.y = previous_item_spacing_y;
 
-    selected_launcher
+    selected_action
 }
 
 fn styled_launcher_menu_button(
@@ -31037,8 +31884,8 @@ fn styled_launcher_menu_button(
     _active_bg: Color32,
     tooltip: &str,
     launchers: &[LauncherEntry],
-) -> Option<String> {
-    let mut selected_launcher = None;
+) -> Option<ForegroundLauncherAction> {
+    let mut selected_action = None;
     let (button_rect, button_response) = ui.allocate_exact_size(
         egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT),
         Sense::click(),
@@ -31094,13 +31941,13 @@ fn styled_launcher_menu_button(
                 foreground_launcher_popup_frame(ui).show(ui, |ui| {
                     ui.set_min_width(FOREGROUND_LAUNCHER_MENU_WIDTH);
                     ui.set_max_width(FOREGROUND_LAUNCHER_MENU_WIDTH);
-                    selected_launcher = draw_launcher_menu_contents(app, ui, launchers);
+                    selected_action = draw_launcher_menu_contents(app, ui, launchers);
                 });
             });
 
         let clicked_outside =
             response.clicked_elsewhere() && popup_response.response.clicked_elsewhere();
-        if selected_launcher.is_some()
+        if selected_action.is_some()
             || clicked_outside
             || ctx.input(|input| input.key_pressed(egui::Key::Escape))
         {
@@ -31108,7 +31955,7 @@ fn styled_launcher_menu_button(
         }
     }
 
-    selected_launcher
+    selected_action
 }
 
 fn activity_rail_icon_button(
@@ -36379,7 +37226,7 @@ mod tests {
         let hover_output = draw_foreground_launcher_menu_in_test_ui(
             &ctx,
             RawInput {
-                events: vec![Event::PointerMoved(pos2(60.0, 16.0))],
+                events: vec![Event::PointerMoved(pos2(60.0, 40.0))],
                 ..RawInput::default()
             },
             &launchers,
@@ -36409,7 +37256,7 @@ mod tests {
         let output = draw_foreground_launcher_menu_in_test_ui(
             &ctx,
             RawInput {
-                events: vec![Event::PointerMoved(pos2(60.0, 16.0))],
+                events: vec![Event::PointerMoved(pos2(60.0, 40.0))],
                 ..RawInput::default()
             },
             &launchers,
@@ -36680,15 +37527,19 @@ mod tests {
 
         let output = draw_open_foreground_launcher_popup_in_test_ui(&ctx, &[]);
 
-        assert_foreground_launcher_vertical_padding(&output, 1);
+        assert_foreground_launcher_vertical_padding(&output, 0);
     }
 
     fn assert_foreground_launcher_vertical_padding(
         output: &egui::FullOutput,
-        expected_row_count: usize,
+        launcher_count: usize,
     ) {
-        let expected_frame_height =
-            super::foreground_launcher_menu_total_height(expected_row_count);
+        let expected_row_count = if launcher_count == 0 {
+            2 // OpenCode Chat + hint
+        } else {
+            launcher_count + 1 // OpenCode Chat + launchers
+        };
+        let expected_frame_height = super::foreground_launcher_menu_total_height(launcher_count);
         let frame_rect = collect_rects_matching(output, |rect_shape| {
             rect_shape.fill == super::SURFACE_BG
                 && (rect_shape.rect.width() - super::FOREGROUND_LAUNCHER_MENU_WIDTH).abs() <= 1.0
@@ -37062,24 +37913,23 @@ mod tests {
                         .max_rect(rect)
                         .layout(egui::Layout::top_down(egui::Align::Center)),
                 );
-                let (_, spawn_clicked, selected_launcher_id) =
-                    super::draw_terminal_manager_worktree_row(
-                        &mut app,
-                        &mut child,
-                        "feature-x",
-                        false,
-                        false,
-                        "/repo/wt",
-                        &[],
-                        TerminalKind::Background,
-                        &super::TerminalManagerDiffSummaryModel::default(),
-                    );
+                let (_, spawn_clicked, selected_action) = super::draw_terminal_manager_worktree_row(
+                    &mut app,
+                    &mut child,
+                    "feature-x",
+                    false,
+                    false,
+                    "/repo/wt",
+                    &[],
+                    TerminalKind::Background,
+                    &super::TerminalManagerDiffSummaryModel::default(),
+                );
                 assert!(
                     !spawn_clicked,
                     "Background worktree row should not auto-click"
                 );
                 assert_eq!(
-                    selected_launcher_id, None,
+                    selected_action, None,
                     "Background row should not offer a launcher"
                 );
             });
@@ -37100,24 +37950,31 @@ mod tests {
                         .max_rect(rect)
                         .layout(egui::Layout::top_down(egui::Align::Center)),
                 );
-                let (_, spawn_clicked, selected_launcher_id) =
-                    super::draw_terminal_manager_worktree_row(
-                        &mut app,
-                        &mut child,
-                        "feature-x",
-                        false,
-                        false,
-                        "/repo/wt",
-                        &[],
-                        TerminalKind::Foreground,
-                        &super::TerminalManagerDiffSummaryModel::default(),
-                    );
+                let (_, spawn_clicked, selected_action) = super::draw_terminal_manager_worktree_row(
+                    &mut app,
+                    &mut child,
+                    "feature-x",
+                    false,
+                    false,
+                    "/repo/wt",
+                    &[],
+                    TerminalKind::Foreground,
+                    &super::TerminalManagerDiffSummaryModel::default(),
+                );
                 assert!(
                     !spawn_clicked,
                     "Foreground worktree row should not auto-click spawn"
                 );
                 assert_eq!(
-                    selected_launcher_id, None,
+                    selected_action, None,
+                    "Foreground row should not offer a launcher without interaction"
+                );
+                assert!(
+                    !spawn_clicked,
+                    "Foreground worktree row should not auto-click spawn"
+                );
+                assert_eq!(
+                    selected_action, None,
                     "Foreground row without interaction should not select a launcher"
                 );
             });
@@ -44134,6 +44991,13 @@ mod tests {
             create_worktree_events_rx,
             browser_video_encode_events_tx,
             browser_video_encode_events_rx,
+            acp_chat_sessions: BTreeMap::new(),
+            acp_chat_ids_by_project: BTreeMap::new(),
+            active_acp_chat_by_project: BTreeMap::new(),
+            acp_chat_events_tx: crossbeam_channel::unbounded().0,
+            acp_chat_events_rx: crossbeam_channel::unbounded().1,
+            active_acp_chat: None,
+            next_acp_chat_id: 1,
         }
     }
 
@@ -51780,6 +52644,7 @@ mod tests {
             terminal_id: None,
             project_id: None,
             session_id: None,
+            acp_chat_id: None,
             tool: "browser_snapshot".to_owned(),
             params: serde_json::json!({}),
         };
@@ -51787,6 +52652,7 @@ mod tests {
             terminal_id: 1,
             project_id: Some(7),
             session_id: None,
+            acp_chat_id: None,
         };
 
         assert_eq!(app.resolve_browser_mcp_project_id(&request, &scope), Ok(7));
@@ -51832,6 +52698,7 @@ mod tests {
             terminal_id: Some(1),
             project_id: Some(8),
             session_id: None,
+            acp_chat_id: None,
             tool: "browser_navigate".to_owned(),
             params: serde_json::json!({ "url": "https://blocked.example" }),
         };
@@ -51839,6 +52706,7 @@ mod tests {
             terminal_id: 1,
             project_id: Some(7),
             session_id: None,
+            acp_chat_id: None,
         };
 
         let response = app.handle_browser_mcp_request(&ctx, request, scope);
@@ -51864,6 +52732,7 @@ mod tests {
             terminal_id: None,
             project_id: None,
             session_id: None,
+            acp_chat_id: None,
             tool: "browser_navigate".to_owned(),
             params: serde_json::json!({ "url": "https://active.example" }),
         };
@@ -51871,6 +52740,7 @@ mod tests {
             terminal_id: 99,
             project_id: Some(7),
             session_id: None,
+            acp_chat_id: None,
         };
 
         let response = app.handle_browser_mcp_request(&ctx, request, scope);
@@ -53749,6 +54619,7 @@ mod tests {
             terminal_id: 1,
             project_id: Some(7),
             session_id: None,
+            acp_chat_id: None,
         };
         let browser_scope = BrowserScopeKey::Terminal {
             project_id: 7,
@@ -53760,89 +54631,12 @@ mod tests {
                 terminal_id: Some(1),
                 project_id: Some(7),
                 session_id: None,
+                acp_chat_id: None,
                 tool: tool.to_owned(),
                 params,
             }
         };
 
-        let response = app.handle_browser_mcp_request(
-            &ctx,
-            request(
-                "browser_tabs",
-                serde_json::json!({ "action": "new", "url": "example.com/path" }),
-            ),
-            scope.clone(),
-        );
-
-        assert!(!response.is_error, "{}", response.text);
-        // With the new behavior, only 1 tab is created (no implicit ensure_browser_tab_state)
-        assert_eq!(
-            app.browser_tabs_by_scope.get(&browser_scope).unwrap().len(),
-            1
-        );
-        let new_tab_id = app.active_browser_tab_id(browser_scope).unwrap();
-        assert_eq!(
-            app.browser_tab_mut(browser_scope, new_tab_id)
-                .unwrap()
-                .url
-                .as_deref(),
-            Some("https://example.com/path")
-        );
-
-        // Add a second tab so we can test select
-        let response2 = app.handle_browser_mcp_request(
-            &ctx,
-            request(
-                "browser_tabs",
-                serde_json::json!({ "action": "new", "url": "example2.com" }),
-            ),
-            scope.clone(),
-        );
-        assert!(!response2.is_error, "{}", response2.text);
-        assert_eq!(
-            app.browser_tabs_by_scope.get(&browser_scope).unwrap().len(),
-            2
-        );
-
-        let response = app.handle_browser_mcp_request(
-            &ctx,
-            request(
-                "browser_tabs",
-                serde_json::json!({ "action": "select", "index": 0 }),
-            ),
-            scope.clone(),
-        );
-
-        assert!(!response.is_error, "{}", response.text);
-        // After selecting index 0, we should be back on the first tab (new_tab_id)
-        assert_eq!(app.active_browser_tab_id(browser_scope), Some(new_tab_id));
-
-        let response = app.handle_browser_mcp_request(
-            &ctx,
-            request(
-                "browser_tabs",
-                serde_json::json!({ "action": "close", "tabId": new_tab_id }),
-            ),
-            scope,
-        );
-
-        assert!(!response.is_error, "{}", response.text);
-        let tabs = app.browser_tabs_by_scope.get(&browser_scope).unwrap();
-        assert_eq!(tabs.len(), 1);
-        assert!(tabs.iter().all(|tab| tab.id != new_tab_id));
-    }
-
-    #[test]
-    fn browser_mcp_tabs_new_rejects_duplicate_url() {
-        let ctx = egui::Context::default();
-        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
-        app.projects
-            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
-        let scope = crate::browser_mcp_service::BrowserMcpAuthScope {
-            terminal_id: 1,
-            project_id: Some(7),
-            session_id: None,
-        };
         let browser_scope = BrowserScopeKey::Terminal {
             project_id: 7,
             terminal_id: 1,
@@ -53853,74 +54647,12 @@ mod tests {
                 terminal_id: Some(1),
                 project_id: Some(7),
                 session_id: None,
+                acp_chat_id: None,
                 tool: tool.to_owned(),
                 params,
             }
         };
 
-        let response = app.handle_browser_mcp_request(
-            &ctx,
-            request(
-                "browser_tabs",
-                serde_json::json!({ "action": "new", "url": "example.com/path" }),
-            ),
-            scope.clone(),
-        );
-        assert!(!response.is_error, "{}", response.text);
-        let duplicate_tab_id = app.active_browser_tab_id(browser_scope).unwrap();
-
-        let response = app.handle_browser_mcp_request(
-            &ctx,
-            request(
-                "browser_tabs",
-                serde_json::json!({ "action": "select", "index": 0 }),
-            ),
-            scope.clone(),
-        );
-        assert!(!response.is_error, "{}", response.text);
-        let active_before_duplicate = app.active_browser_tab_id(browser_scope);
-        let tab_count_before_duplicate =
-            app.browser_tabs_by_scope.get(&browser_scope).unwrap().len();
-
-        let response = app.handle_browser_mcp_request(
-            &ctx,
-            request(
-                "browser_tabs",
-                serde_json::json!({ "action": "new", "url": "https://example.com/path" }),
-            ),
-            scope,
-        );
-
-        assert!(response.is_error);
-        assert!(response
-            .text
-            .contains(&format!("{} numaralı sekmede açık", duplicate_tab_id)));
-        // With new behavior, only 1 tab exists so duplicate is at index 0
-        assert!(response.text.contains("index 0"));
-        assert!(response.text.contains(&format!(
-            "browser_tabs action=select tabId={duplicate_tab_id}"
-        )));
-        assert_eq!(
-            app.browser_tabs_by_scope.get(&browser_scope).unwrap().len(),
-            tab_count_before_duplicate
-        );
-        assert_eq!(
-            app.active_browser_tab_id(browser_scope),
-            active_before_duplicate
-        );
-    }
-
-    #[test]
-    fn browser_mcp_tabs_duplicate_uses_normalized_url() {
-        let ctx = egui::Context::default();
-        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
-        app.projects
-            .insert(7, test_project(7, "Demo", "C:/demo", &[], &[]));
-        let scope = crate::browser_mcp_service::BrowserMcpAuthScope {
-            terminal_id: 1,
-            project_id: Some(7),
-            session_id: None,
-        };
         let browser_scope = BrowserScopeKey::Terminal {
             project_id: 7,
             terminal_id: 1,
@@ -53931,6 +54663,7 @@ mod tests {
                 terminal_id: Some(1),
                 project_id: Some(7),
                 session_id: None,
+                acp_chat_id: None,
                 tool: "browser_tabs".to_owned(),
                 params,
             };
@@ -53967,6 +54700,7 @@ mod tests {
             terminal_id: 1,
             project_id: Some(7),
             session_id: None,
+            acp_chat_id: None,
         };
         let browser_scope = BrowserScopeKey::Terminal {
             project_id: 7,
@@ -53977,6 +54711,7 @@ mod tests {
             terminal_id: Some(1),
             project_id: Some(7),
             session_id: None,
+            acp_chat_id: None,
             tool: "browser_tabs".to_owned(),
             params: serde_json::json!({ "action": "new", "url": url }),
         };
@@ -54866,12 +55601,14 @@ mod tests {
             terminal_id: 2,
             project_id: Some(7),
             session_id: None,
+            acp_chat_id: None,
         };
         let request = crate::browser_mcp_service::BrowserMcpIpcRequest {
             request_id: "req".to_owned(),
             terminal_id: Some(2),
             project_id: Some(7),
             session_id: None,
+            acp_chat_id: None,
             tool: "browser_tabs".to_owned(),
             params: serde_json::json!({"action": "new", "url": "https://navigated.com"}),
         };

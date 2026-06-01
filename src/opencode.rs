@@ -170,7 +170,7 @@ pub fn opencode_env_pairs(
     pairs
 }
 
-fn opencode_bin_path() -> Option<OsString> {
+pub(crate) fn opencode_bin_path() -> Option<OsString> {
     resolve_opencode_bin_path(
         std::env::var_os(OPENCODE_BIN_PATH_ENV_VAR),
         std::env::var_os("APPDATA"),

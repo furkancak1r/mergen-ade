@@ -336,9 +336,7 @@ fn repair_mojibake_in_projects(projects: &mut [crate::models::ProjectRecord]) ->
 
         if let Some(path_str) = project.path.to_str() {
             let repaired_path = crate::mojibake::repair_mojibake(path_str);
-            if repaired_path != path_str
-                && std::path::Path::new(&repaired_path).exists()
-            {
+            if repaired_path != path_str && std::path::Path::new(&repaired_path).exists() {
                 project.path = std::path::PathBuf::from(repaired_path);
                 changed = true;
             }

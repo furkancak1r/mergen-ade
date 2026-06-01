@@ -6,9 +6,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::browser_mcp_service::{
     BrowserMcpIpcRequest, BrowserMcpIpcResponse, DEFAULT_BROWSER_MCP_TIMEOUT_MS,
-    MERGEN_BROWSER_MCP_ENDPOINT_PATH, MERGEN_BROWSER_MCP_PORT_ENV_VAR,
-    MERGEN_BROWSER_MCP_PROJECT_ID_ENV_VAR, MERGEN_BROWSER_MCP_SESSION_ID_ENV_VAR,
-    MERGEN_BROWSER_MCP_TERMINAL_ID_ENV_VAR, MERGEN_BROWSER_MCP_TOKEN_ENV_VAR,
+    MERGEN_BROWSER_MCP_ACP_CHAT_ID_ENV_VAR, MERGEN_BROWSER_MCP_ENDPOINT_PATH,
+    MERGEN_BROWSER_MCP_PORT_ENV_VAR, MERGEN_BROWSER_MCP_PROJECT_ID_ENV_VAR,
+    MERGEN_BROWSER_MCP_SESSION_ID_ENV_VAR, MERGEN_BROWSER_MCP_TERMINAL_ID_ENV_VAR,
+    MERGEN_BROWSER_MCP_TOKEN_ENV_VAR,
 };
 use serde_json::{json, Value as JsonValue};
 
@@ -343,6 +344,7 @@ fn browser_mcp_ipc_request(env: &HelperEnv, tool: &str, params: JsonValue) -> Br
         terminal_id: env.terminal_id,
         project_id: env.project_id,
         session_id: env.session_id.clone(),
+        acp_chat_id: env.acp_chat_id,
         tool: tool.to_owned(),
         params,
     }
@@ -420,6 +422,8 @@ struct HelperEnv {
     project_id: Option<u64>,
     /// Session ID for multi-session isolation.
     session_id: Option<String>,
+    /// ACP chat ID for terminal-less chat sessions (OpenCode ACP).
+    acp_chat_id: Option<u64>,
     caps: Vec<String>,
 }
 
@@ -437,6 +441,9 @@ impl HelperEnv {
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok()),
             session_id: env::var(MERGEN_BROWSER_MCP_SESSION_ID_ENV_VAR).ok(),
+            acp_chat_id: env::var(MERGEN_BROWSER_MCP_ACP_CHAT_ID_ENV_VAR)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok()),
             caps: parse_caps_from_args(),
         }
     }
@@ -1170,6 +1177,7 @@ mod tests {
             terminal_id: Some(1),
             project_id: Some(1),
             session_id: None,
+            acp_chat_id: None,
             caps: vec!["devtools".to_owned()],
         };
         // Public tools should be allowed
@@ -1334,6 +1342,7 @@ mod tests {
             terminal_id: Some(42),
             project_id: Some(7),
             session_id: None,
+            acp_chat_id: None,
             caps: Vec::new(),
         };
 

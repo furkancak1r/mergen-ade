@@ -913,7 +913,7 @@ impl TerminalRuntime {
                     std::env::current_exe().ok().map(|current_exe| {
                         (
                             current_exe,
-                            service.endpoint_env(terminal_id, Some(project_id), None),
+                            service.endpoint_env(terminal_id, Some(project_id), None, None),
                         )
                     })
                 });
@@ -955,7 +955,7 @@ impl TerminalRuntime {
         }
         if let Some(browser_mcp_service) = browser_mcp_service {
             for (name, value) in
-                browser_mcp_service.build_pty_env(terminal_id, Some(project_id), None)
+                browser_mcp_service.build_pty_env(terminal_id, Some(project_id), None, None)
             {
                 command.env(name, value);
             }

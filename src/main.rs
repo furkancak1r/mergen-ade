@@ -37,6 +37,7 @@ mod layout;
 mod models;
 mod mojibake;
 mod opencode;
+mod opencode_acp;
 mod opencode_config;
 mod opencode_hook_service;
 mod path_utils;
