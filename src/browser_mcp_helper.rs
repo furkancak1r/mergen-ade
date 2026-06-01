@@ -422,7 +422,7 @@ struct HelperEnv {
     project_id: Option<u64>,
     /// Session ID for multi-session isolation.
     session_id: Option<String>,
-    /// ACP chat ID for terminal-less chat sessions (OpenCode ACP).
+    /// OpenCode ACP session ID for terminal-less chat sessions.
     acp_chat_id: Option<u64>,
     caps: Vec<String>,
 }

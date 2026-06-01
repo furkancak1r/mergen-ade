@@ -482,7 +482,7 @@ enum AppIcon {
 pub enum ForegroundLauncherAction {
     /// Spawn a terminal with the given launcher ID.
     TerminalLauncher(String),
-    /// Open a terminal-less OpenCode ACP chat session.
+    /// Open a terminal-less OpenCode ACP session.
     OpenCodeChat,
 }
 
@@ -2200,19 +2200,19 @@ pub struct AdeApp {
     create_worktree_in_progress: Option<CreateWorktreePending>,
     create_worktree_events_tx: Sender<CreateWorktreeEvent>,
     create_worktree_events_rx: Receiver<CreateWorktreeEvent>,
-    /// ACP chat sessions (OpenCode ACP) per chat ID.
+    /// OpenCode ACP sessions per chat ID.
     acp_chat_sessions: BTreeMap<u64, crate::opencode_acp::AcpChatSession>,
     /// Chat IDs grouped by project (for multi-thread model).
     acp_chat_ids_by_project: BTreeMap<u64, Vec<u64>>,
     /// Active chat ID per project (which thread is visible for each project).
     active_acp_chat_by_project: BTreeMap<u64, u64>,
-    /// Sender for ACP chat events (cloned per spawn).
+    /// Sender for OpenCode ACP events (cloned per spawn).
     acp_chat_events_tx: Sender<crate::opencode_acp::AcpChatEvent>,
-    /// Receiver for ACP chat events from the agent threads.
+    /// Receiver for OpenCode ACP events from the agent threads.
     acp_chat_events_rx: Receiver<crate::opencode_acp::AcpChatEvent>,
-    /// Currently active ACP chat session ID (replaces terminal grid in main area).
+    /// Currently active OpenCode ACP session ID (replaces terminal grid in main area).
     active_acp_chat: Option<u64>,
-    /// Next ACP chat ID counter.
+    /// Next OpenCode ACP session ID counter.
     next_acp_chat_id: u64,
 }
 
@@ -4945,7 +4945,7 @@ impl AdeApp {
         self.pending_config_changes.selection = true;
         // Reset Directory search tracking so the same query re-runs for the new project.
         self.reset_directory_search_tracking_for_project(self.selected_project);
-        // Restore the active ACP chat for the newly selected project.
+        // Restore the active OpenCode ACP session for the newly selected project.
         if let Some(project_id) = self.selected_project {
             if let Some(&chat_id) = self.active_acp_chat_by_project.get(&project_id) {
                 if self.acp_chat_sessions.contains_key(&chat_id) {
@@ -9655,7 +9655,7 @@ impl AdeApp {
                         // After initialize response, send session/new
                         session.send_session_new();
                     }
-                    self.status_line = format!("ACP chat {chat_id} connected");
+                    self.status_line = format!("OpenCode ACP {chat_id} connected");
                 }
                 crate::opencode_acp::AcpChatEvent::SessionCreated {
                     chat_id,
@@ -9667,7 +9667,7 @@ impl AdeApp {
                         session.is_running = false;
                         session.updated_at = Instant::now();
                     }
-                    self.status_line = format!("ACP chat {chat_id} session created");
+                    self.status_line = format!("OpenCode ACP {chat_id} session created");
                 }
                 crate::opencode_acp::AcpChatEvent::AgentMessageChunk { chat_id, text } => {
                     if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
@@ -9803,7 +9803,7 @@ impl AdeApp {
                         session.is_running = false;
                         session.updated_at = Instant::now();
                     }
-                    self.status_line = format!("ACP chat {chat_id} stopped: {stop_reason}");
+                    self.status_line = format!("OpenCode ACP {chat_id} stopped: {stop_reason}");
                     changed = true;
                 }
                 crate::opencode_acp::AcpChatEvent::PermissionRequest {
@@ -9834,7 +9834,7 @@ impl AdeApp {
                             });
                         session.updated_at = Instant::now();
                     }
-                    self.status_line = format!("ACP chat {chat_id} error: {message}");
+                    self.status_line = format!("OpenCode ACP {chat_id} error: {message}");
                     changed = true;
                 }
                 crate::opencode_acp::AcpChatEvent::Disconnected { chat_id } => {
@@ -9843,7 +9843,7 @@ impl AdeApp {
                         session.is_running = false;
                         session.updated_at = Instant::now();
                     }
-                    self.status_line = format!("ACP chat {chat_id} disconnected");
+                    self.status_line = format!("OpenCode ACP {chat_id} disconnected");
                     changed = true;
                 }
             }
@@ -9863,7 +9863,7 @@ impl AdeApp {
                         self.active_acp_chat_by_project
                             .insert(project_id, last_chat_id);
                         self.active_acp_chat = Some(last_chat_id);
-                        self.status_line = format!("Switched to ACP chat for {}", project.name);
+                        self.status_line = format!("Switched to OpenCode ACP for {}", project.name);
                         return Some(last_chat_id);
                     }
                 }
@@ -9904,11 +9904,11 @@ impl AdeApp {
                     .push(chat_id);
                 self.active_acp_chat_by_project.insert(project_id, chat_id);
                 self.active_acp_chat = Some(chat_id);
-                self.status_line = format!("Started ACP chat for {}", project.name);
+                self.status_line = format!("Started OpenCode ACP for {}", project.name);
                 Some(chat_id)
             }
             Err(err) => {
-                self.status_line = format!("Failed to start ACP chat: {err}");
+                self.status_line = format!("Failed to start OpenCode ACP: {err}");
                 None
             }
         }
@@ -16816,12 +16816,12 @@ impl AdeApp {
             changes.note_shortcuts_change();
         }
 
-        // ACP chat mode toggle shortcut section
+        // OpenCode ACP mode toggle shortcut section
         ui.add_space(16.0);
         show_settings_card(
             ui,
             AppIcon::ChatText,
-            "OpenCode Chat Mode Toggle",
+            "OpenCode ACP Mode Toggle",
             "Shortcut to toggle between Plan and Build mode in the OpenCode chat composer.",
             |ui| {
                 let mut shortcut_changed = false;
@@ -20031,9 +20031,37 @@ impl AdeApp {
                     .available_rect_before_wrap()
                     .shrink2(margin.left_top() + margin.right_bottom());
 
+                // Compute composer height dynamically based on session content
+                let composer_height = if let Some(session) = self.acp_chat_sessions.get(&chat_id) {
+                    let mut h = 48.0f32;
+                    if !session.attachments.is_empty() {
+                        h += 24.0 + 4.0;
+                    }
+                    let has_permission = session.pending_permission.is_some();
+                    let has_slash = !session.available_commands.is_empty()
+                        && session.prompt_input.trim().starts_with('/');
+                    if has_permission {
+                        h += 60.0;
+                    }
+                    if has_slash {
+                        let query = session.prompt_input.trim();
+                        let prefix = if query.len() > 1 { &query[1..] } else { "" };
+                        let matches: Vec<_> = session
+                            .available_commands
+                            .iter()
+                            .filter(|c| c.name.starts_with(prefix))
+                            .collect();
+                        if !matches.is_empty() {
+                            h += (matches.len().min(4) as f32 * 22.0 + 24.0).min(120.0);
+                        }
+                    }
+                    h
+                } else {
+                    48.0
+                };
+
                 let thread_selector_height = 32.0;
                 let header_height = 36.0;
-                let composer_height = 48.0;
                 let status_row_height = 22.0;
                 let messages_height = (content_rect.height()
                     - thread_selector_height
@@ -20054,7 +20082,6 @@ impl AdeApp {
                         .layout(Layout::left_to_right(Align::Center)),
                 );
                 thread_ui.spacing_mut().item_spacing.x = 8.0;
-                // Project thread list
                 let project_id = self
                     .acp_chat_sessions
                     .get(&chat_id)
@@ -20123,7 +20150,7 @@ impl AdeApp {
                 );
                 header_ui.spacing_mut().item_spacing.x = 8.0;
                 header_ui.label(
-                    RichText::new(format!("{} OpenCode Chat", icons::CHAT_TEXT))
+                    RichText::new(format!("{} OpenCode ACP", icons::CHAT_TEXT))
                         .size(16.0)
                         .strong()
                         .color(TEXT_PRIMARY),
@@ -20266,16 +20293,16 @@ impl AdeApp {
                     });
                 ui.allocate_rect(messages_rect, Sense::hover());
 
-                // --- Compact composer ---
-                let composer_height = 48.0;
+                // --- Composer ---
                 let composer_rect = egui::Rect::from_min_size(
                     egui::pos2(content_rect.min.x, messages_rect.max.y + 8.0),
                     egui::vec2(content_rect.width(), composer_height),
                 );
+                ui.allocate_rect(composer_rect, Sense::hover());
                 let mut composer_ui = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(composer_rect)
-                        .layout(Layout::left_to_right(Align::Center)),
+                        .layout(Layout::top_down(Align::Min)),
                 );
                 composer_ui.set_clip_rect(composer_rect);
                 if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
@@ -20284,16 +20311,26 @@ impl AdeApp {
                     let session_ready = session.session_id.is_some()
                         && !matches!(session.status, crate::opencode_acp::AcpChatStatus::Starting);
                     let draft = session.prompt_input.clone();
-                    // Composer capsule frame
+
+                    // Capsule row
+                    let capsule_rect = egui::Rect::from_min_size(
+                        composer_ui.cursor().min,
+                        egui::vec2(composer_ui.available_width(), 48.0),
+                    );
+                    composer_ui.allocate_rect(capsule_rect, Sense::hover());
+                    let mut capsule_ui = composer_ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(capsule_rect)
+                            .layout(Layout::left_to_right(Align::Center)),
+                    );
                     egui::Frame::none()
                         .fill(Color32::from_rgb(27, 27, 27))
                         .stroke(Stroke::new(1.0, Color32::from_rgb(48, 48, 48)))
                         .rounding(12.0)
                         .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-                        .show(&mut composer_ui, |ui| {
+                        .show(&mut capsule_ui, |ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
-                            // Reserve ~210px for right-side controls (model selector + send button)
-                            let right_controls_reserved = 210.0;
+
                             // Circular + button
                             let plus_btn = ui.add(
                                 egui::Button::new(
@@ -20307,13 +20344,27 @@ impl AdeApp {
                             );
                             if plus_btn.clicked() {
                                 if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                                    let mut added_paths = Vec::new();
                                     for path in paths {
                                         if let Some(path_str) = path.to_str() {
                                             session.attachments.push(path_str.to_string());
+                                            added_paths.push(path_str.to_string());
                                         }
                                     }
+                                    if !added_paths.is_empty() {
+                                        session.prompt_input =
+                                            crate::opencode_acp::append_mentions_to_input(
+                                                &session.prompt_input,
+                                                &added_paths,
+                                            );
+                                        ctx.memory_mut(|m| {
+                                            m.request_focus(egui::Id::new("acp-composer-input"))
+                                        });
+                                    }
+                                    ctx.request_repaint();
                                 }
                             }
+
                             // Mode pill
                             let mut mode_changed = false;
                             let mut new_mode = String::new();
@@ -20346,7 +20397,6 @@ impl AdeApp {
                                     .small(),
                                 );
                                 if pill_btn.clicked() {
-                                    // Toggle between plan and build
                                     if current_mode == "plan" {
                                         if let Some(entry) =
                                             mode_opt.options.iter().find(|e| e.value == "build")
@@ -20372,9 +20422,18 @@ impl AdeApp {
                                     opt.current_value = new_mode;
                                 }
                             }
-                            // Input text
-                            let available_width =
-                                (ui.available_width() - right_controls_reserved).max(60.0);
+
+                            // Compute remaining width for text input and model selector
+                            let remaining = ui.available_width();
+                            let spacing = ui.spacing().item_spacing.x;
+                            let send_width = 32.0f32;
+                            let model_selector_width =
+                                (remaining - send_width - spacing * 2.0 - 40.0).clamp(60.0, 120.0);
+                            let text_input_width =
+                                (remaining - model_selector_width - send_width - spacing * 2.0)
+                                    .max(40.0);
+
+                            // Hint text
                             let hint_text = if session_ready {
                                 if let Some(mode_opt) = session.config_option("mode") {
                                     if mode_opt.current_value == "plan" {
@@ -20388,19 +20447,23 @@ impl AdeApp {
                             } else {
                                 "Waiting for session..."
                             };
+
+                            // Text input
                             let text_edit = egui::TextEdit::multiline(&mut session.prompt_input)
+                                .id_salt("acp-composer-input")
                                 .desired_rows(1)
-                                .desired_width(available_width)
+                                .desired_width(text_input_width)
                                 .hint_text(hint_text)
-                                .interactive(!is_running && session_ready)
+                                .interactive(!is_running)
                                 .return_key(egui::KeyboardShortcut::new(
                                     egui::Modifiers::CTRL,
                                     egui::Key::Enter,
                                 ))
                                 .frame(false);
                             let response =
-                                ui.add_sized(egui::vec2(available_width, 28.0), text_edit);
-                            // Detect plain Enter to submit
+                                ui.add_sized(egui::vec2(text_input_width, 36.0), text_edit);
+
+                            // Detect plain Enter
                             let plain_enter = ui.input(|i| {
                                 i.events.iter().any(|e| {
                                     matches!(
@@ -20417,38 +20480,30 @@ impl AdeApp {
                             if response.changed() {
                                 ctx.request_repaint();
                             }
+
                             let can_send = (!session.prompt_input.trim().is_empty()
                                 || !session.attachments.is_empty())
                                 && !is_running
                                 && session_ready;
-                            if (plain_enter || response.lost_focus()) && can_send {
+
+                            // Submit on plain Enter with focus
+                            if plain_enter && response.has_focus() && can_send {
                                 let text = session.prompt_input.trim().to_owned();
                                 session.prompt_input.clear();
                                 let attachments = std::mem::take(&mut session.attachments);
+                                let prompt_text =
+                                    crate::opencode_acp::build_acp_prompt_text(&text, &attachments);
                                 session
                                     .messages
                                     .push(crate::opencode_acp::AcpChatMessage::User {
-                                        text: text.clone(),
+                                        text: prompt_text.clone(),
                                     });
                                 session.is_running = true;
                                 session.status = crate::opencode_acp::AcpChatStatus::Running;
-                                // Prepend attachments info to prompt text
-                                let prompt_text = if attachments.is_empty() {
-                                    text
-                                } else {
-                                    let att_text =
-                                        format!("Attached files:\n{}", attachments.join("\n"));
-                                    if text.is_empty() {
-                                        att_text
-                                    } else {
-                                        format!("{}\n\n{}", text, att_text)
-                                    }
-                                };
-                                session.attachments = attachments;
                                 session.send_prompt(&prompt_text);
-                                session.attachments.clear();
                                 ctx.request_repaint();
                             }
+
                             // Model + effort selector
                             let model_label = session
                                 .config_option("model")
@@ -20469,13 +20524,24 @@ impl AdeApp {
                                                 .unwrap_or_else(|| e.current_value.clone())
                                         })
                                         .unwrap_or_default();
-                                    if effort.is_empty() {
+                                    let combined = if effort.is_empty() {
                                         name
                                     } else {
                                         format!("{} {}", name, effort)
+                                    };
+                                    // Truncate to ~18 chars with ellipsis
+                                    let mut truncated = String::new();
+                                    for (i, c) in combined.chars().enumerate() {
+                                        if i >= 18 {
+                                            truncated.push('…');
+                                            break;
+                                        }
+                                        truncated.push(c);
                                     }
+                                    truncated
                                 })
                                 .unwrap_or_else(|| "Model".to_string());
+
                             let mut selected_model = session
                                 .config_option("model")
                                 .map(|o| o.current_value.clone())
@@ -20486,13 +20552,14 @@ impl AdeApp {
                                 .map(|o| o.current_value.clone())
                                 .unwrap_or_default();
                             let current_effort = selected_effort.clone();
+
                             egui::ComboBox::from_id_salt("acp_composer_model_selector")
                                 .selected_text(
                                     RichText::new(format!("{} ▾", model_label))
                                         .size(11.0)
                                         .color(TEXT_MUTED),
                                 )
-                                .width(160.0)
+                                .width(model_selector_width)
                                 .show_ui(ui, |ui| {
                                     if let Some(model_opt) = session.config_option("model") {
                                         ui.label(RichText::new("Model").small().color(TEXT_MUTED));
@@ -20540,6 +20607,7 @@ impl AdeApp {
                                     opt.current_value = selected_effort;
                                 }
                             }
+
                             // Send button
                             let send_btn = ui.add_enabled(
                                 can_send,
@@ -20556,65 +20624,71 @@ impl AdeApp {
                                 let text = session.prompt_input.trim().to_owned();
                                 session.prompt_input.clear();
                                 let attachments = std::mem::take(&mut session.attachments);
+                                let prompt_text =
+                                    crate::opencode_acp::build_acp_prompt_text(&text, &attachments);
                                 session
                                     .messages
                                     .push(crate::opencode_acp::AcpChatMessage::User {
-                                        text: text.clone(),
+                                        text: prompt_text.clone(),
                                     });
                                 session.is_running = true;
                                 session.status = crate::opencode_acp::AcpChatStatus::Running;
-                                let prompt_text = if attachments.is_empty() {
-                                    text
-                                } else {
-                                    let att_text =
-                                        format!("Attached files:\n{}", attachments.join("\n"));
-                                    if text.is_empty() {
-                                        att_text
-                                    } else {
-                                        format!("{}\n\n{}", text, att_text)
-                                    }
-                                };
-                                session.attachments = attachments;
                                 session.send_prompt(&prompt_text);
-                                session.attachments.clear();
                                 ctx.request_repaint();
                             }
                         });
-                    // Attachment chips below composer
+
+                    // Attachment chips below capsule
                     if !session.attachments.is_empty() {
                         composer_ui.add_space(4.0);
-                        composer_ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            for (i, path) in session.attachments.clone().iter().enumerate() {
+                        let chip_row_rect = egui::Rect::from_min_size(
+                            composer_ui.cursor().min,
+                            egui::vec2(composer_ui.available_width(), 24.0),
+                        );
+                        composer_ui.allocate_rect(chip_row_rect, Sense::hover());
+                        let mut chip_ui = composer_ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(chip_row_rect)
+                                .layout(Layout::left_to_right(Align::Center)),
+                        );
+                        chip_ui.spacing_mut().item_spacing.x = 6.0;
+                        egui::ScrollArea::horizontal().show(&mut chip_ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let mut to_remove = Vec::new();
+                            for (i, path) in session.attachments.iter().enumerate() {
                                 let file_name = std::path::Path::new(path)
                                     .file_name()
                                     .and_then(|n| n.to_str())
                                     .unwrap_or(path);
-                                let chip_response = ui.add(
+                                let chip = ui.add(
                                     egui::Button::new(
-                                        RichText::new(format!(
-                                            "{} {} {}",
-                                            icons::FOLDER,
-                                            file_name,
-                                            icons::X
-                                        ))
-                                        .size(11.0)
-                                        .color(TEXT_MUTED),
+                                        RichText::new(format!("{} {}", icons::FOLDER, file_name))
+                                            .size(11.0)
+                                            .color(Color32::from_rgb(180, 180, 180)),
                                     )
-                                    .fill(Color32::from_rgb(35, 35, 35))
+                                    .fill(Color32::from_rgb(40, 40, 40))
                                     .rounding(4.0)
-                                    .stroke(Stroke::new(1.0, Color32::from_rgb(55, 55, 55)))
+                                    .stroke(Stroke::new(1.0, Color32::from_rgb(90, 90, 90)))
                                     .small(),
                                 );
-                                if chip_response.clicked() {
-                                    session.attachments.remove(i);
+                                if chip.clicked() {
+                                    to_remove.push(i);
                                 }
+                            }
+                            for i in to_remove.iter().rev() {
+                                let path = session.attachments.remove(*i);
+                                session.prompt_input =
+                                    crate::opencode_acp::remove_mention_from_input(
+                                        &session.prompt_input,
+                                        &path,
+                                    );
                             }
                         });
                     }
+
                     // Permission card below composer
-                    if let Some(permission) = session.pending_permission.take() {
-                        composer_ui.separator();
+                    if let Some(permission) = session.pending_permission.clone() {
+                        composer_ui.add_space(4.0);
                         composer_ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new(format!(
@@ -20625,6 +20699,7 @@ impl AdeApp {
                                 .color(TEXT_PRIMARY),
                             );
                         });
+                        let mut responded = false;
                         for opt in &permission.options {
                             if composer_ui
                                 .button(format!("{} {}", icons::CHECK_CIRCLE, opt.name))
@@ -20635,51 +20710,56 @@ impl AdeApp {
                                     &opt.option_id,
                                 );
                                 session.status = crate::opencode_acp::AcpChatStatus::Running;
+                                responded = true;
                             }
                         }
-                        if session.pending_permission.is_none() {
-                            session.pending_permission = Some(permission);
+                        if responded {
+                            session.pending_permission = None;
                         }
                     }
+
                     // Slash command hint
                     if !session.available_commands.is_empty() {
                         let query = session.prompt_input.trim();
-                        if query.starts_with('/') && query.len() > 1 {
-                            let prefix = &query[1..];
+                        if query.starts_with('/') {
+                            let prefix = if query.len() > 1 { &query[1..] } else { "" };
                             let matches: Vec<_> = session
                                 .available_commands
                                 .iter()
                                 .filter(|c| c.name.starts_with(prefix))
                                 .collect();
                             if !matches.is_empty() {
-                                composer_ui.separator();
+                                composer_ui.add_space(4.0);
                                 composer_ui
                                     .label(RichText::new("Commands:").small().color(TEXT_MUTED));
-                                for cmd in matches.iter().take(5) {
-                                    composer_ui.horizontal(|ui| {
-                                        ui.label(
-                                            RichText::new(format!("/{}", cmd.name))
-                                                .strong()
-                                                .color(ACCENT),
-                                        );
-                                        ui.label(
-                                            RichText::new(&cmd.description)
-                                                .small()
-                                                .color(TEXT_MUTED),
-                                        );
+                                egui::ScrollArea::vertical()
+                                    .auto_shrink([false, true])
+                                    .show(&mut composer_ui, |ui| {
+                                        for cmd in &matches {
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    RichText::new(format!("/{}", cmd.name))
+                                                        .strong()
+                                                        .color(ACCENT),
+                                                );
+                                                ui.label(
+                                                    RichText::new(&cmd.description)
+                                                        .small()
+                                                        .color(TEXT_MUTED),
+                                                );
+                                            });
+                                        }
                                     });
-                                }
                             }
                         }
                     }
+
                     if draft != session.prompt_input {
                         ctx.request_repaint();
                     }
                 }
-                ui.allocate_rect(composer_rect, Sense::hover());
 
                 // --- Status row ---
-                let status_row_height = 22.0;
                 let status_rect = egui::Rect::from_min_size(
                     egui::pos2(content_rect.min.x, composer_rect.max.y + 4.0),
                     egui::vec2(content_rect.width(), status_row_height),
@@ -20732,7 +20812,7 @@ impl AdeApp {
             return;
         }
 
-        // If an ACP chat is active, show it instead of the terminal grid.
+        // If an OpenCode ACP session is active, show it instead of the terminal grid.
         if let Some(chat_id) = self.active_acp_chat {
             if self.acp_chat_sessions.contains_key(&chat_id) {
                 self.draw_acp_chat_panel(ctx, chat_id);
@@ -26364,7 +26444,7 @@ impl eframe::App for AdeApp {
                 return;
             }
 
-            // ACP chat mode toggle shortcut (default Tab when ACP chat is active)
+            // OpenCode ACP mode toggle shortcut (default Tab when OpenCode ACP is active)
             if self.active_acp_chat.is_some()
                 && self.config.acp_mode_toggle_shortcut.enabled
                 && !self.show_settings_popup
@@ -26657,7 +26737,7 @@ impl eframe::App for AdeApp {
             browser.shutdown();
         }
 
-        // Kill all ACP chat sessions
+        // Kill all OpenCode ACP sessions
         for chat_id in self.acp_chat_sessions.keys().copied().collect::<Vec<_>>() {
             self.kill_acp_chat(chat_id);
         }
@@ -32200,9 +32280,9 @@ fn foreground_launcher_menu_content_height(total_rows: usize) -> f32 {
 
 fn foreground_launcher_menu_total_height(launcher_count: usize) -> f32 {
     let total_rows = if launcher_count == 0 {
-        2 // OpenCode Chat + hint row
+        2 // OpenCode ACP + hint row
     } else {
-        launcher_count + 1 // OpenCode Chat + launchers
+        launcher_count + 1 // OpenCode ACP + launchers
     };
     FOREGROUND_LAUNCHER_MENU_PADDING_Y * 2.0 + foreground_launcher_menu_content_height(total_rows)
 }
@@ -32239,7 +32319,7 @@ fn draw_launcher_menu_contents(
     ui.set_max_width(menu_width);
     ui.add_space(FOREGROUND_LAUNCHER_MENU_PADDING_Y);
 
-    // Synthetic OpenCode Chat row (always shown, non-persisted)
+    // Synthetic OpenCode ACP row (always shown, non-persisted)
     let full_row_rect =
         egui::Rect::from_min_size(ui.cursor().min, egui::vec2(menu_width, row_height));
     let row_rect = full_row_rect.shrink2(egui::vec2(FOREGROUND_LAUNCHER_MENU_PADDING_X, 0.0));
@@ -32258,7 +32338,7 @@ fn draw_launcher_menu_contents(
             ui.add_space(6.0);
             ui.add(
                 egui::Label::new(
-                    RichText::new("OpenCode Chat")
+                    RichText::new("OpenCode ACP")
                         .strong()
                         .color(if row_hovered { ACCENT } else { TEXT_PRIMARY }),
                 )
@@ -32326,7 +32406,7 @@ fn draw_launcher_menu_contents(
             }
         }
     } else {
-        // When no launchers are enabled, show a hint row after OpenCode Chat
+        // When no launchers are enabled, show a hint row after OpenCode ACP
         ui.add_space(FOREGROUND_LAUNCHER_ROW_GAP);
         let full_row_rect =
             egui::Rect::from_min_size(ui.cursor().min, egui::vec2(menu_width, row_height));
@@ -38017,9 +38097,9 @@ mod tests {
         launcher_count: usize,
     ) {
         let expected_row_count = if launcher_count == 0 {
-            2 // OpenCode Chat + hint
+            2 // OpenCode ACP + hint
         } else {
-            launcher_count + 1 // OpenCode Chat + launchers
+            launcher_count + 1 // OpenCode ACP + launchers
         };
         let expected_frame_height = super::foreground_launcher_menu_total_height(launcher_count);
         let frame_rect = collect_rects_matching(output, |rect_shape| {

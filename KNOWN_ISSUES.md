@@ -2,6 +2,28 @@
  
 ---
 
+#### OpenCode ACP chat composer dosya seçiminde input'a @dosya_adi ile eklenme {#acp-chat-attachment-mention}
+- Date: 2026-06-01
+- Context: User requested that when a file is selected via the `+` button in the ACP chat composer, the file name should be inserted into the input field as `@file_name` so the user can see inline which files are attached.
+- Error signature:
+  1. The `+` button only stored selected paths in `session.attachments` but did not update the visible input text.
+  2. Removing a chip did not clean up the input text, leaving stale references.
+- Symptoms/Impact:
+  1. The input field did not reflect attached files, making it hard to build a prompt that references specific files.
+  2. Removing a chip left orphaned `@file_name` text in the input.
+- Resolution:
+  - Added `path_to_mention()`, `append_mentions_to_input()`, and `remove_mention_from_input()` helpers in `src/opencode_acp.rs`.
+  - File picker now appends `@file_name` to `session.prompt_input` for each selected file, preserving existing text.
+  - Input focus is restored after the file picker closes via `ctx.memory_mut(|m| m.request_focus(...))`.
+  - Chip removal now also removes the corresponding `@file_name` mention from the input text using `remove_mention_from_input()`.
+  - Added unit tests for all three helpers and the remove behavior.
+- Prevent recurrence:
+  - Updated AGENTS.md OpenCode ACP Chat UI Guidelines with `+` button mention insertion and chip removal mention cleanup.
+- Files/Commands touched: `src/app.rs`, `src/opencode_acp.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-01
+
+---
+
 #### OpenCode ACP chat composer redesigned to match Cursor style {#acp-chat-cursor-composer}
 - Date: 2026-06-01
 - Context: User provided a Cursor screenshot showing a compact, rounded composer input with mode pill, model selector, and status row, and requested the OpenCode ACP chat UI to match that visual style.
@@ -47,13 +69,101 @@
   - Removed `×` icon from mode pill; the pill now shows only the mode name and toggles bidirectionally (`plan ↔ build`).
   - Added `Tab` as the default keyboard shortcut for Plan/Build toggle when the ACP chat is active and no popup is open.
   - Added `AcpModeToggleShortcut` config to `AppConfig` with `key`, `modifiers`, and `enabled` fields.
-  - Added Settings > Shortcuts > "OpenCode Chat Mode Toggle" card with enable/disable, key recording, and modifier checkboxes.
+  - Added Settings > Shortcuts > "OpenCode ACP Mode Toggle" card with enable/disable, key recording, and modifier checkboxes.
   - Reserved ~210px for right-side controls in the composer layout so the model selector and send button are always visible.
   - Added `send_prompt_includes_attachments_when_present` unit test in `opencode_acp.rs`.
   - Added `app_config_default_acp_mode_toggle_is_tab` unit test in `models.rs`.
 - Prevent recurrence:
   - Updated AGENTS.md OpenCode ACP Chat UI Guidelines with `+` button, mode pill, and Tab toggle behavior.
 - Files/Commands touched: `src/app.rs`, `src/opencode_acp.rs`, `src/models.rs`, `src/config.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-01
+
+---
+
+#### OpenCode ACP chat composer chip overlap and model selector overflow {#acp-chat-chip-overlap}
+- Date: 2026-06-01
+- Context: User reported that after selecting a file attachment, the chip overlay (`AGENTS.md`) rendered on top of the capsule input area instead of below it, and the model selector text was truncated/clipped (`Fireworks AI/Kimi K2.6 Tu...`).
+- Error signature:
+  1. The chip row was computed using `composer_ui.available_rect_before_wrap()`, but `capsule_ui` (created via `ui.new_child`) did not advance `composer_ui`'s cursor. So the chip row started at the same Y position as the capsule, causing overlap.
+  2. The input width was calculated before the plus button and mode pill were drawn, so the computed width was too large for the remaining space after those widgets. This pushed the model selector and send button off-screen.
+  3. Long model names (e.g. `Fireworks AI/Kimi K2.6 Turbo`) were rendered with truncation inside the ComboBox, causing visual overflow.
+- Symptoms/Impact:
+  1. The attachment chip visually overlapped the input text/hint area.
+  2. The model selector text was cut off or clipped.
+  3. The send button could be pushed out of the capsule on narrow windows.
+- Root cause:
+  - `capsule_row_rect` was a `new_child` that did not allocate space in the parent `composer_ui`, so the subsequent chip row reused the same top coordinate.
+  - `input_width` was computed with `ui.available_width()` before plus/mode widgets were allocated, making it larger than the actual remaining space.
+- Resolution:
+  - Changed `capsule_row_rect` to be computed from `composer_rect.min` explicitly instead of `composer_ui.available_rect_before_wrap()`.
+  - Added `composer_ui.allocate_rect(capsule_row_rect, Sense::hover())` after the capsule is drawn so the parent cursor advances past the 48px capsule height.
+  - Moved the `input_width` computation to after plus and mode pill are drawn, using `ui.available_width()` at that point which reflects the actual remaining space.
+  - Added `truncated_label` with an 18-character cap and ellipsis for the model selector display text.
+  - Reduced `model_max` from 160 to 120 and `model_min` from 80 to 60 to give more room to the input on narrow windows.
+- Prevent recurrence:
+  - Updated AGENTS.md OpenCode ACP Chat UI Guidelines to document that the capsule row must be explicitly allocated in the parent UI before drawing the chip row, and that model selector text must be truncated to avoid overflow.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-01
+
+---
+
+#### OpenCode ACP chat composer auto-send and layout overflow {#acp-chat-auto-send-overflow}
+- Date: 2026-06-01
+- Context: User reported that clicking the `+` button to add attachments triggered an automatic prompt send, and the composer UI overflowed/clipped when attachment chips appeared.
+- Error signature:
+  1. `response.lost_focus()` was used as a send trigger alongside plain Enter. When the file picker opened, the `TextEdit` lost focus; after the file picker closed and attachments were added, the `lost_focus` condition combined with `can_send` caused an immediate automatic submit.
+  2. The `composer_height` was dynamically calculated at the top of the panel but then overridden by a hardcoded `let composer_height = 48.0;` inside the draw block. This caused attachment chips, permission cards, and slash hints to render outside the clip rect and appear clipped or overflowed.
+  3. The model selector and send button were pushed off-screen when the window was narrow because the text input reserved a fixed ~210px right-side gap regardless of available width.
+- Symptoms/Impact:
+  1. Adding a file via the `+` button immediately sent the prompt without waiting for the user to press Enter or the Send button.
+  2. Attachment chips were invisible or clipped because the composer rect was only 48px tall.
+  3. On narrow windows, the right-side controls (model selector + send button) overflowed or disappeared.
+- Root cause:
+  - The `lost_focus` submit trigger was overly broad and reacted to any focus loss, including the file picker.
+  - The composer height variable was shadowed by a hardcoded value inside the draw function, ignoring the dynamic attachment height computed earlier.
+  - The right-side control reservation used a fixed pixel width instead of a relative/clamped width.
+- Resolution:
+  - Removed `response.lost_focus()` from the send condition. Submit now requires `plain_enter && response.has_focus() && can_send`.
+  - Removed the shadowing `let composer_height = 48.0;` so the precomputed dynamic height is used.
+  - Restructured the composer area into a `top_down` layout with a fixed 48px capsule row and a separate attachment chip row below it.
+  - Attachment chips are rendered inside a horizontal `ScrollArea` so many files do not overflow the composer width.
+  - Model selector width is now dynamically clamped between 80px and 160px based on available capsule width; input width fills the remaining space with a minimum of 40px.
+  - Added regression tests in `opencode_acp.rs` for `build_acp_prompt_text` behavior.
+- Prevent recurrence:
+  - Updated AGENTS.md OpenCode ACP Chat UI Guidelines with explicit rules: "Plain Enter only sends when the input has focus", "Attachment picker must not auto-send", and "Model selector shrinks when composer is narrow".
+- Files/Commands touched: `src/app.rs`, `src/opencode_acp.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-01
+
+---
+
+#### OpenCode ACP chat composer attachment visibility and duplicate bug {#acp-chat-attachment-fix}
+- Date: 2026-06-01
+- Context: User reported that attachment chips were not visible in the ACP chat composer, attachments were duplicated in the sent prompt, and the chat history did not show attached files.
+- Error signature:
+  1. The `composer_rect` was fixed at 48px and `composer_ui.set_clip_rect(composer_rect)` clipped the attachment chips drawn below the capsule.
+  2. `send_prompt` appended attachments from `session.attachments` to the JSON payload, but `app.rs` also restored attachments before calling `send_prompt` after building the combined prompt text, causing the attachment block to appear twice.
+  3. The chat history pushed `AcpChatMessage::User { text: text.clone() }` using only the raw user text, not the combined prompt text with attachments.
+- Symptoms/Impact:
+  1. File attachment chips were invisible or clipped below the composer.
+  2. The sent prompt contained duplicate "Attached files:" blocks.
+  3. The chat history did not reflect that files were attached.
+- Root cause:
+  - `app.rs` restored `session.attachments` before `send_prompt` via `session.attachments = attachments`, and `send_prompt` read `self.attachments` to append a second attachment block.
+  - The chat message used the raw `text` variable instead of the final `prompt_text`.
+- Resolution:
+  - Made `composer_height` dynamic based on `has_attachments` (`48.0 + attachment_row_height + 4.0` when attachments exist), so the clip rect includes the chip area.
+  - Changed attachment chip styling to brighter text (`rgb(180,180,180)`), darker fill (`rgb(40,40,40)`), and more visible stroke (`rgb(90,90,90)`).
+  - Added `build_acp_prompt_text()` helper in `opencode_acp.rs` to centralize prompt text construction.
+  - Removed the `session.attachments = attachments` restore before `send_prompt`; used `std::mem::take` and left `session.attachments` empty so `send_prompt` does not append duplicates.
+  - Updated both Enter-submit and send-button paths to use `prompt_text.clone()` for the chat history `User` message.
+  - Added regression tests:
+    - `build_acp_prompt_text_with_text_and_attachments`
+    - `build_acp_prompt_text_with_attachments_only`
+    - `build_acp_prompt_text_with_text_only`
+    - `build_acp_prompt_text_no_duplicate_attachments`
+- Prevent recurrence:
+  - Updated AGENTS.md OpenCode ACP Chat UI Guidelines with attachment visibility, chat history, and no-duplicate rules.
+- Files/Commands touched: `src/app.rs`, `src/opencode_acp.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-06-01
 
 ---
@@ -2447,4 +2557,30 @@
   - Updated AGENTS.md OpenCode ACP Chat Protocol Guidelines to document the brand-neutral `clientInfo`, `session/set_config_option` usage, and the structured `configOptions` format.
   - `cargo test` passes (1354 tests).
 - Files/Commands touched: `src/opencode_acp.rs`, `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-01
+
+---
+
+#### OpenCode ACP UI labels standardized from "OpenCode Chat" to "OpenCode ACP" {#opencode-acp-rename}
+- Date: 2026-06-01
+- Context: User requested that all user-facing labels for the ACP chat panel use the consistent name "OpenCode ACP" instead of the mixed "OpenCode Chat" / "ACP chat" naming that had accumulated across iterations.
+- Error signature:
+  1. The header label said "OpenCode Chat".
+  2. The launcher row said "OpenCode Chat".
+  3. The Settings shortcut card said "OpenCode Chat Mode Toggle".
+  4. Status line messages used "ACP chat" (e.g. "Started ACP chat for ...").
+- Symptoms/Impact:
+  1. Inconsistent branding across the UI.
+  2. Users could not tell whether the feature was called "OpenCode Chat", "ACP chat", or "OpenCode ACP".
+- Root cause:
+  - Earlier iterations renamed the panel from "OpenCode ACP" → "OpenCode Chat" (to avoid identity leak), but later the user wanted the original "OpenCode ACP" name restored for consistency.
+- Resolution:
+  - Header label: "OpenCode Chat" → "OpenCode ACP".
+  - Launcher/Terminal Manager synthetic row: "OpenCode Chat" → "OpenCode ACP".
+  - Settings shortcut card: "OpenCode Chat Mode Toggle" → "OpenCode ACP Mode Toggle".
+  - Status line messages: "Started ACP chat for ..." → "Started OpenCode ACP for ...", "Switched to ACP chat for ..." → "Switched to OpenCode ACP for ...", "ACP chat {id} connected/session created/stopped/error/disconnected" → "OpenCode ACP {id} ...".
+  - AGENTS.md heading: "OpenCode ACP Chat UI Guidelines" → "OpenCode ACP UI Guidelines".
+- Prevent recurrence:
+  - Updated AGENTS.md to use "OpenCode ACP" consistently in all user-facing references.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-06-01

@@ -34,7 +34,7 @@ pub struct BrowserMcpIpcRequest {
     /// Session ID for multi-session isolation (concurrent OpenCode sessions).
     #[serde(default)]
     pub session_id: Option<String>,
-    /// ACP chat ID for terminal-less chat sessions (OpenCode ACP).
+    /// OpenCode ACP session ID for terminal-less chat sessions.
     #[serde(default)]
     pub acp_chat_id: Option<u64>,
     pub tool: String,
@@ -97,7 +97,7 @@ pub struct BrowserMcpAuthScope {
     pub project_id: Option<u64>,
     /// Session ID for multi-session isolation.
     pub session_id: Option<String>,
-    /// ACP chat ID for terminal-less chat sessions (OpenCode ACP).
+    /// OpenCode ACP session ID for terminal-less chat sessions.
     pub acp_chat_id: Option<u64>,
 }
 
@@ -180,7 +180,7 @@ impl BrowserMcpTokenRegistry {
         }
     }
 
-    /// Revoke all tokens for a specific ACP chat (e.g., when chat closes).
+    /// Revoke all tokens for a specific OpenCode ACP session (e.g., when session closes).
     fn revoke_acp_chat(&mut self, acp_chat_id: u64) {
         let revoked = self
             .token_by_scope
@@ -323,7 +323,7 @@ impl BrowserMcpService {
         }
     }
 
-    /// Revoke all tokens for a specific ACP chat (e.g., when chat closes).
+    /// Revoke all tokens for a specific OpenCode ACP session (e.g., when session closes).
     pub fn revoke_acp_chat(&self, acp_chat_id: u64) {
         if let Ok(mut registry) = self.token_registry.lock() {
             registry.revoke_acp_chat(acp_chat_id);
@@ -339,7 +339,7 @@ pub struct BrowserMcpEndpointEnv {
     pub project_id: Option<u64>,
     /// Session ID for multi-session isolation.
     pub session_id: Option<String>,
-    /// ACP chat ID for terminal-less chat sessions (OpenCode ACP).
+    /// OpenCode ACP session ID for terminal-less chat sessions.
     pub acp_chat_id: Option<u64>,
 }
 

@@ -166,7 +166,7 @@ pub struct AcpCommand {
     pub description: String,
 }
 
-/// A single ACP chat session with the OpenCode agent.
+/// A single OpenCode ACP session with the OpenCode agent.
 #[derive(Debug)]
 pub struct AcpChatSession {
     pub id: u64,
@@ -188,6 +188,7 @@ pub struct AcpChatSession {
     pub is_running: bool,
     pub show_thread_selector: bool,
     pub selected_mode_id: Option<String>,
+    pub queue: Vec<String>,
     command_tx: crossbeam_channel::Sender<String>,
     #[allow(dead_code)]
     process: Option<Child>,
@@ -242,11 +243,7 @@ impl AcpChatSession {
             None => return,
         };
         let id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-        let mut prompt_parts = vec![json!({ "type": "text", "text": text })];
-        if !self.attachments.is_empty() {
-            let attachment_text = format!("Attached files:\n{}", self.attachments.join("\n"));
-            prompt_parts.push(json!({ "type": "text", "text": attachment_text }));
-        }
+        let prompt_parts = vec![json!({ "type": "text", "text": text })];
         let params = json!({
             "sessionId": session_id,
             "prompt": prompt_parts
@@ -314,7 +311,63 @@ impl AcpChatSession {
     }
 }
 
-/// Spawn a new OpenCode ACP chat session.
+/// Build the final prompt text from user text and attachment paths.
+pub fn build_acp_prompt_text(text: &str, attachments: &[String]) -> String {
+    if attachments.is_empty() {
+        text.to_string()
+    } else {
+        let att_text = format!("Attached files:\n{}", attachments.join("\n"));
+        if text.is_empty() {
+            att_text
+        } else {
+            format!("{}\n\n{}", text, att_text)
+        }
+    }
+}
+
+/// Extract the file name from a path and return as `@file_name`.
+pub fn path_to_mention(path: &str) -> String {
+    let file_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path);
+    format!("@{}", file_name)
+}
+
+/// Append attachment mentions to the composer input text.
+/// If input is empty, returns the mentions directly.
+/// Otherwise, appends a space followed by the mentions.
+pub fn append_mentions_to_input(input: &str, paths: &[String]) -> String {
+    if paths.is_empty() {
+        return input.to_string();
+    }
+    let mentions: Vec<String> = paths.iter().map(|p| path_to_mention(p)).collect();
+    let mentions_text = mentions.join(" ");
+    if input.is_empty() {
+        mentions_text
+    } else {
+        format!("{} {}", input, mentions_text)
+    }
+}
+
+/// Remove the last occurrence of a mention derived from `path` from the input text.
+/// Returns the original text if the mention is not found.
+pub fn remove_mention_from_input(input: &str, path: &str) -> String {
+    let mention = path_to_mention(path);
+    // Try to find the last occurrence of the mention, optionally preceded by a space.
+    if let Some(pos) = input.rfind(&mention) {
+        let before = &input[..pos];
+        let after = &input[pos + mention.len()..];
+        // If mention is preceded by a space and not at the start, remove the preceding space too.
+        if !before.is_empty() && before.ends_with(' ') {
+            return format!("{}{}", &before[..before.len() - 1], after);
+        }
+        return format!("{}{}", before, after);
+    }
+    input.to_string()
+}
+
+/// Spawn a new OpenCode ACP session.
 pub fn spawn_opencode_acp(
     chat_id: u64,
     project_id: u64,
@@ -455,6 +508,7 @@ pub fn spawn_opencode_acp(
         config_options_struct: Vec::new(),
         modes: Vec::new(),
         available_commands: Vec::new(),
+        queue: Vec::new(),
         show_thread_selector: false,
         selected_mode_id: None,
         command_tx,
@@ -862,6 +916,7 @@ mod tests {
             config_options_struct: Vec::new(),
             modes: Vec::new(),
             available_commands: Vec::new(),
+            queue: Vec::new(),
             messages: Vec::new(),
             pending_permission: None,
             prompt_input: String::new(),
@@ -927,7 +982,7 @@ mod tests {
     }
 
     #[test]
-    fn send_prompt_includes_attachments_when_present() {
+    fn send_prompt_does_not_append_attachments() {
         let (mut session, rx) = test_session();
         session.session_id = Some("sess-abc".to_string());
         session.attachments = vec!["C:/test/file.txt".to_string()];
@@ -935,22 +990,110 @@ mod tests {
         let msg = rx.recv().unwrap();
         let parsed: JsonValue = serde_json::from_str(&msg).unwrap();
         let prompt = parsed["params"]["prompt"].as_array().unwrap();
-        assert_eq!(prompt.len(), 2);
+        assert_eq!(prompt.len(), 1);
         assert_eq!(prompt[0]["text"], "hello");
-        assert!(
-            prompt[1]["text"]
-                .as_str()
-                .unwrap()
-                .contains("Attached files:"),
-            "attachment header should be present"
+    }
+
+    #[test]
+    fn build_acp_prompt_text_with_text_and_attachments() {
+        let attachments = vec![
+            "C:/test/file.txt".to_string(),
+            "D:/test/file2.png".to_string(),
+        ];
+        let result = build_acp_prompt_text("hello", &attachments);
+        assert_eq!(
+            result,
+            "hello\n\nAttached files:\nC:/test/file.txt\nD:/test/file2.png"
         );
-        assert!(
-            prompt[1]["text"]
-                .as_str()
-                .unwrap()
-                .contains("C:/test/file.txt"),
-            "attachment path should be present"
+    }
+
+    #[test]
+    fn build_acp_prompt_text_with_attachments_only() {
+        let attachments = vec!["C:/test/file.txt".to_string()];
+        let result = build_acp_prompt_text("", &attachments);
+        assert_eq!(result, "Attached files:\nC:/test/file.txt");
+    }
+
+    #[test]
+    fn build_acp_prompt_text_with_text_only() {
+        let result = build_acp_prompt_text("hello", &[]);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn build_acp_prompt_text_no_duplicate_attachments() {
+        let attachments = vec!["C:/test/file.txt".to_string()];
+        let result = build_acp_prompt_text("hello", &attachments);
+        assert!(result.contains("hello"));
+        assert!(result.contains("Attached files:"));
+        assert!(result.contains("C:/test/file.txt"));
+        // Should only contain the attachment path once
+        let count = result.matches("C:/test/file.txt").count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn path_to_mention_windows_path() {
+        assert_eq!(path_to_mention("C:/test/file.rs"), "@file.rs");
+    }
+
+    #[test]
+    fn path_to_mention_unicode_file_name() {
+        assert_eq!(path_to_mention("/home/user/şema.rs"), "@şema.rs");
+    }
+
+    #[test]
+    fn append_mentions_to_input_empty() {
+        let paths = vec!["C:/test/foo.rs".to_string()];
+        assert_eq!(append_mentions_to_input("", &paths), "@foo.rs");
+    }
+
+    #[test]
+    fn append_mentions_to_input_existing() {
+        let paths = vec!["C:/test/foo.rs".to_string()];
+        assert_eq!(
+            append_mentions_to_input("bunu incele", &paths),
+            "bunu incele @foo.rs"
         );
+    }
+
+    #[test]
+    fn append_mentions_to_input_multiple() {
+        let paths = vec!["C:/test/a.rs".to_string(), "D:/test/b.rs".to_string()];
+        assert_eq!(append_mentions_to_input("", &paths), "@a.rs @b.rs");
+    }
+
+    #[test]
+    fn append_mentions_to_input_existing_multiple() {
+        let paths = vec!["C:/test/a.rs".to_string(), "D:/test/b.rs".to_string()];
+        assert_eq!(
+            append_mentions_to_input("incele", &paths),
+            "incele @a.rs @b.rs"
+        );
+    }
+
+    #[test]
+    fn remove_mention_from_input_found() {
+        let result = remove_mention_from_input("bunu incele @foo.rs", "C:/test/foo.rs");
+        assert_eq!(result, "bunu incele");
+    }
+
+    #[test]
+    fn remove_mention_from_input_not_found() {
+        let result = remove_mention_from_input("bunu incele", "C:/test/foo.rs");
+        assert_eq!(result, "bunu incele");
+    }
+
+    #[test]
+    fn remove_mention_from_input_first_position() {
+        let result = remove_mention_from_input("@foo.rs bunu incele", "C:/test/foo.rs");
+        assert_eq!(result, " bunu incele");
+    }
+
+    #[test]
+    fn remove_mention_from_input_multiple() {
+        let result = remove_mention_from_input("@a.rs @b.rs @a.rs", "C:/test/a.rs");
+        assert_eq!(result, "@a.rs @b.rs");
     }
 
     #[test]
