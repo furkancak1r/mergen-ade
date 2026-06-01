@@ -137,7 +137,16 @@ pub fn discover_worktrees(project_path: &Path) -> std::io::Result<Vec<GitWorktre
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_git_worktree_list_porcelain(&stdout))
+    let mut results = parse_git_worktree_list_porcelain(&stdout);
+    for wt in &mut results {
+        if let Some(s) = wt.path.to_str() {
+            let r = crate::mojibake::repair_mojibake(s);
+            if r != s && std::path::Path::new(&r).exists() {
+                wt.path = std::path::PathBuf::from(r);
+            }
+        }
+    }
+    Ok(results)
 }
 
 #[cfg(test)]

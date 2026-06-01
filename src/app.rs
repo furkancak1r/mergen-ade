@@ -4516,10 +4516,11 @@ impl AdeApp {
 
     pub fn bootstrap(_cc: &eframe::CreationContext<'_>) -> Self {
         let config_path = config::config_path().unwrap_or_else(|_| PathBuf::from("config.toml"));
-        let (mut config, config_load_error) = match config::load_config(&config_path) {
-            Ok(config) => (config, None),
-            Err(err) => (AppConfig::default(), Some(err.to_string())),
-        };
+        let (mut config, config_load_error, needs_initial_persist) =
+            match config::load_config_with_status(&config_path) {
+                Ok((config, repaired)) => (config, None, repaired),
+                Err(err) => (AppConfig::default(), Some(err.to_string()), false),
+            };
         config.ui.show_project_explorer = true;
         config.ui.show_terminal_manager = true;
         config.ui.main_visibility_mode = MainVisibilityMode::Global;
@@ -4640,7 +4641,7 @@ impl AdeApp {
             }
         };
 
-        let app = Self {
+        let mut app = Self {
             config_path,
             current_executable_path,
             factory_droid_hooks_dir,
@@ -4805,6 +4806,10 @@ impl AdeApp {
         // Do NOT seed runtime browser state from legacy config.
         // Browser panel open state is now runtime-only per project.
         // config.ui.browser_panel_expanded is legacy and reset on load.
+        if needs_initial_persist {
+            app.note_projects_changed();
+            app.persist_config();
+        }
         app
     }
 
@@ -5127,6 +5132,7 @@ impl AdeApp {
                 .filter(|segment| !segment.trim().is_empty())
                 .unwrap_or_else(|| path.display().to_string())
         };
+        let name = crate::mojibake::repair_mojibake(&name);
 
         // Family-shared state: worktrees inherit root project's saved messages and browser URL.
         let (saved_messages, foreground_saved_messages, browser_last_url) = if is_worktree {

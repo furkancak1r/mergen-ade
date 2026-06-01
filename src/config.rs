@@ -148,8 +148,15 @@ pub fn codex_bridge_path() -> io::Result<PathBuf> {
 }
 
 pub fn load_config(path: &Path) -> io::Result<AppConfig> {
+    load_config_with_status(path).map(|(config, _)| config)
+}
+
+/// Like `load_config` but additionally reports whether mojibake repair
+/// modified any persisted strings. Bootstrap uses this to schedule an
+/// immediate write-back so the cleaned data is persisted to disk.
+pub fn load_config_with_status(path: &Path) -> io::Result<(AppConfig, bool)> {
     if !path.exists() {
-        return Ok(AppConfig::default());
+        return Ok((AppConfig::default(), false));
     }
 
     let text = fs::read_to_string(path)?;
@@ -160,8 +167,8 @@ pub fn load_config(path: &Path) -> io::Result<AppConfig> {
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
         legacy.into()
     };
-    normalize_config_for_current_platform(&mut config);
-    Ok(config)
+    let repaired = normalize_config_for_current_platform(&mut config);
+    Ok((config, repaired))
 }
 
 pub fn save_config(path: &Path, config: &AppConfig) -> io::Result<()> {
@@ -295,7 +302,7 @@ const fn default_config_version() -> u32 {
     1
 }
 
-fn normalize_config_for_current_platform(config: &mut AppConfig) {
+fn normalize_config_for_current_platform(config: &mut AppConfig) -> bool {
     config.default_shell = config.default_shell.normalize_for_current_platform();
     normalize_launcher_entries(&mut config.launchers);
     normalize_terminal_shortcut_entries(&mut config.terminal_shortcuts);
@@ -314,6 +321,53 @@ fn normalize_config_for_current_platform(config: &mut AppConfig) {
                 Some(crate::path_utils::normalize_windows_verbatim_path_for_shell(root));
         }
     }
+
+    repair_mojibake_in_projects(&mut config.projects)
+}
+
+fn repair_mojibake_in_projects(projects: &mut [crate::models::ProjectRecord]) -> bool {
+    let mut changed = false;
+    for project in projects.iter_mut() {
+        let repaired_name = crate::mojibake::repair_mojibake(&project.name);
+        if repaired_name != project.name {
+            project.name = repaired_name;
+            changed = true;
+        }
+
+        if let Some(path_str) = project.path.to_str() {
+            let repaired_path = crate::mojibake::repair_mojibake(path_str);
+            if repaired_path != path_str
+                && std::path::Path::new(&repaired_path).exists()
+            {
+                project.path = std::path::PathBuf::from(repaired_path);
+                changed = true;
+            }
+        }
+
+        if let Some(ref root) = project.repo_root {
+            if let Some(s) = root.to_str() {
+                let r = crate::mojibake::repair_mojibake(s);
+                if r != s && std::path::Path::new(&r).exists() {
+                    project.repo_root = Some(std::path::PathBuf::from(r));
+                    changed = true;
+                }
+            }
+        }
+
+        for msg in project
+            .saved_messages
+            .iter_mut()
+            .chain(project.foreground_saved_messages.iter_mut())
+            .chain(project.checklist.iter_mut())
+        {
+            let r = crate::mojibake::repair_mojibake(msg);
+            if r != *msg {
+                *msg = r;
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 #[cfg(test)]
