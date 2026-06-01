@@ -29,6 +29,35 @@
 
 ---
 
+#### OpenCode ACP chat composer UX improvements {#acp-chat-composer-ux}
+- Date: 2026-06-01
+- Context: User requested several UX improvements to the ACP chat composer: `+` button should open a file picker, mode pill should not show a `×` icon and should toggle both ways, and `Tab` should toggle between Plan/Build mode with the ability to customize the shortcut from Settings.
+- Error signature:
+  1. The `+` button was a non-functional placeholder with no action.
+  2. The mode pill showed a `×` icon (like a dismiss button) and only toggled one-way (plan → build, not build → plan).
+  3. There was no keyboard shortcut to toggle between Plan and Build modes.
+  4. The composer layout did not reserve space for the right-side model selector and send button, causing them to be pushed off-screen when the input text was long.
+- Symptoms/Impact:
+  1. Users could not attach files to the ACP chat prompt.
+  2. The mode pill's `×` icon was confusing and the one-way toggle was limiting.
+  3. No quick keyboard way to switch between Plan and Build modes.
+  4. Right-side controls could disappear on narrow window widths.
+- Resolution:
+  - `+` button now opens `rfd::FileDialog::new().pick_files()`; selected files are stored in `session.attachments` and rendered as removable chips below the composer.
+  - Removed `×` icon from mode pill; the pill now shows only the mode name and toggles bidirectionally (`plan ↔ build`).
+  - Added `Tab` as the default keyboard shortcut for Plan/Build toggle when the ACP chat is active and no popup is open.
+  - Added `AcpModeToggleShortcut` config to `AppConfig` with `key`, `modifiers`, and `enabled` fields.
+  - Added Settings > Shortcuts > "OpenCode Chat Mode Toggle" card with enable/disable, key recording, and modifier checkboxes.
+  - Reserved ~210px for right-side controls in the composer layout so the model selector and send button are always visible.
+  - Added `send_prompt_includes_attachments_when_present` unit test in `opencode_acp.rs`.
+  - Added `app_config_default_acp_mode_toggle_is_tab` unit test in `models.rs`.
+- Prevent recurrence:
+  - Updated AGENTS.md OpenCode ACP Chat UI Guidelines with `+` button, mode pill, and Tab toggle behavior.
+- Files/Commands touched: `src/app.rs`, `src/opencode_acp.rs`, `src/models.rs`, `src/config.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-01
+
+---
+
 #### Mergen saved messages and OpenCode MCPs migrated to Zed {#mergen-to-zed-migration}
 - Date: 2026-05-21
 - Context: User requested that Mergen project saved messages be copied to Zed as project tasks, and that OpenCode MCP servers be synchronized into Zed's `context_servers` (excluding Mergen-specific browser MCP, using Playwright instead).

@@ -701,6 +701,24 @@ impl Default for OsNotificationConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct AcpModeToggleShortcut {
+    pub key: String,
+    pub modifiers: ShortcutModifiers,
+    pub enabled: bool,
+}
+
+impl AcpModeToggleShortcut {
+    pub fn default_tab() -> Self {
+        Self {
+            key: "Tab".to_string(),
+            modifiers: ShortcutModifiers::default(),
+            enabled: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -717,6 +735,8 @@ pub struct AppConfig {
     pub opencode: OpenCodeModelConfig,
     #[serde(default)]
     pub notifications: OsNotificationConfig,
+    #[serde(default = "AcpModeToggleShortcut::default_tab")]
+    pub acp_mode_toggle_shortcut: AcpModeToggleShortcut,
 }
 
 impl Default for AppConfig {
@@ -731,6 +751,7 @@ impl Default for AppConfig {
             ai_hooks: AiHooksConfig::default(),
             opencode: OpenCodeModelConfig::default(),
             notifications: OsNotificationConfig::default(),
+            acp_mode_toggle_shortcut: AcpModeToggleShortcut::default_tab(),
         }
     }
 }
@@ -739,9 +760,9 @@ impl Default for AppConfig {
 mod tests {
     use super::{
         default_launchers, default_terminal_shortcuts, normalize_launcher_entries,
-        normalize_terminal_shortcut_entries, AppConfig, BuiltinLauncherKind, LauncherEntry,
-        LauncherIconKey, OpenCodeModelConfig, ShellKind, ShortcutModifiers, TerminalShortcutEntry,
-        UiConfig,
+        normalize_terminal_shortcut_entries, AcpModeToggleShortcut, AppConfig, BuiltinLauncherKind,
+        LauncherEntry, LauncherIconKey, OpenCodeModelConfig, ShellKind, ShortcutModifiers,
+        TerminalShortcutEntry, UiConfig,
     };
 
     #[test]
@@ -824,6 +845,17 @@ mod tests {
         let config = AppConfig::default();
 
         assert_eq!(config.terminal_shortcuts, default_terminal_shortcuts());
+    }
+
+    #[test]
+    fn app_config_default_acp_mode_toggle_is_tab() {
+        let config = AppConfig::default();
+        assert_eq!(config.acp_mode_toggle_shortcut.key, "Tab");
+        assert_eq!(
+            config.acp_mode_toggle_shortcut.modifiers,
+            ShortcutModifiers::default()
+        );
+        assert!(config.acp_mode_toggle_shortcut.enabled);
     }
 
     #[test]

@@ -184,6 +184,7 @@ pub struct AcpChatSession {
     pub messages: Vec<AcpChatMessage>,
     pub pending_permission: Option<AcpPendingPermission>,
     pub prompt_input: String,
+    pub attachments: Vec<String>,
     pub is_running: bool,
     pub show_thread_selector: bool,
     pub selected_mode_id: Option<String>,
@@ -241,9 +242,14 @@ impl AcpChatSession {
             None => return,
         };
         let id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let mut prompt_parts = vec![json!({ "type": "text", "text": text })];
+        if !self.attachments.is_empty() {
+            let attachment_text = format!("Attached files:\n{}", self.attachments.join("\n"));
+            prompt_parts.push(json!({ "type": "text", "text": attachment_text }));
+        }
         let params = json!({
             "sessionId": session_id,
-            "prompt": [{ "type": "text", "text": text }]
+            "prompt": prompt_parts
         });
         let msg = json!({
             "jsonrpc": "2.0",
@@ -442,6 +448,7 @@ pub fn spawn_opencode_acp(
         messages: Vec::new(),
         pending_permission: None,
         prompt_input: String::new(),
+        attachments: Vec::new(),
         is_running: false,
         session_id: None,
         config_options: BTreeMap::new(),
@@ -858,6 +865,7 @@ mod tests {
             messages: Vec::new(),
             pending_permission: None,
             prompt_input: String::new(),
+            attachments: Vec::new(),
             is_running: false,
             show_thread_selector: false,
             selected_mode_id: None,
@@ -916,6 +924,33 @@ mod tests {
         let parsed: JsonValue = serde_json::from_str(&msg).unwrap();
         assert_eq!(parsed["method"], "session/prompt");
         assert_eq!(parsed["params"]["sessionId"], "sess-abc");
+    }
+
+    #[test]
+    fn send_prompt_includes_attachments_when_present() {
+        let (mut session, rx) = test_session();
+        session.session_id = Some("sess-abc".to_string());
+        session.attachments = vec!["C:/test/file.txt".to_string()];
+        session.send_prompt("hello");
+        let msg = rx.recv().unwrap();
+        let parsed: JsonValue = serde_json::from_str(&msg).unwrap();
+        let prompt = parsed["params"]["prompt"].as_array().unwrap();
+        assert_eq!(prompt.len(), 2);
+        assert_eq!(prompt[0]["text"], "hello");
+        assert!(
+            prompt[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Attached files:"),
+            "attachment header should be present"
+        );
+        assert!(
+            prompt[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("C:/test/file.txt"),
+            "attachment path should be present"
+        );
     }
 
     #[test]

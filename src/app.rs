@@ -2063,6 +2063,8 @@ pub struct AdeApp {
     settings_diagnostics_expanded: bool,
     /// Which shortcut index is currently recording a key (None if not recording)
     settings_shortcut_recording_index: Option<usize>,
+    /// Whether the ACP mode toggle shortcut is currently recording a key
+    settings_acp_mode_toggle_recording: bool,
     saved_message_drafts: BTreeMap<u64, String>,
     /// Foreground saved messages popup state
     foreground_message_popup_open: Option<u64>, // project_id if popup is open
@@ -4720,6 +4722,7 @@ impl AdeApp {
             active_settings_section: SettingsSection::General,
             settings_diagnostics_expanded: false,
             settings_shortcut_recording_index: None,
+            settings_acp_mode_toggle_recording: false,
             saved_message_drafts: BTreeMap::new(),
             foreground_message_popup_open: None,
             foreground_message_popup_editing_index: None,
@@ -16578,7 +16581,7 @@ impl AdeApp {
             ui.add_space(8.0);
         }
 
-        // Handle key capture mode
+        // Handle key capture mode for terminal shortcuts
         let mut key_captured: Option<(usize, String, ShortcutModifiers)> = None;
         let mut capture_cancelled = false;
 
@@ -16614,6 +16617,13 @@ impl AdeApp {
                     .color(Color32::from_rgb(100, 195, 140)),
             );
             ui.add_space(8.0);
+        } else if self.settings_acp_mode_toggle_recording {
+            ui.label(
+                RichText::new("Recording ACP mode toggle key... Press any key to assign, or Escape to cancel.")
+                    .strong()
+                    .color(Color32::from_rgb(100, 195, 140)),
+            );
+            ui.add_space(8.0);
         }
 
         if capture_cancelled {
@@ -16629,6 +16639,45 @@ impl AdeApp {
                 changes.note_shortcuts_change();
             }
             self.settings_shortcut_recording_index = None;
+        }
+
+        // Handle key capture mode for ACP mode toggle shortcut
+        let mut acp_key_captured: Option<(String, ShortcutModifiers)> = None;
+        let mut acp_capture_cancelled = false;
+
+        if self.settings_acp_mode_toggle_recording {
+            ctx.input(|input| {
+                for event in &input.events {
+                    if let egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } = event
+                    {
+                        if *key == egui::Key::Escape {
+                            acp_capture_cancelled = true;
+                            break;
+                        }
+                        let key_str = Self::capture_shortcut_key(key);
+                        let mods = Self::egui_modifiers_to_stored(modifiers);
+                        acp_key_captured = Some((key_str, mods));
+                        break;
+                    }
+                }
+            });
+        }
+
+        if acp_capture_cancelled {
+            self.settings_acp_mode_toggle_recording = false;
+            acp_key_captured = None;
+        }
+
+        if let Some((key, mods)) = acp_key_captured {
+            self.config.acp_mode_toggle_shortcut.key = key;
+            self.config.acp_mode_toggle_shortcut.modifiers = mods;
+            self.settings_acp_mode_toggle_recording = false;
+            changes.note_shortcuts_change();
         }
 
         // List existing shortcuts
@@ -16766,6 +16815,72 @@ impl AdeApp {
         if shortcut_changed {
             changes.note_shortcuts_change();
         }
+
+        // ACP chat mode toggle shortcut section
+        ui.add_space(16.0);
+        show_settings_card(
+            ui,
+            AppIcon::ChatText,
+            "OpenCode Chat Mode Toggle",
+            "Shortcut to toggle between Plan and Build mode in the OpenCode chat composer.",
+            |ui| {
+                let mut shortcut_changed = false;
+                let mut toggle_enabled = self.config.acp_mode_toggle_shortcut.enabled;
+                if ui.checkbox(&mut toggle_enabled, "Enabled").changed() {
+                    self.config.acp_mode_toggle_shortcut.enabled = toggle_enabled;
+                    shortcut_changed = true;
+                }
+                ui.add_space(8.0);
+                // Key capture row
+                ui.horizontal(|ui| {
+                    ui.label("Key:");
+                    let is_recording = self.settings_acp_mode_toggle_recording;
+                    let display_combo = Self::format_shortcut_for_display(
+                        &self.config.acp_mode_toggle_shortcut.key,
+                        &self.config.acp_mode_toggle_shortcut.modifiers,
+                    );
+                    let button_text = if is_recording {
+                        "Recording..."
+                    } else if self.config.acp_mode_toggle_shortcut.key.is_empty() {
+                        "Click to record"
+                    } else {
+                        &display_combo
+                    };
+                    if ui.button(button_text).clicked() && !is_recording {
+                        self.settings_acp_mode_toggle_recording = true;
+                    }
+                    if is_recording {
+                        if ui.button("Cancel").clicked() {
+                            self.settings_acp_mode_toggle_recording = false;
+                        }
+                    }
+                });
+                // Modifiers checkboxes
+                ui.horizontal(|ui| {
+                    ui.label("Modifiers:");
+                    let mut mods = self.config.acp_mode_toggle_shortcut.modifiers;
+                    if ui.checkbox(&mut mods.ctrl, "Ctrl").changed() {
+                        self.config.acp_mode_toggle_shortcut.modifiers = mods;
+                        shortcut_changed = true;
+                    }
+                    if ui.checkbox(&mut mods.alt, "Alt").changed() {
+                        self.config.acp_mode_toggle_shortcut.modifiers = mods;
+                        shortcut_changed = true;
+                    }
+                    if ui.checkbox(&mut mods.shift, "Shift").changed() {
+                        self.config.acp_mode_toggle_shortcut.modifiers = mods;
+                        shortcut_changed = true;
+                    }
+                    if ui.checkbox(&mut mods.command, "Cmd").changed() {
+                        self.config.acp_mode_toggle_shortcut.modifiers = mods;
+                        shortcut_changed = true;
+                    }
+                });
+                if shortcut_changed {
+                    changes.note_shortcuts_change();
+                }
+            },
+        );
 
         // Add new shortcut section
         ui.add_space(8.0);
@@ -20177,8 +20292,10 @@ impl AdeApp {
                         .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                         .show(&mut composer_ui, |ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
+                            // Reserve ~210px for right-side controls (model selector + send button)
+                            let right_controls_reserved = 210.0;
                             // Circular + button
-                            let _plus_btn = ui.add(
+                            let plus_btn = ui.add(
                                 egui::Button::new(
                                     RichText::new(format!("{}", icons::PLUS))
                                         .size(14.0)
@@ -20188,9 +20305,19 @@ impl AdeApp {
                                 .rounding(16.0)
                                 .small(),
                             );
+                            if plus_btn.clicked() {
+                                if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                                    for path in paths {
+                                        if let Some(path_str) = path.to_str() {
+                                            session.attachments.push(path_str.to_string());
+                                        }
+                                    }
+                                }
+                            }
                             // Mode pill
+                            let mut mode_changed = false;
+                            let mut new_mode = String::new();
                             if let Some(mode_opt) = session.config_option("mode") {
-                                let mut selected_mode = mode_opt.current_value.clone();
                                 let current_mode = mode_opt.current_value.clone();
                                 let mode_name = mode_opt
                                     .options
@@ -20209,10 +20336,9 @@ impl AdeApp {
                                         Color32::from_rgb(16, 28, 40),
                                     )
                                 };
-                                let pill_text = format!("{} {}", mode_name, icons::X);
                                 let pill_btn = ui.add(
                                     egui::Button::new(
-                                        RichText::new(pill_text).size(12.0).color(pill_color),
+                                        RichText::new(&mode_name).size(12.0).color(pill_color),
                                     )
                                     .fill(pill_fill)
                                     .rounding(6.0)
@@ -20220,27 +20346,35 @@ impl AdeApp {
                                     .small(),
                                 );
                                 if pill_btn.clicked() {
+                                    // Toggle between plan and build
                                     if current_mode == "plan" {
-                                        if let Some(build_entry) =
+                                        if let Some(entry) =
                                             mode_opt.options.iter().find(|e| e.value == "build")
                                         {
-                                            selected_mode = build_entry.value.clone();
+                                            new_mode = entry.value.clone();
+                                            mode_changed = true;
                                         }
-                                    }
-                                }
-                                if selected_mode != current_mode {
-                                    session.send_set_config_option("mode", &selected_mode);
-                                    if let Some(opt) = session
-                                        .config_options_struct
-                                        .iter_mut()
-                                        .find(|o| o.id == "mode")
+                                    } else if let Some(entry) =
+                                        mode_opt.options.iter().find(|e| e.value == "plan")
                                     {
-                                        opt.current_value = selected_mode;
+                                        new_mode = entry.value.clone();
+                                        mode_changed = true;
                                     }
                                 }
                             }
+                            if mode_changed && !new_mode.is_empty() {
+                                session.send_set_config_option("mode", &new_mode);
+                                if let Some(opt) = session
+                                    .config_options_struct
+                                    .iter_mut()
+                                    .find(|o| o.id == "mode")
+                                {
+                                    opt.current_value = new_mode;
+                                }
+                            }
                             // Input text
-                            let available_width = ui.available_width();
+                            let available_width =
+                                (ui.available_width() - right_controls_reserved).max(60.0);
                             let hint_text = if session_ready {
                                 if let Some(mode_opt) = session.config_option("mode") {
                                     if mode_opt.current_value == "plan" {
@@ -20264,8 +20398,8 @@ impl AdeApp {
                                     egui::Key::Enter,
                                 ))
                                 .frame(false);
-                            let response = ui
-                                .add_sized(egui::vec2(available_width.max(60.0), 28.0), text_edit);
+                            let response =
+                                ui.add_sized(egui::vec2(available_width, 28.0), text_edit);
                             // Detect plain Enter to submit
                             let plain_enter = ui.input(|i| {
                                 i.events.iter().any(|e| {
@@ -20283,12 +20417,14 @@ impl AdeApp {
                             if response.changed() {
                                 ctx.request_repaint();
                             }
-                            let can_send = !session.prompt_input.trim().is_empty()
+                            let can_send = (!session.prompt_input.trim().is_empty()
+                                || !session.attachments.is_empty())
                                 && !is_running
                                 && session_ready;
                             if (plain_enter || response.lost_focus()) && can_send {
                                 let text = session.prompt_input.trim().to_owned();
                                 session.prompt_input.clear();
+                                let attachments = std::mem::take(&mut session.attachments);
                                 session
                                     .messages
                                     .push(crate::opencode_acp::AcpChatMessage::User {
@@ -20296,7 +20432,21 @@ impl AdeApp {
                                     });
                                 session.is_running = true;
                                 session.status = crate::opencode_acp::AcpChatStatus::Running;
-                                session.send_prompt(&text);
+                                // Prepend attachments info to prompt text
+                                let prompt_text = if attachments.is_empty() {
+                                    text
+                                } else {
+                                    let att_text =
+                                        format!("Attached files:\n{}", attachments.join("\n"));
+                                    if text.is_empty() {
+                                        att_text
+                                    } else {
+                                        format!("{}\n\n{}", text, att_text)
+                                    }
+                                };
+                                session.attachments = attachments;
+                                session.send_prompt(&prompt_text);
+                                session.attachments.clear();
                                 ctx.request_repaint();
                             }
                             // Model + effort selector
@@ -20405,6 +20555,7 @@ impl AdeApp {
                             if send_btn.clicked() && can_send {
                                 let text = session.prompt_input.trim().to_owned();
                                 session.prompt_input.clear();
+                                let attachments = std::mem::take(&mut session.attachments);
                                 session
                                     .messages
                                     .push(crate::opencode_acp::AcpChatMessage::User {
@@ -20412,10 +20563,55 @@ impl AdeApp {
                                     });
                                 session.is_running = true;
                                 session.status = crate::opencode_acp::AcpChatStatus::Running;
-                                session.send_prompt(&text);
+                                let prompt_text = if attachments.is_empty() {
+                                    text
+                                } else {
+                                    let att_text =
+                                        format!("Attached files:\n{}", attachments.join("\n"));
+                                    if text.is_empty() {
+                                        att_text
+                                    } else {
+                                        format!("{}\n\n{}", text, att_text)
+                                    }
+                                };
+                                session.attachments = attachments;
+                                session.send_prompt(&prompt_text);
+                                session.attachments.clear();
                                 ctx.request_repaint();
                             }
                         });
+                    // Attachment chips below composer
+                    if !session.attachments.is_empty() {
+                        composer_ui.add_space(4.0);
+                        composer_ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            for (i, path) in session.attachments.clone().iter().enumerate() {
+                                let file_name = std::path::Path::new(path)
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or(path);
+                                let chip_response = ui.add(
+                                    egui::Button::new(
+                                        RichText::new(format!(
+                                            "{} {} {}",
+                                            icons::FOLDER,
+                                            file_name,
+                                            icons::X
+                                        ))
+                                        .size(11.0)
+                                        .color(TEXT_MUTED),
+                                    )
+                                    .fill(Color32::from_rgb(35, 35, 35))
+                                    .rounding(4.0)
+                                    .stroke(Stroke::new(1.0, Color32::from_rgb(55, 55, 55)))
+                                    .small(),
+                                );
+                                if chip_response.clicked() {
+                                    session.attachments.remove(i);
+                                }
+                            }
+                        });
+                    }
                     // Permission card below composer
                     if let Some(permission) = session.pending_permission.take() {
                         composer_ui.separator();
@@ -26161,11 +26357,102 @@ impl eframe::App for AdeApp {
             }
 
             let (alt_m_events, remaining_events) =
-                Self::partition_alt_m_shortcut(events, global_modifiers);
+                Self::partition_alt_m_shortcut(events.clone(), global_modifiers);
             if !alt_m_events.is_empty() {
                 self.toggle_main_visibility_mode();
                 raw_input.events = remaining_events;
                 return;
+            }
+
+            // ACP chat mode toggle shortcut (default Tab when ACP chat is active)
+            if self.active_acp_chat.is_some()
+                && self.config.acp_mode_toggle_shortcut.enabled
+                && !self.show_settings_popup
+                && !self.show_exit_confirm_popup
+                && self.foreground_message_popup_open.is_none()
+                && !self.show_create_worktree_popup
+                && !ctx.memory(|mem| mem.any_popup_open())
+                && !ctx.is_context_menu_open()
+            {
+                let shortcut = &self.config.acp_mode_toggle_shortcut;
+                let key_matches = shortcut.key.eq_ignore_ascii_case("Tab");
+                let mods_match = shortcut.modifiers.ctrl == global_modifiers.ctrl
+                    && shortcut.modifiers.alt == global_modifiers.alt
+                    && shortcut.modifiers.shift == global_modifiers.shift
+                    && shortcut.modifiers.command == global_modifiers.mac_cmd;
+                if key_matches && mods_match {
+                    let mut tab_consumed = false;
+                    for event in &events {
+                        if let Event::Key {
+                            key: Key::Tab,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } = event
+                        {
+                            if modifiers.ctrl == shortcut.modifiers.ctrl
+                                && modifiers.alt == shortcut.modifiers.alt
+                                && modifiers.shift == shortcut.modifiers.shift
+                                && modifiers.command == shortcut.modifiers.command
+                            {
+                                tab_consumed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if tab_consumed {
+                        if let Some(chat_id) = self.active_acp_chat {
+                            if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+                                if let Some(mode_opt) = session.config_option("mode") {
+                                    let current = &mode_opt.current_value;
+                                    let new_mode = if current == "plan" {
+                                        mode_opt
+                                            .options
+                                            .iter()
+                                            .find(|e| e.value == "build")
+                                            .map(|e| e.value.clone())
+                                    } else {
+                                        mode_opt
+                                            .options
+                                            .iter()
+                                            .find(|e| e.value == "plan")
+                                            .map(|e| e.value.clone())
+                                    };
+                                    if let Some(new_mode) = new_mode {
+                                        session.send_set_config_option("mode", &new_mode);
+                                        if let Some(opt) = session
+                                            .config_options_struct
+                                            .iter_mut()
+                                            .find(|o| o.id == "mode")
+                                        {
+                                            opt.current_value = new_mode;
+                                        }
+                                        ctx.request_repaint();
+                                    }
+                                }
+                            }
+                        }
+                        // Filter out the Tab event so TextEdit doesn't get it
+                        raw_input.events = events
+                            .into_iter()
+                            .filter(|event| {
+                                !matches!(
+                                    event,
+                                    Event::Key {
+                                        key: Key::Tab,
+                                        pressed: true,
+                                        modifiers,
+                                        ..
+                                    } if modifiers.ctrl == shortcut.modifiers.ctrl
+                                        && modifiers.alt == shortcut.modifiers.alt
+                                        && modifiers.shift == shortcut.modifiers.shift
+                                        && modifiers.command == shortcut.modifiers.command
+                                )
+                            })
+                            .collect();
+                        return;
+                    }
+                }
             }
 
             if self.should_steal_attention_terminal_input(ctx, &remaining_events) {
@@ -45100,6 +45387,7 @@ mod tests {
             active_settings_section: SettingsSection::General,
             settings_diagnostics_expanded: false,
             settings_shortcut_recording_index: None,
+            settings_acp_mode_toggle_recording: false,
             saved_message_drafts: BTreeMap::new(),
             foreground_message_popup_open: None,
             foreground_message_popup_editing_index: None,

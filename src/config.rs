@@ -294,6 +294,7 @@ impl From<LegacyAppConfig> for AppConfig {
             ai_hooks: crate::hooks::AiHooksConfig::default(),
             opencode: crate::models::OpenCodeModelConfig::default(),
             notifications: crate::models::OsNotificationConfig::default(),
+            acp_mode_toggle_shortcut: crate::models::AcpModeToggleShortcut::default_tab(),
         }
     }
 }
