@@ -9763,13 +9763,20 @@ impl AdeApp {
                     }
                     changed = true;
                 }
-                crate::opencode_acp::AcpChatEvent::ConfigOptionUpdate {
-                    chat_id,
-                    category,
-                    value,
-                } => {
+                crate::opencode_acp::AcpChatEvent::ConfigOptionUpdate { chat_id, option } => {
                     if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
-                        session.config_options.insert(category, value);
+                        session
+                            .config_options
+                            .insert(option.id.clone(), option.current_value.clone());
+                        let pos = session
+                            .config_options_struct
+                            .iter()
+                            .position(|o| o.id == option.id);
+                        if let Some(idx) = pos {
+                            session.config_options_struct[idx] = option;
+                        } else {
+                            session.config_options_struct.push(option);
+                        }
                         session.updated_at = Instant::now();
                     }
                     changed = true;
@@ -9843,17 +9850,19 @@ impl AdeApp {
         }
     }
 
-    fn spawn_acp_chat_for_project(&mut self, project_id: u64) -> Option<u64> {
+    fn spawn_acp_chat_for_project(&mut self, project_id: u64, force_new: bool) -> Option<u64> {
         let project = self.projects.get(&project_id)?;
-        // If project already has chats, activate the most recent one.
-        if let Some(chat_ids) = self.acp_chat_ids_by_project.get(&project_id) {
-            if let Some(&last_chat_id) = chat_ids.last() {
-                if self.acp_chat_sessions.contains_key(&last_chat_id) {
-                    self.active_acp_chat_by_project
-                        .insert(project_id, last_chat_id);
-                    self.active_acp_chat = Some(last_chat_id);
-                    self.status_line = format!("Switched to ACP chat for {}", project.name);
-                    return Some(last_chat_id);
+        // If project already has chats and force_new is false, activate the most recent one.
+        if !force_new {
+            if let Some(chat_ids) = self.acp_chat_ids_by_project.get(&project_id) {
+                if let Some(&last_chat_id) = chat_ids.last() {
+                    if self.acp_chat_sessions.contains_key(&last_chat_id) {
+                        self.active_acp_chat_by_project
+                            .insert(project_id, last_chat_id);
+                        self.active_acp_chat = Some(last_chat_id);
+                        self.status_line = format!("Switched to ACP chat for {}", project.name);
+                        return Some(last_chat_id);
+                    }
                 }
             }
         }
@@ -19105,7 +19114,7 @@ impl AdeApp {
                             )
                         }
                         Some(ForegroundLauncherAction::OpenCodeChat) => {
-                            self.spawn_acp_chat_for_project(project_id);
+                            self.spawn_acp_chat_for_project(project_id, true);
                             false
                         }
                         None => false,
@@ -19193,7 +19202,7 @@ impl AdeApp {
                                             )
                                         }
                                         Some(ForegroundLauncherAction::OpenCodeChat) => {
-                                            self.spawn_acp_chat_for_project(wt_project_id);
+                                            self.spawn_acp_chat_for_project(wt_project_id, true);
                                             false
                                         }
                                         None => false,
@@ -19969,7 +19978,7 @@ impl AdeApp {
                     )
                     .clicked()
                 {
-                    self.spawn_acp_chat_for_project(project_id);
+                    self.spawn_acp_chat_for_project(project_id, true);
                 }
                 thread_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
@@ -19997,7 +20006,7 @@ impl AdeApp {
                 );
                 header_ui.spacing_mut().item_spacing.x = 8.0;
                 header_ui.label(
-                    RichText::new(format!("{} OpenCode ACP", icons::CHAT_TEXT))
+                    RichText::new(format!("{} OpenCode Chat", icons::CHAT_TEXT))
                         .size(16.0)
                         .strong()
                         .color(TEXT_PRIMARY),
@@ -20022,43 +20031,112 @@ impl AdeApp {
                         _ => TEXT_MUTED,
                     };
                     header_ui.label(RichText::new(status_text).size(12.0).color(status_color));
-                    // Mode selector if modes available
-                    if !session.modes.is_empty() {
-                        let mode_id = session.selected_mode_id.clone().unwrap_or_else(|| {
-                            session
-                                .modes
-                                .first()
-                                .map(|m| m.id.clone())
-                                .unwrap_or_default()
-                        });
-                        let mode_label = session
-                            .modes
-                            .iter()
-                            .find(|m| m.id == mode_id)
-                            .map(|m| m.name.clone())
-                            .unwrap_or_else(|| mode_id.clone());
-                        let mut selected_mode_id = session.selected_mode_id.clone();
+                    // Mode selector from config_options_struct
+                    if let Some(mode_opt) = session.config_option("mode") {
+                        let mut selected_mode = mode_opt.current_value.clone();
+                        let current_mode = mode_opt.current_value.clone();
                         egui::ComboBox::from_id_salt("acp_mode_selector")
-                            .selected_text(RichText::new(mode_label).size(12.0).color(TEXT_PRIMARY))
-                            .width(120.0)
+                            .selected_text(
+                                RichText::new(format!(
+                                    "{}: {}",
+                                    mode_opt.name, mode_opt.current_value
+                                ))
+                                .size(12.0)
+                                .color(TEXT_PRIMARY),
+                            )
+                            .width(140.0)
                             .show_ui(&mut header_ui, |ui| {
-                                for mode in &session.modes {
+                                for entry in &mode_opt.options {
+                                    let label = if let Some(ref desc) = entry.description {
+                                        format!("{} — {}", entry.name, desc)
+                                    } else {
+                                        entry.name.clone()
+                                    };
                                     ui.selectable_value(
-                                        &mut selected_mode_id,
-                                        Some(mode.id.clone()),
-                                        RichText::new(&mode.name).size(12.0).color(TEXT_PRIMARY),
+                                        &mut selected_mode,
+                                        entry.value.clone(),
+                                        RichText::new(label).size(12.0).color(TEXT_PRIMARY),
                                     );
                                 }
                             });
-                        session.selected_mode_id = selected_mode_id;
+                        if selected_mode != current_mode {
+                            session.send_set_config_option("mode", &selected_mode);
+                            if let Some(opt) = session
+                                .config_options_struct
+                                .iter_mut()
+                                .find(|o| o.id == "mode")
+                            {
+                                opt.current_value = selected_mode;
+                            }
+                        }
                     }
-                    // Model display from config_options
-                    if let Some(model) = session.config_options.get("model") {
-                        header_ui.label(
-                            RichText::new(format!("Model: {model}"))
-                                .size(11.0)
-                                .color(TEXT_MUTED),
-                        );
+                    // Model selector from config_options_struct
+                    if let Some(model_opt) = session.config_option("model") {
+                        let mut selected_model = model_opt.current_value.clone();
+                        let current_model = model_opt.current_value.clone();
+                        egui::ComboBox::from_id_salt("acp_model_selector")
+                            .selected_text(
+                                RichText::new(format!(
+                                    "{}: {}",
+                                    model_opt.name, model_opt.current_value
+                                ))
+                                .size(12.0)
+                                .color(TEXT_PRIMARY),
+                            )
+                            .width(200.0)
+                            .show_ui(&mut header_ui, |ui| {
+                                for entry in &model_opt.options {
+                                    ui.selectable_value(
+                                        &mut selected_model,
+                                        entry.value.clone(),
+                                        RichText::new(&entry.name).size(12.0).color(TEXT_PRIMARY),
+                                    );
+                                }
+                            });
+                        if selected_model != current_model {
+                            session.send_set_config_option("model", &selected_model);
+                            if let Some(opt) = session
+                                .config_options_struct
+                                .iter_mut()
+                                .find(|o| o.id == "model")
+                            {
+                                opt.current_value = selected_model;
+                            }
+                        }
+                    }
+                    // Effort selector from config_options_struct
+                    if let Some(effort_opt) = session.config_option("effort") {
+                        let mut selected_effort = effort_opt.current_value.clone();
+                        let current_effort = effort_opt.current_value.clone();
+                        egui::ComboBox::from_id_salt("acp_effort_selector")
+                            .selected_text(
+                                RichText::new(format!(
+                                    "{}: {}",
+                                    effort_opt.name, effort_opt.current_value
+                                ))
+                                .size(12.0)
+                                .color(TEXT_PRIMARY),
+                            )
+                            .width(120.0)
+                            .show_ui(&mut header_ui, |ui| {
+                                for entry in &effort_opt.options {
+                                    ui.selectable_value(
+                                        &mut selected_effort,
+                                        entry.value.clone(),
+                                        RichText::new(&entry.name).size(12.0).color(TEXT_PRIMARY),
+                                    );
+                                }
+                            });
+                        if selected_effort != current_effort {
+                            session.send_set_config_option("effort", &selected_effort);
+                            if let Some(opt) = session
+                                .config_options_struct
+                                .iter_mut()
+                                .find(|o| o.id == "effort")
+                            {
+                                opt.current_value = selected_effort;
+                            }
+                        }
                     }
                 }
                 header_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -20109,7 +20187,7 @@ impl AdeApp {
                                     crate::opencode_acp::AcpChatMessage::Agent { text } => {
                                         ui.horizontal_wrapped(|ui| {
                                             ui.label(
-                                                RichText::new("Agent: ")
+                                                RichText::new("OpenCode: ")
                                                     .strong()
                                                     .color(Color32::from_rgb(100, 200, 255)),
                                             );

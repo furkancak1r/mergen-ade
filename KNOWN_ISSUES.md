@@ -2359,3 +2359,36 @@
   - Documented in AGENTS.md that ACP chat must not spawn an external console window.
 - Files/Commands touched: `src/opencode_acp.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-06-01
+
+---
+
+#### OpenCode ACP chat leaked Mergen identity and lacked real mode/model selectors {#acp-chat-identity-leak}
+- Date: 2026-06-01
+- Context: User reported that the ACP chat panel said "OpenCode ACP" and used "Agent:" labels, and the agent sometimes answered "I am Mergen" because the initialize request sent `clientInfo.name = "mergen-ade"`. Additionally, the UI had no way to switch between Build/Plan modes or select models from the real OpenCode provider list.
+- Error signature: `AcpConfigOption` only stored `{category, value}`; `configOptions` parsing ignored the full structured option objects (`id`, `name`, `currentValue`, `options`) returned by OpenCode. The UI mode selector was driven by `CurrentModeUpdate` (a single mode) instead of the `configOptions` array. The prompt request redundantly included `modeId` and `model` params.
+- Symptoms/Impact:
+  1. Asking "who are you?" in ACP chat could produce answers referencing Mergen instead of OpenCode.
+  2. Build/Plan mode switching was not wired to the actual OpenCode ACP protocol.
+  3. Model selection was read-only text; users could not pick from the real provider/model list.
+  4. The "New Chat" button sometimes just activated an existing chat instead of creating a new session.
+- Root cause:
+  - `spawn_opencode_acp()` sent `clientInfo` with Mergen branding.
+  - `AcpChatEvent::ConfigOptionUpdate` only carried `category: String` and `value: String`, so the parser discarded the `options` list.
+  - `send_prompt()` included `modeId` and `model` params, overriding the session state managed by OpenCode.
+  - `spawn_acp_chat_for_project()` reused the last existing chat when the project already had one.
+- Resolution:
+  - Changed `clientInfo` to `name: "opencode-local-acp"`, `title: "OpenCode"` in `src/opencode_acp.rs`.
+  - Replaced `AcpConfigOption` with a full struct (`id`, `name`, `category`, `current_value`, `options`) and updated `AcpChatEvent::ConfigOptionUpdate` to carry the whole option.
+  - Added `parse_config_option()` helper that parses full option objects from `configOptions` arrays.
+  - Added `AcpChatSession::send_set_config_option()` and `config_option()` helper.
+  - Updated `process_acp_chat_events()` in `src/app.rs` to store both the legacy `BTreeMap` and the new `config_options_struct` list.
+  - Replaced the header mode/model display with real `ComboBox` selectors driven by `config_options_struct` (mode, model, effort). Selecting a value calls `send_set_config_option` and updates local state.
+  - Removed `modeId` and `model` from `send_prompt()` so OpenCode uses the session state set via `set_config_option`.
+  - Changed UI labels: "OpenCode ACP" → "OpenCode Chat", "Agent:" → "OpenCode:".
+  - Added `force_new` parameter to `spawn_acp_chat_for_project()` so the "New Chat" button always creates a fresh session.
+  - Added regression tests: `send_set_config_option_sends_correct_json_rpc`, `config_option_helper_returns_correct_option`, and updated existing `configOptions` tests to use full objects.
+- Prevent recurrence:
+  - Updated AGENTS.md OpenCode ACP Chat Protocol Guidelines to document the brand-neutral `clientInfo`, `session/set_config_option` usage, and the structured `configOptions` format.
+  - `cargo test` passes (1354 tests).
+- Files/Commands touched: `src/opencode_acp.rs`, `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-01

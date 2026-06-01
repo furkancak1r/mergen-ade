@@ -55,8 +55,7 @@ pub enum AcpChatEvent {
     },
     ConfigOptionUpdate {
         chat_id: u64,
-        category: String,
-        value: String,
+        option: AcpConfigOption,
     },
     AvailableCommandsUpdate {
         chat_id: u64,
@@ -140,9 +139,19 @@ pub struct AcpPendingPermission {
 }
 
 #[derive(Debug, Clone)]
-pub struct AcpConfigOption {
-    pub category: String,
+pub struct AcpConfigOptionEntry {
     pub value: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcpConfigOption {
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    pub current_value: String,
+    pub options: Vec<AcpConfigOptionEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +178,7 @@ pub struct AcpChatSession {
     pub status: AcpChatStatus,
     pub session_id: Option<String>,
     pub config_options: BTreeMap<String, String>,
+    pub config_options_struct: Vec<AcpConfigOption>,
     pub modes: Vec<AcpMode>,
     pub available_commands: Vec<AcpCommand>,
     pub messages: Vec<AcpChatMessage>,
@@ -231,21 +241,35 @@ impl AcpChatSession {
             None => return,
         };
         let id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-        let mut params = json!({
+        let params = json!({
             "sessionId": session_id,
             "prompt": [{ "type": "text", "text": text }]
         });
-        if let Some(ref mode_id) = self.selected_mode_id {
-            params["modeId"] = json!(mode_id);
-        }
-        if let Some(model) = self.config_options.get("model") {
-            params["model"] = json!(model);
-        }
         let msg = json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "session/prompt",
             "params": params
+        });
+        let _ = self.command_tx.send(msg.to_string());
+    }
+
+    /// Send a session/set_config_option request.
+    pub fn send_set_config_option(&self, config_id: &str, value: &str) {
+        let session_id = match self.session_id {
+            Some(ref id) => id.clone(),
+            None => return,
+        };
+        let id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/set_config_option",
+            "params": {
+                "sessionId": session_id,
+                "configId": config_id,
+                "value": value
+            }
         });
         let _ = self.command_tx.send(msg.to_string());
     }
@@ -261,6 +285,11 @@ impl AcpChatSession {
             }
         });
         let _ = self.command_tx.send(msg.to_string());
+    }
+
+    /// Look up a structured config option by id.
+    pub fn config_option(&self, id: &str) -> Option<&AcpConfigOption> {
+        self.config_options_struct.iter().find(|o| o.id == id)
     }
 
     /// Respond to a permission request.
@@ -394,8 +423,8 @@ pub fn spawn_opencode_acp(
                 "terminal": false
             },
             "clientInfo": {
-                "name": "mergen-ade",
-                "title": "Mergen ADE",
+                "name": "opencode-local-acp",
+                "title": "OpenCode",
                 "version": env!("CARGO_PKG_VERSION")
             }
         }
@@ -416,6 +445,7 @@ pub fn spawn_opencode_acp(
         is_running: false,
         session_id: None,
         config_options: BTreeMap::new(),
+        config_options_struct: Vec::new(),
         modes: Vec::new(),
         available_commands: Vec::new(),
         show_thread_selector: false,
@@ -425,6 +455,57 @@ pub fn spawn_opencode_acp(
         writer_thread: Some(writer_thread),
         reader_thread: Some(reader_thread),
         stderr_thread: Some(stderr_thread),
+    })
+}
+
+fn parse_config_option(opt: &JsonValue) -> Option<AcpConfigOption> {
+    let id = opt.get("id").and_then(JsonValue::as_str)?.to_string();
+    let name = opt
+        .get("name")
+        .and_then(JsonValue::as_str)
+        .unwrap_or(&id)
+        .to_string();
+    let category = opt
+        .get("category")
+        .and_then(JsonValue::as_str)
+        .unwrap_or(&id)
+        .to_string();
+    let current_value = opt
+        .get("currentValue")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("")
+        .to_string();
+    let options = opt
+        .get("options")
+        .and_then(JsonValue::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|o| {
+                    let value = o.get("value").and_then(JsonValue::as_str)?.to_string();
+                    let entry_name = o
+                        .get("name")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or(&value)
+                        .to_string();
+                    let description = o
+                        .get("description")
+                        .and_then(JsonValue::as_str)
+                        .map(|s| s.to_string());
+                    Some(AcpConfigOptionEntry {
+                        value,
+                        name: entry_name,
+                        description,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(AcpConfigOption {
+        id,
+        name,
+        category,
+        current_value,
+        options,
     })
 }
 
@@ -459,21 +540,12 @@ fn parse_acp_message(
                     if let Some(options) = result.get("configOptions").and_then(JsonValue::as_array)
                     {
                         for opt in options {
-                            let category = opt
-                                .get("configId")
-                                .and_then(JsonValue::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            let value = opt
-                                .get("value")
-                                .and_then(JsonValue::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            let _ = event_tx.send(AcpChatEvent::ConfigOptionUpdate {
-                                chat_id,
-                                category: category.clone(),
-                                value: value.clone(),
-                            });
+                            if let Some(option) = parse_config_option(opt) {
+                                let _ = event_tx.send(AcpChatEvent::ConfigOptionUpdate {
+                                    chat_id,
+                                    option: option.clone(),
+                                });
+                            }
                         }
                     }
                     return;
@@ -696,25 +768,16 @@ fn parse_acp_message(
                     let _ = event_tx.send(AcpChatEvent::UserMessageChunk { chat_id, text });
                 }
                 "config_option_update" => {
-                    // OpenCode ACP spec sends configOptions as an array of {configId, value}
+                    // OpenCode ACP spec sends configOptions as an array of full option objects
                     if let Some(options) = update.get("configOptions").and_then(JsonValue::as_array)
                     {
                         for opt in options {
-                            let category = opt
-                                .get("configId")
-                                .and_then(JsonValue::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            let value = opt
-                                .get("value")
-                                .and_then(JsonValue::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            let _ = event_tx.send(AcpChatEvent::ConfigOptionUpdate {
-                                chat_id,
-                                category: category.clone(),
-                                value: value.clone(),
-                            });
+                            if let Some(option) = parse_config_option(opt) {
+                                let _ = event_tx.send(AcpChatEvent::ConfigOptionUpdate {
+                                    chat_id,
+                                    option: option.clone(),
+                                });
+                            }
                         }
                     } else {
                         // Fallback for legacy single-field format
@@ -730,8 +793,13 @@ fn parse_acp_message(
                             .to_string();
                         let _ = event_tx.send(AcpChatEvent::ConfigOptionUpdate {
                             chat_id,
-                            category,
-                            value,
+                            option: AcpConfigOption {
+                                id: category.clone(),
+                                name: category.clone(),
+                                category: category.clone(),
+                                current_value: value.clone(),
+                                options: Vec::new(),
+                            },
                         });
                     }
                 }
@@ -784,6 +852,7 @@ mod tests {
             status: AcpChatStatus::Starting,
             session_id: None,
             config_options: BTreeMap::new(),
+            config_options_struct: Vec::new(),
             modes: Vec::new(),
             available_commands: Vec::new(),
             messages: Vec::new(),
@@ -858,8 +927,8 @@ mod tests {
             "result": {
                 "sessionId": "sess-123",
                 "configOptions": [
-                    { "configId": "model", "value": "gpt-4" },
-                    { "configId": "mode", "value": "build" }
+                    { "id": "model", "name": "Model", "category": "model", "currentValue": "gpt-4", "options": [{ "value": "gpt-4", "name": "GPT-4" }] },
+                    { "id": "mode", "name": "Session Mode", "category": "mode", "currentValue": "build", "options": [{ "value": "build", "name": "Build" }] }
                 ]
             }
         });
@@ -870,11 +939,11 @@ mod tests {
         );
         let ev2 = rx.recv().unwrap();
         assert!(
-            matches!(ev2, AcpChatEvent::ConfigOptionUpdate { category, value, .. } if category == "model" && value == "gpt-4")
+            matches!(ev2, AcpChatEvent::ConfigOptionUpdate { option, .. } if option.id == "model" && option.current_value == "gpt-4")
         );
         let ev3 = rx.recv().unwrap();
         assert!(
-            matches!(ev3, AcpChatEvent::ConfigOptionUpdate { category, value, .. } if category == "mode" && value == "build")
+            matches!(ev3, AcpChatEvent::ConfigOptionUpdate { option, .. } if option.id == "mode" && option.current_value == "build")
         );
     }
 
@@ -933,7 +1002,7 @@ mod tests {
                 "update": {
                     "sessionUpdate": "config_option_update",
                     "configOptions": [
-                        { "configId": "model", "value": "gpt-4o" }
+                        { "id": "model", "name": "Model", "category": "model", "currentValue": "gpt-4o", "options": [{ "value": "gpt-4o", "name": "GPT-4o" }] }
                     ]
                 }
             }
@@ -941,8 +1010,39 @@ mod tests {
         parse_acp_message(1, msg, &tx);
         let ev = rx.recv().unwrap();
         assert!(
-            matches!(ev, AcpChatEvent::ConfigOptionUpdate { category, value, .. } if category == "model" && value == "gpt-4o")
+            matches!(ev, AcpChatEvent::ConfigOptionUpdate { option, .. } if option.id == "model" && option.current_value == "gpt-4o")
         );
+    }
+
+    #[test]
+    fn send_set_config_option_sends_correct_json_rpc() {
+        let (session, rx) = test_session();
+        let mut session = session;
+        session.session_id = Some("sess-abc".to_string());
+        session.send_set_config_option("mode", "plan");
+        let msg = rx.recv().unwrap();
+        let parsed: JsonValue = serde_json::from_str(&msg).unwrap();
+        assert_eq!(parsed["method"], "session/set_config_option");
+        assert_eq!(parsed["params"]["sessionId"], "sess-abc");
+        assert_eq!(parsed["params"]["configId"], "mode");
+        assert_eq!(parsed["params"]["value"], "plan");
+    }
+
+    #[test]
+    fn config_option_helper_returns_correct_option() {
+        let (mut session, _rx) = test_session();
+        session.config_options_struct.push(AcpConfigOption {
+            id: "model".to_string(),
+            name: "Model".to_string(),
+            category: "model".to_string(),
+            current_value: "gpt-4".to_string(),
+            options: Vec::new(),
+        });
+        assert_eq!(
+            session.config_option("model").unwrap().current_value,
+            "gpt-4"
+        );
+        assert!(session.config_option("mode").is_none());
     }
 
     #[test]
