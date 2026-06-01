@@ -159,6 +159,14 @@ If `cargo` is not on PATH in PowerShell, use:
 - **ACP `clientInfo` must be brand-neutral.** The `initialize` request's `clientInfo` should use generic identifiers (e.g., `name: "opencode-local-acp"`, `title: "OpenCode"`) rather than Mergen-specific branding, so the upstream agent behaves identically to a native OpenCode session.
 - **Add regression tests for all ACP protocol parsers.** Every update field (`configOptions`, `currentModeId`, `availableCommands`, permission id types) must have a unit test in `src/opencode_acp.rs`.
 
+## OpenCode ACP Chat UI Guidelines
+- **Composer must be a compact rounded capsule.** The chat input area should be a single-row, rounded rectangle (`rounding: 12.0`, fill `Color32::from_rgb(27,27,27)`, stroke `Color32::from_rgb(48,48,48)`) containing: a circular `+` button on the left, an orange mode pill (e.g. `Plan`) when the active mode is `plan`, the prompt input in the middle, a combined model+effort selector on the right, and a circular send button on the far right. This matches the Cursor composer visual style.
+- **Mode pill must toggle between `plan` and `build`.** Clicking the mode pill should switch from the current mode to `build` if the current mode is `plan`. The pill uses orange styling (`pill_color: rgb(200,140,60)`, `pill_fill: rgb(40,28,16)`) for `plan` mode and blue styling for other modes. The pill must send `session/set_config_option` when the mode changes.
+- **Model + effort selector must be a single compact dropdown.** Instead of separate ComboBoxes for model and effort, the composer should show one combined selector displaying the current model name and effort name (e.g. `Sonnet 4 No Thinking`). The dropdown popup should still have separate Model and Effort sections so the user can change each independently.
+- **Status row must appear below the composer.** A thin status row (22px, muted text) should show the current git branch (from `source_control_state`), the `Local` label, and the ACP session status text (`Idle`, `Running...`, etc.). No fake context percentage or token usage should be displayed unless real data is available from the ACP protocol.
+- **Permission cards and slash hints must render below the composer frame.** The compact composer frame itself is always 48px. Permission cards and slash command hints are drawn in the remaining space below the composer, not clipped inside the capsule.
+- **Enter submits, Ctrl+Enter inserts newline.** The single-line multiline text edit must keep the existing `return_key(Ctrl+Enter)` behavior so plain Enter sends the prompt while Ctrl+Enter adds a newline.
+
 ## File Editor Guidelines
 - Long editor content must be wrapped in a stable-id `ScrollArea` (e.g., `FILE_EDITOR_SCROLL_ID`).
 - `TextEdit::multiline` must allocate enough rows for the full line count (`max(visible_rows, line_count)`), not only the visible viewport.

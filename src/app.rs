@@ -19918,12 +19918,14 @@ impl AdeApp {
 
                 let thread_selector_height = 32.0;
                 let header_height = 36.0;
-                let input_height = 120.0;
+                let composer_height = 48.0;
+                let status_row_height = 22.0;
                 let messages_height = (content_rect.height()
                     - thread_selector_height
                     - header_height
-                    - input_height
-                    - 24.0)
+                    - composer_height
+                    - status_row_height
+                    - 32.0)
                     .max(80.0);
 
                 // --- Thread selector bar ---
@@ -20031,113 +20033,6 @@ impl AdeApp {
                         _ => TEXT_MUTED,
                     };
                     header_ui.label(RichText::new(status_text).size(12.0).color(status_color));
-                    // Mode selector from config_options_struct
-                    if let Some(mode_opt) = session.config_option("mode") {
-                        let mut selected_mode = mode_opt.current_value.clone();
-                        let current_mode = mode_opt.current_value.clone();
-                        egui::ComboBox::from_id_salt("acp_mode_selector")
-                            .selected_text(
-                                RichText::new(format!(
-                                    "{}: {}",
-                                    mode_opt.name, mode_opt.current_value
-                                ))
-                                .size(12.0)
-                                .color(TEXT_PRIMARY),
-                            )
-                            .width(140.0)
-                            .show_ui(&mut header_ui, |ui| {
-                                for entry in &mode_opt.options {
-                                    let label = if let Some(ref desc) = entry.description {
-                                        format!("{} — {}", entry.name, desc)
-                                    } else {
-                                        entry.name.clone()
-                                    };
-                                    ui.selectable_value(
-                                        &mut selected_mode,
-                                        entry.value.clone(),
-                                        RichText::new(label).size(12.0).color(TEXT_PRIMARY),
-                                    );
-                                }
-                            });
-                        if selected_mode != current_mode {
-                            session.send_set_config_option("mode", &selected_mode);
-                            if let Some(opt) = session
-                                .config_options_struct
-                                .iter_mut()
-                                .find(|o| o.id == "mode")
-                            {
-                                opt.current_value = selected_mode;
-                            }
-                        }
-                    }
-                    // Model selector from config_options_struct
-                    if let Some(model_opt) = session.config_option("model") {
-                        let mut selected_model = model_opt.current_value.clone();
-                        let current_model = model_opt.current_value.clone();
-                        egui::ComboBox::from_id_salt("acp_model_selector")
-                            .selected_text(
-                                RichText::new(format!(
-                                    "{}: {}",
-                                    model_opt.name, model_opt.current_value
-                                ))
-                                .size(12.0)
-                                .color(TEXT_PRIMARY),
-                            )
-                            .width(200.0)
-                            .show_ui(&mut header_ui, |ui| {
-                                for entry in &model_opt.options {
-                                    ui.selectable_value(
-                                        &mut selected_model,
-                                        entry.value.clone(),
-                                        RichText::new(&entry.name).size(12.0).color(TEXT_PRIMARY),
-                                    );
-                                }
-                            });
-                        if selected_model != current_model {
-                            session.send_set_config_option("model", &selected_model);
-                            if let Some(opt) = session
-                                .config_options_struct
-                                .iter_mut()
-                                .find(|o| o.id == "model")
-                            {
-                                opt.current_value = selected_model;
-                            }
-                        }
-                    }
-                    // Effort selector from config_options_struct
-                    if let Some(effort_opt) = session.config_option("effort") {
-                        let mut selected_effort = effort_opt.current_value.clone();
-                        let current_effort = effort_opt.current_value.clone();
-                        egui::ComboBox::from_id_salt("acp_effort_selector")
-                            .selected_text(
-                                RichText::new(format!(
-                                    "{}: {}",
-                                    effort_opt.name, effort_opt.current_value
-                                ))
-                                .size(12.0)
-                                .color(TEXT_PRIMARY),
-                            )
-                            .width(120.0)
-                            .show_ui(&mut header_ui, |ui| {
-                                for entry in &effort_opt.options {
-                                    ui.selectable_value(
-                                        &mut selected_effort,
-                                        entry.value.clone(),
-                                        RichText::new(&entry.name).size(12.0).color(TEXT_PRIMARY),
-                                    );
-                                }
-                            });
-                        if selected_effort != current_effort {
-                            session.send_set_config_option("effort", &selected_effort);
-                            if let Some(opt) = session
-                                .config_options_struct
-                                .iter_mut()
-                                .find(|o| o.id == "effort")
-                            {
-                                opt.current_value = selected_effort;
-                            }
-                        }
-                    }
                 }
                 header_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if let Some(session) = self.acp_chat_sessions.get(&chat_id) {
@@ -20256,78 +20151,258 @@ impl AdeApp {
                     });
                 ui.allocate_rect(messages_rect, Sense::hover());
 
-                // --- Input area ---
-                let input_rect = egui::Rect::from_min_size(
+                // --- Compact composer ---
+                let composer_height = 48.0;
+                let composer_rect = egui::Rect::from_min_size(
                     egui::pos2(content_rect.min.x, messages_rect.max.y + 8.0),
-                    egui::vec2(content_rect.width(), input_height),
+                    egui::vec2(content_rect.width(), composer_height),
                 );
-                let mut input_ui = ui.new_child(
+                let mut composer_ui = ui.new_child(
                     egui::UiBuilder::new()
-                        .max_rect(input_rect)
-                        .layout(Layout::top_down(Align::Min)),
+                        .max_rect(composer_rect)
+                        .layout(Layout::left_to_right(Align::Center)),
                 );
-                input_ui.set_clip_rect(input_rect);
+                composer_ui.set_clip_rect(composer_rect);
                 if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
                     let is_running = session.is_running
                         || matches!(session.status, crate::opencode_acp::AcpChatStatus::Running);
                     let session_ready = session.session_id.is_some()
                         && !matches!(session.status, crate::opencode_acp::AcpChatStatus::Starting);
                     let draft = session.prompt_input.clone();
-                    let text_edit = egui::TextEdit::multiline(&mut session.prompt_input)
-                        .desired_rows(4)
-                        .hint_text(if session_ready {
-                            "Type a message... (Enter to send, Ctrl+Enter for newline)"
-                        } else {
-                            "Waiting for session..."
-                        })
-                        .interactive(!is_running && session_ready)
-                        .return_key(egui::KeyboardShortcut::new(
-                            egui::Modifiers::CTRL,
-                            egui::Key::Enter,
-                        ));
-                    let response = input_ui.add_sized(
-                        egui::vec2(input_rect.width(), input_height - 32.0),
-                        text_edit,
-                    );
-                    // Detect plain Enter to submit
-                    let plain_enter = input_ui.input(|i| {
-                        i.events.iter().any(|e| {
-                            matches!(
-                                e,
-                                Event::Key {
-                                    key: Key::Enter,
-                                    modifiers,
-                                    pressed: true,
-                                    ..
-                                } if modifiers.is_none()
-                            )
-                        })
-                    });
-                    if response.changed() {
-                        ctx.request_repaint();
-                    }
-                    let can_send =
-                        !session.prompt_input.trim().is_empty() && !is_running && session_ready;
-                    if (plain_enter || response.lost_focus()) && can_send {
-                        let text = session.prompt_input.trim().to_owned();
-                        session.prompt_input.clear();
-                        session
-                            .messages
-                            .push(crate::opencode_acp::AcpChatMessage::User { text: text.clone() });
-                        session.is_running = true;
-                        session.status = crate::opencode_acp::AcpChatStatus::Running;
-                        session.send_prompt(&text);
-                        ctx.request_repaint();
-                    }
-                    input_ui.horizontal(|ui| {
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui
-                                .add_enabled(
-                                    can_send,
-                                    egui::Button::new(format!("{} Send", icons::SEND_HORIZONTAL)),
+                    // Composer capsule frame
+                    egui::Frame::none()
+                        .fill(Color32::from_rgb(27, 27, 27))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(48, 48, 48)))
+                        .rounding(12.0)
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                        .show(&mut composer_ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            // Circular + button
+                            let _plus_btn = ui.add(
+                                egui::Button::new(
+                                    RichText::new(format!("{}", icons::PLUS))
+                                        .size(14.0)
+                                        .color(TEXT_MUTED),
                                 )
-                                .clicked()
-                            {
+                                .fill(Color32::from_rgb(35, 35, 35))
+                                .rounding(16.0)
+                                .small(),
+                            );
+                            // Mode pill
+                            if let Some(mode_opt) = session.config_option("mode") {
+                                let mut selected_mode = mode_opt.current_value.clone();
+                                let current_mode = mode_opt.current_value.clone();
+                                let mode_name = mode_opt
+                                    .options
+                                    .iter()
+                                    .find(|e| e.value == current_mode)
+                                    .map(|e| e.name.clone())
+                                    .unwrap_or_else(|| current_mode.clone());
+                                let (pill_color, pill_fill) = if current_mode == "plan" {
+                                    (
+                                        Color32::from_rgb(200, 140, 60),
+                                        Color32::from_rgb(40, 28, 16),
+                                    )
+                                } else {
+                                    (
+                                        Color32::from_rgb(60, 140, 200),
+                                        Color32::from_rgb(16, 28, 40),
+                                    )
+                                };
+                                let pill_text = format!("{} {}", mode_name, icons::X);
+                                let pill_btn = ui.add(
+                                    egui::Button::new(
+                                        RichText::new(pill_text).size(12.0).color(pill_color),
+                                    )
+                                    .fill(pill_fill)
+                                    .rounding(6.0)
+                                    .stroke(Stroke::new(1.0, pill_color))
+                                    .small(),
+                                );
+                                if pill_btn.clicked() {
+                                    if current_mode == "plan" {
+                                        if let Some(build_entry) =
+                                            mode_opt.options.iter().find(|e| e.value == "build")
+                                        {
+                                            selected_mode = build_entry.value.clone();
+                                        }
+                                    }
+                                }
+                                if selected_mode != current_mode {
+                                    session.send_set_config_option("mode", &selected_mode);
+                                    if let Some(opt) = session
+                                        .config_options_struct
+                                        .iter_mut()
+                                        .find(|o| o.id == "mode")
+                                    {
+                                        opt.current_value = selected_mode;
+                                    }
+                                }
+                            }
+                            // Input text
+                            let available_width = ui.available_width();
+                            let hint_text = if session_ready {
+                                if let Some(mode_opt) = session.config_option("mode") {
+                                    if mode_opt.current_value == "plan" {
+                                        "Plan and design before coding..."
+                                    } else {
+                                        "Type a message..."
+                                    }
+                                } else {
+                                    "Type a message..."
+                                }
+                            } else {
+                                "Waiting for session..."
+                            };
+                            let text_edit = egui::TextEdit::multiline(&mut session.prompt_input)
+                                .desired_rows(1)
+                                .desired_width(available_width)
+                                .hint_text(hint_text)
+                                .interactive(!is_running && session_ready)
+                                .return_key(egui::KeyboardShortcut::new(
+                                    egui::Modifiers::CTRL,
+                                    egui::Key::Enter,
+                                ))
+                                .frame(false);
+                            let response = ui
+                                .add_sized(egui::vec2(available_width.max(60.0), 28.0), text_edit);
+                            // Detect plain Enter to submit
+                            let plain_enter = ui.input(|i| {
+                                i.events.iter().any(|e| {
+                                    matches!(
+                                        e,
+                                        Event::Key {
+                                            key: Key::Enter,
+                                            modifiers,
+                                            pressed: true,
+                                            ..
+                                        } if modifiers.is_none()
+                                    )
+                                })
+                            });
+                            if response.changed() {
+                                ctx.request_repaint();
+                            }
+                            let can_send = !session.prompt_input.trim().is_empty()
+                                && !is_running
+                                && session_ready;
+                            if (plain_enter || response.lost_focus()) && can_send {
+                                let text = session.prompt_input.trim().to_owned();
+                                session.prompt_input.clear();
+                                session
+                                    .messages
+                                    .push(crate::opencode_acp::AcpChatMessage::User {
+                                        text: text.clone(),
+                                    });
+                                session.is_running = true;
+                                session.status = crate::opencode_acp::AcpChatStatus::Running;
+                                session.send_prompt(&text);
+                                ctx.request_repaint();
+                            }
+                            // Model + effort selector
+                            let model_label = session
+                                .config_option("model")
+                                .map(|o| {
+                                    let name = o
+                                        .options
+                                        .iter()
+                                        .find(|e| e.value == o.current_value)
+                                        .map(|e| e.name.clone())
+                                        .unwrap_or_else(|| o.current_value.clone());
+                                    let effort = session
+                                        .config_option("effort")
+                                        .map(|e| {
+                                            e.options
+                                                .iter()
+                                                .find(|entry| entry.value == e.current_value)
+                                                .map(|entry| entry.name.clone())
+                                                .unwrap_or_else(|| e.current_value.clone())
+                                        })
+                                        .unwrap_or_default();
+                                    if effort.is_empty() {
+                                        name
+                                    } else {
+                                        format!("{} {}", name, effort)
+                                    }
+                                })
+                                .unwrap_or_else(|| "Model".to_string());
+                            let mut selected_model = session
+                                .config_option("model")
+                                .map(|o| o.current_value.clone())
+                                .unwrap_or_default();
+                            let current_model = selected_model.clone();
+                            let mut selected_effort = session
+                                .config_option("effort")
+                                .map(|o| o.current_value.clone())
+                                .unwrap_or_default();
+                            let current_effort = selected_effort.clone();
+                            egui::ComboBox::from_id_salt("acp_composer_model_selector")
+                                .selected_text(
+                                    RichText::new(format!("{} ▾", model_label))
+                                        .size(11.0)
+                                        .color(TEXT_MUTED),
+                                )
+                                .width(160.0)
+                                .show_ui(ui, |ui| {
+                                    if let Some(model_opt) = session.config_option("model") {
+                                        ui.label(RichText::new("Model").small().color(TEXT_MUTED));
+                                        for entry in &model_opt.options {
+                                            ui.selectable_value(
+                                                &mut selected_model,
+                                                entry.value.clone(),
+                                                RichText::new(&entry.name)
+                                                    .size(12.0)
+                                                    .color(TEXT_PRIMARY),
+                                            );
+                                        }
+                                        ui.separator();
+                                    }
+                                    if let Some(effort_opt) = session.config_option("effort") {
+                                        ui.label(RichText::new("Effort").small().color(TEXT_MUTED));
+                                        for entry in &effort_opt.options {
+                                            ui.selectable_value(
+                                                &mut selected_effort,
+                                                entry.value.clone(),
+                                                RichText::new(&entry.name)
+                                                    .size(12.0)
+                                                    .color(TEXT_PRIMARY),
+                                            );
+                                        }
+                                    }
+                                });
+                            if selected_model != current_model {
+                                session.send_set_config_option("model", &selected_model);
+                                if let Some(opt) = session
+                                    .config_options_struct
+                                    .iter_mut()
+                                    .find(|o| o.id == "model")
+                                {
+                                    opt.current_value = selected_model;
+                                }
+                            }
+                            if selected_effort != current_effort {
+                                session.send_set_config_option("effort", &selected_effort);
+                                if let Some(opt) = session
+                                    .config_options_struct
+                                    .iter_mut()
+                                    .find(|o| o.id == "effort")
+                                {
+                                    opt.current_value = selected_effort;
+                                }
+                            }
+                            // Send button
+                            let send_btn = ui.add_enabled(
+                                can_send,
+                                egui::Button::new(
+                                    RichText::new(format!("{}", icons::SEND_HORIZONTAL))
+                                        .size(16.0)
+                                        .color(if can_send { TEXT_PRIMARY } else { TEXT_MUTED }),
+                                )
+                                .fill(Color32::from_rgb(45, 45, 45))
+                                .rounding(16.0)
+                                .small(),
+                            );
+                            if send_btn.clicked() && can_send {
                                 let text = session.prompt_input.trim().to_owned();
                                 session.prompt_input.clear();
                                 session
@@ -20341,11 +20416,10 @@ impl AdeApp {
                                 ctx.request_repaint();
                             }
                         });
-                    });
-                    // Permission card
+                    // Permission card below composer
                     if let Some(permission) = session.pending_permission.take() {
-                        input_ui.separator();
-                        input_ui.horizontal(|ui| {
+                        composer_ui.separator();
+                        composer_ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new(format!(
                                     "Permission: {}",
@@ -20356,7 +20430,7 @@ impl AdeApp {
                             );
                         });
                         for opt in &permission.options {
-                            if ui
+                            if composer_ui
                                 .button(format!("{} {}", icons::CHECK_CIRCLE, opt.name))
                                 .clicked()
                             {
@@ -20382,11 +20456,11 @@ impl AdeApp {
                                 .filter(|c| c.name.starts_with(prefix))
                                 .collect();
                             if !matches.is_empty() {
-                                input_ui.separator();
-                                input_ui
+                                composer_ui.separator();
+                                composer_ui
                                     .label(RichText::new("Commands:").small().color(TEXT_MUTED));
                                 for cmd in matches.iter().take(5) {
-                                    input_ui.horizontal(|ui| {
+                                    composer_ui.horizontal(|ui| {
                                         ui.label(
                                             RichText::new(format!("/{}", cmd.name))
                                                 .strong()
@@ -20406,7 +20480,50 @@ impl AdeApp {
                         ctx.request_repaint();
                     }
                 }
-                ui.allocate_rect(input_rect, Sense::hover());
+                ui.allocate_rect(composer_rect, Sense::hover());
+
+                // --- Status row ---
+                let status_row_height = 22.0;
+                let status_rect = egui::Rect::from_min_size(
+                    egui::pos2(content_rect.min.x, composer_rect.max.y + 4.0),
+                    egui::vec2(content_rect.width(), status_row_height),
+                );
+                let mut status_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(status_rect)
+                        .layout(Layout::left_to_right(Align::Center)),
+                );
+                status_ui.set_clip_rect(status_rect);
+                let project_id = self
+                    .acp_chat_sessions
+                    .get(&chat_id)
+                    .map(|s| s.project_id)
+                    .unwrap_or(0);
+                if let Some(snapshot) = self.source_control_state.get(&project_id) {
+                    if !snapshot.branch.is_empty() {
+                        status_ui.label(
+                            RichText::new(format!("{} {}", icons::GIT_BRANCH, snapshot.branch))
+                                .size(11.0)
+                                .color(TEXT_MUTED),
+                        );
+                        status_ui.add_space(8.0);
+                    }
+                }
+                status_ui.label(RichText::new("Local").size(11.0).color(TEXT_MUTED));
+                status_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if let Some(session) = self.acp_chat_sessions.get(&chat_id) {
+                        let status_text = match session.status {
+                            crate::opencode_acp::AcpChatStatus::Starting => "Starting...",
+                            crate::opencode_acp::AcpChatStatus::Idle => "Idle",
+                            crate::opencode_acp::AcpChatStatus::Running => "Running...",
+                            crate::opencode_acp::AcpChatStatus::Permission => "Permission",
+                            crate::opencode_acp::AcpChatStatus::Error => "Error",
+                            crate::opencode_acp::AcpChatStatus::Exited => "Disconnected",
+                        };
+                        ui.label(RichText::new(status_text).size(11.0).color(TEXT_MUTED));
+                    }
+                });
+                ui.allocate_rect(status_rect, Sense::hover());
             });
     }
 

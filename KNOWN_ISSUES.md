@@ -2,6 +2,33 @@
  
 ---
 
+#### OpenCode ACP chat composer redesigned to match Cursor style {#acp-chat-cursor-composer}
+- Date: 2026-06-01
+- Context: User provided a Cursor screenshot showing a compact, rounded composer input with mode pill, model selector, and status row, and requested the OpenCode ACP chat UI to match that visual style.
+- Error signature: The previous ACP chat input was a large, blocky multiline text area (120px tall) with a separate Send button row, mode/model/effort ComboBoxes in the header, and no status row. This did not resemble the sleek Cursor composer.
+- Symptoms/Impact:
+  1. The input area consumed too much vertical space and looked visually heavy.
+  2. Mode, model, and effort selectors were in the header, far from the input, making them harder to discover.
+  3. No visual indication of the active git branch or project context below the composer.
+- Root cause:
+  - The initial ACP chat UI was a functional prototype without design alignment to the Cursor reference.
+- Resolution:
+  - Replaced the 120px input block with a 48px compact rounded capsule (`fill: rgb(27,27,27)`, `stroke: rgb(48,48,48)`, `rounding: 12.0`).
+  - Added a circular `+` button on the left (placeholder for future attachment support).
+  - Added an orange mode pill (`Plan`) inside the capsule that toggles to `build` when clicked, using `session/set_config_option`.
+  - Moved the model and effort selectors into a single combined dropdown on the right side of the capsule.
+  - Added a circular send button on the far right.
+  - Added a 22px status row below the composer showing the git branch (from `source_control_state`), `Local`, and the current ACP session status.
+  - Removed the separate mode/model/effort ComboBoxes from the header.
+  - Preserved Enter-to-submit and Ctrl+Enter-for-newline behavior.
+  - Kept permission cards and slash command hints rendering below the composer frame.
+- Prevent recurrence:
+  - Added UI behavior guidelines to AGENTS.md under "OpenCode ACP Chat UI Guidelines" documenting the composer capsule, mode pill, model+effort selector, status row, and input behavior.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-01
+
+---
+
 #### Mergen saved messages and OpenCode MCPs migrated to Zed {#mergen-to-zed-migration}
 - Date: 2026-05-21
 - Context: User requested that Mergen project saved messages be copied to Zed as project tasks, and that OpenCode MCP servers be synchronized into Zed's `context_servers` (excluding Mergen-specific browser MCP, using Playwright instead).
