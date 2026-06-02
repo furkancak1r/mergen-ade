@@ -719,6 +719,28 @@ impl AcpModeToggleShortcut {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub enum AcpStartupMode {
+    #[default]
+    Build,
+    Plan,
+}
+
+impl AcpStartupMode {
+    pub fn as_mode_id(&self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Plan => "plan",
+        }
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Build => "Build",
+            Self::Plan => "Plan",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -737,6 +759,8 @@ pub struct AppConfig {
     pub notifications: OsNotificationConfig,
     #[serde(default = "AcpModeToggleShortcut::default_tab")]
     pub acp_mode_toggle_shortcut: AcpModeToggleShortcut,
+    #[serde(default)]
+    pub acp_startup_mode: AcpStartupMode,
 }
 
 impl Default for AppConfig {
@@ -752,6 +776,7 @@ impl Default for AppConfig {
             opencode: OpenCodeModelConfig::default(),
             notifications: OsNotificationConfig::default(),
             acp_mode_toggle_shortcut: AcpModeToggleShortcut::default_tab(),
+            acp_startup_mode: AcpStartupMode::default(),
         }
     }
 }
@@ -760,9 +785,9 @@ impl Default for AppConfig {
 mod tests {
     use super::{
         default_launchers, default_terminal_shortcuts, normalize_launcher_entries,
-        normalize_terminal_shortcut_entries, AcpModeToggleShortcut, AppConfig, BuiltinLauncherKind,
-        LauncherEntry, LauncherIconKey, OpenCodeModelConfig, ShellKind, ShortcutModifiers,
-        TerminalShortcutEntry, UiConfig,
+        normalize_terminal_shortcut_entries, AcpModeToggleShortcut, AcpStartupMode, AppConfig,
+        BuiltinLauncherKind, LauncherEntry, LauncherIconKey, OpenCodeModelConfig, ShellKind,
+        ShortcutModifiers, TerminalShortcutEntry, UiConfig,
     };
 
     #[test]
@@ -856,6 +881,21 @@ mod tests {
             ShortcutModifiers::default()
         );
         assert!(config.acp_mode_toggle_shortcut.enabled);
+    }
+
+    #[test]
+    fn app_config_default_acp_startup_mode_is_build() {
+        let config = AppConfig::default();
+        assert_eq!(config.acp_startup_mode, AcpStartupMode::Build);
+    }
+
+    #[test]
+    fn acp_startup_mode_serde_roundtrip() {
+        let plan = AcpStartupMode::Plan;
+        let json = serde_json::to_string(&plan).unwrap();
+        assert_eq!(json, "\"Plan\"");
+        let back: AcpStartupMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, AcpStartupMode::Plan);
     }
 
     #[test]

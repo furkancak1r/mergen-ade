@@ -9670,6 +9670,19 @@ impl AdeApp {
                         session.status = crate::opencode_acp::AcpChatStatus::Idle;
                         session.is_running = false;
                         session.updated_at = Instant::now();
+                        // Ensure the configured startup mode is enforced server-side
+                        let startup_mode = self.config.acp_startup_mode.as_mode_id();
+                        if session.active_mode_id_or_default() != startup_mode {
+                            session.send_set_config_option("mode", startup_mode);
+                            if let Some(opt) = session
+                                .config_options_struct
+                                .iter_mut()
+                                .find(|o| o.id == "mode")
+                            {
+                                opt.current_value = startup_mode.to_string();
+                            }
+                            session.selected_mode_id = Some(startup_mode.to_string());
+                        }
                     }
                     self.status_line = format!("OpenCode ACP {chat_id} session created");
                 }
@@ -9891,6 +9904,7 @@ impl AdeApp {
             .as_ref()
             .map(|service| service.build_pty_env(chat_id, Some(project_id), None, Some(chat_id)))
             .unwrap_or_default();
+        let startup_mode = self.config.acp_startup_mode.as_mode_id().to_string();
         let event_tx = self.acp_chat_events_tx.clone();
         match crate::opencode_acp::spawn_opencode_acp(
             chat_id,
@@ -9898,6 +9912,7 @@ impl AdeApp {
             project.path.clone(),
             opencode_bin,
             build_model,
+            startup_mode,
             browser_mcp_env,
             event_tx,
         ) {
@@ -16153,6 +16168,36 @@ impl AdeApp {
             )
             .small()
             .color(TEXT_MUTED),
+        );
+        ui.add_space(12.0);
+
+        // Startup mode card
+        show_settings_card(
+            ui,
+            AppIcon::ChatText,
+            "ACP Startup Mode",
+            "Choose which mode ACP chat uses when a new session starts.",
+            |ui| {
+                let previous_mode = self.config.acp_startup_mode.clone();
+                egui::ComboBox::from_id_salt("settings-acp-startup-mode")
+                    .selected_text(self.config.acp_startup_mode.label())
+                    .width(ui.available_width().max(0.0))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.config.acp_startup_mode,
+                            crate::models::AcpStartupMode::Build,
+                            crate::models::AcpStartupMode::Build.label(),
+                        );
+                        ui.selectable_value(
+                            &mut self.config.acp_startup_mode,
+                            crate::models::AcpStartupMode::Plan,
+                            crate::models::AcpStartupMode::Plan.label(),
+                        );
+                    });
+                if self.config.acp_startup_mode != previous_mode {
+                    changes.note_opencode_change();
+                }
+            },
         );
         ui.add_space(12.0);
 

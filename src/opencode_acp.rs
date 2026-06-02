@@ -407,6 +407,7 @@ pub fn spawn_opencode_acp(
     project_path: PathBuf,
     opencode_bin: Option<std::ffi::OsString>,
     build_model: Option<String>,
+    startup_mode_id: String,
     browser_mcp_env: Vec<(String, String)>,
     event_tx: crossbeam_channel::Sender<AcpChatEvent>,
 ) -> std::io::Result<AcpChatSession> {
@@ -543,7 +544,7 @@ pub fn spawn_opencode_acp(
         available_commands: Vec::new(),
         queue: Vec::new(),
         show_thread_selector: false,
-        selected_mode_id: None,
+        selected_mode_id: Some(startup_mode_id),
         model_search_query: String::new(),
         recent_inputs: Vec::new(),
         history_index: None,
@@ -1325,7 +1326,16 @@ mod tests {
             "/bin/sh".to_string()
         };
         let bin = std::ffi::OsString::from(path);
-        let result = spawn_opencode_acp(1, 1, PathBuf::from("test"), Some(bin), None, vec![], tx);
+        let result = spawn_opencode_acp(
+            1,
+            1,
+            PathBuf::from("test"),
+            Some(bin),
+            None,
+            "build".to_string(),
+            vec![],
+            tx,
+        );
         assert!(result.is_ok());
     }
 
@@ -1363,6 +1373,14 @@ mod tests {
             id: "plan".to_string(),
             name: "Plan".to_string(),
         });
+        assert_eq!(session.active_mode_id_or_default(), "plan");
+    }
+
+    #[test]
+    fn active_mode_id_or_default_uses_startup_mode_preseed() {
+        let (mut session, _rx) = test_session();
+        // When selected_mode_id is preseed at spawn time it wins over the hardcoded fallback
+        session.selected_mode_id = Some("plan".to_string());
         assert_eq!(session.active_mode_id_or_default(), "plan");
     }
 

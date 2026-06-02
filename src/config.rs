@@ -295,6 +295,7 @@ impl From<LegacyAppConfig> for AppConfig {
             opencode: crate::models::OpenCodeModelConfig::default(),
             notifications: crate::models::OsNotificationConfig::default(),
             acp_mode_toggle_shortcut: crate::models::AcpModeToggleShortcut::default_tab(),
+            acp_startup_mode: crate::models::AcpStartupMode::default(),
         }
     }
 }
@@ -1002,6 +1003,34 @@ command = false
 
         let loaded = load_config(&path).expect("should load config");
         assert_eq!(loaded.opencode.build_model_slot_a, "custom/model-x");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_config_restores_default_acp_startup_mode_when_missing() {
+        let path = unique_temp_path("acp-startup-mode-default");
+        let config = AppConfig::default();
+        save_config(&path, &config).expect("should save config");
+
+        let loaded = load_config(&path).expect("should load config");
+        assert_eq!(
+            loaded.acp_startup_mode,
+            crate::models::AcpStartupMode::Build
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_config_persists_acp_startup_mode_plan() {
+        let path = unique_temp_path("acp-startup-mode-plan");
+        let mut config = AppConfig::default();
+        config.acp_startup_mode = crate::models::AcpStartupMode::Plan;
+        save_config(&path, &config).expect("should save config");
+
+        let loaded = load_config(&path).expect("should load config");
+        assert_eq!(loaded.acp_startup_mode, crate::models::AcpStartupMode::Plan);
 
         let _ = fs::remove_file(path);
     }
