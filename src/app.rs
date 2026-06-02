@@ -317,10 +317,12 @@ const SMART_INPUT_DRAFT_INNER_MARGIN_X: f32 = 6.0;
 const SMART_INPUT_DRAFT_INNER_MARGIN_Y: f32 = 5.0;
 const SMART_INPUT_DRAFT_ATTACHMENT_STRIP_HEIGHT: f32 = 20.0;
 const SMART_INPUT_ATTACHMENT_REMOVE_BUTTON_SIZE: f32 = 12.0;
-const ACP_COMPOSER_CONTROL_HEIGHT: f32 = 36.0;
+const ACP_COMPOSER_CONTROL_HEIGHT: f32 = 30.0;
+const ACP_COMPOSER_FOOTER_CONTROL_TOP_INSET: f32 = 1.0;
+const ACP_COMPOSER_SEND_RIGHT_INSET: f32 = 8.0;
 const ACP_COMPOSER_PADDING_X: f32 = 10.0;
 const ACP_COMPOSER_PADDING_Y: f32 = 8.0;
-const ACP_COMPOSER_FOOTER_HEIGHT: f32 = ACP_COMPOSER_CONTROL_HEIGHT;
+const ACP_COMPOSER_FOOTER_HEIGHT: f32 = 40.0;
 const ACP_COMPOSER_WELCOME_TEXT_MIN: f32 = 56.0;
 const ACP_COMPOSER_CHAT_CAPSULE_HEIGHT: f32 =
     ACP_COMPOSER_PADDING_Y * 2.0 + ACP_COMPOSER_FOOTER_HEIGHT;
@@ -335,7 +337,120 @@ const ACP_WELCOME_COMPOSER_MIN_HEIGHT: f32 =
     ACP_COMPOSER_PADDING_Y * 2.0 + ACP_COMPOSER_WELCOME_TEXT_MIN + ACP_COMPOSER_FOOTER_HEIGHT;
 const ACP_WELCOME_CONTEXT_ROW_HEIGHT: f32 = 28.0;
 const ACP_WELCOME_HINT: &str = "Plan, Build, / for skills, @ for context";
+const ACP_COMPOSER_FOOTER_SPACING: f32 = 6.0;
+const ACP_COMPOSER_PLAN_PILL_WIDTH: f32 = 52.0;
+const ACP_COMPOSER_MODEL_WIDTH_MIN: f32 = 18.0;
+const ACP_COMPOSER_MODEL_WIDTH_MAX: f32 = 42.0;
+const ACP_COMPOSER_TEXT_WIDTH_MIN: f32 = 40.0;
 const ACP_STANDBY_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
+
+fn acp_context_project_combo_width(label_width: f32, available_width: f32) -> f32 {
+    (label_width + 28.0)
+        .clamp(72.0, 220.0)
+        .min(available_width.max(0.0))
+}
+
+fn acp_composer_footer_control_rect(footer_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(
+            footer_rect.left(),
+            footer_rect.top() + ACP_COMPOSER_FOOTER_CONTROL_TOP_INSET,
+        ),
+        egui::vec2(footer_rect.width(), ACP_COMPOSER_CONTROL_HEIGHT),
+    )
+}
+
+fn acp_composer_footer_content_rect(controls_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        controls_rect.min,
+        egui::vec2(
+            (controls_rect.width() - ACP_COMPOSER_SEND_RIGHT_INSET).max(0.0),
+            controls_rect.height(),
+        ),
+    )
+}
+
+fn acp_composer_footer_layout(
+    footer_w: f32,
+    ctrl_h: f32,
+    footer_spacing: f32,
+    show_plan_pill: bool,
+    welcome_center: bool,
+) -> (f32, f32, f32, f32, f32) {
+    let send_w = ctrl_h;
+    let plus_w = ctrl_h;
+    let plan_w = if show_plan_pill {
+        ACP_COMPOSER_PLAN_PILL_WIDTH
+    } else {
+        0.0
+    };
+    let left_w = (footer_w - send_w - footer_spacing).max(0.0);
+    let mut widget_count = 2usize;
+    if show_plan_pill {
+        widget_count += 1;
+    }
+    if !welcome_center {
+        widget_count += 1;
+    }
+    let gaps_total = if widget_count > 1 {
+        (widget_count - 1) as f32 * footer_spacing
+    } else {
+        0.0
+    };
+    let fixed_left = plus_w + plan_w + gaps_total;
+    let (mut plus_w, mut plan_w, mut text_w, mut model_w) = if left_w + 0.01 < fixed_left {
+        let scale = if fixed_left > 0.0 {
+            left_w / fixed_left
+        } else {
+            0.0
+        };
+        (plus_w * scale, plan_w * scale, 0.0, 0.0)
+    } else {
+        let flex_budget = left_w - fixed_left;
+        let (text_w, model_w) = if welcome_center {
+            (0.0, flex_budget.min(ACP_COMPOSER_MODEL_WIDTH_MAX))
+        } else if flex_budget <= 0.0 {
+            (0.0, 0.0)
+        } else if flex_budget <= ACP_COMPOSER_TEXT_WIDTH_MIN + ACP_COMPOSER_MODEL_WIDTH_MIN {
+            let model_w = (flex_budget * 0.135).clamp(0.0, flex_budget);
+            (flex_budget - model_w, model_w)
+        } else {
+            let mut model_w = flex_budget.min(ACP_COMPOSER_MODEL_WIDTH_MAX);
+            let mut text_w = flex_budget - model_w;
+            if text_w < ACP_COMPOSER_TEXT_WIDTH_MIN {
+                text_w = ACP_COMPOSER_TEXT_WIDTH_MIN.min(flex_budget);
+                model_w = flex_budget - text_w;
+            }
+            if model_w < ACP_COMPOSER_MODEL_WIDTH_MIN {
+                model_w = ACP_COMPOSER_MODEL_WIDTH_MIN.min(flex_budget);
+                text_w = flex_budget - model_w;
+            }
+            (text_w, model_w)
+        };
+        (plus_w, plan_w, text_w, model_w)
+    };
+    let mut gaps_fit = gaps_total;
+    let mut content_w = plus_w + plan_w + text_w + model_w;
+    if content_w + gaps_fit > left_w {
+        gaps_fit = (left_w - content_w).max(0.0);
+    }
+    if content_w + gaps_fit > left_w && content_w > 0.0 {
+        let scale = (left_w - gaps_fit).max(0.0) / content_w;
+        plus_w *= scale;
+        plan_w *= scale;
+        text_w *= scale;
+        model_w *= scale;
+        content_w = plus_w + plan_w + text_w + model_w;
+    }
+    if content_w + gaps_fit > left_w {
+        let scale = left_w / (content_w + gaps_fit);
+        plus_w *= scale;
+        plan_w *= scale;
+        text_w *= scale;
+        model_w *= scale;
+    }
+    (plus_w, plan_w, text_w, model_w, send_w)
+}
 const SMART_INPUT_FOOTER_GAP: f32 = 6.0;
 const SMART_INPUT_HEADER_RIGHT_INSET: f32 = 12.0;
 const SMART_INPUT_RESIZE_HANDLE_HEIGHT: f32 = 5.0;
@@ -20914,32 +21029,18 @@ impl AdeApp {
             .get(&active_project_id)
             .map(|project| crate::mojibake::repair_mojibake_display(&project.name))
             .unwrap_or_else(|| "Project".to_owned());
-        let combo_width = project_rows
-            .iter()
-            .map(|(_, name)| {
-                ui.fonts(|fonts| {
-                    fonts
-                        .layout_no_wrap(
-                            name.clone(),
-                            egui::FontId::proportional(12.0),
-                            Color32::WHITE,
-                        )
-                        .size()
-                        .x
-                })
-            })
-            .fold(0.0_f32, f32::max)
-            .max(ui.fonts(|fonts| {
-                fonts
-                    .layout_no_wrap(
-                        selected_label.clone(),
-                        egui::FontId::proportional(12.0),
-                        Color32::WHITE,
-                    )
-                    .size()
-                    .x
-            }))
-            + 28.0;
+        let selected_label_width = ui.fonts(|fonts| {
+            fonts
+                .layout_no_wrap(
+                    selected_label.clone(),
+                    egui::FontId::proportional(12.0),
+                    Color32::WHITE,
+                )
+                .size()
+                .x
+        });
+        let combo_width =
+            acp_context_project_combo_width(selected_label_width, ui.available_width());
         let branch_label = self
             .source_control_state
             .get(&active_project_id)
@@ -20966,7 +21067,7 @@ impl AdeApp {
                 egui::ComboBox::from_id_salt("acp-context-project-select")
                     .selected_text(RichText::new(&selected_label).size(12.0).color(TEXT_MUTED))
                     .icon(paint_minimal_combo_icon)
-                    .width(combo_width.clamp(72.0, 220.0))
+                    .width(combo_width)
                     .show_ui(ui, |ui| {
                         for (row_project_id, project_name) in &project_rows {
                             ui.selectable_value(
@@ -21411,43 +21512,65 @@ impl AdeApp {
                         inner_rect.max,
                     );
                     capsule_ui.allocate_rect(footer_rect, Sense::hover());
+                    let footer_controls_rect = acp_composer_footer_control_rect(footer_rect);
+                    let footer_content_rect = acp_composer_footer_content_rect(footer_controls_rect);
                     let active_mode = session.active_mode_id_or_default();
                     let show_plan_pill = crate::opencode_acp::mode_is_plan(&active_mode);
-                    let footer_w = footer_rect.width();
-                    let ctrl_h = ACP_COMPOSER_FOOTER_HEIGHT;
-                    let footer_spacing = 6.0;
-                    let send_w = ctrl_h;
-                    let plus_w = ctrl_h;
-                    let plan_w = if show_plan_pill { 52.0 } else { 0.0 };
-                    let gaps = if welcome_center {
-                        footer_spacing * 3.0
-                    } else {
-                        footer_spacing * 4.0
-                    };
-                    let model_selector_width = (footer_w - plus_w - plan_w - send_w - gaps - if welcome_center {
-                        0.0
-                    } else {
-                        40.0
-                    })
-                    .clamp(60.0, 140.0);
-                    let text_input_width = if welcome_center {
-                        0.0
-                    } else {
-                        (footer_w - plus_w - plan_w - send_w - model_selector_width - gaps).max(40.0)
-                    };
+                    let footer_w = footer_content_rect.width();
+                    let ctrl_h = ACP_COMPOSER_CONTROL_HEIGHT;
+                    let footer_spacing = ACP_COMPOSER_FOOTER_SPACING;
+                    let (plus_w, plan_w, text_input_width, model_selector_width, send_w) =
+                        acp_composer_footer_layout(
+                            footer_w,
+                            ctrl_h,
+                            footer_spacing,
+                            show_plan_pill,
+                            welcome_center,
+                        );
                     let mut footer_ui = capsule_ui.new_child(
                         egui::UiBuilder::new()
-                            .max_rect(footer_rect)
+                            .max_rect(footer_content_rect)
                             .layout(Layout::left_to_right(Align::Center)),
                     );
-                    footer_ui.set_min_height(ACP_COMPOSER_FOOTER_HEIGHT);
-                    footer_ui.spacing_mut().item_spacing.x = footer_spacing;
+                    footer_ui.set_clip_rect(footer_rect);
+                    footer_ui.set_min_height(ctrl_h);
+                    let left_w = (footer_w - send_w - footer_spacing).max(0.0);
+                    let mut left_widget_count = 2usize;
+                    if show_plan_pill {
+                        left_widget_count += 1;
+                    }
+                    if !welcome_center {
+                        left_widget_count += 1;
+                    }
+                    let min_left_gaps = if left_widget_count > 1 {
+                        (left_widget_count - 1) as f32 * footer_spacing
+                    } else {
+                        0.0
+                    };
+                    let effective_footer_spacing = if left_w >= min_left_gaps {
+                        footer_spacing
+                    } else if left_widget_count > 1 {
+                        (left_w / (left_widget_count - 1) as f32).max(0.0)
+                    } else {
+                        0.0
+                    };
+                    footer_ui.spacing_mut().item_spacing.x = effective_footer_spacing;
                     footer_ui.horizontal(|ui| {
-                        ui.set_min_height(ACP_COMPOSER_FOOTER_HEIGHT);
+                        ui.set_width(footer_w);
+                        ui.set_min_height(ctrl_h);
+                        let mut chat_text_response = None;
 
-                        let plus_btn = ui.add_sized(
-                            egui::vec2(ctrl_h, ctrl_h),
-                            egui::Button::new(
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(left_w, ctrl_h),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                ui.set_width(left_w);
+                                ui.set_min_height(ctrl_h);
+                                ui.spacing_mut().item_spacing.x = effective_footer_spacing;
+
+                                let plus_btn = ui.add_sized(
+                                    egui::vec2(plus_w, ctrl_h),
+                                    egui::Button::new(
                                 RichText::new(format!("{}", icons::PLUS))
                                     .size(14.0)
                                     .color(ACP_COMPOSER_ICON_COLOR),
@@ -21512,25 +21635,20 @@ impl AdeApp {
                             }
                         }
 
-                        let hint_text = if welcome_center {
-                            welcome_hint
-                        } else if session_ready {
-                            if let Some(mode_opt) = session.config_option("mode") {
-                                if mode_opt.current_value == "plan" {
-                                    "Plan and design before coding..."
+                        if !welcome_center {
+                            let hint_text = if session_ready {
+                                if let Some(mode_opt) = session.config_option("mode") {
+                                    if mode_opt.current_value == "plan" {
+                                        "Plan and design before coding..."
+                                    } else {
+                                        "Type a message..."
+                                    }
                                 } else {
                                     "Type a message..."
                                 }
                             } else {
-                                "Type a message..."
-                            }
-                        } else {
-                            "Waiting for session..."
-                        };
-
-                        let response = if welcome_center {
-                            composer_response.expect("welcome composer response")
-                        } else {
+                                "Waiting for session..."
+                            };
                             let text_edit = egui::TextEdit::multiline(&mut session.prompt_input)
                                 .id_salt("acp-composer-input")
                                 .desired_rows(1)
@@ -21543,120 +21661,12 @@ impl AdeApp {
                                 ))
                                 .vertical_align(egui::Align::Center)
                                 .frame(false);
-                            ui.add_sized(
+                            chat_text_response = Some(ui.add_sized(
                                 egui::vec2(text_input_width, ctrl_h),
                                 text_edit,
-                            )
-                        };
-
-                        let plain_enter = ui.input(|i| {
-                            i.events.iter().any(|e| {
-                                matches!(
-                                    e,
-                                    Event::Key {
-                                        key: Key::Enter,
-                                        modifiers,
-                                        pressed: true,
-                                        ..
-                                    } if modifiers.is_none()
-                                )
-                            })
-                        });
-                        if response.changed() {
-                            ctx.request_repaint();
+                            ));
                         }
 
-                        let can_send = (!session.prompt_input.trim().is_empty()
-                            || !session.attachments.is_empty())
-                            && !is_running
-                            && session_ready;
-
-                        // History navigation: Up / Down arrows
-                        let (up_pressed, down_pressed) = ui.input(|i| {
-                            let mut up = false;
-                            let mut down = false;
-                            for e in &i.events {
-                                if let Event::Key {
-                                    key: Key::ArrowUp,
-                                    modifiers,
-                                    pressed: true,
-                                    ..
-                                } = e
-                                {
-                                    if modifiers.is_none() {
-                                        up = true;
-                                    }
-                                }
-                                if let Event::Key {
-                                    key: Key::ArrowDown,
-                                    modifiers,
-                                    pressed: true,
-                                    ..
-                                } = e
-                                {
-                                    if modifiers.is_none() {
-                                        down = true;
-                                    }
-                                }
-                            }
-                            (up, down)
-                        });
-                        if up_pressed && response.has_focus() {
-                            if !session.recent_inputs.is_empty() {
-                                if session.history_index.is_none() {
-                                    session.history_draft = session.prompt_input.clone();
-                                }
-                                let new_index = session
-                                    .history_index
-                                    .map(|i| (i + 1).min(session.recent_inputs.len() - 1))
-                                    .unwrap_or(0);
-                                session.history_index = Some(new_index);
-                                session.prompt_input = session.recent_inputs[new_index].clone();
-                                ctx.request_repaint();
-                            }
-                        }
-                        if down_pressed && response.has_focus() {
-                            if let Some(idx) = session.history_index {
-                                if idx == 0 {
-                                    session.prompt_input = session.history_draft.clone();
-                                    session.history_index = None;
-                                } else {
-                                    session.history_index = Some(idx - 1);
-                                    session.prompt_input = session.recent_inputs[idx - 1].clone();
-                                }
-                                ctx.request_repaint();
-                            }
-                        }
-
-                        // Submit on plain Enter with focus
-                        if plain_enter && response.has_focus() && can_send {
-                            let text = session.prompt_input.trim().to_owned();
-                            let attachments = std::mem::take(&mut session.attachments);
-                            session.prompt_input.clear();
-                            if welcome_center {
-                                let prompt_text =
-                                    crate::opencode_acp::build_acp_prompt_text(&text, &attachments);
-                                let target_project = self.selected_project.unwrap_or(project_id);
-                                welcome_foreground_submit = Some((target_project, prompt_text));
-                            } else {
-                                let prompt_text =
-                                    crate::opencode_acp::build_acp_prompt_text(&text, &attachments);
-                                session
-                                    .messages
-                                    .push(crate::opencode_acp::AcpChatMessage::User {
-                                        text: prompt_text.clone(),
-                                    });
-                                session.recent_inputs.insert(0, prompt_text.clone());
-                                session.history_index = None;
-                                session.history_draft.clear();
-                                session.is_running = true;
-                                session.status = crate::opencode_acp::AcpChatStatus::Running;
-                                session.send_prompt(&prompt_text);
-                                ctx.request_repaint();
-                            }
-                        }
-
-                        // Model + effort selector
                         let model_label = session
                             .config_option("model")
                             .map(|o| {
@@ -21708,7 +21718,7 @@ impl AdeApp {
                         // Scope so interact_size and widget visuals only affect the ComboBox button
                         let _combo_response = ui
                             .scope(|ui| {
-                                ui.spacing_mut().interact_size.y = ACP_COMPOSER_FOOTER_HEIGHT;
+                                ui.spacing_mut().interact_size.y = ACP_COMPOSER_CONTROL_HEIGHT;
                                 // Local widget visuals for consistent capsule tone
                                 let visuals = ui.visuals_mut();
                                 visuals.widgets.inactive.bg_fill = ACP_COMPOSER_CAPSULE_FILL;
@@ -21818,6 +21828,119 @@ impl AdeApp {
                                 .find(|o| o.id == "effort")
                             {
                                 opt.current_value = selected_effort;
+                            }
+                        }
+                            },
+                        );
+
+                        let response = if welcome_center {
+                            composer_response.expect("welcome composer response")
+                        } else {
+                            chat_text_response.expect("chat composer response")
+                        };
+
+                        let plain_enter = ui.input(|i| {
+                            i.events.iter().any(|e| {
+                                matches!(
+                                    e,
+                                    Event::Key {
+                                        key: Key::Enter,
+                                        modifiers,
+                                        pressed: true,
+                                        ..
+                                    } if modifiers.is_none()
+                                )
+                            })
+                        });
+                        if response.changed() {
+                            ctx.request_repaint();
+                        }
+
+                        let can_send = (!session.prompt_input.trim().is_empty()
+                            || !session.attachments.is_empty())
+                            && !is_running
+                            && session_ready;
+
+                        let (up_pressed, down_pressed) = ui.input(|i| {
+                            let mut up = false;
+                            let mut down = false;
+                            for e in &i.events {
+                                if let Event::Key {
+                                    key: Key::ArrowUp,
+                                    modifiers,
+                                    pressed: true,
+                                    ..
+                                } = e
+                                {
+                                    if modifiers.is_none() {
+                                        up = true;
+                                    }
+                                }
+                                if let Event::Key {
+                                    key: Key::ArrowDown,
+                                    modifiers,
+                                    pressed: true,
+                                    ..
+                                } = e
+                                {
+                                    if modifiers.is_none() {
+                                        down = true;
+                                    }
+                                }
+                            }
+                            (up, down)
+                        });
+                        if up_pressed && response.has_focus() {
+                            if !session.recent_inputs.is_empty() {
+                                if session.history_index.is_none() {
+                                    session.history_draft = session.prompt_input.clone();
+                                }
+                                let new_index = session
+                                    .history_index
+                                    .map(|i| (i + 1).min(session.recent_inputs.len() - 1))
+                                    .unwrap_or(0);
+                                session.history_index = Some(new_index);
+                                session.prompt_input = session.recent_inputs[new_index].clone();
+                                ctx.request_repaint();
+                            }
+                        }
+                        if down_pressed && response.has_focus() {
+                            if let Some(idx) = session.history_index {
+                                if idx == 0 {
+                                    session.prompt_input = session.history_draft.clone();
+                                    session.history_index = None;
+                                } else {
+                                    session.history_index = Some(idx - 1);
+                                    session.prompt_input = session.recent_inputs[idx - 1].clone();
+                                }
+                                ctx.request_repaint();
+                            }
+                        }
+
+                        if plain_enter && response.has_focus() && can_send {
+                            let text = session.prompt_input.trim().to_owned();
+                            let attachments = std::mem::take(&mut session.attachments);
+                            session.prompt_input.clear();
+                            if welcome_center {
+                                let prompt_text =
+                                    crate::opencode_acp::build_acp_prompt_text(&text, &attachments);
+                                let target_project = self.selected_project.unwrap_or(project_id);
+                                welcome_foreground_submit = Some((target_project, prompt_text));
+                            } else {
+                                let prompt_text =
+                                    crate::opencode_acp::build_acp_prompt_text(&text, &attachments);
+                                session
+                                    .messages
+                                    .push(crate::opencode_acp::AcpChatMessage::User {
+                                        text: prompt_text.clone(),
+                                    });
+                                session.recent_inputs.insert(0, prompt_text.clone());
+                                session.history_index = None;
+                                session.history_draft.clear();
+                                session.is_running = true;
+                                session.status = crate::opencode_acp::AcpChatStatus::Running;
+                                session.send_prompt(&prompt_text);
+                                ctx.request_repaint();
                             }
                         }
 
@@ -63551,6 +63674,133 @@ mod tests {
         assert!(
             super::AdeApp::parse_opencode_question_from_raw_json(r#"{"status":"idle"}"#).is_none()
         );
+    }
+
+    #[test]
+    fn acp_context_project_combo_width_tracks_selected_label() {
+        let width = super::acp_context_project_combo_width(58.0, 720.0);
+        assert!((width - 86.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn acp_context_project_combo_width_clamps_long_label() {
+        let width = super::acp_context_project_combo_width(400.0, 720.0);
+        assert!((width - 220.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn acp_context_project_combo_width_respects_narrow_available_width() {
+        let width = super::acp_context_project_combo_width(58.0, 64.0);
+        assert!((width - 64.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn acp_composer_footer_control_rect_lifts_smaller_controls() {
+        let footer_rect = egui::Rect::from_min_size(
+            egui::pos2(10.0, 20.0),
+            egui::vec2(320.0, super::ACP_COMPOSER_FOOTER_HEIGHT),
+        );
+        let control_rect = super::acp_composer_footer_control_rect(footer_rect);
+        let top_gap = control_rect.top() - footer_rect.top();
+        let bottom_gap = footer_rect.bottom() - control_rect.bottom();
+
+        assert!((control_rect.height() - super::ACP_COMPOSER_CONTROL_HEIGHT).abs() < 0.01);
+        assert!(
+            (top_gap - super::ACP_COMPOSER_FOOTER_CONTROL_TOP_INSET).abs() < 0.01,
+            "top gap should match the explicit inset, got {top_gap}"
+        );
+        assert!(
+            bottom_gap > top_gap,
+            "bottom gap should be larger after lifting controls (top={top_gap}, bottom={bottom_gap})"
+        );
+        assert!(
+            (bottom_gap - 9.0).abs() < 0.01,
+            "bottom gap should leave visible breathing room, got {bottom_gap}"
+        );
+    }
+
+    #[test]
+    fn acp_composer_footer_content_rect_insets_send_from_right_edge() {
+        let controls_rect =
+            egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(320.0, 30.0));
+        let content_rect = super::acp_composer_footer_content_rect(controls_rect);
+
+        assert!((content_rect.left() - controls_rect.left()).abs() < 0.01);
+        assert!((content_rect.height() - controls_rect.height()).abs() < 0.01);
+        assert!(
+            (controls_rect.right() - content_rect.right() - super::ACP_COMPOSER_SEND_RIGHT_INSET)
+                .abs()
+                < 0.01,
+            "content rect should leave send inset at the right edge"
+        );
+    }
+
+    #[test]
+    fn acp_composer_footer_content_rect_never_goes_negative() {
+        let controls_rect = egui::Rect::from_min_size(
+            egui::pos2(10.0, 20.0),
+            egui::vec2(super::ACP_COMPOSER_SEND_RIGHT_INSET - 2.0, 30.0),
+        );
+        let content_rect = super::acp_composer_footer_content_rect(controls_rect);
+
+        assert!(content_rect.width() >= 0.0);
+        assert!((content_rect.width() - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn acp_composer_footer_layout_never_exceeds_footer_width() {
+        let ctrl_h = super::ACP_COMPOSER_CONTROL_HEIGHT;
+        let spacing = super::ACP_COMPOSER_FOOTER_SPACING;
+        let cases: &[(f32, bool, bool)] = &[
+            (120.0, false, false),
+            (200.0, true, false),
+            (320.0, true, true),
+            (720.0, false, true),
+        ];
+        for &(footer_w, show_plan, welcome) in cases {
+            let (plus_w, plan_w, text_w, model_w, send_w) =
+                super::acp_composer_footer_layout(footer_w, ctrl_h, spacing, show_plan, welcome);
+            let widget_count = 2usize + usize::from(show_plan) + usize::from(!welcome);
+            let gaps = if widget_count > 1 {
+                (widget_count - 1) as f32 * spacing
+            } else {
+                0.0
+            };
+            let left_w = footer_w - send_w - spacing;
+            let left_gaps = gaps.min(left_w.max(0.0));
+            let left_used = plus_w + plan_w + text_w + model_w + left_gaps;
+            assert!(
+                left_used <= left_w + 0.01,
+                "footer_w={footer_w} plan={show_plan} welcome={welcome} left_used={left_used} left_w={left_w}"
+            );
+            assert!((footer_w - left_w - spacing - send_w).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn acp_composer_footer_layout_model_width_capped() {
+        let (_, _, _, model_w, _) = super::acp_composer_footer_layout(
+            720.0,
+            super::ACP_COMPOSER_CONTROL_HEIGHT,
+            super::ACP_COMPOSER_FOOTER_SPACING,
+            true,
+            true,
+        );
+        assert!(model_w <= super::ACP_COMPOSER_MODEL_WIDTH_MAX + 0.01);
+    }
+
+    #[test]
+    fn acp_composer_footer_layout_send_reserved_at_right() {
+        let footer_w = 400.0;
+        let ctrl_h = super::ACP_COMPOSER_CONTROL_HEIGHT;
+        let spacing = super::ACP_COMPOSER_FOOTER_SPACING;
+        let (_, _, text_w, model_w, send_w) =
+            super::acp_composer_footer_layout(footer_w, ctrl_h, spacing, true, false);
+        assert_eq!(send_w, ctrl_h);
+        let left_w = footer_w - send_w - spacing;
+        let gaps = 3.0 * spacing;
+        let used_left = ctrl_h + super::ACP_COMPOSER_PLAN_PILL_WIDTH + text_w + model_w + gaps;
+        assert!((used_left - left_w).abs() < 0.02);
     }
 
     #[test]

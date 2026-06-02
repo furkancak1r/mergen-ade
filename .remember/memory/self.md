@@ -24,3 +24,13 @@
 
 - Wrong: static project chip label only; welcome Enter always sent ACP prompt
 - Correct: ComboBox + chevron on project chip; `focus_project_in_terminal_manager`; welcome Enter/send routes via `submit_acp_welcome_to_foreground_terminal` (spawn opencode FG if needed)
+
+## ACP composer send sağ sabit (2026-06-02)
+
+- Wrong: tek `horizontal` satır; sabit gap; model `.clamp(60,140)` → dar pencerede send kapsül dışına taşıyordu
+- Correct: `acp_composer_footer_layout` + sol grup (`allocate_ui_with_layout`) + send sağda; `footer_ui.set_clip_rect`
+
+## ACP composer model genişliği (2026-06-02)
+
+- Wrong: welcome modda `model_w = flex_budget`; MODEL 60–140px
+- Correct: MODEL 18–42px; welcome `flex_budget.min(MODEL_MAX)`; dar ekran oranı 0.135
