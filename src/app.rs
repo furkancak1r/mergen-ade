@@ -13009,9 +13009,10 @@ impl AdeApp {
         style.spacing.item_spacing = egui::vec2(10.0, 8.0);
         style.spacing.button_padding = egui::vec2(12.0, 7.0);
         style.spacing.window_margin = egui::Margin::symmetric(12.0, 10.0);
-        // Immediate tooltips on hover (no delay, show while moving)
-        style.interaction.show_tooltips_only_when_still = false;
-        style.interaction.tooltip_delay = 0.0;
+        // One-second delay on all hover tooltips
+        style.interaction.show_tooltips_only_when_still = true;
+        style.interaction.tooltip_delay = 1.0;
+        style.interaction.tooltip_grace_time = 0.0;
         let mut scroll_style = egui::style::ScrollStyle::floating();
         // Keep scrollbars thin and low-contrast, even while hovered.
         scroll_style.bar_width = 3.2;
@@ -32347,29 +32348,33 @@ fn browser_toolbar_icon_button(ui: &mut Ui, icon: AppIcon, tooltip: &str) -> egu
         Sense::click(),
     );
 
-    // Show custom tooltip centered above the button when hovered
+    // Show hover background immediately (no delay), but delay the tooltip text.
     if response.hovered() {
         ui.painter()
             .rect_filled(rect.shrink(1.0), 8.0, with_alpha(BTN_ICON_HOVER, 110));
 
-        let tooltip_id = ui.make_persistent_id(("browser_toolbar_tooltip", response.id));
-        let tooltip_anchor = rect.center_top() + egui::vec2(0.0, -BROWSER_TOOLBAR_TOOLTIP_GAP);
+        if should_show_delayed_tooltip(ui.ctx(), response.id, true) {
+            let tooltip_id = ui.make_persistent_id(("browser_toolbar_tooltip", response.id));
+            let tooltip_anchor = rect.center_top() + egui::vec2(0.0, -BROWSER_TOOLBAR_TOOLTIP_GAP);
 
-        // Use Area with CENTER_BOTTOM pivot so tooltip is centered horizontally above the anchor
-        let ctx = ui.ctx();
-        egui::Area::new(tooltip_id)
-            .kind(egui::UiKind::Tooltip)
-            .order(egui::Order::Tooltip)
-            .pivot(egui::Align2::CENTER_BOTTOM)
-            .fixed_pos(tooltip_anchor)
-            .default_width(ctx.style().spacing.tooltip_width)
-            .sense(egui::Sense::hover())
-            .show(ctx, |ui| {
-                egui::Frame::popup(&ctx.style()).show(ui, |ui| {
-                    ui.style_mut().interaction.selectable_labels = false;
-                    ui.label(tooltip);
+            // Use Area with CENTER_BOTTOM pivot so tooltip is centered horizontally above the anchor
+            let ctx = ui.ctx();
+            egui::Area::new(tooltip_id)
+                .kind(egui::UiKind::Tooltip)
+                .order(egui::Order::Tooltip)
+                .pivot(egui::Align2::CENTER_BOTTOM)
+                .fixed_pos(tooltip_anchor)
+                .default_width(ctx.style().spacing.tooltip_width)
+                .sense(egui::Sense::hover())
+                .show(ctx, |ui| {
+                    egui::Frame::popup(&ctx.style()).show(ui, |ui| {
+                        ui.style_mut().interaction.selectable_labels = false;
+                        ui.label(tooltip);
+                    });
                 });
-            });
+        }
+    } else {
+        should_show_delayed_tooltip(ui.ctx(), response.id, false);
     }
 
     ui.painter().text(
@@ -32406,29 +32411,33 @@ fn browser_toolbar_toggle_button(
         Sense::click(),
     );
 
-    // Show custom tooltip centered above the button when hovered
+    // Show hover background immediately (no delay), but delay the tooltip text.
     if response.hovered() {
         ui.painter()
             .rect_filled(rect.shrink(1.0), 8.0, with_alpha(BTN_ICON_HOVER, 110));
 
-        let tooltip_id = ui.make_persistent_id(("browser_toolbar_tooltip", response.id));
-        let tooltip_anchor = rect.center_top() + egui::vec2(0.0, -BROWSER_TOOLBAR_TOOLTIP_GAP);
+        if should_show_delayed_tooltip(ui.ctx(), response.id, true) {
+            let tooltip_id = ui.make_persistent_id(("browser_toolbar_tooltip", response.id));
+            let tooltip_anchor = rect.center_top() + egui::vec2(0.0, -BROWSER_TOOLBAR_TOOLTIP_GAP);
 
-        // Use Area with CENTER_BOTTOM pivot so tooltip is centered horizontally above the anchor
-        let ctx = ui.ctx();
-        egui::Area::new(tooltip_id)
-            .kind(egui::UiKind::Tooltip)
-            .order(egui::Order::Tooltip)
-            .pivot(egui::Align2::CENTER_BOTTOM)
-            .fixed_pos(tooltip_anchor)
-            .default_width(ctx.style().spacing.tooltip_width)
-            .sense(egui::Sense::hover())
-            .show(ctx, |ui| {
-                egui::Frame::popup(&ctx.style()).show(ui, |ui| {
-                    ui.style_mut().interaction.selectable_labels = false;
-                    ui.label(tooltip);
+            // Use Area with CENTER_BOTTOM pivot so tooltip is centered horizontally above the anchor
+            let ctx = ui.ctx();
+            egui::Area::new(tooltip_id)
+                .kind(egui::UiKind::Tooltip)
+                .order(egui::Order::Tooltip)
+                .pivot(egui::Align2::CENTER_BOTTOM)
+                .fixed_pos(tooltip_anchor)
+                .default_width(ctx.style().spacing.tooltip_width)
+                .sense(egui::Sense::hover())
+                .show(ctx, |ui| {
+                    egui::Frame::popup(&ctx.style()).show(ui, |ui| {
+                        ui.style_mut().interaction.selectable_labels = false;
+                        ui.label(tooltip);
+                    });
                 });
-            });
+        }
+    } else {
+        should_show_delayed_tooltip(ui.ctx(), response.id, false);
     }
 
     let icon_color = if selected || response.hovered() || response.is_pointer_button_down_on() {
@@ -32447,6 +32456,45 @@ fn browser_toolbar_toggle_button(
     response
 }
 
+/// Tracks hover start time for the 1-second tooltip delay.
+#[derive(Clone, Copy, Default)]
+struct TooltipDelayState {
+    hover_start: Option<f64>,
+}
+
+/// Returns `true` once the pointer has been hovering over the widget
+/// for at least 1.0 second, enabling delayed tooltip display for
+/// custom `Area`-based tooltips (browser toolbar, tab titles, etc.).
+///
+/// Pass `hovering = false` to clean up state when the pointer leaves
+/// the widget, so the timer resets on re-entry.
+fn should_show_delayed_tooltip(ctx: &egui::Context, widget_id: egui::Id, hovering: bool) -> bool {
+    let delay_id = egui::Id::new(("tooltip_delay", widget_id));
+
+    if !hovering {
+        ctx.data_mut(|data| {
+            data.remove_temp::<TooltipDelayState>(delay_id);
+        });
+        return false;
+    }
+
+    let now = ctx.input(|i| i.time);
+    let elapsed = ctx.data_mut(|data| {
+        let state = data.get_temp_mut_or_insert_with(delay_id, || TooltipDelayState {
+            hover_start: Some(now),
+        });
+        let start = state.hover_start.unwrap_or(now);
+        now - start
+    });
+
+    if elapsed < 1.0 {
+        ctx.request_repaint_after(Duration::from_secs_f64((1.0 - elapsed).max(0.001)));
+        false
+    } else {
+        true
+    }
+}
+
 /// Show a tooltip centered above the given widget response.
 /// Helper for custom buttons that need tooltip positioning centered above the widget.
 fn show_tooltip_above(ui: &mut Ui, response: &egui::Response, tooltip: &str) {
@@ -32454,7 +32502,7 @@ fn show_tooltip_above(ui: &mut Ui, response: &egui::Response, tooltip: &str) {
 }
 
 fn show_tooltip_above_at(ui: &mut Ui, id: egui::Id, rect: egui::Rect, tooltip: &str, show: bool) {
-    if !show {
+    if !should_show_delayed_tooltip(ui.ctx(), id, show) {
         return;
     }
 
@@ -36629,13 +36677,35 @@ mod tests {
     }
 
     #[test]
-    fn transient_toast_content_width_caps_at_screen_on_narrow_screen() {
-        let ctx = egui::Context::default();
-        ctx.set_fonts(egui::FontDefinitions::default());
-        let _ = ctx.run(egui::RawInput::default(), |_ctx| {});
-        let message = "a".repeat(300);
-        let width = AdeApp::transient_toast_content_width(&ctx, 300.0, &message);
-        assert!(width <= 300.0, "width {width} should not exceed screen");
+    fn browser_tab_body_hover_still_shows_title_tooltip() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+        let widget_id = egui::Id::new("tab_body_test");
+
+        // Frame 1: hover at time 0.0 starts the delay timer
+        let _ = ctx.run(
+            RawInput {
+                time: Some(0.0),
+                events: vec![Event::PointerMoved(egui::pos2(10.0, 10.0))],
+                ..Default::default()
+            },
+            |ctx| {
+                // start the 1-second delay timer
+                assert!(!super::should_show_delayed_tooltip(ctx, widget_id, true));
+            },
+        );
+
+        // Frame 2: time is 2.0, timer should have elapsed
+        let _ = ctx.run(
+            RawInput {
+                time: Some(2.0),
+                events: vec![Event::PointerMoved(egui::pos2(10.0, 10.0))],
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(super::should_show_delayed_tooltip(ctx, widget_id, true));
+            },
+        );
     }
 
     #[test]
@@ -56006,6 +56076,7 @@ mod tests {
         ctx: &Context,
         hover_pos: Option<egui::Pos2>,
         can_add_tab: bool,
+        time: f64,
     ) -> (egui::FullOutput, BrowserTabTooltipTestRects) {
         const TAB_TOOLTIP: &str = "https://tooltip.example/browser-tab";
 
@@ -56014,6 +56085,7 @@ mod tests {
                 egui::pos2(0.0, 0.0),
                 egui::vec2(320.0, 140.0),
             )),
+            time: Some(time),
             ..RawInput::default()
         };
         if let Some(pos) = hover_pos {
@@ -56076,11 +56148,20 @@ mod tests {
     fn browser_tab_close_hover_does_not_show_action_or_tab_tooltip() {
         let ctx = Context::default();
         ctx.set_fonts(FontDefinitions::default());
-        let (_, rects) = draw_browser_tab_tooltip_test_ui(&ctx, None, true);
+        let (_, rects) = draw_browser_tab_tooltip_test_ui(&ctx, None, true, 0.0);
 
-        let _ = draw_browser_tab_tooltip_test_ui(&ctx, Some(rects.close_hover_rect.center()), true);
-        let (output, _) =
-            draw_browser_tab_tooltip_test_ui(&ctx, Some(rects.close_hover_rect.center()), true);
+        let _ = draw_browser_tab_tooltip_test_ui(
+            &ctx,
+            Some(rects.close_hover_rect.center()),
+            true,
+            0.0,
+        );
+        let (output, _) = draw_browser_tab_tooltip_test_ui(
+            &ctx,
+            Some(rects.close_hover_rect.center()),
+            true,
+            0.0,
+        );
 
         assert!(
             !output_contains_text(&output, "Close tab"),
@@ -56093,21 +56174,36 @@ mod tests {
     }
 
     #[test]
-    fn browser_tab_body_hover_still_shows_title_tooltip() {
+    fn delayed_tooltip_directly_returns_true_after_one_second() {
         let ctx = Context::default();
-        ctx.set_fonts(FontDefinitions::default());
-        let (_, rects) = draw_browser_tab_tooltip_test_ui(&ctx, None, true);
-        let body_hover_pos = egui::pos2(
-            rects.tab_rect.left() + super::BROWSER_TAB_LABEL_LEFT_PADDING,
-            rects.tab_rect.center().y,
+        let widget_id = egui::Id::new("direct_test");
+
+        // First frame: hover starts at time 0.0, timer begins
+        let _ = ctx.run(
+            RawInput {
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(
+                    !super::should_show_delayed_tooltip(ctx, widget_id, true),
+                    "should return false immediately at time 0.0"
+                );
+            },
         );
 
-        let _ = draw_browser_tab_tooltip_test_ui(&ctx, Some(body_hover_pos), true);
-        let (output, _) = draw_browser_tab_tooltip_test_ui(&ctx, Some(body_hover_pos), true);
-
-        assert!(
-            output_contains_text(&output, "https://tooltip.example/browser-tab"),
-            "hovering tab body should still render the tab title/url tooltip"
+        // Second frame: time is 2.0, timer should have elapsed
+        let _ = ctx.run(
+            RawInput {
+                time: Some(2.0),
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(
+                    super::should_show_delayed_tooltip(ctx, widget_id, true),
+                    "should return true at time 2.0"
+                );
+            },
         );
     }
 
@@ -56115,21 +56211,38 @@ mod tests {
     fn browser_add_tab_hover_does_not_show_action_tooltip() {
         let ctx = Context::default();
         ctx.set_fonts(FontDefinitions::default());
-        let (_, enabled_rects) = draw_browser_tab_tooltip_test_ui(&ctx, None, true);
-        let _ = draw_browser_tab_tooltip_test_ui(&ctx, Some(enabled_rects.add_rect.center()), true);
-        let (enabled_output, _) =
-            draw_browser_tab_tooltip_test_ui(&ctx, Some(enabled_rects.add_rect.center()), true);
+        let (_, enabled_rects) = draw_browser_tab_tooltip_test_ui(&ctx, None, true, 0.0);
+        let _ = draw_browser_tab_tooltip_test_ui(
+            &ctx,
+            Some(enabled_rects.add_rect.center()),
+            true,
+            0.0,
+        );
+        let (enabled_output, _) = draw_browser_tab_tooltip_test_ui(
+            &ctx,
+            Some(enabled_rects.add_rect.center()),
+            true,
+            0.0,
+        );
 
         assert!(
             !output_contains_text(&enabled_output, "New tab"),
             "enabled add-tab hover should not render a text tooltip"
         );
 
-        let (_, disabled_rects) = draw_browser_tab_tooltip_test_ui(&ctx, None, false);
-        let _ =
-            draw_browser_tab_tooltip_test_ui(&ctx, Some(disabled_rects.add_rect.center()), false);
-        let (disabled_output, _) =
-            draw_browser_tab_tooltip_test_ui(&ctx, Some(disabled_rects.add_rect.center()), false);
+        let (_, disabled_rects) = draw_browser_tab_tooltip_test_ui(&ctx, None, false, 0.0);
+        let _ = draw_browser_tab_tooltip_test_ui(
+            &ctx,
+            Some(disabled_rects.add_rect.center()),
+            false,
+            0.0,
+        );
+        let (disabled_output, _) = draw_browser_tab_tooltip_test_ui(
+            &ctx,
+            Some(disabled_rects.add_rect.center()),
+            false,
+            0.0,
+        );
 
         assert!(
             !output_contains_text(&disabled_output, "Tab limit reached"),

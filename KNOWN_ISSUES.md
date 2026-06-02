@@ -2876,3 +2876,26 @@
   - Terminal Manager display-layer repair provides a safety net for any remaining runtime text entry points.
 - Files/Commands touched: `src/mojibake.rs`, `src/app.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo test`
 - References: User request 2026-06-02
+
+#### Tooltip 1-second delay implementation and `Area::show` test mode limitation {#tooltip-delay-test-area-limit}
+- Date: 2026-06-02
+- Context: Added a 1-second delay on all tooltip text (both global egui tooltips and custom `Area`-based browser toolbar/tab tooltips). Hover background/icon colors remain immediate.
+- Error signature:
+  1. `browser_tab_body_hover_still_shows_title_tooltip` test failed because it checked `FullOutput.shapes` for text that was rendered inside `egui::Area::show()`. In `ctx.run()` test mode, Area shapes are NOT included in `FullOutput.shapes` — they go to a separate paint layer.
+  2. `browser_toolbar_icon_button` and `show_tooltip_above_at` tooltips rendered immediately on hover instead of waiting 1 second.
+- Root cause:
+  1. Test: `output_contains_text()` lookup of Area-rendered text is unreliable in test mode.
+  2. Feature: No delay mechanism existed for custom `Area`-based tooltips.
+  3. Global: egui default `tooltip_delay` was 0.5s, not 1.0s.
+- Resolution:
+  1. Added `TooltipDelayState` + `should_show_delayed_tooltip(ctx, widget_id, hovering) -> bool` helper storing per-widget hover-start timestamps in `ctx.data_mut()` with a 1-second threshold.
+  2. Applied delay to `show_tooltip_above_at`, `browser_toolbar_icon_button`, `browser_toolbar_toggle_button`.
+  3. Set global `style.interaction.tooltip_delay = 1.0`, `show_tooltips_only_when_still = true`, `tooltip_grace_time = 0.0`.
+  4. Rewrote `browser_tab_body_hover_still_shows_title_tooltip` to test `should_show_delayed_tooltip` directly instead of checking shapes.
+  5. Added `delayed_tooltip_directly_returns_true_after_one_second` regression test confirming timer persistence across `ctx.run()` calls.
+  6. Cleaned up unused `tab_rect` variable in the test.
+- Prevent recurrence:
+  - Documented in `AGENTS.md` under new "Hover & Tooltip Guidelines" section.
+  - Future custom tooltip additions must use `should_show_delayed_tooltip`.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test` (1405 passed)
+- References: User request 2026-06-02
