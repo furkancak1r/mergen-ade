@@ -944,6 +944,47 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
 
+    /// Build a test-only ACP session without spawning a real process.
+    fn test_acp_session(
+        chat_id: u64,
+        project_id: u64,
+        status: AcpChatStatus,
+        session_id: Option<String>,
+    ) -> AcpChatSession {
+        let (tx, _rx) = crossbeam_channel::unbounded::<String>();
+        AcpChatSession {
+            id: chat_id,
+            project_id,
+            project_path: PathBuf::from("C:/test/project"),
+            title: format!("Chat {chat_id}"),
+            created_at: Instant::now(),
+            updated_at: Instant::now(),
+            status,
+            session_id: session_id.clone(),
+            config_options: BTreeMap::new(),
+            config_options_struct: Vec::new(),
+            modes: Vec::new(),
+            available_commands: Vec::new(),
+            messages: Vec::new(),
+            pending_permission: None,
+            prompt_input: String::new(),
+            attachments: Vec::new(),
+            is_running: false,
+            show_thread_selector: false,
+            selected_mode_id: None,
+            model_search_query: String::new(),
+            recent_inputs: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
+            queue: Vec::new(),
+            command_tx: tx,
+            process: None,
+            writer_thread: None,
+            reader_thread: None,
+            stderr_thread: None,
+        }
+    }
+
     fn test_session() -> (AcpChatSession, crossbeam_channel::Receiver<String>) {
         let (tx, rx) = crossbeam_channel::unbounded::<String>();
         let session = AcpChatSession {

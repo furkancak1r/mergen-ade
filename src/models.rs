@@ -576,7 +576,10 @@ impl OpenCodeModelConfig {
     /// Merge newly discovered ACP model options into the known-models cache.
     /// Updates existing entries with the latest name, adds new ones.
     /// Returns true when the cache changed.
-    pub fn merge_acp_known_models(&mut self, options: impl Iterator<Item = (String, String)>) -> bool {
+    pub fn merge_acp_known_models(
+        &mut self,
+        options: impl Iterator<Item = (String, String)>,
+    ) -> bool {
         let mut changed = false;
         for (value, name) in options {
             if let Some(existing) = self.acp_known_models.iter_mut().find(|e| e.value == value) {

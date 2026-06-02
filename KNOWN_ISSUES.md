@@ -2899,3 +2899,28 @@
   - Future custom tooltip additions must use `should_show_delayed_tooltip`.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test` (1405 passed)
 - References: User request 2026-06-02
+
+---
+
+#### OpenCode ACP standby stale auto-promotion and retry loop {#acp-standby-promotion-retry-guards}
+- Date: 2026-06-02
+- Context: ACP standby sessions were introduced to pre-warm one hidden OpenCode ACP session per project so startup and New Chat could reuse a ready session instead of showing a cold "Waiting for session..." state.
+- Error signature:
+  1. `maybe_promote_standby_to_active()` promoted a standby on `SessionCreated` without checking that the project was still selected or even still registered.
+  2. `update()` called `ensure_acp_standby_for_project(selected_project)` every frame, and failed/errored standby sessions were removed from the standby map without any retry cooldown.
+- Symptoms/Impact:
+  1. If the user switched projects or removed a project while a standby was warming, a late `SessionCreated` event could activate a chat for the stale project path.
+  2. If `opencode acp` failed to spawn, wrote stderr, or disconnected while warming, the app could attempt to create another standby every frame for the selected project.
+- Root cause:
+  1. Standby promotion did not distinguish automatic background readiness from explicit user activation.
+  2. Standby failure cleanup removed the current standby marker but did not record a retry deadline.
+- Resolution:
+  1. Guard automatic standby promotion so it only applies to still-registered, currently selected projects with no visible ACP chat.
+  2. Clear ACP state on project removal so late standby events cannot resurrect removed projects.
+  3. Add per-project standby retry cooldown state and apply it to automatic warming after spawn failure, ACP error, or disconnect.
+  4. Keep user-triggered OpenCode Chat/New Chat retries explicit while preventing per-frame automatic retry loops.
+- Prevent recurrence:
+  1. Updated AGENTS.md with ACP standby promotion, project cleanup, and retry cooldown invariants.
+  2. Added regression tests for unselected standby promotion blocking, selected standby promotion, project removal cleanup, standby error cleanup, and retry cooldown behavior.
+- Files/Commands touched: `src/app.rs`, `src/opencode_acp.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted ACP standby tests, `cargo test`
+- References: Review findings 2026-06-02

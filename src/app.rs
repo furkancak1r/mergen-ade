@@ -318,6 +318,12 @@ const SMART_INPUT_DRAFT_INNER_MARGIN_Y: f32 = 5.0;
 const SMART_INPUT_DRAFT_ATTACHMENT_STRIP_HEIGHT: f32 = 20.0;
 const SMART_INPUT_ATTACHMENT_REMOVE_BUTTON_SIZE: f32 = 12.0;
 const ACP_COMPOSER_CONTROL_HEIGHT: f32 = 36.0;
+const ACP_COMPOSER_PADDING_X: f32 = 10.0;
+const ACP_COMPOSER_PADDING_Y: f32 = 8.0;
+const ACP_COMPOSER_FOOTER_HEIGHT: f32 = ACP_COMPOSER_CONTROL_HEIGHT;
+const ACP_COMPOSER_WELCOME_TEXT_MIN: f32 = 56.0;
+const ACP_COMPOSER_CHAT_CAPSULE_HEIGHT: f32 =
+    ACP_COMPOSER_PADDING_Y * 2.0 + ACP_COMPOSER_FOOTER_HEIGHT;
 const ACP_COMPOSER_CAPSULE_FILL: Color32 = Color32::from_rgb(27, 27, 27);
 const ACP_COMPOSER_CAPSULE_STROKE: Color32 = Color32::from_rgb(40, 40, 40);
 const ACP_COMPOSER_CAPSULE_RADIUS: f32 = 12.0;
@@ -325,9 +331,11 @@ const ACP_COMPOSER_ICON_COLOR: Color32 = Color32::from_rgb(244, 244, 244);
 const ACP_COMPOSER_ICON_MUTED: Color32 = Color32::from_rgb(190, 190, 190);
 const ACP_COMPOSER_SEND_ACTIVE_FILL: Color32 = Color32::from_rgb(230, 230, 230);
 const ACP_WELCOME_MAX_WIDTH: f32 = 720.0;
-const ACP_WELCOME_COMPOSER_MIN_HEIGHT: f32 = 136.0;
+const ACP_WELCOME_COMPOSER_MIN_HEIGHT: f32 =
+    ACP_COMPOSER_PADDING_Y * 2.0 + ACP_COMPOSER_WELCOME_TEXT_MIN + ACP_COMPOSER_FOOTER_HEIGHT;
 const ACP_WELCOME_CONTEXT_ROW_HEIGHT: f32 = 28.0;
 const ACP_WELCOME_HINT: &str = "Plan, Build, / for skills, @ for context";
+const ACP_STANDBY_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
 const SMART_INPUT_FOOTER_GAP: f32 = 6.0;
 const SMART_INPUT_HEADER_RIGHT_INSET: f32 = 12.0;
 const SMART_INPUT_RESIZE_HANDLE_HEIGHT: f32 = 5.0;
@@ -1972,8 +1980,7 @@ fn window_close_clicked_in_hover_rect(ctx: &egui::Context, window_rect: egui::Re
     let close_rect = window_close_button_hover_rect(window_rect, &style);
     ctx.input(|i| {
         i.pointer.primary_clicked()
-            && i
-                .pointer
+            && i.pointer
                 .interact_pos()
                 .is_some_and(|p| close_rect.contains(p))
     })
@@ -2245,6 +2252,10 @@ pub struct AdeApp {
     active_acp_chat: Option<u64>,
     /// Hidden ACP session opened only to load model options in Settings.
     acp_model_probe_chat: Option<u64>,
+    /// Pre-warmed hidden ACP session per project (consumed on "New Chat").
+    acp_standby_chat_by_project: BTreeMap<u64, u64>,
+    /// Per-project cooldown for automatic ACP standby respawn after failure.
+    acp_standby_retry_after_by_project: BTreeMap<u64, Instant>,
     /// Next OpenCode ACP session ID counter.
     next_acp_chat_id: u64,
 }
@@ -4871,8 +4882,13 @@ impl AdeApp {
             acp_chat_events_rx,
             active_acp_chat: None,
             acp_model_probe_chat: None,
+            acp_standby_chat_by_project: BTreeMap::new(),
+            acp_standby_retry_after_by_project: BTreeMap::new(),
             next_acp_chat_id: 1,
         };
+        if let Some(project_id) = app.selected_project {
+            app.ensure_acp_standby_for_project(project_id);
+        }
         // Do NOT seed runtime browser state from legacy config.
         // Browser panel open state is now runtime-only per project.
         // config.ui.browser_panel_expanded is legacy and reset on load.
@@ -4986,12 +5002,18 @@ impl AdeApp {
             if let Some(&chat_id) = self.active_acp_chat_by_project.get(&project_id) {
                 if self.acp_chat_sessions.contains_key(&chat_id) {
                     self.active_acp_chat = Some(chat_id);
+                } else {
+                    // Stale mapping for removed/killed session
+                    self.active_acp_chat_by_project.remove(&project_id);
+                    self.active_acp_chat = None;
                 }
             } else {
                 // If no active chat for this project, clear the global active chat
                 // so terminals show instead of a stale chat from another project.
                 self.active_acp_chat = None;
             }
+        } else {
+            self.active_acp_chat = None;
         }
     }
 
@@ -9721,6 +9743,9 @@ impl AdeApp {
                         }
                     }
                     self.status_line = format!("OpenCode ACP {chat_id} session created");
+                    if self.maybe_promote_standby_to_active(chat_id) {
+                        changed = true;
+                    }
                 }
                 crate::opencode_acp::AcpChatEvent::AgentMessageChunk { chat_id, text } => {
                     if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
@@ -9905,6 +9930,8 @@ impl AdeApp {
                     if self.acp_model_probe_chat == Some(chat_id) {
                         self.acp_model_probe_chat = None;
                     }
+                    self.acp_standby_chat_by_project
+                        .retain(|_, &mut id| id != chat_id);
                     self.status_line = format!("OpenCode ACP {chat_id} error: {message}");
                     changed = true;
                 }
@@ -9917,6 +9944,8 @@ impl AdeApp {
                     if self.acp_model_probe_chat == Some(chat_id) {
                         self.acp_model_probe_chat = None;
                     }
+                    self.acp_standby_chat_by_project
+                        .retain(|_, &mut id| id != chat_id);
                     self.status_line = format!("OpenCode ACP {chat_id} disconnected");
                     changed = true;
                 }
@@ -9947,10 +9976,53 @@ impl AdeApp {
         })
     }
 
-    fn spawn_hidden_model_probe(&mut self, project_id: u64) {
-        let Some(project_path) = self.projects.get(&project_id).map(|p| p.path.clone()) else {
-            return;
-        };
+    fn acp_session_is_warm(session: &crate::opencode_acp::AcpChatSession) -> bool {
+        session.session_id.is_some()
+            && matches!(
+                session.status,
+                crate::opencode_acp::AcpChatStatus::Idle
+                    | crate::opencode_acp::AcpChatStatus::Running
+                    | crate::opencode_acp::AcpChatStatus::Permission
+            )
+    }
+
+    fn acp_standby_project_for_chat(&self, chat_id: u64) -> Option<u64> {
+        self.acp_standby_chat_by_project
+            .iter()
+            .find(|(_, &id)| id == chat_id)
+            .map(|(&pid, _)| pid)
+    }
+
+    fn project_has_visible_acp_chats(&self, project_id: u64) -> bool {
+        self.acp_chat_ids_by_project
+            .get(&project_id)
+            .is_some_and(|ids| !ids.is_empty())
+    }
+
+    fn acp_standby_retry_blocked(&self, project_id: u64) -> bool {
+        self.acp_standby_retry_after_by_project
+            .get(&project_id)
+            .is_some_and(|deadline| *deadline > Instant::now())
+    }
+
+    fn mark_acp_standby_retry(&mut self, project_id: u64) {
+        self.acp_standby_retry_after_by_project
+            .insert(project_id, Instant::now() + ACP_STANDBY_RETRY_COOLDOWN);
+    }
+
+    fn clear_acp_standby_retry(&mut self, project_id: u64) {
+        self.acp_standby_retry_after_by_project.remove(&project_id);
+    }
+
+    fn selected_project_allows_acp_auto_promotion(&self, project_id: u64) -> bool {
+        self.projects.contains_key(&project_id) && self.selected_project == Some(project_id)
+    }
+
+    fn spawn_acp_process(
+        &mut self,
+        project_id: u64,
+        project_path: PathBuf,
+    ) -> Result<u64, std::io::Error> {
         let chat_id = self.next_acp_chat_id;
         self.next_acp_chat_id += 1;
         let opencode_bin = crate::opencode::opencode_bin_path();
@@ -9969,7 +10041,7 @@ impl AdeApp {
             .unwrap_or_default();
         let startup_mode = self.config.acp_startup_mode.as_mode_id().to_string();
         let event_tx = self.acp_chat_events_tx.clone();
-        match crate::opencode_acp::spawn_opencode_acp(
+        let session = crate::opencode_acp::spawn_opencode_acp(
             chat_id,
             project_id,
             project_path,
@@ -9978,9 +10050,123 @@ impl AdeApp {
             startup_mode,
             browser_mcp_env,
             event_tx,
-        ) {
-            Ok(session) => {
-                self.acp_chat_sessions.insert(chat_id, session);
+        )?;
+        self.acp_chat_sessions.insert(chat_id, session);
+        Ok(chat_id)
+    }
+
+    fn ensure_acp_standby_for_project(&mut self, project_id: u64) {
+        let Some(project_path) = self.projects.get(&project_id).map(|p| p.path.clone()) else {
+            return;
+        };
+        if let Some(&standby_id) = self.acp_standby_chat_by_project.get(&project_id) {
+            if let Some(session) = self.acp_chat_sessions.get(&standby_id) {
+                match session.status {
+                    crate::opencode_acp::AcpChatStatus::Exited
+                    | crate::opencode_acp::AcpChatStatus::Error => {
+                        self.acp_standby_chat_by_project.remove(&project_id);
+                    }
+                    _ => return,
+                }
+            } else {
+                self.acp_standby_chat_by_project.remove(&project_id);
+            }
+        }
+        if self.acp_model_probe_chat.is_some() {
+            return;
+        }
+        match self.spawn_acp_process(project_id, project_path) {
+            Ok(chat_id) => {
+                self.acp_standby_chat_by_project.insert(project_id, chat_id);
+            }
+            Err(err) => {
+                self.status_line = format!("Failed to warm OpenCode ACP: {err}");
+            }
+        }
+    }
+
+    fn take_warm_standby_for_project(&mut self, project_id: u64) -> Option<u64> {
+        let chat_id = self.acp_standby_chat_by_project.remove(&project_id)?;
+        let warm = self
+            .acp_chat_sessions
+            .get(&chat_id)
+            .is_some_and(Self::acp_session_is_warm);
+        if warm {
+            Some(chat_id)
+        } else {
+            self.acp_standby_chat_by_project.insert(project_id, chat_id);
+            None
+        }
+    }
+
+    fn register_active_acp_chat(&mut self, project_id: u64, chat_id: u64) {
+        let project_name = self
+            .projects
+            .get(&project_id)
+            .map(|p| p.name.as_str())
+            .unwrap_or("project");
+        self.acp_chat_ids_by_project
+            .entry(project_id)
+            .or_default()
+            .push(chat_id);
+        self.active_acp_chat_by_project.insert(project_id, chat_id);
+        self.active_acp_chat = Some(chat_id);
+        self.status_line = format!("Started OpenCode ACP for {project_name}");
+    }
+
+    fn maybe_promote_standby_to_active(&mut self, chat_id: u64) -> bool {
+        let session = match self.acp_chat_sessions.get(&chat_id) {
+            Some(s) => s,
+            None => return false,
+        };
+        let project_id = session.project_id;
+        if self.acp_standby_chat_by_project.get(&project_id) != Some(&chat_id) {
+            return false;
+        }
+        if !self.projects.contains_key(&project_id) {
+            self.acp_standby_chat_by_project.remove(&project_id);
+            self.kill_acp_chat(chat_id);
+            return false;
+        }
+        if !self.selected_project_allows_acp_auto_promotion(project_id) {
+            return false;
+        }
+        if !Self::acp_session_is_warm(session) {
+            return false;
+        }
+        if self.project_has_visible_acp_chats(project_id) {
+            return false;
+        }
+        self.acp_standby_chat_by_project.remove(&project_id);
+        self.clear_acp_standby_retry(project_id);
+        self.register_active_acp_chat(project_id, chat_id);
+        self.ensure_acp_standby_for_project(project_id);
+        true
+    }
+
+    fn promote_standby_to_active_if_present(&mut self, project_id: u64) -> Option<u64> {
+        if let Some(chat_id) = self.take_warm_standby_for_project(project_id) {
+            self.register_active_acp_chat(project_id, chat_id);
+            self.ensure_acp_standby_for_project(project_id);
+            return Some(chat_id);
+        }
+        let standby_id = self.acp_standby_chat_by_project.get(&project_id).copied()?;
+        if !self.acp_chat_sessions.contains_key(&standby_id) {
+            self.acp_standby_chat_by_project.remove(&project_id);
+            return None;
+        }
+        self.acp_standby_chat_by_project.remove(&project_id);
+        self.register_active_acp_chat(project_id, standby_id);
+        self.ensure_acp_standby_for_project(project_id);
+        Some(standby_id)
+    }
+
+    fn spawn_hidden_model_probe(&mut self, project_id: u64) {
+        let Some(project_path) = self.projects.get(&project_id).map(|p| p.path.clone()) else {
+            return;
+        };
+        match self.spawn_acp_process(project_id, project_path) {
+            Ok(chat_id) => {
                 self.acp_model_probe_chat = Some(chat_id);
             }
             Err(err) => {
@@ -10008,66 +10194,67 @@ impl AdeApp {
     }
 
     fn spawn_acp_chat_for_project(&mut self, project_id: u64, force_new: bool) -> Option<u64> {
-        let project = self.projects.get(&project_id)?;
-        // If project already has chats and force_new is false, activate the most recent one.
+        let project_name = self.projects.get(&project_id)?.name.clone();
         if !force_new {
             if let Some(chat_ids) = self.acp_chat_ids_by_project.get(&project_id) {
                 if let Some(&last_chat_id) = chat_ids.last() {
+                    if self
+                        .acp_chat_sessions
+                        .get(&last_chat_id)
+                        .is_some_and(Self::acp_session_is_warm)
+                    {
+                        self.active_acp_chat_by_project
+                            .insert(project_id, last_chat_id);
+                        self.active_acp_chat = Some(last_chat_id);
+                        self.status_line = format!("Switched to OpenCode ACP for {project_name}");
+                        self.ensure_acp_standby_for_project(project_id);
+                        return Some(last_chat_id);
+                    }
                     if self.acp_chat_sessions.contains_key(&last_chat_id) {
                         self.active_acp_chat_by_project
                             .insert(project_id, last_chat_id);
                         self.active_acp_chat = Some(last_chat_id);
-                        self.status_line = format!("Switched to OpenCode ACP for {}", project.name);
+                        self.status_line = format!("Switched to OpenCode ACP for {project_name}");
+                        self.ensure_acp_standby_for_project(project_id);
                         return Some(last_chat_id);
                     }
                 }
             }
+            if let Some(chat_id) = self.promote_standby_to_active_if_present(project_id) {
+                return Some(chat_id);
+            }
+            self.ensure_acp_standby_for_project(project_id);
+            if let Some(chat_id) = self.promote_standby_to_active_if_present(project_id) {
+                return Some(chat_id);
+            }
+            self.status_line = "OpenCode hazırlanıyor...".to_owned();
+            return None;
         }
-        // Otherwise create a new chat thread.
-        let chat_id = self.next_acp_chat_id;
-        self.next_acp_chat_id += 1;
-        let opencode_bin = crate::opencode::opencode_bin_path();
-        let build_model = {
-            let model = self.config.opencode.active_build_model();
-            if model.is_empty() {
-                None
-            } else {
-                Some(model.to_owned())
-            }
-        };
-        let browser_mcp_env = self
-            .browser_mcp_service
-            .as_ref()
-            .map(|service| service.build_pty_env(chat_id, Some(project_id), None, Some(chat_id)))
-            .unwrap_or_default();
-        let startup_mode = self.config.acp_startup_mode.as_mode_id().to_string();
-        let event_tx = self.acp_chat_events_tx.clone();
-        match crate::opencode_acp::spawn_opencode_acp(
-            chat_id,
-            project_id,
-            project.path.clone(),
-            opencode_bin,
-            build_model,
-            startup_mode,
-            browser_mcp_env,
-            event_tx,
-        ) {
-            Ok(session) => {
-                self.acp_chat_sessions.insert(chat_id, session);
-                self.acp_chat_ids_by_project
-                    .entry(project_id)
-                    .or_default()
-                    .push(chat_id);
-                self.active_acp_chat_by_project.insert(project_id, chat_id);
-                self.active_acp_chat = Some(chat_id);
-                self.status_line = format!("Started OpenCode ACP for {}", project.name);
-                Some(chat_id)
-            }
-            Err(err) => {
-                self.status_line = format!("Failed to start OpenCode ACP: {err}");
-                None
+        if let Some(chat_id) = self.promote_standby_to_active_if_present(project_id) {
+            return Some(chat_id);
+        }
+        if let Some(chat_ids) = self.acp_chat_ids_by_project.get(&project_id) {
+            if let Some(&last_chat_id) = chat_ids.last() {
+                if self
+                    .acp_chat_sessions
+                    .get(&last_chat_id)
+                    .is_some_and(Self::acp_session_is_warm)
+                {
+                    self.active_acp_chat_by_project
+                        .insert(project_id, last_chat_id);
+                    self.active_acp_chat = Some(last_chat_id);
+                    self.status_line = format!("Switched to OpenCode ACP for {project_name}");
+                    self.ensure_acp_standby_for_project(project_id);
+                    return Some(last_chat_id);
+                }
             }
         }
+        self.ensure_acp_standby_for_project(project_id);
+        if let Some(chat_id) = self.promote_standby_to_active_if_present(project_id) {
+            return Some(chat_id);
+        }
+        self.status_line = "OpenCode hazırlanıyor...".to_owned();
+        None
     }
 
     fn kill_acp_chat(&mut self, chat_id: u64) {
@@ -10077,14 +10264,18 @@ impl AdeApp {
                 service.revoke_acp_chat(chat_id);
             }
         }
-        // Remove chat_id from project tracking.
         for (_, ids) in self.acp_chat_ids_by_project.iter_mut() {
             ids.retain(|&id| id != chat_id);
         }
         self.active_acp_chat_by_project
             .retain(|_, &mut id| id != chat_id);
+        self.acp_standby_chat_by_project
+            .retain(|_, &mut id| id != chat_id);
         if self.active_acp_chat == Some(chat_id) {
             self.active_acp_chat = None;
+        }
+        if self.acp_model_probe_chat == Some(chat_id) {
+            self.acp_model_probe_chat = None;
         }
     }
 
@@ -10094,8 +10285,108 @@ impl AdeApp {
                 self.kill_acp_chat(chat_id);
             }
         }
+        if let Some(standby_id) = self.acp_standby_chat_by_project.remove(&project_id) {
+            self.kill_acp_chat(standby_id);
+        }
+        self.clear_acp_standby_retry(project_id);
         self.acp_chat_ids_by_project.remove(&project_id);
         self.active_acp_chat_by_project.remove(&project_id);
+    }
+
+    fn preferred_opencode_launcher_id(&self) -> Option<String> {
+        self.config
+            .launchers
+            .iter()
+            .find(|launcher| {
+                launcher.enabled
+                    && !launcher.launch_command.trim().is_empty()
+                    && Self::launch_command_stem(&launcher.launch_command)
+                        .is_some_and(|stem| stem.eq_ignore_ascii_case("opencode"))
+            })
+            .map(|launcher| launcher.id.clone())
+    }
+
+    fn focus_project_in_terminal_manager(&mut self, ctx: &egui::Context, project_id: u64) {
+        if !self.projects.contains_key(&project_id) {
+            return;
+        }
+        if self.selected_project != Some(project_id) {
+            self.selected_project = Some(project_id);
+            self.note_selection_changed();
+        }
+        self.active_acp_chat = None;
+        self.config.ui.show_project_explorer = true;
+        self.config.ui.project_explorer_expanded = true;
+        self.config.ui.left_sidebar_tab = LeftSidebarTab::TerminalManager;
+        self.config.ui.terminal_manager_filter = crate::models::TerminalManagerFilter::Foreground;
+        self.pending_config_changes.ui = true;
+        self.pending_config_changes.selection = true;
+        let mut header_state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            ctx,
+            terminal_manager_project_group_header_id(project_id),
+            false,
+        );
+        header_state.set_open(true);
+        header_state.store(ctx);
+        if let Some(terminal_id) = self.preferred_terminal_for_project(project_id) {
+            self.active_terminal = Some(terminal_id);
+        }
+        self.persist_config();
+        ctx.request_repaint();
+    }
+
+    fn submit_acp_welcome_to_foreground_terminal(
+        &mut self,
+        ctx: &egui::Context,
+        project_id: u64,
+        text: &str,
+    ) -> bool {
+        let text = text.trim();
+        if text.is_empty() || !self.projects.contains_key(&project_id) {
+            return false;
+        }
+
+        let mut terminal_id = self.preferred_terminal_for_project(project_id);
+        if terminal_id.is_none() {
+            let launcher_id = self.preferred_opencode_launcher_id().or_else(|| {
+                self.foreground_launchers()
+                    .first()
+                    .map(|launcher| launcher.id.clone())
+            });
+            if let Some(launcher_id) = launcher_id {
+                if self.spawn_terminal_for_project(
+                    ctx,
+                    project_id,
+                    TerminalKind::Foreground,
+                    Some(&launcher_id),
+                ) {
+                    terminal_id = self.preferred_terminal_for_project(project_id);
+                }
+            }
+        }
+
+        let Some(terminal_id) = terminal_id else {
+            self.status_line = "Foreground terminal açılamadı.".to_owned();
+            return false;
+        };
+
+        self.focus_project_in_terminal_manager(ctx, project_id);
+        self.active_terminal = Some(terminal_id);
+        let submitted = self.submit_prompt_to_terminal(
+            ctx,
+            terminal_id,
+            text,
+            TerminalPromptSubmitOptions::smart_manual(),
+        );
+        if submitted {
+            let project_name = self
+                .projects
+                .get(&project_id)
+                .map(|project| project.name.as_str())
+                .unwrap_or("project");
+            self.status_line = format!("Sent to foreground terminal for {project_name}");
+        }
+        submitted
     }
 
     fn request_source_control_refresh(&mut self, project_id: u64, run_fetch: bool, manual: bool) {
@@ -15750,11 +16041,7 @@ impl AdeApp {
     fn draw_settings_diagnostic_row(ui: &mut Ui, label: &str, value: &str, value_color: Color32) {
         let row_width = ui.available_width().max(0.0);
         ui.set_max_width(row_width);
-        settings_copyable_label(
-            ui,
-            RichText::new(label).strong().color(TEXT_PRIMARY),
-            label,
-        );
+        settings_copyable_label(ui, RichText::new(label).strong().color(TEXT_PRIMARY), label);
         let value_response = ui
             .add(
                 egui::Label::new(RichText::new(value).monospace().small().color(value_color))
@@ -15867,9 +16154,7 @@ impl AdeApp {
         let section_description = self.active_settings_section.description();
         settings_copyable_label(
             ui,
-            RichText::new(section_description)
-                .small()
-                .color(TEXT_MUTED),
+            RichText::new(section_description).small().color(TEXT_MUTED),
             section_description,
         );
         ui.add_space(12.0);
@@ -17431,8 +17716,7 @@ impl AdeApp {
                         .any(|s| s.id == default.id);
                     if !exists {
                         ui.horizontal(|ui| {
-                            let default_summary =
-                                format!("{} → {}", default.key, default.command);
+                            let default_summary = format!("{} → {}", default.key, default.command);
                             settings_copyable_label(
                                 ui,
                                 RichText::new(&default_summary),
@@ -19813,7 +20097,7 @@ impl AdeApp {
                             )
                         }
                         Some(ForegroundLauncherAction::OpenCodeChat) => {
-                            self.spawn_acp_chat_for_project(project_id, true);
+                            self.spawn_acp_chat_for_project(project_id, false);
                             false
                         }
                         None => false,
@@ -19902,7 +20186,7 @@ impl AdeApp {
                                             )
                                         }
                                         Some(ForegroundLauncherAction::OpenCodeChat) => {
-                                            self.spawn_acp_chat_for_project(wt_project_id, true);
+                                            self.spawn_acp_chat_for_project(wt_project_id, false);
                                             false
                                         }
                                         None => false,
@@ -20613,19 +20897,55 @@ impl AdeApp {
             .is_some_and(|s| s.messages.is_empty())
     }
 
-    fn draw_acp_context_chips(&self, ui: &mut egui::Ui, project_id: u64) {
+    fn draw_acp_context_chips(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, project_id: u64) {
         ui.spacing_mut().item_spacing.x = 10.0;
-        let project_label = self
+        let project_rows: Vec<(u64, String)> = sorted_projects(&self.projects)
+            .into_iter()
+            .map(|project| {
+                (
+                    project.id,
+                    crate::mojibake::repair_mojibake_display(&project.name),
+                )
+            })
+            .collect();
+        let active_project_id = self.selected_project.unwrap_or(project_id);
+        let selected_label = self
             .projects
-            .get(&project_id)
-            .map(|p| p.name.as_str())
-            .unwrap_or("Project");
+            .get(&active_project_id)
+            .map(|project| crate::mojibake::repair_mojibake_display(&project.name))
+            .unwrap_or_else(|| "Project".to_owned());
+        let combo_width = project_rows
+            .iter()
+            .map(|(_, name)| {
+                ui.fonts(|fonts| {
+                    fonts
+                        .layout_no_wrap(
+                            name.clone(),
+                            egui::FontId::proportional(12.0),
+                            Color32::WHITE,
+                        )
+                        .size()
+                        .x
+                })
+            })
+            .fold(0.0_f32, f32::max)
+            .max(ui.fonts(|fonts| {
+                fonts
+                    .layout_no_wrap(
+                        selected_label.clone(),
+                        egui::FontId::proportional(12.0),
+                        Color32::WHITE,
+                    )
+                    .size()
+                    .x
+            }))
+            + 28.0;
         let branch_label = self
             .source_control_state
-            .get(&project_id)
-            .map(|s| s.branch.as_str())
+            .get(&active_project_id)
+            .map(|s| s.branch.clone())
             .filter(|b| !b.is_empty())
-            .unwrap_or("main");
+            .unwrap_or_else(|| "main".to_owned());
         let chip = |ui: &mut egui::Ui, icon: Option<AppIcon>, label: &str| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
@@ -20636,15 +20956,34 @@ impl AdeApp {
                             .color(ACP_COMPOSER_ICON_COLOR),
                     );
                 }
-                ui.label(
-                    RichText::new(label)
-                        .size(12.0)
-                        .color(TEXT_MUTED),
-                );
+                ui.label(RichText::new(label).size(12.0).color(TEXT_MUTED));
             });
         };
-        chip(ui, None, project_label);
-        chip(ui, Some(icons::GIT_BRANCH), branch_label);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let mut selected_id = self.selected_project;
+            with_minimal_button_chrome(ui, |ui| {
+                egui::ComboBox::from_id_salt("acp-context-project-select")
+                    .selected_text(RichText::new(&selected_label).size(12.0).color(TEXT_MUTED))
+                    .icon(paint_minimal_combo_icon)
+                    .width(combo_width.clamp(72.0, 220.0))
+                    .show_ui(ui, |ui| {
+                        for (row_project_id, project_name) in &project_rows {
+                            ui.selectable_value(
+                                &mut selected_id,
+                                Some(*row_project_id),
+                                project_name.clone(),
+                            );
+                        }
+                    });
+            });
+            if selected_id != self.selected_project {
+                if let Some(new_project_id) = selected_id {
+                    self.focus_project_in_terminal_manager(ctx, new_project_id);
+                }
+            }
+        });
+        chip(ui, Some(icons::GIT_BRANCH), branch_label.as_str());
         chip(ui, Some(icons::TERMINAL), "Local");
     }
 
@@ -20667,7 +21006,7 @@ impl AdeApp {
                     let mut h = if welcome_center {
                         ACP_WELCOME_COMPOSER_MIN_HEIGHT
                     } else {
-                        48.0f32
+                        ACP_COMPOSER_CHAT_CAPSULE_HEIGHT
                     };
                     if !session.attachments.is_empty() {
                         h += 24.0 + 4.0;
@@ -20692,7 +21031,7 @@ impl AdeApp {
                     }
                     h
                 } else {
-                    48.0
+                    ACP_COMPOSER_CHAT_CAPSULE_HEIGHT
                 };
 
                 let thread_selector_height = if welcome_center { 0.0 } else { 32.0 };
@@ -20779,7 +21118,7 @@ impl AdeApp {
                                 .max_rect(context_rect)
                                 .layout(Layout::left_to_right(Align::Center)),
                         );
-                        self.draw_acp_context_chips(&mut context_ui, project_id);
+                        self.draw_acp_context_chips(&mut context_ui, ctx, project_id);
                     }
                 } else {
                 // --- Thread selector bar ---
@@ -20994,6 +21333,7 @@ impl AdeApp {
                 );
                 composer_ui.set_clip_rect(composer_rect);
                 let acp_favorite_models = self.config.opencode.acp_favorite_models.clone();
+                let mut welcome_foreground_submit: Option<(u64, String)> = None;
                 if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
                     let is_running = session.is_running
                         || matches!(session.status, crate::opencode_acp::AcpChatStatus::Running);
@@ -21004,7 +21344,7 @@ impl AdeApp {
                     let capsule_body_height = if welcome_center {
                         ACP_WELCOME_COMPOSER_MIN_HEIGHT
                     } else {
-                        48.0
+                        ACP_COMPOSER_CHAT_CAPSULE_HEIGHT
                     };
                     let capsule_rect = egui::Rect::from_min_size(
                         composer_ui.cursor().min,
@@ -21017,30 +21357,43 @@ impl AdeApp {
                         ACP_COMPOSER_CAPSULE_FILL,
                         Stroke::NONE,
                     );
-                    let capsule_layout = if welcome_center {
-                        Layout::top_down(Align::Min)
-                    } else {
-                        Layout::left_to_right(Align::Center)
-                    };
-                    let mut capsule_ui = composer_ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(capsule_rect.shrink2(egui::vec2(10.0, 8.0)))
-                            .layout(capsule_layout),
-                    );
-                    capsule_ui.set_clip_rect(capsule_rect);
+                    let inner_rect = capsule_rect.shrink2(egui::vec2(
+                        ACP_COMPOSER_PADDING_X,
+                        ACP_COMPOSER_PADDING_Y,
+                    ));
+                    let inner_height = inner_rect.height();
                     let welcome_hint = if session_ready {
                         ACP_WELCOME_HINT
                     } else {
                         "Waiting for session..."
                     };
-                    let welcome_text_height =
-                        (capsule_body_height - 48.0 - 6.0).max(56.0);
+                    let welcome_text_height = if welcome_center {
+                        (inner_height - ACP_COMPOSER_FOOTER_HEIGHT).max(ACP_COMPOSER_WELCOME_TEXT_MIN)
+                    } else {
+                        0.0
+                    };
+                    let mut capsule_ui = composer_ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(inner_rect)
+                            .layout(Layout::top_down(Align::Min)),
+                    );
+                    capsule_ui.set_clip_rect(capsule_rect);
                     let mut composer_response = None;
                     if welcome_center {
+                        let text_rect = egui::Rect::from_min_size(
+                            capsule_ui.cursor().min,
+                            egui::vec2(inner_rect.width(), welcome_text_height),
+                        );
+                        capsule_ui.allocate_rect(text_rect, Sense::hover());
+                        let mut text_ui = capsule_ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(text_rect)
+                                .layout(Layout::left_to_right(Align::Min)),
+                        );
                         let text_edit = egui::TextEdit::multiline(&mut session.prompt_input)
                             .id_salt("acp-composer-input")
                             .desired_rows(4)
-                            .desired_width(capsule_ui.available_width())
+                            .desired_width(text_rect.width())
                             .hint_text(welcome_hint)
                             .interactive(!is_running)
                             .return_key(egui::KeyboardShortcut::new(
@@ -21048,25 +21401,60 @@ impl AdeApp {
                                 egui::Key::Enter,
                             ))
                             .frame(false);
-                        let response = capsule_ui.add_sized(
-                            egui::vec2(capsule_ui.available_width(), welcome_text_height),
+                        composer_response = Some(text_ui.add_sized(
+                            egui::vec2(text_rect.width(), welcome_text_height),
                             text_edit,
-                        );
-                        composer_response = Some(response);
+                        ));
                     }
-                    capsule_ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
+                    let footer_rect = egui::Rect::from_min_max(
+                        egui::pos2(inner_rect.min.x, inner_rect.max.y - ACP_COMPOSER_FOOTER_HEIGHT),
+                        inner_rect.max,
+                    );
+                    capsule_ui.allocate_rect(footer_rect, Sense::hover());
+                    let active_mode = session.active_mode_id_or_default();
+                    let show_plan_pill = crate::opencode_acp::mode_is_plan(&active_mode);
+                    let footer_w = footer_rect.width();
+                    let ctrl_h = ACP_COMPOSER_FOOTER_HEIGHT;
+                    let footer_spacing = 6.0;
+                    let send_w = ctrl_h;
+                    let plus_w = ctrl_h;
+                    let plan_w = if show_plan_pill { 52.0 } else { 0.0 };
+                    let gaps = if welcome_center {
+                        footer_spacing * 3.0
+                    } else {
+                        footer_spacing * 4.0
+                    };
+                    let model_selector_width = (footer_w - plus_w - plan_w - send_w - gaps - if welcome_center {
+                        0.0
+                    } else {
+                        40.0
+                    })
+                    .clamp(60.0, 140.0);
+                    let text_input_width = if welcome_center {
+                        0.0
+                    } else {
+                        (footer_w - plus_w - plan_w - send_w - model_selector_width - gaps).max(40.0)
+                    };
+                    let mut footer_ui = capsule_ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(footer_rect)
+                            .layout(Layout::left_to_right(Align::Center)),
+                    );
+                    footer_ui.set_min_height(ACP_COMPOSER_FOOTER_HEIGHT);
+                    footer_ui.spacing_mut().item_spacing.x = footer_spacing;
+                    footer_ui.horizontal(|ui| {
+                        ui.set_min_height(ACP_COMPOSER_FOOTER_HEIGHT);
 
-                        let plus_btn = ui.add(
+                        let plus_btn = ui.add_sized(
+                            egui::vec2(ctrl_h, ctrl_h),
                             egui::Button::new(
                                 RichText::new(format!("{}", icons::PLUS))
                                     .size(14.0)
                                     .color(ACP_COMPOSER_ICON_COLOR),
                             )
                             .fill(Color32::from_rgb(35, 35, 35))
-                            .rounding(16.0)
-                            .stroke(Stroke::NONE)
-                            .small(),
+                            .rounding(ctrl_h * 0.5)
+                            .stroke(Stroke::NONE),
                         );
                         if plus_btn.clicked() {
                             if let Some(paths) = rfd::FileDialog::new().pick_files() {
@@ -21092,20 +21480,18 @@ impl AdeApp {
                             }
                         }
 
-                        // Mode pill — only visible when the active mode is "plan"
-                        let active_mode = session.active_mode_id_or_default();
-                        if crate::opencode_acp::mode_is_plan(&active_mode) {
+                        if show_plan_pill {
                             let pill_color = Color32::from_rgb(200, 140, 60);
                             let pill_fill = Color32::from_rgb(40, 28, 16);
                             let pill_stroke = Color32::from_rgb(140, 100, 40);
-                            let pill_btn = ui.add(
+                            let pill_btn = ui.add_sized(
+                                egui::vec2(plan_w, ctrl_h),
                                 egui::Button::new(
                                     RichText::new("Plan").size(12.0).color(pill_color),
                                 )
                                 .fill(pill_fill)
                                 .rounding(6.0)
-                                .stroke(Stroke::new(1.0, pill_stroke))
-                                .small(),
+                                .stroke(Stroke::new(1.0, pill_stroke)),
                             );
                             if pill_btn.clicked() && session_ready {
                                 if let Some(mode_opt) = session.config_option("mode") {
@@ -21125,16 +21511,6 @@ impl AdeApp {
                                 }
                             }
                         }
-
-                        // Compute remaining width for text input and model selector
-                        let remaining = ui.available_width();
-                        let spacing = ui.spacing().item_spacing.x;
-                        let send_width = 32.0f32;
-                        let model_selector_width =
-                            (remaining - send_width - spacing * 2.0 - 40.0).clamp(60.0, 120.0);
-                        let text_input_width =
-                            (remaining - model_selector_width - send_width - spacing * 2.0)
-                                .max(40.0);
 
                         let hint_text = if welcome_center {
                             welcome_hint
@@ -21168,7 +21544,7 @@ impl AdeApp {
                                 .vertical_align(egui::Align::Center)
                                 .frame(false);
                             ui.add_sized(
-                                egui::vec2(text_input_width, ACP_COMPOSER_CONTROL_HEIGHT),
+                                egui::vec2(text_input_width, ctrl_h),
                                 text_edit,
                             )
                         };
@@ -21255,22 +21631,29 @@ impl AdeApp {
                         // Submit on plain Enter with focus
                         if plain_enter && response.has_focus() && can_send {
                             let text = session.prompt_input.trim().to_owned();
-                            session.prompt_input.clear();
                             let attachments = std::mem::take(&mut session.attachments);
-                            let prompt_text =
-                                crate::opencode_acp::build_acp_prompt_text(&text, &attachments);
-                            session
-                                .messages
-                                .push(crate::opencode_acp::AcpChatMessage::User {
-                                    text: prompt_text.clone(),
-                                });
-                            session.recent_inputs.insert(0, prompt_text.clone());
-                            session.history_index = None;
-                            session.history_draft.clear();
-                            session.is_running = true;
-                            session.status = crate::opencode_acp::AcpChatStatus::Running;
-                            session.send_prompt(&prompt_text);
-                            ctx.request_repaint();
+                            session.prompt_input.clear();
+                            if welcome_center {
+                                let prompt_text =
+                                    crate::opencode_acp::build_acp_prompt_text(&text, &attachments);
+                                let target_project = self.selected_project.unwrap_or(project_id);
+                                welcome_foreground_submit = Some((target_project, prompt_text));
+                            } else {
+                                let prompt_text =
+                                    crate::opencode_acp::build_acp_prompt_text(&text, &attachments);
+                                session
+                                    .messages
+                                    .push(crate::opencode_acp::AcpChatMessage::User {
+                                        text: prompt_text.clone(),
+                                    });
+                                session.recent_inputs.insert(0, prompt_text.clone());
+                                session.history_index = None;
+                                session.history_draft.clear();
+                                session.is_running = true;
+                                session.status = crate::opencode_acp::AcpChatStatus::Running;
+                                session.send_prompt(&prompt_text);
+                                ctx.request_repaint();
+                            }
                         }
 
                         // Model + effort selector
@@ -21325,7 +21708,7 @@ impl AdeApp {
                         // Scope so interact_size and widget visuals only affect the ComboBox button
                         let _combo_response = ui
                             .scope(|ui| {
-                                ui.spacing_mut().interact_size.y = ACP_COMPOSER_CONTROL_HEIGHT;
+                                ui.spacing_mut().interact_size.y = ACP_COMPOSER_FOOTER_HEIGHT;
                                 // Local widget visuals for consistent capsule tone
                                 let visuals = ui.visuals_mut();
                                 visuals.widgets.inactive.bg_fill = ACP_COMPOSER_CAPSULE_FILL;
@@ -21438,46 +21821,56 @@ impl AdeApp {
                             }
                         }
 
-                        ui.add_space(ui.available_width().max(0.0));
-
-                        let send_btn = ui.add_enabled(
+                        let send_btn = ui.add_enabled_ui(
                             can_send,
-                            egui::Button::new(
-                                RichText::new(format!("{}", icons::SEND_HORIZONTAL))
-                                    .size(16.0)
-                                    .color(if can_send {
-                                        Color32::from_rgb(20, 20, 20)
+                            |ui| {
+                                ui.add_sized(
+                                    egui::vec2(send_w, ctrl_h),
+                                    egui::Button::new(
+                                        RichText::new(format!("{}", icons::SEND_HORIZONTAL))
+                                            .size(16.0)
+                                            .color(if can_send {
+                                                Color32::from_rgb(20, 20, 20)
+                                            } else {
+                                                ACP_COMPOSER_ICON_MUTED
+                                            }),
+                                    )
+                                    .fill(if can_send {
+                                        ACP_COMPOSER_SEND_ACTIVE_FILL
                                     } else {
-                                        ACP_COMPOSER_ICON_MUTED
-                                    }),
-                            )
-                            .fill(if can_send {
-                                ACP_COMPOSER_SEND_ACTIVE_FILL
-                            } else {
-                                Color32::from_rgb(45, 45, 45)
-                            })
-                            .rounding(16.0)
-                            .stroke(Stroke::NONE)
-                            .small(),
-                        );
+                                        Color32::from_rgb(45, 45, 45)
+                                    })
+                                    .rounding(ctrl_h * 0.5)
+                                    .stroke(Stroke::NONE),
+                                )
+                            },
+                        )
+                        .inner;
                         if send_btn.clicked() && can_send {
                             let text = session.prompt_input.trim().to_owned();
-                            session.prompt_input.clear();
                             let attachments = std::mem::take(&mut session.attachments);
-                            let prompt_text =
-                                crate::opencode_acp::build_acp_prompt_text(&text, &attachments);
-                            session
-                                .messages
-                                .push(crate::opencode_acp::AcpChatMessage::User {
-                                    text: prompt_text.clone(),
-                                });
-                            session.recent_inputs.insert(0, prompt_text.clone());
-                            session.history_index = None;
-                            session.history_draft.clear();
-                            session.is_running = true;
-                            session.status = crate::opencode_acp::AcpChatStatus::Running;
-                            session.send_prompt(&prompt_text);
-                            ctx.request_repaint();
+                            session.prompt_input.clear();
+                            if welcome_center {
+                                let prompt_text =
+                                    crate::opencode_acp::build_acp_prompt_text(&text, &attachments);
+                                let target_project = self.selected_project.unwrap_or(project_id);
+                                welcome_foreground_submit = Some((target_project, prompt_text));
+                            } else {
+                                let prompt_text =
+                                    crate::opencode_acp::build_acp_prompt_text(&text, &attachments);
+                                session
+                                    .messages
+                                    .push(crate::opencode_acp::AcpChatMessage::User {
+                                        text: prompt_text.clone(),
+                                    });
+                                session.recent_inputs.insert(0, prompt_text.clone());
+                                session.history_index = None;
+                                session.history_draft.clear();
+                                session.is_running = true;
+                                session.status = crate::opencode_acp::AcpChatStatus::Running;
+                                session.send_prompt(&prompt_text);
+                                ctx.request_repaint();
+                            }
                         }
                     });
 
@@ -21600,6 +21993,9 @@ impl AdeApp {
                     if draft != session.prompt_input {
                         ctx.request_repaint();
                     }
+                }
+                if let Some((target_project, text)) = welcome_foreground_submit {
+                    self.submit_acp_welcome_to_foreground_terminal(ctx, target_project, &text);
                 }
 
                 if !welcome_center && status_row_height > 0.0 {
@@ -27529,6 +27925,9 @@ impl eframe::App for AdeApp {
 
         self.process_create_worktree_events(ctx);
         self.process_acp_chat_events(ctx);
+        if let Some(project_id) = self.selected_project {
+            self.ensure_acp_standby_for_project(project_id);
+        }
         self.process_source_control_events(ctx);
         self.process_directory_index_events(ctx);
         self.process_browser_events(ctx);
@@ -33971,16 +34370,12 @@ fn show_bounded_settings_card<R>(
     description: &str,
     add_contents: impl FnOnce(&mut Ui) -> R,
 ) -> R {
-    ui.allocate_ui_with_layout(
-        egui::vec2(width, 0.0),
-        Layout::top_down(Align::Min),
-        |ui| {
-            ui.set_width(width);
-            ui.set_min_width(width);
-            ui.set_max_width(width);
-            show_settings_card(ui, icon, title, description, add_contents)
-        },
-    )
+    ui.allocate_ui_with_layout(egui::vec2(width, 0.0), Layout::top_down(Align::Min), |ui| {
+        ui.set_width(width);
+        ui.set_min_width(width);
+        ui.set_max_width(width);
+        show_settings_card(ui, icon, title, description, add_contents)
+    })
     .inner
 }
 
@@ -46593,8 +46988,24 @@ mod tests {
             acp_chat_events_rx: crossbeam_channel::unbounded().1,
             active_acp_chat: None,
             acp_model_probe_chat: None,
+            acp_standby_chat_by_project: BTreeMap::new(),
+            acp_standby_retry_after_by_project: BTreeMap::new(),
             next_acp_chat_id: 1,
         }
+    }
+
+    fn test_app_with_acp_channels(
+        terminals: impl IntoIterator<Item = (u64, TerminalEntry)>,
+        active_terminal: Option<u64>,
+    ) -> (
+        AdeApp,
+        crossbeam_channel::Sender<crate::opencode_acp::AcpChatEvent>,
+    ) {
+        let mut app = test_app(terminals, active_terminal);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.acp_chat_events_tx = tx.clone();
+        app.acp_chat_events_rx = rx;
+        (app, tx)
     }
 
     fn test_app_with_ai_hooks(
