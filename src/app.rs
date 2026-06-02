@@ -321,6 +321,13 @@ const ACP_COMPOSER_CONTROL_HEIGHT: f32 = 36.0;
 const ACP_COMPOSER_CAPSULE_FILL: Color32 = Color32::from_rgb(27, 27, 27);
 const ACP_COMPOSER_CAPSULE_STROKE: Color32 = Color32::from_rgb(40, 40, 40);
 const ACP_COMPOSER_CAPSULE_RADIUS: f32 = 12.0;
+const ACP_COMPOSER_ICON_COLOR: Color32 = Color32::from_rgb(244, 244, 244);
+const ACP_COMPOSER_ICON_MUTED: Color32 = Color32::from_rgb(190, 190, 190);
+const ACP_COMPOSER_SEND_ACTIVE_FILL: Color32 = Color32::from_rgb(230, 230, 230);
+const ACP_WELCOME_MAX_WIDTH: f32 = 720.0;
+const ACP_WELCOME_COMPOSER_MIN_HEIGHT: f32 = 136.0;
+const ACP_WELCOME_CONTEXT_ROW_HEIGHT: f32 = 28.0;
+const ACP_WELCOME_HINT: &str = "Plan, Build, / for skills, @ for context";
 const SMART_INPUT_FOOTER_GAP: f32 = 6.0;
 const SMART_INPUT_HEADER_RIGHT_INSET: f32 = 12.0;
 const SMART_INPUT_RESIZE_HANDLE_HEIGHT: f32 = 5.0;
@@ -20600,6 +20607,47 @@ impl AdeApp {
         }
     }
 
+    fn acp_shows_welcome_center(&self, chat_id: u64) -> bool {
+        self.acp_chat_sessions
+            .get(&chat_id)
+            .is_some_and(|s| s.messages.is_empty())
+    }
+
+    fn draw_acp_context_chips(&self, ui: &mut egui::Ui, project_id: u64) {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        let project_label = self
+            .projects
+            .get(&project_id)
+            .map(|p| p.name.as_str())
+            .unwrap_or("Project");
+        let branch_label = self
+            .source_control_state
+            .get(&project_id)
+            .map(|s| s.branch.as_str())
+            .filter(|b| !b.is_empty())
+            .unwrap_or("main");
+        let chip = |ui: &mut egui::Ui, icon: Option<AppIcon>, label: &str| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if let Some(icon) = icon {
+                    ui.label(
+                        RichText::new(format!("{icon}"))
+                            .size(12.0)
+                            .color(ACP_COMPOSER_ICON_COLOR),
+                    );
+                }
+                ui.label(
+                    RichText::new(label)
+                        .size(12.0)
+                        .color(TEXT_MUTED),
+                );
+            });
+        };
+        chip(ui, None, project_label);
+        chip(ui, Some(icons::GIT_BRANCH), branch_label);
+        chip(ui, Some(icons::TERMINAL), "Local");
+    }
+
     fn draw_acp_chat_panel(&mut self, ctx: &egui::Context, chat_id: u64) {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(APP_BG))
@@ -20608,10 +20656,19 @@ impl AdeApp {
                 let content_rect = ui
                     .available_rect_before_wrap()
                     .shrink2(margin.left_top() + margin.right_bottom());
+                let welcome_center = self.acp_shows_welcome_center(chat_id);
+                let project_id = self
+                    .acp_chat_sessions
+                    .get(&chat_id)
+                    .map(|s| s.project_id)
+                    .unwrap_or(0);
 
-                // Compute composer height dynamically based on session content
                 let composer_height = if let Some(session) = self.acp_chat_sessions.get(&chat_id) {
-                    let mut h = 48.0f32;
+                    let mut h = if welcome_center {
+                        ACP_WELCOME_COMPOSER_MIN_HEIGHT
+                    } else {
+                        48.0f32
+                    };
                     if !session.attachments.is_empty() {
                         h += 24.0 + 4.0;
                     }
@@ -20638,33 +20695,100 @@ impl AdeApp {
                     48.0
                 };
 
-                let thread_selector_height = 32.0;
-                let header_height = 36.0;
-                let status_row_height = 22.0;
-                let messages_height = (content_rect.height()
-                    - thread_selector_height
-                    - header_height
-                    - composer_height
-                    - status_row_height
-                    - 32.0)
-                    .max(80.0);
+                let thread_selector_height = if welcome_center { 0.0 } else { 32.0 };
+                let header_height = if welcome_center { 0.0 } else { 36.0 };
+                let status_row_height = if welcome_center { 0.0 } else { 22.0 };
+                let messages_height = if welcome_center {
+                    0.0
+                } else {
+                    (content_rect.height()
+                        - thread_selector_height
+                        - header_height
+                        - composer_height
+                        - status_row_height
+                        - 32.0)
+                        .max(80.0)
+                };
 
+                let (context_rect, composer_rect, messages_rect, thread_selector_rect, header_rect) =
+                    if welcome_center {
+                        let block_width = content_rect.width().min(ACP_WELCOME_MAX_WIDTH);
+                        let block_left = content_rect.center().x - block_width * 0.5;
+                        let context_gap = 10.0;
+                        let stack_height =
+                            ACP_WELCOME_CONTEXT_ROW_HEIGHT + context_gap + composer_height;
+                        let stack_top = (content_rect.center().y - stack_height * 0.5).max(content_rect.min.y);
+                        let context_rect = egui::Rect::from_min_size(
+                            egui::pos2(block_left, stack_top),
+                            egui::vec2(block_width, ACP_WELCOME_CONTEXT_ROW_HEIGHT),
+                        );
+                        let composer_rect = egui::Rect::from_min_size(
+                            egui::pos2(block_left, context_rect.max.y + context_gap),
+                            egui::vec2(block_width, composer_height),
+                        );
+                        (
+                            Some(context_rect),
+                            composer_rect,
+                            egui::Rect::NOTHING,
+                            egui::Rect::NOTHING,
+                            egui::Rect::NOTHING,
+                        )
+                    } else {
+                        let thread_selector_rect = egui::Rect::from_min_size(
+                            content_rect.min,
+                            egui::vec2(content_rect.width(), thread_selector_height),
+                        );
+                        let header_rect = egui::Rect::from_min_size(
+                            egui::pos2(content_rect.min.x, thread_selector_rect.max.y + 4.0),
+                            egui::vec2(content_rect.width(), header_height),
+                        );
+                        let messages_rect = egui::Rect::from_min_size(
+                            egui::pos2(content_rect.min.x, header_rect.max.y + 8.0),
+                            egui::vec2(content_rect.width(), messages_height),
+                        );
+                        let composer_rect = egui::Rect::from_min_size(
+                            egui::pos2(content_rect.min.x, messages_rect.max.y + 8.0),
+                            egui::vec2(content_rect.width(), composer_height),
+                        );
+                        (
+                            None,
+                            composer_rect,
+                            messages_rect,
+                            thread_selector_rect,
+                            header_rect,
+                        )
+                    };
+
+                if welcome_center {
+                    ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                        if ui
+                            .button(
+                                RichText::new(format!("{}", icons::X))
+                                    .size(12.0)
+                                    .color(TEXT_MUTED),
+                            )
+                            .clicked()
+                        {
+                            self.kill_acp_chat(chat_id);
+                        }
+                    });
+                    if let Some(context_rect) = context_rect {
+                        ui.allocate_rect(context_rect, Sense::hover());
+                        let mut context_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(context_rect)
+                                .layout(Layout::left_to_right(Align::Center)),
+                        );
+                        self.draw_acp_context_chips(&mut context_ui, project_id);
+                    }
+                } else {
                 // --- Thread selector bar ---
-                let thread_selector_rect = egui::Rect::from_min_size(
-                    content_rect.min,
-                    egui::vec2(content_rect.width(), thread_selector_height),
-                );
                 let mut thread_ui = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(thread_selector_rect)
                         .layout(Layout::left_to_right(Align::Center)),
                 );
                 thread_ui.spacing_mut().item_spacing.x = 8.0;
-                let project_id = self
-                    .acp_chat_sessions
-                    .get(&chat_id)
-                    .map(|s| s.project_id)
-                    .unwrap_or(0);
                 if let Some(chat_ids) = self.acp_chat_ids_by_project.get(&project_id).cloned() {
                     for cid in chat_ids {
                         if let Some(session) = self.acp_chat_sessions.get(&cid) {
@@ -20716,11 +20840,6 @@ impl AdeApp {
                 });
                 ui.allocate_rect(thread_selector_rect, Sense::hover());
 
-                // --- Header controls ---
-                let header_rect = egui::Rect::from_min_size(
-                    egui::pos2(content_rect.min.x, thread_selector_rect.max.y + 4.0),
-                    egui::vec2(content_rect.width(), header_height),
-                );
                 let mut header_ui = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(header_rect)
@@ -20774,11 +20893,6 @@ impl AdeApp {
                 });
                 ui.allocate_rect(header_rect, Sense::hover());
 
-                // --- Messages area ---
-                let messages_rect = egui::Rect::from_min_size(
-                    egui::pos2(content_rect.min.x, header_rect.max.y + 8.0),
-                    egui::vec2(content_rect.width(), messages_height),
-                );
                 let mut messages_ui = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(messages_rect)
@@ -20870,12 +20984,8 @@ impl AdeApp {
                         }
                     });
                 ui.allocate_rect(messages_rect, Sense::hover());
+                }
 
-                // --- Composer ---
-                let composer_rect = egui::Rect::from_min_size(
-                    egui::pos2(content_rect.min.x, messages_rect.max.y + 8.0),
-                    egui::vec2(content_rect.width(), composer_height),
-                );
                 ui.allocate_rect(composer_rect, Sense::hover());
                 let mut composer_ui = ui.new_child(
                     egui::UiBuilder::new()
@@ -20891,35 +21001,67 @@ impl AdeApp {
                         && !matches!(session.status, crate::opencode_acp::AcpChatStatus::Starting);
                     let draft = session.prompt_input.clone();
 
-                    // Capsule row
+                    let capsule_body_height = if welcome_center {
+                        ACP_WELCOME_COMPOSER_MIN_HEIGHT
+                    } else {
+                        48.0
+                    };
                     let capsule_rect = egui::Rect::from_min_size(
                         composer_ui.cursor().min,
-                        egui::vec2(composer_ui.available_width(), 48.0),
+                        egui::vec2(composer_ui.available_width(), capsule_body_height),
                     );
                     composer_ui.allocate_rect(capsule_rect, Sense::hover());
-                    // Manual paint to avoid egui frame rounding artifacts
-                    // No visible stroke; fill only to prevent grey halo at corners
                     composer_ui.painter().rect(
                         capsule_rect,
                         ACP_COMPOSER_CAPSULE_RADIUS,
                         ACP_COMPOSER_CAPSULE_FILL,
                         Stroke::NONE,
                     );
+                    let capsule_layout = if welcome_center {
+                        Layout::top_down(Align::Min)
+                    } else {
+                        Layout::left_to_right(Align::Center)
+                    };
                     let mut capsule_ui = composer_ui.new_child(
                         egui::UiBuilder::new()
-                            .max_rect(capsule_rect.shrink2(egui::vec2(8.0, 6.0)))
-                            .layout(Layout::left_to_right(Align::Center)),
+                            .max_rect(capsule_rect.shrink2(egui::vec2(10.0, 8.0)))
+                            .layout(capsule_layout),
                     );
                     capsule_ui.set_clip_rect(capsule_rect);
-                    capsule_ui.horizontal_centered(|ui| {
+                    let welcome_hint = if session_ready {
+                        ACP_WELCOME_HINT
+                    } else {
+                        "Waiting for session..."
+                    };
+                    let welcome_text_height =
+                        (capsule_body_height - 48.0 - 6.0).max(56.0);
+                    let mut composer_response = None;
+                    if welcome_center {
+                        let text_edit = egui::TextEdit::multiline(&mut session.prompt_input)
+                            .id_salt("acp-composer-input")
+                            .desired_rows(4)
+                            .desired_width(capsule_ui.available_width())
+                            .hint_text(welcome_hint)
+                            .interactive(!is_running)
+                            .return_key(egui::KeyboardShortcut::new(
+                                egui::Modifiers::CTRL,
+                                egui::Key::Enter,
+                            ))
+                            .frame(false);
+                        let response = capsule_ui.add_sized(
+                            egui::vec2(capsule_ui.available_width(), welcome_text_height),
+                            text_edit,
+                        );
+                        composer_response = Some(response);
+                    }
+                    capsule_ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
 
-                        // Circular + button
                         let plus_btn = ui.add(
                             egui::Button::new(
                                 RichText::new(format!("{}", icons::PLUS))
                                     .size(14.0)
-                                    .color(TEXT_MUTED),
+                                    .color(ACP_COMPOSER_ICON_COLOR),
                             )
                             .fill(Color32::from_rgb(35, 35, 35))
                             .rounding(16.0)
@@ -20994,8 +21136,9 @@ impl AdeApp {
                             (remaining - model_selector_width - send_width - spacing * 2.0)
                                 .max(40.0);
 
-                        // Hint text
-                        let hint_text = if session_ready {
+                        let hint_text = if welcome_center {
+                            welcome_hint
+                        } else if session_ready {
                             if let Some(mode_opt) = session.config_option("mode") {
                                 if mode_opt.current_value == "plan" {
                                     "Plan and design before coding..."
@@ -21009,25 +21152,27 @@ impl AdeApp {
                             "Waiting for session..."
                         };
 
-                        // Text input
-                        let text_edit = egui::TextEdit::multiline(&mut session.prompt_input)
-                            .id_salt("acp-composer-input")
-                            .desired_rows(1)
-                            .desired_width(text_input_width)
-                            .hint_text(hint_text)
-                            .interactive(!is_running)
-                            .return_key(egui::KeyboardShortcut::new(
-                                egui::Modifiers::CTRL,
-                                egui::Key::Enter,
-                            ))
-                            .vertical_align(egui::Align::Center)
-                            .frame(false);
-                        let response = ui.add_sized(
-                            egui::vec2(text_input_width, ACP_COMPOSER_CONTROL_HEIGHT),
-                            text_edit,
-                        );
+                        let response = if welcome_center {
+                            composer_response.expect("welcome composer response")
+                        } else {
+                            let text_edit = egui::TextEdit::multiline(&mut session.prompt_input)
+                                .id_salt("acp-composer-input")
+                                .desired_rows(1)
+                                .desired_width(text_input_width)
+                                .hint_text(hint_text)
+                                .interactive(!is_running)
+                                .return_key(egui::KeyboardShortcut::new(
+                                    egui::Modifiers::CTRL,
+                                    egui::Key::Enter,
+                                ))
+                                .vertical_align(egui::Align::Center)
+                                .frame(false);
+                            ui.add_sized(
+                                egui::vec2(text_input_width, ACP_COMPOSER_CONTROL_HEIGHT),
+                                text_edit,
+                            )
+                        };
 
-                        // Detect plain Enter
                         let plain_enter = ui.input(|i| {
                             i.events.iter().any(|e| {
                                 matches!(
@@ -21197,7 +21342,7 @@ impl AdeApp {
                                     .selected_text(
                                         RichText::new(model_label)
                                             .size(11.0)
-                                            .color(TEXT_MUTED),
+                                            .color(ACP_COMPOSER_ICON_COLOR),
                                     )
                                     .width(model_selector_width)
                                     .show_ui(ui, |ui| {
@@ -21293,15 +21438,24 @@ impl AdeApp {
                             }
                         }
 
-                        // Send button
+                        ui.add_space(ui.available_width().max(0.0));
+
                         let send_btn = ui.add_enabled(
                             can_send,
                             egui::Button::new(
                                 RichText::new(format!("{}", icons::SEND_HORIZONTAL))
                                     .size(16.0)
-                                    .color(if can_send { TEXT_PRIMARY } else { TEXT_MUTED }),
+                                    .color(if can_send {
+                                        Color32::from_rgb(20, 20, 20)
+                                    } else {
+                                        ACP_COMPOSER_ICON_MUTED
+                                    }),
                             )
-                            .fill(Color32::from_rgb(45, 45, 45))
+                            .fill(if can_send {
+                                ACP_COMPOSER_SEND_ACTIVE_FILL
+                            } else {
+                                Color32::from_rgb(45, 45, 45)
+                            })
                             .rounding(16.0)
                             .stroke(Stroke::NONE)
                             .small(),
@@ -21448,47 +21602,46 @@ impl AdeApp {
                     }
                 }
 
-                // --- Status row ---
-                let status_rect = egui::Rect::from_min_size(
-                    egui::pos2(content_rect.min.x, composer_rect.max.y + 4.0),
-                    egui::vec2(content_rect.width(), status_row_height),
-                );
-                let mut status_ui = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(status_rect)
-                        .layout(Layout::left_to_right(Align::Center)),
-                );
-                status_ui.set_clip_rect(status_rect);
-                let project_id = self
-                    .acp_chat_sessions
-                    .get(&chat_id)
-                    .map(|s| s.project_id)
-                    .unwrap_or(0);
-                if let Some(snapshot) = self.source_control_state.get(&project_id) {
-                    if !snapshot.branch.is_empty() {
-                        status_ui.label(
-                            RichText::new(format!("{} {}", icons::GIT_BRANCH, snapshot.branch))
+                if !welcome_center && status_row_height > 0.0 {
+                    let status_rect = egui::Rect::from_min_size(
+                        egui::pos2(content_rect.min.x, composer_rect.max.y + 4.0),
+                        egui::vec2(content_rect.width(), status_row_height),
+                    );
+                    let mut status_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(status_rect)
+                            .layout(Layout::left_to_right(Align::Center)),
+                    );
+                    status_ui.set_clip_rect(status_rect);
+                    if let Some(snapshot) = self.source_control_state.get(&project_id) {
+                        if !snapshot.branch.is_empty() {
+                            status_ui.label(
+                                RichText::new(format!(
+                                    "{} {}",
+                                    icons::GIT_BRANCH, snapshot.branch
+                                ))
                                 .size(11.0)
                                 .color(TEXT_MUTED),
-                        );
-                        status_ui.add_space(8.0);
+                            );
+                            status_ui.add_space(8.0);
+                        }
                     }
+                    status_ui.label(RichText::new("Local").size(11.0).color(TEXT_MUTED));
+                    status_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if let Some(session) = self.acp_chat_sessions.get(&chat_id) {
+                            let status_text = match session.status {
+                                crate::opencode_acp::AcpChatStatus::Starting => "Starting...",
+                                crate::opencode_acp::AcpChatStatus::Idle => "Idle",
+                                crate::opencode_acp::AcpChatStatus::Running => "Running...",
+                                crate::opencode_acp::AcpChatStatus::Permission => "Permission",
+                                crate::opencode_acp::AcpChatStatus::Error => "Error",
+                                crate::opencode_acp::AcpChatStatus::Exited => "Disconnected",
+                            };
+                            ui.label(RichText::new(status_text).size(11.0).color(TEXT_MUTED));
+                        }
+                    });
+                    ui.allocate_rect(status_rect, Sense::hover());
                 }
-                status_ui.label(RichText::new("Local").size(11.0).color(TEXT_MUTED));
-                status_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if let Some(session) = self.acp_chat_sessions.get(&chat_id) {
-                        let status_text = match session.status {
-                            crate::opencode_acp::AcpChatStatus::Starting => "Starting...",
-                            crate::opencode_acp::AcpChatStatus::Idle => "Idle",
-                            crate::opencode_acp::AcpChatStatus::Running => "Running...",
-                            crate::opencode_acp::AcpChatStatus::Permission => "Permission",
-                            crate::opencode_acp::AcpChatStatus::Error => "Error",
-                            crate::opencode_acp::AcpChatStatus::Exited => "Disconnected",
-                        };
-                        ui.label(RichText::new(status_text).size(11.0).color(TEXT_MUTED));
-                    }
-                });
-                ui.allocate_rect(status_rect, Sense::hover());
             });
     }
 
