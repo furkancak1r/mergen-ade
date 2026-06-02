@@ -346,9 +346,27 @@ const ACP_COMPOSER_TEXT_WIDTH_MIN: f32 = 40.0;
 const ACP_STANDBY_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
 
 fn acp_context_project_combo_width(label_width: f32, available_width: f32) -> f32 {
-    (label_width + 28.0)
-        .clamp(72.0, 220.0)
+    (label_width + 52.0)
+        .clamp(96.0, 320.0)
         .min(available_width.max(0.0))
+}
+
+fn acp_context_project_popup_width(button_width: f32, available_width: f32) -> f32 {
+    button_width.max(320.0).min(available_width.max(0.0))
+}
+
+fn acp_project_rows_matching_query<'a>(
+    project_rows: &'a [(u64, String)],
+    query: &str,
+) -> Vec<&'a (u64, String)> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return project_rows.iter().collect();
+    }
+    project_rows
+        .iter()
+        .filter(|(_, name)| name.to_lowercase().contains(&query))
+        .collect()
 }
 
 fn acp_composer_footer_control_rect(footer_rect: egui::Rect) -> egui::Rect {
@@ -2233,6 +2251,7 @@ pub struct AdeApp {
     /// Whether the ACP mode toggle shortcut is currently recording a key
     settings_acp_mode_toggle_recording: bool,
     settings_acp_favorite_filter: String,
+    acp_context_project_search_query: String,
     saved_message_drafts: BTreeMap<u64, String>,
     /// Foreground saved messages popup state
     foreground_message_popup_open: Option<u64>, // project_id if popup is open
@@ -4899,6 +4918,7 @@ impl AdeApp {
             settings_shortcut_recording_index: None,
             settings_acp_mode_toggle_recording: false,
             settings_acp_favorite_filter: String::new(),
+            acp_context_project_search_query: String::new(),
             saved_message_drafts: BTreeMap::new(),
             foreground_message_popup_open: None,
             foreground_message_popup_editing_index: None,
@@ -21055,8 +21075,9 @@ impl AdeApp {
                 .size()
                 .x
         });
-        let combo_width =
-            acp_context_project_combo_width(selected_label_width, ui.available_width());
+        let available_width = ui.available_width();
+        let combo_width = acp_context_project_combo_width(selected_label_width, available_width);
+        let popup_width = acp_context_project_popup_width(combo_width, available_width);
         let branch_label = self
             .source_control_state
             .get(&active_project_id)
@@ -21080,21 +21101,168 @@ impl AdeApp {
             ui.spacing_mut().item_spacing.x = 4.0;
             let mut selected_id = self.selected_project;
             with_minimal_button_chrome(ui, |ui| {
-                egui::ComboBox::from_id_salt("acp-context-project-select")
-                    .selected_text(RichText::new(&selected_label).size(12.0).color(TEXT_MUTED))
-                    .icon(paint_minimal_combo_icon)
-                    .width(combo_width)
-                    .show_ui(ui, |ui| {
-                        for (row_project_id, project_name) in &project_rows {
-                            ui.selectable_value(
-                                &mut selected_id,
-                                Some(*row_project_id),
-                                project_name.clone(),
-                            );
+                let button_id = ui.make_persistent_id("acp-context-project-select");
+                let popup_id = button_id.with("popup");
+                let popup_open_before = ui.memory(|mem| mem.is_popup_open(popup_id));
+                let popup_height = ui.spacing().combo_height + ACP_WELCOME_CONTEXT_ROW_HEIGHT;
+                let above_or_below =
+                    if ui.next_widget_position().y + ACP_WELCOME_CONTEXT_ROW_HEIGHT + popup_height
+                        < ui.ctx().screen_rect().bottom()
+                    {
+                        egui::AboveOrBelow::Below
+                    } else {
+                        egui::AboveOrBelow::Above
+                    };
+                let button_size = egui::vec2(combo_width, ACP_WELCOME_CONTEXT_ROW_HEIGHT);
+                let (button_rect, button_response) =
+                    ui.allocate_exact_size(button_size, Sense::click());
+                let button_response =
+                    button_response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                let visuals = if popup_open_before {
+                    &ui.visuals().widgets.open
+                } else {
+                    ui.style().interact(&button_response)
+                };
+
+                if ui.is_rect_visible(button_rect) {
+                    ui.painter().rect(
+                        button_rect.expand(visuals.expansion),
+                        visuals.rounding,
+                        visuals.weak_bg_fill,
+                        visuals.bg_stroke,
+                    );
+
+                    let content_rect = button_rect.shrink2(ui.spacing().button_padding);
+                    let icon_size = Vec2::splat(ui.spacing().icon_width);
+                    let icon_rect =
+                        egui::Align2::RIGHT_CENTER.align_size_within_rect(icon_size, content_rect);
+                    let text_width =
+                        (content_rect.width() - icon_size.x - ui.spacing().icon_spacing).max(0.0);
+                    let selected_text = WidgetText::from(
+                        RichText::new(&selected_label).size(12.0).color(TEXT_MUTED),
+                    );
+                    let galley = selected_text.into_galley(
+                        ui,
+                        Some(TextWrapMode::Truncate),
+                        text_width,
+                        egui::TextStyle::Button,
+                    );
+                    let text_rect = egui::Align2::LEFT_CENTER
+                        .align_size_within_rect(galley.size(), content_rect);
+                    ui.painter()
+                        .galley(text_rect.min, galley, visuals.text_color());
+                    paint_minimal_combo_icon(
+                        ui,
+                        icon_rect.expand(visuals.expansion),
+                        visuals,
+                        popup_open_before,
+                        above_or_below,
+                    );
+                }
+
+                button_response.widget_info(|| {
+                    WidgetInfo::labeled(WidgetType::ComboBox, ui.is_enabled(), "ACP project")
+                });
+                if button_response.clicked() {
+                    ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+                }
+                let opened_this_frame = button_response.clicked() && !popup_open_before;
+                let popup_open = ui.memory(|mem| mem.is_popup_open(popup_id));
+
+                if popup_open_before && !popup_open {
+                    self.acp_context_project_search_query.clear();
+                }
+
+                if popup_open {
+                    let ctx = ui.ctx().clone();
+                    let popup_gap = ui.spacing().menu_spacing;
+                    let mut popup_pos = match above_or_below {
+                        egui::AboveOrBelow::Below => {
+                            button_response.rect.left_bottom() + egui::vec2(0.0, popup_gap)
                         }
-                    });
+                        egui::AboveOrBelow::Above => {
+                            button_response.rect.left_top()
+                                - egui::vec2(0.0, popup_height + popup_gap)
+                        }
+                    };
+                    if let Some(transform) =
+                        ui.memory(|mem| mem.layer_transforms.get(&ui.layer_id()).copied())
+                    {
+                        popup_pos = transform * popup_pos;
+                    }
+                    let screen_rect = ctx.screen_rect();
+                    popup_pos.x = popup_pos.x.clamp(
+                        screen_rect.left(),
+                        (screen_rect.right() - popup_width).max(screen_rect.left()),
+                    );
+
+                    let mut close_popup = false;
+                    let popup_response = egui::Area::new(popup_id)
+                        .kind(egui::UiKind::Popup)
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(popup_pos)
+                        .fade_in(false)
+                        .show(&ctx, |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                ui.set_min_width(popup_width);
+                                ui.set_max_width(popup_width);
+                                let search_response = ui.add(
+                                    egui::TextEdit::singleline(
+                                        &mut self.acp_context_project_search_query,
+                                    )
+                                    .id(popup_id.with("search"))
+                                    .hint_text("Search projects...")
+                                    .desired_width(popup_width)
+                                    .vertical_align(Align::Center),
+                                );
+                                if opened_this_frame {
+                                    search_response.request_focus();
+                                }
+                                ui.separator();
+
+                                egui::ScrollArea::vertical()
+                                    .max_height(ui.spacing().combo_height)
+                                    .show(ui, |ui| {
+                                        let matching_project_rows = acp_project_rows_matching_query(
+                                            &project_rows,
+                                            &self.acp_context_project_search_query,
+                                        );
+                                        if matching_project_rows.is_empty() {
+                                            ui.label(
+                                                RichText::new("No matching projects")
+                                                    .color(TEXT_MUTED),
+                                            );
+                                        } else {
+                                            for (row_project_id, project_name) in
+                                                matching_project_rows
+                                            {
+                                                let response = ui.selectable_value(
+                                                    &mut selected_id,
+                                                    Some(*row_project_id),
+                                                    project_name.clone(),
+                                                );
+                                                if response.clicked() {
+                                                    close_popup = true;
+                                                }
+                                            }
+                                        }
+                                    });
+                            });
+                        });
+
+                    let clicked_outside = button_response.clicked_elsewhere()
+                        && popup_response.response.clicked_elsewhere();
+                    if close_popup
+                        || clicked_outside
+                        || ctx.input(|input| input.key_pressed(egui::Key::Escape))
+                    {
+                        ctx.memory_mut(|mem| mem.close_popup());
+                        self.acp_context_project_search_query.clear();
+                    }
+                }
             });
             if selected_id != self.selected_project {
+                self.acp_context_project_search_query.clear();
                 if let Some(new_project_id) = selected_id {
                     self.focus_project_in_terminal_manager(ctx, new_project_id);
                 }
@@ -47038,6 +47206,7 @@ mod tests {
             settings_shortcut_recording_index: None,
             settings_acp_mode_toggle_recording: false,
             settings_acp_favorite_filter: String::new(),
+            acp_context_project_search_query: String::new(),
             saved_message_drafts: BTreeMap::new(),
             foreground_message_popup_open: None,
             foreground_message_popup_editing_index: None,
@@ -63700,19 +63869,93 @@ mod tests {
     #[test]
     fn acp_context_project_combo_width_tracks_selected_label() {
         let width = super::acp_context_project_combo_width(58.0, 720.0);
-        assert!((width - 86.0).abs() < 0.01);
+        assert!((width - 110.0).abs() < 0.01);
     }
 
     #[test]
     fn acp_context_project_combo_width_clamps_long_label() {
         let width = super::acp_context_project_combo_width(400.0, 720.0);
-        assert!((width - 220.0).abs() < 0.01);
+        assert!((width - 320.0).abs() < 0.01);
     }
 
     #[test]
     fn acp_context_project_combo_width_respects_narrow_available_width() {
         let width = super::acp_context_project_combo_width(58.0, 64.0);
         assert!((width - 64.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn acp_context_project_popup_width_expands_short_button() {
+        let width = super::acp_context_project_popup_width(86.0, 720.0);
+        assert!((width - 320.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn acp_context_project_popup_width_uses_stable_base_width() {
+        let width = super::acp_context_project_popup_width(260.0, 720.0);
+        assert!((width - 320.0).abs() < 0.01);
+
+        let wider_than_base = super::acp_context_project_popup_width(400.0, 720.0);
+        assert!((wider_than_base - 400.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn acp_context_project_popup_width_respects_available_width() {
+        let width = super::acp_context_project_popup_width(86.0, 180.0);
+        assert!((width - 180.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn acp_project_rows_matching_query_empty_returns_all_rows() {
+        let rows = vec![
+            (1, "Alpha".to_owned()),
+            (2, "Beta".to_owned()),
+            (3, "Gamma".to_owned()),
+        ];
+        let matches = super::acp_project_rows_matching_query(&rows, "");
+
+        assert_eq!(
+            matches.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn acp_project_rows_matching_query_is_case_insensitive() {
+        let rows = vec![
+            (1, "ProsoLocal".to_owned()),
+            (2, "Mergen ADE".to_owned()),
+            (3, "Sandbox".to_owned()),
+        ];
+        let matches = super::acp_project_rows_matching_query(&rows, "local");
+
+        assert_eq!(
+            matches.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn acp_project_rows_matching_query_returns_empty_for_no_matches() {
+        let rows = vec![(1, "Alpha".to_owned()), (2, "Beta".to_owned())];
+        let matches = super::acp_project_rows_matching_query(&rows, "zzz");
+
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn acp_project_rows_matching_query_handles_unicode() {
+        let rows = vec![
+            (1, "Calisma".to_owned()),
+            (2, "Çalışma Alanı".to_owned()),
+            (3, "Deneme".to_owned()),
+        ];
+        let matches = super::acp_project_rows_matching_query(&rows, "çalış");
+
+        assert_eq!(
+            matches.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![2]
+        );
     }
 
     #[test]
