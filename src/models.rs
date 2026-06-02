@@ -575,16 +575,23 @@ impl OpenCodeModelConfig {
 
     /// Merge newly discovered ACP model options into the known-models cache.
     /// Updates existing entries with the latest name, adds new ones.
-    pub fn merge_acp_known_models(&mut self, options: impl Iterator<Item = (String, String)>) {
+    /// Returns true when the cache changed.
+    pub fn merge_acp_known_models(&mut self, options: impl Iterator<Item = (String, String)>) -> bool {
+        let mut changed = false;
         for (value, name) in options {
             if let Some(existing) = self.acp_known_models.iter_mut().find(|e| e.value == value) {
-                existing.name = name;
+                if existing.name != name {
+                    existing.name = name;
+                    changed = true;
+                }
             } else {
                 self.acp_known_models
                     .push(OpenCodeAcpModelEntry::new(value, name));
+                changed = true;
             }
         }
         self.normalize_acp_known_models();
+        changed
     }
 }
 
@@ -1296,13 +1303,13 @@ mod tests {
             "gpt-4".to_owned(),
             "Old GPT-4".to_owned(),
         )];
-        config.merge_acp_known_models(
+        assert!(config.merge_acp_known_models(
             vec![
                 ("gpt-4".to_owned(), "New GPT-4".to_owned()),
                 ("gpt-5".to_owned(), "GPT-5".to_owned()),
             ]
             .into_iter(),
-        );
+        ));
         assert_eq!(config.acp_known_models.len(), 2);
         let gpt4 = config
             .acp_known_models

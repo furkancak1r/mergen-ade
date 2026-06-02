@@ -347,6 +347,7 @@ const SETTINGS_DIAGNOSTICS_SINGLE_COLUMN_BREAKPOINT: f32 = 560.0;
 const SETTINGS_GENERAL_STACK_BREAKPOINT: f32 = 480.0;
 const SETTINGS_GENERAL_INLINE_CONTROL_WIDTH: f32 = 180.0;
 const SETTINGS_SAVED_MESSAGES_COMPACT_BREAKPOINT: f32 = 520.0;
+const SETTINGS_ACP_FAVORITES_LIST_HEIGHT: f32 = 240.0;
 const SETTINGS_SAVED_MESSAGE_ACTIONS_GAP: f32 = 8.0;
 const SETTINGS_SAVED_MESSAGE_CARD_MARGIN: f32 = 10.0;
 const SETTINGS_SAVED_MESSAGE_TEXT_SIZE: f32 = 14.0;
@@ -2074,6 +2075,7 @@ pub struct AdeApp {
     settings_shortcut_recording_index: Option<usize>,
     /// Whether the ACP mode toggle shortcut is currently recording a key
     settings_acp_mode_toggle_recording: bool,
+    settings_acp_favorite_filter: String,
     saved_message_drafts: BTreeMap<u64, String>,
     /// Foreground saved messages popup state
     foreground_message_popup_open: Option<u64>, // project_id if popup is open
@@ -2222,6 +2224,8 @@ pub struct AdeApp {
     acp_chat_events_rx: Receiver<crate::opencode_acp::AcpChatEvent>,
     /// Currently active OpenCode ACP session ID (replaces terminal grid in main area).
     active_acp_chat: Option<u64>,
+    /// Hidden ACP session opened only to load model options in Settings.
+    acp_model_probe_chat: Option<u64>,
     /// Next OpenCode ACP session ID counter.
     next_acp_chat_id: u64,
 }
@@ -4733,6 +4737,7 @@ impl AdeApp {
             settings_diagnostics_expanded: false,
             settings_shortcut_recording_index: None,
             settings_acp_mode_toggle_recording: false,
+            settings_acp_favorite_filter: String::new(),
             saved_message_drafts: BTreeMap::new(),
             foreground_message_popup_open: None,
             foreground_message_popup_editing_index: None,
@@ -4846,6 +4851,7 @@ impl AdeApp {
             acp_chat_events_tx,
             acp_chat_events_rx,
             active_acp_chat: None,
+            acp_model_probe_chat: None,
             next_acp_chat_id: 1,
         };
         // Do NOT seed runtime browser state from legacy config.
@@ -9660,6 +9666,8 @@ impl AdeApp {
 
     fn process_acp_chat_events(&mut self, ctx: &egui::Context) {
         let mut changed = false;
+        let mut known_models_changed = false;
+        let mut probe_to_kill: Option<u64> = None;
         while let Ok(event) = self.acp_chat_events_rx.try_recv() {
             match event {
                 crate::opencode_acp::AcpChatEvent::Connected { chat_id } => {
@@ -9809,12 +9817,17 @@ impl AdeApp {
                         }
                         // Cache model options so they are visible in Settings even without a live session
                         if option.id == "model" {
-                            self.config.opencode.merge_acp_known_models(
+                            known_models_changed |= self.config.opencode.merge_acp_known_models(
                                 option
                                     .options
                                     .iter()
                                     .map(|e| (e.value.clone(), e.name.clone())),
                             );
+                            if self.acp_model_probe_chat == Some(chat_id)
+                                && !self.config.opencode.acp_known_models.is_empty()
+                            {
+                                probe_to_kill = Some(chat_id);
+                            }
                         }
                         session.updated_at = Instant::now();
                     }
@@ -9870,6 +9883,9 @@ impl AdeApp {
                             });
                         session.updated_at = Instant::now();
                     }
+                    if self.acp_model_probe_chat == Some(chat_id) {
+                        self.acp_model_probe_chat = None;
+                    }
                     self.status_line = format!("OpenCode ACP {chat_id} error: {message}");
                     changed = true;
                 }
@@ -9879,13 +9895,96 @@ impl AdeApp {
                         session.is_running = false;
                         session.updated_at = Instant::now();
                     }
+                    if self.acp_model_probe_chat == Some(chat_id) {
+                        self.acp_model_probe_chat = None;
+                    }
                     self.status_line = format!("OpenCode ACP {chat_id} disconnected");
                     changed = true;
                 }
             }
         }
+        if let Some(id) = probe_to_kill {
+            self.kill_acp_chat(id);
+            self.acp_model_probe_chat = None;
+        }
+        if known_models_changed {
+            self.persist_config();
+        }
         if changed {
             ctx.request_repaint();
+        }
+    }
+
+    fn has_live_acp_session(&self) -> bool {
+        use crate::opencode_acp::AcpChatStatus;
+        self.acp_chat_sessions.values().any(|s| {
+            matches!(
+                s.status,
+                AcpChatStatus::Starting
+                    | AcpChatStatus::Idle
+                    | AcpChatStatus::Running
+                    | AcpChatStatus::Permission
+            )
+        })
+    }
+
+    fn spawn_hidden_model_probe(&mut self, project_id: u64) {
+        let Some(project_path) = self.projects.get(&project_id).map(|p| p.path.clone()) else {
+            return;
+        };
+        let chat_id = self.next_acp_chat_id;
+        self.next_acp_chat_id += 1;
+        let opencode_bin = crate::opencode::opencode_bin_path();
+        let build_model = {
+            let model = self.config.opencode.active_build_model();
+            if model.is_empty() {
+                None
+            } else {
+                Some(model.to_owned())
+            }
+        };
+        let browser_mcp_env = self
+            .browser_mcp_service
+            .as_ref()
+            .map(|service| service.build_pty_env(chat_id, Some(project_id), None, Some(chat_id)))
+            .unwrap_or_default();
+        let startup_mode = self.config.acp_startup_mode.as_mode_id().to_string();
+        let event_tx = self.acp_chat_events_tx.clone();
+        match crate::opencode_acp::spawn_opencode_acp(
+            chat_id,
+            project_id,
+            project_path,
+            opencode_bin,
+            build_model,
+            startup_mode,
+            browser_mcp_env,
+            event_tx,
+        ) {
+            Ok(session) => {
+                self.acp_chat_sessions.insert(chat_id, session);
+                self.acp_model_probe_chat = Some(chat_id);
+            }
+            Err(err) => {
+                self.status_line = format!("Failed to load models: {err}");
+            }
+        }
+    }
+
+    fn maybe_spawn_model_probe(&mut self) {
+        if !self.config.opencode.acp_known_models.is_empty() {
+            return;
+        }
+        if self.acp_model_probe_chat.is_some() {
+            return;
+        }
+        if self.has_live_acp_session() {
+            return;
+        }
+        let project_id = self
+            .selected_project
+            .or_else(|| self.projects.keys().copied().next());
+        if let Some(project_id) = project_id {
+            self.spawn_hidden_model_probe(project_id);
         }
     }
 
@@ -15630,12 +15729,21 @@ impl AdeApp {
     }
 
     fn draw_settings_diagnostic_row(ui: &mut Ui, label: &str, value: &str, value_color: Color32) {
-        ui.label(RichText::new(label).strong().color(TEXT_PRIMARY));
-        ui.add(
-            egui::Label::new(RichText::new(value).monospace().small().color(value_color))
-                .truncate(),
-        )
-        .on_hover_text(value);
+        let row_width = ui.available_width().max(0.0);
+        ui.set_max_width(row_width);
+        settings_copyable_label(
+            ui,
+            RichText::new(label).strong().color(TEXT_PRIMARY),
+            label,
+        );
+        let value_response = ui
+            .add(
+                egui::Label::new(RichText::new(value).monospace().small().color(value_color))
+                    .truncate()
+                    .sense(Sense::click()),
+            )
+            .on_hover_text(value);
+        add_label_copy_context_menu(&value_response, value);
         ui.add_space(4.0);
     }
 
@@ -15647,6 +15755,7 @@ impl AdeApp {
         // blocking the modal overlay (native child window z-order issue)
         self.hide_embedded_browsers();
         self.pending_browser_rect = None;
+        self.maybe_spawn_model_probe();
     }
 
     fn draw_settings_navigation(&mut self, ui: &mut Ui, shows_diagnostics_warning_badge: bool) {
@@ -15723,20 +15832,26 @@ impl AdeApp {
         changes: &mut SettingsEditOutcome,
     ) {
         ui.set_width(ui.available_width().max(0.0));
-        ui.label(
-            RichText::new(format!(
-                "{} {}",
-                self.active_settings_section.icon(),
-                self.active_settings_section.title()
-            ))
-            .strong()
-            .size(17.0)
-            .color(TEXT_PRIMARY),
+        let section_heading = format!(
+            "{} {}",
+            self.active_settings_section.icon(),
+            self.active_settings_section.title()
         );
-        ui.label(
-            RichText::new(self.active_settings_section.description())
+        settings_copyable_label(
+            ui,
+            RichText::new(&section_heading)
+                .strong()
+                .size(17.0)
+                .color(TEXT_PRIMARY),
+            &section_heading,
+        );
+        let section_description = self.active_settings_section.description();
+        settings_copyable_label(
+            ui,
+            RichText::new(section_description)
                 .small()
                 .color(TEXT_MUTED),
+            section_description,
         );
         ui.add_space(12.0);
 
@@ -15797,11 +15912,17 @@ impl AdeApp {
 
                 if stack_controls {
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("Default shell").strong().color(TEXT_PRIMARY));
-                        ui.label(
+                        settings_copyable_label(
+                            ui,
+                            RichText::new("Default shell").strong().color(TEXT_PRIMARY),
+                            "Default shell",
+                        );
+                        settings_copyable_label(
+                            ui,
                             RichText::new("Used when you open a new terminal from Mergen ADE.")
                                 .small()
                                 .color(TEXT_MUTED),
+                            "Used when you open a new terminal from Mergen ADE.",
                         );
                         ui.add_space(8.0);
                         egui::ComboBox::from_id_salt("settings-default-shell")
@@ -15820,11 +15941,17 @@ impl AdeApp {
                 } else {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
-                            ui.label(RichText::new("Default shell").strong().color(TEXT_PRIMARY));
-                            ui.label(
+                            settings_copyable_label(
+                                ui,
+                                RichText::new("Default shell").strong().color(TEXT_PRIMARY),
+                                "Default shell",
+                            );
+                            settings_copyable_label(
+                                ui,
                                 RichText::new("Used when you open a new terminal from Mergen ADE.")
                                     .small()
                                     .color(TEXT_MUTED),
+                                "Used when you open a new terminal from Mergen ADE.",
                             );
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -15867,8 +15994,16 @@ impl AdeApp {
 
                 if stack_controls {
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("Workspace visibility").strong().color(TEXT_PRIMARY));
-                        ui.label(RichText::new(helper_text).small().color(TEXT_MUTED));
+                        settings_copyable_label(
+                            ui,
+                            RichText::new("Workspace visibility").strong().color(TEXT_PRIMARY),
+                            "Workspace visibility",
+                        );
+                        settings_copyable_label(
+                            ui,
+                            RichText::new(helper_text).small().color(TEXT_MUTED),
+                            helper_text,
+                        );
                         ui.add_space(8.0);
                         let multi_terminal_toggle = ui.add_sized(
                             [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
@@ -15884,12 +16019,18 @@ impl AdeApp {
                 } else {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
-                            ui.label(
+                            settings_copyable_label(
+                                ui,
                                 RichText::new("Workspace visibility")
                                     .strong()
                                     .color(TEXT_PRIMARY),
+                                "Workspace visibility",
                             );
-                            ui.label(RichText::new(helper_text).small().color(TEXT_MUTED));
+                            settings_copyable_label(
+                                ui,
+                                RichText::new(helper_text).small().color(TEXT_MUTED),
+                                helper_text,
+                            );
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let multi_terminal_toggle = ui.add_sized(
@@ -15927,12 +16068,14 @@ impl AdeApp {
     }
 
     fn draw_settings_launchers_section(&mut self, ui: &mut Ui, changes: &mut SettingsEditOutcome) {
-        ui.label(
+        settings_copyable_label(
+            ui,
             RichText::new(
                 "Foreground terminal creation now launches through this catalog instead of opening an empty shell.",
             )
             .small()
             .color(TEXT_MUTED),
+            "Foreground terminal creation now launches through this catalog instead of opening an empty shell.",
         );
         ui.add_space(12.0);
 
@@ -15958,44 +16101,66 @@ impl AdeApp {
                             let launcher = &mut self.config.launchers[index];
                             ui.vertical(|ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label(
+                                    settings_copyable_label(
+                                        ui,
                                         RichText::new(&launcher.display_name)
                                             .strong()
                                             .color(TEXT_PRIMARY),
+                                        &launcher.display_name,
                                     );
                                     let kind_label = if is_builtin { "Built-in" } else { "Custom" };
-                                    ui.label(
+                                    settings_copyable_label(
+                                        ui,
                                         RichText::new(kind_label).small().color(TEXT_MUTED),
+                                        kind_label,
                                     );
                                 });
 
                                 ui.add_space(6.0);
-                                ui.label(RichText::new("Menu label").small().color(TEXT_MUTED));
-                                row_changed |= with_settings_text_edit_chrome(ui, |ui| {
+                                settings_copyable_label(
+                                    ui,
+                                    RichText::new("Menu label").small().color(TEXT_MUTED),
+                                    "Menu label",
+                                );
+                                let display_name_snapshot = launcher.display_name.clone();
+                                let display_name_response = with_settings_text_edit_chrome(ui, |ui| {
                                     ui.add_sized(
                                         [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
                                         egui::TextEdit::singleline(&mut launcher.display_name)
                                             .hint_text("Launcher name")
-                                            .desired_width(ui.available_width().max(0.0)),
+                                            .desired_width(ui.available_width().max(0.0))
+                                            .vertical_align(Align::Center),
                                     )
-                                })
-                                .changed();
+                                });
+                                add_settings_copy_context_menu(
+                                    &display_name_response,
+                                    &display_name_snapshot,
+                                );
+                                row_changed |= display_name_response.changed();
 
                                 ui.add_space(6.0);
-                                ui.label(
+                                settings_copyable_label(
+                                    ui,
                                     RichText::new("Command to type and submit")
                                         .small()
                                         .color(TEXT_MUTED),
+                                    "Command to type and submit",
                                 );
-                                row_changed |= with_settings_text_edit_chrome(ui, |ui| {
+                                let launch_command_snapshot = launcher.launch_command.clone();
+                                let launch_command_response = with_settings_text_edit_chrome(ui, |ui| {
                                     ui.add_sized(
                                         [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
                                         egui::TextEdit::singleline(&mut launcher.launch_command)
                                             .hint_text("Example: codex, cc, droid, opencode")
-                                            .desired_width(ui.available_width().max(0.0)),
+                                            .desired_width(ui.available_width().max(0.0))
+                                            .vertical_align(Align::Center),
                                     )
-                                })
-                                .changed();
+                                });
+                                add_settings_copy_context_menu(
+                                    &launch_command_response,
+                                    &launch_command_snapshot,
+                                );
+                                row_changed |= launch_command_response.changed();
 
                                 ui.add_space(8.0);
                                 ui.horizontal(|ui| {
@@ -16069,10 +16234,12 @@ impl AdeApp {
                         } else {
                             "Menu label cannot be empty."
                         };
-                        ui.label(
+                        settings_copyable_label(
+                            ui,
                             RichText::new(warning)
                                 .small()
                                 .color(Color32::from_rgb(220, 170, 60)),
+                            warning,
                         );
                     }
 
@@ -16106,33 +16273,51 @@ impl AdeApp {
             "Add Custom Launcher",
             "Create extra foreground launchers with a preset icon and a custom command.",
             |ui| {
-                ui.label(RichText::new("Menu label").small().color(TEXT_MUTED));
+                settings_copyable_label(
+                    ui,
+                    RichText::new("Menu label").small().color(TEXT_MUTED),
+                    "Menu label",
+                );
                 let mut draft_changed = false;
-                draft_changed |= with_settings_text_edit_chrome(ui, |ui| {
+                let draft_display_name_snapshot = self.launcher_draft.display_name.clone();
+                let draft_display_name_response = with_settings_text_edit_chrome(ui, |ui| {
                     ui.add_sized(
                         [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
                         egui::TextEdit::singleline(&mut self.launcher_draft.display_name)
                             .hint_text("Example: Gemini")
-                            .desired_width(ui.available_width().max(0.0)),
+                            .desired_width(ui.available_width().max(0.0))
+                            .vertical_align(Align::Center),
                     )
-                })
-                .changed();
+                });
+                add_settings_copy_context_menu(
+                    &draft_display_name_response,
+                    &draft_display_name_snapshot,
+                );
+                draft_changed |= draft_display_name_response.changed();
                 ui.add_space(8.0);
 
-                ui.label(
+                settings_copyable_label(
+                    ui,
                     RichText::new("Command to type and submit")
                         .small()
                         .color(TEXT_MUTED),
+                    "Command to type and submit",
                 );
-                draft_changed |= with_settings_text_edit_chrome(ui, |ui| {
+                let draft_launch_command_snapshot = self.launcher_draft.launch_command.clone();
+                let draft_launch_command_response = with_settings_text_edit_chrome(ui, |ui| {
                     ui.add_sized(
                         [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
                         egui::TextEdit::singleline(&mut self.launcher_draft.launch_command)
                             .hint_text("Example: gemini")
-                            .desired_width(ui.available_width().max(0.0)),
+                            .desired_width(ui.available_width().max(0.0))
+                            .vertical_align(Align::Center),
                     )
-                })
-                .changed();
+                });
+                add_settings_copy_context_menu(
+                    &draft_launch_command_response,
+                    &draft_launch_command_snapshot,
+                );
+                draft_changed |= draft_launch_command_response.changed();
                 ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
@@ -16201,19 +16386,24 @@ impl AdeApp {
     ) {
         let healthy_color = Color32::from_rgb(100, 195, 140);
         let _warning_color = Color32::from_rgb(220, 170, 60);
+        let card_width = ui.available_width().max(0.0);
+        ui.set_width(card_width);
+        ui.set_max_width(card_width);
 
-        ui.label(
+        settings_copyable_label(
+            ui,
             RichText::new(
                 "Switch between two configured build models with a single click. Both global and runtime configs are updated.",
             )
             .small()
             .color(TEXT_MUTED),
+            "Switch between two configured build models with a single click. Both global and runtime configs are updated.",
         );
         ui.add_space(12.0);
 
-        // Startup mode card
-        show_settings_card(
+        show_bounded_settings_card(
             ui,
+            card_width,
             AppIcon::ChatText,
             "ACP Startup Mode",
             "Choose which mode ACP chat uses when a new session starts.",
@@ -16243,13 +16433,19 @@ impl AdeApp {
 
         // Model Slot A Card
         let is_slot_a_active = self.config.opencode.active_build_model_slot == "a";
-        show_settings_card(
+        show_bounded_settings_card(
             ui,
+            card_width,
             AppIcon::Terminal,
             "Build Model Slot A",
             "First model configuration for build mode.",
             |ui| {
-                ui.label(RichText::new("Model identifier").small().color(TEXT_MUTED));
+                settings_copyable_label(
+                    ui,
+                    RichText::new("Model identifier").small().color(TEXT_MUTED),
+                    "Model identifier",
+                );
+                let slot_a_snapshot = self.config.opencode.build_model_slot_a.clone();
                 let slot_a_response = with_settings_text_edit_chrome(ui, |ui| {
                     ui.add_sized(
                         [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
@@ -16257,9 +16453,11 @@ impl AdeApp {
                             .hint_text(
                                 "e.g., fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo",
                             )
-                            .desired_width(ui.available_width().max(0.0)),
+                            .desired_width(ui.available_width().max(0.0))
+                            .vertical_align(Align::Center),
                     )
                 });
+                add_settings_copy_context_menu(&slot_a_response, &slot_a_snapshot);
                 if slot_a_response.changed() {
                     changes.note_opencode_change();
                 }
@@ -16297,21 +16495,29 @@ impl AdeApp {
         ui.add_space(12.0);
 
         // Model Slot B Card
-        show_settings_card(
+        show_bounded_settings_card(
             ui,
+            card_width,
             AppIcon::TerminalWindow,
             "Build Model Slot B",
             "Second model configuration for build mode.",
             |ui| {
-                ui.label(RichText::new("Model identifier").small().color(TEXT_MUTED));
+                settings_copyable_label(
+                    ui,
+                    RichText::new("Model identifier").small().color(TEXT_MUTED),
+                    "Model identifier",
+                );
+                let slot_b_snapshot = self.config.opencode.build_model_slot_b.clone();
                 let slot_b_response = with_settings_text_edit_chrome(ui, |ui| {
                     ui.add_sized(
                         [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
                         egui::TextEdit::singleline(&mut self.config.opencode.build_model_slot_b)
                             .hint_text("e.g., openai/gpt-5.5-fast")
-                            .desired_width(ui.available_width().max(0.0)),
+                            .desired_width(ui.available_width().max(0.0))
+                            .vertical_align(Align::Center),
                     )
                 });
+                add_settings_copy_context_menu(&slot_b_response, &slot_b_snapshot);
                 if slot_b_response.changed() {
                     changes.note_opencode_change();
                 }
@@ -16352,67 +16558,165 @@ impl AdeApp {
         // Favorite Models card
         let favorite_models = self.config.opencode.acp_favorite_models.clone();
         let known_models = self.config.opencode.acp_known_models.clone();
-        show_settings_card(
+        let acp_session_loading = self.has_live_acp_session();
+        show_bounded_settings_card(
             ui,
+            card_width,
             AppIcon::Star,
             "ACP Favorite Models",
             "Star models so they appear in the composer dropdown. Only favorited models are shown there.",
             |ui| {
                 if known_models.is_empty() {
-                    ui.label(
-                        RichText::new("Open an ACP chat to load available models.").small().color(TEXT_MUTED),
-                    );
-                } else {
-                    let mut toggled: Option<String> = None;
-                    for entry in &known_models {
-                        let is_favorite = favorite_models.contains(&entry.value);
-                        let star_color = if is_favorite {
-                            Color32::from_rgb(220, 180, 60)
-                        } else {
-                            TEXT_MUTED
-                        };
+                    if acp_session_loading {
                         ui.horizontal(|ui| {
-                            let star_btn = ui.add(
-                                egui::Button::new(
-                                    RichText::new(format!("{}", icons::STAR))
-                                        .size(14.0)
-                                        .color(star_color),
-                                )
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::NONE)
-                                .small(),
-                            );
-                            if star_btn.clicked() {
-                                toggled = Some(entry.value.clone());
-                            }
-                            ui.label(
-                                RichText::new(&entry.name)
-                                    .size(12.0)
-                                    .color(if is_favorite { TEXT_PRIMARY } else { TEXT_MUTED }),
-                            );
-                            ui.label(
-                                RichText::new(&entry.value)
+                            ui.add(egui::Spinner::new().size(14.0));
+                            settings_copyable_label(
+                                ui,
+                                RichText::new("Loading available models...")
                                     .small()
                                     .color(TEXT_MUTED),
+                                "Loading available models...",
                             );
                         });
+                    } else {
+                        settings_copyable_label(
+                            ui,
+                            RichText::new("Open an ACP chat to load available models.")
+                                .small()
+                                .color(TEXT_MUTED),
+                            "Open an ACP chat to load available models.",
+                        );
                     }
-                    if let Some(value) = toggled {
-                        self.config.opencode.toggle_acp_model_favorite(&value);
-                        changes.note_opencode_change();
+                } else {
+                    let filter_snapshot = self.settings_acp_favorite_filter.clone();
+                    let filter_response = with_settings_text_edit_chrome(ui, |ui| {
+                        ui.add_sized(
+                            [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
+                            egui::TextEdit::singleline(&mut self.settings_acp_favorite_filter)
+                                .hint_text("Filter favorites")
+                                .desired_width(ui.available_width().max(0.0))
+                                .vertical_align(Align::Center),
+                        )
+                    });
+                    add_settings_copy_context_menu(&filter_response, &filter_snapshot);
+                    ui.add_space(8.0);
+
+                    let query = self.settings_acp_favorite_filter.trim().to_lowercase();
+                    let filtered: Vec<_> = known_models
+                        .iter()
+                        .filter(|entry| {
+                            query.is_empty()
+                                || entry.name.to_lowercase().contains(&query)
+                                || entry.value.to_lowercase().contains(&query)
+                        })
+                        .collect();
+
+                    if filtered.is_empty() {
+                        settings_copyable_label(
+                            ui,
+                            RichText::new("No matching models.").small().color(TEXT_MUTED),
+                            "No matching models.",
+                        );
+                    } else {
+                        let mut toggled: Option<String> = None;
+                        let list_width = ui.available_width().max(0.0);
+                        let list_height = SETTINGS_ACP_FAVORITES_LIST_HEIGHT;
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(list_width, list_height),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                ui.set_min_height(list_height);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("settings-acp-favorites-list")
+                                    .auto_shrink([false, false])
+                                    .max_height(list_height)
+                                    .show(ui, |ui| {
+                                        ui.set_width(list_width);
+                                        for entry in filtered {
+                                            let is_favorite =
+                                                favorite_models.contains(&entry.value);
+                                            let star_color = if is_favorite {
+                                                Color32::from_rgb(220, 180, 60)
+                                            } else {
+                                                TEXT_MUTED
+                                            };
+                                            ui.horizontal(|ui| {
+                                                ui.set_max_width(list_width);
+                                                let star_btn = ui.add(
+                                                    egui::Button::new(
+                                                        RichText::new(format!(
+                                                            "{}",
+                                                            icons::STAR
+                                                        ))
+                                                        .size(14.0)
+                                                        .color(star_color),
+                                                    )
+                                                    .fill(Color32::TRANSPARENT)
+                                                    .stroke(Stroke::NONE)
+                                                    .small(),
+                                                );
+                                                if star_btn.clicked() {
+                                                    toggled = Some(entry.value.clone());
+                                                }
+                                                let name_response = ui
+                                                    .add(
+                                                        egui::Label::new(
+                                                            RichText::new(&entry.name)
+                                                                .size(12.0)
+                                                                .color(if is_favorite {
+                                                                    TEXT_PRIMARY
+                                                                } else {
+                                                                    TEXT_MUTED
+                                                                }),
+                                                        )
+                                                        .truncate()
+                                                        .sense(Sense::click()),
+                                                    )
+                                                    .on_hover_text(&entry.name);
+                                                add_label_copy_context_menu(
+                                                    &name_response,
+                                                    &entry.name,
+                                                );
+                                                let value_response = ui
+                                                    .add(
+                                                        egui::Label::new(
+                                                            RichText::new(&entry.value)
+                                                                .small()
+                                                                .color(TEXT_MUTED),
+                                                        )
+                                                        .truncate()
+                                                        .sense(Sense::click()),
+                                                    )
+                                                    .on_hover_text(&entry.value);
+                                                add_label_copy_context_menu(
+                                                    &value_response,
+                                                    &entry.value,
+                                                );
+                                            });
+                                        }
+                                    });
+                            },
+                        );
+                        if let Some(value) = toggled {
+                            self.config.opencode.toggle_acp_model_favorite(&value);
+                            changes.note_opencode_change();
+                        }
                     }
                 }
             },
         );
         ui.add_space(12.0);
 
-        // Status card
-        show_settings_card(
+        show_bounded_settings_card(
             ui,
+            card_width,
             AppIcon::Eye,
             "Configuration Status",
             "Current active model and last update status.",
             |ui| {
+                let content_width = ui.available_width().max(0.0);
+                ui.set_width(content_width);
+                ui.set_max_width(content_width);
                 let active_model = self.config.opencode.active_build_model();
                 let slot_label = if is_slot_a_active { "A" } else { "B" };
                 Self::draw_settings_diagnostic_row(ui, "Active Slot", slot_label, healthy_color);
@@ -16508,12 +16812,14 @@ impl AdeApp {
             return;
         }
 
-        ui.label(
+        settings_copyable_label(
+            ui,
             RichText::new(
                 "Saved messages stay grouped by project and can be sent to any live terminal in that workspace.",
             )
-                .small()
-                .color(TEXT_MUTED),
+            .small()
+            .color(TEXT_MUTED),
+            "Saved messages stay grouped by project and can be sent to any live terminal in that workspace.",
         );
         ui.add_space(SETTINGS_SAVED_MESSAGES_SECTION_TOP_GAP);
 
@@ -16554,19 +16860,23 @@ impl AdeApp {
                         ui.add_space(8.0);
 
                         if project_snapshot.saved_messages.is_empty() {
-                            ui.label(
+                            settings_copyable_label(
+                                ui,
                                 RichText::new("No saved messages for this project.")
                                     .small()
                                     .color(TEXT_MUTED),
+                                "No saved messages for this project.",
                             );
                         } else {
                             if send_target_terminal.is_none() {
-                                ui.label(
+                                settings_copyable_label(
+                                    ui,
                                     RichText::new(
                                         "Open a live terminal in this project to send saved messages one by one.",
                                     )
                                     .small()
                                     .color(TEXT_MUTED),
+                                    "Open a live terminal in this project to send saved messages one by one.",
                                 );
                                 ui.add_space(8.0);
                             }
@@ -16599,15 +16909,18 @@ impl AdeApp {
                         let draft = self.saved_message_drafts.entry(project_id).or_default();
                         if stack_draft_row {
                             let input_width = ui.available_width().max(0.0);
-                            with_settings_text_edit_chrome(ui, |ui| {
+                            let draft_snapshot = draft.clone();
+                            let draft_response = with_settings_text_edit_chrome(ui, |ui| {
                                 ui.add_sized(
                                     [input_width, CONTROL_ROW_HEIGHT],
                                     egui::TextEdit::singleline(draft)
                                         .hint_text("Add a saved message for this project")
                                         .id(Self::saved_message_draft_input_id(project_id))
-                                        .desired_width(input_width),
-                                );
+                                        .desired_width(input_width)
+                                        .vertical_align(Align::Center),
+                                )
                             });
+                            add_settings_copy_context_menu(&draft_response, &draft_snapshot);
                             ui.add_space(8.0);
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if styled_icon_button(
@@ -16629,15 +16942,18 @@ impl AdeApp {
                             ui.horizontal(|ui| {
                                 let button_space = CONTROL_ROW_HEIGHT + ui.spacing().item_spacing.x;
                                 let input_width = (ui.available_width() - button_space).max(0.0);
-                                with_settings_text_edit_chrome(ui, |ui| {
+                                let draft_snapshot = draft.clone();
+                                let draft_response = with_settings_text_edit_chrome(ui, |ui| {
                                     ui.add_sized(
                                         [input_width, CONTROL_ROW_HEIGHT],
                                         egui::TextEdit::singleline(draft)
                                             .hint_text("Add a saved message for this project")
                                             .id(Self::saved_message_draft_input_id(project_id))
-                                            .desired_width(input_width),
-                                    );
+                                            .desired_width(input_width)
+                                            .vertical_align(Align::Center),
+                                    )
                                 });
+                                add_settings_copy_context_menu(&draft_response, &draft_snapshot);
                                 if styled_icon_button(
                                     ui,
                                     icons::PLUS,
@@ -16686,10 +17002,12 @@ impl AdeApp {
     ) {
         use crate::models::{default_terminal_shortcuts, ShortcutModifiers, TerminalShortcutEntry};
 
-        ui.label(
+        settings_copyable_label(
+            ui,
             RichText::new("Configure keyboard shortcuts to send commands to the active terminal.")
                 .small()
                 .color(TEXT_MUTED),
+            "Configure keyboard shortcuts to send commands to the active terminal.",
         );
         ui.add_space(12.0);
 
@@ -16713,13 +17031,12 @@ impl AdeApp {
                     dup_summary
                 )
             };
-            ui.add(
-                egui::Label::new(
-                    RichText::new(label_text)
-                        .small()
-                        .color(Color32::from_rgb(220, 170, 60)),
-                )
-                .truncate(),
+            settings_copyable_label(
+                ui,
+                RichText::new(&label_text)
+                    .small()
+                    .color(Color32::from_rgb(220, 170, 60)),
+                &label_text,
             )
             .on_hover_text(format!(
                 "Duplicate combos: {}. Enable only one shortcut per combination.",
@@ -16758,17 +17075,21 @@ impl AdeApp {
             });
 
             // Show recording overlay
-            ui.label(
+            settings_copyable_label(
+                ui,
                 RichText::new("Recording key... Press any key to assign, or Escape to cancel.")
                     .strong()
                     .color(Color32::from_rgb(100, 195, 140)),
+                "Recording key... Press any key to assign, or Escape to cancel.",
             );
             ui.add_space(8.0);
         } else if self.settings_acp_mode_toggle_recording {
-            ui.label(
+            settings_copyable_label(
+                ui,
                 RichText::new("Recording ACP mode toggle key... Press any key to assign, or Escape to cancel.")
                     .strong()
                     .color(Color32::from_rgb(100, 195, 140)),
+                "Recording ACP mode toggle key... Press any key to assign, or Escape to cancel.",
             );
             ui.add_space(8.0);
         }
@@ -16869,7 +17190,7 @@ impl AdeApp {
 
                     // Key capture row
                     ui.horizontal(|ui| {
-                        ui.label("Key:");
+                        settings_copyable_label(ui, RichText::new("Key:"), "Key:");
                         let is_recording = self.settings_shortcut_recording_index == Some(index);
                         let button_text = if is_recording {
                             "Recording..."
@@ -16891,7 +17212,7 @@ impl AdeApp {
 
                     // Modifiers checkboxes
                     ui.horizontal(|ui| {
-                        ui.label("Modifiers:");
+                        settings_copyable_label(ui, RichText::new("Modifiers:"), "Modifiers:");
                         let mut mods = shortcut.modifiers;
                         if ui.checkbox(&mut mods.ctrl, "Ctrl").changed() {
                             shortcut.modifiers = mods;
@@ -16912,35 +17233,45 @@ impl AdeApp {
                     });
 
                     // Command edit
-                    ui.label(RichText::new("Command to send").small().color(TEXT_MUTED));
-                    if with_settings_text_edit_chrome(ui, |ui| {
+                    settings_copyable_label(
+                        ui,
+                        RichText::new("Command to send").small().color(TEXT_MUTED),
+                        "Command to send",
+                    );
+                    let command_snapshot = shortcut.command.clone();
+                    let command_response = with_settings_text_edit_chrome(ui, |ui| {
                         ui.add_sized(
                             [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
                             egui::TextEdit::singleline(&mut shortcut.command)
-                                .hint_text("e.g., /prepare-fix-plan"),
+                                .hint_text("e.g., /prepare-fix-plan")
+                                .vertical_align(Align::Center),
                         )
-                    })
-                    .changed()
-                    {
+                    });
+                    add_settings_copy_context_menu(&command_response, &command_snapshot);
+                    if command_response.changed() {
                         shortcut_changed = true;
                     }
 
                     // Label edit
                     ui.add_space(4.0);
-                    ui.label(
+                    settings_copyable_label(
+                        ui,
                         RichText::new("Label (for display)")
                             .small()
                             .color(TEXT_MUTED),
+                        "Label (for display)",
                     );
-                    if with_settings_text_edit_chrome(ui, |ui| {
+                    let label_snapshot = shortcut.label.clone();
+                    let label_response = with_settings_text_edit_chrome(ui, |ui| {
                         ui.add_sized(
                             [ui.available_width().max(0.0), CONTROL_ROW_HEIGHT],
                             egui::TextEdit::singleline(&mut shortcut.label)
-                                .hint_text("Shortcut name"),
+                                .hint_text("Shortcut name")
+                                .vertical_align(Align::Center),
                         )
-                    })
-                    .changed()
-                    {
+                    });
+                    add_settings_copy_context_menu(&label_response, &label_snapshot);
+                    if label_response.changed() {
                         shortcut_changed = true;
                     }
                 },
@@ -16980,7 +17311,7 @@ impl AdeApp {
                 ui.add_space(8.0);
                 // Key capture row
                 ui.horizontal(|ui| {
-                    ui.label("Key:");
+                    settings_copyable_label(ui, RichText::new("Key:"), "Key:");
                     let is_recording = self.settings_acp_mode_toggle_recording;
                     let display_combo = Self::format_shortcut_for_display(
                         &self.config.acp_mode_toggle_shortcut.key,
@@ -17004,7 +17335,7 @@ impl AdeApp {
                 });
                 // Modifiers checkboxes
                 ui.horizontal(|ui| {
-                    ui.label("Modifiers:");
+                    settings_copyable_label(ui, RichText::new("Modifiers:"), "Modifiers:");
                     let mut mods = self.config.acp_mode_toggle_shortcut.modifiers;
                     if ui.checkbox(&mut mods.ctrl, "Ctrl").changed() {
                         self.config.acp_mode_toggle_shortcut.modifiers = mods;
@@ -17062,10 +17393,12 @@ impl AdeApp {
                 ui.add_space(8.0);
 
                 // Available default shortcuts
-                ui.label(
+                settings_copyable_label(
+                    ui,
                     RichText::new("Or add default shortcuts:")
                         .small()
                         .color(TEXT_MUTED),
+                    "Or add default shortcuts:",
                 );
                 ui.add_space(4.0);
 
@@ -17079,7 +17412,13 @@ impl AdeApp {
                         .any(|s| s.id == default.id);
                     if !exists {
                         ui.horizontal(|ui| {
-                            ui.label(format!("{} → {}", default.key, default.command));
+                            let default_summary =
+                                format!("{} → {}", default.key, default.command);
+                            settings_copyable_label(
+                                ui,
+                                RichText::new(&default_summary),
+                                &default_summary,
+                            );
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui.button("Add").clicked() {
                                     self.config.terminal_shortcuts.push(default.clone());
@@ -17120,16 +17459,22 @@ impl AdeApp {
                     "Only when Mergen is not focused",
                 );
                 ui.add_space(8.0);
-                ui.label(RichText::new("Notify when").strong().color(TEXT_PRIMARY));
+                settings_copyable_label(
+                    ui,
+                    RichText::new("Notify when").strong().color(TEXT_PRIMARY),
+                    "Notify when",
+                );
                 ui.checkbox(&mut cfg.on_permission, "Permission / input requested");
                 ui.checkbox(&mut cfg.on_turn_complete, "Agent finishes a turn");
                 ui.checkbox(&mut cfg.on_session_error, "Session error");
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    ui.label(
+                    settings_copyable_label(
+                        ui,
                         RichText::new("Cooldown seconds")
                             .strong()
                             .color(TEXT_PRIMARY),
+                        "Cooldown seconds",
                     );
                     ui.add(
                         egui::DragValue::new(&mut cfg.cooldown_secs)
@@ -17612,23 +17957,33 @@ impl AdeApp {
             "Runtime Overview",
             "Get a quick read on integration health before opening the verbose diagnostics.",
             |ui| {
-                ui.label(RichText::new(summary_title).strong().color(
-                    if diagnostics.shows_settings_warning_badge() {
-                        warning_color
-                    } else {
-                        healthy_color
-                    },
-                ));
-                ui.label(
+                settings_copyable_label(
+                    ui,
+                    RichText::new(summary_title).strong().color(
+                        if diagnostics.shows_settings_warning_badge() {
+                            warning_color
+                        } else {
+                            healthy_color
+                        },
+                    ),
+                    summary_title,
+                );
+                settings_copyable_label(
+                    ui,
                     RichText::new(&summary_message)
                         .small()
                         .color(summary_message_color),
+                    &summary_message,
                 );
                 ui.add_space(10.0);
                 let use_single_column =
                     settings_diagnostics_uses_single_column(ui.available_width());
                 if use_single_column {
-                    ui.label(RichText::new("Factory Droid").strong().color(TEXT_PRIMARY));
+                    settings_copyable_label(
+                        ui,
+                        RichText::new("Factory Droid").strong().color(TEXT_PRIMARY),
+                        "Factory Droid",
+                    );
                     Self::draw_settings_diagnostic_row(
                         ui,
                         "Primary",
@@ -17652,7 +18007,11 @@ impl AdeApp {
                         TEXT_PRIMARY,
                     );
                     ui.add_space(8.0);
-                    ui.label(RichText::new("Codex CLI").strong().color(TEXT_PRIMARY));
+                    settings_copyable_label(
+                        ui,
+                        RichText::new("Codex CLI").strong().color(TEXT_PRIMARY),
+                        "Codex CLI",
+                    );
                     Self::draw_settings_diagnostic_row(
                         ui,
                         "Inbox",
@@ -17689,8 +18048,11 @@ impl AdeApp {
                     );
                 } else {
                     ui.columns(2, |columns| {
-                        columns[0]
-                            .label(RichText::new("Factory Droid").strong().color(TEXT_PRIMARY));
+                        settings_copyable_label(
+                            &mut columns[0],
+                            RichText::new("Factory Droid").strong().color(TEXT_PRIMARY),
+                            "Factory Droid",
+                        );
                         Self::draw_settings_diagnostic_row(
                             &mut columns[0],
                             "Primary",
@@ -17714,7 +18076,11 @@ impl AdeApp {
                             TEXT_PRIMARY,
                         );
 
-                        columns[1].label(RichText::new("Codex CLI").strong().color(TEXT_PRIMARY));
+                        settings_copyable_label(
+                            &mut columns[1],
+                            RichText::new("Codex CLI").strong().color(TEXT_PRIMARY),
+                            "Codex CLI",
+                        );
                         Self::draw_settings_diagnostic_row(
                             &mut columns[1],
                             "Inbox",
@@ -17810,20 +18176,24 @@ impl AdeApp {
             }
 
             ui.add_space(10.0);
-            ui.label(
+            settings_copyable_label(
+                ui,
                 RichText::new(
                     "Inspect exact paths, sources, and health checks when something needs debugging.",
                 )
                 .small()
                 .color(TEXT_MUTED),
+                "Inspect exact paths, sources, and health checks when something needs debugging.",
             );
             ui.add_space(10.0);
-            ui.label(
+            settings_copyable_label(
+                ui,
                 RichText::new(
                     "Factory Droid status uses PTY/process detection first. Inbox JSONL remains a best-effort fallback.",
                 )
                 .small()
                 .color(TEXT_MUTED),
+                "Factory Droid status uses PTY/process detection first. Inbox JSONL remains a best-effort fallback.",
             );
             ui.add_space(4.0);
             Self::draw_settings_diagnostic_row(
@@ -17905,29 +18275,39 @@ impl AdeApp {
                 TEXT_PRIMARY,
             );
             if let Some(warning_message) = diagnostics.warning_message() {
-                ui.label(RichText::new(warning_message).small().color(warning_color));
+                settings_copyable_label(
+                    ui,
+                    RichText::new(&warning_message).small().color(warning_color),
+                    &warning_message,
+                );
             }
 
             ui.separator();
-            ui.label(
+            settings_copyable_label(
+                ui,
                 RichText::new("Codex CLI")
                     .strong()
                     .size(15.0)
                     .color(TEXT_PRIMARY),
+                "Codex CLI",
             );
-            ui.label(
+            settings_copyable_label(
+                ui,
                 RichText::new(
                     "Windows support in Codex CLI is still experimental. For now Mergen only wires native Windows sessions; WSL bridging stays out of scope in this release.",
                 )
                 .small()
                 .color(warning_color),
+                "Windows support in Codex CLI is still experimental. For now Mergen only wires native Windows sessions; WSL bridging stays out of scope in this release.",
             );
-            ui.label(
+            settings_copyable_label(
+                ui,
                 RichText::new(
                     "Codex CLI integration uses official hooks on Windows: prompt/tool hooks keep the gray spinner active, permission requests use amber attention, and Stop settles into a green turn-complete pulse unless follow-up work arrives first. WSL bridging stays out of scope in this release.",
                 )
                 .small()
                 .color(TEXT_MUTED),
+                "Codex CLI integration uses official hooks on Windows: prompt/tool hooks keep the gray spinner active, permission requests use amber attention, and Stop settles into a green turn-complete pulse unless follow-up work arrives first. WSL bridging stays out of scope in this release.",
             );
             ui.add_space(4.0);
             Self::draw_settings_diagnostic_row(ui, "Codex Config", &codex_config_text, TEXT_PRIMARY);
@@ -20817,7 +21197,8 @@ impl AdeApp {
                                                     &mut session.model_search_query,
                                                 )
                                                 .hint_text("Search models...")
-                                                .desired_width(ui.available_width()),
+                                                .desired_width(ui.available_width())
+                                                .vertical_align(Align::Center),
                                             );
                                             ui.separator();
 
@@ -25638,18 +26019,22 @@ impl AdeApp {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .fixed_size(window_size)
             .show(ctx, |ui| {
-                ui.label(
+                settings_copyable_label(
+                    ui,
                     RichText::new("Application Settings")
                         .strong()
                         .size(16.0)
                         .color(TEXT_PRIMARY),
+                    "Application Settings",
                 );
-                ui.label(
+                settings_copyable_label(
+                    ui,
                     RichText::new(
                         "Workspace defaults, launchers, shortcuts, saved messages, and diagnostics.",
                     )
                     .small()
                     .color(TEXT_MUTED),
+                    "Workspace defaults, launchers, shortcuts, saved messages, and diagnostics.",
                 );
                 ui.add_space(12.0);
 
@@ -26233,7 +26618,8 @@ impl AdeApp {
                             [ui.available_width(), CONTROL_ROW_HEIGHT],
                             egui::TextEdit::singleline(&mut self.create_worktree_branch_draft)
                                 .id(Self::create_worktree_branch_input_id())
-                                .hint_text("feature/my-task"),
+                                .hint_text("feature/my-task")
+                                .vertical_align(Align::Center),
                         );
                     });
                     ui.add_space(6.0);
@@ -26248,7 +26634,8 @@ impl AdeApp {
                             [ui.available_width(), CONTROL_ROW_HEIGHT],
                             egui::TextEdit::singleline(&mut self.create_worktree_base_branch)
                                 .id(Self::create_worktree_base_branch_input_id())
-                                .hint_text("main or origin/main"),
+                                .hint_text("main or origin/main")
+                                .vertical_align(Align::Center),
                         );
                     });
                     ui.add_space(6.0);
@@ -26264,7 +26651,8 @@ impl AdeApp {
                             egui::TextEdit::singleline(&mut self.create_worktree_path_draft)
                                 .id(Self::create_worktree_path_input_id())
                                 .hint_text("auto-generated from branch")
-                                .interactive(false),
+                                .interactive(false)
+                                .vertical_align(Align::Center),
                         );
                     });
                     ui.add_space(8.0);
@@ -29847,6 +30235,45 @@ fn with_settings_text_edit_chrome<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut
     .inner
 }
 
+fn add_settings_copy_context_menu(response: &egui::Response, text_snapshot: &str) {
+    let id = response.id;
+    let snapshot = text_snapshot.to_owned();
+    response.context_menu(|ui| {
+        with_minimal_button_chrome(ui, |ui| {
+            let range = egui::text_edit::TextEditState::load(ui.ctx(), id)
+                .and_then(|s| s.cursor.char_range())
+                .filter(|r| r.primary != r.secondary);
+            let has_selection = range.is_some();
+            ui.add_enabled_ui(has_selection, |ui| {
+                if ui.button(format!("{} Copy", icons::COPY)).clicked() {
+                    if let Some(t) = extract_text_from_char_range(&snapshot, range) {
+                        ui.ctx().copy_text(t);
+                    }
+                    ui.close_menu();
+                }
+            });
+        });
+    });
+}
+
+fn add_label_copy_context_menu(response: &egui::Response, text: &str) {
+    let snapshot = text.to_owned();
+    response.context_menu(|ui| {
+        with_minimal_button_chrome(ui, |ui| {
+            if ui.button(format!("{} Copy", icons::COPY)).clicked() {
+                ui.ctx().copy_text(snapshot.clone());
+                ui.close_menu();
+            }
+        });
+    });
+}
+
+fn settings_copyable_label(ui: &mut Ui, rich: RichText, plain: &str) -> egui::Response {
+    let response = ui.add(egui::Label::new(rich).sense(Sense::click()));
+    add_label_copy_context_menu(&response, plain);
+    response
+}
+
 fn capped_hover_text(text: &str, max_chars: usize) -> String {
     let mut result = String::new();
     for (index, ch) in text.chars().enumerate() {
@@ -30956,7 +31383,8 @@ fn draw_smart_input_footer(
                                         egui::TextEdit::singleline(
                                             &mut terminal.opencode_question_custom,
                                         )
-                                        .id(custom_id),
+                                        .id(custom_id)
+                                        .vertical_align(Align::Center),
                                     );
                                     if custom_response.clicked() || custom_response.gained_focus()
                                     {
@@ -31173,7 +31601,8 @@ fn draw_smart_input_footer(
                                             egui::vec2(text_width, 22.0),
                                             egui::TextEdit::singleline(&mut state.edit_draft)
                                                 .id(edit_id)
-                                                .hint_text("Edit queued task"),
+                                                .hint_text("Edit queued task")
+                                                .vertical_align(Align::Center),
                                         )
                                     });
                                 if edit_response.clicked() || edit_response.gained_focus() {
@@ -33286,14 +33715,16 @@ fn draw_settings_saved_message_card(
         .show(ui, |ui| {
             ui.set_min_width(text_width);
             ui.set_max_width(text_width);
-            ui.add(
+            let message_response = ui.add(
                 egui::Label::new(
                     RichText::new(message)
                         .size(SETTINGS_SAVED_MESSAGE_TEXT_SIZE)
                         .color(TEXT_PRIMARY),
                 )
-                .wrap(),
+                .wrap()
+                .sense(Sense::click()),
             );
+            add_label_copy_context_menu(&message_response, message);
         });
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(0.0, 6.0);
@@ -33343,19 +33774,46 @@ fn show_settings_card<R>(
 ) -> R {
     settings_surface_frame(with_alpha(SURFACE_BG_SOFT, 228), 12.0)
         .show(ui, |ui| {
-            ui.label(
+            settings_copyable_label(
+                ui,
                 RichText::new(format!("{icon} {title}"))
                     .strong()
                     .size(15.0)
                     .color(TEXT_PRIMARY),
+                title,
             );
             if !description.is_empty() {
-                ui.label(RichText::new(description).small().color(TEXT_MUTED));
+                settings_copyable_label(
+                    ui,
+                    RichText::new(description).small().color(TEXT_MUTED),
+                    description,
+                );
                 ui.add_space(10.0);
             }
             add_contents(ui)
         })
         .inner
+}
+
+fn show_bounded_settings_card<R>(
+    ui: &mut Ui,
+    width: f32,
+    icon: AppIcon,
+    title: &str,
+    description: &str,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 0.0),
+        Layout::top_down(Align::Min),
+        |ui| {
+            ui.set_width(width);
+            ui.set_min_width(width);
+            ui.set_max_width(width);
+            show_settings_card(ui, icon, title, description, add_contents)
+        },
+    )
+    .inner
 }
 
 fn sanitize_design_inspect_value(value: &str, max_chars: usize) -> String {
@@ -45872,6 +46330,7 @@ mod tests {
             settings_diagnostics_expanded: false,
             settings_shortcut_recording_index: None,
             settings_acp_mode_toggle_recording: false,
+            settings_acp_favorite_filter: String::new(),
             saved_message_drafts: BTreeMap::new(),
             foreground_message_popup_open: None,
             foreground_message_popup_editing_index: None,
@@ -45965,6 +46424,7 @@ mod tests {
             acp_chat_events_tx: crossbeam_channel::unbounded().0,
             acp_chat_events_rx: crossbeam_channel::unbounded().1,
             active_acp_chat: None,
+            acp_model_probe_chat: None,
             next_acp_chat_id: 1,
         }
     }
