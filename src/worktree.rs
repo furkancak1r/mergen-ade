@@ -30,8 +30,10 @@ impl GitWorktreeInfo {
     }
 
     /// Display label: branch name when available, otherwise a shortened path.
+    /// The returned text is run through mojibake repair so Turkish characters
+    /// (and other CP1252-corrupted text) display correctly.
     pub fn display_label(&self) -> String {
-        if let Some(name) = self.branch_name() {
+        let label = if let Some(name) = self.branch_name() {
             name.to_owned()
         } else if self.detached {
             let short = self
@@ -45,7 +47,8 @@ impl GitWorktreeInfo {
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| self.path.display().to_string())
-        }
+        };
+        crate::mojibake::repair_mojibake_display(&label)
     }
 }
 
@@ -139,12 +142,7 @@ pub fn discover_worktrees(project_path: &Path) -> std::io::Result<Vec<GitWorktre
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut results = parse_git_worktree_list_porcelain(&stdout);
     for wt in &mut results {
-        if let Some(s) = wt.path.to_str() {
-            let r = crate::mojibake::repair_mojibake(s);
-            if r != s && std::path::Path::new(&r).exists() {
-                wt.path = std::path::PathBuf::from(r);
-            }
-        }
+        wt.path = crate::mojibake::repair_mojibake_path(&wt.path);
     }
     Ok(results)
 }

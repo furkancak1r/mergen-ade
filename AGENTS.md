@@ -616,6 +616,22 @@ If `cargo` is not on PATH in PowerShell, use:
   Then verify with `claude --version`. Persistent failures can be diagnosed with `claude doctor`.
 - **Secret handling**: `~/.claude/settings.json`, `.claude/settings.local.json`, and `.claude/state/` are ignored by git (via `.gitignore`). No API keys or tokens are committed to the repository.
 
+## Runtime Mojibake (Character Encoding) Repair
+
+- **Two repair modes**: `repair_mojibake_path` (disk-aware, returns repaired path only when it actually exists) vs `repair_mojibake_display` (always repairs for user-facing text).
+- **Paths use disk-existence gating**: Use `repair_mojibake_path` for filesystem operations (paths, directory nodes, project records). The repaired path is only returned when it exists on disk to prevent false repair of genuinely oddly-named paths.
+- **Display text uses unconditional repair**: Use `repair_mojibake_display` for user-facing strings (branch labels, file names, tooltips, attachment mentions). Always apply recovery regardless of disk existence.
+- **CP1252→UTF-8 decode chain**: `repair_mojibake` iterates up to 5 rounds of treating bytes as CP1252 then decoding as UTF-8. Bail when repair yields no change or produces invalid UTF-8.
+- **Coverage points**: Add mojibake repair at every text boundary where user-visible strings enter the system:
+  - Directory node names (`build_directory_root_node`, `build_directory_node`, `build_directory_node_from_entry`)
+  - File editor `display_name` in `open_file_in_editor`
+  - ACP attachment paths and `path_to_mention` for `@file_name` mentions
+  - Smart Input image attachment paths
+  - Clipboard image paths (both HDROP and text-fallback)
+  - Worktree `display_label()` and `discover_worktrees()` path repair
+  - Config-level project records via `repair_mojibake_in_projects`
+- **Non-UTF-8 path segments**: `repair_mojibake_path` converts `PathBuf` to `String` via `to_string_lossy()`, replacing non-UTF-8 segments with `U+FFFD`. This is a known limitation unlikely to matter in practice (Windows paths with NTFS are generally UTF-16 clean).
+
 ## Cross-Tool Project Configuration
 - When a project is used in both Mergen and Zed, keep terminal commands in sync.
 - Mergen `ProjectRecord::saved_messages` should be mirrored as `.zed/tasks.json` entries so the same commands are available in Zed's task picker.

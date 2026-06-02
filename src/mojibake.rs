@@ -85,6 +85,30 @@ pub fn repair_mojibake(input: &str) -> String {
     current
 }
 
+/// Repair a display string: always applies mojibake recovery regardless
+/// of whether the result exists on disk. Use for user-facing text that
+/// may have been re-encoded (directory names, file names, branch names,
+/// project names, tooltips, attachment mentions, etc.).
+pub fn repair_mojibake_display(input: &str) -> String {
+    repair_mojibake(input)
+}
+
+/// Repair a path that may contain mojibake. If the repaired path exists
+/// on disk, returns the repaired `PathBuf`. Otherwise returns the original
+/// `PathBuf` unchanged. This prevents false repair of paths whose actual
+/// on-disk names genuinely contain what looks like mojibake.
+pub fn repair_mojibake_path(path: &std::path::Path) -> std::path::PathBuf {
+    let s = path.as_os_str().to_string_lossy();
+    let repaired = repair_mojibake(&s);
+    if repaired != s.as_ref() {
+        let repaired_path = std::path::PathBuf::from(&repaired);
+        if repaired_path.exists() {
+            return repaired_path;
+        }
+    }
+    path.to_path_buf()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +207,50 @@ mod tests {
     fn invalid_utf8_round_preserves_input() {
         let weird = "\u{FFFD}";
         assert_eq!(repair_mojibake(weird), weird);
+    }
+
+    #[test]
+    fn repair_mojibake_display_repairs_turkish() {
+        let corrupted = corrupt_once("Satın Alma");
+        assert_eq!(repair_mojibake_display(&corrupted), "Satın Alma");
+        assert_eq!(repair_mojibake_display("Satın Alma"), "Satın Alma");
+    }
+
+    #[test]
+    fn repair_mojibake_display_repairs_multi_level() {
+        let mut c = corrupt_once("ÜRETİM PLANI");
+        c = corrupt_once(&c);
+        assert_eq!(repair_mojibake_display(&c), "ÜRETİM PLANI");
+    }
+
+    #[test]
+    fn repair_mojibake_path_returns_original_when_repaired_does_not_exist() {
+        let path = std::path::Path::new("C:/nonexistent/Satın Alma");
+        let result = repair_mojibake_path(path);
+        assert_eq!(result, path);
+    }
+
+    #[test]
+    fn repair_mojibake_path_returns_repaired_when_it_exists() {
+        let dir = std::env::temp_dir().join("mojibake_test_exists");
+        let _ = std::fs::remove_dir_all(&dir);
+        let clean_path = dir.join("Satın Alma");
+        std::fs::create_dir_all(&clean_path).unwrap();
+        let corrupted_segment = corrupt_once("Satın Alma");
+        let corrupted_path = dir.join(&corrupted_segment);
+        let result = repair_mojibake_path(&corrupted_path);
+        assert_eq!(
+            result, clean_path,
+            "repair should map to the existing clean path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repair_mojibake_path_returns_original_for_clean_path() {
+        let path = std::path::Path::new("C:/clean/path");
+        let result = repair_mojibake_path(path);
+        assert_eq!(result, path);
     }
 
     #[test]

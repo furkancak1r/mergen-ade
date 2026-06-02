@@ -346,11 +346,14 @@ pub fn build_acp_prompt_text(text: &str, attachments: &[String]) -> String {
 }
 
 /// Extract the file name from a path and return as `@file_name`.
+/// The file name is run through mojibake repair so Turkish characters
+/// (and other CP1252-corrupted text) display correctly.
 pub fn path_to_mention(path: &str) -> String {
     let file_name = std::path::Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(path);
+    let file_name = crate::mojibake::repair_mojibake_display(file_name);
     format!("@{}", file_name)
 }
 

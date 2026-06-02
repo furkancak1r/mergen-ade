@@ -5161,6 +5161,8 @@ impl AdeApp {
         repo_root: Option<PathBuf>,
         is_worktree: bool,
     ) {
+        let path = crate::mojibake::repair_mojibake_path(&path);
+        let repo_root = repo_root.map(|r| crate::mojibake::repair_mojibake_path(&r));
         if self.projects.values().any(|project| project.path == path) {
             self.status_line = "Project is already added".to_owned();
             return;
@@ -10464,6 +10466,7 @@ impl AdeApp {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| path.display().to_string());
+                let display_name = crate::mojibake::repair_mojibake_display(&display_name);
 
                 let status_name = display_name.clone();
                 let buffer = OpenFileBuffer::new(project_id, path, text, display_name);
@@ -14294,6 +14297,9 @@ impl AdeApp {
         request: SmartInputSubmitRequest,
         path: String,
     ) -> bool {
+        let path = crate::mojibake::repair_mojibake_path(std::path::Path::new(&path))
+            .to_string_lossy()
+            .to_string();
         let terminal_id = match request {
             SmartInputSubmitRequest::Draft { terminal_id }
             | SmartInputSubmitRequest::Edit { terminal_id, .. } => terminal_id,
@@ -14386,7 +14392,12 @@ impl AdeApp {
                 if let Ok(text) = clipboard.get_text() {
                     let trimmed = text.trim();
                     if Self::looks_like_image_path(trimmed) {
-                        return Some(trimmed.to_owned());
+                        let path = std::path::Path::new(trimmed);
+                        return Some(
+                            crate::mojibake::repair_mojibake_path(path)
+                                .to_string_lossy()
+                                .replace('\\', "/"),
+                        );
                     }
                 }
             }
@@ -14465,7 +14476,12 @@ impl AdeApp {
 
                 // Check if it's an image file
                 if Self::looks_like_image_path(&path_str) {
-                    return Some(path_str.to_string());
+                    let path = std::path::Path::new(path_str.as_ref());
+                    return Some(
+                        crate::mojibake::repair_mojibake_path(path)
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
                 }
             }
 
@@ -20515,8 +20531,9 @@ impl AdeApp {
                                 let mut added_paths = Vec::new();
                                 for path in paths {
                                     if let Some(path_str) = path.to_str() {
-                                        session.attachments.push(path_str.to_string());
-                                        added_paths.push(path_str.to_string());
+                                        let repaired = crate::mojibake::repair_mojibake_display(path_str);
+                                        session.attachments.push(repaired.clone());
+                                        added_paths.push(repaired);
                                     }
                                 }
                                 if !added_paths.is_empty() {
@@ -27978,6 +27995,7 @@ fn build_directory_root_node(path: &Path) -> DirectoryNode {
         .map(|segment| segment.to_string_lossy().to_string())
         .filter(|segment| !segment.trim().is_empty())
         .unwrap_or_else(|| path.display().to_string());
+    let name = crate::mojibake::repair_mojibake_display(&name);
 
     DirectoryNode {
         name,
@@ -28213,8 +28231,9 @@ fn build_directory_node_from_entry(
     // unless they are symlinks (which we never descend into)
     let should_defer = is_dir && !is_symlink;
 
+    let name = crate::mojibake::repair_mojibake_display(&info.name);
     let node = DirectoryNode {
-        name: info.name,
+        name,
         path: info.path.clone(),
         is_dir,
         is_placeholder: false,
@@ -28245,6 +28264,7 @@ fn build_directory_node(
         .file_name()
         .map(|segment| segment.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string());
+    let name = crate::mojibake::repair_mojibake_display(&name);
 
     let metadata = fs::symlink_metadata(path).ok()?;
     let file_type = metadata.file_type();

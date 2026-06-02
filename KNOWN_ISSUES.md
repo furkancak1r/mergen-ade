@@ -2817,3 +2817,37 @@
   - Updated AGENTS.md with a new "Source Control Search Guidelines" section documenting the search behavior, focus handling, filtering logic, and empty-state rules.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`, `cargo build --release --target x86_64-pc-windows-msvc`
 - References: User request 2026-06-02
+
+---
+
+#### Runtime Mojibake (Karakter Bozulması) Onarımı {#runtime-mojibake-repair}
+- Date: 2026-06-02
+- Context: Turkish characters (and other CP1252-encoded text) displayed as garbled/mojibake in directory names, branch labels, file names, tooltips, ACP attachment mentions, Smart Input image paths, and clipboard paths when the operating system encoded them as Latin-1 instead of UTF-8.
+- Error signature:
+  1. Directory node names, file editor display names, worktree branch labels, ACP `@file_name` mentions, and clipboard image paths showed corrupted characters (e.g., `Sat▒n Alma` instead of `Satın Alma`, `▄RET▌M` instead of `ÜRETİM`).
+  2. The existing `repair_mojibake` function was only applied during config load (`repair_mojibake_in_projects`), not at runtime entry points where user-visible text enters the system.
+- Symptoms/Impact:
+  1. Users with Turkish (or other CP1252-encoded) filenames, branches, or paths saw corrupted display text throughout the UI.
+  2. ACP `@file_name` mentions showed corrupted names.
+  3. Clipboard image paths from Explorer (CF_HDROP) could be corrupted.
+- Root cause:
+  - `repair_mojibake` was only called during config deserialization, not at runtime text boundaries.
+  - No `repair_mojibake_path` or `repair_mojibake_display` helper existed; callers had to inline the repair + exists check manually.
+- Resolution:
+  - Added `repair_mojibake_display(&str) -> String` in `src/mojibake.rs`: unconditionally repairs mojibake for user-facing strings.
+  - Added `repair_mojibake_path(&Path) -> PathBuf` in `src/mojibake.rs`: returns repaired path only when it exists on disk, otherwise returns original.
+  - Applied repair at these runtime boundaries:
+    - `build_directory_root_node`, `build_directory_node`, `build_directory_node_from_entry`: node names via `repair_mojibake_display`.
+    - `open_file_in_editor`: file editor `display_name` via `repair_mojibake_display`.
+    - `path_to_mention`: ACP `@file_name` mentions via `repair_mojibake_display`.
+    - `add_smart_input_image_attachment`: Smart Input image paths via `repair_mojibake_path`.
+    - Clipboard image paths (CF_HDROP and text fallback): via `repair_mojibake_path`.
+    - `display_label()` in `worktree.rs`: branch labels via `repair_mojibake_display`.
+    - `discover_worktrees()` in `worktree.rs`: replaced inline manual check with `repair_mojibake_path`.
+    - `add_project_with_worktree`: project and repo_root paths via `repair_mojibake_path`.
+  - Added 5 regression tests in `src/mojibake.rs` covering Turkish characters, multi-level repair, path existence gating, and clean path passthrough.
+- Prevent recurrence:
+  - Added "Runtime Mojibake (Character Encoding) Repair" section to AGENTS.md with coverage points and usage rules.
+  - All new runtime text entry points must apply `repair_mojibake_display` or `repair_mojibake_path` as appropriate.
+- Files/Commands touched: `src/mojibake.rs`, `src/app.rs`, `src/opencode_acp.rs`, `src/worktree.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`
+- References: User request 2026-06-02
