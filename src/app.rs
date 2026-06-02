@@ -337,6 +337,7 @@ const ACP_WELCOME_COMPOSER_MIN_HEIGHT: f32 =
     ACP_COMPOSER_PADDING_Y * 2.0 + ACP_COMPOSER_WELCOME_TEXT_MIN + ACP_COMPOSER_FOOTER_HEIGHT;
 const ACP_WELCOME_CONTEXT_ROW_HEIGHT: f32 = 28.0;
 const ACP_WELCOME_HINT: &str = "Plan, Build, / for skills, @ for context";
+const ACP_TOP_CLOSE_ROW_HEIGHT: f32 = TERMINAL_HEADER_HEIGHT;
 const ACP_COMPOSER_FOOTER_SPACING: f32 = 6.0;
 const ACP_COMPOSER_PLAN_PILL_WIDTH: f32 = 52.0;
 const ACP_COMPOSER_MODEL_WIDTH_MIN: f32 = 18.0;
@@ -368,6 +369,21 @@ fn acp_composer_footer_content_rect(controls_rect: egui::Rect) -> egui::Rect {
             controls_rect.height(),
         ),
     )
+}
+
+fn acp_top_close_row_rect(content_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        content_rect.min,
+        egui::vec2(content_rect.width(), ACP_TOP_CLOSE_ROW_HEIGHT),
+    )
+}
+
+fn acp_thread_selector_height(welcome_center: bool) -> f32 {
+    if welcome_center {
+        0.0
+    } else {
+        ACP_TOP_CLOSE_ROW_HEIGHT
+    }
 }
 
 fn acp_composer_footer_layout(
@@ -21135,7 +21151,7 @@ impl AdeApp {
                     ACP_COMPOSER_CHAT_CAPSULE_HEIGHT
                 };
 
-                let thread_selector_height = if welcome_center { 0.0 } else { 32.0 };
+                let thread_selector_height = acp_thread_selector_height(welcome_center);
                 let header_height = if welcome_center { 0.0 } else { 36.0 };
                 let status_row_height = if welcome_center { 0.0 } else { 22.0 };
                 let messages_height = if welcome_center {
@@ -21200,18 +21216,23 @@ impl AdeApp {
                     };
 
                 if welcome_center {
-                    ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-                        if ui
-                            .button(
-                                RichText::new(format!("{}", icons::X))
-                                    .size(12.0)
-                                    .color(TEXT_MUTED),
-                            )
-                            .clicked()
-                        {
-                            self.kill_acp_chat(chat_id);
-                        }
-                    });
+                    let close_rect = acp_top_close_row_rect(content_rect);
+                    ui.allocate_rect(close_rect, Sense::hover());
+                    let mut close_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(close_rect)
+                            .layout(Layout::right_to_left(Align::Center)),
+                    );
+                    if close_ui
+                        .button(
+                            RichText::new(format!("{}", icons::X))
+                                .size(12.0)
+                                .color(TEXT_MUTED),
+                        )
+                        .clicked()
+                    {
+                        self.kill_acp_chat(chat_id);
+                    }
                     if let Some(context_rect) = context_rect {
                         ui.allocate_rect(context_rect, Sense::hover());
                         let mut context_ui = ui.new_child(
@@ -63745,6 +63766,26 @@ mod tests {
 
         assert!(content_rect.width() >= 0.0);
         assert!((content_rect.width() - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn acp_top_close_row_rect_matches_terminal_header_height() {
+        let content_rect =
+            egui::Rect::from_min_size(egui::pos2(16.0, 12.0), egui::vec2(720.0, 480.0));
+        let close_rect = super::acp_top_close_row_rect(content_rect);
+
+        assert!((close_rect.top() - content_rect.top()).abs() < 0.01);
+        assert!((close_rect.right() - content_rect.right()).abs() < 0.01);
+        assert!((close_rect.height() - super::TERMINAL_HEADER_HEIGHT).abs() < 0.01);
+    }
+
+    #[test]
+    fn acp_thread_selector_height_matches_terminal_header_for_chat() {
+        assert_eq!(super::acp_thread_selector_height(true), 0.0);
+        assert_eq!(
+            super::acp_thread_selector_height(false),
+            super::TERMINAL_HEADER_HEIGHT
+        );
     }
 
     #[test]
