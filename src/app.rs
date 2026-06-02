@@ -11620,7 +11620,6 @@ fn embedded_browser_should_yield_to_ui_layer(
     browser_overlay_active: bool,
     foreground_message_popup_open: bool,
     create_worktree_popup_open: bool,
-    checklist_floating_open: bool,
 ) -> bool {
     show_settings_popup
         || show_exit_confirm_popup
@@ -11630,7 +11629,6 @@ fn embedded_browser_should_yield_to_ui_layer(
         || browser_overlay_active
         || foreground_message_popup_open
         || create_worktree_popup_open
-        || checklist_floating_open
 }
 
 /// Determine if terminal output mouse wheel events should be processed.
@@ -21555,8 +21553,15 @@ impl AdeApp {
         };
 
         let mut open = self.checklist_floating_open;
+        // When the browser panel is open, offset the checklist to the left of it
+        // so the floating popup does not overlap the native WebView area.
+        let checklist_anchor_x = if self.is_active_browser_panel_open() {
+            -(self.config.ui.browser_panel_width + 24.0)
+        } else {
+            -18.0
+        };
         let checklist_window_response = egui::Window::new("Check-list")
-            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-18.0, -80.0))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(checklist_anchor_x, -80.0))
             .order(egui::Order::Foreground)
             .open(&mut open)
             .max_size(egui::vec2(360.0, 500.0))
@@ -23901,7 +23906,6 @@ impl AdeApp {
             self.browser_panel_overlay_active,
             self.foreground_message_popup_open.is_some(),
             self.show_create_worktree_popup,
-            self.checklist_floating_open,
         )
     }
 
@@ -54667,47 +54671,76 @@ mod tests {
     #[test]
     fn embedded_browser_yields_to_ui_overlay_layers() {
         // Test the pure predicate for all overlay sources
-        // Parameters: settings, exit_confirm, terminal_history_popup, egui_popup, context_menu_open, context_menu_overlaps_browser, browser_overlay_active, foreground_message_popup_open, create_worktree_popup_open, checklist_floating_open
+        // Parameters: settings, exit_confirm, terminal_history_popup, egui_popup, context_menu_open, context_menu_overlaps_browser, browser_overlay_active, foreground_message_popup_open, create_worktree_popup_open
         assert!(embedded_browser_should_yield_to_ui_layer(
-            true, false, false, false, false, false, false, false, false, false
+            true, false, false, false, false, false, false, false, false
         ));
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, true, false, false, false, false, false, false, false, false
+            false, true, false, false, false, false, false, false, false
         ));
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, true, false, false, false, false, false, false, false
+            false, false, true, false, false, false, false, false, false
         ));
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, false, true, false, false, false, false, false, false
+            false, false, false, true, false, false, false, false, false
         ));
         // Context menu only yields when it overlaps with browser
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, true, true, false, false, false, false
+            false, false, false, false, true, true, false, false, false
         ));
         // Context menu does NOT yield when it doesn't overlap
         assert!(!embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, true, false, false, false, false, false
+            false, false, false, false, true, false, false, false, false
         ));
         // No overlays at all
         assert!(!embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, false, false, false, false, false, false
+            false, false, false, false, false, false, false, false, false
         ));
         // Browser overlay active (dropdown, tooltip, hover) should cause yield
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, false, false, true, false, false, false
+            false, false, false, false, false, false, true, false, false
         ));
         // Foreground message popup open should cause yield
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, false, false, false, true, false, false
+            false, false, false, false, false, false, false, true, false
         ));
         // Create worktree popup open should cause yield
         assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, false, false, false, false, true, false
+            false, false, false, false, false, false, false, false, true
         ));
-        // Check-list floating open should cause yield
-        assert!(embedded_browser_should_yield_to_ui_layer(
-            false, false, false, false, false, false, false, false, false, true
+    }
+
+    #[test]
+    fn checklist_floating_open_does_not_hide_embedded_browser() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+
+        app.projects
+            .insert(1, test_project(1, "Demo", "C:/demo", &[], &[]));
+        app.selected_project = Some(1);
+        app.set_browser_panel_open_for_project(1, true);
+
+        // Show the browser
+        app.browser_for_scope(1).show();
+        app.pending_browser_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(800.0, 100.0),
+            egui::vec2(400.0, 600.0),
         ));
+        assert!(app
+            .embedded_browsers_by_scope
+            .get(&BrowserScopeKey::Project(1))
+            .unwrap()
+            .requested_visible());
+
+        // Open floating checklist
+        app.checklist_floating_open = true;
+
+        // Checklist is a non-modal floating popup; it should not trigger
+        // embedded browser hiding (unlike modal overlays such as Settings).
+        assert!(
+            !app.should_hide_embedded_browser_for_ui_layer(&ctx),
+            "checklist should not hide embedded browser"
+        );
     }
 
     #[test]
