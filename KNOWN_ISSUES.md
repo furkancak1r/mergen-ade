@@ -2851,3 +2851,28 @@
   - All new runtime text entry points must apply `repair_mojibake_display` or `repair_mojibake_path` as appropriate.
 - Files/Commands touched: `src/mojibake.rs`, `src/app.rs`, `src/opencode_acp.rs`, `src/worktree.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`
 - References: User request 2026-06-02
+
+---
+
+#### Terminal Manager project names corrupted by 7-level CP1252 mojibake chain {#deep-mojibake-7level}
+- Date: 2026-06-02
+- Context: After the initial mojibake repair framework was deployed across runtime text boundaries, a further deep-corruption case was discovered: Turkish project names such as "Satın Alma" and "2026 ÜRETİM PLANI 11.Haftadan İtibaren Güncelleme" displayed as garbled text in the Terminal Manager foreground project list. These strings had undergone approximately 7 levels of CP1252→UTF-8 mis-encoding.
+- Error signature: `repair_mojibake` could not recover deep multi-level corruption because (1) C1 control characters (U+0080–U+009F) produced by the chain were not mapped back to their source bytes, and (2) the iteration limit (5) was insufficient for 7-level chains.
+- Symptoms/Impact:
+  1. Turkish project names with extended characters displayed as garbled text in Terminal Manager foreground project header.
+  2. Worktree rows under the corrupted project also showed garbled names.
+  3. `repair_mojibake_in_projects` during config normalization could not heal the persisted record because repair stalled at U+009E (which cp1252_byte left unmapped).
+- Root cause:
+  - `cp1252_byte()` in `src/mojibake.rs` converted only printable CP1252 code points (0xA0–0xFF) and the Euro sign (0x80), but not C1 control characters (0x80–0x9F range, Unicode U+0080–U+009F). The 7-level decode chain produced raw U+009E at intermediate steps that blocked further recovery.
+  - The iteration limit of 5 was one fewer than needed for the 7-level chain; iteration 6 would have succeeded if C1 bytes were mapped.
+- Resolution:
+  - Extended `cp1252_byte()` to map C1 control characters U+0080–U+009F to their byte values (0x80–0x9F).
+  - Increased `repair_mojibake` iteration limit from 5 to 12 to cover deeper chains with safety margin.
+  - Added Terminal Manager display-layer defense: `project_display_name = repair_mojibake_display(&project_snapshot.name)` in `draw_terminal_manager_contents` so on-screen text is repaired even if the in-memory state is still corrupted.
+  - Same defense applied to worktree row names.
+  - Added 3 regression tests: 7-level Turkish phrase recovery, C1 control char byte mapping, C1 direct round-trip.
+- Prevent recurrence:
+  - Updated `AGENTS.md` to document C1 fallback and 12-iteration cap in `repair_mojibake`.
+  - Terminal Manager display-layer repair provides a safety net for any remaining runtime text entry points.
+- Files/Commands touched: `src/mojibake.rs`, `src/app.rs`, `KNOWN_ISSUES.md`, `AGENTS.md`, `cargo test`
+- References: User request 2026-06-02

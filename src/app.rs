@@ -19380,13 +19380,19 @@ impl AdeApp {
 
             let has_children =
                 visible_count > 0 || worktree_count > 0 || worktree_visible_count > 0;
+            // Apply mojibake repair defensively at display time so the
+            // Terminal Manager always shows clean text even if config
+            // normalization hasn't caught up (e.g. in-memory state from
+            // a previous session before the repair code was updated).
+            let project_display_name =
+                crate::mojibake::repair_mojibake_display(&project_snapshot.name);
             let mut create_worktree_clicked = false;
             let (header_response, spawn_clicked, selected_action, header_clicked) =
                 draw_project_group_header(
                     self,
                     ui,
                     project_id,
-                    &project_snapshot.name,
+                    &project_display_name,
                     header_open,
                     has_children,
                     visible_kind,
@@ -19457,7 +19463,8 @@ impl AdeApp {
                             (screen_right - right_offset).max(panel_right + 100.0);
                         // Draw child worktrees under the root project (BOM-style tree)
                         for wt in &child_worktrees {
-                            let wt_name = &wt.name;
+                            let wt_name =
+                                crate::mojibake::repair_mojibake_display(&wt.name);
                             let wt_project_id = wt.id;
                             let wt_path_str = wt.path.display().to_string();
                             let is_selected = self.selected_project == Some(wt_project_id);
@@ -19470,7 +19477,7 @@ impl AdeApp {
                                 draw_terminal_manager_worktree_row(
                                     self,
                                     ui,
-                                    wt_name,
+                                    &wt_name,
                                     is_selected,
                                     wt_has_live_terminal,
                                     &wt_path_str,

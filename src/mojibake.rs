@@ -1,6 +1,9 @@
 //! Mojibake recovery for project names/paths that were accidentally
 //! re-encoded through the UTF-8 -> CP1252 -> UTF-8 chain (sometimes
-//! repeatedly). Used by `config::normalize_config_for_current_platform`
+//! repeatedly). Handles mixed CP1252/Latin-1 C1 control characters
+//! (U+0080..U+009F) and up to 12 repair iterations to cover deep
+//! corruption chains (e.g. 7-level Turkish mojibake).
+//! Used by `config::normalize_config_for_current_platform`
 //! and by project-add code paths as a defensive net.
 
 /// Maps a single Unicode `char` back to its CP1252 byte, if such a mapping
@@ -47,7 +50,15 @@ pub fn cp1252_byte(c: char) -> Option<u8> {
         '\u{009D}' => Some(0x9D),
         '\u{017E}' => Some(0x9E),
         '\u{0178}' => Some(0x9F),
-        _ => None,
+        _ => {
+            // C1 control character fallback: map U+0080..U+009F directly
+            // to the same byte value so mixed CP1252/Latin-1 corruption chains
+            // (e.g. 7-level Turkish mojibake) can be unwound.
+            if (0x80..=0x9F).contains(&code) {
+                return Some(code as u8);
+            }
+            None
+        }
     }
 }
 
@@ -73,10 +84,11 @@ pub fn try_repair_once(input: &str) -> Option<String> {
 /// Iteratively recovers from multi-level mojibake. ASCII-only or already
 /// clean input is returned unchanged. Bails out as soon as another round
 /// would fail (invalid UTF-8 or a no-op), preserving the deepest valid
-/// repair. Caps iterations to avoid pathological loops.
+/// repair. Caps iterations to avoid pathological loops (12 covers
+/// real-world 7-level CP1252 chains plus margin).
 pub fn repair_mojibake(input: &str) -> String {
     let mut current = input.to_owned();
-    for _ in 0..5 {
+    for _ in 0..12 {
         match try_repair_once(&current) {
             Some(next) => current = next,
             None => break,
@@ -251,6 +263,45 @@ mod tests {
         let path = std::path::Path::new("C:/clean/path");
         let result = repair_mojibake_path(path);
         assert_eq!(result, path);
+    }
+
+    #[test]
+    fn seven_level_mojibake_turkish_phrase_recovers() {
+        // Real-world case: project id=9 had 7-level CP1252 corruption
+        // "2026 ÜRETİM PLANI 11.Haftadan İtibaren Güncelleme"
+        let original = "2026 ÜRETİM PLANI 11.Haftadan İtibaren Güncelleme";
+        let mut corrupted = original.to_owned();
+        for _ in 0..7 {
+            corrupted = corrupt_once(&corrupted);
+        }
+        assert_ne!(corrupted, original, "corruption should change the text");
+        assert_eq!(
+            repair_mojibake(&corrupted),
+            original,
+            "7-level mojibake must recover to original Turkish"
+        );
+    }
+
+    #[test]
+    fn c1_control_char_fallback_maps_009e_to_byte() {
+        // cp1252_byte must map U+009E → 0x9E for C1 control characters.
+        assert_eq!(super::cp1252_byte('\u{009E}'), Some(0x9E));
+        // Also verify 0x80 (€ normally, but should also work through C1 fallback)
+        assert_eq!(super::cp1252_byte('\u{0080}'), Some(0x80));
+        assert_eq!(super::cp1252_byte('\u{009F}'), Some(0x9F));
+    }
+
+    #[test]
+    fn c1_control_char_direct_round_trip() {
+        // Direct test: raw U+009E -> CP1252 byte 0x9E -> UTF-8 decode
+        // This simulates what try_repair_once does with the C1 fallback.
+        let input = "\u{009E}";
+        let repaired = repair_mojibake(input);
+        // U+009E alone does not map through the chain, but cp1252_byte should
+        // return Some(0x9E) for it, which is a valid single-byte sequence.
+        // Since 0x9E is not valid UTF-8 standalone, try_repair_once returns None,
+        // so repair_mojibake returns the input unchanged.
+        assert_eq!(repaired, input, "single U+009E should be preserved as-is");
     }
 
     #[test]
