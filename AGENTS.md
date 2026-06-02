@@ -250,6 +250,14 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Worktree row text color must reflect live terminal presence**: A worktree row in Terminal Manager should only use bright `TEXT_PRIMARY` when it is both selected and contains at least one live terminal. Empty or exited worktrees must stay muted (`with_alpha(ACCENT, 200)`) even when selected, so clicking a worktree with no terminals does not produce a misleading bright highlight.
 - **Orphan worktree projects must be auto-removed**: When a root repo's source control refresh succeeds and `discover_worktrees()` no longer lists a previously registered worktree, and the worktree path no longer exists on disk, Mergen must automatically remove the worktree `ProjectRecord` and close its terminals. This cleanup runs inside `process_source_control_events` after a successful refresh, using `cleanup_orphan_worktrees_for_project()`. Root project terminals are unaffected.
 
+## Source Control Search Guidelines
+- **Source Control panel has a search input**: Below the project selector toolbar, a single-line `TextEdit` with hint `"Search files..."` allows filtering changed files and worktrees by name, path, status, or staged state.
+- **Search is runtime-only and not persisted**: The query lives in `AdeApp::source_control_search_query` and resets to empty on app restart. No config field is needed.
+- **Search blocks terminal input routing**: When the Source Control search input has focus, `text_input_has_focus()` and `text_input_has_focus_extended()` return true, preventing terminal shortcuts and AI attention from stealing keyboard input.
+- **Filtering is snapshot-local and pure**: `source_control_file_matches_query()` and `source_control_worktree_matches_query()` perform case-insensitive matching against file path, status label (e.g., `Modified`, `Untracked`), and staged/unstaged state. The git worker is not re-run; filtering happens on the existing `SourceControlSnapshot`.
+- **Empty search shows all items; active search shows empty-state message when nothing matches**: When the query is non-empty and both files and worktrees produce zero matches, the UI shows `"No matching files or worktrees"`. Loading, error, and clean-tree messages remain visible when appropriate.
+- **Worktree search matches branch label and path**: `source_control_worktree_matches_query()` searches both `display_label()` and the worktree path so branch names and folder paths are discoverable.
+
 ## Terminal Manager & Input History Guidelines
 - **Background terminals use runtime-only input history**: Do not persist background terminal inputs to `history.json`. They use `recent_inputs` (runtime-only) for the rerun/interrupt button.
 - **Foreground terminals persist input history**: Foreground terminal inputs are recorded to persistent history and shown in the global Input History panel.

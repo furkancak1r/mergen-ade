@@ -2707,3 +2707,33 @@
   - Updated AGENTS.md to use "OpenCode ACP" consistently in all user-facing references.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-06-01
+
+---
+
+#### Source Control panel arama ekleme {#source-control-search}
+- Date: 2026-06-02
+- Context: User requested a search/filter input in the Source Control panel so changed files and worktrees can be filtered by name, path, status, or staged state.
+- Error signature:
+  1. The Source Control panel had no search capability; users had to manually scan long file lists.
+  2. There was no runtime state for holding a Source Control search query.
+  3. There were no helper functions for filtering `SourceControlFile` or `GitWorktreeInfo` by query.
+- Symptoms/Impact:
+  1. Large repos with many changed files made the Source Control panel hard to use.
+  2. No way to quickly find a specific file or worktree by name/status.
+- Root cause:
+  - The Source Control panel was designed without search/filter UI or logic.
+- Resolution:
+  - Added `source_control_search_query: String` to `AdeApp` (runtime-only, not persisted).
+  - Added `SOURCE_CONTROL_SEARCH_INPUT_ID` constant and `AdeApp::source_control_search_input_id()` method.
+  - Integrated search input into focus/surrender logic: `text_input_has_focus()`, `text_input_has_focus_extended()`, and `surrender_ui_text_focus()` all recognize the Source Control search input.
+  - Added `source_control_file_matches_query()` helper: case-insensitive matching against file path, status label (`Modified`, `Added`, etc.), and staged/unstaged state.
+  - Added `source_control_worktree_matches_query()` helper: case-insensitive matching against worktree branch label and path.
+  - UI: placed a `TextEdit::singleline` with hint `"Search files..."` below the project selector toolbar in the Source Control panel.
+  - Updated the draw loop to filter `snapshot.worktrees` and `snapshot.files` through the query before rendering.
+  - Added empty-state message: `"No matching files or worktrees"` when search is active and no items match.
+  - Existing loading/error/warning/clean-tree messages remain visible and are not suppressed by search.
+  - Added 7 regression tests covering path matching, status matching, staged state matching, empty query, focus blocking, and focus surrender.
+- Prevent recurrence:
+  - Updated AGENTS.md with a new "Source Control Search Guidelines" section documenting the search behavior, focus handling, filtering logic, and empty-state rules.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-06-02

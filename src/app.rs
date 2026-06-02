@@ -302,6 +302,7 @@ const SMART_INPUT_QUESTION_CUSTOM_INPUT_ID: &str = "smart-input-question-custom"
 const CREATE_WORKTREE_BRANCH_INPUT_ID: &str = "create-worktree-branch-input";
 const CREATE_WORKTREE_BASE_BRANCH_INPUT_ID: &str = "create-worktree-base-branch-input";
 const CREATE_WORKTREE_PATH_INPUT_ID: &str = "create-worktree-path-input";
+const SOURCE_CONTROL_SEARCH_INPUT_ID: &str = "source-control-search-input";
 const SMART_INPUT_MIN_FOOTER_HEIGHT: f32 = 132.0;
 const SMART_INPUT_BASE_FOOTER_HEIGHT: f32 = 128.0;
 const SMART_INPUT_TASK_ROW_HEIGHT: f32 = 28.0;
@@ -2115,6 +2116,7 @@ pub struct AdeApp {
     history_path: PathBuf,
     input_history: AppHistory,
     input_history_search_query: String,
+    source_control_search_query: String,
     input_history_selected_project_id: Option<u64>,
     /// Which terminal's history popup is currently open (terminal_id)
     terminal_history_popup_open: Option<u64>,
@@ -4787,6 +4789,7 @@ impl AdeApp {
             history_path,
             input_history,
             input_history_search_query: String::new(),
+            source_control_search_query: String::new(),
             input_history_selected_project_id: selected_project,
             terminal_history_popup_open: None,
             terminal_history_popup_just_opened: false,
@@ -10684,6 +10687,10 @@ impl AdeApp {
         Id::new(DIRECTORY_SEARCH_INPUT_ID)
     }
 
+    fn source_control_search_input_id() -> Id {
+        Id::new(SOURCE_CONTROL_SEARCH_INPUT_ID)
+    }
+
     fn saved_message_draft_input_id(project_id: u64) -> Id {
         Id::new((SAVED_MESSAGE_DRAFT_INPUT_ID, project_id))
     }
@@ -11114,6 +11121,10 @@ impl AdeApp {
             return true;
         }
 
+        if ctx.memory(|mem| mem.has_focus(Self::source_control_search_input_id())) {
+            return true;
+        }
+
         if ctx.memory(|mem| mem.has_focus(egui::Id::new(FILE_EDITOR_INPUT_ID))) {
             return true;
         }
@@ -11213,6 +11224,7 @@ impl AdeApp {
     fn surrender_ui_text_focus(&self, ctx: &egui::Context) {
         ctx.memory_mut(|mem| {
             mem.surrender_focus(Self::directory_search_input_id());
+            mem.surrender_focus(Self::source_control_search_input_id());
             mem.surrender_focus(Self::file_editor_input_id());
             if let Some(project_id) = self.selected_project {
                 mem.surrender_focus(Self::saved_message_draft_input_id(project_id));
@@ -18774,7 +18786,19 @@ impl AdeApp {
                                 }
                             }
                         }
+
+                        // Source Control search input
+                        ui.add_sized(
+                            [ui.available_width(), CONTROL_ROW_HEIGHT],
+                            egui::TextEdit::singleline(&mut self.source_control_search_query)
+                                .id(Self::source_control_search_input_id())
+                                .hint_text("Search files...")
+                                .vertical_align(Align::Center),
+                        );
                         ui.separator();
+
+                        let sc_query = self.source_control_search_query.trim().to_lowercase();
+                        let search_active = !sc_query.is_empty();
 
                         egui::ScrollArea::vertical()
                             .id_salt("source-control-scroll")
@@ -18813,14 +18837,19 @@ impl AdeApp {
                                     );
                                 }
                                 // Worktrees section
-                                if !snapshot.worktrees.is_empty() {
+                                let matching_worktrees: Vec<_> = snapshot
+                                    .worktrees
+                                    .iter()
+                                    .filter(|wt| source_control_worktree_matches_query(wt, &sc_query))
+                                    .collect();
+                                if !matching_worktrees.is_empty() {
                                     ui.separator();
                                     ui.label(
                                         RichText::new(format!("{} Worktrees", icons::TREE_VIEW))
                                             .color(TEXT_MUTED)
                                             .strong(),
                                     );
-                                    for wt in &snapshot.worktrees {
+                                    for wt in matching_worktrees {
                                         let already_added = self
                                             .projects
                                             .values()
@@ -18890,7 +18919,22 @@ impl AdeApp {
                                     );
                                 }
 
-                                for file in snapshot.files {
+                                let matching_files: Vec<_> = snapshot
+                                    .files
+                                    .iter()
+                                    .filter(|f| source_control_file_matches_query(f, &sc_query))
+                                    .collect();
+
+                                if search_active && matching_files.is_empty() && snapshot.last_error.is_none() && !snapshot.loading {
+                                    draw_sidebar_text_row(
+                                        ui,
+                                        RichText::new("No matching files or worktrees").color(TEXT_MUTED),
+                                        TEXT_MUTED,
+                                        "No matching files or worktrees",
+                                    );
+                                }
+
+                                for file in matching_files {
                                     let absolute = project.path.join(&file.path);
                                     let status_icon = if file.staged {
                                         icons::CHECK_CIRCLE
@@ -29891,6 +29935,36 @@ fn source_control_snapshot_has_display_data(snapshot: &SourceControlSnapshot) ->
         || !snapshot.files.is_empty()
         || snapshot.added_lines.is_some()
         || snapshot.removed_lines.is_some()
+}
+
+/// Returns true if a source control file matches the search query.
+/// Searches in file path, status label, and staged state.
+fn source_control_file_matches_query(file: &SourceControlFile, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let q = query.to_lowercase();
+    let path_lower = file.path.to_lowercase();
+    let status_lower = file.status.to_lowercase();
+    let staged_label = if file.staged { "staged" } else { "unstaged" };
+    path_lower.contains(&q)
+        || status_lower.contains(&q)
+        || staged_label == q
+        || staged_label.starts_with(&q)
+}
+
+/// Returns true if a worktree matches the search query.
+fn source_control_worktree_matches_query(
+    worktree: &crate::worktree::GitWorktreeInfo,
+    query: &str,
+) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let q = query.to_lowercase();
+    let label = worktree.display_label().to_lowercase();
+    let path = worktree.path.display().to_string().to_lowercase();
+    label.contains(&q) || path.contains(&q)
 }
 
 fn source_control_branch_line(snapshot: &SourceControlSnapshot) -> Option<String> {
@@ -45686,6 +45760,7 @@ mod tests {
             history_path: test_temp_path("mergen-ade-test-history", "json"),
             input_history: AppHistory::default(),
             input_history_search_query: String::new(),
+            source_control_search_query: String::new(),
             input_history_selected_project_id: None,
             terminal_history_popup_open: None,
             terminal_history_popup_just_opened: false,
@@ -48098,6 +48173,94 @@ mod tests {
 
         let observed_width = observed_width.expect("worktree row width was not observed");
         assert_eq!(observed_width, 320.0);
+    }
+
+    #[test]
+    fn source_control_file_matches_query_matches_path_case_insensitive() {
+        let file = super::SourceControlFile {
+            path: "src/app.rs".to_owned(),
+            status: "Modified",
+            staged: false,
+        };
+        assert!(super::source_control_file_matches_query(&file, "app"));
+        assert!(super::source_control_file_matches_query(&file, "APP"));
+        assert!(super::source_control_file_matches_query(&file, "src/app"));
+        assert!(super::source_control_file_matches_query(&file, "rs"));
+    }
+
+    #[test]
+    fn source_control_file_matches_query_matches_status() {
+        let file = super::SourceControlFile {
+            path: "src/app.rs".to_owned(),
+            status: "Modified",
+            staged: false,
+        };
+        assert!(super::source_control_file_matches_query(&file, "modified"));
+        assert!(super::source_control_file_matches_query(&file, "MODIFIED"));
+    }
+
+    #[test]
+    fn source_control_file_matches_query_matches_staged_state() {
+        let staged = super::SourceControlFile {
+            path: "src/app.rs".to_owned(),
+            status: "Modified",
+            staged: true,
+        };
+        let unstaged = super::SourceControlFile {
+            path: "src/app.rs".to_owned(),
+            status: "Modified",
+            staged: false,
+        };
+        assert!(super::source_control_file_matches_query(&staged, "staged"));
+        assert!(!super::source_control_file_matches_query(
+            &unstaged, "staged"
+        ));
+        assert!(super::source_control_file_matches_query(
+            &unstaged, "unstaged"
+        ));
+        assert!(!super::source_control_file_matches_query(
+            &staged, "unstaged"
+        ));
+    }
+
+    #[test]
+    fn source_control_file_matches_query_rejects_unmatched_query() {
+        let file = super::SourceControlFile {
+            path: "src/app.rs".to_owned(),
+            status: "Modified",
+            staged: false,
+        };
+        assert!(!super::source_control_file_matches_query(&file, "deleted"));
+        assert!(!super::source_control_file_matches_query(&file, "xyz"));
+    }
+
+    #[test]
+    fn source_control_file_matches_query_empty_query_returns_true() {
+        let file = super::SourceControlFile {
+            path: "src/app.rs".to_owned(),
+            status: "Modified",
+            staged: false,
+        };
+        assert!(super::source_control_file_matches_query(&file, ""));
+    }
+
+    #[test]
+    fn focused_source_control_search_blocks_terminal_capture() {
+        let mut app = test_app(vec![], None);
+        let ctx = Context::default();
+        ctx.memory_mut(|mem| mem.request_focus(super::AdeApp::source_control_search_input_id()));
+        assert!(app.text_input_has_focus(&ctx));
+        assert!(app.text_input_has_focus_extended(&ctx));
+    }
+
+    #[test]
+    fn surrender_ui_text_focus_clears_source_control_search_focus() {
+        let mut app = test_app(vec![], None);
+        let ctx = Context::default();
+        ctx.memory_mut(|mem| mem.request_focus(super::AdeApp::source_control_search_input_id()));
+        assert!(ctx.memory(|mem| mem.has_focus(super::AdeApp::source_control_search_input_id())));
+        app.surrender_ui_text_focus(&ctx);
+        assert!(!ctx.memory(|mem| mem.has_focus(super::AdeApp::source_control_search_input_id())));
     }
 
     #[test]
