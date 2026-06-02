@@ -1,5 +1,34 @@
   
- 
+  
+---
+
+#### OpenCode ACP composer model favori filtreleme ve Settings star toggle {#acp-model-favorite-filter}
+- Date: 2026-06-02
+- Context: User requested that ACP model list in the composer dropdown be filtered by favorites, with a star toggle in Settings > OpenCode to manage favorites, and no extra icons in the composer input area.
+- Error signature:
+  1. The composer model dropdown showed every model returned by the ACP server, making the list long and hard to navigate.
+  2. The selected model label included a `▾` glyph and the search hint used `🔍`, which added visual noise.
+  3. There was no UI to mark models as favorites; users had to remember model names manually.
+- Symptoms/Impact:
+  1. Model dropdown was crowded with many unused models.
+  2. Composer looked cluttered due to extra glyphs.
+  3. Favorite model management was impossible without external configuration.
+- Root cause:
+  - The model dropdown used the full `model_opt.options` list without filtering.
+  - The `selected_text` builder appended `▾` to the label, and the search hint used an emoji.
+- Resolution:
+  - Added `acp_favorite_models: Vec<String>` and `acp_known_models: Vec<OpenCodeAcpModelEntry>` to `OpenCodeModelConfig` in `src/models.rs` with helpers (`toggle_acp_model_favorite`, `merge_acp_known_models`, `normalize_acp_known_models`).
+  - Updated `process_acp_chat_events` to merge `model` config options into `acp_known_models` on every `ConfigOptionUpdate`.
+  - Added a new "ACP Favorite Models" card in Settings > OpenCode (`draw_settings_opencode_section`) that lists known models with a star toggle button. Favorites are persisted via `note_opencode_change()`.
+  - Changed the composer model dropdown to filter `model_opt.options` against `acp_favorite_models`. Empty favorites show `"No favorite models. Add favorites in Settings > OpenCode."`.
+  - Removed `▾` from the selected model label and `🔍` from the search hint.
+  - Added `AppIcon::Star` (Lucide `star`) and `icons::STAR`.
+- Prevent recurrence:
+  - Updated AGENTS.md: "Composer model dropdown shows only favorited models" and "ACP model options are cached on ConfigOptionUpdate" guidelines.
+  - Added regression tests: `toggle_acp_model_favorite_adds_and_removes`, `normalize_acp_known_models_deduplicates_and_removes_empty`, `merge_acp_known_models_updates_names_and_adds_new`, `composer_model_filter_shows_only_favorites`, `composer_model_filter_shows_empty_hint_when_no_favorites`.
+- Files/Commands touched: `src/models.rs`, `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-02
+
 ---
 
 #### OpenCode ACP chat composer capsule ve model selector radius renk artifact {#acp-chat-capsule-radius-colors}

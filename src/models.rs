@@ -487,7 +487,21 @@ pub struct AppHistory {
     pub projects: std::collections::BTreeMap<String, TerminalInputHistory>,
 }
 
-/// OpenCode model configuration with two switchable slots.
+/// A cached ACP model entry from a past session so its name can be shown in Settings
+/// even when no ACP session is currently active.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenCodeAcpModelEntry {
+    pub value: String,
+    pub name: String,
+}
+
+impl OpenCodeAcpModelEntry {
+    pub fn new(value: String, name: String) -> Self {
+        Self { value, name }
+    }
+}
+
+/// OpenCode model configuration with two switchable slots and ACP favorites.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OpenCodeModelConfig {
@@ -497,6 +511,12 @@ pub struct OpenCodeModelConfig {
     pub build_model_slot_b: String,
     /// Which slot is currently active ("a" or "b").
     pub active_build_model_slot: String,
+    /// Favorite ACP model values (persisted). Only these appear in the composer dropdown.
+    #[serde(default)]
+    pub acp_favorite_models: Vec<String>,
+    /// Cached known ACP models from recent sessions (value + display name).
+    #[serde(default)]
+    pub acp_known_models: Vec<OpenCodeAcpModelEntry>,
 }
 
 impl Default for OpenCodeModelConfig {
@@ -506,6 +526,8 @@ impl Default for OpenCodeModelConfig {
                 .to_owned(),
             build_model_slot_b: "openai/gpt-5.5-fast".to_owned(),
             active_build_model_slot: "a".to_owned(),
+            acp_favorite_models: Vec::new(),
+            acp_known_models: Vec::new(),
         }
     }
 }
@@ -524,6 +546,45 @@ impl OpenCodeModelConfig {
         if slot.eq_ignore_ascii_case("a") || slot.eq_ignore_ascii_case("b") {
             self.active_build_model_slot = slot.to_ascii_lowercase();
         }
+    }
+
+    /// Check whether a given model value is marked as a favorite.
+    pub fn is_acp_model_favorite(&self, value: &str) -> bool {
+        self.acp_favorite_models.iter().any(|v| v == value)
+    }
+
+    /// Toggle a model value in the favorite list. Returns true if the model is now a favorite.
+    pub fn toggle_acp_model_favorite(&mut self, value: &str) -> bool {
+        if let Some(pos) = self.acp_favorite_models.iter().position(|v| v == value) {
+            self.acp_favorite_models.remove(pos);
+            false
+        } else {
+            self.acp_favorite_models.push(value.to_owned());
+            true
+        }
+    }
+
+    /// Remove empty or duplicate entries from the known-models cache.
+    pub fn normalize_acp_known_models(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        self.acp_known_models.retain(|e| {
+            let keep = !e.value.is_empty() && seen.insert(e.value.clone());
+            keep
+        });
+    }
+
+    /// Merge newly discovered ACP model options into the known-models cache.
+    /// Updates existing entries with the latest name, adds new ones.
+    pub fn merge_acp_known_models(&mut self, options: impl Iterator<Item = (String, String)>) {
+        for (value, name) in options {
+            if let Some(existing) = self.acp_known_models.iter_mut().find(|e| e.value == value) {
+                existing.name = name;
+            } else {
+                self.acp_known_models
+                    .push(OpenCodeAcpModelEntry::new(value, name));
+            }
+        }
+        self.normalize_acp_known_models();
     }
 }
 
@@ -786,8 +847,8 @@ mod tests {
     use super::{
         default_launchers, default_terminal_shortcuts, normalize_launcher_entries,
         normalize_terminal_shortcut_entries, AcpModeToggleShortcut, AcpStartupMode, AppConfig,
-        BuiltinLauncherKind, LauncherEntry, LauncherIconKey, OpenCodeModelConfig, ShellKind,
-        ShortcutModifiers, TerminalShortcutEntry, UiConfig,
+        BuiltinLauncherKind, LauncherEntry, LauncherIconKey, OpenCodeAcpModelEntry,
+        OpenCodeModelConfig, ShellKind, ShortcutModifiers, TerminalShortcutEntry, UiConfig,
     };
 
     #[test]
@@ -1181,6 +1242,11 @@ mod tests {
             build_model_slot_a: "custom/model-a".to_owned(),
             build_model_slot_b: "custom/model-b".to_owned(),
             active_build_model_slot: "b".to_owned(),
+            acp_favorite_models: vec!["custom/model-a".to_owned()],
+            acp_known_models: vec![OpenCodeAcpModelEntry::new(
+                "custom/model-a".to_owned(),
+                "Custom Model A".to_owned(),
+            )],
         };
 
         let serialized = serde_json::to_string(&original).unwrap();
@@ -1189,5 +1255,66 @@ mod tests {
         assert_eq!(deserialized.build_model_slot_a, "custom/model-a");
         assert_eq!(deserialized.build_model_slot_b, "custom/model-b");
         assert_eq!(deserialized.active_build_model_slot, "b");
+        assert_eq!(deserialized.acp_favorite_models, vec!["custom/model-a"]);
+        assert_eq!(deserialized.acp_known_models.len(), 1);
+        assert_eq!(deserialized.acp_known_models[0].value, "custom/model-a");
+        assert_eq!(deserialized.acp_known_models[0].name, "Custom Model A");
+    }
+
+    #[test]
+    fn toggle_acp_model_favorite_adds_and_removes() {
+        let mut config = OpenCodeModelConfig::default();
+        assert!(!config.is_acp_model_favorite("gpt-4"));
+
+        assert!(config.toggle_acp_model_favorite("gpt-4"));
+        assert!(config.is_acp_model_favorite("gpt-4"));
+        assert_eq!(config.acp_favorite_models.len(), 1);
+
+        assert!(!config.toggle_acp_model_favorite("gpt-4"));
+        assert!(!config.is_acp_model_favorite("gpt-4"));
+        assert!(config.acp_favorite_models.is_empty());
+    }
+
+    #[test]
+    fn normalize_acp_known_models_deduplicates_and_removes_empty() {
+        let mut config = OpenCodeModelConfig::default();
+        config.acp_known_models = vec![
+            OpenCodeAcpModelEntry::new("gpt-4".to_owned(), "GPT-4".to_owned()),
+            OpenCodeAcpModelEntry::new("gpt-4".to_owned(), "GPT-4 Duplicate".to_owned()),
+            OpenCodeAcpModelEntry::new("".to_owned(), "Empty Value".to_owned()),
+        ];
+        config.normalize_acp_known_models();
+        assert_eq!(config.acp_known_models.len(), 1);
+        assert_eq!(config.acp_known_models[0].value, "gpt-4");
+        assert_eq!(config.acp_known_models[0].name, "GPT-4");
+    }
+
+    #[test]
+    fn merge_acp_known_models_updates_names_and_adds_new() {
+        let mut config = OpenCodeModelConfig::default();
+        config.acp_known_models = vec![OpenCodeAcpModelEntry::new(
+            "gpt-4".to_owned(),
+            "Old GPT-4".to_owned(),
+        )];
+        config.merge_acp_known_models(
+            vec![
+                ("gpt-4".to_owned(), "New GPT-4".to_owned()),
+                ("gpt-5".to_owned(), "GPT-5".to_owned()),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(config.acp_known_models.len(), 2);
+        let gpt4 = config
+            .acp_known_models
+            .iter()
+            .find(|e| e.value == "gpt-4")
+            .unwrap();
+        assert_eq!(gpt4.name, "New GPT-4");
+        let gpt5 = config
+            .acp_known_models
+            .iter()
+            .find(|e| e.value == "gpt-5")
+            .unwrap();
+        assert_eq!(gpt5.name, "GPT-5");
     }
 }

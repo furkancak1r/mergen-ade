@@ -466,6 +466,7 @@ enum AppIcon {
     Plus,
     Question,
     SendHorizontal,
+    Star,
     File,
     FileText,
     FileCode,
@@ -492,7 +493,7 @@ pub enum ForegroundLauncherAction {
 }
 
 impl AppIcon {
-    const ALL: [Self; 38] = [
+    const ALL: [Self; 39] = [
         Self::ArrowClockwise,
         Self::ArrowLeft,
         Self::ArrowRight,
@@ -517,6 +518,7 @@ impl AppIcon {
         Self::Plus,
         Self::Question,
         Self::SendHorizontal,
+        Self::Star,
         Self::File,
         Self::FileText,
         Self::FileCode,
@@ -559,6 +561,7 @@ impl AppIcon {
             Self::Plus => "plus",
             Self::Question => "help-circle",
             Self::SendHorizontal => "send-horizontal",
+            Self::Star => "star",
             Self::File => "file",
             Self::FileText => "file-text",
             Self::FileCode => "file-code",
@@ -632,6 +635,7 @@ mod icons {
     pub const PLUS: AppIcon = AppIcon::Plus;
     pub const QUESTION: AppIcon = AppIcon::Question;
     pub const SEND_HORIZONTAL: AppIcon = AppIcon::SendHorizontal;
+    pub const STAR: AppIcon = AppIcon::Star;
     pub const SCAN: AppIcon = AppIcon::Scan;
     pub const SCAN_LINE: AppIcon = AppIcon::ScanLine;
     pub const TERMINAL: AppIcon = AppIcon::Terminal;
@@ -9797,9 +9801,18 @@ impl AdeApp {
                             .iter()
                             .position(|o| o.id == option.id);
                         if let Some(idx) = pos {
-                            session.config_options_struct[idx] = option;
+                            session.config_options_struct[idx] = option.clone();
                         } else {
-                            session.config_options_struct.push(option);
+                            session.config_options_struct.push(option.clone());
+                        }
+                        // Cache model options so they are visible in Settings even without a live session
+                        if option.id == "model" {
+                            self.config.opencode.merge_acp_known_models(
+                                option
+                                    .options
+                                    .iter()
+                                    .map(|e| (e.value.clone(), e.name.clone())),
+                            );
                         }
                         session.updated_at = Instant::now();
                     }
@@ -16319,6 +16332,63 @@ impl AdeApp {
         );
         ui.add_space(12.0);
 
+        // Favorite Models card
+        let favorite_models = self.config.opencode.acp_favorite_models.clone();
+        let known_models = self.config.opencode.acp_known_models.clone();
+        show_settings_card(
+            ui,
+            AppIcon::Star,
+            "ACP Favorite Models",
+            "Star models so they appear in the composer dropdown. Only favorited models are shown there.",
+            |ui| {
+                if known_models.is_empty() {
+                    ui.label(
+                        RichText::new("Open an ACP chat to load available models.").small().color(TEXT_MUTED),
+                    );
+                } else {
+                    let mut toggled: Option<String> = None;
+                    for entry in &known_models {
+                        let is_favorite = favorite_models.contains(&entry.value);
+                        let star_color = if is_favorite {
+                            Color32::from_rgb(220, 180, 60)
+                        } else {
+                            TEXT_MUTED
+                        };
+                        ui.horizontal(|ui| {
+                            let star_btn = ui.add(
+                                egui::Button::new(
+                                    RichText::new(format!("{}", icons::STAR))
+                                        .size(14.0)
+                                        .color(star_color),
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE)
+                                .small(),
+                            );
+                            if star_btn.clicked() {
+                                toggled = Some(entry.value.clone());
+                            }
+                            ui.label(
+                                RichText::new(&entry.name)
+                                    .size(12.0)
+                                    .color(if is_favorite { TEXT_PRIMARY } else { TEXT_MUTED }),
+                            );
+                            ui.label(
+                                RichText::new(&entry.value)
+                                    .small()
+                                    .color(TEXT_MUTED),
+                            );
+                        });
+                    }
+                    if let Some(value) = toggled {
+                        self.config.opencode.toggle_acp_model_favorite(&value);
+                        changes.note_opencode_change();
+                    }
+                }
+            },
+        );
+        ui.add_space(12.0);
+
         // Status card
         show_settings_card(
             ui,
@@ -20397,6 +20467,7 @@ impl AdeApp {
                         .layout(Layout::top_down(Align::Min)),
                 );
                 composer_ui.set_clip_rect(composer_rect);
+                let acp_favorite_models = self.config.opencode.acp_favorite_models.clone();
                 if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
                     let is_running = session.is_running
                         || matches!(session.status, crate::opencode_acp::AcpChatStatus::Running);
@@ -20733,7 +20804,7 @@ impl AdeApp {
                                     Stroke::new(1.0, Color32::from_rgb(70, 70, 70));
                                 egui::ComboBox::from_id_salt("acp_composer_model_selector")
                                     .selected_text(
-                                        RichText::new(format!("{} ▾", model_label))
+                                        RichText::new(model_label)
                                             .size(11.0)
                                             .color(TEXT_MUTED),
                                     )
@@ -20746,7 +20817,7 @@ impl AdeApp {
                                                 egui::TextEdit::singleline(
                                                     &mut session.model_search_query,
                                                 )
-                                                .hint_text("🔍 Search models...")
+                                                .hint_text("Search models...")
                                                 .desired_width(ui.available_width()),
                                             );
                                             ui.separator();
@@ -20756,14 +20827,21 @@ impl AdeApp {
                                                 .options
                                                 .iter()
                                                 .filter(|e| {
-                                                    e.name.to_lowercase().contains(&query)
-                                                        || e.value.to_lowercase().contains(&query)
+                                                    acp_favorite_models.contains(&e.value)
+                                                        && (e.name.to_lowercase().contains(&query)
+                                                            || e.value.to_lowercase().contains(&query))
                                                 })
                                                 .collect();
 
-                                            if filtered.is_empty() {
+                                            if acp_favorite_models.is_empty() {
                                                 ui.label(
-                                                    RichText::new("No matching models")
+                                                    RichText::new("No favorite models. Add favorites in Settings > OpenCode.")
+                                                        .small()
+                                                        .color(TEXT_MUTED),
+                                                );
+                                            } else if filtered.is_empty() {
+                                                ui.label(
+                                                    RichText::new("No matching favorite models")
                                                         .small()
                                                         .color(TEXT_MUTED),
                                                 );
@@ -62320,6 +62398,54 @@ mod tests {
         assert!(
             super::AdeApp::parse_opencode_question_from_raw_json(r#"{"status":"idle"}"#).is_none()
         );
+    }
+
+    #[test]
+    fn composer_model_filter_shows_only_favorites() {
+        let options = vec![
+            crate::opencode_acp::AcpConfigOptionEntry {
+                value: "gpt-4".to_owned(),
+                name: "GPT-4".to_owned(),
+                description: None,
+            },
+            crate::opencode_acp::AcpConfigOptionEntry {
+                value: "gpt-5".to_owned(),
+                name: "GPT-5".to_owned(),
+                description: None,
+            },
+        ];
+        let favorites = vec!["gpt-4".to_owned()];
+        let query = "".to_owned();
+        let filtered: Vec<_> = options
+            .iter()
+            .filter(|e| {
+                favorites.contains(&e.value)
+                    && (e.name.to_lowercase().contains(&query)
+                        || e.value.to_lowercase().contains(&query))
+            })
+            .collect();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].value, "gpt-4");
+    }
+
+    #[test]
+    fn composer_model_filter_shows_empty_hint_when_no_favorites() {
+        let options = vec![crate::opencode_acp::AcpConfigOptionEntry {
+            value: "gpt-4".to_owned(),
+            name: "GPT-4".to_owned(),
+            description: None,
+        }];
+        let favorites: Vec<String> = Vec::new();
+        let query = "".to_owned();
+        let filtered: Vec<_> = options
+            .iter()
+            .filter(|e| {
+                favorites.contains(&e.value)
+                    && (e.name.to_lowercase().contains(&query)
+                        || e.value.to_lowercase().contains(&query))
+            })
+            .collect();
+        assert!(filtered.is_empty());
     }
 
     #[test]
