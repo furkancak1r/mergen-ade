@@ -330,11 +330,13 @@ impl AcpChatSession {
 }
 
 /// Build the final prompt text from user text and attachment paths.
+/// Only file paths are appended; file contents are never read or injected.
+/// This keeps the AI context lean and lets the agent read files on demand.
 pub fn build_acp_prompt_text(text: &str, attachments: &[String]) -> String {
     if attachments.is_empty() {
         text.to_string()
     } else {
-        let att_text = format!("Attached files:\n{}", attachments.join("\n"));
+        let att_text = format!("Attached file paths:\n{}", attachments.join("\n"));
         if text.is_empty() {
             att_text
         } else {
@@ -1045,7 +1047,7 @@ mod tests {
         let result = build_acp_prompt_text("hello", &attachments);
         assert_eq!(
             result,
-            "hello\n\nAttached files:\nC:/test/file.txt\nD:/test/file2.png"
+            "hello\n\nAttached file paths:\nC:/test/file.txt\nD:/test/file2.png"
         );
     }
 
@@ -1053,7 +1055,7 @@ mod tests {
     fn build_acp_prompt_text_with_attachments_only() {
         let attachments = vec!["C:/test/file.txt".to_string()];
         let result = build_acp_prompt_text("", &attachments);
-        assert_eq!(result, "Attached files:\nC:/test/file.txt");
+        assert_eq!(result, "Attached file paths:\nC:/test/file.txt");
     }
 
     #[test]
@@ -1067,7 +1069,7 @@ mod tests {
         let attachments = vec!["C:/test/file.txt".to_string()];
         let result = build_acp_prompt_text("hello", &attachments);
         assert!(result.contains("hello"));
-        assert!(result.contains("Attached files:"));
+        assert!(result.contains("Attached file paths:"));
         assert!(result.contains("C:/test/file.txt"));
         // Should only contain the attachment path once
         let count = result.matches("C:/test/file.txt").count();

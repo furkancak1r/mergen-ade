@@ -2,6 +2,30 @@
   
 ---
 
+#### OpenCode ACP attachments sadece path gönderiyor, içerik enjekte edilmiyor {#acp-attachments-path-only}
+- Date: 2026-06-02
+- Context: User requested that file attachments in the ACP composer should only send file paths to the AI, not the file contents, to prevent context bloat and keep the AI responsible for reading files on demand.
+- Error signature:
+  1. The `build_acp_prompt_text` helper used a label `Attached files:` which could be ambiguous about whether file contents were included.
+  2. The chat history and prompt text included file paths under the attachment label, but there was no explicit documentation that only paths were sent.
+- Symptoms/Impact:
+  1. Users could not easily confirm whether the AI was receiving file contents or just paths.
+  2. Large file contents could silently inflate context if future changes accidentally added content injection.
+- Root cause:
+  - The attachment label was generic (`Attached files:`) and the builder had no explicit comment about path-only behavior.
+- Resolution:
+  - Changed `build_acp_prompt_text` label from `Attached files:` to `Attached file paths:` to make it unambiguous.
+  - Added a doc comment on `build_acp_prompt_text` documenting the path-only policy.
+  - Updated AGENTS.md to include the "Attachments are path-only" guideline.
+  - Updated existing unit tests to assert the new label.
+- Prevent recurrence:
+  - Updated AGENTS.md: "Attachments are path-only; file contents are never injected" guideline.
+  - Added regression tests verifying the label and that no file content is present in the prompt.
+- Files/Commands touched: `src/opencode_acp.rs`, `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-02
+
+---
+
 #### OpenCode ACP composer Build mode UI'dan gizlendi {#acp-build-mode-hidden}
 - Date: 2026-06-02
 - Context: User requested that the `build` mode should remain the internal default mode but should not appear in the ACP composer UI. The composer should only show the `Plan` pill when in plan mode, and show nothing when in the default/build mode.
