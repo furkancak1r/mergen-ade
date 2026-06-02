@@ -189,6 +189,10 @@ pub struct AcpChatSession {
     pub show_thread_selector: bool,
     pub selected_mode_id: Option<String>,
     pub queue: Vec<String>,
+    pub model_search_query: String,
+    pub recent_inputs: Vec<String>,
+    pub history_index: Option<usize>,
+    pub history_draft: String,
     command_tx: crossbeam_channel::Sender<String>,
     #[allow(dead_code)]
     process: Option<Child>,
@@ -295,6 +299,20 @@ impl AcpChatSession {
         self.config_options_struct.iter().find(|o| o.id == id)
     }
 
+    /// Determine the active mode id using fallback sources when the config option
+    /// has not yet arrived (e.g. during ACP startup).
+    pub fn active_mode_id_or_default(&self) -> String {
+        if let Some(mode_opt) = self.config_option("mode") {
+            mode_opt.current_value.clone()
+        } else if let Some(ref mode_id) = self.selected_mode_id {
+            mode_id.clone()
+        } else if let Some(mode) = self.modes.last() {
+            mode.id.clone()
+        } else {
+            "build".to_string()
+        }
+    }
+
     /// Respond to a permission request.
     pub fn send_permission_response(&self, request_id: &str, option_id: &str) {
         let msg = json!({
@@ -365,6 +383,21 @@ pub fn remove_mention_from_input(input: &str, path: &str) -> String {
         return format!("{}{}", before, after);
     }
     input.to_string()
+}
+
+/// Return a human-readable display name for a mode id.
+/// Falls back to the raw id if the mode is unrecognized.
+pub fn mode_display_name(mode_id: &str) -> String {
+    match mode_id {
+        "plan" => "Plan".to_string(),
+        "build" => "Build".to_string(),
+        _ => mode_id.to_string(),
+    }
+}
+
+/// Whether the given mode id is considered "plan".
+pub fn mode_is_plan(mode_id: &str) -> bool {
+    mode_id == "plan"
 }
 
 /// Spawn a new OpenCode ACP session.
@@ -511,6 +544,10 @@ pub fn spawn_opencode_acp(
         queue: Vec::new(),
         show_thread_selector: false,
         selected_mode_id: None,
+        model_search_query: String::new(),
+        recent_inputs: Vec::new(),
+        history_index: None,
+        history_draft: String::new(),
         command_tx,
         process: Some(child),
         writer_thread: Some(writer_thread),
@@ -924,6 +961,10 @@ mod tests {
             is_running: false,
             show_thread_selector: false,
             selected_mode_id: None,
+            model_search_query: String::new(),
+            recent_inputs: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
             command_tx: tx,
             process: None,
             writer_thread: None,
@@ -1286,5 +1327,67 @@ mod tests {
         let bin = std::ffi::OsString::from(path);
         let result = spawn_opencode_acp(1, 1, PathBuf::from("test"), Some(bin), None, vec![], tx);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn active_mode_id_or_default_fallback_to_build() {
+        let (session, _rx) = test_session();
+        assert_eq!(session.active_mode_id_or_default(), "build");
+    }
+
+    #[test]
+    fn active_mode_id_or_default_uses_selected_mode_id() {
+        let (mut session, _rx) = test_session();
+        session.selected_mode_id = Some("plan".to_string());
+        assert_eq!(session.active_mode_id_or_default(), "plan");
+    }
+
+    #[test]
+    fn active_mode_id_or_default_prefers_config_option() {
+        let (mut session, _rx) = test_session();
+        session.selected_mode_id = Some("plan".to_string());
+        session.config_options_struct.push(AcpConfigOption {
+            id: "mode".to_string(),
+            name: "Mode".to_string(),
+            category: "mode".to_string(),
+            current_value: "build".to_string(),
+            options: Vec::new(),
+        });
+        assert_eq!(session.active_mode_id_or_default(), "build");
+    }
+
+    #[test]
+    fn active_mode_id_or_default_uses_last_mode() {
+        let (mut session, _rx) = test_session();
+        session.modes.push(AcpMode {
+            id: "plan".to_string(),
+            name: "Plan".to_string(),
+        });
+        assert_eq!(session.active_mode_id_or_default(), "plan");
+    }
+
+    #[test]
+    fn mode_display_name_plan() {
+        assert_eq!(mode_display_name("plan"), "Plan");
+    }
+
+    #[test]
+    fn mode_display_name_build() {
+        assert_eq!(mode_display_name("build"), "Build");
+    }
+
+    #[test]
+    fn mode_display_name_unknown() {
+        assert_eq!(mode_display_name("custom"), "custom");
+    }
+
+    #[test]
+    fn mode_is_plan_true() {
+        assert!(mode_is_plan("plan"));
+    }
+
+    #[test]
+    fn mode_is_plan_false() {
+        assert!(!mode_is_plan("build"));
     }
 }

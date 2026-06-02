@@ -2,6 +2,129 @@
  
 ---
 
+#### OpenCode ACP chat composer capsule ve model selector radius renk artifact {#acp-chat-capsule-radius-colors}
+- Date: 2026-06-02
+- Context: User reported that the rounded corners of the ACP chat composer capsule and the model selector ComboBox had color artifacts / a visible halo at the radius edges.
+- Error signature:
+  1. The capsule was drawn using `egui::Frame::none().fill(...).stroke(...).rounding(...)` which caused egui's default background to bleed through the anti-aliased corners, creating a dark/black halo against the capsule fill.
+  2. The model selector ComboBox used default egui widget visuals (inactive fill ≈ rgb(30,30,30), stroke ≈ rgb(46,46,46)) which clashed with the capsule fill (rgb(27,27,27)), producing visible color mismatches at the rounded edges.
+  3. The Plan mode pill used a bright orange stroke (`rgb(200,140,60)`) at 6px radius; the strong contrast between the bright stroke and the dark fill created a harsh halo at the corners.
+- Symptoms/Impact:
+  1. Capsule radius edges showed dark/black artifacts instead of smooth rounded corners.
+  2. Model selector button had a slightly different background tone than the capsule, visible at the corners.
+  3. Plan mode pill corners looked too bright and distracting.
+- Root cause:
+  - `egui::Frame::none()` does not provide a fully opaque background at the corners; anti-aliasing can blend with the underlying surface color. The default egui widget visuals for inactive/hovered/active states were not tuned to match the capsule's dark tone.
+- Resolution:
+  - Replaced `Frame::none().fill(...).stroke(...).rounding(...)` with manual `composer_ui.painter().rect(...)` call using `ACP_COMPOSER_CAPSULE_FILL`, `ACP_COMPOSER_CAPSULE_STROKE`, and `ACP_COMPOSER_CAPSULE_RADIUS`. This gives a single, clean painted rectangle with no default background bleed.
+  - Added `ACP_COMPOSER_CAPSULE_FILL`, `ACP_COMPOSER_CAPSULE_STROKE`, and `ACP_COMPOSER_CAPSULE_RADIUS` constants.
+  - Wrapped the ComboBox in a `ui.scope` that locally overrides `visuals.widgets.inactive`, `hovered`, `active`, and `open` fill/stroke colors to match the capsule tone.
+  - Changed the mode pill stroke to a muted tone (`pill_stroke`) rather than the same bright `pill_color`:
+    - Plan: `rgb(140,100,40)` instead of `rgb(200,140,60)`
+    - Build: `rgb(45,100,140)` instead of `rgb(60,140,200)`
+  - Capsule content now uses `capsule_ui.horizontal_centered(|ui| { ... })` with a `capsule_rect.shrink2(...)` child UI for consistent margin.
+- Prevent recurrence:
+  - Updated AGENTS.md: "Capsule must be painted manually with a single `painter().rect()` call instead of `Frame::none()` to avoid anti-aliasing bleed."
+  - Updated AGENTS.md: "ComboBox inside the capsule must use local `ui.scope` widget visual overrides to match the capsule fill and stroke."
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-02
+
+---
+
+#### OpenCode ACP chat composer capsule köşelerinde gri border kaldı {#acp-chat-capsule-grey-border}
+- Date: 2026-06-02
+- Context: User reported that after the manual capsule paint fix, the rounded corners still showed a faint gray border/outline instead of clean, sharp edges.
+- Error signature:
+  1. The manual `painter().rect(...)` call used `Stroke::new(1.0, ACP_COMPOSER_CAPSULE_STROKE)` which produced a visible gray stroke around the capsule.
+  2. The ComboBox widget visuals also used `Stroke::new(1.0, ...)` for inactive/hovered/active states, creating subtle gray borders on the model selector button.
+  3. Anti-aliasing at the rounded corners blended this stroke with the dark background, producing a faint gray halo.
+- Symptoms/Impact:
+  1. Capsule edges had a slight gray outline instead of a seamless dark fill.
+  2. Model selector button appeared to have a thin border that did not match the capsule interior.
+- Root cause:
+  - Any visible stroke on a rounded rectangle will create a border/halo at the anti-aliased edges, especially against a dark background.
+- Resolution:
+  - Changed capsule `painter().rect(...)` to use `Stroke::NONE` instead of `Stroke::new(1.0, ACP_COMPOSER_CAPSULE_STROKE)`.
+  - Changed ComboBox local widget visuals: all `bg_stroke` fields (inactive, hovered, active, open) set to `Stroke::NONE`.
+  - Removed the visible border entirely from both the capsule and the model selector.
+- Prevent recurrence:
+  - Updated AGENTS.md: capsule and ComboBox must use `Stroke::NONE` to avoid visible border artifacts at rounded corners.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-02
+
+---
+
+#### OpenCode ACP chat composer input/hint text dikeyde ortalanmamış {#acp-chat-input-vertical-align}
+- Date: 2026-06-02
+- Context: User reported that the `Waiting for session...` hint text in the ACP chat composer input was not vertically centered within the 48px capsule; it sat at the top of the input area instead of the middle.
+- Error signature:
+  1. `egui::TextEdit::multiline(...)` defaults to `Align2::LEFT_TOP` alignment.
+  2. The capsule allocates `ACP_COMPOSER_CONTROL_HEIGHT = 36.0` for the input, but the text/hint was rendered at the top edge of that 36px rect.
+  3. This caused the hint text to appear visually misaligned with the mode pill and model selector, which are centered in the same row.
+- Symptoms/Impact:
+  1. The input text looked like it was floating near the top of the capsule, not on the same center line as the surrounding controls.
+  2. The visual imbalance was especially noticeable when the hint text was the only visible content (e.g. during `Waiting for session...`).
+- Root cause:
+  - `TextEdit` default alignment is top-left; we did not explicitly set vertical alignment to center.
+- Resolution:
+  - Added `.vertical_align(egui::Align::Center)` to the `TextEdit::multiline` builder in the ACP composer.
+  - Kept `desired_rows(1)` and `return_key(Ctrl+Enter)` behavior unchanged.
+  - The input text and hint text now render on the vertical center of the 36px control area.
+- Prevent recurrence:
+  - Updated AGENTS.md: "Composer input text must be vertically centered." with the `.vertical_align(Align::Center)` requirement.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-02
+
+---
+
+#### OpenCode ACP chat composer mode pill yüklenirken görünmüyordu {#acp-chat-mode-pill-loading}
+- Date: 2026-06-01
+- Context: User reported that the Plan/Build mode pill was not visible while the ACP session was loading (before `configOptions` arrived from the server).
+- Error signature:
+  1. The mode pill was only rendered inside `if let Some(mode_opt) = session.config_option("mode")`, which evaluates to `None` until the server sends `configOptions`.
+  2. Without a visible pill, the user had no indication of the current mode during startup.
+- Symptoms/Impact:
+  1. ACP chat açılır açılmaz mode pill boşluk olarak kalıyordu.
+  2. Kullanıcı session hazır olana kadar hangi modda olduğunu göremiyordu.
+- Resolution:
+  - Added `active_mode_id_or_default()` to `AcpChatSession` with a fallback chain: `config_option("mode")` → `selected_mode_id` → last `current_mode_update` → `"build"`.
+  - Added `mode_display_name()` and `mode_is_plan()` standalone helpers.
+  - Updated composer mode pill to always render using `active_mode_id_or_default()`, with orange/blue styling based on `mode_is_plan()`.
+  - Toggle click is now gated by `session_ready` so the pill does not attempt `session/set_config_option` before the session exists.
+  - Updated `CurrentModeUpdate` handler to also store the mode in `selected_mode_id` so it becomes a fallback source.
+  - Added unit tests for `active_mode_id_or_default()`, `mode_display_name()`, and `mode_is_plan()`.
+- Prevent recurrence:
+  - Updated AGENTS.md: "Mode pill must remain visible during ACP startup/loading using fallback Build/Plan state."
+- Files/Commands touched: `src/app.rs`, `src/opencode_acp.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-01
+
+---
+
+#### OpenCode ACP chat composer model seçim butonu ile input alanı dikey hizasız {#acp-chat-model-input-alignment}
+- Date: 2026-06-02
+- Context: User reported that the model selector dropdown button and the text input field in the ACP chat composer were not vertically aligned — the ComboBox appeared shorter/taller than the 36px input.
+- Error signature:
+  1. The `ComboBox::height(36.0)` call was used assuming it set the button height, but in egui `ComboBox::height()` only controls the popup menu max height.
+  2. The actual ComboBox button height was determined by `ui.spacing().interact_size.y`, which defaults to ~19px and did not match the `TextEdit` input's `add_sized(..., 36.0)`.
+  3. The input and model selector visually sat on different center lines inside the 48px capsule.
+- Symptoms/Impact:
+  1. Model selector button was vertically misaligned with the input field.
+  2. The capsule row looked uneven and visually inconsistent.
+- Root cause:
+  - Misunderstanding of egui's `ComboBox::height()` API vs. `interact_size.y` for button height.
+- Resolution:
+  - Added `ACP_COMPOSER_CONTROL_HEIGHT = 36.0` constant in `src/app.rs`.
+  - Changed the ComboBox to be wrapped in a `ui.scope` where `interact_size.y` is temporarily set to `ACP_COMPOSER_CONTROL_HEIGHT`.
+  - Removed the mistaken `ComboBox::height(36.0)` call (popup max height now uses the default egui spacing).
+  - Changed the input `add_sized(..., 36.0)` to use the `ACP_COMPOSER_CONTROL_HEIGHT` constant.
+  - Added a unit test for the constant definition.
+- Prevent recurrence:
+  - Updated AGENTS.md: "Model selector button must be vertically aligned with the input field." with the correct `interact_size.y` approach.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-02
+
+---
+
 #### OpenCode ACP chat composer dosya seçiminde input'a @dosya_adi ile eklenme {#acp-chat-attachment-mention}
 - Date: 2026-06-01
 - Context: User requested that when a file is selected via the `+` button in the ACP chat composer, the file name should be inserted into the input field as `@file_name` so the user can see inline which files are attached.
