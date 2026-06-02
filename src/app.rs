@@ -21206,13 +21206,14 @@ impl AdeApp {
                             egui::Frame::popup(ui.style()).show(ui, |ui| {
                                 ui.set_min_width(popup_width);
                                 ui.set_max_width(popup_width);
-                                let search_response = ui.add(
+                                let popup_inner_width = ui.available_width().max(0.0);
+                                let search_response = ui.add_sized(
+                                    egui::vec2(popup_inner_width, ui.spacing().interact_size.y),
                                     egui::TextEdit::singleline(
                                         &mut self.acp_context_project_search_query,
                                     )
                                     .id(popup_id.with("search"))
                                     .hint_text("Search projects...")
-                                    .desired_width(popup_width)
                                     .vertical_align(Align::Center),
                                 );
                                 if opened_this_frame {
@@ -21222,26 +21223,99 @@ impl AdeApp {
 
                                 egui::ScrollArea::vertical()
                                     .max_height(ui.spacing().combo_height)
+                                    .auto_shrink([false, true])
                                     .show(ui, |ui| {
+                                        ui.set_min_width(popup_inner_width);
+                                        ui.set_max_width(popup_inner_width);
                                         let matching_project_rows = acp_project_rows_matching_query(
                                             &project_rows,
                                             &self.acp_context_project_search_query,
                                         );
+                                        let button_padding = ui.spacing().button_padding;
+                                        let row_text_width =
+                                            (popup_inner_width - button_padding.x * 2.0).max(0.0);
                                         if matching_project_rows.is_empty() {
-                                            ui.label(
+                                            let galley = WidgetText::from(
                                                 RichText::new("No matching projects")
                                                     .color(TEXT_MUTED),
+                                            )
+                                            .into_galley(
+                                                ui,
+                                                None,
+                                                row_text_width,
+                                                egui::TextStyle::Button,
                                             );
+                                            let row_height = (button_padding.y * 2.0
+                                                + galley.size().y)
+                                                .max(ui.spacing().interact_size.y);
+                                            let (row_rect, _response) = ui.allocate_exact_size(
+                                                egui::vec2(popup_inner_width, row_height),
+                                                Sense::hover(),
+                                            );
+                                            if ui.is_rect_visible(row_rect) {
+                                                let text_pos = egui::pos2(
+                                                    row_rect.left() + button_padding.x,
+                                                    row_rect.center().y - galley.size().y / 2.0,
+                                                );
+                                                ui.painter().galley(text_pos, galley, TEXT_MUTED);
+                                            }
                                         } else {
                                             for (row_project_id, project_name) in
                                                 matching_project_rows
                                             {
-                                                let response = ui.selectable_value(
-                                                    &mut selected_id,
-                                                    Some(*row_project_id),
-                                                    project_name.clone(),
+                                                let selected = selected_id == Some(*row_project_id);
+                                                let galley = WidgetText::from(project_name.clone())
+                                                    .into_galley(
+                                                        ui,
+                                                        None,
+                                                        row_text_width,
+                                                        egui::TextStyle::Button,
+                                                    );
+                                                let row_height = (button_padding.y * 2.0
+                                                    + galley.size().y)
+                                                    .max(ui.spacing().interact_size.y);
+                                                let (row_rect, response) = ui.allocate_exact_size(
+                                                    egui::vec2(popup_inner_width, row_height),
+                                                    Sense::click(),
                                                 );
+                                                let widget_label = project_name.clone();
+                                                let row_enabled = ui.is_enabled();
+                                                response.widget_info(move || {
+                                                    WidgetInfo::selected(
+                                                        WidgetType::SelectableLabel,
+                                                        row_enabled,
+                                                        selected,
+                                                        widget_label.clone(),
+                                                    )
+                                                });
+                                                if ui.is_rect_visible(row_rect) {
+                                                    let visuals = ui
+                                                        .style()
+                                                        .interact_selectable(&response, selected);
+                                                    if selected
+                                                        || response.hovered()
+                                                        || response.highlighted()
+                                                        || response.has_focus()
+                                                    {
+                                                        ui.painter().rect(
+                                                            row_rect.expand(visuals.expansion),
+                                                            visuals.rounding,
+                                                            visuals.weak_bg_fill,
+                                                            visuals.bg_stroke,
+                                                        );
+                                                    }
+                                                    let text_pos = egui::pos2(
+                                                        row_rect.left() + button_padding.x,
+                                                        row_rect.center().y - galley.size().y / 2.0,
+                                                    );
+                                                    ui.painter().galley(
+                                                        text_pos,
+                                                        galley,
+                                                        visuals.text_color(),
+                                                    );
+                                                }
                                                 if response.clicked() {
+                                                    selected_id = Some(*row_project_id);
                                                     close_popup = true;
                                                 }
                                             }
