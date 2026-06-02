@@ -1960,6 +1960,18 @@ fn set_window_close_cursor_on_hover(ctx: &egui::Context, window_rect: egui::Rect
     set_pointing_hand_cursor_on_hover_rect(ctx, close_rect);
 }
 
+fn window_close_clicked_in_hover_rect(ctx: &egui::Context, window_rect: egui::Rect) -> bool {
+    let style = ctx.style();
+    let close_rect = window_close_button_hover_rect(window_rect, &style);
+    ctx.input(|i| {
+        i.pointer.primary_clicked()
+            && i
+                .pointer
+                .interact_pos()
+                .is_some_and(|p| close_rect.contains(p))
+    })
+}
+
 fn percent_encode_file_url_path(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -26117,6 +26129,9 @@ impl AdeApp {
                 ctx.memory(|mem| mem.area_rect(egui::Id::new(SETTINGS_WINDOW_ID)))
             {
                 set_window_close_cursor_on_hover(ctx, window_rect);
+                if window_close_clicked_in_hover_rect(ctx, window_rect) {
+                    open = false;
+                }
             }
         }
 
