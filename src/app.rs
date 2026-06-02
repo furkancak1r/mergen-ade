@@ -20533,63 +20533,37 @@ impl AdeApp {
                             }
                         }
 
-                        // Mode pill
-                        let current_mode = crate::opencode_acp::mode_display_name(
-                            &session.active_mode_id_or_default(),
-                        );
-                        let is_plan =
-                            crate::opencode_acp::mode_is_plan(&session.active_mode_id_or_default());
-                        let (pill_color, pill_fill, pill_stroke) = if is_plan {
-                            (
-                                Color32::from_rgb(200, 140, 60),
-                                Color32::from_rgb(40, 28, 16),
-                                Color32::from_rgb(140, 100, 40),
-                            )
-                        } else {
-                            (
-                                Color32::from_rgb(60, 140, 200),
-                                Color32::from_rgb(16, 28, 40),
-                                Color32::from_rgb(45, 100, 140),
-                            )
-                        };
-                        let mut mode_changed = false;
-                        let mut new_mode = String::new();
-                        let pill_btn = ui.add(
-                            egui::Button::new(
-                                RichText::new(&current_mode).size(12.0).color(pill_color),
-                            )
-                            .fill(pill_fill)
-                            .rounding(6.0)
-                            .stroke(Stroke::new(1.0, pill_stroke))
-                            .small(),
-                        );
-                        // Only toggle when session is ready and the full mode option exists
-                        if pill_btn.clicked() && session_ready {
-                            if let Some(mode_opt) = session.config_option("mode") {
-                                let active = session.active_mode_id_or_default();
-                                if active == "plan" {
+                        // Mode pill — only visible when the active mode is "plan"
+                        let active_mode = session.active_mode_id_or_default();
+                        if crate::opencode_acp::mode_is_plan(&active_mode) {
+                            let pill_color = Color32::from_rgb(200, 140, 60);
+                            let pill_fill = Color32::from_rgb(40, 28, 16);
+                            let pill_stroke = Color32::from_rgb(140, 100, 40);
+                            let pill_btn = ui.add(
+                                egui::Button::new(
+                                    RichText::new("Plan").size(12.0).color(pill_color),
+                                )
+                                .fill(pill_fill)
+                                .rounding(6.0)
+                                .stroke(Stroke::new(1.0, pill_stroke))
+                                .small(),
+                            );
+                            if pill_btn.clicked() && session_ready {
+                                if let Some(mode_opt) = session.config_option("mode") {
                                     if let Some(entry) =
                                         mode_opt.options.iter().find(|e| e.value == "build")
                                     {
-                                        new_mode = entry.value.clone();
-                                        mode_changed = true;
+                                        let new_mode = entry.value.clone();
+                                        session.send_set_config_option("mode", &new_mode);
+                                        if let Some(opt) = session
+                                            .config_options_struct
+                                            .iter_mut()
+                                            .find(|o| o.id == "mode")
+                                        {
+                                            opt.current_value = new_mode;
+                                        }
                                     }
-                                } else if let Some(entry) =
-                                    mode_opt.options.iter().find(|e| e.value == "plan")
-                                {
-                                    new_mode = entry.value.clone();
-                                    mode_changed = true;
                                 }
-                            }
-                        }
-                        if mode_changed && !new_mode.is_empty() {
-                            session.send_set_config_option("mode", &new_mode);
-                            if let Some(opt) = session
-                                .config_options_struct
-                                .iter_mut()
-                                .find(|o| o.id == "mode")
-                            {
-                                opt.current_value = new_mode;
                             }
                         }
 

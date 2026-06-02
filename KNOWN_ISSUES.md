@@ -2,6 +2,33 @@
   
 ---
 
+#### OpenCode ACP composer Build mode UI'dan gizlendi {#acp-build-mode-hidden}
+- Date: 2026-06-02
+- Context: User requested that the `build` mode should remain the internal default mode but should not appear in the ACP composer UI. The composer should only show the `Plan` pill when in plan mode, and show nothing when in the default/build mode.
+- Error signature:
+  1. The composer always rendered a mode pill (orange for `plan`, blue for `build`), making the default mode visually noisy.
+  2. The `mode_display_name` helper returned `"Build"` for the `build` mode, exposing the internal mode name to the user.
+  3. Settings startup mode label also said "Build", which was inconsistent with the desired UI.
+- Symptoms/Impact:
+  1. The composer looked cluttered even when the user was just doing normal coding (default mode).
+  2. The internal mode name leaked into the user-facing UI.
+- Root cause:
+  - The mode pill was rendered unconditionally based on `active_mode_id_or_default()`, with a blue pill for `build` mode.
+  - `mode_display_name` and `AcpStartupMode::Build.label()` explicitly returned "Build".
+- Resolution:
+  - Changed the composer mode pill to only render when `active_mode_id_or_default() == "plan"`. The pill toggles to `build` when clicked, but the pill itself disappears after the toggle.
+  - Changed `mode_display_name("build")` to return `"Default"` instead of `"Build"`.
+  - Changed `AcpStartupMode::Build.label()` to `"Default"`.
+  - Updated `draw_settings_opencode_section` card text to use "Default mode" terminology.
+  - Updated `mode_display_name_build` test to assert `"Default"`.
+- Prevent recurrence:
+  - Updated AGENTS.md: "Mode pill is only visible for `plan` mode" and "Tab toggles plan/default mode by default" guidelines.
+  - Added regression test in `app.rs` to verify the mode pill block is only entered when `mode_is_plan` is true.
+- Files/Commands touched: `src/models.rs`, `src/app.rs`, `src/opencode_acp.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-02
+
+---
+
 #### OpenCode ACP composer model favori filtreleme ve Settings star toggle {#acp-model-favorite-filter}
 - Date: 2026-06-02
 - Context: User requested that ACP model list in the composer dropdown be filtered by favorites, with a star toggle in Settings > OpenCode to manage favorites, and no extra icons in the composer input area.

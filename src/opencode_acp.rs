@@ -390,7 +390,7 @@ pub fn remove_mention_from_input(input: &str, path: &str) -> String {
 pub fn mode_display_name(mode_id: &str) -> String {
     match mode_id {
         "plan" => "Plan".to_string(),
-        "build" => "Build".to_string(),
+        "build" => "Default".to_string(),
         _ => mode_id.to_string(),
     }
 }
@@ -1391,7 +1391,7 @@ mod tests {
 
     #[test]
     fn mode_display_name_build() {
-        assert_eq!(mode_display_name("build"), "Build");
+        assert_eq!(mode_display_name("build"), "Default");
     }
 
     #[test]

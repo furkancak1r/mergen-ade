@@ -796,7 +796,7 @@ impl AcpStartupMode {
     }
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Build => "Build",
+            Self::Build => "Default",
             Self::Plan => "Plan",
         }
     }
