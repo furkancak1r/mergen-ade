@@ -506,6 +506,11 @@ pub const DEFAULT_OPENCODE_BUILD_MODEL: &str =
     "fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo";
 pub const DEFAULT_OPENCODE_PLAN_MODEL: &str = "openai/gpt-5.5-fast";
 pub const DEFAULT_OPENCODE_PLAN_EFFORT: &str = "xhigh";
+pub const DEFAULT_OPENCODE_LOOP_PROTECTION_ENABLED: bool = true;
+pub const DEFAULT_OPENCODE_BUILD_STEPS_LIMIT: u32 = 32;
+pub const DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS: u64 = 600_000;
+pub const DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS: u64 = 120_000;
+pub const DEFAULT_OPENCODE_KIMI_STRICT_PERMISSIONS: bool = true;
 
 /// OpenCode model configuration with two switchable slots and ACP favorites.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -527,6 +532,21 @@ pub struct OpenCodeModelConfig {
     /// Cached known ACP models from recent sessions (value + display name).
     #[serde(default)]
     pub acp_known_models: Vec<OpenCodeAcpModelEntry>,
+    /// Whether Mergen writes OpenCode safety settings for long tool loops.
+    #[serde(default = "default_opencode_loop_protection_enabled")]
+    pub loop_protection_enabled: bool,
+    /// Maximum OpenCode build-agent steps before OpenCode forces a text summary.
+    #[serde(default = "default_opencode_build_steps_limit")]
+    pub build_steps_limit: u32,
+    /// Fireworks full request timeout in milliseconds.
+    #[serde(default = "default_opencode_fireworks_timeout_ms")]
+    pub fireworks_timeout_ms: u64,
+    /// Fireworks streamed chunk timeout in milliseconds.
+    #[serde(default = "default_opencode_fireworks_chunk_timeout_ms")]
+    pub fireworks_chunk_timeout_ms: u64,
+    /// Use stricter build permissions for Kimi-family models.
+    #[serde(default = "default_opencode_kimi_strict_permissions")]
+    pub kimi_strict_permissions: bool,
 }
 
 impl Default for OpenCodeModelConfig {
@@ -539,8 +559,33 @@ impl Default for OpenCodeModelConfig {
             active_build_model_slot: "a".to_owned(),
             acp_favorite_models: Vec::new(),
             acp_known_models: Vec::new(),
+            loop_protection_enabled: DEFAULT_OPENCODE_LOOP_PROTECTION_ENABLED,
+            build_steps_limit: DEFAULT_OPENCODE_BUILD_STEPS_LIMIT,
+            fireworks_timeout_ms: DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS,
+            fireworks_chunk_timeout_ms: DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS,
+            kimi_strict_permissions: DEFAULT_OPENCODE_KIMI_STRICT_PERMISSIONS,
         }
     }
+}
+
+fn default_opencode_loop_protection_enabled() -> bool {
+    DEFAULT_OPENCODE_LOOP_PROTECTION_ENABLED
+}
+
+fn default_opencode_build_steps_limit() -> u32 {
+    DEFAULT_OPENCODE_BUILD_STEPS_LIMIT
+}
+
+fn default_opencode_fireworks_timeout_ms() -> u64 {
+    DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS
+}
+
+fn default_opencode_fireworks_chunk_timeout_ms() -> u64 {
+    DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS
+}
+
+fn default_opencode_kimi_strict_permissions() -> bool {
+    DEFAULT_OPENCODE_KIMI_STRICT_PERMISSIONS
 }
 
 impl OpenCodeModelConfig {
@@ -567,6 +612,30 @@ impl OpenCodeModelConfig {
             DEFAULT_OPENCODE_PLAN_EFFORT
         } else {
             effort
+        }
+    }
+
+    pub fn effective_build_steps_limit(&self) -> u32 {
+        if self.build_steps_limit == 0 {
+            DEFAULT_OPENCODE_BUILD_STEPS_LIMIT
+        } else {
+            self.build_steps_limit
+        }
+    }
+
+    pub fn effective_fireworks_timeout_ms(&self) -> u64 {
+        if self.fireworks_timeout_ms == 0 {
+            DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS
+        } else {
+            self.fireworks_timeout_ms
+        }
+    }
+
+    pub fn effective_fireworks_chunk_timeout_ms(&self) -> u64 {
+        if self.fireworks_chunk_timeout_ms == 0 {
+            DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS
+        } else {
+            self.fireworks_chunk_timeout_ms
         }
     }
 
@@ -892,7 +961,8 @@ mod tests {
         default_launchers, default_terminal_shortcuts, normalize_launcher_entries,
         normalize_terminal_shortcut_entries, AcpStartupMode, AppConfig, BuiltinLauncherKind,
         LauncherEntry, LauncherIconKey, OpenCodeAcpModelEntry, OpenCodeModelConfig, ShellKind,
-        ShortcutModifiers, TerminalShortcutEntry, UiConfig,
+        ShortcutModifiers, TerminalShortcutEntry, UiConfig, DEFAULT_OPENCODE_BUILD_STEPS_LIMIT,
+        DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS, DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS,
     };
 
     #[test]
@@ -1249,6 +1319,17 @@ mod tests {
         assert_eq!(config.plan_model, "openai/gpt-5.5-fast");
         assert_eq!(config.plan_effort, "xhigh");
         assert_eq!(config.active_build_model_slot, "a");
+        assert!(config.loop_protection_enabled);
+        assert_eq!(config.build_steps_limit, DEFAULT_OPENCODE_BUILD_STEPS_LIMIT);
+        assert_eq!(
+            config.fireworks_timeout_ms,
+            DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS
+        );
+        assert_eq!(
+            config.fireworks_chunk_timeout_ms,
+            DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS
+        );
+        assert!(config.kimi_strict_permissions);
     }
 
     #[test]
@@ -1295,6 +1376,11 @@ mod tests {
                 "custom/model-a".to_owned(),
                 "Custom Model A".to_owned(),
             )],
+            loop_protection_enabled: false,
+            build_steps_limit: 12,
+            fireworks_timeout_ms: 700_000,
+            fireworks_chunk_timeout_ms: 180_000,
+            kimi_strict_permissions: false,
         };
 
         let serialized = serde_json::to_string(&original).unwrap();
@@ -1309,6 +1395,39 @@ mod tests {
         assert_eq!(deserialized.acp_known_models.len(), 1);
         assert_eq!(deserialized.acp_known_models[0].value, "custom/model-a");
         assert_eq!(deserialized.acp_known_models[0].name, "Custom Model A");
+        assert!(!deserialized.loop_protection_enabled);
+        assert_eq!(deserialized.build_steps_limit, 12);
+        assert_eq!(deserialized.fireworks_timeout_ms, 700_000);
+        assert_eq!(deserialized.fireworks_chunk_timeout_ms, 180_000);
+        assert!(!deserialized.kimi_strict_permissions);
+    }
+
+    #[test]
+    fn opencode_model_config_missing_safety_fields_use_defaults() {
+        let raw = r#"{
+            "build_model_slot_a": "custom/model-a",
+            "build_model_slot_b": "custom/model-b",
+            "plan_model": "custom/plan",
+            "plan_effort": "high",
+            "active_build_model_slot": "a"
+        }"#;
+
+        let config: OpenCodeModelConfig = serde_json::from_str(raw).unwrap();
+
+        assert!(config.loop_protection_enabled);
+        assert_eq!(
+            config.effective_build_steps_limit(),
+            DEFAULT_OPENCODE_BUILD_STEPS_LIMIT
+        );
+        assert_eq!(
+            config.effective_fireworks_timeout_ms(),
+            DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS
+        );
+        assert_eq!(
+            config.effective_fireworks_chunk_timeout_ms(),
+            DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS
+        );
+        assert!(config.kimi_strict_permissions);
     }
 
     #[test]

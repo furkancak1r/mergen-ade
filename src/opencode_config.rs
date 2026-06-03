@@ -12,7 +12,10 @@ use crate::browser_mcp_service::{
     MERGEN_BROWSER_MCP_TOKEN_ENV_VAR,
 };
 use crate::models::{
-    AcpStartupMode, OpenCodeModelConfig, DEFAULT_OPENCODE_PLAN_EFFORT, DEFAULT_OPENCODE_PLAN_MODEL,
+    AcpStartupMode, OpenCodeModelConfig, DEFAULT_OPENCODE_BUILD_STEPS_LIMIT,
+    DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS, DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS,
+    DEFAULT_OPENCODE_KIMI_STRICT_PERMISSIONS, DEFAULT_OPENCODE_LOOP_PROTECTION_ENABLED,
+    DEFAULT_OPENCODE_PLAN_EFFORT, DEFAULT_OPENCODE_PLAN_MODEL,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +24,11 @@ pub struct OpenCodeRuntimeDefaults {
     pub plan_model: String,
     pub plan_effort: String,
     pub default_agent: String,
+    pub loop_protection_enabled: bool,
+    pub build_steps_limit: u32,
+    pub fireworks_timeout_ms: u64,
+    pub fireworks_chunk_timeout_ms: u64,
+    pub kimi_strict_permissions: bool,
 }
 
 impl OpenCodeRuntimeDefaults {
@@ -42,16 +50,27 @@ impl OpenCodeRuntimeDefaults {
                 "plan" | "build" => default_agent,
                 _ => "build".to_owned(),
             },
+            loop_protection_enabled: DEFAULT_OPENCODE_LOOP_PROTECTION_ENABLED,
+            build_steps_limit: DEFAULT_OPENCODE_BUILD_STEPS_LIMIT,
+            fireworks_timeout_ms: DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS,
+            fireworks_chunk_timeout_ms: DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS,
+            kimi_strict_permissions: DEFAULT_OPENCODE_KIMI_STRICT_PERMISSIONS,
         }
     }
 
     pub fn from_model_config(opencode: &OpenCodeModelConfig, startup_mode: AcpStartupMode) -> Self {
-        Self::new(
+        let mut defaults = Self::new(
             opencode.active_build_model(),
             opencode.effective_plan_model(),
             opencode.effective_plan_effort(),
             startup_mode.as_mode_id(),
-        )
+        );
+        defaults.loop_protection_enabled = opencode.loop_protection_enabled;
+        defaults.build_steps_limit = opencode.effective_build_steps_limit();
+        defaults.fireworks_timeout_ms = opencode.effective_fireworks_timeout_ms();
+        defaults.fireworks_chunk_timeout_ms = opencode.effective_fireworks_chunk_timeout_ms();
+        defaults.kimi_strict_permissions = opencode.kimi_strict_permissions;
+        defaults
     }
 
     pub fn from_build_model(build_model: &str) -> Self {
@@ -72,7 +91,7 @@ impl OpenCodeRuntimeDefaults {
     }
 
     pub fn to_config_json(&self) -> JsonValue {
-        json!({
+        let mut config = json!({
             "$schema": "https://opencode.ai/config.json",
             "agent": {
                 "build": {
@@ -89,7 +108,10 @@ impl OpenCodeRuntimeDefaults {
                     "model": self.build_model
                 }
             }
-        })
+        });
+        apply_runtime_safety_to_config(&mut config, self)
+            .expect("Mergen-generated OpenCode config should be an object");
+        config
     }
 
     pub fn to_env_content_string(&self) -> String {
@@ -223,8 +245,145 @@ fn apply_runtime_defaults_to_config(
         })?;
     changed |= set_json_string(mode_build, "model", &defaults.build_model);
     changed |= set_json_string(root, "default_agent", &defaults.default_agent);
+    changed |= apply_runtime_safety_to_config(value, defaults)?;
 
     Ok(changed)
+}
+
+fn apply_runtime_safety_to_config(
+    value: &mut JsonValue,
+    defaults: &OpenCodeRuntimeDefaults,
+) -> io::Result<bool> {
+    if !defaults.loop_protection_enabled {
+        return Ok(false);
+    }
+
+    let root = value.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OpenCode config root must be a JSON object",
+        )
+    })?;
+    let mut changed = false;
+
+    let agent = root
+        .entry("agent")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "agent must be an object"))?;
+    let build = agent
+        .entry("build")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "agent.build must be an object")
+        })?;
+    changed |= apply_build_agent_safety(build, defaults)?;
+
+    let mode = root
+        .entry("mode")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "mode must be an object"))?;
+    let mode_build = mode
+        .entry("build")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "mode.build must be an object")
+        })?;
+    changed |= apply_build_agent_safety(mode_build, defaults)?;
+
+    if defaults.uses_fireworks_provider() {
+        let provider = root
+            .entry("provider")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "provider must be an object")
+            })?;
+        let fireworks = provider
+            .entry("fireworks-ai")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider.fireworks-ai must be an object",
+                )
+            })?;
+        let options = fireworks
+            .entry("options")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider.fireworks-ai.options must be an object",
+                )
+            })?;
+        changed |= set_json_u64_min(options, "timeout", defaults.fireworks_timeout_ms);
+        changed |= set_json_u64_min(options, "chunkTimeout", defaults.fireworks_chunk_timeout_ms);
+    }
+
+    Ok(changed)
+}
+
+fn apply_build_agent_safety(
+    object: &mut serde_json::Map<String, JsonValue>,
+    defaults: &OpenCodeRuntimeDefaults,
+) -> io::Result<bool> {
+    let mut changed = false;
+    changed |= set_json_u64(object, "steps", u64::from(defaults.build_steps_limit));
+    changed |= set_json_f64(object, "temperature", 0.1);
+
+    let permission = object
+        .entry("permission")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "agent build permission must be an object",
+            )
+        })?;
+
+    changed |= set_json_string(permission, "doom_loop", "allow");
+    if defaults.kimi_strict_permissions && defaults.build_model_is_kimi() {
+        changed |= set_json_string(permission, "*", "ask");
+        changed |= set_json_string(permission, "edit", "ask");
+        changed |= set_json_string(permission, "task", "deny");
+        changed |= set_json_string(permission, "external_directory", "deny");
+        changed |= set_permission_wildcard_action(permission, "bash", "ask")?;
+    }
+
+    Ok(changed)
+}
+
+fn set_permission_wildcard_action(
+    permission: &mut serde_json::Map<String, JsonValue>,
+    key: &str,
+    value: &str,
+) -> io::Result<bool> {
+    match permission.get_mut(key) {
+        Some(existing) if existing.is_object() => {
+            let object = existing.as_object_mut().unwrap();
+            Ok(set_json_string(object, "*", value))
+        }
+        Some(existing) if existing.as_str() == Some(value) => Ok(false),
+        Some(existing) if existing.is_string() || existing.is_null() => {
+            *existing = json!(value);
+            Ok(true)
+        }
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("agent build permission.{key} must be a string or object"),
+        )),
+        None => {
+            permission.insert(key.to_owned(), json!(value));
+            Ok(true)
+        }
+    }
 }
 
 fn set_json_string(
@@ -237,6 +396,50 @@ fn set_json_string(
         object.insert(key.to_owned(), json!(value));
     }
     changed
+}
+
+fn set_json_u64(object: &mut serde_json::Map<String, JsonValue>, key: &str, value: u64) -> bool {
+    let changed = object.get(key).and_then(JsonValue::as_u64) != Some(value);
+    if changed {
+        object.insert(key.to_owned(), json!(value));
+    }
+    changed
+}
+
+fn set_json_u64_min(
+    object: &mut serde_json::Map<String, JsonValue>,
+    key: &str,
+    value: u64,
+) -> bool {
+    let current = object.get(key).and_then(JsonValue::as_u64);
+    if current.is_some_and(|current| current >= value) {
+        return false;
+    }
+    object.insert(key.to_owned(), json!(value));
+    true
+}
+
+fn set_json_f64(object: &mut serde_json::Map<String, JsonValue>, key: &str, value: f64) -> bool {
+    let changed = match object.get(key).and_then(JsonValue::as_f64) {
+        Some(current) => (current - value).abs() > f64::EPSILON,
+        None => true,
+    };
+    if changed {
+        object.insert(key.to_owned(), json!(value));
+    }
+    changed
+}
+
+impl OpenCodeRuntimeDefaults {
+    fn build_model_is_kimi(&self) -> bool {
+        let model = self.build_model.to_ascii_lowercase();
+        model.contains("kimi") || model.contains("k2p6")
+    }
+
+    fn uses_fireworks_provider(&self) -> bool {
+        self.build_model.starts_with("fireworks-ai/")
+            || self.plan_model.starts_with("fireworks-ai/")
+    }
 }
 
 /// Outcome of patching the OpenCode config.
@@ -489,6 +692,7 @@ fn strip_jsonc_comments(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::DEFAULT_OPENCODE_BUILD_MODEL;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -536,7 +740,7 @@ mod tests {
         ));
 
         let config_dir =
-            write_terminal_runtime_config(&temp_dir, 42, "fireworks-ai/k2-turbo").unwrap();
+            write_terminal_runtime_config(&temp_dir, 42, DEFAULT_OPENCODE_BUILD_MODEL).unwrap();
 
         let config_path = config_dir.join("opencode.json");
         assert!(config_path.exists());
@@ -546,11 +750,11 @@ mod tests {
 
         assert_eq!(
             parsed["agent"]["build"]["model"].as_str(),
-            Some("fireworks-ai/k2-turbo")
+            Some(DEFAULT_OPENCODE_BUILD_MODEL)
         );
         assert_eq!(
             parsed["mode"]["build"]["model"].as_str(),
-            Some("fireworks-ai/k2-turbo")
+            Some(DEFAULT_OPENCODE_BUILD_MODEL)
         );
         assert_eq!(
             parsed["agent"]["plan"]["model"].as_str(),
@@ -559,6 +763,30 @@ mod tests {
         assert_eq!(
             parsed["agent"]["plan"]["variant"].as_str(),
             Some(DEFAULT_OPENCODE_PLAN_EFFORT)
+        );
+        assert_eq!(
+            parsed["agent"]["build"]["steps"].as_u64(),
+            Some(u64::from(DEFAULT_OPENCODE_BUILD_STEPS_LIMIT))
+        );
+        assert_eq!(
+            parsed["mode"]["build"]["steps"].as_u64(),
+            Some(u64::from(DEFAULT_OPENCODE_BUILD_STEPS_LIMIT))
+        );
+        assert_eq!(
+            parsed["agent"]["build"]["permission"]["doom_loop"].as_str(),
+            Some("allow")
+        );
+        assert_eq!(
+            parsed["agent"]["build"]["permission"]["edit"].as_str(),
+            Some("ask")
+        );
+        assert_eq!(
+            parsed["provider"]["fireworks-ai"]["options"]["timeout"].as_u64(),
+            Some(DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS)
+        );
+        assert_eq!(
+            parsed["provider"]["fireworks-ai"]["options"]["chunkTimeout"].as_u64(),
+            Some(DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS)
         );
 
         // Cleanup
@@ -598,6 +826,129 @@ mod tests {
         assert_eq!(parsed["agent"]["plan"]["variant"].as_str(), Some("xhigh"));
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn runtime_defaults_patch_preserves_provider_and_raises_fireworks_timeouts() {
+        let mut config = json!({
+            "agent": {
+                "build": {
+                    "model": "old/build",
+                    "permission": {
+                        "*": "allow",
+                        "bash": {
+                            "*": "allow",
+                            "rm -rf *": "deny"
+                        }
+                    }
+                }
+            },
+            "mode": {
+                "build": {
+                    "model": "old/build"
+                }
+            },
+            "provider": {
+                "fireworks-ai": {
+                    "models": {
+                        "accounts/fireworks/routers/kimi-k2p6-turbo": {
+                            "name": "Kimi K2.6 Turbo"
+                        }
+                    },
+                    "options": {
+                        "apiKey": "{env:FIREWORKS_API_KEY}",
+                        "baseURL": "https://api.fireworks.ai/inference/v1",
+                        "timeout": 1
+                    }
+                }
+            },
+            "mcp": {
+                "db": {
+                    "type": "local",
+                    "command": ["npx", "db"]
+                }
+            }
+        });
+        let defaults = OpenCodeRuntimeDefaults::from_build_model(
+            "fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo",
+        );
+
+        let changed = apply_runtime_defaults_to_config(&mut config, &defaults).unwrap();
+
+        assert!(changed);
+        assert_eq!(
+            config["agent"]["build"]["model"].as_str(),
+            Some("fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo")
+        );
+        assert_eq!(
+            config["mode"]["build"]["model"].as_str(),
+            Some("fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo")
+        );
+        assert_eq!(
+            config["agent"]["build"]["steps"].as_u64(),
+            Some(u64::from(DEFAULT_OPENCODE_BUILD_STEPS_LIMIT))
+        );
+        assert_eq!(
+            config["agent"]["build"]["permission"]["doom_loop"].as_str(),
+            Some("allow")
+        );
+        assert_eq!(
+            config["agent"]["build"]["permission"]["task"].as_str(),
+            Some("deny")
+        );
+        assert_eq!(
+            config["agent"]["build"]["permission"]["bash"]["*"].as_str(),
+            Some("ask")
+        );
+        assert_eq!(
+            config["agent"]["build"]["permission"]["bash"]["rm -rf *"].as_str(),
+            Some("deny")
+        );
+        assert_eq!(
+            config["provider"]["fireworks-ai"]["options"]["apiKey"].as_str(),
+            Some("{env:FIREWORKS_API_KEY}")
+        );
+        assert_eq!(
+            config["provider"]["fireworks-ai"]["options"]["baseURL"].as_str(),
+            Some("https://api.fireworks.ai/inference/v1")
+        );
+        assert_eq!(
+            config["provider"]["fireworks-ai"]["options"]["timeout"].as_u64(),
+            Some(DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS)
+        );
+        assert_eq!(
+            config["provider"]["fireworks-ai"]["options"]["chunkTimeout"].as_u64(),
+            Some(DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS)
+        );
+        assert_eq!(config["mcp"]["db"]["type"].as_str(), Some("local"));
+    }
+
+    #[test]
+    fn runtime_defaults_patch_does_not_lower_existing_fireworks_timeouts() {
+        let mut config = json!({
+            "provider": {
+                "fireworks-ai": {
+                    "options": {
+                        "timeout": 700000,
+                        "chunkTimeout": 180000
+                    }
+                }
+            }
+        });
+        let defaults = OpenCodeRuntimeDefaults::from_build_model(
+            "fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo",
+        );
+
+        apply_runtime_defaults_to_config(&mut config, &defaults).unwrap();
+
+        assert_eq!(
+            config["provider"]["fireworks-ai"]["options"]["timeout"].as_u64(),
+            Some(700_000)
+        );
+        assert_eq!(
+            config["provider"]["fireworks-ai"]["options"]["chunkTimeout"].as_u64(),
+            Some(180_000)
+        );
     }
 
     #[test]
@@ -648,6 +999,10 @@ mod tests {
         assert_eq!(
             parsed["agent"]["plan"]["variant"].as_str(),
             Some(DEFAULT_OPENCODE_PLAN_EFFORT)
+        );
+        assert_eq!(
+            parsed["agent"]["build"]["steps"].as_u64(),
+            Some(u64::from(DEFAULT_OPENCODE_BUILD_STEPS_LIMIT))
         );
         assert_eq!(mcp["type"].as_str(), Some("local"));
         assert_eq!(mcp["enabled"].as_bool(), Some(true));

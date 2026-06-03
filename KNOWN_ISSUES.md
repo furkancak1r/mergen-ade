@@ -3263,3 +3263,48 @@
   - Added regression tests for passive project selection, target ACP restore, standby promotion, draft transfer, and preserving already-started ACP chats.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, ACP project-change tests
 - References: User request 2026-06-03
+
+---
+
+#### OpenCode ACP slash command hints rendered below composer and triggered duplicate ScrollArea debug UI {#acp-slash-hints-below-composer-scrollarea}
+- Date: 2026-06-03
+- Context: User reported that typing `/` in OpenCode ACP broke the UI, showed egui debug text about widget placement/ScrollArea IDs, and rendered slash command data below the input instead of above it.
+- Error signature:
+  1. Slash command hints were appended after the composer capsule in the same bottom stack.
+  2. The message history and slash hint list both used vertical `ScrollArea` without stable per-chat IDs.
+- Symptoms/Impact:
+  - Slash suggestions appeared below the input near the status row instead of above the composer.
+  - egui rendered red debug warnings such as duplicate `ScrollArea` IDs.
+- Root cause:
+  - The ACP composer layout treated slash hints like below-composer cards and relied on automatic ScrollArea IDs in multiple sibling vertical scroll areas.
+- Resolution:
+  - Moved slash command hints into a dedicated area above the input capsule.
+  - Added chat-scoped `id_salt` values for ACP message, attachment, and slash hint scroll areas.
+- Prevent recurrence:
+  - Added regression tests for slash filtering, popup height, slash-above-capsule layout, and short-viewport capsule priority.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, ACP composer/slash tests
+- References: User request 2026-06-03
+
+---
+
+#### OpenCode Kimi K2.6 build turns could loop on tool/retry events and then abort {#opencode-kimi-k26-loop-abort}
+- Date: 2026-06-03
+- Context: User provided desktop OpenCode loop report files showing Kimi K2.6 Turbo entering long tool-call/reasoning loops during build-mode thinking, then stopping or aborting shortly after continuation.
+- Error signature:
+  1. Kimi build phases produced many consecutive tool-call finishes before a stop.
+  2. One continuation ended with `MessageAbortedError: Aborted` after a reasoning-only part.
+  3. Global OpenCode config had broad permissions and no build step cap or Fireworks streaming timeout guard.
+- Symptoms/Impact:
+  - OpenCode appeared to think indefinitely, then stopped.
+  - Continuing the same session often reproduced the same short-lived loop/abort cycle.
+- Root cause:
+  - Mergen wrote model defaults but did not add loop-specific safety controls for high-risk Kimi/Fireworks build sessions.
+  - The OpenCode hook service dropped progress events when normalized status stayed `Working`, so Mergen could not detect repeated tool/status loops.
+- Resolution:
+  - Added OpenCode loop protection settings and defaults: build step cap, Fireworks timeout/chunk timeout, and strict Kimi build permissions.
+  - Patched global, runtime terminal, and ACP OpenCode config paths to apply the same safety defaults.
+  - Preserved tool/status event payloads from the OpenCode plugin and added terminal/ACP loop warnings without cancelling the session.
+- Prevent recurrence:
+  - Added regression tests for config safety patching, hook progress event delivery, terminal loop counters, ACP loop messages, and session.status retry mapping.
+- Files/Commands touched: `src/models.rs`, `src/opencode_config.rs`, `src/opencode_hook_service.rs`, `src/opencode.rs`, `src/opencode_acp.rs`, `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User desktop files `opencode-loop-report.txt` and `opencode-loop-sanitized.json`, 2026-06-03

@@ -139,6 +139,10 @@ const OPENCODE_TRAILING_OUTPUT_GRACE_MS: u64 = 750;
 const OPENCODE_RUNNING_GRACE_MS: u64 = 2_000;
 const OPENCODE_NOTIFY_POLL_MS: u64 = 150;
 const OPENCODE_HOOK_POLL_MS: u64 = 100;
+const OPENCODE_TERMINAL_LOOP_WARNING_TOOL_CALLS: usize =
+    crate::opencode_acp::ACP_LOOP_WARNING_TOOL_CALLS;
+const OPENCODE_TERMINAL_LOOP_LIMIT_TOOL_CALLS: usize =
+    crate::opencode_acp::ACP_LOOP_LIMIT_TOOL_CALLS;
 /// Settle duration after Smart Input auto-dispatch before accepting Idle as turn-complete.
 /// Prevents stale delayed Idle events from the previous turn from immediately triggering
 /// back-to-back dispatch of the next queued task.
@@ -348,6 +352,10 @@ const ACP_COMPOSER_MODEL_WIDTH_TARGET: f32 = 220.0;
 const ACP_COMPOSER_MODEL_WIDTH_MAX: f32 = 320.0;
 const ACP_COMPOSER_MODEL_COMBO_CHROME_WIDTH: f32 = 34.0;
 const ACP_COMPOSER_TEXT_WIDTH_MIN: f32 = 56.0;
+const ACP_SLASH_COMMAND_HEADER_HEIGHT: f32 = 24.0;
+const ACP_SLASH_COMMAND_ROW_HEIGHT: f32 = 22.0;
+const ACP_SLASH_COMMAND_MAX_VISIBLE_ROWS: usize = 4;
+const ACP_SLASH_COMMAND_MAX_HEIGHT: f32 = 120.0;
 const ACP_STANDBY_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
 
 fn acp_context_project_combo_width(label_width: f32, available_width: f32) -> f32 {
@@ -372,6 +380,129 @@ fn acp_project_rows_matching_query<'a>(
         .iter()
         .filter(|(_, name)| name.to_lowercase().contains(&query))
         .collect()
+}
+
+fn acp_slash_command_matches(
+    commands: &[crate::opencode_acp::AcpCommand],
+    prompt_input: &str,
+) -> Vec<crate::opencode_acp::AcpCommand> {
+    let query = prompt_input.trim();
+    let Some(prefix) = query.strip_prefix('/') else {
+        return Vec::new();
+    };
+    commands
+        .iter()
+        .filter(|command| command.name.starts_with(prefix))
+        .cloned()
+        .collect()
+}
+
+fn acp_slash_command_popup_height(match_count: usize) -> f32 {
+    if match_count == 0 {
+        return 0.0;
+    }
+    let visible_rows = match_count.min(ACP_SLASH_COMMAND_MAX_VISIBLE_ROWS);
+    (ACP_SLASH_COMMAND_HEADER_HEIGHT + visible_rows as f32 * ACP_SLASH_COMMAND_ROW_HEIGHT)
+        .min(ACP_SLASH_COMMAND_MAX_HEIGHT)
+}
+
+fn opencode_model_has_kimi_loop_risk(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("kimi") || model.contains("k2p6")
+}
+
+fn acp_loop_warning_text(count: usize) -> String {
+    format!(
+        "Loop risk detected after {count} tool calls. Split the task, switch model, or ask OpenCode to summarize remaining work."
+    )
+}
+
+fn acp_loop_limit_text(count: usize) -> String {
+    format!(
+        "Loop guard reached {count} tool calls. OpenCode was not cancelled; send a smaller follow-up or switch away from Kimi for this task."
+    )
+}
+
+fn opencode_terminal_loop_status_text(terminal_id: u64, count: usize) -> String {
+    format!(
+        "OpenCode terminal {terminal_id}: loop risk detected after {count} tool/status events; split the task or switch model."
+    )
+}
+
+fn acp_composer_stack_rects(
+    composer_rect: egui::Rect,
+    slash_popup_height: f32,
+    capsule_body_height: f32,
+) -> (Option<egui::Rect>, egui::Rect) {
+    let available_height = composer_rect.height().max(0.0);
+    let capsule_height = capsule_body_height.min(available_height);
+    let slash_height = slash_popup_height
+        .max(0.0)
+        .min((available_height - capsule_height).max(0.0));
+    let slash_rect = (slash_height > 0.0).then(|| {
+        egui::Rect::from_min_size(
+            composer_rect.min,
+            egui::vec2(composer_rect.width(), slash_height),
+        )
+    });
+    let capsule_top = composer_rect.top() + slash_height;
+    let capsule_height = capsule_body_height.min((composer_rect.bottom() - capsule_top).max(0.0));
+    let capsule_rect = egui::Rect::from_min_size(
+        egui::pos2(composer_rect.left(), capsule_top),
+        egui::vec2(composer_rect.width(), capsule_height),
+    );
+    (slash_rect, capsule_rect)
+}
+
+fn draw_acp_slash_command_popup(
+    ui: &mut egui::Ui,
+    chat_id: u64,
+    popup_rect: egui::Rect,
+    commands: &[crate::opencode_acp::AcpCommand],
+) {
+    ui.allocate_rect(popup_rect, Sense::hover());
+    if ui.is_rect_visible(popup_rect) {
+        ui.painter().rect(
+            popup_rect.shrink2(egui::vec2(1.0, 1.0)),
+            8.0,
+            Color32::from_rgb(18, 18, 18),
+            Stroke::new(1.0, Color32::from_rgb(48, 48, 48)),
+        );
+    }
+    let inner_rect = popup_rect.shrink2(egui::vec2(10.0, 4.0));
+    let mut popup_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(inner_rect)
+            .layout(Layout::top_down(Align::Min)),
+    );
+    popup_ui.set_clip_rect(popup_rect);
+    popup_ui.label(RichText::new("Commands:").small().color(TEXT_MUTED));
+    let scroll_height = (inner_rect.height() - ACP_SLASH_COMMAND_HEADER_HEIGHT).max(0.0);
+    egui::ScrollArea::vertical()
+        .id_salt(("acp-slash-command-hints", chat_id))
+        .max_height(scroll_height)
+        .auto_shrink([false, false])
+        .show(&mut popup_ui, |ui| {
+            ui.set_min_width(inner_rect.width());
+            for command in commands {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(inner_rect.width(), ACP_SLASH_COMMAND_ROW_HEIGHT),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.label(
+                            RichText::new(format!("/{}", command.name))
+                                .strong()
+                                .color(ACCENT),
+                        );
+                        ui.label(
+                            RichText::new(&command.description)
+                                .small()
+                                .color(TEXT_MUTED),
+                        );
+                    },
+                );
+            }
+        });
 }
 
 fn acp_composer_footer_control_rect(footer_rect: egui::Rect) -> egui::Rect {
@@ -896,6 +1027,7 @@ enum AppIcon {
     Plus,
     Question,
     SendHorizontal,
+    Shield,
     Star,
     File,
     FileText,
@@ -923,7 +1055,7 @@ pub enum ForegroundLauncherAction {
 }
 
 impl AppIcon {
-    const ALL: [Self; 39] = [
+    const ALL: [Self; 40] = [
         Self::ArrowClockwise,
         Self::ArrowLeft,
         Self::ArrowRight,
@@ -948,6 +1080,7 @@ impl AppIcon {
         Self::Plus,
         Self::Question,
         Self::SendHorizontal,
+        Self::Shield,
         Self::Star,
         Self::File,
         Self::FileText,
@@ -991,6 +1124,7 @@ impl AppIcon {
             Self::Plus => "plus",
             Self::Question => "help-circle",
             Self::SendHorizontal => "send-horizontal",
+            Self::Shield => "shield",
             Self::Star => "star",
             Self::File => "file",
             Self::FileText => "file-text",
@@ -1391,6 +1525,12 @@ enum OpenCodeStatusSource {
     VisibleUi,
     Notify,
     Hook,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenCodeLoopActivity {
+    ToolCall,
+    RetryStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3113,6 +3253,10 @@ struct TerminalEntry {
     opencode_last_visible_attention_at: Option<Instant>,
     opencode_last_hook_attention_at: Option<Instant>,
     opencode_last_turn_complete_at: Option<Instant>,
+    opencode_tool_calls_this_turn: usize,
+    opencode_retry_statuses_this_turn: usize,
+    opencode_loop_warning_emitted: bool,
+    opencode_loop_limit_emitted: bool,
     /// Pending attention flag for pulse/unread semantics (Orca-compatible)
     /// True when user needs to acknowledge attention (idle/permission after working)
     /// Cleared on terminal focus or keyboard input
@@ -6155,6 +6299,10 @@ impl AdeApp {
             opencode_last_visible_attention_at: None,
             opencode_last_hook_attention_at: None,
             opencode_last_turn_complete_at: None,
+            opencode_tool_calls_this_turn: 0,
+            opencode_retry_statuses_this_turn: 0,
+            opencode_loop_warning_emitted: false,
+            opencode_loop_limit_emitted: false,
             opencode_attention_pending: false,
             opencode_pending_question: None,
             opencode_question_selected: Vec::new(),
@@ -8001,6 +8149,18 @@ impl AdeApp {
         let now = Instant::now();
         let mut changed = false;
 
+        if status == AiCliStatus::Running && source == OpenCodeStatusSource::PromptSubmit {
+            changed |= Self::reset_opencode_terminal_loop_guard(entry);
+        } else if status == AiCliStatus::Attention
+            && matches!(
+                attention_reason,
+                Some(OpenCodeAttentionReason::TurnComplete)
+                    | Some(OpenCodeAttentionReason::SessionError)
+            )
+        {
+            changed |= Self::reset_opencode_terminal_loop_guard(entry);
+        }
+
         // Record evidence timestamps for resolver
         match (status, source) {
             (AiCliStatus::Running, OpenCodeStatusSource::PromptSubmit) => {
@@ -8139,6 +8299,14 @@ impl AdeApp {
         let now = Instant::now();
         let previous_transport_status = entry.opencode_normalized_status;
         let mut changed = false;
+
+        if transport_status == OpenCodeTransportStatus::Working
+            && source == OpenCodeStatusSource::PromptSubmit
+        {
+            changed |= Self::reset_opencode_terminal_loop_guard(entry);
+        } else if transport_status == OpenCodeTransportStatus::Idle {
+            changed |= Self::reset_opencode_terminal_loop_guard(entry);
+        }
 
         // Update normalized status
         if entry.opencode_normalized_status != Some(transport_status) {
@@ -8839,9 +9007,37 @@ impl AdeApp {
             }
 
             if let Ok(terminal_id) = event.terminal_id.parse::<u64>() {
+                changed |= self.note_opencode_loop_activity_from_event(
+                    terminal_id,
+                    event.event_kind.as_deref(),
+                    &event.raw_json,
+                );
+
                 let event_kind = event.event_kind.as_deref().unwrap_or("");
                 let (transport_status, reason_hint) = match event_kind {
                     "working" => (OpenCodeTransportStatus::Working, None),
+                    kind if kind == OPENCODE_TOOL_EXECUTE_BEFORE_EVENT => {
+                        (OpenCodeTransportStatus::Working, None)
+                    }
+                    kind if kind == OPENCODE_TOOL_EXECUTE_AFTER_EVENT => {
+                        (OpenCodeTransportStatus::Working, None)
+                    }
+                    "session.status" => match event
+                        .opencode_status
+                        .unwrap_or(OpenCodeTransportStatus::Working)
+                    {
+                        OpenCodeTransportStatus::Working => {
+                            (OpenCodeTransportStatus::Working, None)
+                        }
+                        OpenCodeTransportStatus::Idle => (
+                            OpenCodeTransportStatus::Idle,
+                            Some(OpenCodeAttentionReason::TurnComplete),
+                        ),
+                        OpenCodeTransportStatus::Permission => (
+                            OpenCodeTransportStatus::Permission,
+                            Some(OpenCodeAttentionReason::PermissionAsked),
+                        ),
+                    },
                     "idle" | "session.idle" | "session_idle" | "session-idle" | "turn-complete"
                     | "turn_complete" => (
                         OpenCodeTransportStatus::Idle,
@@ -9633,6 +9829,12 @@ impl AdeApp {
             return false;
         }
 
+        let mut changed = self.note_opencode_loop_activity_from_event(
+            terminal_id,
+            event.event_kind.as_deref(),
+            &event.raw_json,
+        );
+
         // Use normalized OpenCode status if available (Orca-compatible)
         // This preserves the semantic distinction between idle and permission
         let normalized_status = event.opencode_status;
@@ -9703,15 +9905,28 @@ impl AdeApp {
                     OpenCodeTransportStatus::Idle,
                     Some(OpenCodeAttentionReason::SessionError),
                 ),
+                Some(kind) if kind == "session.status" => {
+                    if Self::opencode_session_status_type_is(&event.raw_json, "idle") {
+                        (
+                            OpenCodeTransportStatus::Idle,
+                            Some(OpenCodeAttentionReason::TurnComplete),
+                        )
+                    } else {
+                        changed |= self.note_opencode_tool_activity(terminal_id);
+                        return changed;
+                    }
+                }
                 // tool.execute.before indicates work is starting/running
                 Some(kind) if kind == OPENCODE_TOOL_EXECUTE_BEFORE_EVENT => {
-                    return self.note_opencode_tool_activity(terminal_id);
+                    changed |= self.note_opencode_tool_activity(terminal_id);
+                    return changed;
                 }
                 // tool.execute.after indicates a tool finished but session may continue
                 Some(kind) if kind == OPENCODE_TOOL_EXECUTE_AFTER_EVENT => {
                     // This is NOT a completion signal - session continues
                     // Only update running timestamp, don't change status
-                    return self.note_opencode_tool_activity(terminal_id);
+                    changed |= self.note_opencode_tool_activity(terminal_id);
+                    return changed;
                 }
                 // Legacy/internal names for backward compatibility
                 Some(kind) if kind == OPENCODE_TURN_COMPLETE_EVENT => (
@@ -9742,12 +9957,123 @@ impl AdeApp {
 
         // Use the unified transport status helper for consistent behavior
         // This properly handles pending_attention on working->idle/permission transitions
-        self.apply_opencode_transport_status(
+        changed |= self.apply_opencode_transport_status(
             terminal_id,
             transport_status,
             OpenCodeStatusSource::Notify,
             reason_hint,
-        )
+        );
+        changed
+    }
+
+    fn note_opencode_loop_activity_from_event(
+        &mut self,
+        terminal_id: u64,
+        event_kind: Option<&str>,
+        raw_json: &str,
+    ) -> bool {
+        let Some(kind) = event_kind else {
+            return false;
+        };
+
+        if kind == OPENCODE_TOOL_EXECUTE_BEFORE_EVENT {
+            return self
+                .note_opencode_terminal_loop_activity(terminal_id, OpenCodeLoopActivity::ToolCall);
+        }
+
+        if kind == "session.status" && Self::opencode_session_status_type_is(raw_json, "retry") {
+            return self.note_opencode_terminal_loop_activity(
+                terminal_id,
+                OpenCodeLoopActivity::RetryStatus,
+            );
+        }
+
+        false
+    }
+
+    fn opencode_session_status_type_is(raw_json: &str, expected: &str) -> bool {
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw_json) else {
+            return false;
+        };
+        const STATUS_TYPE_PATHS: &[&[&str]] = &[
+            &["event", "properties", "status", "type"],
+            &["event", "status", "type"],
+            &["properties", "status", "type"],
+            &["status", "type"],
+        ];
+
+        STATUS_TYPE_PATHS.iter().any(|path| {
+            let mut current = &parsed;
+            for key in *path {
+                let Some(next) = current.get(*key) else {
+                    return false;
+                };
+                current = next;
+            }
+            current
+                .as_str()
+                .is_some_and(|value| value.eq_ignore_ascii_case(expected))
+        })
+    }
+
+    fn note_opencode_terminal_loop_activity(
+        &mut self,
+        terminal_id: u64,
+        activity: OpenCodeLoopActivity,
+    ) -> bool {
+        if !self.config.opencode.loop_protection_enabled {
+            return false;
+        }
+
+        let mut status_line: Option<String> = None;
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+
+        match activity {
+            OpenCodeLoopActivity::ToolCall => {
+                entry.opencode_tool_calls_this_turn =
+                    entry.opencode_tool_calls_this_turn.saturating_add(1);
+            }
+            OpenCodeLoopActivity::RetryStatus => {
+                entry.opencode_retry_statuses_this_turn =
+                    entry.opencode_retry_statuses_this_turn.saturating_add(1);
+            }
+        }
+
+        let count = entry
+            .opencode_tool_calls_this_turn
+            .saturating_add(entry.opencode_retry_statuses_this_turn);
+
+        if !entry.opencode_loop_warning_emitted
+            && count >= OPENCODE_TERMINAL_LOOP_WARNING_TOOL_CALLS
+        {
+            entry.opencode_loop_warning_emitted = true;
+            status_line = Some(opencode_terminal_loop_status_text(terminal_id, count));
+        }
+
+        if !entry.opencode_loop_limit_emitted && count >= OPENCODE_TERMINAL_LOOP_LIMIT_TOOL_CALLS {
+            entry.opencode_loop_limit_emitted = true;
+            status_line = Some(opencode_terminal_loop_status_text(terminal_id, count));
+        }
+
+        entry.dirty = true;
+        if let Some(status_line) = status_line {
+            self.status_line = status_line;
+        }
+        true
+    }
+
+    fn reset_opencode_terminal_loop_guard(entry: &mut TerminalEntry) -> bool {
+        let changed = entry.opencode_tool_calls_this_turn != 0
+            || entry.opencode_retry_statuses_this_turn != 0
+            || entry.opencode_loop_warning_emitted
+            || entry.opencode_loop_limit_emitted;
+        entry.opencode_tool_calls_this_turn = 0;
+        entry.opencode_retry_statuses_this_turn = 0;
+        entry.opencode_loop_warning_emitted = false;
+        entry.opencode_loop_limit_emitted = false;
+        changed
     }
 
     fn note_opencode_tool_activity(&mut self, terminal_id: u64) -> bool {
@@ -10426,6 +10752,7 @@ impl AdeApp {
                                 status,
                                 content: None,
                             });
+                        Self::note_acp_tool_call_activity(session);
                         session.updated_at = Instant::now();
                     }
                     changed = true;
@@ -10538,6 +10865,7 @@ impl AdeApp {
                     if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
                         session.status = crate::opencode_acp::AcpChatStatus::Idle;
                         session.is_running = false;
+                        Self::reset_acp_loop_guard(session);
                         session.updated_at = Instant::now();
                     }
                     self.mark_acp_terminal_manager_attention(
@@ -10573,6 +10901,7 @@ impl AdeApp {
                     self.acknowledge_acp_terminal_manager_attention(chat_id);
                     if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
                         session.status = crate::opencode_acp::AcpChatStatus::Error;
+                        Self::reset_acp_loop_guard(session);
                         session
                             .messages
                             .push(crate::opencode_acp::AcpChatMessage::System {
@@ -10594,6 +10923,7 @@ impl AdeApp {
                     if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
                         session.status = crate::opencode_acp::AcpChatStatus::Exited;
                         session.is_running = false;
+                        Self::reset_acp_loop_guard(session);
                         session.updated_at = Instant::now();
                     }
                     if self.acp_model_probe_chat == Some(chat_id) {
@@ -10846,6 +11176,7 @@ impl AdeApp {
         session: &mut crate::opencode_acp::AcpChatSession,
         prompt_text: &str,
     ) {
+        Self::reset_acp_loop_guard(session);
         session.title = acp_chat_title_from_prompt(prompt_text);
         session
             .messages
@@ -10856,6 +11187,35 @@ impl AdeApp {
         session.history_index = None;
         session.history_draft.clear();
         session.updated_at = Instant::now();
+    }
+
+    fn reset_acp_loop_guard(session: &mut crate::opencode_acp::AcpChatSession) {
+        session.tool_calls_this_turn = 0;
+        session.loop_warning_emitted = false;
+        session.loop_limit_emitted = false;
+    }
+
+    fn note_acp_tool_call_activity(session: &mut crate::opencode_acp::AcpChatSession) {
+        session.tool_calls_this_turn = session.tool_calls_this_turn.saturating_add(1);
+        let count = session.tool_calls_this_turn;
+        if !session.loop_warning_emitted
+            && count >= crate::opencode_acp::ACP_LOOP_WARNING_TOOL_CALLS
+        {
+            session.loop_warning_emitted = true;
+            session
+                .messages
+                .push(crate::opencode_acp::AcpChatMessage::System {
+                    text: acp_loop_warning_text(count),
+                });
+        }
+        if !session.loop_limit_emitted && count >= crate::opencode_acp::ACP_LOOP_LIMIT_TOOL_CALLS {
+            session.loop_limit_emitted = true;
+            session
+                .messages
+                .push(crate::opencode_acp::AcpChatMessage::System {
+                    text: acp_loop_limit_text(count),
+                });
+        }
     }
 
     fn acp_chat_has_started(session: &crate::opencode_acp::AcpChatSession) -> bool {
@@ -17763,6 +18123,100 @@ impl AdeApp {
         show_bounded_settings_card(
             ui,
             card_width,
+            AppIcon::Shield,
+            "Loop Protection",
+            "Limits OpenCode build loops and lengthens Fireworks streaming timeouts.",
+            |ui| {
+                if ui
+                    .checkbox(
+                        &mut self.config.opencode.loop_protection_enabled,
+                        "Enable loop protection",
+                    )
+                    .changed()
+                {
+                    changes.note_opencode_change();
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    settings_copyable_label(
+                        ui,
+                        RichText::new("Build step limit").small().color(TEXT_MUTED),
+                        "Build step limit",
+                    );
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut self.config.opencode.build_steps_limit)
+                                .speed(1.0)
+                                .range(4..=128),
+                        )
+                        .changed()
+                    {
+                        changes.note_opencode_change();
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    settings_copyable_label(
+                        ui,
+                        RichText::new("Fireworks timeout").small().color(TEXT_MUTED),
+                        "Fireworks timeout",
+                    );
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut self.config.opencode.fireworks_timeout_ms)
+                                .speed(1_000.0)
+                                .range(30_000..=1_800_000)
+                                .suffix(" ms"),
+                        )
+                        .changed()
+                    {
+                        changes.note_opencode_change();
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    settings_copyable_label(
+                        ui,
+                        RichText::new("Fireworks chunk timeout")
+                            .small()
+                            .color(TEXT_MUTED),
+                        "Fireworks chunk timeout",
+                    );
+                    if ui
+                        .add(
+                            egui::DragValue::new(
+                                &mut self.config.opencode.fireworks_chunk_timeout_ms,
+                            )
+                            .speed(1_000.0)
+                            .range(30_000..=1_800_000)
+                            .suffix(" ms"),
+                        )
+                        .changed()
+                    {
+                        changes.note_opencode_change();
+                    }
+                });
+
+                ui.add_space(8.0);
+                if ui
+                    .checkbox(
+                        &mut self.config.opencode.kimi_strict_permissions,
+                        "Strict Kimi permissions",
+                    )
+                    .changed()
+                {
+                    changes.note_opencode_change();
+                }
+            },
+        );
+        ui.add_space(12.0);
+
+        show_bounded_settings_card(
+            ui,
+            card_width,
             AppIcon::ChatText,
             "ACP Startup Mode",
             "Choose which mode ACP chat uses when a new session starts.",
@@ -22554,23 +23008,14 @@ impl AdeApp {
                         h += 24.0 + 4.0;
                     }
                     let has_permission = session.pending_permission.is_some();
-                    let has_slash = !session.available_commands.is_empty()
-                        && session.prompt_input.trim().starts_with('/');
                     if has_permission {
                         h += 60.0;
                     }
-                    if has_slash {
-                        let query = session.prompt_input.trim();
-                        let prefix = if query.len() > 1 { &query[1..] } else { "" };
-                        let matches: Vec<_> = session
-                            .available_commands
-                            .iter()
-                            .filter(|c| c.name.starts_with(prefix))
-                            .collect();
-                        if !matches.is_empty() {
-                            h += (matches.len().min(4) as f32 * 22.0 + 24.0).min(120.0);
-                        }
-                    }
+                    let slash_commands = acp_slash_command_matches(
+                        &session.available_commands,
+                        &session.prompt_input,
+                    );
+                    h += acp_slash_command_popup_height(slash_commands.len());
                     h
                 } else {
                     ACP_COMPOSER_CHAT_CAPSULE_HEIGHT
@@ -22741,6 +23186,7 @@ impl AdeApp {
                 );
                 messages_ui.set_clip_rect(messages_rect);
                 egui::ScrollArea::vertical()
+                    .id_salt(("acp-chat-messages", chat_id))
                     .auto_shrink([false, false])
                     .show(&mut messages_ui, |ui| {
                         if let Some(session) = self.acp_chat_sessions.get(&chat_id) {
@@ -22846,16 +23292,31 @@ impl AdeApp {
                     let session_ready = session.session_id.is_some()
                         && !matches!(session.status, crate::opencode_acp::AcpChatStatus::Starting);
                     let draft = session.prompt_input.clone();
+                    let slash_commands = acp_slash_command_matches(
+                        &session.available_commands,
+                        &session.prompt_input,
+                    );
+                    let slash_popup_height =
+                        acp_slash_command_popup_height(slash_commands.len());
 
                     let capsule_body_height = if welcome_center {
                         ACP_WELCOME_COMPOSER_MIN_HEIGHT
                     } else {
                         ACP_COMPOSER_CHAT_CAPSULE_HEIGHT
                     };
-                    let capsule_rect = egui::Rect::from_min_size(
-                        composer_ui.cursor().min,
-                        egui::vec2(composer_ui.available_width(), capsule_body_height),
+                    let (slash_rect, capsule_rect) = acp_composer_stack_rects(
+                        composer_rect,
+                        slash_popup_height,
+                        capsule_body_height,
                     );
+                    if let Some(slash_rect) = slash_rect {
+                        draw_acp_slash_command_popup(
+                            &mut composer_ui,
+                            chat_id,
+                            slash_rect,
+                            &slash_commands,
+                        );
+                    }
                     composer_ui.allocate_rect(capsule_rect, Sense::hover());
                     composer_ui.painter().rect(
                         capsule_rect,
@@ -23391,38 +23852,44 @@ impl AdeApp {
                                 .layout(Layout::left_to_right(Align::Center)),
                         );
                         chip_ui.spacing_mut().item_spacing.x = 6.0;
-                        egui::ScrollArea::horizontal().show(&mut chip_ui, |ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            let mut to_remove = Vec::new();
-                            for (i, path) in session.attachments.iter().enumerate() {
-                                let file_name = std::path::Path::new(path)
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or(path);
-                                let chip = ui.add(
-                                    egui::Button::new(
-                                        RichText::new(format!("{} {}", icons::FOLDER, file_name))
+                        egui::ScrollArea::horizontal()
+                            .id_salt(("acp-attachment-chips", chat_id))
+                            .show(&mut chip_ui, |ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                let mut to_remove = Vec::new();
+                                for (i, path) in session.attachments.iter().enumerate() {
+                                    let file_name = std::path::Path::new(path)
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or(path);
+                                    let chip = ui.add(
+                                        egui::Button::new(
+                                            RichText::new(format!(
+                                                "{} {}",
+                                                icons::FOLDER,
+                                                file_name
+                                            ))
                                             .size(11.0)
                                             .color(Color32::from_rgb(180, 180, 180)),
-                                    )
-                                    .fill(Color32::from_rgb(40, 40, 40))
-                                    .rounding(4.0)
-                                    .stroke(Stroke::new(1.0, Color32::from_rgb(90, 90, 90)))
-                                    .small(),
-                                );
-                                if chip.clicked() {
-                                    to_remove.push(i);
-                                }
-                            }
-                            for i in to_remove.iter().rev() {
-                                let path = session.attachments.remove(*i);
-                                session.prompt_input =
-                                    crate::opencode_acp::remove_mention_from_input(
-                                        &session.prompt_input,
-                                        &path,
+                                        )
+                                        .fill(Color32::from_rgb(40, 40, 40))
+                                        .rounding(4.0)
+                                        .stroke(Stroke::new(1.0, Color32::from_rgb(90, 90, 90)))
+                                        .small(),
                                     );
-                            }
-                        });
+                                    if chip.clicked() {
+                                        to_remove.push(i);
+                                    }
+                                }
+                                for i in to_remove.iter().rev() {
+                                    let path = session.attachments.remove(*i);
+                                    session.prompt_input =
+                                        crate::opencode_acp::remove_mention_from_input(
+                                            &session.prompt_input,
+                                            &path,
+                                        );
+                                }
+                            });
                     }
 
                     // Permission card below composer
@@ -23455,42 +23922,6 @@ impl AdeApp {
                         }
                         if responded {
                             session.pending_permission = None;
-                        }
-                    }
-
-                    // Slash command hint
-                    if !session.available_commands.is_empty() {
-                        let query = session.prompt_input.trim();
-                        if query.starts_with('/') {
-                            let prefix = if query.len() > 1 { &query[1..] } else { "" };
-                            let matches: Vec<_> = session
-                                .available_commands
-                                .iter()
-                                .filter(|c| c.name.starts_with(prefix))
-                                .collect();
-                            if !matches.is_empty() {
-                                composer_ui.add_space(4.0);
-                                composer_ui
-                                    .label(RichText::new("Commands:").small().color(TEXT_MUTED));
-                                egui::ScrollArea::vertical()
-                                    .auto_shrink([false, true])
-                                    .show(&mut composer_ui, |ui| {
-                                        for cmd in &matches {
-                                            ui.horizontal(|ui| {
-                                                ui.label(
-                                                    RichText::new(format!("/{}", cmd.name))
-                                                        .strong()
-                                                        .color(ACCENT),
-                                                );
-                                                ui.label(
-                                                    RichText::new(&cmd.description)
-                                                        .small()
-                                                        .color(TEXT_MUTED),
-                                                );
-                                            });
-                                        }
-                                    });
-                            }
                         }
                     }
 
@@ -23532,6 +23963,23 @@ impl AdeApp {
                         }
                     }
                     status_ui.label(RichText::new("Local").size(11.0).color(TEXT_MUTED));
+                    if let Some(session) = self.acp_chat_sessions.get(&chat_id) {
+                        let active_mode =
+                            session.active_mode_id_or(self.config.acp_startup_mode.as_mode_id());
+                        let model = Self::acp_current_config_value(session, "model")
+                            .unwrap_or_else(|| {
+                                acp_runtime_defaults.desired_model_for_mode(&active_mode)
+                            });
+                        if opencode_model_has_kimi_loop_risk(model) {
+                            status_ui.add_space(8.0);
+                            let (label, color) = if self.config.opencode.loop_protection_enabled {
+                                ("Kimi protected", Color32::from_rgb(100, 195, 140))
+                            } else {
+                                ("Kimi unprotected", Color32::from_rgb(220, 170, 60))
+                            };
+                            status_ui.label(RichText::new(label).size(11.0).color(color));
+                        }
+                    }
                     status_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if let Some(session) = self.acp_chat_sessions.get(&chat_id) {
                             let status_text = match session.status {
@@ -47382,6 +47830,115 @@ mod tests {
     }
 
     #[test]
+    fn opencode_notify_tool_loop_guard_warns_without_cancelling_session() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        if let Some(entry) = app.terminals.get_mut(&1) {
+            entry.ai_session.tool = Some(AiCliTool::OpenCode);
+            entry.ai_session.status = AiCliStatus::Running;
+            entry.opencode_session_active = true;
+            entry.opencode_normalized_status = Some(OpenCodeTransportStatus::Working);
+            entry.opencode_last_status_source = Some(OpenCodeStatusSource::Hook);
+        }
+
+        let event = OpenCodeNotifyInboxEvent {
+            terminal_id: "1".to_owned(),
+            session_id: Some("main-session".to_owned()),
+            parent_session_id: None,
+            tool: "opencode".to_owned(),
+            status: "running".to_owned(),
+            inbox_token: Some(test_opencode_inbox_token(1)),
+            event_kind: Some(crate::opencode::OPENCODE_TOOL_EXECUTE_BEFORE_EVENT.to_owned()),
+            opencode_status: Some(OpenCodeTransportStatus::Working),
+            raw_json: r#"{"type":"tool.execute.before"}"#.to_owned(),
+            timestamp_utc: "2026-05-04T00:00:00Z".to_owned(),
+        };
+
+        for _ in 0..super::OPENCODE_TERMINAL_LOOP_WARNING_TOOL_CALLS {
+            assert!(app.apply_opencode_notify_inbox_event(1, &event));
+        }
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.opencode_tool_calls_this_turn,
+            super::OPENCODE_TERMINAL_LOOP_WARNING_TOOL_CALLS
+        );
+        assert!(terminal.opencode_loop_warning_emitted);
+        assert!(!terminal.opencode_loop_limit_emitted);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+        assert!(app.status_line.contains("loop risk detected"));
+
+        for _ in super::OPENCODE_TERMINAL_LOOP_WARNING_TOOL_CALLS
+            ..super::OPENCODE_TERMINAL_LOOP_LIMIT_TOOL_CALLS
+        {
+            assert!(app.apply_opencode_notify_inbox_event(1, &event));
+        }
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.opencode_tool_calls_this_turn,
+            super::OPENCODE_TERMINAL_LOOP_LIMIT_TOOL_CALLS
+        );
+        assert!(terminal.opencode_loop_limit_emitted);
+        assert_eq!(terminal.ai_session.status, AiCliStatus::Running);
+    }
+
+    #[test]
+    fn opencode_notify_retry_status_counts_toward_loop_guard() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let event = OpenCodeNotifyInboxEvent {
+            terminal_id: "1".to_owned(),
+            session_id: Some("main-session".to_owned()),
+            parent_session_id: None,
+            tool: "opencode".to_owned(),
+            status: "running".to_owned(),
+            inbox_token: Some(test_opencode_inbox_token(1)),
+            event_kind: Some("session.status".to_owned()),
+            opencode_status: Some(OpenCodeTransportStatus::Working),
+            raw_json:
+                r#"{"event":{"type":"session.status","properties":{"status":{"type":"retry"}}}}"#
+                    .to_owned(),
+            timestamp_utc: "2026-05-04T00:00:00Z".to_owned(),
+        };
+
+        for _ in 0..super::OPENCODE_TERMINAL_LOOP_WARNING_TOOL_CALLS {
+            assert!(app.apply_opencode_notify_inbox_event(1, &event));
+        }
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(
+            terminal.opencode_retry_statuses_this_turn,
+            super::OPENCODE_TERMINAL_LOOP_WARNING_TOOL_CALLS
+        );
+        assert!(terminal.opencode_loop_warning_emitted);
+    }
+
+    #[test]
+    fn opencode_transport_idle_resets_terminal_loop_guard() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        {
+            let entry = app.terminals.get_mut(&1).expect("terminal 1");
+            entry.opencode_tool_calls_this_turn = 21;
+            entry.opencode_retry_statuses_this_turn = 2;
+            entry.opencode_loop_warning_emitted = true;
+            entry.opencode_loop_limit_emitted = true;
+            entry.opencode_normalized_status = Some(OpenCodeTransportStatus::Working);
+        }
+
+        assert!(app.apply_opencode_transport_status(
+            1,
+            OpenCodeTransportStatus::Idle,
+            OpenCodeStatusSource::Notify,
+            Some(OpenCodeAttentionReason::TurnComplete),
+        ));
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.opencode_tool_calls_this_turn, 0);
+        assert_eq!(terminal.opencode_retry_statuses_this_turn, 0);
+        assert!(!terminal.opencode_loop_warning_emitted);
+        assert!(!terminal.opencode_loop_limit_emitted);
+    }
+
+    #[test]
     fn visible_opencode_turn_complete_does_not_override_hook_working_state() {
         let ctx = Context::default();
         let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
@@ -48305,6 +48862,10 @@ mod tests {
             opencode_last_visible_attention_at: None,
             opencode_last_hook_attention_at: None,
             opencode_last_turn_complete_at: None,
+            opencode_tool_calls_this_turn: 0,
+            opencode_retry_statuses_this_turn: 0,
+            opencode_loop_warning_emitted: false,
+            opencode_loop_limit_emitted: false,
             opencode_attention_pending: false,
             opencode_pending_question: None,
             opencode_question_selected: Vec::new(),
@@ -65167,6 +65728,92 @@ mod tests {
         );
     }
 
+    fn test_acp_command(name: &str) -> crate::opencode_acp::AcpCommand {
+        crate::opencode_acp::AcpCommand {
+            name: name.to_owned(),
+            description: format!("{name} description"),
+        }
+    }
+
+    #[test]
+    fn acp_slash_command_matches_require_slash_and_filter_prefix() {
+        let commands = vec![
+            test_acp_command("find-skills"),
+            test_acp_command("firecrawl"),
+            test_acp_command("new"),
+        ];
+
+        assert!(super::acp_slash_command_matches(&commands, "find").is_empty());
+        assert_eq!(
+            super::acp_slash_command_matches(&commands, "/")
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["find-skills", "firecrawl", "new"]
+        );
+        assert_eq!(
+            super::acp_slash_command_matches(&commands, "/fi")
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["find-skills", "firecrawl"]
+        );
+        assert!(
+            super::acp_slash_command_matches(&commands, "/Fi").is_empty(),
+            "matching intentionally preserves existing case-sensitive behavior"
+        );
+    }
+
+    #[test]
+    fn acp_slash_command_popup_height_tracks_matches_and_clamps_rows() {
+        assert_eq!(super::acp_slash_command_popup_height(0), 0.0);
+        assert_eq!(
+            super::acp_slash_command_popup_height(1),
+            super::ACP_SLASH_COMMAND_HEADER_HEIGHT + super::ACP_SLASH_COMMAND_ROW_HEIGHT
+        );
+        assert_eq!(
+            super::acp_slash_command_popup_height(12),
+            super::ACP_SLASH_COMMAND_HEADER_HEIGHT
+                + super::ACP_SLASH_COMMAND_MAX_VISIBLE_ROWS as f32
+                    * super::ACP_SLASH_COMMAND_ROW_HEIGHT
+        );
+    }
+
+    #[test]
+    fn acp_composer_stack_rects_place_slash_popup_above_capsule() {
+        let slash_height = super::acp_slash_command_popup_height(3);
+        let composer_rect =
+            egui::Rect::from_min_size(egui::pos2(20.0, 100.0), egui::vec2(400.0, 220.0));
+
+        let (slash_rect, capsule_rect) = super::acp_composer_stack_rects(
+            composer_rect,
+            slash_height,
+            super::ACP_COMPOSER_CHAT_CAPSULE_HEIGHT,
+        );
+        let slash_rect = slash_rect.expect("slash rect");
+
+        assert!((slash_rect.top() - composer_rect.top()).abs() < 0.01);
+        assert!(slash_rect.bottom() <= capsule_rect.top() + 0.01);
+        assert!((capsule_rect.height() - super::ACP_COMPOSER_CHAT_CAPSULE_HEIGHT).abs() < 0.01);
+        assert!(capsule_rect.bottom() <= composer_rect.bottom() + 0.01);
+    }
+
+    #[test]
+    fn acp_composer_stack_rects_prioritize_capsule_in_short_space() {
+        let composer_rect =
+            egui::Rect::from_min_size(egui::pos2(20.0, 100.0), egui::vec2(400.0, 32.0));
+
+        let (slash_rect, capsule_rect) = super::acp_composer_stack_rects(
+            composer_rect,
+            super::acp_slash_command_popup_height(4),
+            super::ACP_COMPOSER_CHAT_CAPSULE_HEIGHT,
+        );
+
+        assert!(slash_rect.is_none());
+        assert!(capsule_rect.top() >= composer_rect.top() - 0.01);
+        assert!(capsule_rect.bottom() <= composer_rect.bottom() + 0.01);
+    }
+
     fn insert_visible_test_acp_chat(
         app: &mut AdeApp,
         chat_id: u64,
@@ -65209,6 +65856,50 @@ mod tests {
 
         AdeApp::append_acp_user_prompt_state(&mut session, "second\nmessage with spacing");
         assert_eq!(session.title, "second message with spacing");
+    }
+
+    #[test]
+    fn acp_tool_loop_guard_emits_warning_and_limit_messages() {
+        let (mut session, _rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
+
+        AdeApp::append_acp_user_prompt_state(&mut session, "start kimi task");
+        for _ in 0..crate::opencode_acp::ACP_LOOP_WARNING_TOOL_CALLS {
+            AdeApp::note_acp_tool_call_activity(&mut session);
+        }
+
+        assert_eq!(
+            session.tool_calls_this_turn,
+            crate::opencode_acp::ACP_LOOP_WARNING_TOOL_CALLS
+        );
+        assert!(session.loop_warning_emitted);
+        assert!(session.messages.iter().any(|message| matches!(
+            message,
+            crate::opencode_acp::AcpChatMessage::System { text }
+                if text.contains("Loop risk detected")
+        )));
+
+        for _ in crate::opencode_acp::ACP_LOOP_WARNING_TOOL_CALLS
+            ..crate::opencode_acp::ACP_LOOP_LIMIT_TOOL_CALLS
+        {
+            AdeApp::note_acp_tool_call_activity(&mut session);
+        }
+
+        assert_eq!(
+            session.tool_calls_this_turn,
+            crate::opencode_acp::ACP_LOOP_LIMIT_TOOL_CALLS
+        );
+        assert!(session.loop_limit_emitted);
+        assert!(session.messages.iter().any(|message| matches!(
+            message,
+            crate::opencode_acp::AcpChatMessage::System { text }
+                if text.contains("Loop guard reached")
+        )));
+
+        AdeApp::append_acp_user_prompt_state(&mut session, "next prompt");
+        assert_eq!(session.tool_calls_this_turn, 0);
+        assert!(!session.loop_warning_emitted);
+        assert!(!session.loop_limit_emitted);
     }
 
     #[test]
@@ -66324,6 +67015,30 @@ mod tests {
         assert!(rects.messages_rect.height() > 80.0);
         assert!(rects.messages_rect.bottom() <= rects.composer_rect.top() + 0.01);
         assert!(rects.composer_rect.bottom() <= rects.status_rect.top() - 3.99);
+    }
+
+    #[test]
+    fn acp_chat_panel_rects_keep_slash_popup_space_above_status_row() {
+        let content_rect =
+            egui::Rect::from_min_size(egui::pos2(16.0, 12.0), egui::vec2(360.0, 460.0));
+        let slash_height = super::acp_slash_command_popup_height(4);
+        let rects = super::acp_chat_panel_rects(
+            content_rect,
+            false,
+            super::ACP_COMPOSER_CHAT_CAPSULE_HEIGHT + slash_height,
+            super::acp_thread_selector_height(false),
+            36.0,
+            22.0,
+        );
+        let (slash_rect, capsule_rect) = super::acp_composer_stack_rects(
+            rects.composer_rect,
+            slash_height,
+            super::ACP_COMPOSER_CHAT_CAPSULE_HEIGHT,
+        );
+
+        assert!(slash_rect.is_some());
+        assert!(rects.messages_rect.bottom() <= rects.composer_rect.top() + 0.01);
+        assert!(capsule_rect.bottom() <= rects.status_rect.top() - 3.99);
     }
 
     #[test]

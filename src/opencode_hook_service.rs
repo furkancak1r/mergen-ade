@@ -86,7 +86,10 @@ impl HookServiceState {
                 || k == "plan_mode_prompt"
                 || k == "plan-mode-prompt"
         });
-        let should_enqueue = changed || is_metadata_event;
+        let is_progress_event = event_kind.as_deref().is_some_and(|k| {
+            k == "tool.execute.before" || k == "tool.execute.after" || k == "session.status"
+        });
+        let should_enqueue = changed || is_metadata_event || is_progress_event;
         if should_enqueue {
             if changed {
                 self.last_status_by_terminal.insert(terminal_id, status);
@@ -619,8 +622,18 @@ async function postStatus(status, event) {
   if (parentSessionID) return;
 
   const body = { status };
-  if (event?.type === "question.asked") {
-    body.event = event;
+  if (event?.type) {
+    body.event = {
+      type: event.type,
+      properties: event.properties,
+      status: event.status,
+      sessionID: event.sessionID,
+      sessionId: event.sessionId,
+      parentSessionID: event.parentSessionID,
+      parentSessionId: event.parentSessionId,
+      parentID: event.parentID,
+      parentId: event.parentId,
+    };
   }
   if (sessionID) body.session_id = sessionID;
 
@@ -982,6 +995,58 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_kind.as_deref(), Some("question.asked"));
         assert!(events[0].raw_json.contains("req-2"));
+    }
+
+    #[test]
+    fn hook_service_progress_events_enqueue_even_when_status_unchanged() {
+        let mut state = HookServiceState::new("token".to_owned());
+
+        assert!(state.record_status(
+            1,
+            OpenCodeTransportStatus::Working,
+            Some("sess-a".to_owned()),
+            None,
+            Some("tool.execute.before".to_owned()),
+            Some(r#"{"event":{"type":"tool.execute.before"}}"#.to_owned()),
+        ));
+        assert_eq!(state.drain_pending_events().len(), 1);
+
+        assert!(!state.record_status(
+            1,
+            OpenCodeTransportStatus::Working,
+            Some("sess-a".to_owned()),
+            None,
+            Some("tool.execute.before".to_owned()),
+            Some(r#"{"event":{"type":"tool.execute.before"}}"#.to_owned()),
+        ));
+        let events = state.drain_pending_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_kind.as_deref(), Some("tool.execute.before"));
+
+        assert!(!state.record_status(
+            1,
+            OpenCodeTransportStatus::Working,
+            Some("sess-a".to_owned()),
+            None,
+            Some("session.status".to_owned()),
+            Some(
+                r#"{"event":{"type":"session.status","properties":{"status":{"type":"retry"}}}}"#
+                    .to_owned()
+            ),
+        ));
+        let events = state.drain_pending_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_kind.as_deref(), Some("session.status"));
+        assert!(events[0].raw_json.contains("retry"));
+    }
+
+    #[test]
+    fn plugin_source_posts_event_type_for_progress_events() {
+        let source = get_opencode_plugin_source();
+
+        assert!(source.contains("if (event?.type)"));
+        assert!(source.contains("type: event.type"));
+        assert!(source.contains("properties: event.properties"));
     }
 
     #[test]

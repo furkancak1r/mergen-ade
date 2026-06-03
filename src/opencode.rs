@@ -286,6 +286,11 @@ pub fn write_opencode_notify_event(
         match kind.as_str() {
             // Working signals
             k if k == OPENCODE_TOOL_EXECUTE_BEFORE_EVENT => Some(OpenCodeTransportStatus::Working),
+            k if k == "session.status" => match extract_session_status_type(payload).as_deref() {
+                Some("busy") | Some("retry") => Some(OpenCodeTransportStatus::Working),
+                Some("idle") => Some(OpenCodeTransportStatus::Idle),
+                _ => None,
+            },
             // Permission signals
             k if k == OPENCODE_PERMISSION_ASKED_EVENT
                 || k == "permission_asked"
@@ -392,6 +397,20 @@ fn extract_event_kind(payload: &str) -> Option<String> {
     kind.and_then(|v| v.as_str()).map(|s| s.to_lowercase())
 }
 
+fn extract_session_status_type(payload: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(payload).ok()?;
+    string_at_any_path(
+        &parsed,
+        &[
+            &["properties", "status", "type"],
+            &["status", "type"],
+            &["event", "properties", "status", "type"],
+            &["event", "status", "type"],
+        ],
+    )
+    .map(|value| value.to_lowercase())
+}
+
 fn extract_session_metadata(payload: &str) -> (Option<String>, Option<String>) {
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(payload) else {
         return (None, None);
@@ -494,6 +513,13 @@ pub fn maybe_handle_opencode_notify_mode() -> io::Result<Option<OpenCodeNotifyIn
                 let opencode_status = event_kind.as_ref().and_then(|kind| match kind.as_str() {
                     k if k == OPENCODE_TOOL_EXECUTE_BEFORE_EVENT => {
                         Some(OpenCodeTransportStatus::Working)
+                    }
+                    k if k == "session.status" => {
+                        match extract_session_status_type(&payload).as_deref() {
+                            Some("busy") | Some("retry") => Some(OpenCodeTransportStatus::Working),
+                            Some("idle") => Some(OpenCodeTransportStatus::Idle),
+                            _ => None,
+                        }
                     }
                     k if k == OPENCODE_PERMISSION_ASKED_EVENT
                         || k == "permission_asked"
@@ -745,6 +771,27 @@ mod tests {
         assert_eq!(events[0].status, "attention");
         assert_eq!(events[0].event_kind.as_deref(), Some("turn-complete"));
         assert_eq!(events[0].raw_json, payload);
+    }
+
+    #[test]
+    fn write_notify_inbox_maps_session_status_retry_to_working() {
+        let temp = TestTempDir::new("opencode-notify-session-status-retry");
+        let payload = r#"{"type":"session.status","properties":{"status":{"type":"retry"}}}"#;
+
+        write_opencode_notify_event(payload, "17", &temp.path, "test-token-17", None)
+            .expect("write should succeed");
+
+        let mut processed = std::collections::HashSet::new();
+        let events = read_opencode_notify_inbox(&temp.path, 17, "test-token-17", &mut processed)
+            .expect("read should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status, "running");
+        assert_eq!(events[0].event_kind.as_deref(), Some("session.status"));
+        assert_eq!(
+            events[0].opencode_status,
+            Some(OpenCodeTransportStatus::Working)
+        );
     }
 
     #[test]

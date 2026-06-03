@@ -14,6 +14,9 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 use serde_json::{json, Value as JsonValue};
 
+pub const ACP_LOOP_WARNING_TOOL_CALLS: usize = 20;
+pub const ACP_LOOP_LIMIT_TOOL_CALLS: usize = 32;
+
 /// Events sent from the ACP agent thread to the UI thread.
 #[derive(Debug, Clone)]
 pub enum AcpChatEvent {
@@ -193,6 +196,9 @@ pub struct AcpChatSession {
     pub recent_inputs: Vec<String>,
     pub history_index: Option<usize>,
     pub history_draft: String,
+    pub tool_calls_this_turn: usize,
+    pub loop_warning_emitted: bool,
+    pub loop_limit_emitted: bool,
     command_tx: crossbeam_channel::Sender<String>,
     #[allow(dead_code)]
     process: Option<Child>,
@@ -373,6 +379,9 @@ pub(crate) fn test_session_for_app(
             recent_inputs: Vec::new(),
             history_index: None,
             history_draft: String::new(),
+            tool_calls_this_turn: 0,
+            loop_warning_emitted: false,
+            loop_limit_emitted: false,
             command_tx: tx,
             process: None,
             writer_thread: None,
@@ -612,6 +621,9 @@ pub fn spawn_opencode_acp(
         recent_inputs: Vec::new(),
         history_index: None,
         history_draft: String::new(),
+        tool_calls_this_turn: 0,
+        loop_warning_emitted: false,
+        loop_limit_emitted: false,
         command_tx,
         process: Some(child),
         writer_thread: Some(writer_thread),
@@ -1035,6 +1047,9 @@ mod tests {
             history_index: None,
             history_draft: String::new(),
             queue: Vec::new(),
+            tool_calls_this_turn: 0,
+            loop_warning_emitted: false,
+            loop_limit_emitted: false,
             command_tx: tx,
             process: None,
             writer_thread: None,
@@ -1070,6 +1085,9 @@ mod tests {
             recent_inputs: Vec::new(),
             history_index: None,
             history_draft: String::new(),
+            tool_calls_this_turn: 0,
+            loop_warning_emitted: false,
+            loop_limit_emitted: false,
             command_tx: tx,
             process: None,
             writer_thread: None,
