@@ -3352,3 +3352,24 @@
   - Added regression tests for `+`/`Plan`/model optical spacing in plan mode and default mode.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, ACP composer tests
 - References: User screenshot/request 2026-06-03
+
+---
+
+#### OpenCode ACP acilinca Foreground akordiyonu kapali kalabiliyor {#acp-visible-chat-foreground-reveal}
+- Date: 2026-06-03
+- Context: User requested that opening OpenCode ACP should also open the Foreground accordion.
+- Error signature:
+  1. ACP visible chat activation updated `active_acp_chat` and chat maps.
+  2. Some activation paths did not also reveal Terminal Manager, select the Foreground filter, or expand the project group.
+- Symptoms/Impact:
+  - ACP chat could become active while the Terminal Manager stayed hidden, on another tab/filter, or with the relevant project group collapsed.
+  - Worktree ACP chats were especially easy to miss because the visible row lives under the root project group.
+- Root cause:
+  - Foreground Terminal Manager reveal behavior was not centralized in the ACP visible-activation path.
+- Resolution:
+  - Added a shared reveal helper that opens Terminal Manager, selects Foreground, selects the target project, and expands the root project accordion.
+  - Routed visible ACP activation paths through that helper while leaving hidden standby/model-probe paths non-revealing.
+- Prevent recurrence:
+  - Added regression tests for visible chat registration, worktree root accordion expansion, selected standby promotion, and unselected standby non-promotion.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, ACP tests
+- References: User request 2026-06-03

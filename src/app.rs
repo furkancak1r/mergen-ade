@@ -10837,7 +10837,7 @@ impl AdeApp {
                     }
                     self.status_line = format!("OpenCode ACP {chat_id} session created");
                     changed |= queued_prompt_sent;
-                    if self.maybe_promote_standby_to_active(chat_id) {
+                    if self.maybe_promote_standby_to_active(ctx, chat_id) {
                         changed = true;
                     }
                 }
@@ -11216,7 +11216,30 @@ impl AdeApp {
         }
     }
 
-    fn register_active_acp_chat(&mut self, project_id: u64, chat_id: u64) {
+    fn reveal_project_in_foreground_terminal_manager(
+        &mut self,
+        ctx: &egui::Context,
+        project_id: u64,
+    ) {
+        if !self.projects.contains_key(&project_id) {
+            return;
+        }
+        if self.selected_project != Some(project_id) {
+            self.selected_project = Some(project_id);
+            self.note_selection_changed();
+        }
+        self.config.ui.show_project_explorer = true;
+        self.config.ui.project_explorer_expanded = true;
+        self.config.ui.left_sidebar_tab = LeftSidebarTab::TerminalManager;
+        self.config.ui.terminal_manager_filter = crate::models::TerminalManagerFilter::Foreground;
+        self.pending_config_changes.ui = true;
+        self.pending_config_changes.selection = true;
+        self.set_terminal_manager_project_group_open_for_project(ctx, project_id);
+        self.persist_config();
+        ctx.request_repaint();
+    }
+
+    fn register_active_acp_chat(&mut self, ctx: &egui::Context, project_id: u64, chat_id: u64) {
         let project_name = self
             .projects
             .get(&project_id)
@@ -11229,9 +11252,10 @@ impl AdeApp {
         self.active_acp_chat_by_project.insert(project_id, chat_id);
         self.active_acp_chat = Some(chat_id);
         self.status_line = format!("Started OpenCode ACP for {project_name}");
+        self.reveal_project_in_foreground_terminal_manager(ctx, project_id);
     }
 
-    fn maybe_promote_standby_to_active(&mut self, chat_id: u64) -> bool {
+    fn maybe_promote_standby_to_active(&mut self, ctx: &egui::Context, chat_id: u64) -> bool {
         let session = match self.acp_chat_sessions.get(&chat_id) {
             Some(s) => s,
             None => return false,
@@ -11256,14 +11280,18 @@ impl AdeApp {
         }
         self.acp_standby_chat_by_project.remove(&project_id);
         self.clear_acp_standby_retry(project_id);
-        self.register_active_acp_chat(project_id, chat_id);
+        self.register_active_acp_chat(ctx, project_id, chat_id);
         self.ensure_acp_standby_for_project(project_id);
         true
     }
 
-    fn promote_standby_to_active_if_present(&mut self, project_id: u64) -> Option<u64> {
+    fn promote_standby_to_active_if_present(
+        &mut self,
+        ctx: &egui::Context,
+        project_id: u64,
+    ) -> Option<u64> {
         if let Some(chat_id) = self.take_warm_standby_for_project(project_id) {
-            self.register_active_acp_chat(project_id, chat_id);
+            self.register_active_acp_chat(ctx, project_id, chat_id);
             self.ensure_acp_standby_for_project(project_id);
             return Some(chat_id);
         }
@@ -11273,7 +11301,7 @@ impl AdeApp {
             return None;
         }
         self.acp_standby_chat_by_project.remove(&project_id);
-        self.register_active_acp_chat(project_id, standby_id);
+        self.register_active_acp_chat(ctx, project_id, standby_id);
         self.ensure_acp_standby_for_project(project_id);
         Some(standby_id)
     }
@@ -11471,11 +11499,15 @@ impl AdeApp {
         Some(session.project_id)
     }
 
-    fn spawn_new_visible_acp_chat_for_project(&mut self, project_id: u64) -> Option<u64> {
+    fn spawn_new_visible_acp_chat_for_project(
+        &mut self,
+        ctx: &egui::Context,
+        project_id: u64,
+    ) -> Option<u64> {
         if let Some(standby_id) = self.acp_standby_chat_by_project.remove(&project_id) {
             if self.acp_chat_sessions.contains_key(&standby_id) {
                 self.clear_acp_standby_retry(project_id);
-                self.register_active_acp_chat(project_id, standby_id);
+                self.register_active_acp_chat(ctx, project_id, standby_id);
                 return Some(standby_id);
             }
         }
@@ -11483,7 +11515,7 @@ impl AdeApp {
         let project_path = self.projects.get(&project_id)?.path.clone();
         match self.spawn_acp_process(project_id, project_path) {
             Ok(chat_id) => {
-                self.register_active_acp_chat(project_id, chat_id);
+                self.register_active_acp_chat(ctx, project_id, chat_id);
                 Some(chat_id)
             }
             Err(err) => {
@@ -11578,7 +11610,7 @@ impl AdeApp {
         let target_chat_id = if let Some(target_chat_id) = reusable_target_chat_id {
             target_chat_id
         } else {
-            self.spawn_new_visible_acp_chat_for_project(target_project_id)?
+            self.spawn_new_visible_acp_chat_for_project(ctx, target_project_id)?
         };
 
         if target_chat_id != chat_id {
@@ -11609,7 +11641,7 @@ impl AdeApp {
         self.active_acp_chat = Some(target_chat_id);
         self.selected_project = Some(target_project_id);
         self.note_selection_changed();
-        self.set_terminal_manager_project_group_open_for_project(ctx, target_project_id);
+        self.reveal_project_in_foreground_terminal_manager(ctx, target_project_id);
         self.pending_config_changes.selection = true;
         self.persist_config();
         ctx.request_repaint();
@@ -11670,7 +11702,7 @@ impl AdeApp {
             .get(&project_id)
             .copied()
             .filter(|chat_id| self.acp_chat_sessions.contains_key(chat_id))
-            .or_else(|| self.spawn_acp_chat_for_project(project_id, false));
+            .or_else(|| self.spawn_acp_chat_for_project(ctx, project_id, false));
 
         let Some(chat_id) = chat_id else {
             self.status_line = "OpenCode ACP hazırlanıyor...".to_owned();
@@ -11680,6 +11712,7 @@ impl AdeApp {
 
         self.active_acp_chat_by_project.insert(project_id, chat_id);
         self.active_acp_chat = Some(chat_id);
+        self.reveal_project_in_foreground_terminal_manager(ctx, project_id);
         let submitted = self.submit_acp_prompt_to_chat(chat_id, prompt_text);
         if submitted {
             ctx.request_repaint();
@@ -11734,7 +11767,8 @@ impl AdeApp {
                 self.restore_acp_welcome_draft(source_chat_id, text, attachments);
                 return false;
             }
-            let Some(new_chat_id) = self.spawn_new_visible_acp_chat_for_project(target_project_id)
+            let Some(new_chat_id) =
+                self.spawn_new_visible_acp_chat_for_project(ctx, target_project_id)
             else {
                 self.restore_acp_welcome_draft(source_chat_id, text, attachments);
                 self.status_line = "OpenCode ACP hazırlanıyor...".to_owned();
@@ -11765,6 +11799,7 @@ impl AdeApp {
         self.active_acp_chat = Some(target_chat_id);
         self.selected_project = Some(target_project_id);
         self.note_selection_changed();
+        self.reveal_project_in_foreground_terminal_manager(ctx, target_project_id);
 
         let submitted = self.submit_acp_prompt_to_chat(target_chat_id, prompt_text);
         if submitted {
@@ -11781,7 +11816,12 @@ impl AdeApp {
         submitted
     }
 
-    fn spawn_acp_chat_for_project(&mut self, project_id: u64, force_new: bool) -> Option<u64> {
+    fn spawn_acp_chat_for_project(
+        &mut self,
+        ctx: &egui::Context,
+        project_id: u64,
+        force_new: bool,
+    ) -> Option<u64> {
         let project_name = self.projects.get(&project_id)?.name.clone();
         if !force_new {
             if let Some(chat_ids) = self.acp_chat_ids_by_project.get(&project_id) {
@@ -11795,6 +11835,7 @@ impl AdeApp {
                             .insert(project_id, last_chat_id);
                         self.active_acp_chat = Some(last_chat_id);
                         self.status_line = format!("Switched to OpenCode ACP for {project_name}");
+                        self.reveal_project_in_foreground_terminal_manager(ctx, project_id);
                         self.ensure_acp_standby_for_project(project_id);
                         return Some(last_chat_id);
                     }
@@ -11803,22 +11844,23 @@ impl AdeApp {
                             .insert(project_id, last_chat_id);
                         self.active_acp_chat = Some(last_chat_id);
                         self.status_line = format!("Switched to OpenCode ACP for {project_name}");
+                        self.reveal_project_in_foreground_terminal_manager(ctx, project_id);
                         self.ensure_acp_standby_for_project(project_id);
                         return Some(last_chat_id);
                     }
                 }
             }
-            if let Some(chat_id) = self.promote_standby_to_active_if_present(project_id) {
+            if let Some(chat_id) = self.promote_standby_to_active_if_present(ctx, project_id) {
                 return Some(chat_id);
             }
             self.ensure_acp_standby_for_project(project_id);
-            if let Some(chat_id) = self.promote_standby_to_active_if_present(project_id) {
+            if let Some(chat_id) = self.promote_standby_to_active_if_present(ctx, project_id) {
                 return Some(chat_id);
             }
             self.status_line = "OpenCode hazırlanıyor...".to_owned();
             return None;
         }
-        if let Some(chat_id) = self.promote_standby_to_active_if_present(project_id) {
+        if let Some(chat_id) = self.promote_standby_to_active_if_present(ctx, project_id) {
             return Some(chat_id);
         }
         if let Some(chat_ids) = self.acp_chat_ids_by_project.get(&project_id) {
@@ -11832,13 +11874,14 @@ impl AdeApp {
                         .insert(project_id, last_chat_id);
                     self.active_acp_chat = Some(last_chat_id);
                     self.status_line = format!("Switched to OpenCode ACP for {project_name}");
+                    self.reveal_project_in_foreground_terminal_manager(ctx, project_id);
                     self.ensure_acp_standby_for_project(project_id);
                     return Some(last_chat_id);
                 }
             }
         }
         self.ensure_acp_standby_for_project(project_id);
-        if let Some(chat_id) = self.promote_standby_to_active_if_present(project_id) {
+        if let Some(chat_id) = self.promote_standby_to_active_if_present(ctx, project_id) {
             return Some(chat_id);
         }
         self.status_line = "OpenCode hazırlanıyor...".to_owned();
@@ -11917,29 +11960,11 @@ impl AdeApp {
         if !self.projects.contains_key(&project_id) {
             return;
         }
-        if self.selected_project != Some(project_id) {
-            self.selected_project = Some(project_id);
-            self.note_selection_changed();
-        }
         self.active_acp_chat = None;
-        self.config.ui.show_project_explorer = true;
-        self.config.ui.project_explorer_expanded = true;
-        self.config.ui.left_sidebar_tab = LeftSidebarTab::TerminalManager;
-        self.config.ui.terminal_manager_filter = crate::models::TerminalManagerFilter::Foreground;
-        self.pending_config_changes.ui = true;
-        self.pending_config_changes.selection = true;
-        let mut header_state = egui::collapsing_header::CollapsingState::load_with_default_open(
-            ctx,
-            terminal_manager_project_group_header_id(project_id),
-            false,
-        );
-        header_state.set_open(true);
-        header_state.store(ctx);
+        self.reveal_project_in_foreground_terminal_manager(ctx, project_id);
         if let Some(terminal_id) = self.preferred_terminal_for_project(project_id) {
             self.active_terminal = Some(terminal_id);
         }
-        self.persist_config();
-        ctx.request_repaint();
     }
 
     fn request_source_control_refresh(&mut self, project_id: u64, run_fetch: bool, manual: bool) {
@@ -21814,7 +21839,7 @@ impl AdeApp {
                             )
                         }
                         Some(ForegroundLauncherAction::OpenCodeChat) => {
-                            self.spawn_acp_chat_for_project(project_id, false)
+                            self.spawn_acp_chat_for_project(ctx, project_id, false)
                                 .is_some()
                         }
                         None => false,
@@ -21904,7 +21929,7 @@ impl AdeApp {
                                             )
                                         }
                                         Some(ForegroundLauncherAction::OpenCodeChat) => {
-                                            self.spawn_acp_chat_for_project(wt_project_id, false)
+                                            self.spawn_acp_chat_for_project(ctx, wt_project_id, false)
                                                 .is_some()
                                         }
                                         None => false,
@@ -23228,6 +23253,7 @@ impl AdeApp {
                             if btn.clicked() {
                                 self.active_acp_chat = Some(cid);
                                 self.active_acp_chat_by_project.insert(project_id, cid);
+                                self.reveal_project_in_foreground_terminal_manager(ctx, project_id);
                             }
                         }
                     }
@@ -23240,7 +23266,7 @@ impl AdeApp {
                     )
                     .clicked()
                 {
-                    self.spawn_acp_chat_for_project(project_id, true);
+                    self.spawn_acp_chat_for_project(ctx, project_id, true);
                 }
                 thread_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
@@ -66086,6 +66112,129 @@ mod tests {
         app.acp_standby_chat_by_project.insert(project_id, chat_id);
     }
 
+    fn terminal_manager_project_group_is_open(ctx: &egui::Context, project_id: u64) -> bool {
+        egui::collapsing_header::CollapsingState::load_with_default_open(
+            ctx,
+            super::terminal_manager_project_group_header_id(project_id),
+            false,
+        )
+        .is_open()
+    }
+
+    #[test]
+    fn registering_visible_acp_chat_reveals_foreground_terminal_manager() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        let (session, _rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-42".to_owned()));
+        app.acp_chat_sessions.insert(42, session);
+        app.config.ui.show_project_explorer = false;
+        app.config.ui.project_explorer_expanded = false;
+        app.config.ui.left_sidebar_tab = LeftSidebarTab::Directory;
+        app.config.ui.terminal_manager_filter = TerminalManagerFilter::Background;
+        set_terminal_manager_project_group_open(&ctx, 7, false);
+
+        app.register_active_acp_chat(&ctx, 7, 42);
+
+        assert_eq!(app.active_acp_chat, Some(42));
+        assert_eq!(app.selected_project, Some(7));
+        assert!(app.config.ui.show_project_explorer);
+        assert!(app.config.ui.project_explorer_expanded);
+        assert_eq!(
+            app.config.ui.left_sidebar_tab,
+            LeftSidebarTab::TerminalManager
+        );
+        assert_eq!(
+            app.config.ui.terminal_manager_filter,
+            TerminalManagerFilter::Foreground
+        );
+        assert!(terminal_manager_project_group_is_open(&ctx, 7));
+    }
+
+    #[test]
+    fn revealing_worktree_acp_chat_opens_root_terminal_manager_group() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Root", "C:/repo", &[], &[]));
+        app.projects.insert(
+            2,
+            test_worktree_project(2, "Feature", "C:/repo-feature", "C:/repo", &[]),
+        );
+        let (session, _rx) =
+            crate::opencode_acp::test_session_for_app(44, 2, Some("session-44".to_owned()));
+        app.acp_chat_sessions.insert(44, session);
+        set_terminal_manager_project_group_open(&ctx, 1, false);
+
+        app.register_active_acp_chat(&ctx, 2, 44);
+
+        assert_eq!(app.selected_project, Some(2));
+        assert_eq!(
+            app.config.ui.left_sidebar_tab,
+            LeftSidebarTab::TerminalManager
+        );
+        assert_eq!(
+            app.config.ui.terminal_manager_filter,
+            TerminalManagerFilter::Foreground
+        );
+        assert!(terminal_manager_project_group_is_open(&ctx, 1));
+    }
+
+    #[test]
+    fn standby_auto_promotion_reveals_foreground_terminal_manager() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        insert_standby_test_acp_chat(&mut app, 42, 7);
+        app.selected_project = Some(7);
+        app.config.ui.show_project_explorer = false;
+        app.config.ui.left_sidebar_tab = LeftSidebarTab::Directory;
+        app.config.ui.terminal_manager_filter = TerminalManagerFilter::Background;
+
+        assert!(app.maybe_promote_standby_to_active(&ctx, 42));
+
+        assert_eq!(app.active_acp_chat, Some(42));
+        assert_eq!(
+            app.config.ui.left_sidebar_tab,
+            LeftSidebarTab::TerminalManager
+        );
+        assert_eq!(
+            app.config.ui.terminal_manager_filter,
+            TerminalManagerFilter::Foreground
+        );
+        assert!(terminal_manager_project_group_is_open(&ctx, 7));
+    }
+
+    #[test]
+    fn unselected_standby_promotion_does_not_reveal_terminal_manager() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        app.projects
+            .insert(8, test_project(8, "Other", "C:/other", &[], &[]));
+        insert_standby_test_acp_chat(&mut app, 42, 7);
+        app.selected_project = Some(8);
+        app.config.ui.show_project_explorer = false;
+        app.config.ui.left_sidebar_tab = LeftSidebarTab::Directory;
+        app.config.ui.terminal_manager_filter = TerminalManagerFilter::Background;
+        set_terminal_manager_project_group_open(&ctx, 7, false);
+
+        assert!(!app.maybe_promote_standby_to_active(&ctx, 42));
+
+        assert!(!app.config.ui.show_project_explorer);
+        assert_eq!(app.config.ui.left_sidebar_tab, LeftSidebarTab::Directory);
+        assert_eq!(
+            app.config.ui.terminal_manager_filter,
+            TerminalManagerFilter::Background
+        );
+        assert_eq!(app.active_acp_chat, None);
+        assert!(!terminal_manager_project_group_is_open(&ctx, 7));
+    }
+
     #[test]
     fn acp_chat_title_tracks_last_user_prompt() {
         let (mut session, _rx) =
@@ -66417,7 +66566,7 @@ mod tests {
             Some(99)
         );
 
-        assert!(!app.maybe_promote_standby_to_active(99));
+        assert!(!app.maybe_promote_standby_to_active(&ctx, 99));
         assert!(!app.acp_chat_sessions.contains_key(&42));
         assert_eq!(app.active_acp_chat, Some(99));
         assert_eq!(app.active_acp_chat_by_project.get(&2), Some(&99));
