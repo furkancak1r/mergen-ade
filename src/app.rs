@@ -5534,6 +5534,29 @@ impl AdeApp {
         self.pending_config_changes.selection = true;
         // Reset Directory search tracking so the same query re-runs for the new project.
         self.reset_directory_search_tracking_for_project(self.selected_project);
+        // If the user changes project while an ACP welcome/loading chat is active,
+        // close that unstarted chat instead of leaving it visible under the old project.
+        self.close_unstarted_active_acp_for_selection_change();
+        self.restore_active_acp_for_selected_project();
+    }
+
+    fn close_unstarted_active_acp_for_selection_change(&mut self) -> bool {
+        let Some(chat_id) = self.active_acp_chat else {
+            return false;
+        };
+        let effective_project_id = self.acp_effective_project_for_chat(chat_id);
+        let should_close = self.acp_chat_sessions.get(&chat_id).is_some_and(|session| {
+            Self::acp_chat_project_change_allowed(session)
+                && effective_project_id != self.selected_project
+        });
+        if should_close {
+            self.kill_acp_chat(chat_id);
+            return true;
+        }
+        false
+    }
+
+    fn restore_active_acp_for_selected_project(&mut self) {
         // Restore the active OpenCode ACP session for the newly selected project.
         if let Some(project_id) = self.selected_project {
             if let Some(&chat_id) = self.active_acp_chat_by_project.get(&project_id) {
@@ -11010,37 +11033,89 @@ impl AdeApp {
         if !self.projects.contains_key(&target_project_id) {
             return None;
         }
-        let source_session = self.acp_chat_sessions.get(&chat_id)?;
-        if !Self::acp_chat_project_change_allowed(source_session) {
-            return None;
-        }
-        let source_project_id = source_session.project_id;
-        let current_effective_project_id = self
-            .acp_effective_project_for_chat(chat_id)
-            .unwrap_or(source_project_id);
+        let (
+            current_effective_project_id,
+            prompt_input,
+            attachments,
+            selected_mode_id,
+            config_values,
+        ) = {
+            let source_session = self.acp_chat_sessions.get(&chat_id)?;
+            if !Self::acp_chat_project_change_allowed(source_session) {
+                return None;
+            }
+            let source_project_id = source_session.project_id;
+            let current_effective_project_id = self
+                .acp_effective_project_for_chat(chat_id)
+                .unwrap_or(source_project_id);
+            let config_values = ["mode", "model", "effort"]
+                .into_iter()
+                .filter_map(|config_id| {
+                    Self::acp_current_config_value(source_session, config_id)
+                        .map(|value| (config_id.to_owned(), value.to_owned()))
+                })
+                .collect::<Vec<_>>();
+            (
+                current_effective_project_id,
+                source_session.prompt_input.clone(),
+                source_session.attachments.clone(),
+                source_session.selected_mode_id.clone(),
+                config_values,
+            )
+        };
         if current_effective_project_id == target_project_id {
             return Some(chat_id);
         }
 
-        if source_project_id == target_project_id {
-            self.acp_pending_project_by_chat.remove(&chat_id);
+        let reusable_target_chat_id = self
+            .active_acp_chat_by_project
+            .get(&target_project_id)
+            .copied()
+            .filter(|target_chat_id| *target_chat_id != chat_id)
+            .filter(|target_chat_id| {
+                self.acp_chat_sessions
+                    .get(target_chat_id)
+                    .is_some_and(Self::acp_chat_project_change_allowed)
+            });
+        let target_chat_id = if let Some(target_chat_id) = reusable_target_chat_id {
+            target_chat_id
         } else {
-            self.acp_pending_project_by_chat
-                .insert(chat_id, target_project_id);
+            self.spawn_new_visible_acp_chat_for_project(target_project_id)?
+        };
+
+        if target_chat_id != chat_id {
+            self.kill_acp_chat(chat_id);
         }
 
+        if let Some(target_session) = self.acp_chat_sessions.get_mut(&target_chat_id) {
+            let source_has_composer_state = !prompt_input.is_empty() || !attachments.is_empty();
+            if source_has_composer_state || target_session.prompt_input.is_empty() {
+                target_session.prompt_input = prompt_input;
+            }
+            if source_has_composer_state || target_session.attachments.is_empty() {
+                target_session.attachments = attachments;
+            }
+            target_session.selected_mode_id = selected_mode_id;
+            for (config_id, value) in config_values {
+                if target_session.session_id.is_some() {
+                    target_session.send_set_config_option(&config_id, &value);
+                }
+                Self::set_local_acp_config_value(target_session, &config_id, &value);
+            }
+        }
+
+        self.acp_pending_project_by_chat.remove(&chat_id);
+        self.acp_pending_project_by_chat.remove(&target_chat_id);
         self.active_acp_chat_by_project
-            .retain(|_, active_chat_id| *active_chat_id != chat_id);
-        self.active_acp_chat_by_project
-            .insert(target_project_id, chat_id);
-        self.active_acp_chat = Some(chat_id);
+            .insert(target_project_id, target_chat_id);
+        self.active_acp_chat = Some(target_chat_id);
         self.selected_project = Some(target_project_id);
         self.note_selection_changed();
         self.set_terminal_manager_project_group_open_for_project(ctx, target_project_id);
         self.pending_config_changes.selection = true;
         self.persist_config();
         ctx.request_repaint();
-        Some(chat_id)
+        Some(target_chat_id)
     }
 
     fn flush_queued_acp_prompts(session: &mut crate::opencode_acp::AcpChatSession) -> bool {
@@ -65174,8 +65249,7 @@ mod tests {
     }
 
     #[test]
-    fn unstarted_acp_project_change_updates_effective_project_without_new_chat() {
-        let ctx = egui::Context::default();
+    fn selection_change_closes_unstarted_active_acp() {
         let mut app = test_app([], None);
         app.projects
             .insert(1, test_project(1, "One", "C:/one", &[], &[]));
@@ -65184,22 +65258,73 @@ mod tests {
         insert_visible_test_acp_chat(&mut app, 42, 1, crate::opencode_acp::AcpChatStatus::Idle);
         app.active_acp_chat = Some(42);
         app.selected_project = Some(1);
-        app.next_acp_chat_id = 100;
+
+        app.selected_project = Some(2);
+        app.note_selection_changed();
+
+        assert!(!app.acp_chat_sessions.contains_key(&42));
+        assert_eq!(app.active_acp_chat, None);
+        assert!(!app.active_acp_chat_by_project.contains_key(&1));
+        assert_eq!(
+            app.terminal_manager_count_for_project_kind(1, TerminalKind::Foreground),
+            0
+        );
+        assert_eq!(
+            app.terminal_manager_count_for_project_kind(2, TerminalKind::Foreground),
+            0
+        );
+    }
+
+    #[test]
+    fn selection_change_preserves_started_acp_in_original_project() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "One", "C:/one", &[], &[]));
+        app.projects
+            .insert(2, test_project(2, "Two", "C:/two", &[], &[]));
+        insert_visible_test_acp_chat(&mut app, 42, 1, crate::opencode_acp::AcpChatStatus::Idle);
+        app.active_acp_chat = Some(42);
+        app.selected_project = Some(1);
         {
             let session = app.acp_chat_sessions.get_mut(&42).unwrap();
-            session.prompt_input = "draft".to_owned();
-            session.attachments = vec!["C:/one/file.txt".to_owned()];
+            AdeApp::append_acp_user_prompt_state(session, "started");
         }
 
-        let moved_chat_id = app.move_unstarted_acp_chat_to_project(&ctx, 42, 2);
+        app.selected_project = Some(2);
+        app.note_selection_changed();
 
-        assert_eq!(moved_chat_id, Some(42));
-        assert_eq!(app.next_acp_chat_id, 100);
         assert!(app.acp_chat_sessions.contains_key(&42));
-        assert_eq!(app.active_acp_chat, Some(42));
-        assert_eq!(app.selected_project, Some(2));
-        assert_eq!(app.active_acp_chat_by_project.get(&2), Some(&42));
-        assert_eq!(app.acp_pending_project_by_chat.get(&42), Some(&2));
+        assert_eq!(app.active_acp_chat, None);
+        assert_eq!(app.active_acp_chat_by_project.get(&1), Some(&42));
+        assert_eq!(
+            app.terminal_manager_count_for_project_kind(1, TerminalKind::Foreground),
+            1
+        );
+        assert_eq!(
+            app.terminal_manager_count_for_project_kind(2, TerminalKind::Foreground),
+            0
+        );
+    }
+
+    #[test]
+    fn selection_change_restores_target_acp_after_closing_unstarted_source() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "One", "C:/one", &[], &[]));
+        app.projects
+            .insert(2, test_project(2, "Two", "C:/two", &[], &[]));
+        insert_visible_test_acp_chat(&mut app, 42, 1, crate::opencode_acp::AcpChatStatus::Idle);
+        insert_visible_test_acp_chat(&mut app, 99, 2, crate::opencode_acp::AcpChatStatus::Idle);
+        app.active_acp_chat = Some(42);
+        app.selected_project = Some(1);
+
+        app.selected_project = Some(2);
+        app.note_selection_changed();
+
+        assert!(!app.acp_chat_sessions.contains_key(&42));
+        assert!(app.acp_chat_sessions.contains_key(&99));
+        assert_eq!(app.active_acp_chat, Some(99));
+        assert_eq!(app.active_acp_chat_by_project.get(&2), Some(&99));
         assert_eq!(
             app.terminal_manager_count_for_project_kind(1, TerminalKind::Foreground),
             0
@@ -65208,18 +65333,10 @@ mod tests {
             app.terminal_manager_count_for_project_kind(2, TerminalKind::Foreground),
             1
         );
-        let moved_session = app.acp_chat_sessions.get(&42).unwrap();
-        assert_eq!(moved_session.project_id, 1);
-        assert_eq!(moved_session.prompt_input, "draft");
-        assert_eq!(
-            moved_session.attachments,
-            vec!["C:/one/file.txt".to_owned()]
-        );
-        assert!(app.terminals.is_empty());
     }
 
     #[test]
-    fn repeated_unstarted_acp_project_changes_do_not_consume_chat_ids() {
+    fn unstarted_acp_project_change_uses_target_standby_and_transfers_draft() {
         let ctx = egui::Context::default();
         let mut app = test_app([], None);
         app.projects
@@ -65227,26 +65344,83 @@ mod tests {
         app.projects
             .insert(2, test_project(2, "Two", "C:/two", &[], &[]));
         insert_visible_test_acp_chat(&mut app, 42, 1, crate::opencode_acp::AcpChatStatus::Idle);
+        insert_standby_test_acp_chat(&mut app, 99, 2);
+        app.active_acp_chat = Some(42);
+        app.selected_project = Some(1);
+        app.next_acp_chat_id = 100;
+        {
+            let session = app.acp_chat_sessions.get_mut(&42).unwrap();
+            session.prompt_input = "draft".to_owned();
+            session.attachments = vec!["C:/one/file.txt".to_owned()];
+            session.selected_mode_id = Some("plan".to_owned());
+            session
+                .config_options
+                .insert("mode".to_owned(), "plan".to_owned());
+        }
+
+        let moved_chat_id = app.move_unstarted_acp_chat_to_project(&ctx, 42, 2);
+
+        assert_eq!(moved_chat_id, Some(99));
+        assert_eq!(app.next_acp_chat_id, 100);
+        assert!(!app.acp_chat_sessions.contains_key(&42));
+        assert!(app.acp_chat_sessions.contains_key(&99));
+        assert_eq!(app.active_acp_chat, Some(99));
+        assert_eq!(app.selected_project, Some(2));
+        assert_eq!(app.active_acp_chat_by_project.get(&2), Some(&99));
+        assert!(!app.acp_pending_project_by_chat.contains_key(&42));
+        assert!(!app.acp_pending_project_by_chat.contains_key(&99));
+        assert!(!app.acp_standby_chat_by_project.contains_key(&2));
+        assert_eq!(
+            app.terminal_manager_count_for_project_kind(1, TerminalKind::Foreground),
+            0
+        );
+        assert_eq!(
+            app.terminal_manager_count_for_project_kind(2, TerminalKind::Foreground),
+            1
+        );
+        let moved_session = app.acp_chat_sessions.get(&99).unwrap();
+        assert_eq!(moved_session.project_id, 2);
+        assert_eq!(moved_session.prompt_input, "draft");
+        assert_eq!(
+            moved_session.attachments,
+            vec!["C:/one/file.txt".to_owned()]
+        );
+        assert_eq!(moved_session.selected_mode_id.as_deref(), Some("plan"));
+        assert_eq!(
+            moved_session.config_options.get("mode").map(String::as_str),
+            Some("plan")
+        );
+        assert!(app.terminals.is_empty());
+    }
+
+    #[test]
+    fn unstarted_acp_project_change_reuses_empty_target_active_chat() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "One", "C:/one", &[], &[]));
+        app.projects
+            .insert(2, test_project(2, "Two", "C:/two", &[], &[]));
+        insert_visible_test_acp_chat(&mut app, 42, 1, crate::opencode_acp::AcpChatStatus::Idle);
+        insert_visible_test_acp_chat(&mut app, 99, 2, crate::opencode_acp::AcpChatStatus::Idle);
         app.active_acp_chat = Some(42);
         app.selected_project = Some(1);
         app.next_acp_chat_id = 77;
+        app.acp_chat_sessions.get_mut(&42).unwrap().prompt_input = "target draft".to_owned();
 
         assert_eq!(
             app.move_unstarted_acp_chat_to_project(&ctx, 42, 2),
-            Some(42)
-        );
-        assert_eq!(
-            app.move_unstarted_acp_chat_to_project(&ctx, 42, 1),
-            Some(42)
-        );
-        assert_eq!(
-            app.move_unstarted_acp_chat_to_project(&ctx, 42, 2),
-            Some(42)
+            Some(99)
         );
 
         assert_eq!(app.next_acp_chat_id, 77);
-        assert_eq!(app.active_acp_chat, Some(42));
-        assert_eq!(app.acp_pending_project_by_chat.get(&42), Some(&2));
+        assert!(!app.acp_chat_sessions.contains_key(&42));
+        assert_eq!(app.active_acp_chat, Some(99));
+        assert_eq!(app.active_acp_chat_by_project.get(&2), Some(&99));
+        assert_eq!(
+            app.acp_chat_sessions.get(&99).unwrap().prompt_input,
+            "target draft"
+        );
         assert_eq!(
             app.terminal_manager_count_for_project_kind(2, TerminalKind::Foreground),
             1
@@ -65254,7 +65428,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_project_welcome_submit_uses_target_acp_and_closes_source() {
+    fn switched_project_welcome_submit_uses_target_acp_and_source_is_closed() {
         let ctx = egui::Context::default();
         let mut app = test_app([], None);
         app.projects
@@ -65270,11 +65444,11 @@ mod tests {
 
         assert_eq!(
             app.move_unstarted_acp_chat_to_project(&ctx, 42, 2),
-            Some(42)
+            Some(99)
         );
         assert!(app.submit_acp_welcome_prompt_from_chat(
             &ctx,
-            42,
+            99,
             2,
             "hello target".to_owned(),
             Vec::new()
@@ -65296,7 +65470,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_project_blocks_target_standby_auto_promotion() {
+    fn switched_project_consumes_target_standby_before_auto_promotion() {
         let ctx = egui::Context::default();
         let mut app = test_app([], None);
         app.projects
@@ -65309,13 +65483,14 @@ mod tests {
 
         assert_eq!(
             app.move_unstarted_acp_chat_to_project(&ctx, 42, 2),
-            Some(42)
+            Some(99)
         );
 
         assert!(!app.maybe_promote_standby_to_active(99));
-        assert_eq!(app.active_acp_chat, Some(42));
-        assert_eq!(app.active_acp_chat_by_project.get(&2), Some(&42));
-        assert_eq!(app.acp_standby_chat_by_project.get(&2), Some(&99));
+        assert!(!app.acp_chat_sessions.contains_key(&42));
+        assert_eq!(app.active_acp_chat, Some(99));
+        assert_eq!(app.active_acp_chat_by_project.get(&2), Some(&99));
+        assert!(!app.acp_standby_chat_by_project.contains_key(&2));
         assert_eq!(
             app.terminal_manager_count_for_project_kind(2, TerminalKind::Foreground),
             1

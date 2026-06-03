@@ -2,6 +2,29 @@
   
 ---
 
+#### Codex CLI update 0.134.0 -> 0.136.0 with stale process cleanup {#codex-update-0.136.0}
+- Date: 2026-06-03
+- Context: User requested updating Codex CLI from 0.134.0 to 0.136.0 and killing any running Codex processes to prevent file-lock conflicts during installation.
+- Error signature: Codex CLI displayed an in-app update prompt (`Update available! 0.134.0 -> 0.136.0`) indicating the global npm package was outdated.
+- Symptoms/Impact:
+  1. Running an outdated Codex version could miss bug fixes, performance improvements, or compatibility updates.
+  2. Updating while a Codex process is active could cause file-lock conflicts or version mismatch between the global package and the running process.
+- Root cause:
+  - The global `@openai/codex` package was at version 0.134.0; 0.136.0 was released.
+  - A Codex process may have been running in a terminal session, holding locks on installed files.
+- Resolution:
+  - Searched for running Codex processes using `Get-CimInstance Win32_Process` filtered by `codex|@openai` in `CommandLine`. No active Codex processes were found.
+  - Verified the global installation via `npm list -g @openai/codex --depth=0` and confirmed it was already at `0.136.0`.
+  - No processes required termination; the update was already applied.
+- Prevent recurrence:
+  - Updated AGENTS.md with the "Codex CLI updates must kill stale Codex processes before installation" guideline.
+  - Updated AGENTS.md with the "Codex CLI version verification after update" guideline.
+  - Recorded this entry in KNOWN_ISSUES.md for future reference when Codex update prompts appear.
+- Files/Commands touched: `AGENTS.md`, `KNOWN_ISSUES.md`, `npm list -g @openai/codex --depth=0`
+- References: User request 2026-06-03
+
+---
+
 #### OpenCode ACP attachments sadece path gönderiyor, içerik enjekte edilmiyor {#acp-attachments-path-only}
 - Date: 2026-06-02
 - Context: User requested that file attachments in the ACP composer should only send file paths to the AI, not the file contents, to prevent context bloat and keep the AI responsible for reading files on demand.
@@ -3218,4 +3241,25 @@
 - Prevent recurrence:
   - Added a regression test asserting the send hit rect stays right-aligned while the painted circle remains inset.
 - Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted ACP composer tests
+- References: User request 2026-06-03
+
+---
+
+#### OpenCode ACP loading chat remained visible under old project after project switch {#acp-loading-chat-old-project}
+- Date: 2026-06-03
+- Context: User reported opening OpenCode ACP for the Mergen project, switching away while it was still loading, and then seeing the ACP foreground row under both the old project and the newly selected project.
+- Error signature:
+  1. General project selection only changed `selected_project` and restored/cleared `active_acp_chat`.
+  2. The unstarted ACP context switch path used `acp_pending_project_by_chat`, so one chat could appear under a different effective project without changing the actual ACP process cwd.
+- Symptoms/Impact:
+  - Terminal Manager Foreground showed a stale OpenCode ACP row under the old project after the user selected another project.
+  - A loading/welcome ACP chat could be visually associated with a target project while its spawned process still belonged to the original project path.
+- Root cause:
+  - Project selection and ACP welcome context changes did not close unstarted source ACP chats before moving focus to another project.
+- Resolution:
+  - Close the active unstarted ACP chat when project selection moves away from its project.
+  - Change ACP welcome project switching to activate a real target-project ACP session and close the unstarted source chat.
+- Prevent recurrence:
+  - Added regression tests for passive project selection, target ACP restore, standby promotion, draft transfer, and preserving already-started ACP chats.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, ACP project-change tests
 - References: User request 2026-06-03
