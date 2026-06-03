@@ -2394,6 +2394,8 @@ pub struct AdeApp {
     acp_chat_ids_by_project: BTreeMap<u64, Vec<u64>>,
     /// Active chat ID per project (which thread is visible for each project).
     active_acp_chat_by_project: BTreeMap<u64, u64>,
+    /// ACP welcome context project per chat ID.
+    acp_context_project_by_chat: BTreeMap<u64, u64>,
     /// Sender for OpenCode ACP events (cloned per spawn).
     acp_chat_events_tx: Sender<crate::opencode_acp::AcpChatEvent>,
     /// Receiver for OpenCode ACP events from the agent threads.
@@ -5029,6 +5031,7 @@ impl AdeApp {
             acp_chat_sessions: BTreeMap::new(),
             acp_chat_ids_by_project: BTreeMap::new(),
             active_acp_chat_by_project: BTreeMap::new(),
+            acp_context_project_by_chat: BTreeMap::new(),
             acp_chat_events_tx,
             acp_chat_events_rx,
             active_acp_chat: None,
@@ -5531,6 +5534,8 @@ impl AdeApp {
             .retain(|(scope, _), _| scope.project_id() != project_id);
         self.browser_video_recordings_by_scope
             .retain(|scope, _| scope.project_id() != project_id);
+        self.acp_context_project_by_chat
+            .retain(|_, context_project_id| *context_project_id != project_id);
         if let Some(service) = self.browser_mcp_service.as_ref() {
             service.revoke_project(project_id);
         }
@@ -10420,6 +10425,7 @@ impl AdeApp {
         }
         self.active_acp_chat_by_project
             .retain(|_, &mut id| id != chat_id);
+        self.acp_context_project_by_chat.remove(&chat_id);
         self.acp_standby_chat_by_project
             .retain(|_, &mut id| id != chat_id);
         if self.active_acp_chat == Some(chat_id) {
@@ -21048,7 +21054,22 @@ impl AdeApp {
             .is_some_and(|s| s.messages.is_empty())
     }
 
-    fn draw_acp_context_chips(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, project_id: u64) {
+    fn acp_context_project_for_chat(&self, chat_id: u64, fallback_project_id: u64) -> u64 {
+        self.acp_context_project_by_chat
+            .get(&chat_id)
+            .copied()
+            .filter(|project_id| self.projects.contains_key(project_id))
+            .unwrap_or(fallback_project_id)
+    }
+
+    fn select_acp_context_project_for_chat(&mut self, chat_id: u64, project_id: u64) -> bool {
+        if !self.projects.contains_key(&project_id) {
+            return false;
+        }
+        self.acp_context_project_by_chat.insert(chat_id, project_id) != Some(project_id)
+    }
+
+    fn draw_acp_context_chips(&mut self, ui: &mut egui::Ui, chat_id: u64, project_id: u64) {
         ui.spacing_mut().item_spacing.x = 10.0;
         let project_rows: Vec<(u64, String)> = sorted_projects(&self.projects)
             .into_iter()
@@ -21059,7 +21080,7 @@ impl AdeApp {
                 )
             })
             .collect();
-        let active_project_id = self.selected_project.unwrap_or(project_id);
+        let active_project_id = self.acp_context_project_for_chat(chat_id, project_id);
         let selected_label = self
             .projects
             .get(&active_project_id)
@@ -21099,7 +21120,7 @@ impl AdeApp {
         };
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            let mut selected_id = self.selected_project;
+            let mut selected_id = Some(active_project_id);
             with_minimal_button_chrome(ui, |ui| {
                 let button_id = ui.make_persistent_id("acp-context-project-select");
                 let popup_id = button_id.with("popup");
@@ -21335,10 +21356,10 @@ impl AdeApp {
                     }
                 }
             });
-            if selected_id != self.selected_project {
+            if selected_id != Some(active_project_id) {
                 self.acp_context_project_search_query.clear();
                 if let Some(new_project_id) = selected_id {
-                    self.focus_project_in_terminal_manager(ctx, new_project_id);
+                    self.select_acp_context_project_for_chat(chat_id, new_project_id);
                 }
             }
         });
@@ -21482,7 +21503,7 @@ impl AdeApp {
                                 .max_rect(context_rect)
                                 .layout(Layout::left_to_right(Align::Center)),
                         );
-                        self.draw_acp_context_chips(&mut context_ui, ctx, project_id);
+                        self.draw_acp_context_chips(&mut context_ui, chat_id, project_id);
                     }
                 } else {
                 // --- Thread selector bar ---
@@ -21698,6 +21719,8 @@ impl AdeApp {
                 composer_ui.set_clip_rect(composer_rect);
                 let acp_favorite_models = self.config.opencode.acp_favorite_models.clone();
                 let mut welcome_foreground_submit: Option<(u64, String)> = None;
+                let acp_context_project_id =
+                    self.acp_context_project_for_chat(chat_id, project_id);
                 if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
                     let is_running = session.is_running
                         || matches!(session.status, crate::opencode_acp::AcpChatStatus::Running);
@@ -22187,7 +22210,7 @@ impl AdeApp {
                             if welcome_center {
                                 let prompt_text =
                                     crate::opencode_acp::build_acp_prompt_text(&text, &attachments);
-                                let target_project = self.selected_project.unwrap_or(project_id);
+                                let target_project = acp_context_project_id;
                                 welcome_foreground_submit = Some((target_project, prompt_text));
                             } else {
                                 let prompt_text =
@@ -22239,7 +22262,7 @@ impl AdeApp {
                             if welcome_center {
                                 let prompt_text =
                                     crate::opencode_acp::build_acp_prompt_text(&text, &attachments);
-                                let target_project = self.selected_project.unwrap_or(project_id);
+                                let target_project = acp_context_project_id;
                                 welcome_foreground_submit = Some((target_project, prompt_text));
                             } else {
                                 let prompt_text =
@@ -47371,6 +47394,7 @@ mod tests {
             acp_chat_sessions: BTreeMap::new(),
             acp_chat_ids_by_project: BTreeMap::new(),
             active_acp_chat_by_project: BTreeMap::new(),
+            acp_context_project_by_chat: BTreeMap::new(),
             acp_chat_events_tx: crossbeam_channel::unbounded().0,
             acp_chat_events_rx: crossbeam_channel::unbounded().1,
             active_acp_chat: None,
@@ -64030,6 +64054,33 @@ mod tests {
             matches.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             vec![2]
         );
+    }
+
+    #[test]
+    fn selecting_acp_context_project_keeps_acp_chat_visible() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Project 1", "C:/one", &[], &[]));
+        app.projects
+            .insert(2, test_project(2, "Project 2", "C:/two", &[], &[]));
+        app.selected_project = Some(1);
+        app.active_acp_chat = Some(42);
+
+        assert!(app.select_acp_context_project_for_chat(42, 2));
+
+        assert_eq!(app.active_acp_chat, Some(42));
+        assert_eq!(app.selected_project, Some(1));
+        assert_eq!(app.acp_context_project_for_chat(42, 1), 2);
+    }
+
+    #[test]
+    fn acp_context_project_falls_back_when_mapping_is_invalid() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(7, test_project(7, "Fallback", "C:/fallback", &[], &[]));
+        app.acp_context_project_by_chat.insert(42, 99);
+
+        assert_eq!(app.acp_context_project_for_chat(42, 7), 7);
     }
 
     #[test]
