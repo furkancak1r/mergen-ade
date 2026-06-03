@@ -558,6 +558,26 @@ fn acp_composer_can_send(
     (!prompt_input.trim().is_empty() || has_attachments) && !is_running && session_ready
 }
 
+fn acp_composer_controls_enabled(is_running: bool, session_ready: bool) -> bool {
+    session_ready && !is_running
+}
+
+fn acp_composer_disabled_control_cursor(enabled: bool) -> Option<egui::CursorIcon> {
+    if enabled {
+        None
+    } else {
+        Some(egui::CursorIcon::NotAllowed)
+    }
+}
+
+fn acp_composer_control_response_cursor(response: egui::Response, enabled: bool) -> egui::Response {
+    if let Some(cursor) = acp_composer_disabled_control_cursor(enabled) {
+        response.on_hover_cursor(cursor)
+    } else {
+        response
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AcpComposerSubmit {
     text: String,
@@ -23447,6 +23467,8 @@ impl AdeApp {
                         || matches!(session.status, crate::opencode_acp::AcpChatStatus::Running);
                     let session_ready = session.session_id.is_some()
                         && !matches!(session.status, crate::opencode_acp::AcpChatStatus::Starting);
+                    let composer_controls_enabled =
+                        acp_composer_controls_enabled(is_running, session_ready);
                     let draft = session.prompt_input.clone();
                     let slash_commands = acp_slash_command_matches(
                         &session.available_commands,
@@ -23517,15 +23539,16 @@ impl AdeApp {
                             .desired_rows(4)
                             .desired_width(input_text_rect.width())
                             .hint_text(welcome_hint)
-                            .interactive(!is_running)
+                            .interactive(composer_controls_enabled)
                             .return_key(egui::KeyboardShortcut::new(
                                 egui::Modifiers::CTRL,
                                 egui::Key::Enter,
                             ))
                             .frame(false);
-                        composer_response = Some(text_ui.add_sized(
-                            input_text_rect.size(),
-                            text_edit,
+                        let response = text_ui.add_sized(input_text_rect.size(), text_edit);
+                        composer_response = Some(acp_composer_control_response_cursor(
+                            response,
+                            composer_controls_enabled,
                         ));
                     }
                     let footer_rect = egui::Rect::from_min_max(
@@ -23564,174 +23587,192 @@ impl AdeApp {
                         footer_rects.plus_rect,
                         footer_rect,
                     ));
-                    let plus_btn = plus_ui.add_sized(
-                        footer_rects.plus_rect.size(),
-                        egui::Button::new(
-                            RichText::new(format!("{}", icons::PLUS))
-                                .size(14.0)
-                                .color(ACP_COMPOSER_ICON_COLOR),
-                        )
-                        .fill(Color32::from_rgb(35, 35, 35))
-                        .rounding(ctrl_h * 0.5)
-                        .stroke(Stroke::NONE),
-                    );
-                        if plus_btn.clicked() {
-                            if let Some(paths) = rfd::FileDialog::new().pick_files() {
-                                let mut added_paths = Vec::new();
-                                for path in paths {
-                                    if let Some(path_str) = path.to_str() {
-                                        let repaired = crate::mojibake::repair_mojibake_display(path_str);
-                                        session.attachments.push(repaired.clone());
-                                        added_paths.push(repaired);
-                                    }
-                                }
-                                if !added_paths.is_empty() {
-                                    session.prompt_input =
-                                        crate::opencode_acp::append_mentions_to_input(
-                                            &session.prompt_input,
-                                            &added_paths,
-                                        );
-                                    ctx.memory_mut(|m| {
-                                        m.request_focus(egui::Id::new("acp-composer-input"))
-                                    });
-                                }
-                                ctx.request_repaint();
-                            }
-                        }
-
-                        if let Some(plan_rect) = footer_rects.plan_rect {
-                            let mut plan_ui = footer_ui.new_child(
-                                egui::UiBuilder::new()
-                                    .max_rect(plan_rect)
-                                    .layout(Layout::left_to_right(Align::Center)),
-                            );
-                            plan_ui.set_clip_rect(acp_composer_footer_widget_clip_rect(
-                                plan_rect,
-                                footer_rect,
-                            ));
-                            let pill_color = Color32::from_rgb(200, 140, 60);
-                            let pill_fill = Color32::from_rgb(40, 28, 16);
-                            let pill_stroke = Color32::from_rgb(140, 100, 40);
-                            let pill_btn = plan_ui.add_sized(
-                                plan_rect.size(),
+                    let plus_btn = plus_ui
+                        .add_enabled_ui(composer_controls_enabled, |ui| {
+                            ui.add_sized(
+                                footer_rects.plus_rect.size(),
                                 egui::Button::new(
-                                    RichText::new("Plan").size(12.0).color(pill_color),
+                                    RichText::new(format!("{}", icons::PLUS))
+                                        .size(14.0)
+                                        .color(ACP_COMPOSER_ICON_COLOR),
                                 )
-                                .fill(pill_fill)
-                                .rounding(6.0)
-                                .stroke(Stroke::new(1.0, pill_stroke)),
-                            );
-                            if pill_btn.clicked() && session_ready {
-                                let new_mode = "build";
-                                session.send_set_config_option("mode", new_mode);
-                                Self::set_local_acp_config_value(session, "mode", new_mode);
-                                session.selected_mode_id = Some(new_mode.to_owned());
-                                Self::apply_acp_runtime_defaults_to_session(
-                                    session,
-                                    &acp_runtime_defaults,
-                                    false,
-                                );
+                                .fill(Color32::from_rgb(35, 35, 35))
+                                .rounding(ctrl_h * 0.5)
+                                .stroke(Stroke::NONE),
+                            )
+                        })
+                        .inner;
+                    let plus_btn = acp_composer_control_response_cursor(
+                        plus_btn,
+                        composer_controls_enabled,
+                    );
+                    if plus_btn.clicked() && composer_controls_enabled {
+                        if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                            let mut added_paths = Vec::new();
+                            for path in paths {
+                                if let Some(path_str) = path.to_str() {
+                                    let repaired =
+                                        crate::mojibake::repair_mojibake_display(path_str);
+                                    session.attachments.push(repaired.clone());
+                                    added_paths.push(repaired);
+                                }
                             }
+                            if !added_paths.is_empty() {
+                                session.prompt_input =
+                                    crate::opencode_acp::append_mentions_to_input(
+                                        &session.prompt_input,
+                                        &added_paths,
+                                    );
+                                ctx.memory_mut(|m| {
+                                    m.request_focus(egui::Id::new("acp-composer-input"))
+                                });
+                            }
+                            ctx.request_repaint();
                         }
+                    }
 
-                        if let Some(text_rect) = footer_rects.text_rect {
-                            let mut text_ui = footer_ui.new_child(
-                                egui::UiBuilder::new()
-                                    .max_rect(acp_composer_input_text_rect(text_rect))
-                                    .layout(Layout::left_to_right(Align::Center)),
-                            );
-                            text_ui.set_clip_rect(acp_composer_footer_widget_clip_rect(
-                                text_rect,
-                                footer_rect,
-                            ));
-                            let input_text_rect = acp_composer_input_text_rect(text_rect);
-                            let hint_text = if session_ready {
-                                if crate::opencode_acp::mode_is_plan(&active_mode) {
-                                    "Plan and design before coding..."
-                                } else {
-                                    "Type a message..."
-                                }
-                            } else {
-                                "Waiting for session..."
-                            };
-                            let text_edit = egui::TextEdit::multiline(&mut session.prompt_input)
-                                .id_salt("acp-composer-input")
-                                .desired_rows(1)
-                                .desired_width(input_text_rect.width())
-                                .hint_text(hint_text)
-                                .interactive(!is_running)
-                                .return_key(egui::KeyboardShortcut::new(
-                                    egui::Modifiers::CTRL,
-                                    egui::Key::Enter,
-                                ))
-                                .vertical_align(egui::Align::Center)
-                                .frame(false);
-                            chat_text_response = Some(text_ui.add_sized(
-                                input_text_rect.size(),
-                                text_edit,
-                            ));
-                        }
-
-                        let mut selected_model = session
-                            .config_option("model")
-                            .map(|o| o.current_value.clone())
-                            .or_else(|| {
-                                Self::acp_current_config_value(session, "model")
-                                    .map(ToOwned::to_owned)
-                            })
-                            .unwrap_or_else(|| {
-                                acp_runtime_defaults
-                                    .desired_model_for_mode(&active_mode)
-                                    .to_owned()
-                            });
-                        let current_model = selected_model.clone();
-                        let mut selected_effort = session
-                            .config_option("effort")
-                            .map(|o| o.current_value.clone())
-                            .or_else(|| {
-                                Self::acp_current_config_value(session, "effort")
-                                    .map(ToOwned::to_owned)
-                            })
-                            .unwrap_or_else(|| {
-                                if crate::opencode_acp::mode_is_plan(&active_mode) {
-                                    acp_runtime_defaults.plan_effort.clone()
-                                } else {
-                                    String::new()
-                                }
-                            });
-                        let current_effort = selected_effort.clone();
-
-                        // Scope so interact_size and widget visuals only affect the ComboBox button
-                        let mut model_ui = footer_ui.new_child(
+                    if let Some(plan_rect) = footer_rects.plan_rect {
+                        let mut plan_ui = footer_ui.new_child(
                             egui::UiBuilder::new()
-                                .max_rect(footer_rects.model_rect)
+                                .max_rect(plan_rect)
                                 .layout(Layout::left_to_right(Align::Center)),
                         );
-                        model_ui.set_clip_rect(acp_composer_footer_widget_clip_rect(
-                            footer_rects.model_rect,
+                        plan_ui.set_clip_rect(acp_composer_footer_widget_clip_rect(
+                            plan_rect,
                             footer_rect,
                         ));
-                        let _combo_response = model_ui
-                            .scope(|ui| {
-                                ui.set_width(footer_rects.model_rect.width());
-                                ui.spacing_mut().interact_size.y = ACP_COMPOSER_CONTROL_HEIGHT;
-                                ui.spacing_mut().button_padding.x =
-                                    ACP_COMPOSER_MODEL_BUTTON_PADDING_X;
-                                // Local widget visuals for consistent capsule tone
-                                let visuals = ui.visuals_mut();
-                                visuals.widgets.inactive.bg_fill = ACP_COMPOSER_CAPSULE_FILL;
-                                visuals.widgets.inactive.weak_bg_fill = ACP_COMPOSER_CAPSULE_FILL;
-                                visuals.widgets.inactive.bg_stroke = Stroke::NONE;
-                                visuals.widgets.hovered.bg_fill = Color32::from_rgb(38, 38, 38);
-                                visuals.widgets.hovered.bg_stroke = Stroke::NONE;
-                                visuals.widgets.active.bg_stroke = Stroke::NONE;
-                                visuals.widgets.open.bg_stroke = Stroke::NONE;
-                                visuals.widgets.open.bg_fill = Color32::from_rgb(44, 44, 44);
-                                visuals.widgets.open.bg_stroke =
-                                    Stroke::new(1.0, Color32::from_rgb(70, 70, 70));
+                        let pill_color = Color32::from_rgb(200, 140, 60);
+                        let pill_fill = Color32::from_rgb(40, 28, 16);
+                        let pill_stroke = Color32::from_rgb(140, 100, 40);
+                        let pill_btn = plan_ui
+                            .add_enabled_ui(composer_controls_enabled, |ui| {
+                                ui.add_sized(
+                                    plan_rect.size(),
+                                    egui::Button::new(
+                                        RichText::new("Plan").size(12.0).color(pill_color),
+                                    )
+                                    .fill(pill_fill)
+                                    .rounding(6.0)
+                                    .stroke(Stroke::new(1.0, pill_stroke)),
+                                )
+                            })
+                            .inner;
+                        let pill_btn = acp_composer_control_response_cursor(
+                            pill_btn,
+                            composer_controls_enabled,
+                        );
+                        if pill_btn.clicked() && composer_controls_enabled {
+                            let new_mode = "build";
+                            session.send_set_config_option("mode", new_mode);
+                            Self::set_local_acp_config_value(session, "mode", new_mode);
+                            session.selected_mode_id = Some(new_mode.to_owned());
+                            Self::apply_acp_runtime_defaults_to_session(
+                                session,
+                                &acp_runtime_defaults,
+                                false,
+                            );
+                        }
+                    }
+
+                    if let Some(text_rect) = footer_rects.text_rect {
+                        let mut text_ui = footer_ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(acp_composer_input_text_rect(text_rect))
+                                .layout(Layout::left_to_right(Align::Center)),
+                        );
+                        text_ui.set_clip_rect(acp_composer_footer_widget_clip_rect(
+                            text_rect,
+                            footer_rect,
+                        ));
+                        let input_text_rect = acp_composer_input_text_rect(text_rect);
+                        let hint_text = if session_ready {
+                            if crate::opencode_acp::mode_is_plan(&active_mode) {
+                                "Plan and design before coding..."
+                            } else {
+                                "Type a message..."
+                            }
+                        } else {
+                            "Waiting for session..."
+                        };
+                        let text_edit = egui::TextEdit::multiline(&mut session.prompt_input)
+                            .id_salt("acp-composer-input")
+                            .desired_rows(1)
+                            .desired_width(input_text_rect.width())
+                            .hint_text(hint_text)
+                            .interactive(composer_controls_enabled)
+                            .return_key(egui::KeyboardShortcut::new(
+                                egui::Modifiers::CTRL,
+                                egui::Key::Enter,
+                            ))
+                            .vertical_align(egui::Align::Center)
+                            .frame(false);
+                        let response = text_ui.add_sized(input_text_rect.size(), text_edit);
+                        chat_text_response = Some(acp_composer_control_response_cursor(
+                            response,
+                            composer_controls_enabled,
+                        ));
+                    }
+
+                    let mut selected_model = session
+                        .config_option("model")
+                        .map(|o| o.current_value.clone())
+                        .or_else(|| {
+                            Self::acp_current_config_value(session, "model").map(ToOwned::to_owned)
+                        })
+                        .unwrap_or_else(|| {
+                            acp_runtime_defaults
+                                .desired_model_for_mode(&active_mode)
+                                .to_owned()
+                        });
+                    let current_model = selected_model.clone();
+                    let mut selected_effort = session
+                        .config_option("effort")
+                        .map(|o| o.current_value.clone())
+                        .or_else(|| {
+                            Self::acp_current_config_value(session, "effort")
+                                .map(ToOwned::to_owned)
+                        })
+                        .unwrap_or_else(|| {
+                            if crate::opencode_acp::mode_is_plan(&active_mode) {
+                                acp_runtime_defaults.plan_effort.clone()
+                            } else {
+                                String::new()
+                            }
+                        });
+                    let current_effort = selected_effort.clone();
+
+                    // Scope so interact_size and widget visuals only affect the ComboBox button
+                    let mut model_ui = footer_ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(footer_rects.model_rect)
+                            .layout(Layout::left_to_right(Align::Center)),
+                    );
+                    model_ui.set_clip_rect(acp_composer_footer_widget_clip_rect(
+                        footer_rects.model_rect,
+                        footer_rect,
+                    ));
+                    let combo_response = model_ui
+                        .scope(|ui| {
+                            ui.set_width(footer_rects.model_rect.width());
+                            ui.spacing_mut().interact_size.y = ACP_COMPOSER_CONTROL_HEIGHT;
+                            ui.spacing_mut().button_padding.x =
+                                ACP_COMPOSER_MODEL_BUTTON_PADDING_X;
+                            // Local widget visuals for consistent capsule tone
+                            let visuals = ui.visuals_mut();
+                            visuals.widgets.inactive.bg_fill = ACP_COMPOSER_CAPSULE_FILL;
+                            visuals.widgets.inactive.weak_bg_fill = ACP_COMPOSER_CAPSULE_FILL;
+                            visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+                            visuals.widgets.hovered.bg_fill = Color32::from_rgb(38, 38, 38);
+                            visuals.widgets.hovered.bg_stroke = Stroke::NONE;
+                            visuals.widgets.active.bg_stroke = Stroke::NONE;
+                            visuals.widgets.open.bg_stroke = Stroke::NONE;
+                            visuals.widgets.open.bg_fill = Color32::from_rgb(44, 44, 44);
+                            visuals.widgets.open.bg_stroke =
+                                Stroke::new(1.0, Color32::from_rgb(70, 70, 70));
+                            if composer_controls_enabled {
                                 egui::ComboBox::from_id_salt("acp_composer_model_selector")
                                     .selected_text(
-                                        RichText::new(model_label)
+                                        RichText::new(model_label.clone())
                                             .size(11.0)
                                             .color(ACP_COMPOSER_ICON_COLOR),
                                     )
@@ -23739,7 +23780,6 @@ impl AdeApp {
                                     .show_ui(ui, |ui| {
                                         let model_opt = session.config_option("model").cloned();
                                         if let Some(model_opt) = model_opt {
-                                            // Search input at the top
                                             ui.add(
                                                 egui::TextEdit::singleline(
                                                     &mut session.model_search_query,
@@ -23757,7 +23797,9 @@ impl AdeApp {
                                                 .filter(|e| {
                                                     acp_favorite_models.contains(&e.value)
                                                         && (e.name.to_lowercase().contains(&query)
-                                                            || e.value.to_lowercase().contains(&query))
+                                                            || e.value
+                                                                .to_lowercase()
+                                                                .contains(&query))
                                                 })
                                                 .collect();
 
@@ -23805,181 +23847,189 @@ impl AdeApp {
                                                 );
                                             }
                                         }
-                                    });
-                            })
-                            .inner;
-                        if selected_model != current_model {
-                            Self::ensure_acp_config_option_value(
-                                session,
-                                "model",
-                                &selected_model,
-                            );
-                        }
-                        if selected_effort != current_effort {
-                            Self::ensure_acp_config_option_value(
-                                session,
-                                "effort",
-                                &selected_effort,
-                            );
-                        }
+                                    })
+                                    .response
+                            } else {
+                                ui.add_enabled_ui(false, |ui| {
+                                    ui.add_sized(
+                                        footer_rects.model_rect.size(),
+                                        egui::Button::new(
+                                            RichText::new(model_label.clone())
+                                                .size(11.0)
+                                                .color(ACP_COMPOSER_ICON_MUTED),
+                                        )
+                                        .fill(ACP_COMPOSER_CAPSULE_FILL)
+                                        .rounding(4.0)
+                                        .stroke(Stroke::NONE),
+                                    )
+                                })
+                                .inner
+                            }
+                        })
+                        .inner;
+                    let _combo_response = acp_composer_control_response_cursor(
+                        combo_response,
+                        composer_controls_enabled,
+                    );
+                    if composer_controls_enabled && selected_model != current_model {
+                        Self::ensure_acp_config_option_value(session, "model", &selected_model);
+                    }
+                    if composer_controls_enabled && selected_effort != current_effort {
+                        Self::ensure_acp_config_option_value(session, "effort", &selected_effort);
+                    }
 
-                        let response = if welcome_center {
-                            composer_response.expect("welcome composer response")
-                        } else {
-                            chat_text_response.expect("chat composer response")
-                        };
+                    let response = if welcome_center {
+                        composer_response.expect("welcome composer response")
+                    } else {
+                        chat_text_response.expect("chat composer response")
+                    };
 
-                        let plain_enter = ui.input(|i| {
-                            i.events.iter().any(|e| {
-                                matches!(
-                                    e,
-                                    Event::Key {
-                                        key: Key::Enter,
-                                        modifiers,
-                                        pressed: true,
-                                        ..
-                                    } if modifiers.is_none()
-                                )
-                            })
-                        });
-                        if response.changed() {
+                    let plain_enter = ui.input(|i| {
+                        i.events.iter().any(|e| {
+                            matches!(
+                                e,
+                                Event::Key {
+                                    key: Key::Enter,
+                                    modifiers,
+                                    pressed: true,
+                                    ..
+                                } if modifiers.is_none()
+                            )
+                        })
+                    });
+                    if response.changed() {
+                        ctx.request_repaint();
+                    }
+
+                    let can_send = acp_composer_can_send(
+                        &session.prompt_input,
+                        !session.attachments.is_empty(),
+                        is_running,
+                        session_ready,
+                    );
+
+                    let (up_pressed, down_pressed) = ui.input(|i| {
+                        let mut up = false;
+                        let mut down = false;
+                        for e in &i.events {
+                            if let Event::Key {
+                                key: Key::ArrowUp,
+                                modifiers,
+                                pressed: true,
+                                ..
+                            } = e
+                            {
+                                if modifiers.is_none() {
+                                    up = true;
+                                }
+                            }
+                            if let Event::Key {
+                                key: Key::ArrowDown,
+                                modifiers,
+                                pressed: true,
+                                ..
+                            } = e
+                            {
+                                if modifiers.is_none() {
+                                    down = true;
+                                }
+                            }
+                        }
+                        (up, down)
+                    });
+                    if composer_controls_enabled && up_pressed && response.has_focus() {
+                        if !session.recent_inputs.is_empty() {
+                            if session.history_index.is_none() {
+                                session.history_draft = session.prompt_input.clone();
+                            }
+                            let new_index = session
+                                .history_index
+                                .map(|i| (i + 1).min(session.recent_inputs.len() - 1))
+                                .unwrap_or(0);
+                            session.history_index = Some(new_index);
+                            session.prompt_input = session.recent_inputs[new_index].clone();
                             ctx.request_repaint();
                         }
-
-                        let can_send = acp_composer_can_send(
-                            &session.prompt_input,
-                            !session.attachments.is_empty(),
-                            is_running,
-                            session_ready,
-                        );
-
-                        let (up_pressed, down_pressed) = ui.input(|i| {
-                            let mut up = false;
-                            let mut down = false;
-                            for e in &i.events {
-                                if let Event::Key {
-                                    key: Key::ArrowUp,
-                                    modifiers,
-                                    pressed: true,
-                                    ..
-                                } = e
-                                {
-                                    if modifiers.is_none() {
-                                        up = true;
-                                    }
-                                }
-                                if let Event::Key {
-                                    key: Key::ArrowDown,
-                                    modifiers,
-                                    pressed: true,
-                                    ..
-                                } = e
-                                {
-                                    if modifiers.is_none() {
-                                        down = true;
-                                    }
-                                }
-                            }
-                            (up, down)
-                        });
-                        if up_pressed && response.has_focus() {
-                            if !session.recent_inputs.is_empty() {
-                                if session.history_index.is_none() {
-                                    session.history_draft = session.prompt_input.clone();
-                                }
-                                let new_index = session
-                                    .history_index
-                                    .map(|i| (i + 1).min(session.recent_inputs.len() - 1))
-                                    .unwrap_or(0);
-                                session.history_index = Some(new_index);
-                                session.prompt_input = session.recent_inputs[new_index].clone();
-                                ctx.request_repaint();
-                            }
-                        }
-                        if down_pressed && response.has_focus() {
-                            if let Some(idx) = session.history_index {
-                                if idx == 0 {
-                                    session.prompt_input = session.history_draft.clone();
-                                    session.history_index = None;
-                                } else {
-                                    session.history_index = Some(idx - 1);
-                                    session.prompt_input = session.recent_inputs[idx - 1].clone();
-                                }
-                                ctx.request_repaint();
-                            }
-                        }
-
-                        let mut submit_requested = plain_enter && response.has_focus() && can_send;
-
-                        let send_response = footer_ui.interact(
-                            footer_rects.send_rect,
-                            Id::new(("acp-composer-send-button", chat_id)),
-                            if can_send {
-                                Sense::click()
+                    }
+                    if composer_controls_enabled && down_pressed && response.has_focus() {
+                        if let Some(idx) = session.history_index {
+                            if idx == 0 {
+                                session.prompt_input = session.history_draft.clone();
+                                session.history_index = None;
                             } else {
-                                Sense::hover()
-                            },
-                        );
-                        let send_response = if can_send {
-                            send_response.on_hover_cursor(egui::CursorIcon::PointingHand)
-                        } else {
-                            send_response
-                        };
-                        let send_paint_rect = acp_composer_send_paint_rect(footer_rects.send_rect);
-                        let send_fill = if can_send {
-                            ACP_COMPOSER_SEND_ACTIVE_FILL
-                        } else {
-                            Color32::from_rgb(45, 45, 45)
-                        };
-                        let send_icon_color = if can_send {
-                            Color32::from_rgb(20, 20, 20)
-                        } else {
-                            ACP_COMPOSER_ICON_MUTED
-                        };
-                        footer_ui.painter().rect_filled(
-                            send_paint_rect,
-                            send_paint_rect.height() * 0.5,
-                            send_fill,
-                        );
-                        footer_ui.painter().text(
-                            send_paint_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            format!("{}", icons::SEND_HORIZONTAL),
-                            FontId::proportional(ACP_COMPOSER_SEND_ICON_SIZE),
-                            send_icon_color,
-                        );
-                        if send_response.clicked() && can_send {
-                            submit_requested = true;
+                                session.history_index = Some(idx - 1);
+                                session.prompt_input = session.recent_inputs[idx - 1].clone();
+                            }
+                            ctx.request_repaint();
                         }
-                        if submit_requested {
-                            if let Some(submit) = take_acp_composer_submit(session) {
-                                if welcome_center {
-                                    let target_project = acp_context_project_id;
-                                    welcome_acp_submit = Some((
-                                        chat_id,
-                                        target_project,
-                                        submit.text,
-                                        submit.attachments,
-                                    ));
-                                } else {
-                                    Self::apply_acp_runtime_defaults_to_session(
-                                        session,
-                                        &acp_runtime_defaults,
-                                        false,
-                                    );
-                                    Self::append_acp_user_prompt_state(
-                                        session,
-                                        &submit.prompt_text,
-                                    );
-                                    session.is_running = true;
-                                    session.status =
-                                        crate::opencode_acp::AcpChatStatus::Running;
-                                    session.send_prompt(&submit.prompt_text);
-                                    acknowledge_acp_attention = true;
-                                    ctx.request_repaint();
-                                }
+                    }
+
+                    let mut submit_requested = plain_enter && response.has_focus() && can_send;
+
+                    let send_response = footer_ui.interact(
+                        footer_rects.send_rect,
+                        Id::new(("acp-composer-send-button", chat_id)),
+                        if can_send {
+                            Sense::click()
+                        } else {
+                            Sense::hover()
+                        },
+                    );
+                    let send_response = if can_send {
+                        send_response.on_hover_cursor(egui::CursorIcon::PointingHand)
+                    } else if !composer_controls_enabled {
+                        send_response.on_hover_cursor(egui::CursorIcon::NotAllowed)
+                    } else {
+                        send_response
+                    };
+                    let send_paint_rect = acp_composer_send_paint_rect(footer_rects.send_rect);
+                    let send_fill = if can_send {
+                        ACP_COMPOSER_SEND_ACTIVE_FILL
+                    } else {
+                        Color32::from_rgb(45, 45, 45)
+                    };
+                    let send_icon_color = if can_send {
+                        Color32::from_rgb(20, 20, 20)
+                    } else {
+                        ACP_COMPOSER_ICON_MUTED
+                    };
+                    footer_ui.painter().rect_filled(
+                        send_paint_rect,
+                        send_paint_rect.height() * 0.5,
+                        send_fill,
+                    );
+                    footer_ui.painter().text(
+                        send_paint_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        format!("{}", icons::SEND_HORIZONTAL),
+                        FontId::proportional(ACP_COMPOSER_SEND_ICON_SIZE),
+                        send_icon_color,
+                    );
+                    if send_response.clicked() && can_send {
+                        submit_requested = true;
+                    }
+                    if submit_requested {
+                        if let Some(submit) = take_acp_composer_submit(session) {
+                            if welcome_center {
+                                let target_project = acp_context_project_id;
+                                welcome_acp_submit =
+                                    Some((chat_id, target_project, submit.text, submit.attachments));
+                            } else {
+                                Self::apply_acp_runtime_defaults_to_session(
+                                    session,
+                                    &acp_runtime_defaults,
+                                    false,
+                                );
+                                Self::append_acp_user_prompt_state(session, &submit.prompt_text);
+                                session.is_running = true;
+                                session.status =
+                                    crate::opencode_acp::AcpChatStatus::Running;
+                                session.send_prompt(&submit.prompt_text);
+                                acknowledge_acp_attention = true;
+                                ctx.request_repaint();
                             }
                         }
+                    }
 
                     if !session.attachments.is_empty() {
                         if let Some(chip_row_rect) = composer_rects.attachment_rect {
@@ -66039,6 +66089,19 @@ mod tests {
         assert!(!super::acp_composer_can_send("   ", false, false, true));
         assert!(super::acp_composer_can_send("hello", false, false, true));
         assert!(super::acp_composer_can_send("", true, false, true));
+    }
+
+    #[test]
+    fn acp_composer_controls_enable_only_when_ready_and_idle() {
+        assert!(!super::acp_composer_controls_enabled(false, false));
+        assert!(!super::acp_composer_controls_enabled(true, false));
+        assert!(!super::acp_composer_controls_enabled(true, true));
+        assert!(super::acp_composer_controls_enabled(false, true));
+        assert_eq!(
+            super::acp_composer_disabled_control_cursor(false),
+            Some(egui::CursorIcon::NotAllowed)
+        );
+        assert_eq!(super::acp_composer_disabled_control_cursor(true), None);
     }
 
     #[test]

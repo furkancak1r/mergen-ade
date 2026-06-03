@@ -3373,3 +3373,25 @@
   - Added regression tests for visible chat registration, worktree root accordion expansion, selected standby promotion, and unselected standby non-promotion.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, ACP tests
 - References: User request 2026-06-03
+
+---
+
+#### OpenCode ACP waiting state kontrolleri tiklanabilir gorunuyor {#acp-waiting-controls-clickable}
+- Date: 2026-06-03
+- Context: User reported that while ACP composer showed "Waiting for session...", controls such as the model selector were still clickable and could open a small empty popup.
+- Error signature:
+  1. `session_ready` blocked some RPC actions but did not disable all composer widgets.
+  2. The model/effort selector still rendered as an active ComboBox before `sessionId` existed.
+- Symptoms/Impact:
+  - Users could click unavailable controls during startup.
+  - The model selector could show an empty popup, making the waiting state feel broken.
+- Root cause:
+  - Composer readiness gating was split between action handlers instead of the widget interactivity layer.
+- Resolution:
+  - Added a shared composer controls-enabled helper.
+  - Disabled input, attachment, mode, model/effort, send, and history navigation while the session is not ready or is running.
+  - Rendered the model selector as an inert disabled control while waiting and applied `CursorIcon::NotAllowed` to disabled composer controls.
+- Prevent recurrence:
+  - Added a regression test for composer controls being enabled only when the session is ready and idle.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, ACP composer tests
+- References: User request 2026-06-03
