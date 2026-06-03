@@ -354,6 +354,7 @@ const ACP_COMPOSER_MODEL_WIDTH_MIN: f32 = 120.0;
 const ACP_COMPOSER_MODEL_WIDTH_TARGET: f32 = 220.0;
 const ACP_COMPOSER_MODEL_WIDTH_MAX: f32 = 320.0;
 const ACP_COMPOSER_MODEL_COMBO_CHROME_WIDTH: f32 = 34.0;
+const ACP_COMPOSER_MODEL_BUTTON_PADDING_X: f32 = 0.0;
 const ACP_COMPOSER_TEXT_WIDTH_MIN: f32 = 56.0;
 const ACP_SLASH_COMMAND_HEADER_HEIGHT: f32 = 24.0;
 const ACP_SLASH_COMMAND_ROW_HEIGHT: f32 = 22.0;
@@ -708,6 +709,10 @@ fn acp_composer_model_label_width(ui: &egui::Ui, label: &str) -> f32 {
             .size()
             .x
     })
+}
+
+fn acp_composer_model_label_left(model_rect: egui::Rect) -> f32 {
+    model_rect.left() + ACP_COMPOSER_MODEL_BUTTON_PADDING_X
 }
 
 fn acp_composer_model_label(
@@ -23684,6 +23689,8 @@ impl AdeApp {
                             .scope(|ui| {
                                 ui.set_width(footer_rects.model_rect.width());
                                 ui.spacing_mut().interact_size.y = ACP_COMPOSER_CONTROL_HEIGHT;
+                                ui.spacing_mut().button_padding.x =
+                                    ACP_COMPOSER_MODEL_BUTTON_PADDING_X;
                                 // Local widget visuals for consistent capsule tone
                                 let visuals = ui.visuals_mut();
                                 visuals.widgets.inactive.bg_fill = ACP_COMPOSER_CAPSULE_FILL;
@@ -67023,6 +67030,53 @@ mod tests {
             rects.model_rect.right()
                 <= rects.send_rect.left() - super::ACP_COMPOSER_FOOTER_SPACING + 0.01,
             "model selector must not overlap or push the send button"
+        );
+    }
+
+    #[test]
+    fn acp_composer_footer_widget_rects_keep_plan_to_model_label_gap_optically_equal() {
+        let footer_rect = egui::Rect::from_min_size(
+            egui::pos2(10.0, 20.0),
+            egui::vec2(720.0, super::ACP_COMPOSER_FOOTER_HEIGHT),
+        );
+        let rects = super::acp_composer_footer_widget_rects(
+            footer_rect,
+            true,
+            true,
+            super::ACP_COMPOSER_MODEL_WIDTH_TARGET,
+        );
+        let plan_rect = rects.plan_rect.expect("plan pill");
+
+        let plus_to_plan_gap = plan_rect.left() - rects.plus_rect.right();
+        let plan_to_model_label_gap =
+            super::acp_composer_model_label_left(rects.model_rect) - plan_rect.right();
+
+        assert!(
+            (plus_to_plan_gap - plan_to_model_label_gap).abs() <= 1.0,
+            "visible model label should start at the same optical gap as the plus/plan gap (plus_to_plan={plus_to_plan_gap}, plan_to_model_label={plan_to_model_label_gap})"
+        );
+    }
+
+    #[test]
+    fn acp_composer_footer_widget_rects_keep_plus_to_model_label_gap_optically_equal_without_plan()
+    {
+        let footer_rect = egui::Rect::from_min_size(
+            egui::pos2(10.0, 20.0),
+            egui::vec2(720.0, super::ACP_COMPOSER_FOOTER_HEIGHT),
+        );
+        let rects = super::acp_composer_footer_widget_rects(
+            footer_rect,
+            false,
+            true,
+            super::ACP_COMPOSER_MODEL_WIDTH_TARGET,
+        );
+
+        let plus_to_model_label_gap =
+            super::acp_composer_model_label_left(rects.model_rect) - rects.plus_rect.right();
+
+        assert!(
+            (plus_to_model_label_gap - super::ACP_COMPOSER_FOOTER_SPACING).abs() <= 1.0,
+            "default-mode model label should start at the footer spacing after plus (gap={plus_to_model_label_gap})"
         );
     }
 

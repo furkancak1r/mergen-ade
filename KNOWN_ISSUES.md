@@ -3331,3 +3331,24 @@
   - Added regression tests for optional row geometry, short viewport clamping, readiness gating, single prompt construction, and unready-session queueing without RPC.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, ACP composer tests
 - References: User request 2026-06-03
+
+---
+
+#### OpenCode ACP footer model selector optik boslugu fazla gorunuyor {#acp-footer-model-optical-gap}
+- Date: 2026-06-03
+- Context: User reported that the `+`, `Plan`, and model selector spacing in the ACP welcome composer did not look equal even when widget rect gaps were equal.
+- Error signature:
+  1. Footer layout compared raw widget rectangles.
+  2. The model ComboBox had its own left button padding, so the visible model label started farther right than `model_rect.left()`.
+- Symptoms/Impact:
+  - The gap between `Plan` and the model text looked wider than the gap between `+` and `Plan`.
+  - Equal mathematical rect gaps still produced an unbalanced visual row.
+- Root cause:
+  - Optical spacing did not account for the ComboBox selected-text inset.
+- Resolution:
+  - Added `ACP_COMPOSER_MODEL_BUTTON_PADDING_X` and applied it in the model ComboBox scope.
+  - Added `acp_composer_model_label_left()` so tests and future layout changes compare the visible model label start.
+- Prevent recurrence:
+  - Added regression tests for `+`/`Plan`/model optical spacing in plan mode and default mode.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, ACP composer tests
+- References: User screenshot/request 2026-06-03
