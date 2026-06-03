@@ -2924,3 +2924,26 @@
   2. Added regression tests for unselected standby promotion blocking, selected standby promotion, project removal cleanup, standby error cleanup, and retry cooldown behavior.
 - Files/Commands touched: `src/app.rs`, `src/opencode_acp.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted ACP standby tests, `cargo test`
 - References: Review findings 2026-06-02
+
+---
+
+#### OpenCode ACP chat missing from Terminal Manager foreground project rows {#acp-terminal-manager-foreground-row}
+- Date: 2026-06-03
+- Context: OpenCode ACP prompts correctly used `opencode acp` instead of launching an OpenCode terminal, but the active ACP chat was not represented in Terminal Manager under the foreground project.
+- Error signature:
+  1. Terminal Manager foreground project groups counted and rendered only real `TerminalEntry` rows.
+  2. The synthetic `New FG > OpenCode ACP` launcher activated ACP state, but returned no foreground child success signal when no terminal existed.
+- Symptoms/Impact:
+  1. After sending an ACP message, the main area could show the ACP chat while Terminal Manager still looked empty for the relevant project.
+  2. Users could not see ACP running/permission/complete spinner or pulse state in the same foreground list where terminal AI sessions appear.
+- Root cause:
+  - ACP sessions live in `acp_chat_sessions` and `acp_chat_ids_by_project`, not in the terminal runtime model. Terminal Manager did not have a virtual row path for non-terminal foreground work.
+- Resolution:
+  1. Added virtual OpenCode ACP foreground rows sourced from visible ACP chat IDs, without creating fake `TerminalEntry` records or launching an OpenCode TUI.
+  2. Included visible/live ACP sessions in Terminal Manager foreground child counts, project/worktree activity, and group open behavior.
+  3. Added ACP Terminal Manager badge mapping for starting/running spinner, permission pulse, turn-complete pulse, error, and disconnected states.
+  4. Added ACP row activation that selects the project and chat while clearing terminal activation, preserving terminal process lifecycle isolation.
+- Prevent recurrence:
+  - Added regression tests for ACP foreground counting, worktree ACP counting, row activation without terminal creation, badge mapping, and ACP event-driven attention state.
+- Files/Commands touched: `src/app.rs`, `src/opencode_acp.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted ACP tests, `cargo test`
+- References: User request 2026-06-03

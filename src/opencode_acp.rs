@@ -329,6 +329,54 @@ impl AcpChatSession {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_session_for_app(
+    chat_id: u64,
+    project_id: u64,
+    session_id: Option<String>,
+) -> (AcpChatSession, crossbeam_channel::Receiver<String>) {
+    let (tx, rx) = crossbeam_channel::unbounded::<String>();
+    let status = if session_id.is_some() {
+        AcpChatStatus::Idle
+    } else {
+        AcpChatStatus::Starting
+    };
+    (
+        AcpChatSession {
+            id: chat_id,
+            project_id,
+            project_path: PathBuf::from("C:/test/project"),
+            title: format!("Chat {chat_id}"),
+            created_at: Instant::now(),
+            updated_at: Instant::now(),
+            status,
+            session_id,
+            config_options: BTreeMap::new(),
+            config_options_struct: Vec::new(),
+            modes: Vec::new(),
+            available_commands: Vec::new(),
+            messages: Vec::new(),
+            pending_permission: None,
+            prompt_input: String::new(),
+            attachments: Vec::new(),
+            is_running: false,
+            show_thread_selector: false,
+            selected_mode_id: None,
+            queue: Vec::new(),
+            model_search_query: String::new(),
+            recent_inputs: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
+            command_tx: tx,
+            process: None,
+            writer_thread: None,
+            reader_thread: None,
+            stderr_thread: None,
+        },
+        rx,
+    )
+}
+
 /// Build the final prompt text from user text and attachment paths.
 /// Only file paths are appended; file contents are never read or injected.
 /// This keeps the AI context lean and lets the agent read files on demand.

@@ -2396,6 +2396,8 @@ pub struct AdeApp {
     active_acp_chat_by_project: BTreeMap<u64, u64>,
     /// ACP welcome context project per chat ID.
     acp_context_project_by_chat: BTreeMap<u64, u64>,
+    /// Pending Terminal Manager badge attention per visible ACP chat.
+    acp_terminal_manager_attention_by_chat: BTreeMap<u64, AcpTerminalManagerAttentionReason>,
     /// Sender for OpenCode ACP events (cloned per spawn).
     acp_chat_events_tx: Sender<crate::opencode_acp::AcpChatEvent>,
     /// Receiver for OpenCode ACP events from the agent threads.
@@ -2920,6 +2922,21 @@ struct TerminalRowData {
     in_main_view: bool,
     ai_logo_key: Option<LauncherIconKey>,
     ai_badge: AiBadgeModel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcpTerminalManagerAttentionReason {
+    Permission,
+    TurnComplete,
+}
+
+#[derive(Debug, Clone)]
+struct AcpTerminalManagerRowData {
+    chat_id: u64,
+    project_id: u64,
+    title: String,
+    status: crate::opencode_acp::AcpChatStatus,
+    attention_reason: Option<AcpTerminalManagerAttentionReason>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3449,20 +3466,54 @@ fn ai_cli_logo_key_for_terminal(entry: &TerminalEntry) -> Option<LauncherIconKey
     }
 }
 
-fn draw_ai_badge(ui: &mut Ui, badge: &AiBadgeModel) -> egui::Response {
-    let Some(visual) = ai_badge_visual(
-        badge.status,
-        badge.codex_normalized_status,
-        badge.opencode_normalized_status,
-        badge.claude_normalized_status,
-        badge.codex_attention_pending,
-        badge.codex_attention_reason,
-        badge.opencode_attention_pending,
-        badge.opencode_attention_reason,
-    ) else {
-        return ui.allocate_at_least(egui::vec2(0.0, 0.0), Sense::hover()).1;
-    };
+fn acp_terminal_manager_badge_visual(
+    status: crate::opencode_acp::AcpChatStatus,
+    attention_reason: Option<AcpTerminalManagerAttentionReason>,
+) -> Option<AiBadgeVisual> {
+    match status {
+        crate::opencode_acp::AcpChatStatus::Starting
+        | crate::opencode_acp::AcpChatStatus::Running => {
+            Some(AiBadgeVisual::Spinner(Color32::from_rgb(170, 170, 170)))
+        }
+        crate::opencode_acp::AcpChatStatus::Permission => {
+            if attention_reason == Some(AcpTerminalManagerAttentionReason::Permission) {
+                Some(AiBadgeVisual::Pulse(Color32::from_rgb(210, 170, 80)))
+            } else {
+                Some(AiBadgeVisual::Solid(Color32::from_rgb(210, 170, 80)))
+            }
+        }
+        crate::opencode_acp::AcpChatStatus::Idle => {
+            if attention_reason == Some(AcpTerminalManagerAttentionReason::TurnComplete) {
+                Some(AiBadgeVisual::Pulse(Color32::from_rgb(90, 185, 90)))
+            } else {
+                None
+            }
+        }
+        crate::opencode_acp::AcpChatStatus::Error => {
+            Some(AiBadgeVisual::Solid(Color32::from_rgb(170, 50, 50)))
+        }
+        crate::opencode_acp::AcpChatStatus::Exited => {
+            Some(AiBadgeVisual::Solid(with_alpha(TEXT_MUTED, 180)))
+        }
+    }
+}
 
+fn acp_terminal_manager_status_text(status: crate::opencode_acp::AcpChatStatus) -> &'static str {
+    match status {
+        crate::opencode_acp::AcpChatStatus::Starting => "Starting...",
+        crate::opencode_acp::AcpChatStatus::Idle => "Idle",
+        crate::opencode_acp::AcpChatStatus::Running => "Running...",
+        crate::opencode_acp::AcpChatStatus::Permission => "Permission",
+        crate::opencode_acp::AcpChatStatus::Error => "Error",
+        crate::opencode_acp::AcpChatStatus::Exited => "Disconnected",
+    }
+}
+
+fn draw_ai_badge_visual_with_tooltip(
+    ui: &mut Ui,
+    visual: AiBadgeVisual,
+    tooltip_lines: &[String],
+) -> egui::Response {
     let (rect, response) = ui.allocate_at_least(egui::vec2(16.0, 16.0), Sense::hover());
 
     if ui.is_rect_visible(rect) {
@@ -3506,10 +3557,27 @@ fn draw_ai_badge(ui: &mut Ui, badge: &AiBadgeModel) -> egui::Response {
     }
 
     response.on_hover_ui(|ui| {
-        for line in &badge.tooltip_lines {
+        for line in tooltip_lines {
             ui.label(line);
         }
     })
+}
+
+fn draw_ai_badge(ui: &mut Ui, badge: &AiBadgeModel) -> egui::Response {
+    let Some(visual) = ai_badge_visual(
+        badge.status,
+        badge.codex_normalized_status,
+        badge.opencode_normalized_status,
+        badge.claude_normalized_status,
+        badge.codex_attention_pending,
+        badge.codex_attention_reason,
+        badge.opencode_attention_pending,
+        badge.opencode_attention_reason,
+    ) else {
+        return ui.allocate_at_least(egui::vec2(0.0, 0.0), Sense::hover()).1;
+    };
+
+    draw_ai_badge_visual_with_tooltip(ui, visual, &badge.tooltip_lines)
 }
 
 struct TerminalStatusBadgeLayout {
@@ -5032,6 +5100,7 @@ impl AdeApp {
             acp_chat_ids_by_project: BTreeMap::new(),
             active_acp_chat_by_project: BTreeMap::new(),
             acp_context_project_by_chat: BTreeMap::new(),
+            acp_terminal_manager_attention_by_chat: BTreeMap::new(),
             acp_chat_events_tx,
             acp_chat_events_rx,
             active_acp_chat: None,
@@ -9371,6 +9440,87 @@ impl AdeApp {
             .count()
     }
 
+    fn acp_terminal_manager_chat_ids_for_project(&self, project_id: u64) -> Vec<u64> {
+        let Some(chat_ids) = self.acp_chat_ids_by_project.get(&project_id) else {
+            return Vec::new();
+        };
+        let mut seen = BTreeSet::new();
+        chat_ids
+            .iter()
+            .copied()
+            .filter(|chat_id| seen.insert(*chat_id))
+            .filter(|chat_id| {
+                self.acp_chat_sessions
+                    .get(chat_id)
+                    .is_some_and(|session| session.project_id == project_id)
+            })
+            .collect()
+    }
+
+    fn acp_terminal_manager_chat_count_for_project(&self, project_id: u64) -> usize {
+        self.acp_terminal_manager_chat_ids_for_project(project_id)
+            .len()
+    }
+
+    fn acp_terminal_manager_live_chat_count_for_project(&self, project_id: u64) -> usize {
+        use crate::opencode_acp::AcpChatStatus;
+        self.acp_terminal_manager_chat_ids_for_project(project_id)
+            .into_iter()
+            .filter(|chat_id| {
+                self.acp_chat_sessions.get(chat_id).is_some_and(|session| {
+                    matches!(
+                        session.status,
+                        AcpChatStatus::Starting
+                            | AcpChatStatus::Idle
+                            | AcpChatStatus::Running
+                            | AcpChatStatus::Permission
+                    )
+                })
+            })
+            .count()
+    }
+
+    fn terminal_manager_count_for_project_kind(
+        &self,
+        project_id: u64,
+        kind: TerminalKind,
+    ) -> usize {
+        let terminal_count = self.terminal_count_for_project_kind(project_id, kind);
+        match kind {
+            TerminalKind::Foreground => {
+                terminal_count + self.acp_terminal_manager_chat_count_for_project(project_id)
+            }
+            TerminalKind::Background => terminal_count,
+        }
+    }
+
+    fn terminal_manager_live_count_for_project_kind(
+        &self,
+        project_id: u64,
+        kind: TerminalKind,
+    ) -> usize {
+        let terminal_count = self.terminal_count_live_for_project_kind(project_id, kind);
+        match kind {
+            TerminalKind::Foreground => {
+                terminal_count + self.acp_terminal_manager_live_chat_count_for_project(project_id)
+            }
+            TerminalKind::Background => terminal_count,
+        }
+    }
+
+    fn acknowledge_acp_terminal_manager_attention(&mut self, chat_id: u64) {
+        self.acp_terminal_manager_attention_by_chat.remove(&chat_id);
+    }
+
+    fn mark_acp_terminal_manager_attention(
+        &mut self,
+        chat_id: u64,
+        reason: AcpTerminalManagerAttentionReason,
+    ) {
+        self.acp_terminal_manager_attention_by_chat
+            .insert(chat_id, reason);
+    }
+
     #[cfg(test)]
     fn should_auto_open_project_terminal_group(spawn_succeeded: bool) -> bool {
         spawn_succeeded
@@ -9879,6 +10029,8 @@ impl AdeApp {
                     chat_id,
                     session_id,
                 } => {
+                    self.acknowledge_acp_terminal_manager_attention(chat_id);
+                    let mut queued_prompt_sent = false;
                     if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
                         session.session_id = Some(session_id.clone());
                         session.status = crate::opencode_acp::AcpChatStatus::Idle;
@@ -9897,8 +10049,10 @@ impl AdeApp {
                             }
                             session.selected_mode_id = Some(startup_mode.to_string());
                         }
+                        queued_prompt_sent = Self::flush_queued_acp_prompts(session);
                     }
                     self.status_line = format!("OpenCode ACP {chat_id} session created");
+                    changed |= queued_prompt_sent;
                     if self.maybe_promote_standby_to_active(chat_id) {
                         changed = true;
                     }
@@ -10052,6 +10206,10 @@ impl AdeApp {
                         session.is_running = false;
                         session.updated_at = Instant::now();
                     }
+                    self.mark_acp_terminal_manager_attention(
+                        chat_id,
+                        AcpTerminalManagerAttentionReason::TurnComplete,
+                    );
                     self.status_line = format!("OpenCode ACP {chat_id} stopped: {stop_reason}");
                     changed = true;
                 }
@@ -10071,9 +10229,14 @@ impl AdeApp {
                             });
                         session.updated_at = Instant::now();
                     }
+                    self.mark_acp_terminal_manager_attention(
+                        chat_id,
+                        AcpTerminalManagerAttentionReason::Permission,
+                    );
                     changed = true;
                 }
                 crate::opencode_acp::AcpChatEvent::Error { chat_id, message } => {
+                    self.acknowledge_acp_terminal_manager_attention(chat_id);
                     if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
                         session.status = crate::opencode_acp::AcpChatStatus::Error;
                         session
@@ -10092,6 +10255,7 @@ impl AdeApp {
                     changed = true;
                 }
                 crate::opencode_acp::AcpChatEvent::Disconnected { chat_id } => {
+                    self.acknowledge_acp_terminal_manager_attention(chat_id);
                     if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
                         session.status = crate::opencode_acp::AcpChatStatus::Exited;
                         session.is_running = false;
@@ -10349,6 +10513,89 @@ impl AdeApp {
         }
     }
 
+    fn append_acp_user_prompt_state(
+        session: &mut crate::opencode_acp::AcpChatSession,
+        prompt_text: &str,
+    ) {
+        session
+            .messages
+            .push(crate::opencode_acp::AcpChatMessage::User {
+                text: prompt_text.to_owned(),
+            });
+        session.recent_inputs.insert(0, prompt_text.to_owned());
+        session.history_index = None;
+        session.history_draft.clear();
+        session.updated_at = Instant::now();
+    }
+
+    fn flush_queued_acp_prompts(session: &mut crate::opencode_acp::AcpChatSession) -> bool {
+        if session.queue.is_empty() || session.session_id.is_none() {
+            return false;
+        }
+        let queued_prompts = std::mem::take(&mut session.queue);
+        session.is_running = true;
+        session.status = crate::opencode_acp::AcpChatStatus::Running;
+        session.updated_at = Instant::now();
+        for prompt_text in &queued_prompts {
+            session.send_prompt(prompt_text);
+        }
+        true
+    }
+
+    fn submit_acp_prompt_to_chat(&mut self, chat_id: u64, prompt_text: String) -> bool {
+        let prompt_text = prompt_text.trim().to_owned();
+        if prompt_text.is_empty() {
+            return false;
+        }
+        self.acknowledge_acp_terminal_manager_attention(chat_id);
+        let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) else {
+            return false;
+        };
+
+        Self::append_acp_user_prompt_state(session, &prompt_text);
+        if session.session_id.is_some() {
+            session.is_running = true;
+            session.status = crate::opencode_acp::AcpChatStatus::Running;
+            session.send_prompt(&prompt_text);
+        } else {
+            session.queue.push(prompt_text);
+        }
+        true
+    }
+
+    fn submit_acp_welcome_prompt_to_acp(
+        &mut self,
+        ctx: &egui::Context,
+        project_id: u64,
+        prompt_text: String,
+    ) -> bool {
+        let prompt_text = prompt_text.trim().to_owned();
+        if prompt_text.is_empty() || !self.projects.contains_key(&project_id) {
+            return false;
+        }
+
+        let chat_id = self
+            .active_acp_chat_by_project
+            .get(&project_id)
+            .copied()
+            .filter(|chat_id| self.acp_chat_sessions.contains_key(chat_id))
+            .or_else(|| self.spawn_acp_chat_for_project(project_id, false));
+
+        let Some(chat_id) = chat_id else {
+            self.status_line = "OpenCode ACP hazırlanıyor...".to_owned();
+            ctx.request_repaint();
+            return false;
+        };
+
+        self.active_acp_chat_by_project.insert(project_id, chat_id);
+        self.active_acp_chat = Some(chat_id);
+        let submitted = self.submit_acp_prompt_to_chat(chat_id, prompt_text);
+        if submitted {
+            ctx.request_repaint();
+        }
+        submitted
+    }
+
     fn spawn_acp_chat_for_project(&mut self, project_id: u64, force_new: bool) -> Option<u64> {
         let project_name = self.projects.get(&project_id)?.name.clone();
         if !force_new {
@@ -10426,6 +10673,7 @@ impl AdeApp {
         self.active_acp_chat_by_project
             .retain(|_, &mut id| id != chat_id);
         self.acp_context_project_by_chat.remove(&chat_id);
+        self.acp_terminal_manager_attention_by_chat.remove(&chat_id);
         self.acp_standby_chat_by_project
             .retain(|_, &mut id| id != chat_id);
         if self.active_acp_chat == Some(chat_id) {
@@ -10450,17 +10698,37 @@ impl AdeApp {
         self.active_acp_chat_by_project.remove(&project_id);
     }
 
-    fn preferred_opencode_launcher_id(&self) -> Option<String> {
-        self.config
-            .launchers
-            .iter()
-            .find(|launcher| {
-                launcher.enabled
-                    && !launcher.launch_command.trim().is_empty()
-                    && Self::launch_command_stem(&launcher.launch_command)
-                        .is_some_and(|stem| stem.eq_ignore_ascii_case("opencode"))
-            })
-            .map(|launcher| launcher.id.clone())
+    fn activate_acp_chat_from_terminal_manager(
+        &mut self,
+        ctx: &egui::Context,
+        project_id: u64,
+        chat_id: u64,
+    ) -> bool {
+        if !self.projects.contains_key(&project_id)
+            || !self
+                .acp_chat_sessions
+                .get(&chat_id)
+                .is_some_and(|session| session.project_id == project_id)
+        {
+            return false;
+        }
+
+        self.active_acp_chat_by_project.insert(project_id, chat_id);
+        self.active_acp_chat = Some(chat_id);
+        self.active_terminal = None;
+        self.clear_terminal_selections_except(None);
+        self.acknowledge_acp_terminal_manager_attention(chat_id);
+
+        if self.file_editor.is_visible() {
+            self.file_editor.hide();
+        }
+        if self.selected_project != Some(project_id) {
+            self.selected_project = Some(project_id);
+            self.note_selection_changed();
+            self.persist_config();
+        }
+        ctx.request_repaint();
+        true
     }
 
     fn focus_project_in_terminal_manager(&mut self, ctx: &egui::Context, project_id: u64) {
@@ -10490,60 +10758,6 @@ impl AdeApp {
         }
         self.persist_config();
         ctx.request_repaint();
-    }
-
-    fn submit_acp_welcome_to_foreground_terminal(
-        &mut self,
-        ctx: &egui::Context,
-        project_id: u64,
-        text: &str,
-    ) -> bool {
-        let text = text.trim();
-        if text.is_empty() || !self.projects.contains_key(&project_id) {
-            return false;
-        }
-
-        let mut terminal_id = self.preferred_terminal_for_project(project_id);
-        if terminal_id.is_none() {
-            let launcher_id = self.preferred_opencode_launcher_id().or_else(|| {
-                self.foreground_launchers()
-                    .first()
-                    .map(|launcher| launcher.id.clone())
-            });
-            if let Some(launcher_id) = launcher_id {
-                if self.spawn_terminal_for_project(
-                    ctx,
-                    project_id,
-                    TerminalKind::Foreground,
-                    Some(&launcher_id),
-                ) {
-                    terminal_id = self.preferred_terminal_for_project(project_id);
-                }
-            }
-        }
-
-        let Some(terminal_id) = terminal_id else {
-            self.status_line = "Foreground terminal açılamadı.".to_owned();
-            return false;
-        };
-
-        self.focus_project_in_terminal_manager(ctx, project_id);
-        self.active_terminal = Some(terminal_id);
-        let submitted = self.submit_prompt_to_terminal(
-            ctx,
-            terminal_id,
-            text,
-            TerminalPromptSubmitOptions::smart_manual(),
-        );
-        if submitted {
-            let project_name = self
-                .projects
-                .get(&project_id)
-                .map(|project| project.name.as_str())
-                .unwrap_or("project");
-            self.status_line = format!("Sent to foreground terminal for {project_name}");
-        }
-        submitted
     }
 
     fn request_source_control_refresh(&mut self, project_id: u64, run_fetch: bool, manual: bool) {
@@ -20202,17 +20416,17 @@ impl AdeApp {
                 false,
             );
             let header_open = header_state.is_open();
-            let visible_count = self.terminal_count_for_project_kind(project_id, visible_kind);
+            let visible_count = self.terminal_manager_count_for_project_kind(project_id, visible_kind);
             let has_live_terminal =
-                self.terminal_count_live_for_project_kind(project_id, visible_kind) > 0;
+                self.terminal_manager_live_count_for_project_kind(project_id, visible_kind) > 0;
             let worktree_count = child_worktrees.len();
             let worktree_visible_count: usize = child_worktrees
                 .iter()
-                .map(|wt| self.terminal_count_for_project_kind(wt.id, visible_kind))
+                .map(|wt| self.terminal_manager_count_for_project_kind(wt.id, visible_kind))
                 .sum();
             let worktree_has_live = child_worktrees
                 .iter()
-                .any(|wt| self.terminal_count_live_for_project_kind(wt.id, visible_kind) > 0);
+                .any(|wt| self.terminal_manager_live_count_for_project_kind(wt.id, visible_kind) > 0);
 
             // Skip inactive projects when filter is enabled (consider root + worktree activity)
             if hide_inactive && !has_live_terminal && !worktree_has_live && worktree_count == 0 {
@@ -20254,8 +20468,8 @@ impl AdeApp {
                             )
                         }
                         Some(ForegroundLauncherAction::OpenCodeChat) => {
-                            self.spawn_acp_chat_for_project(project_id, false);
-                            false
+                            self.spawn_acp_chat_for_project(project_id, false)
+                                .is_some()
                         }
                         None => false,
                     }
@@ -20272,6 +20486,7 @@ impl AdeApp {
             if spawn_succeeded {
                 header_state.set_open(true);
                 header_state.store(ui.ctx());
+                ctx.request_repaint();
             }
             if create_worktree_clicked {
                 self.show_create_worktree_popup = true;
@@ -20310,7 +20525,7 @@ impl AdeApp {
                             let wt_path_str = wt.path.display().to_string();
                             let is_selected = self.selected_project == Some(wt_project_id);
                             let wt_has_live_terminal =
-                                self.terminal_count_live_for_project_kind(wt_project_id, visible_kind) > 0;
+                                self.terminal_manager_live_count_for_project_kind(wt_project_id, visible_kind) > 0;
                             let wt_diff_summary = terminal_manager_diff_summary_model(
                                 self.source_control_state.get(&wt_project_id),
                             );
@@ -20343,8 +20558,8 @@ impl AdeApp {
                                             )
                                         }
                                         Some(ForegroundLauncherAction::OpenCodeChat) => {
-                                            self.spawn_acp_chat_for_project(wt_project_id, false);
-                                            false
+                                            self.spawn_acp_chat_for_project(wt_project_id, false)
+                                                .is_some()
                                         }
                                         None => false,
                                     }
@@ -20390,7 +20605,7 @@ impl AdeApp {
                             });
                             // Draw worktree's own terminals under its row
                             let wt_visible_count =
-                                self.terminal_count_for_project_kind(wt_project_id, visible_kind);
+                                self.terminal_manager_count_for_project_kind(wt_project_id, visible_kind);
                             if wt_visible_count > 0 {
                                 ui.add_space(2.0);
                                 ui.scope(|ui| {
@@ -20404,6 +20619,13 @@ impl AdeApp {
                                             wt_project_id,
                                         )),
                                         |ui| {
+                                            if visible_kind == TerminalKind::Foreground {
+                                                self.draw_acp_terminal_manager_rows(
+                                                    ctx,
+                                                    ui,
+                                                    wt_project_id,
+                                                );
+                                            }
                                             self.draw_terminal_rows(
                                                 ctx,
                                                 ui,
@@ -20419,6 +20641,9 @@ impl AdeApp {
                         }
                         if worktree_count > 0 && visible_count > 0 {
                             ui.add_space(2.0);
+                        }
+                        if visible_kind == TerminalKind::Foreground {
+                            self.draw_acp_terminal_manager_rows(ctx, ui, project_id);
                         }
                         self.draw_terminal_rows(
                             ctx,
@@ -20466,6 +20691,182 @@ impl AdeApp {
         });
     }
 
+    fn draw_acp_terminal_manager_rows(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut Ui,
+        project_id: u64,
+    ) {
+        let chat_ids = self.acp_terminal_manager_chat_ids_for_project(project_id);
+        for chat_id in chat_ids {
+            let Some(session) = self.acp_chat_sessions.get(&chat_id) else {
+                continue;
+            };
+            let row_data = AcpTerminalManagerRowData {
+                chat_id,
+                project_id: session.project_id,
+                title: session.title.clone(),
+                status: session.status,
+                attention_reason: self
+                    .acp_terminal_manager_attention_by_chat
+                    .get(&chat_id)
+                    .copied(),
+            };
+
+            let active = self.active_acp_chat == Some(row_data.chat_id);
+            let label = format!("OpenCode ACP - {}", row_data.title);
+            let status_text = acp_terminal_manager_status_text(row_data.status);
+            let tooltip_lines = vec![format!("OpenCode ACP: {status_text}")];
+            let badge_visual =
+                acp_terminal_manager_badge_visual(row_data.status, row_data.attention_reason);
+
+            let mut activate_chat = false;
+            let mut close_chat = false;
+            let section_gap = ui.spacing().item_spacing.x;
+            let actions_width = CONTROL_ROW_HEIGHT;
+            let row_width = ui.available_width().max(0.0);
+            let row_label_width = (row_width - actions_width - section_gap).max(0.0);
+            let row_height = ui.spacing().interact_size.y.max(CONTROL_ROW_HEIGHT);
+            let (row_rect, row_response) =
+                ui.allocate_exact_size(egui::vec2(row_width, row_height), Sense::click());
+
+            let row_chrome = terminal_manager_row_chrome(active, row_response.hovered());
+            let selection_rect = terminal_manager_row_selection_rect(row_rect, actions_width);
+            let selection_response = (selection_rect.width() > 0.0).then(|| {
+                ui.interact(
+                    selection_rect,
+                    ui.id()
+                        .with(("terminal_manager_acp_row_select", row_data.chat_id)),
+                    Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+            });
+            if ui
+                .ctx()
+                .input(|input| input.pointer.hover_pos())
+                .is_some_and(|pos| selection_rect.contains(pos))
+            {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+
+            if ui.is_rect_visible(row_rect) {
+                let paint_rect = row_rect.shrink2(egui::vec2(1.0, 1.0));
+                if let Some(fill) = row_chrome.fill {
+                    ui.painter().rect_filled(paint_rect, 8.0, fill);
+                }
+                if row_chrome.stroke != Stroke::NONE {
+                    ui.painter().rect_stroke(paint_rect, 8.0, row_chrome.stroke);
+                }
+            }
+
+            let mut activation_response = selection_response;
+            if row_label_width > 0.0 {
+                let label_rect = egui::Rect::from_min_size(
+                    row_rect.min,
+                    egui::vec2(row_label_width, row_rect.height()),
+                );
+                let label_response = ui
+                    .scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(label_rect)
+                            .layout(Layout::left_to_right(Align::Center)),
+                        |ui| {
+                            ui.add_space(SIDEBAR_ROW_LEADING_INSET);
+
+                            let badge_response = badge_visual.map(|visual| {
+                                draw_ai_badge_visual_with_tooltip(ui, visual, &tooltip_lines)
+                            });
+                            if badge_response.is_some() {
+                                ui.add_space(4.0);
+                            }
+
+                            let launcher_response =
+                                self.draw_launcher_icon(ui, LauncherIconKey::OpenCode, 16.0);
+                            ui.add_space(4.0);
+
+                            let text_color = match row_data.status {
+                                crate::opencode_acp::AcpChatStatus::Exited => {
+                                    with_alpha(TEXT_MUTED, 160)
+                                }
+                                crate::opencode_acp::AcpChatStatus::Error => BTN_RED,
+                                _ => row_chrome.title_color,
+                            };
+                            let title_font = egui::TextStyle::Body.resolve(ui.style());
+                            let title_response = ui.add(
+                                egui::Label::new(RichText::new(&label).color(text_color))
+                                    .truncate()
+                                    .sense(Sense::click()),
+                            );
+                            let title_response = with_truncation_tooltip(
+                                ui,
+                                title_response,
+                                &label,
+                                &title_font,
+                                text_color,
+                                row_label_width,
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                            let mut combined_response = title_response.union(launcher_response);
+                            if let Some(response) = badge_response {
+                                combined_response = response.union(combined_response);
+                            }
+                            combined_response
+                        },
+                    )
+                    .inner;
+                activation_response = Some(match activation_response {
+                    Some(response) => response.union(label_response),
+                    None => label_response,
+                });
+            }
+
+            let actions_rect = egui::Rect::from_min_size(
+                egui::pos2(row_rect.right() - actions_width, row_rect.top()),
+                egui::vec2(actions_width, row_rect.height()),
+            );
+            let mut action_clicked = false;
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(actions_rect)
+                    .layout(Layout::right_to_left(Align::Center)),
+                |ui| {
+                    if styled_icon_button(
+                        ui,
+                        icons::X,
+                        BTN_RED,
+                        BTN_RED_HOVER,
+                        Color32::from_rgb(170, 50, 50),
+                        "Close",
+                    ) {
+                        close_chat = true;
+                        action_clicked = true;
+                    }
+                },
+            );
+
+            if activation_response
+                .as_ref()
+                .is_some_and(|response| response.clicked())
+                && !action_clicked
+            {
+                activate_chat = true;
+            }
+
+            if activate_chat {
+                self.activate_acp_chat_from_terminal_manager(
+                    ctx,
+                    row_data.project_id,
+                    row_data.chat_id,
+                );
+            }
+            if close_chat {
+                self.kill_acp_chat(row_data.chat_id);
+                ctx.request_repaint();
+            }
+        }
+    }
+
     fn draw_terminal_rows(
         &mut self,
         ctx: &egui::Context,
@@ -20486,7 +20887,11 @@ impl AdeApp {
                 )
             })
             .unwrap_or_default();
-        let current_active = self.active_terminal;
+        let current_active = if self.active_acp_chat.is_some() {
+            None
+        } else {
+            self.active_terminal
+        };
         let show_visibility_toggle = self.config.ui.multi_terminal_view_enabled;
 
         for terminal_id in ids {
@@ -21718,7 +22123,8 @@ impl AdeApp {
                 );
                 composer_ui.set_clip_rect(composer_rect);
                 let acp_favorite_models = self.config.opencode.acp_favorite_models.clone();
-                let mut welcome_foreground_submit: Option<(u64, String)> = None;
+                let mut welcome_acp_submit: Option<(u64, String)> = None;
+                let mut acknowledge_acp_attention = false;
                 let acp_context_project_id =
                     self.acp_context_project_for_chat(chat_id, project_id);
                 if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
@@ -22211,7 +22617,7 @@ impl AdeApp {
                                 let prompt_text =
                                     crate::opencode_acp::build_acp_prompt_text(&text, &attachments);
                                 let target_project = acp_context_project_id;
-                                welcome_foreground_submit = Some((target_project, prompt_text));
+                                welcome_acp_submit = Some((target_project, prompt_text));
                             } else {
                                 let prompt_text =
                                     crate::opencode_acp::build_acp_prompt_text(&text, &attachments);
@@ -22226,6 +22632,7 @@ impl AdeApp {
                                 session.is_running = true;
                                 session.status = crate::opencode_acp::AcpChatStatus::Running;
                                 session.send_prompt(&prompt_text);
+                                acknowledge_acp_attention = true;
                                 ctx.request_repaint();
                             }
                         }
@@ -22263,7 +22670,7 @@ impl AdeApp {
                                 let prompt_text =
                                     crate::opencode_acp::build_acp_prompt_text(&text, &attachments);
                                 let target_project = acp_context_project_id;
-                                welcome_foreground_submit = Some((target_project, prompt_text));
+                                welcome_acp_submit = Some((target_project, prompt_text));
                             } else {
                                 let prompt_text =
                                     crate::opencode_acp::build_acp_prompt_text(&text, &attachments);
@@ -22278,6 +22685,7 @@ impl AdeApp {
                                 session.is_running = true;
                                 session.status = crate::opencode_acp::AcpChatStatus::Running;
                                 session.send_prompt(&prompt_text);
+                                acknowledge_acp_attention = true;
                                 ctx.request_repaint();
                             }
                         }
@@ -22356,6 +22764,7 @@ impl AdeApp {
                                 );
                                 session.status = crate::opencode_acp::AcpChatStatus::Running;
                                 responded = true;
+                                acknowledge_acp_attention = true;
                             }
                         }
                         if responded {
@@ -22403,8 +22812,11 @@ impl AdeApp {
                         ctx.request_repaint();
                     }
                 }
-                if let Some((target_project, text)) = welcome_foreground_submit {
-                    self.submit_acp_welcome_to_foreground_terminal(ctx, target_project, &text);
+                if acknowledge_acp_attention {
+                    self.acknowledge_acp_terminal_manager_attention(chat_id);
+                }
+                if let Some((target_project, text)) = welcome_acp_submit {
+                    self.submit_acp_welcome_prompt_to_acp(ctx, target_project, text);
                 }
 
                 if !welcome_center && status_row_height > 0.0 {
@@ -36131,9 +36543,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        ai_badge_tooltip_lines, ai_badge_visual, ai_cli_logo_key_for_terminal,
-        average_terminal_cell_width, build_terminal_cursor_overlay, build_terminal_render,
-        collect_source_control_line_totals, collect_source_control_snapshot,
+        acp_terminal_manager_badge_visual, ai_badge_tooltip_lines, ai_badge_visual,
+        ai_cli_logo_key_for_terminal, average_terminal_cell_width, build_terminal_cursor_overlay,
+        build_terminal_render, collect_source_control_line_totals, collect_source_control_snapshot,
         configure_terminal_font_family, count_text_line_bytes, cursor_hidden_by_row_filter,
         deduplicated_recent_inputs, default_app_open_command, design_inspect_delivery_signature,
         design_inspect_should_deliver, detach_terminal_prompt_scroll_anchor_on_manual_scroll,
@@ -36167,11 +36579,11 @@ mod tests {
         terminal_selection_autoscroll_delta, terminal_selection_autoscroll_speed,
         terminal_selection_point_from_pointer, terminal_selection_text, to_egui_color,
         update_stable_cursor_row, visible_terminal_cursor, with_minimal_button_chrome,
-        with_settings_text_edit_chrome, AdeApp, AiBadgeModel, AiBadgeVisual, AppIcon,
-        BrowserScopeKey, BrowserTabKind, BrowserVideoEncodeEvent, CodexAttentionReason,
-        CodexCliStatusSource, CodexTransportStatus, CtrlCAction, DesignInspectDeliveryState,
-        DirectoryIndexSnapshot, DirectoryIndexTruncationFlags, DirectoryNode,
-        FactoryDroidAttentionReason, FactoryDroidHookInboxEvent,
+        with_settings_text_edit_chrome, AcpTerminalManagerAttentionReason, AdeApp, AiBadgeModel,
+        AiBadgeVisual, AppIcon, BrowserScopeKey, BrowserTabKind, BrowserVideoEncodeEvent,
+        CodexAttentionReason, CodexCliStatusSource, CodexTransportStatus, CtrlCAction,
+        DesignInspectDeliveryState, DirectoryIndexSnapshot, DirectoryIndexTruncationFlags,
+        DirectoryNode, FactoryDroidAttentionReason, FactoryDroidHookInboxEvent,
         FactoryDroidManagedInstallComponent, FactoryDroidManagedInstallDiagnostics,
         FactoryDroidStatusSource, FactoryDroidTransportDiagnostics, FileEditorState,
         NativeImagePasteTarget, OpenCodeAttentionReason, OpenCodeQuestionInfo,
@@ -47395,6 +47807,7 @@ mod tests {
             acp_chat_ids_by_project: BTreeMap::new(),
             active_acp_chat_by_project: BTreeMap::new(),
             acp_context_project_by_chat: BTreeMap::new(),
+            acp_terminal_manager_attention_by_chat: BTreeMap::new(),
             acp_chat_events_tx: crossbeam_channel::unbounded().0,
             acp_chat_events_rx: crossbeam_channel::unbounded().1,
             active_acp_chat: None,
@@ -64081,6 +64494,286 @@ mod tests {
         app.acp_context_project_by_chat.insert(42, 99);
 
         assert_eq!(app.acp_context_project_for_chat(42, 7), 7);
+    }
+
+    fn insert_visible_test_acp_chat(
+        app: &mut AdeApp,
+        chat_id: u64,
+        project_id: u64,
+        status: crate::opencode_acp::AcpChatStatus,
+    ) {
+        let session_id = match status {
+            crate::opencode_acp::AcpChatStatus::Starting => None,
+            _ => Some(format!("session-{chat_id}")),
+        };
+        let (mut session, _rx) =
+            crate::opencode_acp::test_session_for_app(chat_id, project_id, session_id);
+        session.status = status;
+        session.is_running = matches!(status, crate::opencode_acp::AcpChatStatus::Running);
+        app.acp_chat_sessions.insert(chat_id, session);
+        app.acp_chat_ids_by_project
+            .entry(project_id)
+            .or_default()
+            .push(chat_id);
+        app.active_acp_chat_by_project.insert(project_id, chat_id);
+    }
+
+    #[test]
+    fn terminal_manager_counts_visible_acp_as_foreground_child() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        insert_visible_test_acp_chat(&mut app, 42, 7, crate::opencode_acp::AcpChatStatus::Idle);
+
+        assert_eq!(
+            app.terminal_manager_count_for_project_kind(7, TerminalKind::Foreground),
+            1
+        );
+        assert_eq!(
+            app.terminal_manager_live_count_for_project_kind(7, TerminalKind::Foreground),
+            1
+        );
+        assert_eq!(
+            app.terminal_manager_count_for_project_kind(7, TerminalKind::Background),
+            0
+        );
+    }
+
+    #[test]
+    fn terminal_manager_counts_worktree_acp_under_worktree_project() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "Repo", "C:/repo", &[], &[]));
+        app.projects.insert(
+            2,
+            test_worktree_project(2, "Feature", "C:/repo-feature", "C:/repo", &[]),
+        );
+        insert_visible_test_acp_chat(&mut app, 44, 2, crate::opencode_acp::AcpChatStatus::Running);
+
+        assert_eq!(
+            app.terminal_manager_count_for_project_kind(1, TerminalKind::Foreground),
+            0
+        );
+        assert_eq!(
+            app.terminal_manager_count_for_project_kind(2, TerminalKind::Foreground),
+            1
+        );
+        assert_eq!(
+            app.terminal_manager_live_count_for_project_kind(2, TerminalKind::Foreground),
+            1
+        );
+    }
+
+    #[test]
+    fn activating_acp_terminal_manager_row_does_not_create_terminal() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 8))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        insert_visible_test_acp_chat(
+            &mut app,
+            42,
+            7,
+            crate::opencode_acp::AcpChatStatus::Permission,
+        );
+        app.mark_acp_terminal_manager_attention(42, AcpTerminalManagerAttentionReason::Permission);
+
+        assert!(app.activate_acp_chat_from_terminal_manager(&ctx, 7, 42));
+
+        assert_eq!(app.active_acp_chat, Some(42));
+        assert_eq!(app.active_acp_chat_by_project.get(&7), Some(&42));
+        assert_eq!(app.selected_project, Some(7));
+        assert_eq!(app.active_terminal, None);
+        assert_eq!(app.terminals.len(), 1);
+        assert!(!app.acp_terminal_manager_attention_by_chat.contains_key(&42));
+    }
+
+    #[test]
+    fn acp_terminal_manager_badge_visuals_match_status() {
+        assert_eq!(
+            acp_terminal_manager_badge_visual(crate::opencode_acp::AcpChatStatus::Starting, None),
+            Some(AiBadgeVisual::Spinner(Color32::from_rgb(170, 170, 170)))
+        );
+        assert_eq!(
+            acp_terminal_manager_badge_visual(crate::opencode_acp::AcpChatStatus::Running, None),
+            Some(AiBadgeVisual::Spinner(Color32::from_rgb(170, 170, 170)))
+        );
+        assert_eq!(
+            acp_terminal_manager_badge_visual(
+                crate::opencode_acp::AcpChatStatus::Permission,
+                Some(AcpTerminalManagerAttentionReason::Permission)
+            ),
+            Some(AiBadgeVisual::Pulse(Color32::from_rgb(210, 170, 80)))
+        );
+        assert_eq!(
+            acp_terminal_manager_badge_visual(crate::opencode_acp::AcpChatStatus::Permission, None),
+            Some(AiBadgeVisual::Solid(Color32::from_rgb(210, 170, 80)))
+        );
+        assert_eq!(
+            acp_terminal_manager_badge_visual(
+                crate::opencode_acp::AcpChatStatus::Idle,
+                Some(AcpTerminalManagerAttentionReason::TurnComplete)
+            ),
+            Some(AiBadgeVisual::Pulse(Color32::from_rgb(90, 185, 90)))
+        );
+        assert_eq!(
+            acp_terminal_manager_badge_visual(crate::opencode_acp::AcpChatStatus::Idle, None),
+            None
+        );
+        assert_eq!(
+            acp_terminal_manager_badge_visual(crate::opencode_acp::AcpChatStatus::Error, None),
+            Some(AiBadgeVisual::Solid(Color32::from_rgb(170, 50, 50)))
+        );
+    }
+
+    #[test]
+    fn acp_events_set_terminal_manager_attention_state() {
+        let ctx = egui::Context::default();
+        let (mut app, event_tx) = test_app_with_acp_channels([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        insert_visible_test_acp_chat(&mut app, 42, 7, crate::opencode_acp::AcpChatStatus::Running);
+
+        event_tx
+            .send(crate::opencode_acp::AcpChatEvent::PromptResponse {
+                chat_id: 42,
+                stop_reason: "end-turn".to_owned(),
+            })
+            .unwrap();
+        app.process_acp_chat_events(&ctx);
+
+        assert_eq!(
+            app.acp_terminal_manager_attention_by_chat.get(&42),
+            Some(&AcpTerminalManagerAttentionReason::TurnComplete)
+        );
+
+        event_tx
+            .send(crate::opencode_acp::AcpChatEvent::PermissionRequest {
+                chat_id: 42,
+                request_id: "req-1".to_owned(),
+                options: vec![crate::opencode_acp::AcpPermissionOption {
+                    option_id: "allow".to_owned(),
+                    name: "Allow".to_owned(),
+                    kind: "allow".to_owned(),
+                }],
+                tool_call: crate::opencode_acp::AcpToolCallBrief {
+                    tool_call_id: "tool-1".to_owned(),
+                    title: "Edit file".to_owned(),
+                    kind: "edit".to_owned(),
+                },
+            })
+            .unwrap();
+        app.process_acp_chat_events(&ctx);
+
+        assert_eq!(
+            app.acp_terminal_manager_attention_by_chat.get(&42),
+            Some(&AcpTerminalManagerAttentionReason::Permission)
+        );
+    }
+
+    #[test]
+    fn welcome_acp_submit_sends_session_prompt_without_terminal() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        let (session, rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
+        app.acp_chat_sessions.insert(42, session);
+        app.active_acp_chat = Some(42);
+        app.active_acp_chat_by_project.insert(7, 42);
+
+        assert!(app.submit_acp_welcome_prompt_to_acp(&ctx, 7, "hello".to_owned()));
+
+        assert!(app.terminals.is_empty());
+        assert_eq!(app.active_acp_chat, Some(42));
+        let raw = rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .expect("ACP prompt should be sent");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["method"], "session/prompt");
+        assert_eq!(parsed["params"]["sessionId"], "session-7");
+        assert_eq!(parsed["params"]["prompt"][0]["text"], "hello");
+
+        let session = app.acp_chat_sessions.get(&42).unwrap();
+        assert!(session.is_running);
+        assert!(matches!(
+            session.status,
+            crate::opencode_acp::AcpChatStatus::Running
+        ));
+        assert!(matches!(
+            session.messages.first(),
+            Some(crate::opencode_acp::AcpChatMessage::User { text }) if text == "hello"
+        ));
+    }
+
+    #[test]
+    fn queued_welcome_acp_submit_flushes_after_session_created() {
+        let ctx = egui::Context::default();
+        let (mut app, event_tx) = test_app_with_acp_channels([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        let (session, rx) = crate::opencode_acp::test_session_for_app(42, 7, None);
+        app.acp_chat_sessions.insert(42, session);
+        app.active_acp_chat = Some(42);
+        app.active_acp_chat_by_project.insert(7, 42);
+
+        assert!(app.submit_acp_welcome_prompt_to_acp(&ctx, 7, "queued".to_owned()));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            app.acp_chat_sessions.get(&42).unwrap().queue,
+            vec!["queued".to_owned()]
+        );
+
+        event_tx
+            .send(crate::opencode_acp::AcpChatEvent::SessionCreated {
+                chat_id: 42,
+                session_id: "session-7".to_owned(),
+            })
+            .unwrap();
+        app.process_acp_chat_events(&ctx);
+
+        let raw = rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .expect("queued ACP prompt should be sent after session creation");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["method"], "session/prompt");
+        assert_eq!(parsed["params"]["sessionId"], "session-7");
+        assert_eq!(parsed["params"]["prompt"][0]["text"], "queued");
+        let session = app.acp_chat_sessions.get(&42).unwrap();
+        assert!(session.queue.is_empty());
+        assert!(session.is_running);
+    }
+
+    #[test]
+    fn welcome_acp_submit_to_context_project_activates_target_chat() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(1, test_project(1, "One", "C:/one", &[], &[]));
+        app.projects
+            .insert(2, test_project(2, "Two", "C:/two", &[], &[]));
+        let (session_one, _rx_one) =
+            crate::opencode_acp::test_session_for_app(11, 1, Some("session-1".to_owned()));
+        let (session_two, rx_two) =
+            crate::opencode_acp::test_session_for_app(22, 2, Some("session-2".to_owned()));
+        app.acp_chat_sessions.insert(11, session_one);
+        app.acp_chat_sessions.insert(22, session_two);
+        app.active_acp_chat_by_project.insert(1, 11);
+        app.active_acp_chat_by_project.insert(2, 22);
+        app.active_acp_chat = Some(11);
+
+        assert!(app.submit_acp_welcome_prompt_to_acp(&ctx, 2, "target".to_owned()));
+
+        assert!(app.terminals.is_empty());
+        assert_eq!(app.active_acp_chat, Some(22));
+        let raw = rx_two
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .expect("target ACP prompt should be sent");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["method"], "session/prompt");
+        assert_eq!(parsed["params"]["sessionId"], "session-2");
+        assert_eq!(parsed["params"]["prompt"][0]["text"], "target");
     }
 
     #[test]
