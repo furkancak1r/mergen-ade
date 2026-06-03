@@ -339,6 +339,9 @@ const ACP_COMPOSER_ICON_MUTED: Color32 = Color32::from_rgb(190, 190, 190);
 const ACP_COMPOSER_SEND_ACTIVE_FILL: Color32 = Color32::from_rgb(230, 230, 230);
 const ACP_COMPOSER_SEND_PAINT_INSET: f32 = 2.0;
 const ACP_COMPOSER_SEND_ICON_SIZE: f32 = 16.0;
+const ACP_COMPOSER_ATTACHMENT_ROW_HEIGHT: f32 = 24.0;
+const ACP_COMPOSER_BELOW_CAPSULE_GAP: f32 = 4.0;
+const ACP_COMPOSER_PERMISSION_CARD_HEIGHT: f32 = 60.0;
 const ACP_WELCOME_MAX_WIDTH: f32 = 720.0;
 const ACP_WELCOME_COMPOSER_MIN_HEIGHT: f32 =
     ACP_COMPOSER_PADDING_Y * 2.0 + ACP_COMPOSER_WELCOME_TEXT_MIN + ACP_COMPOSER_FOOTER_HEIGHT;
@@ -452,6 +455,136 @@ fn acp_composer_stack_rects(
         egui::vec2(composer_rect.width(), capsule_height),
     );
     (slash_rect, capsule_rect)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AcpComposerRects {
+    slash_rect: Option<egui::Rect>,
+    capsule_rect: egui::Rect,
+    attachment_rect: Option<egui::Rect>,
+    permission_rect: Option<egui::Rect>,
+}
+
+fn acp_composer_capsule_body_height(welcome_center: bool) -> f32 {
+    if welcome_center {
+        ACP_WELCOME_COMPOSER_MIN_HEIGHT
+    } else {
+        ACP_COMPOSER_CHAT_CAPSULE_HEIGHT
+    }
+}
+
+fn acp_composer_height(
+    welcome_center: bool,
+    has_attachments: bool,
+    has_permission: bool,
+    slash_popup_height: f32,
+) -> f32 {
+    let mut height = acp_composer_capsule_body_height(welcome_center) + slash_popup_height.max(0.0);
+    if has_attachments {
+        height += ACP_COMPOSER_BELOW_CAPSULE_GAP + ACP_COMPOSER_ATTACHMENT_ROW_HEIGHT;
+    }
+    if has_permission {
+        height += ACP_COMPOSER_BELOW_CAPSULE_GAP + ACP_COMPOSER_PERMISSION_CARD_HEIGHT;
+    }
+    height
+}
+
+fn acp_optional_composer_row_rect(
+    composer_rect: egui::Rect,
+    previous_bottom: f32,
+    desired_height: f32,
+) -> (Option<egui::Rect>, f32) {
+    let row_top = (previous_bottom + ACP_COMPOSER_BELOW_CAPSULE_GAP).min(composer_rect.bottom());
+    let row_height = desired_height.min((composer_rect.bottom() - row_top).max(0.0));
+    if row_height <= 0.0 {
+        return (None, row_top);
+    }
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(composer_rect.left(), row_top),
+        egui::vec2(composer_rect.width(), row_height),
+    );
+    (Some(rect), rect.bottom())
+}
+
+fn acp_composer_rects(
+    composer_rect: egui::Rect,
+    welcome_center: bool,
+    has_attachments: bool,
+    has_permission: bool,
+    slash_popup_height: f32,
+) -> AcpComposerRects {
+    let (slash_rect, capsule_rect) = acp_composer_stack_rects(
+        composer_rect,
+        slash_popup_height,
+        acp_composer_capsule_body_height(welcome_center),
+    );
+    let mut next_top = capsule_rect.bottom();
+    let attachment_rect = if has_attachments {
+        let (rect, bottom) = acp_optional_composer_row_rect(
+            composer_rect,
+            next_top,
+            ACP_COMPOSER_ATTACHMENT_ROW_HEIGHT,
+        );
+        next_top = bottom;
+        rect
+    } else {
+        None
+    };
+    let permission_rect = if has_permission {
+        let (rect, _bottom) = acp_optional_composer_row_rect(
+            composer_rect,
+            next_top,
+            ACP_COMPOSER_PERMISSION_CARD_HEIGHT,
+        );
+        rect
+    } else {
+        None
+    };
+    AcpComposerRects {
+        slash_rect,
+        capsule_rect,
+        attachment_rect,
+        permission_rect,
+    }
+}
+
+fn acp_composer_can_send(
+    prompt_input: &str,
+    has_attachments: bool,
+    is_running: bool,
+    session_ready: bool,
+) -> bool {
+    (!prompt_input.trim().is_empty() || has_attachments) && !is_running && session_ready
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AcpComposerSubmit {
+    text: String,
+    attachments: Vec<String>,
+    prompt_text: String,
+}
+
+fn take_acp_composer_submit(
+    session: &mut crate::opencode_acp::AcpChatSession,
+) -> Option<AcpComposerSubmit> {
+    if session.prompt_input.trim().is_empty() && session.attachments.is_empty() {
+        return None;
+    }
+    let text = session.prompt_input.trim().to_owned();
+    let attachments = std::mem::take(&mut session.attachments);
+    session.prompt_input.clear();
+    let prompt_text = crate::opencode_acp::build_acp_prompt_text(&text, &attachments)
+        .trim()
+        .to_owned();
+    if prompt_text.is_empty() {
+        None
+    } else {
+        Some(AcpComposerSubmit {
+            text,
+            attachments,
+            prompt_text,
+        })
+    }
 }
 
 fn draw_acp_slash_command_popup(
@@ -22999,26 +23132,18 @@ impl AdeApp {
                 let project_id = self.acp_effective_project_for_chat(chat_id).unwrap_or(0);
 
                 let composer_height = if let Some(session) = self.acp_chat_sessions.get(&chat_id) {
-                    let mut h = if welcome_center {
-                        ACP_WELCOME_COMPOSER_MIN_HEIGHT
-                    } else {
-                        ACP_COMPOSER_CHAT_CAPSULE_HEIGHT
-                    };
-                    if !session.attachments.is_empty() {
-                        h += 24.0 + 4.0;
-                    }
-                    let has_permission = session.pending_permission.is_some();
-                    if has_permission {
-                        h += 60.0;
-                    }
                     let slash_commands = acp_slash_command_matches(
                         &session.available_commands,
                         &session.prompt_input,
                     );
-                    h += acp_slash_command_popup_height(slash_commands.len());
-                    h
+                    acp_composer_height(
+                        welcome_center,
+                        !session.attachments.is_empty(),
+                        session.pending_permission.is_some(),
+                        acp_slash_command_popup_height(slash_commands.len()),
+                    )
                 } else {
-                    ACP_COMPOSER_CHAT_CAPSULE_HEIGHT
+                    acp_composer_height(welcome_center, false, false, 0.0)
                 };
 
                 let thread_selector_height = acp_thread_selector_height(welcome_center);
@@ -23299,17 +23424,14 @@ impl AdeApp {
                     let slash_popup_height =
                         acp_slash_command_popup_height(slash_commands.len());
 
-                    let capsule_body_height = if welcome_center {
-                        ACP_WELCOME_COMPOSER_MIN_HEIGHT
-                    } else {
-                        ACP_COMPOSER_CHAT_CAPSULE_HEIGHT
-                    };
-                    let (slash_rect, capsule_rect) = acp_composer_stack_rects(
+                    let composer_rects = acp_composer_rects(
                         composer_rect,
+                        welcome_center,
+                        !session.attachments.is_empty(),
+                        session.pending_permission.is_some(),
                         slash_popup_height,
-                        capsule_body_height,
                     );
-                    if let Some(slash_rect) = slash_rect {
+                    if let Some(slash_rect) = composer_rects.slash_rect {
                         draw_acp_slash_command_popup(
                             &mut composer_ui,
                             chat_id,
@@ -23317,6 +23439,7 @@ impl AdeApp {
                             &slash_commands,
                         );
                     }
+                    let capsule_rect = composer_rects.capsule_rect;
                     composer_ui.allocate_rect(capsule_rect, Sense::hover());
                     composer_ui.painter().rect(
                         capsule_rect,
@@ -23690,10 +23813,12 @@ impl AdeApp {
                             ctx.request_repaint();
                         }
 
-                        let can_send = (!session.prompt_input.trim().is_empty()
-                            || !session.attachments.is_empty())
-                            && !is_running
-                            && session_ready;
+                        let can_send = acp_composer_can_send(
+                            &session.prompt_input,
+                            !session.attachments.is_empty(),
+                            is_running,
+                            session_ready,
+                        );
 
                         let (up_pressed, down_pressed) = ui.input(|i| {
                             let mut up = false;
@@ -23751,30 +23876,7 @@ impl AdeApp {
                             }
                         }
 
-                        if plain_enter && response.has_focus() && can_send {
-                            let text = session.prompt_input.trim().to_owned();
-                            let attachments = std::mem::take(&mut session.attachments);
-                            session.prompt_input.clear();
-                            if welcome_center {
-                                let target_project = acp_context_project_id;
-                                welcome_acp_submit =
-                                    Some((chat_id, target_project, text, attachments));
-                            } else {
-                                let prompt_text =
-                                    crate::opencode_acp::build_acp_prompt_text(&text, &attachments);
-                                Self::apply_acp_runtime_defaults_to_session(
-                                    session,
-                                    &acp_runtime_defaults,
-                                    false,
-                                );
-                                Self::append_acp_user_prompt_state(session, &prompt_text);
-                                session.is_running = true;
-                                session.status = crate::opencode_acp::AcpChatStatus::Running;
-                                session.send_prompt(&prompt_text);
-                                acknowledge_acp_attention = true;
-                                ctx.request_repaint();
-                            }
-                        }
+                        let mut submit_requested = plain_enter && response.has_focus() && can_send;
 
                         let send_response = footer_ui.interact(
                             footer_rects.send_rect,
@@ -23814,88 +23916,100 @@ impl AdeApp {
                             send_icon_color,
                         );
                         if send_response.clicked() && can_send {
-                            let text = session.prompt_input.trim().to_owned();
-                            let attachments = std::mem::take(&mut session.attachments);
-                            session.prompt_input.clear();
-                            if welcome_center {
-                                let target_project = acp_context_project_id;
-                                welcome_acp_submit =
-                                    Some((chat_id, target_project, text, attachments));
-                            } else {
-                                let prompt_text =
-                                    crate::opencode_acp::build_acp_prompt_text(&text, &attachments);
-                                Self::apply_acp_runtime_defaults_to_session(
-                                    session,
-                                    &acp_runtime_defaults,
-                                    false,
-                                );
-                                Self::append_acp_user_prompt_state(session, &prompt_text);
-                                session.is_running = true;
-                                session.status = crate::opencode_acp::AcpChatStatus::Running;
-                                session.send_prompt(&prompt_text);
-                                acknowledge_acp_attention = true;
-                                ctx.request_repaint();
+                            submit_requested = true;
+                        }
+                        if submit_requested {
+                            if let Some(submit) = take_acp_composer_submit(session) {
+                                if welcome_center {
+                                    let target_project = acp_context_project_id;
+                                    welcome_acp_submit = Some((
+                                        chat_id,
+                                        target_project,
+                                        submit.text,
+                                        submit.attachments,
+                                    ));
+                                } else {
+                                    Self::apply_acp_runtime_defaults_to_session(
+                                        session,
+                                        &acp_runtime_defaults,
+                                        false,
+                                    );
+                                    Self::append_acp_user_prompt_state(
+                                        session,
+                                        &submit.prompt_text,
+                                    );
+                                    session.is_running = true;
+                                    session.status =
+                                        crate::opencode_acp::AcpChatStatus::Running;
+                                    session.send_prompt(&submit.prompt_text);
+                                    acknowledge_acp_attention = true;
+                                    ctx.request_repaint();
+                                }
                             }
                         }
 
-                    // Attachment chips below capsule
                     if !session.attachments.is_empty() {
-                        composer_ui.add_space(4.0);
-                        let chip_row_rect = egui::Rect::from_min_size(
-                            composer_ui.cursor().min,
-                            egui::vec2(composer_ui.available_width(), 24.0),
-                        );
-                        composer_ui.allocate_rect(chip_row_rect, Sense::hover());
-                        let mut chip_ui = composer_ui.new_child(
-                            egui::UiBuilder::new()
-                                .max_rect(chip_row_rect)
-                                .layout(Layout::left_to_right(Align::Center)),
-                        );
-                        chip_ui.spacing_mut().item_spacing.x = 6.0;
-                        egui::ScrollArea::horizontal()
-                            .id_salt(("acp-attachment-chips", chat_id))
-                            .show(&mut chip_ui, |ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                let mut to_remove = Vec::new();
-                                for (i, path) in session.attachments.iter().enumerate() {
-                                    let file_name = std::path::Path::new(path)
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or(path);
-                                    let chip = ui.add(
-                                        egui::Button::new(
-                                            RichText::new(format!(
-                                                "{} {}",
-                                                icons::FOLDER,
-                                                file_name
-                                            ))
-                                            .size(11.0)
-                                            .color(Color32::from_rgb(180, 180, 180)),
-                                        )
-                                        .fill(Color32::from_rgb(40, 40, 40))
-                                        .rounding(4.0)
-                                        .stroke(Stroke::new(1.0, Color32::from_rgb(90, 90, 90)))
-                                        .small(),
-                                    );
-                                    if chip.clicked() {
-                                        to_remove.push(i);
-                                    }
-                                }
-                                for i in to_remove.iter().rev() {
-                                    let path = session.attachments.remove(*i);
-                                    session.prompt_input =
-                                        crate::opencode_acp::remove_mention_from_input(
-                                            &session.prompt_input,
-                                            &path,
+                        if let Some(chip_row_rect) = composer_rects.attachment_rect {
+                            composer_ui.allocate_rect(chip_row_rect, Sense::hover());
+                            let mut chip_ui = composer_ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(chip_row_rect)
+                                    .layout(Layout::left_to_right(Align::Center)),
+                            );
+                            chip_ui.spacing_mut().item_spacing.x = 6.0;
+                            egui::ScrollArea::horizontal()
+                                .id_salt(("acp-attachment-chips", chat_id))
+                                .show(&mut chip_ui, |ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    let mut to_remove = Vec::new();
+                                    for (i, path) in session.attachments.iter().enumerate() {
+                                        let file_name = std::path::Path::new(path)
+                                            .file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or(path);
+                                        let chip = ui.add(
+                                            egui::Button::new(
+                                                RichText::new(format!(
+                                                    "{} {}",
+                                                    icons::FOLDER,
+                                                    file_name
+                                                ))
+                                                .size(11.0)
+                                                .color(Color32::from_rgb(180, 180, 180)),
+                                            )
+                                            .fill(Color32::from_rgb(40, 40, 40))
+                                            .rounding(4.0)
+                                            .stroke(Stroke::new(1.0, Color32::from_rgb(90, 90, 90)))
+                                            .small(),
                                         );
-                                }
-                            });
+                                        if chip.clicked() {
+                                            to_remove.push(i);
+                                        }
+                                    }
+                                    for i in to_remove.iter().rev() {
+                                        let path = session.attachments.remove(*i);
+                                        session.prompt_input =
+                                            crate::opencode_acp::remove_mention_from_input(
+                                                &session.prompt_input,
+                                                &path,
+                                            );
+                                    }
+                                });
+                        }
                     }
 
-                    // Permission card below composer
-                    if let Some(permission) = session.pending_permission.clone() {
-                        composer_ui.add_space(4.0);
-                        composer_ui.horizontal(|ui| {
+                    if let (Some(permission), Some(permission_rect)) = (
+                        session.pending_permission.clone(),
+                        composer_rects.permission_rect,
+                    ) {
+                        composer_ui.allocate_rect(permission_rect, Sense::hover());
+                        let mut permission_ui = composer_ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(permission_rect)
+                                .layout(Layout::top_down(Align::Min)),
+                        );
+                        permission_ui.set_clip_rect(permission_rect);
+                        permission_ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new(format!(
                                     "Permission: {}",
@@ -23907,7 +24021,7 @@ impl AdeApp {
                         });
                         let mut responded = false;
                         for opt in &permission.options {
-                            if composer_ui
+                            if permission_ui
                                 .button(format!("{} {}", icons::CHECK_CIRCLE, opt.name))
                                 .clicked()
                             {
@@ -65812,6 +65926,125 @@ mod tests {
         assert!(slash_rect.is_none());
         assert!(capsule_rect.top() >= composer_rect.top() - 0.01);
         assert!(capsule_rect.bottom() <= composer_rect.bottom() + 0.01);
+    }
+
+    #[test]
+    fn acp_composer_height_accounts_for_optional_rows() {
+        let slash_height = super::acp_slash_command_popup_height(3);
+        let height = super::acp_composer_height(true, true, true, slash_height);
+        let expected = super::ACP_WELCOME_COMPOSER_MIN_HEIGHT
+            + slash_height
+            + super::ACP_COMPOSER_BELOW_CAPSULE_GAP
+            + super::ACP_COMPOSER_ATTACHMENT_ROW_HEIGHT
+            + super::ACP_COMPOSER_BELOW_CAPSULE_GAP
+            + super::ACP_COMPOSER_PERMISSION_CARD_HEIGHT;
+
+        assert!((height - expected).abs() < 0.01);
+        assert_eq!(
+            super::acp_composer_height(false, false, false, 0.0),
+            super::ACP_COMPOSER_CHAT_CAPSULE_HEIGHT
+        );
+    }
+
+    #[test]
+    fn acp_composer_rects_stack_slash_capsule_attachment_and_permission() {
+        let slash_height = super::acp_slash_command_popup_height(2);
+        let composer_height = super::acp_composer_height(false, true, true, slash_height);
+        let composer_rect =
+            egui::Rect::from_min_size(egui::pos2(20.0, 100.0), egui::vec2(400.0, composer_height));
+
+        let rects = super::acp_composer_rects(composer_rect, false, true, true, slash_height);
+        let slash_rect = rects.slash_rect.expect("slash rect");
+        let attachment_rect = rects.attachment_rect.expect("attachment rect");
+        let permission_rect = rects.permission_rect.expect("permission rect");
+
+        assert!((slash_rect.top() - composer_rect.top()).abs() < 0.01);
+        assert!(slash_rect.bottom() <= rects.capsule_rect.top() + 0.01);
+        assert!(
+            attachment_rect.top()
+                >= rects.capsule_rect.bottom() + super::ACP_COMPOSER_BELOW_CAPSULE_GAP - 0.01
+        );
+        assert!(
+            permission_rect.top()
+                >= attachment_rect.bottom() + super::ACP_COMPOSER_BELOW_CAPSULE_GAP - 0.01
+        );
+        assert!(permission_rect.bottom() <= composer_rect.bottom() + 0.01);
+    }
+
+    #[test]
+    fn acp_composer_rects_clamp_optional_rows_in_short_space() {
+        let composer_rect =
+            egui::Rect::from_min_size(egui::pos2(20.0, 100.0), egui::vec2(400.0, 72.0));
+
+        let rects = super::acp_composer_rects(
+            composer_rect,
+            false,
+            true,
+            true,
+            super::acp_slash_command_popup_height(4),
+        );
+
+        if let Some(slash_rect) = rects.slash_rect {
+            assert!(slash_rect.top() >= composer_rect.top() - 0.01);
+            assert!(slash_rect.bottom() <= rects.capsule_rect.top() + 0.01);
+        }
+        assert!(rects.capsule_rect.top() >= composer_rect.top() - 0.01);
+        assert!(rects.capsule_rect.bottom() <= composer_rect.bottom() + 0.01);
+        if let Some(attachment_rect) = rects.attachment_rect {
+            assert!(attachment_rect.top() >= rects.capsule_rect.bottom() - 0.01);
+            assert!(attachment_rect.bottom() <= composer_rect.bottom() + 0.01);
+        }
+        if let Some(permission_rect) = rects.permission_rect {
+            assert!(permission_rect.bottom() <= composer_rect.bottom() + 0.01);
+        }
+    }
+
+    #[test]
+    fn acp_composer_can_send_requires_ready_session() {
+        assert!(!super::acp_composer_can_send("hello", false, false, false));
+        assert!(!super::acp_composer_can_send("hello", false, true, true));
+        assert!(!super::acp_composer_can_send("   ", false, false, true));
+        assert!(super::acp_composer_can_send("hello", false, false, true));
+        assert!(super::acp_composer_can_send("", true, false, true));
+    }
+
+    #[test]
+    fn take_acp_composer_submit_builds_prompt_and_consumes_attachments_once() {
+        let (mut session, _rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
+        session.prompt_input = "  hello  ".to_owned();
+        session.attachments = vec!["C:/test/file.txt".to_owned()];
+
+        let submit = super::take_acp_composer_submit(&mut session).expect("composer submit");
+
+        assert_eq!(submit.text, "hello");
+        assert_eq!(submit.attachments, vec!["C:/test/file.txt".to_owned()]);
+        assert_eq!(
+            submit.prompt_text,
+            "hello\n\nAttached file paths:\nC:/test/file.txt"
+        );
+        assert!(session.prompt_input.is_empty());
+        assert!(session.attachments.is_empty());
+    }
+
+    #[test]
+    fn acp_composer_submit_to_unready_chat_queues_without_rpc() {
+        let (mut app, _event_tx) = test_app_with_acp_channels([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        let (mut session, rx) = crate::opencode_acp::test_session_for_app(42, 7, None);
+        session.prompt_input = "hello".to_owned();
+        session.attachments = vec!["C:/test/file.txt".to_owned()];
+        let submit = super::take_acp_composer_submit(&mut session).expect("composer submit");
+        app.acp_chat_sessions.insert(42, session);
+
+        assert!(app.submit_acp_prompt_to_chat(42, submit.prompt_text.clone()));
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            app.acp_chat_sessions.get(&42).unwrap().queue,
+            vec![submit.prompt_text]
+        );
     }
 
     fn insert_visible_test_acp_chat(

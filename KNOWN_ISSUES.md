@@ -3308,3 +3308,26 @@
   - Added regression tests for config safety patching, hook progress event delivery, terminal loop counters, ACP loop messages, and session.status retry mapping.
 - Files/Commands touched: `src/models.rs`, `src/opencode_config.rs`, `src/opencode_hook_service.rs`, `src/opencode.rs`, `src/opencode_acp.rs`, `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
 - References: User desktop files `opencode-loop-report.txt` and `opencode-loop-sanitized.json`, 2026-06-03
+
+---
+
+#### OpenCode ACP composer UI kurallari kodla drift edebiliyor {#acp-composer-ui-rule-drift}
+- Date: 2026-06-03
+- Context: User reported that ACP UI fixes often break a nearby area, especially in the OpenCode ACP composer.
+- Error signature:
+  1. Some ACP UI dimensions lived only as prose in `AGENTS.md`.
+  2. Some `AGENTS.md` ACP UI bullets still described older measurements and truncation behavior.
+  3. `draw_acp_chat_panel` duplicated submit handling for Enter and the send button.
+- Symptoms/Impact:
+  - Fixing slash hints, attachments, permission cards, or model selector sizing could regress another composer row.
+  - Attachment prompt building could drift between input paths if one branch was updated and the other was not.
+- Root cause:
+  - ACP composer geometry and submit behavior were not fully centralized in small helper functions with targeted tests.
+- Resolution:
+  - Added `acp_composer_height()` and `acp_composer_rects()` as the source of truth for slash, capsule, attachment, and permission row placement.
+  - Added `acp_composer_can_send()` and `take_acp_composer_submit()` so readiness checks and attachment-consuming prompt construction are shared.
+  - Updated ACP UI guidance to match the current helper-driven layout contract.
+- Prevent recurrence:
+  - Added regression tests for optional row geometry, short viewport clamping, readiness gating, single prompt construction, and unready-session queueing without RPC.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, ACP composer tests
+- References: User request 2026-06-03
