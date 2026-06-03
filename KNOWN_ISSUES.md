@@ -2947,3 +2947,275 @@
   - Added regression tests for ACP foreground counting, worktree ACP counting, row activation without terminal creation, badge mapping, and ACP event-driven attention state.
 - Files/Commands touched: `src/app.rs`, `src/opencode_acp.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted ACP tests, `cargo test`
 - References: User request 2026-06-03
+
+---
+
+#### OpenCode ACP foreground row did not track last prompt or move empty chats between projects {#acp-row-title-and-empty-chat-project-move}
+- Date: 2026-06-03
+- Context: OpenCode ACP was visible in Terminal Manager foreground, but the row title stayed at the initial chat name after sending messages. The project selector also only changed a UI context map, so selecting a different project did not move the foreground row or update the ACP session cwd.
+- Error signature:
+  1. ACP prompt submission appended messages/recent input but did not update `session.title`.
+  2. `acp_context_project_by_chat` decoupled the visible selector from the real `AcpChatSession.project_id`.
+  3. A started ACP session could still appear project-switchable even though the underlying `opencode acp` process cwd cannot be changed safely.
+- Symptoms/Impact:
+  1. Foreground rows showed generic labels such as `OpenCode ACP - Chat 42` instead of the latest user prompt.
+  2. Empty chats selected to another project remained grouped under the original project.
+  3. Started chats could imply project switching was possible even though continuing in a different cwd would be incorrect.
+- Root cause:
+  - ACP chat ownership and ACP composer context were modeled separately. The selector updated only context state, while Terminal Manager rows were grouped from actual chat ownership.
+- Resolution:
+  1. Update ACP chat title from the latest submitted user prompt through the shared prompt-state helper.
+  2. Treat a chat as started once it has user messages, recent inputs, or queued prompts.
+  3. Lock the project selector after a chat starts.
+  4. For unstarted chats, move project ownership by promoting/creating a target-project ACP session and transferring draft/attachments before closing the old empty session.
+- Prevent recurrence:
+  - Added regression tests for last-prompt title updates, unstarted chat project movement, started chat project-change rejection, and no terminal creation during movement.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted ACP tests
+- References: User request 2026-06-03
+
+---
+
+#### OpenCode ACP empty project switching consumed chat IDs two at a time {#acp-empty-project-switch-chat-id-churn}
+- Date: 2026-06-03
+- Context: After opening OpenCode ACP, switching the project selector before sending any message made the visible chat number jump by two on each change.
+- Error signature:
+  1. Empty-chat project selection promoted or spawned a new visible ACP session immediately.
+  2. The same path also warmed a replacement standby ACP session, consuming another internal chat id.
+  3. Empty ACP sessions displayed raw `Chat {id}` titles, making hidden/internal id churn visible in the UI.
+- Symptoms/Impact:
+  - Users saw ACP chat numbering advance by `2` even though no conversation had started.
+- Root cause:
+  - The project selector treated an unstarted chat selection as a real ACP session migration. ACP `cwd` cannot be changed after `session/new`, but no real migration is needed until the first prompt.
+- Resolution:
+  1. Store pending/effective project selection for unstarted ACP chats without spawning or killing ACP sessions.
+  2. Group Terminal Manager rows by the effective project while keeping the real ACP session project as the process `cwd` source of truth.
+  3. Block target-project standby auto-promotion while an unstarted effective-project chat is already visible there.
+  4. Prepare the correct target-project ACP session only when the first prompt is submitted, then close the old empty source chat.
+  5. Hide raw chat ids for unstarted ACP display titles.
+- Prevent recurrence:
+  - Added regression tests for repeated empty project switching without id consumption, Terminal Manager effective-project grouping, standby promotion blocking, first-prompt target routing, started-chat project locking, and stable unstarted display titles.
+- Files/Commands touched: `src/app.rs`, `src/opencode_acp.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted ACP tests
+- References: User request 2026-06-03
+
+---
+
+#### OpenCode ACP Terminal Manager row duplicated the empty ACP title {#acp-terminal-manager-duplicate-empty-title}
+- Date: 2026-06-03
+- Context: Empty OpenCode ACP chats used `OpenCode ACP` as their display title, while the Terminal Manager row also prefixed the title with `OpenCode ACP -`.
+- Error signature:
+  - The foreground row rendered `OpenCode ACP - OpenCode ACP` before any message was sent.
+- Symptoms/Impact:
+  - The ACP foreground row looked duplicated and noisy for new/empty chats.
+- Root cause:
+  - The row renderer always applied the started-chat label format, even when the chat title was the generic empty-chat label.
+- Resolution:
+  - Use a dedicated ACP Terminal Manager row label helper: empty chats render `OpenCode ACP`, started chats render `OpenCode ACP - <last prompt title>`.
+- Prevent recurrence:
+  - Added regression tests for empty and started ACP row labels.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted ACP label tests
+- References: User request 2026-06-03
+
+---
+
+#### OpenCode ACP chat composer could move below the viewport after the first message {#acp-chat-composer-bottom-overflow}
+- Date: 2026-06-03
+- Context: After sending the first OpenCode ACP message, the composer switched from the welcome layout to the chat layout. On short viewports, the model selector and send button could appear below the visible area.
+- Error signature:
+  1. The chat layout forced the message history area to at least `80px`.
+  2. The composer was placed after that minimum-height message area instead of being anchored to the bottom of the available content.
+  3. Footer controls were clipped against the larger footer rect instead of the send-inset content rect.
+- Symptoms/Impact:
+  - The input row dropped downward after a message was sent, and the model selector/send button could overflow the screen.
+- Root cause:
+  - The non-welcome ACP layout prioritized message-history minimum height over keeping the composer/status controls inside the viewport.
+- Resolution:
+  - Anchor the chat composer and status row to the bottom of the content rect, let the message history shrink when space is tight, and clip footer controls to the bounded content rect.
+- Prevent recurrence:
+  - Added regression tests for short chat viewport layout and narrow footer send/model bounds.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted ACP composer layout tests
+- References: User request 2026-06-03
+
+---
+
+#### OpenCode ACP welcome composer footer controls appeared clipped {#acp-welcome-composer-footer-clipped}
+- Date: 2026-06-03
+- Context: After tightening ACP chat footer clipping to keep chat-mode model/send controls inside the viewport, the no-message welcome composer showed clipped-looking lower edges on footer controls.
+- Error signature:
+  - The welcome footer UI clipped to the same 30px content rect used for bounded chat-mode controls.
+- Symptoms/Impact:
+  - The `+`, `Plan`, model selector, and send controls looked cut off along their bottom edges before any message was sent.
+- Root cause:
+  - Welcome mode needs visual breathing room for rounded controls, while chat mode needs a tighter content clip to prevent overflow.
+- Resolution:
+  - Use a mode-aware footer clip helper: welcome clips to the full footer rect, chat clips to the bounded content rect.
+- Prevent recurrence:
+  - Added regression tests for welcome and chat footer clip rect behavior.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted ACP footer clip tests
+- References: User request 2026-06-03
+
+---
+
+#### OpenCode ACP chat composer send button disappeared after first prompt {#acp-chat-composer-send-button-hidden}
+- Date: 2026-06-03
+- Context: After sending a message, OpenCode ACP switched to the chat layout and the bottom composer showed clipped controls with the send button missing on the right.
+- Error signature:
+  1. The footer was rendered with egui horizontal flow inside a narrowed content rect.
+  2. The model selector could consume more than its computed width and push the send button outside the visible clipped area.
+  3. Chat-mode clipping used the 30px content rect, leaving too little breathing room for rounded footer controls.
+- Symptoms/Impact:
+  - The model/status area was visible, but the send button disappeared and the footer controls looked cut off after the first prompt.
+- Root cause:
+  - The footer layout depended on flow-based widget placement for controls that need fixed positions. The send button was not independently pinned to the right edge.
+- Resolution:
+  - Compute explicit footer control rects, pin the send button to its own right-side rect, constrain model/text controls before it, and clip both welcome and chat footer controls to the full footer rect.
+- Prevent recurrence:
+  - Added regression tests for chat send positioning, model/send non-overlap, full footer clip breathing room, and tiny-footer send bounds.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted ACP footer tests
+- References: User request 2026-06-03
+
+---
+
+#### OpenCode ACP composer model selector was squeezed to an unreadable width {#acp-composer-model-selector-too-narrow}
+- Date: 2026-06-03
+- Context: After pinning the ACP composer send button, both welcome and chat composer footers still looked broken because the model selector only displayed fragments such as `OpenA`.
+- Error signature:
+  1. `ACP_COMPOSER_MODEL_WIDTH_MAX` was still `42px`.
+  2. The footer layout respected that max even on wide viewports.
+  3. The prompt input and send button stayed visible, but the model selector became unreadable and made the footer look unbalanced.
+- Symptoms/Impact:
+  - Users could not read the selected model in either the no-message welcome composer or the post-message chat composer.
+- Root cause:
+  - The prior layout fix solved send-button overflow without updating the model selector's width contract from icon-sized to label-sized.
+- Resolution:
+  - Increase the model selector to a readable target/max width, preserve it before shrinking the prompt input in narrow chat footers, and keep send pinned to the right.
+- Prevent recurrence:
+  - Added regression tests for wide welcome/chat readable model widths and narrow chat text-first shrinking behavior.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted ACP footer tests
+- References: User request 2026-06-03
+
+---
+
+#### OpenCode ACP composer footer controls still looked clipped after width fixes {#acp-composer-footer-hard-clips}
+- Date: 2026-06-03
+- Context: After the send button and model selector widths were fixed, the composer controls still looked cut off in screenshots: the `+`/`Plan` controls and text cursor appeared too close to their hard edges.
+- Error signature:
+  1. Footer controls were clipped exactly to their widget rects.
+  2. The control row was positioned from a fixed top offset instead of being centered in the 40px footer.
+  3. Frame-less text edits started at the exact control edge, making the cursor and hint text look cropped.
+- Symptoms/Impact:
+  - Controls appeared visually chopped even though their logical rects were inside the capsule.
+- Root cause:
+  - The footer layout treated widget bounds as both layout and paint clipping bounds. Rounded controls, text cursors, and antialiasing need a little paint breathing room.
+- Resolution:
+  - Reduce footer controls to 28px, center them vertically, expand per-widget clip rects within the footer, and inset text-edit content horizontally.
+- Prevent recurrence:
+  - Added regression tests for vertical centering, relaxed widget clips, and text-edit horizontal insets.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted ACP footer tests
+- References: User request 2026-06-03
+
+---
+
+#### OpenCode ACP composer send button remained too close to the right corner {#acp-composer-send-right-inset-too-small}
+- Date: 2026-06-03
+- Context: After footer clipping fixes, the send button was visible but still looked partially clipped because it sat too close to the rounded capsule's right edge.
+- Error signature:
+  - The send button used only an `8px` right inset.
+- Symptoms/Impact:
+  - The send icon/button looked visually crowded against the right rounded corner.
+- Root cause:
+  - The footer reserved enough space for geometry, but not enough visual spacing for the rounded capsule edge.
+- Resolution:
+  - Increase the ACP composer send right inset from `8px` to `16px`.
+- Prevent recurrence:
+  - Existing ACP footer tests assert the send rect respects the configured right inset and stays non-overlapping.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted ACP footer tests
+- References: User request 2026-06-03
+
+---
+
+#### OpenCode ACP did not inherit Plan defaults from Mergen settings {#acp-plan-defaults-not-applied}
+- Date: 2026-06-03
+- Context: User reported that while OpenCode terminal sessions used the expected Plan/Build defaults, OpenCode ACP loaded without showing the Plan pill during startup and did not automatically apply Plan mode `gpt-5.5-fast` with `xhigh` effort or Build mode Kimi K2.6.
+- Error signature:
+  1. ACP startup mode defaulted to Build for older/default configs.
+  2. ACP composer fallback mode was hardcoded to Build while the session was still loading.
+  3. Terminal OpenCode runtime config and ACP `session/set_config_option` defaults were maintained through separate paths, allowing drift.
+- Symptoms/Impact:
+  - The Plan pill appeared only after ACP config arrived, causing layout instability during startup.
+  - New ACP sessions could send prompts before the expected Plan model/effort had been applied.
+  - Terminal OpenCode config changes did not reliably propagate to visible ACP chats.
+- Root cause:
+  - There was no shared runtime defaults object for OpenCode terminal config, global config patching, ACP startup env, and live ACP session config RPCs.
+- Resolution:
+  - Added shared OpenCode runtime defaults for Build model, Plan model, Plan effort, and default agent.
+  - Changed fresh and migrated v1 configs to default ACP startup mode to Plan.
+  - Applied defaults to terminal runtime configs, global OpenCode config, ACP process env, live ACP sessions, and queued prompt flushes before `session/prompt`.
+  - Added Settings > OpenCode Plan default fields for Plan model and Plan effort.
+- Prevent recurrence:
+  - Added regression tests for custom runtime defaults in terminal config and for queued ACP prompts sending `mode`, `model`, and `effort` updates before the prompt.
+- Files/Commands touched: `src/models.rs`, `src/config.rs`, `src/opencode_config.rs`, `src/opencode_acp.rs`, `src/terminal.rs`, `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`, `cargo build`
+- References: User request 2026-06-03
+
+---
+
+#### OpenCode ACP welcome composer model label truncated too early {#acp-welcome-model-label-early-truncation}
+- Date: 2026-06-03
+- Context: User reported that the welcome composer send button still sat too close to the right edge, while the model selector arrow was far to the right and the model name was cut to `...` too early.
+- Error signature:
+  1. The send button used a `16px` right inset, which still looked crowded in the rounded capsule.
+  2. The model selector used a fixed target width independent of the actual model label.
+  3. The selected model label was manually truncated after 18 characters before egui had a chance to size the selector.
+- Symptoms/Impact:
+  - The send icon looked visually clipped against the right side.
+  - Shorter model labels left the dropdown arrow disconnected from the text.
+  - Default Plan labels such as `openai/gpt-5.5-fast xhigh` were shortened even when enough composer width was available.
+- Root cause:
+  - ACP footer layout treated the model selector as a fixed-width control and applied character-count truncation rather than measuring the rendered label.
+- Resolution:
+  - Increased the send right inset to `28px`.
+  - Measured the model label width and used it to compute selector width within min/max bounds.
+  - Removed the 18-character manual truncation from the composer model label.
+- Prevent recurrence:
+  - Added regression tests for dynamic model selector width, short-label sizing, long-label expansion, send inset geometry, and untruncated Plan fallback labels.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted ACP composer tests
+- References: User request 2026-06-03
+
+---
+
+#### OpenCode ACP send button rounded edge looked clipped after inset changes {#acp-send-button-rounded-edge-clipped}
+- Date: 2026-06-03
+- Context: User reported that the welcome composer send button had moved left but its circular right edge still looked cut off.
+- Error signature:
+  1. The send button was still rendered as an `egui::Button` sized exactly to the send hit rect.
+  2. The button fill and rounded edge could paint up to the widget/clip boundary, making antialiasing look clipped inside the rounded composer capsule.
+- Symptoms/Impact:
+  - The send button circle appeared visually chopped even though the hit rect was inside the footer.
+- Root cause:
+  - The visual circle and the interactive rect were the same rectangle. The geometry had spacing, but the painted circle needed its own inset.
+- Resolution:
+  - Replaced the send control's `egui::Button` rendering with a manual painter path.
+  - Kept the full send hit rect for interaction and painted the circular fill/icon inside a `2px` inset rect.
+- Prevent recurrence:
+  - Added regression tests asserting the send paint rect stays inset inside the hit rect and away from the footer clip edge.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted ACP composer tests
+- References: User request 2026-06-03
+
+---
+
+#### OpenCode ACP send button over-inset after clipping fix {#acp-send-button-over-inset}
+- Date: 2026-06-03
+- Context: User reported that the send arrow should be right-aligned again, while still avoiding the clipped circular edge.
+- Error signature:
+  1. The previous clipping fix kept the safe manual paint inset.
+  2. The send hit rect still used a `28px` right inset, leaving the arrow visibly too far left.
+- Symptoms/Impact:
+  - The send arrow no longer looked right-aligned in the welcome composer.
+- Root cause:
+  - The layout inset and the paint inset were both compensating for the same rounded-edge clipping problem.
+- Resolution:
+  - Reduced the send right layout inset to `12px`.
+  - Kept the `2px` internal paint inset so the circular button edge remains fully inside its hit rect.
+- Prevent recurrence:
+  - Added a regression test asserting the send hit rect stays right-aligned while the painted circle remains inset.
+- Files/Commands touched: `src/app.rs`, `KNOWN_ISSUES.md`, `cargo fmt`, targeted ACP composer tests
+- References: User request 2026-06-03

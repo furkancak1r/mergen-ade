@@ -302,14 +302,20 @@ impl AcpChatSession {
     /// Determine the active mode id using fallback sources when the config option
     /// has not yet arrived (e.g. during ACP startup).
     pub fn active_mode_id_or_default(&self) -> String {
+        self.active_mode_id_or("build")
+    }
+
+    pub fn active_mode_id_or(&self, fallback: &str) -> String {
         if let Some(mode_opt) = self.config_option("mode") {
             mode_opt.current_value.clone()
+        } else if let Some(mode_id) = self.config_options.get("mode") {
+            mode_id.clone()
         } else if let Some(ref mode_id) = self.selected_mode_id {
             mode_id.clone()
         } else if let Some(mode) = self.modes.last() {
             mode.id.clone()
         } else {
-            "build".to_string()
+            fallback.to_string()
         }
     }
 
@@ -346,7 +352,7 @@ pub(crate) fn test_session_for_app(
             id: chat_id,
             project_id,
             project_path: PathBuf::from("C:/test/project"),
-            title: format!("Chat {chat_id}"),
+            title: "OpenCode ACP".to_owned(),
             created_at: Instant::now(),
             updated_at: Instant::now(),
             status,
@@ -459,7 +465,7 @@ pub fn spawn_opencode_acp(
     project_id: u64,
     project_path: PathBuf,
     opencode_bin: Option<std::ffi::OsString>,
-    build_model: Option<String>,
+    runtime_defaults: Option<crate::opencode_config::OpenCodeRuntimeDefaults>,
     startup_mode_id: String,
     browser_mcp_env: Vec<(String, String)>,
     event_tx: crossbeam_channel::Sender<AcpChatEvent>,
@@ -472,15 +478,8 @@ pub fn spawn_opencode_acp(
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    if let Some(model) = build_model {
-        command.env(
-            "OPENCODE_CONFIG_CONTENT",
-            json!({
-                "agent": { "build": { "model": model } },
-                "mode": { "build": { "model": model } }
-            })
-            .to_string(),
-        );
+    if let Some(defaults) = runtime_defaults.as_ref() {
+        command.env("OPENCODE_CONFIG_CONTENT", defaults.to_env_content_string());
     }
     for (k, v) in browser_mcp_env {
         command.env(k, v);
@@ -577,11 +576,22 @@ pub fn spawn_opencode_acp(
     });
     let _ = command_tx.send(init_msg.to_string());
     let now = Instant::now();
+    let mut config_options = BTreeMap::new();
+    config_options.insert("mode".to_owned(), startup_mode_id.clone());
+    if let Some(defaults) = runtime_defaults.as_ref() {
+        config_options.insert(
+            "model".to_owned(),
+            defaults.desired_model_for_mode(&startup_mode_id).to_owned(),
+        );
+        if mode_is_plan(&startup_mode_id) {
+            config_options.insert("effort".to_owned(), defaults.plan_effort.clone());
+        }
+    }
     Ok(AcpChatSession {
         id: chat_id,
         project_id,
         project_path,
-        title: format!("Chat {chat_id}"),
+        title: "OpenCode ACP".to_owned(),
         created_at: now,
         updated_at: now,
         status: AcpChatStatus::Starting,
@@ -591,7 +601,7 @@ pub fn spawn_opencode_acp(
         attachments: Vec::new(),
         is_running: false,
         session_id: None,
-        config_options: BTreeMap::new(),
+        config_options,
         config_options_struct: Vec::new(),
         modes: Vec::new(),
         available_commands: Vec::new(),
@@ -1004,7 +1014,7 @@ mod tests {
             id: chat_id,
             project_id,
             project_path: PathBuf::from("C:/test/project"),
-            title: format!("Chat {chat_id}"),
+            title: "OpenCode ACP".to_owned(),
             created_at: Instant::now(),
             updated_at: Instant::now(),
             status,
@@ -1437,6 +1447,12 @@ mod tests {
     fn active_mode_id_or_default_fallback_to_build() {
         let (session, _rx) = test_session();
         assert_eq!(session.active_mode_id_or_default(), "build");
+    }
+
+    #[test]
+    fn active_mode_id_or_uses_supplied_startup_fallback() {
+        let (session, _rx) = test_session();
+        assert_eq!(session.active_mode_id_or("plan"), "plan");
     }
 
     #[test]

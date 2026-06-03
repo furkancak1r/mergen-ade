@@ -501,6 +501,12 @@ impl OpenCodeAcpModelEntry {
     }
 }
 
+pub const APP_CONFIG_VERSION: u32 = 2;
+pub const DEFAULT_OPENCODE_BUILD_MODEL: &str =
+    "fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo";
+pub const DEFAULT_OPENCODE_PLAN_MODEL: &str = "openai/gpt-5.5-fast";
+pub const DEFAULT_OPENCODE_PLAN_EFFORT: &str = "xhigh";
+
 /// OpenCode model configuration with two switchable slots and ACP favorites.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -509,6 +515,10 @@ pub struct OpenCodeModelConfig {
     pub build_model_slot_a: String,
     /// Model name for build mode slot B.
     pub build_model_slot_b: String,
+    /// Model used by OpenCode plan mode and ACP plan sessions.
+    pub plan_model: String,
+    /// Effort/variant used by OpenCode plan mode and ACP plan sessions.
+    pub plan_effort: String,
     /// Which slot is currently active ("a" or "b").
     pub active_build_model_slot: String,
     /// Favorite ACP model values (persisted). Only these appear in the composer dropdown.
@@ -522,9 +532,10 @@ pub struct OpenCodeModelConfig {
 impl Default for OpenCodeModelConfig {
     fn default() -> Self {
         Self {
-            build_model_slot_a: "fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo"
-                .to_owned(),
-            build_model_slot_b: "openai/gpt-5.5-fast".to_owned(),
+            build_model_slot_a: DEFAULT_OPENCODE_BUILD_MODEL.to_owned(),
+            build_model_slot_b: DEFAULT_OPENCODE_PLAN_MODEL.to_owned(),
+            plan_model: DEFAULT_OPENCODE_PLAN_MODEL.to_owned(),
+            plan_effort: DEFAULT_OPENCODE_PLAN_EFFORT.to_owned(),
             active_build_model_slot: "a".to_owned(),
             acp_favorite_models: Vec::new(),
             acp_known_models: Vec::new(),
@@ -538,6 +549,24 @@ impl OpenCodeModelConfig {
         match self.active_build_model_slot.as_str() {
             "b" => &self.build_model_slot_b,
             _ => &self.build_model_slot_a,
+        }
+    }
+
+    pub fn effective_plan_model(&self) -> &str {
+        let model = self.plan_model.trim();
+        if model.is_empty() {
+            DEFAULT_OPENCODE_PLAN_MODEL
+        } else {
+            model
+        }
+    }
+
+    pub fn effective_plan_effort(&self) -> &str {
+        let effort = self.plan_effort.trim();
+        if effort.is_empty() {
+            DEFAULT_OPENCODE_PLAN_EFFORT
+        } else {
+            effort
         }
     }
 
@@ -790,11 +819,16 @@ impl AcpModeToggleShortcut {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AcpStartupMode {
-    #[default]
     Build,
     Plan,
+}
+
+impl Default for AcpStartupMode {
+    fn default() -> Self {
+        Self::Plan
+    }
 }
 
 impl AcpStartupMode {
@@ -837,7 +871,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: APP_CONFIG_VERSION,
             default_shell: ShellKind::default(),
             ui: UiConfig::default(),
             launchers: default_launchers(),
@@ -856,9 +890,9 @@ impl Default for AppConfig {
 mod tests {
     use super::{
         default_launchers, default_terminal_shortcuts, normalize_launcher_entries,
-        normalize_terminal_shortcut_entries, AcpModeToggleShortcut, AcpStartupMode, AppConfig,
-        BuiltinLauncherKind, LauncherEntry, LauncherIconKey, OpenCodeAcpModelEntry,
-        OpenCodeModelConfig, ShellKind, ShortcutModifiers, TerminalShortcutEntry, UiConfig,
+        normalize_terminal_shortcut_entries, AcpStartupMode, AppConfig, BuiltinLauncherKind,
+        LauncherEntry, LauncherIconKey, OpenCodeAcpModelEntry, OpenCodeModelConfig, ShellKind,
+        ShortcutModifiers, TerminalShortcutEntry, UiConfig,
     };
 
     #[test]
@@ -955,9 +989,9 @@ mod tests {
     }
 
     #[test]
-    fn app_config_default_acp_startup_mode_is_build() {
+    fn app_config_default_acp_startup_mode_is_plan() {
         let config = AppConfig::default();
-        assert_eq!(config.acp_startup_mode, AcpStartupMode::Build);
+        assert_eq!(config.acp_startup_mode, AcpStartupMode::Plan);
     }
 
     #[test]
@@ -1208,10 +1242,12 @@ mod tests {
     }
 
     #[test]
-    fn opencode_model_config_default_slot_a_is_kimi_k2p5_turbo() {
+    fn opencode_model_config_defaults_include_build_and_plan_models() {
         let config = OpenCodeModelConfig::default();
         assert!(config.build_model_slot_a.contains("kimi-k2p6-turbo"));
         assert!(config.build_model_slot_b.contains("gpt-5.5-fast"));
+        assert_eq!(config.plan_model, "openai/gpt-5.5-fast");
+        assert_eq!(config.plan_effort, "xhigh");
         assert_eq!(config.active_build_model_slot, "a");
     }
 
@@ -1251,6 +1287,8 @@ mod tests {
         let original = OpenCodeModelConfig {
             build_model_slot_a: "custom/model-a".to_owned(),
             build_model_slot_b: "custom/model-b".to_owned(),
+            plan_model: "custom/plan-model".to_owned(),
+            plan_effort: "xhigh".to_owned(),
             active_build_model_slot: "b".to_owned(),
             acp_favorite_models: vec!["custom/model-a".to_owned()],
             acp_known_models: vec![OpenCodeAcpModelEntry::new(
@@ -1264,6 +1302,8 @@ mod tests {
 
         assert_eq!(deserialized.build_model_slot_a, "custom/model-a");
         assert_eq!(deserialized.build_model_slot_b, "custom/model-b");
+        assert_eq!(deserialized.plan_model, "custom/plan-model");
+        assert_eq!(deserialized.plan_effort, "xhigh");
         assert_eq!(deserialized.active_build_model_slot, "b");
         assert_eq!(deserialized.acp_favorite_models, vec!["custom/model-a"]);
         assert_eq!(deserialized.acp_known_models.len(), 1);

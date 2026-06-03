@@ -25,7 +25,7 @@ use crate::hooks::{
     FACTORY_DROID_TERMINAL_ID_ENV_VAR,
 };
 use crate::opencode::opencode_env_pairs;
-use crate::opencode_config;
+use crate::opencode_config::{self, OpenCodeRuntimeDefaults};
 use crate::opencode_hook_service::{OpenCodeHookService, OPENCODE_CONFIG_DIR_ENV_VAR};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -844,7 +844,7 @@ impl TerminalRuntime {
         opencode_notify_inbox_token: Option<String>,
         opencode_hook_service: Option<&OpenCodeHookService>,
         browser_mcp_service: Option<&BrowserMcpService>,
-        opencode_build_model: Option<&str>,
+        opencode_runtime_defaults: Option<OpenCodeRuntimeDefaults>,
     ) -> io::Result<Self> {
         let pty_system = native_pty_system();
         let pty_pair = pty_system
@@ -908,7 +908,7 @@ impl TerminalRuntime {
                 opencode_config_dir = Some(config_dir);
             }
 
-            if let Some(build_model) = opencode_build_model {
+            if let Some(defaults) = opencode_runtime_defaults.as_ref() {
                 let browser_mcp = browser_mcp_service.and_then(|service| {
                     std::env::current_exe().ok().map(|current_exe| {
                         (
@@ -918,17 +918,17 @@ impl TerminalRuntime {
                     })
                 });
                 let write_result = if let Some((exe_path, endpoint)) = browser_mcp.as_ref() {
-                    opencode_config::write_terminal_runtime_config_with_browser_mcp(
+                    opencode_config::write_terminal_runtime_config_with_browser_mcp_defaults(
                         opencode_dir,
                         terminal_id,
-                        build_model,
+                        defaults,
                         Some((exe_path.as_path(), endpoint.clone())),
                     )
                 } else {
-                    opencode_config::write_terminal_runtime_config(
+                    opencode_config::write_terminal_runtime_config_with_defaults(
                         opencode_dir,
                         terminal_id,
-                        build_model,
+                        defaults,
                     )
                 };
                 match write_result {

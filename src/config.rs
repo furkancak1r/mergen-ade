@@ -8,7 +8,9 @@ use serde::Deserialize;
 
 use crate::models::{
     default_launchers, default_terminal_shortcuts, normalize_launcher_entries,
-    normalize_terminal_shortcut_entries, AppConfig, AppHistory, ProjectRecord, ShellKind, UiConfig,
+    normalize_terminal_shortcut_entries, AcpStartupMode, AppConfig, AppHistory, ProjectRecord,
+    ShellKind, UiConfig, APP_CONFIG_VERSION, DEFAULT_OPENCODE_BUILD_MODEL,
+    DEFAULT_OPENCODE_PLAN_EFFORT, DEFAULT_OPENCODE_PLAN_MODEL,
 };
 
 const QUALIFIER: &str = "com";
@@ -301,10 +303,34 @@ impl From<LegacyAppConfig> for AppConfig {
 }
 
 const fn default_config_version() -> u32 {
-    1
+    APP_CONFIG_VERSION
 }
 
 fn normalize_config_for_current_platform(config: &mut AppConfig) -> bool {
+    let mut changed = false;
+    let loaded_version = config.version;
+
+    if loaded_version < 2 {
+        if config.acp_startup_mode == AcpStartupMode::Build {
+            config.acp_startup_mode = AcpStartupMode::Plan;
+            changed = true;
+        }
+        if config.opencode.plan_model.trim().is_empty() {
+            let slot_b = config.opencode.build_model_slot_b.trim();
+            config.opencode.plan_model = if slot_b.is_empty() {
+                DEFAULT_OPENCODE_PLAN_MODEL.to_owned()
+            } else {
+                slot_b.to_owned()
+            };
+            changed = true;
+        }
+    }
+
+    if config.version != APP_CONFIG_VERSION {
+        config.version = APP_CONFIG_VERSION;
+        changed = true;
+    }
+
     config.default_shell = config.default_shell.normalize_for_current_platform();
     normalize_launcher_entries(&mut config.launchers);
     normalize_terminal_shortcut_entries(&mut config.terminal_shortcuts);
@@ -312,8 +338,16 @@ fn normalize_config_for_current_platform(config: &mut AppConfig) -> bool {
     if config.opencode.build_model_slot_a
         == "fireworks-ai/accounts/fireworks/routers/kimi-k2p5-turbo"
     {
-        config.opencode.build_model_slot_a =
-            "fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo".to_owned();
+        config.opencode.build_model_slot_a = DEFAULT_OPENCODE_BUILD_MODEL.to_owned();
+        changed = true;
+    }
+    if config.opencode.plan_model.trim().is_empty() {
+        config.opencode.plan_model = DEFAULT_OPENCODE_PLAN_MODEL.to_owned();
+        changed = true;
+    }
+    if config.opencode.plan_effort.trim().is_empty() {
+        config.opencode.plan_effort = DEFAULT_OPENCODE_PLAN_EFFORT.to_owned();
+        changed = true;
     }
     // Strip Windows verbatim path prefixes from persisted project paths
     for project in &mut config.projects {
@@ -324,7 +358,7 @@ fn normalize_config_for_current_platform(config: &mut AppConfig) -> bool {
         }
     }
 
-    repair_mojibake_in_projects(&mut config.projects)
+    changed | repair_mojibake_in_projects(&mut config.projects)
 }
 
 fn repair_mojibake_in_projects(projects: &mut [crate::models::ProjectRecord]) -> bool {
@@ -1011,6 +1045,54 @@ command = false
     fn load_config_restores_default_acp_startup_mode_when_missing() {
         let path = unique_temp_path("acp-startup-mode-default");
         let config = AppConfig::default();
+        save_config(&path, &config).expect("should save config");
+
+        let loaded = load_config(&path).expect("should load config");
+        assert_eq!(loaded.acp_startup_mode, crate::models::AcpStartupMode::Plan);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_config_migrates_v1_acp_startup_build_to_plan() {
+        let path = unique_temp_path("acp-startup-mode-v1-build");
+        let mut config = AppConfig::default();
+        config.version = 1;
+        config.acp_startup_mode = crate::models::AcpStartupMode::Build;
+        save_config(&path, &config).expect("should save config");
+
+        let loaded = load_config(&path).expect("should load config");
+        assert_eq!(loaded.version, crate::models::APP_CONFIG_VERSION);
+        assert_eq!(loaded.acp_startup_mode, crate::models::AcpStartupMode::Plan);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_config_migrates_v1_missing_plan_model_from_slot_b() {
+        let path = unique_temp_path("acp-plan-model-v1");
+        let mut config = AppConfig::default();
+        config.version = 1;
+        config.opencode.build_model_slot_b = "custom/plan-model".to_owned();
+        config.opencode.plan_model.clear();
+        save_config(&path, &config).expect("should save config");
+
+        let loaded = load_config(&path).expect("should load config");
+        assert_eq!(loaded.opencode.plan_model, "custom/plan-model");
+        assert_eq!(
+            loaded.opencode.plan_effort,
+            crate::models::DEFAULT_OPENCODE_PLAN_EFFORT
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_config_preserves_v2_acp_startup_build_choice() {
+        let path = unique_temp_path("acp-startup-mode-v2-build");
+        let mut config = AppConfig::default();
+        config.version = crate::models::APP_CONFIG_VERSION;
+        config.acp_startup_mode = crate::models::AcpStartupMode::Build;
         save_config(&path, &config).expect("should save config");
 
         let loaded = load_config(&path).expect("should load config");

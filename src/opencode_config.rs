@@ -11,6 +11,100 @@ use crate::browser_mcp_service::{
     MERGEN_BROWSER_MCP_SESSION_ID_ENV_VAR, MERGEN_BROWSER_MCP_TERMINAL_ID_ENV_VAR,
     MERGEN_BROWSER_MCP_TOKEN_ENV_VAR,
 };
+use crate::models::{
+    AcpStartupMode, OpenCodeModelConfig, DEFAULT_OPENCODE_PLAN_EFFORT, DEFAULT_OPENCODE_PLAN_MODEL,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenCodeRuntimeDefaults {
+    pub build_model: String,
+    pub plan_model: String,
+    pub plan_effort: String,
+    pub default_agent: String,
+}
+
+impl OpenCodeRuntimeDefaults {
+    pub fn new(
+        build_model: impl Into<String>,
+        plan_model: impl Into<String>,
+        plan_effort: impl Into<String>,
+        default_agent: impl Into<String>,
+    ) -> Self {
+        let build_model = build_model.into();
+        let plan_model = plan_model.into();
+        let plan_effort = plan_effort.into();
+        let default_agent = default_agent.into();
+        Self {
+            build_model,
+            plan_model: non_empty_or(plan_model, DEFAULT_OPENCODE_PLAN_MODEL),
+            plan_effort: non_empty_or(plan_effort, DEFAULT_OPENCODE_PLAN_EFFORT),
+            default_agent: match default_agent.as_str() {
+                "plan" | "build" => default_agent,
+                _ => "build".to_owned(),
+            },
+        }
+    }
+
+    pub fn from_model_config(opencode: &OpenCodeModelConfig, startup_mode: AcpStartupMode) -> Self {
+        Self::new(
+            opencode.active_build_model(),
+            opencode.effective_plan_model(),
+            opencode.effective_plan_effort(),
+            startup_mode.as_mode_id(),
+        )
+    }
+
+    pub fn from_build_model(build_model: &str) -> Self {
+        Self::new(
+            build_model,
+            DEFAULT_OPENCODE_PLAN_MODEL,
+            DEFAULT_OPENCODE_PLAN_EFFORT,
+            "build",
+        )
+    }
+
+    pub fn desired_model_for_mode(&self, mode_id: &str) -> &str {
+        if mode_id == "plan" {
+            &self.plan_model
+        } else {
+            &self.build_model
+        }
+    }
+
+    pub fn to_config_json(&self) -> JsonValue {
+        json!({
+            "$schema": "https://opencode.ai/config.json",
+            "agent": {
+                "build": {
+                    "model": self.build_model
+                },
+                "plan": {
+                    "model": self.plan_model,
+                    "variant": self.plan_effort
+                }
+            },
+            "default_agent": self.default_agent,
+            "mode": {
+                "build": {
+                    "model": self.build_model
+                }
+            }
+        })
+    }
+
+    pub fn to_env_content_string(&self) -> String {
+        self.to_config_json().to_string()
+    }
+}
+
+fn non_empty_or(value: String, fallback: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback.to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
 
 /// Returns the global OpenCode config path (~/.config/opencode/opencode.json).
 pub fn global_opencode_config_path() -> io::Result<PathBuf> {
@@ -31,6 +125,12 @@ pub fn global_opencode_config_path() -> io::Result<PathBuf> {
 /// Preserves all other configuration including provider, tools, modes, etc.
 /// Uses JSONC-safe parsing (strips comments before parsing if needed).
 pub fn patch_global_opencode_config(build_model: &str) -> io::Result<OpenCodePatchOutcome> {
+    patch_global_opencode_config_defaults(&OpenCodeRuntimeDefaults::from_build_model(build_model))
+}
+
+pub fn patch_global_opencode_config_defaults(
+    defaults: &OpenCodeRuntimeDefaults,
+) -> io::Result<OpenCodePatchOutcome> {
     let path = global_opencode_config_path()?;
 
     // Read existing or start with empty object
@@ -56,49 +156,7 @@ pub fn patch_global_opencode_config(build_model: &str) -> io::Result<OpenCodePat
         ));
     }
 
-    // Navigate/create the agent.build.model path used by current OpenCode.
-    let root = value.as_object_mut().unwrap();
-
-    let agent = root
-        .entry("agent")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "agent must be an object"))?;
-
-    let build = agent
-        .entry("build")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "agent.build must be an object")
-        })?;
-
-    let previous_model = build.get("model").cloned();
-    build.insert("model".to_owned(), json!(build_model));
-
-    let agent_changed = previous_model.as_ref().and_then(|v| v.as_str()) != Some(build_model);
-
-    // Also set mode.build.model so build mode reads the same model.
-    let mode = root
-        .entry("mode")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "mode must be an object"))?;
-
-    let mode_build = mode
-        .entry("build")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "mode.build must be an object")
-        })?;
-
-    let previous_mode_model = mode_build.get("model").cloned();
-    mode_build.insert("model".to_owned(), json!(build_model));
-
-    let mode_changed = previous_mode_model.as_ref().and_then(|v| v.as_str()) != Some(build_model);
-
-    let changed = agent_changed || mode_changed;
+    let changed = apply_runtime_defaults_to_config(&mut value, defaults)?;
 
     // Write back with pretty formatting
     let rendered = serde_json::to_string_pretty(&value)
@@ -116,6 +174,69 @@ pub fn patch_global_opencode_config(build_model: &str) -> io::Result<OpenCodePat
     } else {
         Ok(OpenCodePatchOutcome::Unchanged)
     }
+}
+
+fn apply_runtime_defaults_to_config(
+    value: &mut JsonValue,
+    defaults: &OpenCodeRuntimeDefaults,
+) -> io::Result<bool> {
+    let root = value.as_object_mut().unwrap();
+    let mut changed = false;
+
+    let agent = root
+        .entry("agent")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "agent must be an object"))?;
+
+    let build = agent
+        .entry("build")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "agent.build must be an object")
+        })?;
+    changed |= set_json_string(build, "model", &defaults.build_model);
+
+    let plan = agent
+        .entry("plan")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "agent.plan must be an object")
+        })?;
+    changed |= set_json_string(plan, "model", &defaults.plan_model);
+    changed |= set_json_string(plan, "variant", &defaults.plan_effort);
+
+    let mode = root
+        .entry("mode")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "mode must be an object"))?;
+
+    let mode_build = mode
+        .entry("build")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "mode.build must be an object")
+        })?;
+    changed |= set_json_string(mode_build, "model", &defaults.build_model);
+    changed |= set_json_string(root, "default_agent", &defaults.default_agent);
+
+    Ok(changed)
+}
+
+fn set_json_string(
+    object: &mut serde_json::Map<String, JsonValue>,
+    key: &str,
+    value: &str,
+) -> bool {
+    let changed = object.get(key).and_then(JsonValue::as_str) != Some(value);
+    if changed {
+        object.insert(key.to_owned(), json!(value));
+    }
+    changed
 }
 
 /// Outcome of patching the OpenCode config.
@@ -137,6 +258,19 @@ pub fn write_terminal_runtime_config(
     write_terminal_runtime_config_with_browser_mcp(runtime_dir, terminal_id, build_model, None)
 }
 
+pub fn write_terminal_runtime_config_with_defaults(
+    runtime_dir: &Path,
+    terminal_id: u64,
+    defaults: &OpenCodeRuntimeDefaults,
+) -> io::Result<PathBuf> {
+    write_terminal_runtime_config_with_browser_mcp_defaults(
+        runtime_dir,
+        terminal_id,
+        defaults,
+        None,
+    )
+}
+
 pub const MERGEN_BROWSER_MCP_SERVER_NAME: &str = "mergen-browser";
 const GLOBAL_PLAYWRIGHT_MCP_SERVER_NAME: &str = "mcp-server-playwright";
 
@@ -146,24 +280,26 @@ pub fn write_terminal_runtime_config_with_browser_mcp(
     build_model: &str,
     browser_mcp: Option<(&Path, BrowserMcpEndpointEnv)>,
 ) -> io::Result<PathBuf> {
+    write_terminal_runtime_config_with_browser_mcp_defaults(
+        runtime_dir,
+        terminal_id,
+        &OpenCodeRuntimeDefaults::from_build_model(build_model),
+        browser_mcp,
+    )
+}
+
+pub fn write_terminal_runtime_config_with_browser_mcp_defaults(
+    runtime_dir: &Path,
+    terminal_id: u64,
+    defaults: &OpenCodeRuntimeDefaults,
+    browser_mcp: Option<(&Path, BrowserMcpEndpointEnv)>,
+) -> io::Result<PathBuf> {
     let config_dir = runtime_dir.join("hooks").join(terminal_id.to_string());
     fs::create_dir_all(&config_dir)?;
 
     let config_path = config_dir.join("opencode.json");
 
-    let mut config = json!({
-        "$schema": "https://opencode.ai/config.json",
-        "agent": {
-            "build": {
-                "model": build_model
-            }
-        },
-        "mode": {
-            "build": {
-                "model": build_model
-            }
-        }
-    });
+    let mut config = defaults.to_config_json();
 
     if let Some((helper_path, endpoint)) = browser_mcp {
         let mut environment = json!({
@@ -242,7 +378,7 @@ pub fn write_terminal_runtime_config_with_browser_mcp(
     log::debug!(
         "Wrote OpenCode runtime config for terminal {} with model {} to {}",
         terminal_id,
-        build_model,
+        defaults.build_model,
         config_path.display()
     );
 
@@ -416,8 +552,51 @@ mod tests {
             parsed["mode"]["build"]["model"].as_str(),
             Some("fireworks-ai/k2-turbo")
         );
+        assert_eq!(
+            parsed["agent"]["plan"]["model"].as_str(),
+            Some(DEFAULT_OPENCODE_PLAN_MODEL)
+        );
+        assert_eq!(
+            parsed["agent"]["plan"]["variant"].as_str(),
+            Some(DEFAULT_OPENCODE_PLAN_EFFORT)
+        );
 
         // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn write_terminal_runtime_config_with_defaults_uses_configured_plan_and_build() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "mergen-opencode-runtime-defaults-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let defaults = OpenCodeRuntimeDefaults::new("custom/build", "custom/plan", "xhigh", "plan");
+
+        let config_dir =
+            write_terminal_runtime_config_with_defaults(&temp_dir, 42, &defaults).unwrap();
+
+        let content = fs::read_to_string(config_dir.join("opencode.json")).unwrap();
+        let parsed: JsonValue = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(parsed["default_agent"].as_str(), Some("plan"));
+        assert_eq!(
+            parsed["agent"]["build"]["model"].as_str(),
+            Some("custom/build")
+        );
+        assert_eq!(
+            parsed["mode"]["build"]["model"].as_str(),
+            Some("custom/build")
+        );
+        assert_eq!(
+            parsed["agent"]["plan"]["model"].as_str(),
+            Some("custom/plan")
+        );
+        assert_eq!(parsed["agent"]["plan"]["variant"].as_str(), Some("xhigh"));
+
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
@@ -461,6 +640,14 @@ mod tests {
         assert_eq!(
             parsed["mode"]["build"]["model"].as_str(),
             Some("fireworks-ai/k2-turbo")
+        );
+        assert_eq!(
+            parsed["agent"]["plan"]["model"].as_str(),
+            Some(DEFAULT_OPENCODE_PLAN_MODEL)
+        );
+        assert_eq!(
+            parsed["agent"]["plan"]["variant"].as_str(),
+            Some(DEFAULT_OPENCODE_PLAN_EFFORT)
         );
         assert_eq!(mcp["type"].as_str(), Some("local"));
         assert_eq!(mcp["enabled"].as_bool(), Some(true));
