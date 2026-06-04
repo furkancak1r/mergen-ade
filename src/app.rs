@@ -558,8 +558,23 @@ fn acp_composer_can_send(
     (!prompt_input.trim().is_empty() || has_attachments) && !is_running && session_ready
 }
 
-fn acp_composer_controls_enabled(is_running: bool, session_ready: bool) -> bool {
+fn acp_composer_input_editable(is_running: bool) -> bool {
+    !is_running
+}
+
+fn acp_composer_action_controls_enabled(is_running: bool, session_ready: bool) -> bool {
     session_ready && !is_running
+}
+
+fn acp_composer_slash_popup_height_for_controls(
+    match_count: usize,
+    action_controls_enabled: bool,
+) -> f32 {
+    if action_controls_enabled {
+        acp_slash_command_popup_height(match_count)
+    } else {
+        0.0
+    }
 }
 
 fn acp_composer_disabled_control_cursor(enabled: bool) -> Option<egui::CursorIcon> {
@@ -23467,15 +23482,19 @@ impl AdeApp {
                         || matches!(session.status, crate::opencode_acp::AcpChatStatus::Running);
                     let session_ready = session.session_id.is_some()
                         && !matches!(session.status, crate::opencode_acp::AcpChatStatus::Starting);
-                    let composer_controls_enabled =
-                        acp_composer_controls_enabled(is_running, session_ready);
+                    let input_editable = acp_composer_input_editable(is_running);
+                    let action_controls_enabled =
+                        acp_composer_action_controls_enabled(is_running, session_ready);
                     let draft = session.prompt_input.clone();
-                    let slash_commands = acp_slash_command_matches(
-                        &session.available_commands,
-                        &session.prompt_input,
+                    let slash_commands = if action_controls_enabled {
+                        acp_slash_command_matches(&session.available_commands, &session.prompt_input)
+                    } else {
+                        Vec::new()
+                    };
+                    let slash_popup_height = acp_composer_slash_popup_height_for_controls(
+                        slash_commands.len(),
+                        action_controls_enabled,
                     );
-                    let slash_popup_height =
-                        acp_slash_command_popup_height(slash_commands.len());
 
                     let composer_rects = acp_composer_rects(
                         composer_rect,
@@ -23539,7 +23558,7 @@ impl AdeApp {
                             .desired_rows(4)
                             .desired_width(input_text_rect.width())
                             .hint_text(welcome_hint)
-                            .interactive(composer_controls_enabled)
+                            .interactive(input_editable)
                             .return_key(egui::KeyboardShortcut::new(
                                 egui::Modifiers::CTRL,
                                 egui::Key::Enter,
@@ -23548,7 +23567,7 @@ impl AdeApp {
                         let response = text_ui.add_sized(input_text_rect.size(), text_edit);
                         composer_response = Some(acp_composer_control_response_cursor(
                             response,
-                            composer_controls_enabled,
+                            input_editable,
                         ));
                     }
                     let footer_rect = egui::Rect::from_min_max(
@@ -23588,7 +23607,7 @@ impl AdeApp {
                         footer_rect,
                     ));
                     let plus_btn = plus_ui
-                        .add_enabled_ui(composer_controls_enabled, |ui| {
+                        .add_enabled_ui(action_controls_enabled, |ui| {
                             ui.add_sized(
                                 footer_rects.plus_rect.size(),
                                 egui::Button::new(
@@ -23604,9 +23623,9 @@ impl AdeApp {
                         .inner;
                     let plus_btn = acp_composer_control_response_cursor(
                         plus_btn,
-                        composer_controls_enabled,
+                        action_controls_enabled,
                     );
-                    if plus_btn.clicked() && composer_controls_enabled {
+                    if plus_btn.clicked() && action_controls_enabled {
                         if let Some(paths) = rfd::FileDialog::new().pick_files() {
                             let mut added_paths = Vec::new();
                             for path in paths {
@@ -23645,7 +23664,7 @@ impl AdeApp {
                         let pill_fill = Color32::from_rgb(40, 28, 16);
                         let pill_stroke = Color32::from_rgb(140, 100, 40);
                         let pill_btn = plan_ui
-                            .add_enabled_ui(composer_controls_enabled, |ui| {
+                            .add_enabled_ui(action_controls_enabled, |ui| {
                                 ui.add_sized(
                                     plan_rect.size(),
                                     egui::Button::new(
@@ -23659,9 +23678,9 @@ impl AdeApp {
                             .inner;
                         let pill_btn = acp_composer_control_response_cursor(
                             pill_btn,
-                            composer_controls_enabled,
+                            action_controls_enabled,
                         );
-                        if pill_btn.clicked() && composer_controls_enabled {
+                        if pill_btn.clicked() && action_controls_enabled {
                             let new_mode = "build";
                             session.send_set_config_option("mode", new_mode);
                             Self::set_local_acp_config_value(session, "mode", new_mode);
@@ -23699,7 +23718,7 @@ impl AdeApp {
                             .desired_rows(1)
                             .desired_width(input_text_rect.width())
                             .hint_text(hint_text)
-                            .interactive(composer_controls_enabled)
+                            .interactive(input_editable)
                             .return_key(egui::KeyboardShortcut::new(
                                 egui::Modifiers::CTRL,
                                 egui::Key::Enter,
@@ -23709,7 +23728,7 @@ impl AdeApp {
                         let response = text_ui.add_sized(input_text_rect.size(), text_edit);
                         chat_text_response = Some(acp_composer_control_response_cursor(
                             response,
-                            composer_controls_enabled,
+                            input_editable,
                         ));
                     }
 
@@ -23769,7 +23788,7 @@ impl AdeApp {
                             visuals.widgets.open.bg_fill = Color32::from_rgb(44, 44, 44);
                             visuals.widgets.open.bg_stroke =
                                 Stroke::new(1.0, Color32::from_rgb(70, 70, 70));
-                            if composer_controls_enabled {
+                            if action_controls_enabled {
                                 egui::ComboBox::from_id_salt("acp_composer_model_selector")
                                     .selected_text(
                                         RichText::new(model_label.clone())
@@ -23869,12 +23888,12 @@ impl AdeApp {
                         .inner;
                     let _combo_response = acp_composer_control_response_cursor(
                         combo_response,
-                        composer_controls_enabled,
+                        action_controls_enabled,
                     );
-                    if composer_controls_enabled && selected_model != current_model {
+                    if action_controls_enabled && selected_model != current_model {
                         Self::ensure_acp_config_option_value(session, "model", &selected_model);
                     }
-                    if composer_controls_enabled && selected_effort != current_effort {
+                    if action_controls_enabled && selected_effort != current_effort {
                         Self::ensure_acp_config_option_value(session, "effort", &selected_effort);
                     }
 
@@ -23937,7 +23956,7 @@ impl AdeApp {
                         }
                         (up, down)
                     });
-                    if composer_controls_enabled && up_pressed && response.has_focus() {
+                    if action_controls_enabled && up_pressed && response.has_focus() {
                         if !session.recent_inputs.is_empty() {
                             if session.history_index.is_none() {
                                 session.history_draft = session.prompt_input.clone();
@@ -23951,7 +23970,7 @@ impl AdeApp {
                             ctx.request_repaint();
                         }
                     }
-                    if composer_controls_enabled && down_pressed && response.has_focus() {
+                    if action_controls_enabled && down_pressed && response.has_focus() {
                         if let Some(idx) = session.history_index {
                             if idx == 0 {
                                 session.prompt_input = session.history_draft.clone();
@@ -23977,7 +23996,7 @@ impl AdeApp {
                     );
                     let send_response = if can_send {
                         send_response.on_hover_cursor(egui::CursorIcon::PointingHand)
-                    } else if !composer_controls_enabled {
+                    } else if !action_controls_enabled {
                         send_response.on_hover_cursor(egui::CursorIcon::NotAllowed)
                     } else {
                         send_response
@@ -66092,16 +66111,34 @@ mod tests {
     }
 
     #[test]
-    fn acp_composer_controls_enable_only_when_ready_and_idle() {
-        assert!(!super::acp_composer_controls_enabled(false, false));
-        assert!(!super::acp_composer_controls_enabled(true, false));
-        assert!(!super::acp_composer_controls_enabled(true, true));
-        assert!(super::acp_composer_controls_enabled(false, true));
+    fn acp_composer_input_stays_editable_while_waiting_for_session() {
+        assert!(super::acp_composer_input_editable(false));
+        assert!(!super::acp_composer_input_editable(true));
+    }
+
+    #[test]
+    fn acp_composer_action_controls_enable_only_when_ready_and_idle() {
+        assert!(!super::acp_composer_action_controls_enabled(false, false));
+        assert!(!super::acp_composer_action_controls_enabled(true, false));
+        assert!(!super::acp_composer_action_controls_enabled(true, true));
+        assert!(super::acp_composer_action_controls_enabled(false, true));
         assert_eq!(
             super::acp_composer_disabled_control_cursor(false),
             Some(egui::CursorIcon::NotAllowed)
         );
         assert_eq!(super::acp_composer_disabled_control_cursor(true), None);
+    }
+
+    #[test]
+    fn acp_composer_slash_popup_waits_for_action_controls() {
+        assert_eq!(
+            super::acp_composer_slash_popup_height_for_controls(3, false),
+            0.0
+        );
+        assert_eq!(
+            super::acp_composer_slash_popup_height_for_controls(3, true),
+            super::acp_slash_command_popup_height(3)
+        );
     }
 
     #[test]

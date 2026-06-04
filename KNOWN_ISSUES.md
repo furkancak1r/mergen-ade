@@ -3395,3 +3395,24 @@
   - Added a regression test for composer controls being enabled only when the session is ready and idle.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, ACP composer tests
 - References: User request 2026-06-03
+
+---
+
+#### OpenCode ACP waiting state input da kilitleniyor {#acp-waiting-input-should-stay-editable}
+- Date: 2026-06-03
+- Context: User clarified that while ACP loads, they must still be able to type in the input, but should not be able to submit or click other controls.
+- Error signature:
+  1. Waiting-state gating used one shared `composer_controls_enabled` flag.
+  2. That flag disabled both the draft input and the action controls until `sessionId` existed.
+- Symptoms/Impact:
+  - Users could not prepare a prompt while OpenCode ACP was still creating the session.
+  - The previous fix correctly blocked model/send interactions, but over-blocked the text input.
+- Root cause:
+  - Input editability and action readiness were conflated.
+- Resolution:
+  - Split waiting-state gating into input editability and action-control enablement.
+  - Kept input editable while idle/loading, while keeping submit, attachment, mode, model/effort, slash popup/actions, and history navigation disabled until ready.
+- Prevent recurrence:
+  - Added regression tests for input editability, action-control readiness, disabled cursor, and slash popup gating.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, ACP composer tests
+- References: User clarification 2026-06-03
