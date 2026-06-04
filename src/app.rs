@@ -325,13 +325,15 @@ const SMART_INPUT_ATTACHMENT_REMOVE_BUTTON_SIZE: f32 = 12.0;
 const ACP_COMPOSER_CONTROL_HEIGHT: f32 = 28.0;
 const ACP_COMPOSER_CONTROL_CLIP_OUTSET: f32 = 3.0;
 const ACP_COMPOSER_INPUT_TEXT_INSET_X: f32 = 6.0;
+const ACP_COMPOSER_INPUT_TEXT_INSET_Y: f32 = 2.0;
+const ACP_COMPOSER_INPUT_MAX_HEIGHT: f32 = 160.0;
 const ACP_COMPOSER_SEND_RIGHT_INSET: f32 = 12.0;
 const ACP_COMPOSER_PADDING_X: f32 = 10.0;
 const ACP_COMPOSER_PADDING_Y: f32 = 8.0;
 const ACP_COMPOSER_FOOTER_HEIGHT: f32 = 40.0;
 const ACP_COMPOSER_WELCOME_TEXT_MIN: f32 = 56.0;
 const ACP_COMPOSER_CHAT_CAPSULE_HEIGHT: f32 =
-    ACP_COMPOSER_PADDING_Y * 2.0 + ACP_COMPOSER_FOOTER_HEIGHT;
+    ACP_COMPOSER_PADDING_Y * 2.0 + ACP_COMPOSER_CONTROL_HEIGHT + ACP_COMPOSER_FOOTER_HEIGHT;
 const ACP_COMPOSER_CAPSULE_FILL: Color32 = Color32::from_rgb(27, 27, 27);
 const ACP_COMPOSER_CAPSULE_STROKE: Color32 = Color32::from_rgb(40, 40, 40);
 const ACP_COMPOSER_CAPSULE_RADIUS: f32 = 12.0;
@@ -356,7 +358,6 @@ const ACP_COMPOSER_MODEL_WIDTH_TARGET: f32 = 220.0;
 const ACP_COMPOSER_MODEL_WIDTH_MAX: f32 = 320.0;
 const ACP_COMPOSER_MODEL_COMBO_CHROME_WIDTH: f32 = 34.0;
 const ACP_COMPOSER_MODEL_BUTTON_PADDING_X: f32 = 0.0;
-const ACP_COMPOSER_TEXT_WIDTH_MIN: f32 = 56.0;
 const ACP_SLASH_COMMAND_HEADER_HEIGHT: f32 = 24.0;
 const ACP_SLASH_COMMAND_ROW_HEIGHT: f32 = 22.0;
 const ACP_SLASH_COMMAND_MAX_VISIBLE_ROWS: usize = 4;
@@ -459,6 +460,74 @@ fn acp_composer_stack_rects(
     (slash_rect, capsule_rect)
 }
 
+fn acp_composer_prompt_input_width(composer_width: f32) -> f32 {
+    let inner_width = (composer_width - ACP_COMPOSER_PADDING_X * 2.0).max(0.0);
+    (inner_width - ACP_COMPOSER_INPUT_TEXT_INSET_X * 2.0).max(0.0)
+}
+
+fn acp_composer_input_min_height(welcome_center: bool) -> f32 {
+    if welcome_center {
+        ACP_COMPOSER_WELCOME_TEXT_MIN
+    } else {
+        ACP_COMPOSER_CONTROL_HEIGHT
+    }
+}
+
+fn acp_composer_input_visible_height(welcome_center: bool, desired_height: f32) -> f32 {
+    desired_height
+        .max(acp_composer_input_min_height(welcome_center))
+        .min(ACP_COMPOSER_INPUT_MAX_HEIGHT)
+}
+
+fn acp_composer_prompt_content_height(
+    ui: &egui::Ui,
+    prompt_input: &str,
+    hint_text: &str,
+    wrap_width: f32,
+) -> f32 {
+    let text = if prompt_input.is_empty() {
+        hint_text
+    } else {
+        prompt_input
+    };
+    let galley = WidgetText::from(RichText::new(text)).into_galley(
+        ui,
+        Some(TextWrapMode::Wrap),
+        wrap_width.max(1.0),
+        egui::TextStyle::Body,
+    );
+    (galley.size().y + ACP_COMPOSER_INPUT_TEXT_INSET_Y * 2.0).ceil()
+}
+
+fn acp_composer_prompt_visible_height(
+    ui: &egui::Ui,
+    welcome_center: bool,
+    prompt_input: &str,
+    hint_text: &str,
+    wrap_width: f32,
+) -> f32 {
+    acp_composer_input_visible_height(
+        welcome_center,
+        acp_composer_prompt_content_height(ui, prompt_input, hint_text, wrap_width),
+    )
+}
+
+fn acp_composer_hint_text(
+    welcome_center: bool,
+    session_ready: bool,
+    active_mode: &str,
+) -> &'static str {
+    if !session_ready {
+        "Waiting for session..."
+    } else if welcome_center {
+        ACP_WELCOME_HINT
+    } else if crate::opencode_acp::mode_is_plan(active_mode) {
+        "Plan and design before coding..."
+    } else {
+        "Type a message..."
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AcpComposerRects {
     slash_rect: Option<egui::Rect>,
@@ -467,12 +536,15 @@ struct AcpComposerRects {
     permission_rect: Option<egui::Rect>,
 }
 
-fn acp_composer_capsule_body_height(welcome_center: bool) -> f32 {
-    if welcome_center {
-        ACP_WELCOME_COMPOSER_MIN_HEIGHT
-    } else {
-        ACP_COMPOSER_CHAT_CAPSULE_HEIGHT
-    }
+#[derive(Debug, Clone, Copy)]
+struct AcpComposerCapsuleContentRects {
+    input_rect: egui::Rect,
+    footer_rect: egui::Rect,
+}
+
+fn acp_composer_capsule_body_height(welcome_center: bool, input_height: f32) -> f32 {
+    let input_height = acp_composer_input_visible_height(welcome_center, input_height);
+    ACP_COMPOSER_PADDING_Y * 2.0 + input_height + ACP_COMPOSER_FOOTER_HEIGHT
 }
 
 fn acp_composer_height(
@@ -480,8 +552,10 @@ fn acp_composer_height(
     has_attachments: bool,
     has_permission: bool,
     slash_popup_height: f32,
+    input_height: f32,
 ) -> f32 {
-    let mut height = acp_composer_capsule_body_height(welcome_center) + slash_popup_height.max(0.0);
+    let mut height = acp_composer_capsule_body_height(welcome_center, input_height)
+        + slash_popup_height.max(0.0);
     if has_attachments {
         height += ACP_COMPOSER_BELOW_CAPSULE_GAP + ACP_COMPOSER_ATTACHMENT_ROW_HEIGHT;
     }
@@ -514,11 +588,12 @@ fn acp_composer_rects(
     has_attachments: bool,
     has_permission: bool,
     slash_popup_height: f32,
+    input_height: f32,
 ) -> AcpComposerRects {
     let (slash_rect, capsule_rect) = acp_composer_stack_rects(
         composer_rect,
         slash_popup_height,
-        acp_composer_capsule_body_height(welcome_center),
+        acp_composer_capsule_body_height(welcome_center, input_height),
     );
     let mut next_top = capsule_rect.bottom();
     let attachment_rect = if has_attachments {
@@ -547,6 +622,29 @@ fn acp_composer_rects(
         capsule_rect,
         attachment_rect,
         permission_rect,
+    }
+}
+
+fn acp_composer_capsule_content_rects(
+    inner_rect: egui::Rect,
+    welcome_center: bool,
+    input_height: f32,
+) -> AcpComposerCapsuleContentRects {
+    let footer_height = ACP_COMPOSER_FOOTER_HEIGHT.min(inner_rect.height().max(0.0));
+    let footer_rect = egui::Rect::from_min_max(
+        egui::pos2(inner_rect.left(), inner_rect.bottom() - footer_height),
+        inner_rect.max,
+    );
+    let desired_input_height = acp_composer_input_visible_height(welcome_center, input_height);
+    let max_input_height = (footer_rect.top() - inner_rect.top()).max(0.0);
+    let input_height = desired_input_height.min(max_input_height);
+    let input_rect = egui::Rect::from_min_size(
+        egui::pos2(inner_rect.left(), footer_rect.top() - input_height),
+        egui::vec2(inner_rect.width(), input_height),
+    );
+    AcpComposerCapsuleContentRects {
+        input_rect,
+        footer_rect,
     }
 }
 
@@ -1473,7 +1571,6 @@ fn acp_composer_model_label(
 struct AcpComposerFooterRects {
     plus_rect: egui::Rect,
     plan_rect: Option<egui::Rect>,
-    text_rect: Option<egui::Rect>,
     model_rect: egui::Rect,
     send_rect: egui::Rect,
     clip_rect: egui::Rect,
@@ -1482,7 +1579,7 @@ struct AcpComposerFooterRects {
 fn acp_composer_footer_widget_rects(
     footer_rect: egui::Rect,
     show_plan_pill: bool,
-    welcome_center: bool,
+    _welcome_center: bool,
     model_desired_width: f32,
 ) -> AcpComposerFooterRects {
     let footer_controls_rect = acp_composer_footer_control_rect(footer_rect);
@@ -1490,12 +1587,12 @@ fn acp_composer_footer_widget_rects(
     let ctrl_h = ACP_COMPOSER_CONTROL_HEIGHT;
     let footer_spacing = ACP_COMPOSER_FOOTER_SPACING;
     let footer_w = footer_content_rect.width();
-    let (plus_w, plan_w, text_w, model_w, send_w) = acp_composer_footer_layout(
+    let (plus_w, plan_w, _text_w, model_w, send_w) = acp_composer_footer_layout(
         footer_w,
         ctrl_h,
         footer_spacing,
         show_plan_pill,
-        welcome_center,
+        _welcome_center,
         model_desired_width,
     );
 
@@ -1504,10 +1601,7 @@ fn acp_composer_footer_widget_rects(
     if show_plan_pill {
         left_widget_count += 1;
     }
-    if !welcome_center {
-        left_widget_count += 1;
-    }
-    let left_content_width = plus_w + plan_w + text_w + model_w;
+    let left_content_width = plus_w + plan_w + model_w;
     let effective_footer_spacing = if left_widget_count > 1 {
         ((left_w - left_content_width).max(0.0) / (left_widget_count - 1) as f32)
             .min(footer_spacing)
@@ -1528,23 +1622,15 @@ fn acp_composer_footer_widget_rects(
         None
     };
 
-    let text_rect = if welcome_center {
-        None
-    } else {
-        let rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(text_w, ctrl_h));
-        x += text_w + effective_footer_spacing;
-        Some(rect)
-    };
-
     let model_rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(model_w, ctrl_h));
     let send_left = footer_content_rect.right() - send_w;
     let send_rect = egui::Rect::from_min_size(egui::pos2(send_left, y), egui::vec2(send_w, ctrl_h));
-    let clip_rect = acp_composer_footer_clip_rect(footer_rect, footer_content_rect, welcome_center);
+    let clip_rect =
+        acp_composer_footer_clip_rect(footer_rect, footer_content_rect, _welcome_center);
 
     AcpComposerFooterRects {
         plus_rect,
         plan_rect,
-        text_rect,
         model_rect,
         send_rect,
         clip_rect,
@@ -1654,7 +1740,7 @@ fn acp_composer_footer_layout(
     ctrl_h: f32,
     footer_spacing: f32,
     show_plan_pill: bool,
-    welcome_center: bool,
+    _welcome_center: bool,
     model_desired_width: f32,
 ) -> (f32, f32, f32, f32, f32) {
     let send_w = ctrl_h.min(footer_w.max(0.0));
@@ -1667,9 +1753,6 @@ fn acp_composer_footer_layout(
     let left_w = (footer_w - send_w - footer_spacing).max(0.0);
     let mut widget_count = 2usize;
     if show_plan_pill {
-        widget_count += 1;
-    }
-    if !welcome_center {
         widget_count += 1;
     }
     let gaps_total = if widget_count > 1 {
@@ -1691,20 +1774,14 @@ fn acp_composer_footer_layout(
             ACP_COMPOSER_MODEL_WIDTH_MIN.min(flex_budget.max(0.0)),
             ACP_COMPOSER_MODEL_WIDTH_MAX,
         );
-        let (text_w, model_w) = if welcome_center {
-            (0.0, flex_budget.min(desired_model_w))
-        } else if flex_budget <= 0.0 {
+        let (text_w, model_w) = if flex_budget <= 0.0 {
             (0.0, 0.0)
-        } else if flex_budget >= desired_model_w + ACP_COMPOSER_TEXT_WIDTH_MIN {
+        } else if flex_budget >= desired_model_w {
             let model_w = desired_model_w.min(ACP_COMPOSER_MODEL_WIDTH_MAX);
-            (flex_budget - model_w, model_w)
-        } else if flex_budget >= ACP_COMPOSER_MODEL_WIDTH_MIN + ACP_COMPOSER_TEXT_WIDTH_MIN {
-            let text_w = ACP_COMPOSER_TEXT_WIDTH_MIN;
-            let model_w = (flex_budget - text_w).min(ACP_COMPOSER_MODEL_WIDTH_MAX);
-            (text_w, model_w)
+            (0.0, model_w)
         } else if flex_budget >= ACP_COMPOSER_MODEL_WIDTH_MIN {
             let model_w = ACP_COMPOSER_MODEL_WIDTH_MIN;
-            (flex_budget - model_w, model_w)
+            (0.0, model_w)
         } else {
             (0.0, flex_budget)
         };
@@ -24320,6 +24397,20 @@ impl AdeApp {
                     } else {
                         Vec::new()
                     };
+                    let composer_width = if welcome_center {
+                        content_rect.width().min(ACP_WELCOME_MAX_WIDTH)
+                    } else {
+                        content_rect.width()
+                    };
+                    let active_mode =
+                        session.active_mode_id_or(self.config.acp_startup_mode.as_mode_id());
+                    let prompt_input_height = acp_composer_prompt_visible_height(
+                        ui,
+                        welcome_center,
+                        &session.prompt_input,
+                        acp_composer_hint_text(welcome_center, session_ready, &active_mode),
+                        acp_composer_prompt_input_width(composer_width),
+                    );
                     acp_queued_prompt_panel_height(session)
                         + acp_composer_height(
                         welcome_center,
@@ -24329,9 +24420,16 @@ impl AdeApp {
                             slash_commands.len(),
                             action_controls_enabled,
                         ),
+                        prompt_input_height,
                     )
                 } else {
-                    acp_composer_height(welcome_center, false, false, 0.0)
+                    acp_composer_height(
+                        welcome_center,
+                        false,
+                        false,
+                        0.0,
+                        acp_composer_input_min_height(welcome_center),
+                    )
                 };
 
                 let thread_selector_height = acp_thread_selector_height(welcome_center);
@@ -24647,12 +24745,26 @@ impl AdeApp {
                         }
                     }
 
+                    let active_mode = session.active_mode_id_or(&acp_startup_mode_id);
+                    let prompt_input_width =
+                        acp_composer_prompt_input_width(composer_body_rect.width());
+                    let hint_text =
+                        acp_composer_hint_text(welcome_center, session_ready, &active_mode);
+                    let prompt_content_height = acp_composer_prompt_content_height(
+                        &composer_ui,
+                        &session.prompt_input,
+                        hint_text,
+                        prompt_input_width,
+                    );
+                    let prompt_input_height =
+                        acp_composer_input_visible_height(welcome_center, prompt_content_height);
                     let composer_rects = acp_composer_rects(
                         composer_body_rect,
                         welcome_center,
                         !session.attachments.is_empty(),
                         session.pending_permission.is_some(),
                         slash_popup_height,
+                        prompt_input_height,
                     );
                     if let Some(slash_rect) = composer_rects.slash_rect {
                         draw_acp_slash_command_popup(
@@ -24674,59 +24786,56 @@ impl AdeApp {
                         ACP_COMPOSER_PADDING_X,
                         ACP_COMPOSER_PADDING_Y,
                     ));
-                    let inner_height = inner_rect.height();
-                    let welcome_hint = if session_ready {
-                        ACP_WELCOME_HINT
-                    } else {
-                        "Waiting for session..."
-                    };
-                    let welcome_text_height = if welcome_center {
-                        (inner_height - ACP_COMPOSER_FOOTER_HEIGHT).max(ACP_COMPOSER_WELCOME_TEXT_MIN)
-                    } else {
-                        0.0
-                    };
+                    let capsule_content_rects = acp_composer_capsule_content_rects(
+                        inner_rect,
+                        welcome_center,
+                        prompt_input_height,
+                    );
                     let mut capsule_ui = composer_ui.new_child(
                         egui::UiBuilder::new()
                             .max_rect(inner_rect)
                             .layout(Layout::top_down(Align::Min)),
                     );
                     capsule_ui.set_clip_rect(capsule_rect);
-                    let mut composer_response = None;
-                    if welcome_center {
-                        let text_rect = egui::Rect::from_min_size(
-                            capsule_ui.cursor().min,
-                            egui::vec2(inner_rect.width(), welcome_text_height),
-                        );
-                        capsule_ui.allocate_rect(text_rect, Sense::hover());
-                        let input_text_rect = acp_composer_input_text_rect(text_rect);
-                        let mut text_ui = capsule_ui.new_child(
-                            egui::UiBuilder::new()
-                                .max_rect(input_text_rect)
-                                .layout(Layout::left_to_right(Align::Min)),
-                        );
-                        let text_edit = egui::TextEdit::multiline(&mut session.prompt_input)
-                            .id_salt("acp-composer-input")
-                            .desired_rows(4)
-                            .desired_width(input_text_rect.width())
-                            .hint_text(welcome_hint)
-                            .interactive(input_editable)
-                            .return_key(egui::KeyboardShortcut::new(
-                                egui::Modifiers::CTRL,
-                                egui::Key::Enter,
-                            ))
-                            .frame(false);
-                        let response = text_ui.add_sized(input_text_rect.size(), text_edit);
-                        composer_response = Some(acp_composer_control_response_cursor(
-                            response,
-                            input_editable,
-                        ));
-                    }
-                    let footer_rect = egui::Rect::from_min_max(
-                        egui::pos2(inner_rect.min.x, inner_rect.max.y - ACP_COMPOSER_FOOTER_HEIGHT),
-                        inner_rect.max,
+                    let editor_rect = capsule_content_rects.input_rect;
+                    capsule_ui.allocate_rect(editor_rect, Sense::hover());
+                    let input_text_rect = acp_composer_input_text_rect(editor_rect);
+                    let mut text_ui = capsule_ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(input_text_rect)
+                            .layout(Layout::top_down(Align::Min)),
                     );
+                    text_ui.set_clip_rect(input_text_rect);
+                    let text_edit = egui::TextEdit::multiline(&mut session.prompt_input)
+                        .id_salt("acp-composer-input")
+                        .desired_rows(1)
+                        .desired_width(input_text_rect.width())
+                        .hint_text(hint_text)
+                        .interactive(input_editable)
+                        .return_key(egui::KeyboardShortcut::new(
+                            egui::Modifiers::CTRL,
+                            egui::Key::Enter,
+                        ))
+                        .vertical_align(egui::Align::Center)
+                        .frame(false);
+                    let response = egui::ScrollArea::vertical()
+                        .id_salt(("acp-composer-input-scroll", chat_id))
+                        .max_height(input_text_rect.height())
+                        .auto_shrink([false, false])
+                        .show(&mut text_ui, |ui| {
+                            ui.set_min_width(input_text_rect.width());
+                            ui.add_sized(
+                                egui::vec2(
+                                    input_text_rect.width(),
+                                    prompt_content_height.max(input_text_rect.height()),
+                                ),
+                                text_edit,
+                            )
+                        })
+                        .inner;
+                    let response = acp_composer_control_response_cursor(response, input_editable);
+                    let footer_rect = capsule_content_rects.footer_rect;
                     capsule_ui.allocate_rect(footer_rect, Sense::hover());
-                    let active_mode = session.active_mode_id_or(&acp_startup_mode_id);
                     let visible_mode_label = acp_mode_ui_label(&active_mode);
                     let show_plan_pill = visible_mode_label.is_some();
                     let model_label =
@@ -24747,7 +24856,6 @@ impl AdeApp {
                     );
                     footer_ui.set_clip_rect(footer_rects.clip_rect);
                     footer_ui.set_min_height(ctrl_h);
-                    let mut chat_text_response = None;
 
                     let mut plus_ui = footer_ui.new_child(
                         egui::UiBuilder::new()
@@ -24860,45 +24968,6 @@ impl AdeApp {
                                 );
                             }
                         }
-                    }
-
-                    if let Some(text_rect) = footer_rects.text_rect {
-                        let mut text_ui = footer_ui.new_child(
-                            egui::UiBuilder::new()
-                                .max_rect(acp_composer_input_text_rect(text_rect))
-                                .layout(Layout::left_to_right(Align::Center)),
-                        );
-                        text_ui.set_clip_rect(acp_composer_footer_widget_clip_rect(
-                            text_rect,
-                            footer_rect,
-                        ));
-                        let input_text_rect = acp_composer_input_text_rect(text_rect);
-                        let hint_text = if session_ready {
-                            if crate::opencode_acp::mode_is_plan(&active_mode) {
-                                "Plan and design before coding..."
-                            } else {
-                                "Type a message..."
-                            }
-                        } else {
-                            "Waiting for session..."
-                        };
-                        let text_edit = egui::TextEdit::multiline(&mut session.prompt_input)
-                            .id_salt("acp-composer-input")
-                            .desired_rows(1)
-                            .desired_width(input_text_rect.width())
-                            .hint_text(hint_text)
-                            .interactive(input_editable)
-                            .return_key(egui::KeyboardShortcut::new(
-                                egui::Modifiers::CTRL,
-                                egui::Key::Enter,
-                            ))
-                            .vertical_align(egui::Align::Center)
-                            .frame(false);
-                        let response = text_ui.add_sized(input_text_rect.size(), text_edit);
-                        chat_text_response = Some(acp_composer_control_response_cursor(
-                            response,
-                            input_editable,
-                        ));
                     }
 
                     let mut selected_model = session
@@ -25065,12 +25134,6 @@ impl AdeApp {
                     if action_controls_enabled && selected_effort != current_effort {
                         Self::ensure_acp_config_option_value(session, "effort", &selected_effort);
                     }
-
-                    let response = if welcome_center {
-                        composer_response.expect("welcome composer response")
-                    } else {
-                        chat_text_response.expect("chat composer response")
-                    };
 
                     let plain_enter = ui.input(|i| {
                         i.events.iter().any(|e| {
@@ -67248,7 +67311,8 @@ mod tests {
     #[test]
     fn acp_composer_height_accounts_for_optional_rows() {
         let slash_height = super::acp_slash_command_popup_height(3);
-        let height = super::acp_composer_height(true, true, true, slash_height);
+        let input_height = super::acp_composer_input_min_height(true);
+        let height = super::acp_composer_height(true, true, true, slash_height, input_height);
         let expected = super::ACP_WELCOME_COMPOSER_MIN_HEIGHT
             + slash_height
             + super::ACP_COMPOSER_BELOW_CAPSULE_GAP
@@ -67258,19 +67322,67 @@ mod tests {
 
         assert!((height - expected).abs() < 0.01);
         assert_eq!(
-            super::acp_composer_height(false, false, false, 0.0),
+            super::acp_composer_height(
+                false,
+                false,
+                false,
+                0.0,
+                super::acp_composer_input_min_height(false)
+            ),
             super::ACP_COMPOSER_CHAT_CAPSULE_HEIGHT
         );
     }
 
     #[test]
+    fn acp_composer_input_visible_height_clamps_long_prompts() {
+        assert_eq!(
+            super::acp_composer_input_visible_height(false, 12.0),
+            super::ACP_COMPOSER_CONTROL_HEIGHT
+        );
+        assert_eq!(
+            super::acp_composer_input_visible_height(false, 900.0),
+            super::ACP_COMPOSER_INPUT_MAX_HEIGHT
+        );
+        assert_eq!(
+            super::acp_composer_input_visible_height(true, 12.0),
+            super::ACP_COMPOSER_WELCOME_TEXT_MIN
+        );
+    }
+
+    #[test]
+    fn acp_composer_capsule_content_rects_keep_editor_above_footer() {
+        let capsule_height =
+            super::acp_composer_capsule_body_height(false, super::ACP_COMPOSER_INPUT_MAX_HEIGHT);
+        let capsule_rect =
+            egui::Rect::from_min_size(egui::pos2(20.0, 100.0), egui::vec2(400.0, capsule_height));
+        let inner_rect = capsule_rect.shrink2(egui::vec2(
+            super::ACP_COMPOSER_PADDING_X,
+            super::ACP_COMPOSER_PADDING_Y,
+        ));
+
+        let rects = super::acp_composer_capsule_content_rects(
+            inner_rect,
+            false,
+            super::ACP_COMPOSER_INPUT_MAX_HEIGHT,
+        );
+
+        assert!(rects.input_rect.bottom() <= rects.footer_rect.top() + 0.01);
+        assert!((rects.input_rect.height() - super::ACP_COMPOSER_INPUT_MAX_HEIGHT).abs() < 0.01);
+        assert!((rects.footer_rect.height() - super::ACP_COMPOSER_FOOTER_HEIGHT).abs() < 0.01);
+        assert!(rects.footer_rect.bottom() <= inner_rect.bottom() + 0.01);
+    }
+
+    #[test]
     fn acp_composer_rects_stack_slash_capsule_attachment_and_permission() {
         let slash_height = super::acp_slash_command_popup_height(2);
-        let composer_height = super::acp_composer_height(false, true, true, slash_height);
+        let input_height = super::acp_composer_input_min_height(false);
+        let composer_height =
+            super::acp_composer_height(false, true, true, slash_height, input_height);
         let composer_rect =
             egui::Rect::from_min_size(egui::pos2(20.0, 100.0), egui::vec2(400.0, composer_height));
 
-        let rects = super::acp_composer_rects(composer_rect, false, true, true, slash_height);
+        let rects =
+            super::acp_composer_rects(composer_rect, false, true, true, slash_height, input_height);
         let slash_rect = rects.slash_rect.expect("slash rect");
         let attachment_rect = rects.attachment_rect.expect("attachment rect");
         let permission_rect = rects.permission_rect.expect("permission rect");
@@ -67299,6 +67411,7 @@ mod tests {
             true,
             true,
             super::acp_slash_command_popup_height(4),
+            super::acp_composer_input_min_height(false),
         );
 
         if let Some(slash_rect) = rects.slash_rect {
@@ -67350,11 +67463,10 @@ mod tests {
         );
 
         assert!(rects.plan_rect.is_none());
-        let text_rect = rects
-            .text_rect
-            .expect("chat footer should include text input");
+        let plus_to_model_label_gap =
+            super::acp_composer_model_label_left(rects.model_rect) - rects.plus_rect.right();
         assert!(
-            text_rect.left() <= rects.plus_rect.right() + super::ACP_COMPOSER_FOOTER_SPACING + 0.01,
+            plus_to_model_label_gap <= super::ACP_COMPOSER_FOOTER_SPACING + 1.0,
             "build mode should not leave an empty Normal pill gap"
         );
     }
@@ -69309,12 +69421,9 @@ mod tests {
             false,
             super::ACP_COMPOSER_MODEL_WIDTH_TARGET,
         );
-        let text_rect = rects
-            .text_rect
-            .expect("chat footer should include text input");
 
         assert!(rects.plan_rect.is_some());
-        assert!(text_rect.right() <= rects.model_rect.left() + 0.01);
+        assert!(rects.plan_rect.unwrap().right() <= rects.model_rect.left() + 0.01);
         assert!(
             rects.model_rect.right()
                 <= rects.send_rect.left() - super::ACP_COMPOSER_FOOTER_SPACING + 0.01,
@@ -69428,7 +69537,6 @@ mod tests {
             super::ACP_COMPOSER_MODEL_WIDTH_TARGET,
         );
 
-        assert!(rects.text_rect.is_none());
         assert!(
             rects.model_rect.width() >= 180.0,
             "welcome model selector should be readable, got {}",
@@ -69505,9 +69613,6 @@ mod tests {
             false,
             super::ACP_COMPOSER_MODEL_WIDTH_TARGET,
         );
-        let text_rect = rects
-            .text_rect
-            .expect("chat footer should include text input");
 
         assert!(
             rects.model_rect.width() >= 180.0,
@@ -69515,7 +69620,6 @@ mod tests {
             rects.model_rect.width()
         );
         assert!(rects.model_rect.width() <= super::ACP_COMPOSER_MODEL_WIDTH_MAX + 0.01);
-        assert!(text_rect.width() > rects.model_rect.width());
         assert!(
             rects.model_rect.right()
                 <= rects.send_rect.left() - super::ACP_COMPOSER_FOOTER_SPACING + 0.01,
@@ -69524,7 +69628,7 @@ mod tests {
     }
 
     #[test]
-    fn acp_composer_footer_widget_rects_shrink_text_before_model_in_narrow_chat() {
+    fn acp_composer_footer_widget_rects_keep_model_readable_in_narrow_chat() {
         let footer_rect = egui::Rect::from_min_size(
             egui::pos2(10.0, 20.0),
             egui::vec2(320.0, super::ACP_COMPOSER_FOOTER_HEIGHT),
@@ -69535,17 +69639,10 @@ mod tests {
             false,
             super::ACP_COMPOSER_MODEL_WIDTH_TARGET,
         );
-        let text_rect = rects
-            .text_rect
-            .expect("chat footer should include text input");
 
         assert!(
             rects.model_rect.width() >= super::ACP_COMPOSER_MODEL_WIDTH_MIN - 0.01,
-            "narrow chat should preserve readable model width before shrinking it"
-        );
-        assert!(
-            text_rect.width() <= super::ACP_COMPOSER_TEXT_WIDTH_MIN + 0.01,
-            "narrow chat should shrink prompt input first"
+            "narrow chat should preserve readable model width"
         );
         assert!(
             rects.model_rect.right()
@@ -69682,7 +69779,7 @@ mod tests {
                 welcome,
                 super::ACP_COMPOSER_MODEL_WIDTH_TARGET,
             );
-            let widget_count = 2usize + usize::from(show_plan) + usize::from(!welcome);
+            let widget_count = 2usize + usize::from(show_plan);
             let gaps = if widget_count > 1 {
                 (widget_count - 1) as f32 * spacing
             } else {
@@ -69726,10 +69823,11 @@ mod tests {
             super::ACP_COMPOSER_MODEL_WIDTH_TARGET,
         );
         assert_eq!(send_w, ctrl_h);
+        assert_eq!(text_w, 0.0);
         let left_w = footer_w - send_w - spacing;
-        let gaps = 3.0 * spacing;
+        let gaps = 2.0 * spacing;
         let used_left = ctrl_h + super::ACP_COMPOSER_PLAN_PILL_WIDTH + text_w + model_w + gaps;
-        assert!((used_left - left_w).abs() < 0.02);
+        assert!(used_left <= left_w + 0.02);
     }
 
     #[test]
@@ -69746,7 +69844,7 @@ mod tests {
             super::ACP_COMPOSER_MODEL_WIDTH_TARGET,
         );
         let left_w = (footer_w - send_w - spacing).max(0.0);
-        let widget_count = 4usize;
+        let widget_count = 3usize;
         let content_w = plus_w + plan_w + text_w + model_w;
         let effective_spacing =
             ((left_w - content_w).max(0.0) / (widget_count - 1) as f32).min(spacing);
