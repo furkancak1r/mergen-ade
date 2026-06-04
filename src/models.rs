@@ -555,7 +555,7 @@ pub struct OpenCodeModelConfig {
 
 impl Default for OpenCodeModelConfig {
     fn default() -> Self {
-        Self {
+        let mut config = Self {
             build_model_slot_a: DEFAULT_OPENCODE_BUILD_MODEL.to_owned(),
             build_model_slot_b: DEFAULT_OPENCODE_PLAN_MODEL.to_owned(),
             plan_model: DEFAULT_OPENCODE_PLAN_MODEL.to_owned(),
@@ -569,7 +569,9 @@ impl Default for OpenCodeModelConfig {
             fireworks_timeout_ms: DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS,
             fireworks_chunk_timeout_ms: DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS,
             kimi_strict_permissions: DEFAULT_OPENCODE_KIMI_STRICT_PERMISSIONS,
-        }
+        };
+        config.ensure_configured_models_are_favorites();
+        config
     }
 }
 
@@ -657,11 +659,26 @@ impl OpenCodeModelConfig {
 
     /// Check whether a given model value is marked as a favorite.
     pub fn is_acp_model_favorite(&self, value: &str) -> bool {
+        let value = value.trim();
         self.acp_favorite_models.iter().any(|v| v == value)
+    }
+
+    /// Add a model value to the favorite list. Empty values are ignored.
+    pub fn add_acp_model_favorite(&mut self, value: &str) -> bool {
+        let value = value.trim();
+        if value.is_empty() || self.is_acp_model_favorite(value) {
+            return false;
+        }
+        self.acp_favorite_models.push(value.to_owned());
+        true
     }
 
     /// Toggle a model value in the favorite list. Returns true if the model is now a favorite.
     pub fn toggle_acp_model_favorite(&mut self, value: &str) -> bool {
+        let value = value.trim();
+        if value.is_empty() {
+            return false;
+        }
         if let Some(pos) = self.acp_favorite_models.iter().position(|v| v == value) {
             self.acp_favorite_models.remove(pos);
             false
@@ -669,6 +686,38 @@ impl OpenCodeModelConfig {
             self.acp_favorite_models.push(value.to_owned());
             true
         }
+    }
+
+    /// Remove empty or duplicate entries from the favorite-models list.
+    pub fn normalize_acp_favorite_models(&mut self) -> bool {
+        let before = self.acp_favorite_models.clone();
+        let mut seen = std::collections::HashSet::new();
+        self.acp_favorite_models = before
+            .iter()
+            .filter_map(|value| {
+                let value = value.trim();
+                if value.is_empty() || !seen.insert(value.to_owned()) {
+                    None
+                } else {
+                    Some(value.to_owned())
+                }
+            })
+            .collect();
+        self.acp_favorite_models != before
+    }
+
+    /// Ensure the currently configured Plan and Build models are available in ACP favorites.
+    pub fn ensure_configured_models_are_favorites(&mut self) -> bool {
+        let configured_models = [
+            self.build_model_slot_a.trim().to_owned(),
+            self.build_model_slot_b.trim().to_owned(),
+            self.effective_plan_model().trim().to_owned(),
+        ];
+        let mut changed = self.normalize_acp_favorite_models();
+        for model in configured_models {
+            changed |= self.add_acp_model_favorite(&model);
+        }
+        changed
     }
 
     /// Remove empty or duplicate entries from the known-models cache.
@@ -1339,6 +1388,10 @@ mod tests {
             DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS
         );
         assert!(config.kimi_strict_permissions);
+        assert!(config.is_acp_model_favorite(&config.build_model_slot_a));
+        assert!(config.is_acp_model_favorite(&config.build_model_slot_b));
+        assert!(config.is_acp_model_favorite(config.effective_plan_model()));
+        assert_eq!(config.acp_favorite_models.len(), 2);
     }
 
     #[test]
@@ -1445,6 +1498,7 @@ mod tests {
     #[test]
     fn toggle_acp_model_favorite_adds_and_removes() {
         let mut config = OpenCodeModelConfig::default();
+        config.acp_favorite_models.clear();
         assert!(!config.is_acp_model_favorite("gpt-4"));
 
         assert!(config.toggle_acp_model_favorite("gpt-4"));
@@ -1454,6 +1508,25 @@ mod tests {
         assert!(!config.toggle_acp_model_favorite("gpt-4"));
         assert!(!config.is_acp_model_favorite("gpt-4"));
         assert!(config.acp_favorite_models.is_empty());
+    }
+
+    #[test]
+    fn ensure_configured_models_are_favorites_trims_deduplicates_and_adds_current_models() {
+        let mut config = OpenCodeModelConfig::default();
+        config.build_model_slot_a = " custom/build-a ".to_owned();
+        config.build_model_slot_b = "custom/build-b".to_owned();
+        config.plan_model = "custom/plan".to_owned();
+        config.acp_favorite_models = vec![
+            " custom/build-a ".to_owned(),
+            "".to_owned(),
+            "custom/build-a".to_owned(),
+        ];
+
+        assert!(config.ensure_configured_models_are_favorites());
+        assert_eq!(
+            config.acp_favorite_models,
+            vec!["custom/build-a", "custom/build-b", "custom/plan"]
+        );
     }
 
     #[test]

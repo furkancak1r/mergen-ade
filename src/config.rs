@@ -349,6 +349,9 @@ fn normalize_config_for_current_platform(config: &mut AppConfig) -> bool {
         config.opencode.plan_effort = DEFAULT_OPENCODE_PLAN_EFFORT.to_owned();
         changed = true;
     }
+    if config.opencode.ensure_configured_models_are_favorites() {
+        changed = true;
+    }
     // Strip Windows verbatim path prefixes from persisted project paths
     for project in &mut config.projects {
         project.path = crate::path_utils::normalize_windows_verbatim_path_for_shell(&project.path);
@@ -1037,6 +1040,25 @@ command = false
 
         let loaded = load_config(&path).expect("should load config");
         assert_eq!(loaded.opencode.build_model_slot_a, "custom/model-x");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_config_adds_configured_opencode_models_to_acp_favorites() {
+        let path = unique_temp_path("opencode-configured-model-favorites");
+        let mut config = AppConfig::default();
+        config.opencode.build_model_slot_a = "custom/build-a".to_owned();
+        config.opencode.build_model_slot_b = "custom/build-b".to_owned();
+        config.opencode.plan_model = "custom/plan".to_owned();
+        config.opencode.acp_favorite_models.clear();
+
+        save_config(&path, &config).expect("should save config");
+
+        let loaded = load_config(&path).expect("should load config");
+        assert!(loaded.opencode.is_acp_model_favorite("custom/build-a"));
+        assert!(loaded.opencode.is_acp_model_favorite("custom/build-b"));
+        assert!(loaded.opencode.is_acp_model_favorite("custom/plan"));
 
         let _ = fs::remove_file(path);
     }

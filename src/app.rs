@@ -560,12 +560,15 @@ fn acp_composer_can_stop(is_running: bool, session_ready: bool) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AcpComposerSendButtonState {
     Send,
+    Stop,
     Disabled,
 }
 
-fn acp_composer_send_button_state(can_send: bool, _can_stop: bool) -> AcpComposerSendButtonState {
+fn acp_composer_send_button_state(can_send: bool, can_stop: bool) -> AcpComposerSendButtonState {
     if can_send {
         AcpComposerSendButtonState::Send
+    } else if can_stop {
+        AcpComposerSendButtonState::Stop
     } else {
         AcpComposerSendButtonState::Disabled
     }
@@ -1471,7 +1474,6 @@ struct AcpComposerFooterRects {
     plan_rect: Option<egui::Rect>,
     text_rect: Option<egui::Rect>,
     model_rect: egui::Rect,
-    stop_rect: Option<egui::Rect>,
     send_rect: egui::Rect,
     clip_rect: egui::Rect,
 }
@@ -1482,37 +1484,13 @@ fn acp_composer_footer_widget_rects(
     welcome_center: bool,
     model_desired_width: f32,
 ) -> AcpComposerFooterRects {
-    acp_composer_footer_widget_rects_with_stop(
-        footer_rect,
-        show_plan_pill,
-        welcome_center,
-        model_desired_width,
-        false,
-    )
-}
-
-fn acp_composer_footer_widget_rects_with_stop(
-    footer_rect: egui::Rect,
-    show_plan_pill: bool,
-    welcome_center: bool,
-    model_desired_width: f32,
-    show_stop_button: bool,
-) -> AcpComposerFooterRects {
     let footer_controls_rect = acp_composer_footer_control_rect(footer_rect);
     let footer_content_rect = acp_composer_footer_content_rect(footer_controls_rect);
     let ctrl_h = ACP_COMPOSER_CONTROL_HEIGHT;
     let footer_spacing = ACP_COMPOSER_FOOTER_SPACING;
     let footer_w = footer_content_rect.width();
-    let send_w = ctrl_h.min(footer_w.max(0.0));
-    let stop_w = if show_stop_button {
-        ctrl_h.min((footer_w - send_w - footer_spacing).max(0.0))
-    } else {
-        0.0
-    };
-    let layout_footer_w =
-        (footer_w - stop_w - if stop_w > 0.0 { footer_spacing } else { 0.0 }).max(0.0);
     let (plus_w, plan_w, text_w, model_w, send_w) = acp_composer_footer_layout(
-        layout_footer_w,
+        footer_w,
         ctrl_h,
         footer_spacing,
         show_plan_pill,
@@ -1520,12 +1498,7 @@ fn acp_composer_footer_widget_rects_with_stop(
         model_desired_width,
     );
 
-    let left_w = (footer_w
-        - send_w
-        - stop_w
-        - footer_spacing
-        - if stop_w > 0.0 { footer_spacing } else { 0.0 })
-    .max(0.0);
+    let left_w = (footer_w - send_w - footer_spacing).max(0.0);
     let mut left_widget_count = 2usize;
     if show_plan_pill {
         left_widget_count += 1;
@@ -1565,15 +1538,6 @@ fn acp_composer_footer_widget_rects_with_stop(
     let model_rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(model_w, ctrl_h));
     let send_left = footer_content_rect.right() - send_w;
     let send_rect = egui::Rect::from_min_size(egui::pos2(send_left, y), egui::vec2(send_w, ctrl_h));
-    let stop_rect = if stop_w > 0.0 {
-        let stop_left = send_rect.left() - footer_spacing - stop_w;
-        Some(egui::Rect::from_min_size(
-            egui::pos2(stop_left, y),
-            egui::vec2(stop_w, ctrl_h),
-        ))
-    } else {
-        None
-    };
     let clip_rect = acp_composer_footer_clip_rect(footer_rect, footer_content_rect, welcome_center);
 
     AcpComposerFooterRects {
@@ -1581,7 +1545,6 @@ fn acp_composer_footer_widget_rects_with_stop(
         plan_rect,
         text_rect,
         model_rect,
-        stop_rect,
         send_rect,
         clip_rect,
     }
@@ -19497,6 +19460,14 @@ impl AdeApp {
                 if plan_model_response.changed() {
                     changes.note_opencode_change();
                 }
+                if plan_model_response.lost_focus()
+                    && self
+                        .config
+                        .opencode
+                        .ensure_configured_models_are_favorites()
+                {
+                    changes.note_opencode_change();
+                }
 
                 ui.add_space(8.0);
                 settings_copyable_label(
@@ -19550,6 +19521,14 @@ impl AdeApp {
                 });
                 add_settings_copy_context_menu(&slot_a_response, &slot_a_snapshot);
                 if slot_a_response.changed() {
+                    changes.note_opencode_change();
+                }
+                if slot_a_response.lost_focus()
+                    && self
+                        .config
+                        .opencode
+                        .ensure_configured_models_are_favorites()
+                {
                     changes.note_opencode_change();
                 }
 
@@ -19610,6 +19589,14 @@ impl AdeApp {
                 });
                 add_settings_copy_context_menu(&slot_b_response, &slot_b_snapshot);
                 if slot_b_response.changed() {
+                    changes.note_opencode_change();
+                }
+                if slot_b_response.lost_focus()
+                    && self
+                        .config
+                        .opencode
+                        .ensure_configured_models_are_favorites()
+                {
                     changes.note_opencode_change();
                 }
 
@@ -24655,12 +24642,11 @@ impl AdeApp {
                         acp_composer_model_label(session, &acp_runtime_defaults, &active_mode);
                     let model_label_width =
                         acp_composer_model_label_width(&capsule_ui, &model_label);
-                    let footer_rects = acp_composer_footer_widget_rects_with_stop(
+                    let footer_rects = acp_composer_footer_widget_rects(
                         footer_rect,
                         show_plan_pill,
                         welcome_center,
                         acp_composer_model_desired_width(model_label_width),
-                        can_stop,
                     );
                     let ctrl_h = ACP_COMPOSER_CONTROL_HEIGHT;
                     let mut footer_ui = capsule_ui.new_child(
@@ -25080,27 +25066,41 @@ impl AdeApp {
                     let send_response = footer_ui.interact(
                         footer_rects.send_rect,
                         Id::new(("acp-composer-send-button", chat_id)),
-                        if send_button_state == AcpComposerSendButtonState::Send {
+                        if send_button_state != AcpComposerSendButtonState::Disabled {
                             Sense::click()
                         } else {
                             Sense::hover()
                         },
                     );
-                    let send_response = if send_button_state == AcpComposerSendButtonState::Send {
+                    let send_response = if send_button_state != AcpComposerSendButtonState::Disabled
+                    {
                         send_response.on_hover_cursor(egui::CursorIcon::PointingHand)
                     } else if !action_controls_enabled {
                         send_response.on_hover_cursor(egui::CursorIcon::NotAllowed)
                     } else {
                         send_response
-                    };
+                    }
+                    .on_hover_text(match send_button_state {
+                        AcpComposerSendButtonState::Send => "Send message",
+                        AcpComposerSendButtonState::Stop => "Stop OpenCode",
+                        AcpComposerSendButtonState::Disabled => "Enter a message to send",
+                    });
                     let send_paint_rect = acp_composer_send_paint_rect(footer_rects.send_rect);
                     let send_fill = match send_button_state {
                         AcpComposerSendButtonState::Send => ACP_COMPOSER_SEND_ACTIVE_FILL,
+                        AcpComposerSendButtonState::Stop => Color32::from_rgb(80, 42, 42),
                         AcpComposerSendButtonState::Disabled => Color32::from_rgb(45, 45, 45),
                     };
                     let send_icon_color = match send_button_state {
                         AcpComposerSendButtonState::Send => Color32::from_rgb(20, 20, 20),
+                        AcpComposerSendButtonState::Stop => Color32::from_rgb(255, 190, 190),
                         AcpComposerSendButtonState::Disabled => ACP_COMPOSER_ICON_MUTED,
+                    };
+                    let send_icon = match send_button_state {
+                        AcpComposerSendButtonState::Send | AcpComposerSendButtonState::Disabled => {
+                            icons::SEND_HORIZONTAL
+                        }
+                        AcpComposerSendButtonState::Stop => icons::X,
                     };
                     footer_ui.painter().rect_filled(
                         send_paint_rect,
@@ -25110,7 +25110,7 @@ impl AdeApp {
                     footer_ui.painter().text(
                         send_paint_rect.center(),
                         egui::Align2::CENTER_CENTER,
-                        format!("{}", icons::SEND_HORIZONTAL),
+                        format!("{send_icon}"),
                         FontId::proportional(ACP_COMPOSER_SEND_ICON_SIZE),
                         send_icon_color,
                     );
@@ -25119,43 +25119,12 @@ impl AdeApp {
                             AcpComposerSendButtonState::Send => {
                                 submit_requested = true;
                             }
+                            AcpComposerSendButtonState::Stop => {
+                                Self::stop_acp_chat_session(session);
+                                acknowledge_acp_attention = true;
+                                ctx.request_repaint();
+                            }
                             AcpComposerSendButtonState::Disabled => {}
-                        }
-                    }
-                    if let Some(stop_rect) = footer_rects.stop_rect {
-                        let stop_response = footer_ui
-                            .interact(
-                                stop_rect,
-                                Id::new(("acp-composer-stop-button", chat_id)),
-                                if can_stop {
-                                    Sense::click()
-                                } else {
-                                    Sense::hover()
-                                },
-                            )
-                            .on_hover_cursor(if can_stop {
-                                egui::CursorIcon::PointingHand
-                            } else {
-                                egui::CursorIcon::NotAllowed
-                            })
-                            .on_hover_text("Stop OpenCode");
-                        let stop_paint_rect = acp_composer_send_paint_rect(stop_rect);
-                        footer_ui.painter().rect_filled(
-                            stop_paint_rect,
-                            stop_paint_rect.height() * 0.5,
-                            Color32::from_rgb(80, 42, 42),
-                        );
-                        footer_ui.painter().text(
-                            stop_paint_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            format!("{}", icons::X),
-                            FontId::proportional(ACP_COMPOSER_SEND_ICON_SIZE),
-                            Color32::from_rgb(255, 190, 190),
-                        );
-                        if stop_response.clicked() && can_stop {
-                            Self::stop_acp_chat_session(session);
-                            acknowledge_acp_attention = true;
-                            ctx.request_repaint();
                         }
                     }
                     if submit_requested {
@@ -67420,14 +67389,14 @@ mod tests {
     }
 
     #[test]
-    fn acp_composer_send_button_state_stays_send_when_running() {
+    fn acp_composer_send_button_state_prefers_send_then_stop() {
         assert_eq!(
             super::acp_composer_send_button_state(true, false),
             super::AcpComposerSendButtonState::Send
         );
         assert_eq!(
             super::acp_composer_send_button_state(false, true),
-            super::AcpComposerSendButtonState::Disabled
+            super::AcpComposerSendButtonState::Stop
         );
         assert_eq!(
             super::acp_composer_send_button_state(true, true),
@@ -69167,62 +69136,49 @@ mod tests {
     }
 
     #[test]
-    fn acp_composer_footer_widget_rects_place_stop_between_model_and_send() {
+    fn acp_composer_footer_widget_rects_use_single_action_button_when_running() {
         let footer_rect = egui::Rect::from_min_size(
             egui::pos2(10.0, 20.0),
             egui::vec2(720.0, super::ACP_COMPOSER_FOOTER_HEIGHT),
         );
-        let rects = super::acp_composer_footer_widget_rects_with_stop(
+        let rects = super::acp_composer_footer_widget_rects(
             footer_rect,
             true,
             false,
             super::ACP_COMPOSER_MODEL_WIDTH_TARGET,
-            true,
         );
-        let stop_rect = rects
-            .stop_rect
-            .expect("running composer should reserve stop");
 
         assert!(
             rects.model_rect.right()
-                <= stop_rect.left() - super::ACP_COMPOSER_FOOTER_SPACING + 0.01,
-            "model selector should stay before stop"
-        );
-        assert!(
-            stop_rect.right() <= rects.send_rect.left() - super::ACP_COMPOSER_FOOTER_SPACING + 0.01,
-            "stop should stay before send"
+                <= rects.send_rect.left() - super::ACP_COMPOSER_FOOTER_SPACING + 0.01,
+            "model selector should stay before the single action button"
         );
         assert!(
             (footer_rect.right() - rects.send_rect.right() - super::ACP_COMPOSER_SEND_RIGHT_INSET)
                 .abs()
                 < 0.01,
-            "send should keep its right inset when stop is visible"
+            "single action button should keep the send right inset"
         );
     }
 
     #[test]
-    fn acp_composer_footer_widget_rects_keep_stop_and_send_inside_narrow_footer() {
+    fn acp_composer_footer_widget_rects_keep_single_action_inside_narrow_footer() {
         let footer_rect = egui::Rect::from_min_size(
             egui::pos2(10.0, 20.0),
             egui::vec2(320.0, super::ACP_COMPOSER_FOOTER_HEIGHT),
         );
         let controls_rect = super::acp_composer_footer_control_rect(footer_rect);
         let content_rect = super::acp_composer_footer_content_rect(controls_rect);
-        let rects = super::acp_composer_footer_widget_rects_with_stop(
+        let rects = super::acp_composer_footer_widget_rects(
             footer_rect,
             true,
             false,
             super::ACP_COMPOSER_MODEL_WIDTH_TARGET,
-            true,
         );
-        let stop_rect = rects
-            .stop_rect
-            .expect("running composer should reserve stop");
 
-        assert!(stop_rect.left() >= content_rect.left() - 0.01);
-        assert!(stop_rect.right() <= rects.send_rect.left() + 0.01);
+        assert!(rects.send_rect.left() >= content_rect.left() - 0.01);
         assert!(rects.send_rect.right() <= content_rect.right() + 0.01);
-        assert!(rects.model_rect.right() <= stop_rect.left() + 0.01);
+        assert!(rects.model_rect.right() <= rects.send_rect.left() + 0.01);
     }
 
     #[test]
