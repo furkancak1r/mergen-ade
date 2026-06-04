@@ -3527,3 +3527,26 @@
   - Add regression tests for binding disabled preservation and queued per-message model selection.
 - Files/Commands touched: `src/models.rs`, `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, ACP/model config tests
 - References: User request 2026-06-04
+
+---
+
+#### OpenCode ACP running sirasinda composer queue kapaliydi {#acp-running-composer-queue}
+- Date: 2026-06-04
+- Context: User requested that OpenCode ACP behave like terminal Smart Input while the AI is writing: allow typing and sending new messages into a queue without waiting for the current answer to finish.
+- Error signature:
+  1. `acp_composer_input_editable()` returned false while the ACP session was running.
+  2. `acp_composer_can_send()` blocked submit while running.
+  3. The send button became the stop button, leaving no primary queue-submit action during a turn.
+- Symptoms/Impact:
+  - Users had to wait for the AI response to finish before drafting and queueing the next task.
+  - Running-state cancellation competed with the normal send affordance.
+- Root cause:
+  - Running state was used as a blanket composer interactivity lock instead of only blocking immediate `session/prompt` dispatch.
+- Resolution:
+  - Keep input, attachment, mode, model/effort, slash/actions, and history controls enabled once the ACP session is ready, even while a turn is running.
+  - Keep the send button as queue-submit while running and render a separate inline `X` stop control.
+  - Continue blocking concurrent `session/prompt`; running-state submissions are local queued prompts that flush after `PromptResponse`.
+- Prevent recurrence:
+  - Add regression tests for running-state helper enablement, separate stop/send footer layout, running submit queueing, and post-response queue flush.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, ACP composer tests
+- References: User request 2026-06-04

@@ -549,8 +549,8 @@ fn acp_composer_rects(
     }
 }
 
-fn acp_composer_can_send(prompt_input: &str, has_attachments: bool, is_running: bool) -> bool {
-    (!prompt_input.trim().is_empty() || has_attachments) && !is_running
+fn acp_composer_can_send(prompt_input: &str, has_attachments: bool, _is_running: bool) -> bool {
+    !prompt_input.trim().is_empty() || has_attachments
 }
 
 fn acp_composer_can_stop(is_running: bool, session_ready: bool) -> bool {
@@ -560,14 +560,11 @@ fn acp_composer_can_stop(is_running: bool, session_ready: bool) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AcpComposerSendButtonState {
     Send,
-    Stop,
     Disabled,
 }
 
-fn acp_composer_send_button_state(can_send: bool, can_stop: bool) -> AcpComposerSendButtonState {
-    if can_stop {
-        AcpComposerSendButtonState::Stop
-    } else if can_send {
+fn acp_composer_send_button_state(can_send: bool, _can_stop: bool) -> AcpComposerSendButtonState {
+    if can_send {
         AcpComposerSendButtonState::Send
     } else {
         AcpComposerSendButtonState::Disabled
@@ -585,16 +582,16 @@ fn acp_chat_session_can_stop(session: &crate::opencode_acp::AcpChatSession) -> b
     )
 }
 
-fn acp_composer_input_editable(is_running: bool) -> bool {
-    !is_running
+fn acp_composer_input_editable(_is_running: bool) -> bool {
+    true
 }
 
-fn acp_composer_action_controls_enabled(is_running: bool, session_ready: bool) -> bool {
-    session_ready && !is_running
+fn acp_composer_action_controls_enabled(_is_running: bool, session_ready: bool) -> bool {
+    session_ready
 }
 
-fn acp_composer_mode_toggle_enabled(is_running: bool) -> bool {
-    !is_running
+fn acp_composer_mode_toggle_enabled(_is_running: bool) -> bool {
+    true
 }
 
 fn acp_mode_ui_label(mode_id: &str) -> Option<String> {
@@ -950,6 +947,7 @@ struct AcpComposerFooterRects {
     plan_rect: Option<egui::Rect>,
     text_rect: Option<egui::Rect>,
     model_rect: egui::Rect,
+    stop_rect: Option<egui::Rect>,
     send_rect: egui::Rect,
     clip_rect: egui::Rect,
 }
@@ -960,13 +958,37 @@ fn acp_composer_footer_widget_rects(
     welcome_center: bool,
     model_desired_width: f32,
 ) -> AcpComposerFooterRects {
+    acp_composer_footer_widget_rects_with_stop(
+        footer_rect,
+        show_plan_pill,
+        welcome_center,
+        model_desired_width,
+        false,
+    )
+}
+
+fn acp_composer_footer_widget_rects_with_stop(
+    footer_rect: egui::Rect,
+    show_plan_pill: bool,
+    welcome_center: bool,
+    model_desired_width: f32,
+    show_stop_button: bool,
+) -> AcpComposerFooterRects {
     let footer_controls_rect = acp_composer_footer_control_rect(footer_rect);
     let footer_content_rect = acp_composer_footer_content_rect(footer_controls_rect);
     let ctrl_h = ACP_COMPOSER_CONTROL_HEIGHT;
     let footer_spacing = ACP_COMPOSER_FOOTER_SPACING;
     let footer_w = footer_content_rect.width();
+    let send_w = ctrl_h.min(footer_w.max(0.0));
+    let stop_w = if show_stop_button {
+        ctrl_h.min((footer_w - send_w - footer_spacing).max(0.0))
+    } else {
+        0.0
+    };
+    let layout_footer_w =
+        (footer_w - stop_w - if stop_w > 0.0 { footer_spacing } else { 0.0 }).max(0.0);
     let (plus_w, plan_w, text_w, model_w, send_w) = acp_composer_footer_layout(
-        footer_w,
+        layout_footer_w,
         ctrl_h,
         footer_spacing,
         show_plan_pill,
@@ -974,7 +996,12 @@ fn acp_composer_footer_widget_rects(
         model_desired_width,
     );
 
-    let left_w = (footer_w - send_w - footer_spacing).max(0.0);
+    let left_w = (footer_w
+        - send_w
+        - stop_w
+        - footer_spacing
+        - if stop_w > 0.0 { footer_spacing } else { 0.0 })
+    .max(0.0);
     let mut left_widget_count = 2usize;
     if show_plan_pill {
         left_widget_count += 1;
@@ -1014,6 +1041,15 @@ fn acp_composer_footer_widget_rects(
     let model_rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(model_w, ctrl_h));
     let send_left = footer_content_rect.right() - send_w;
     let send_rect = egui::Rect::from_min_size(egui::pos2(send_left, y), egui::vec2(send_w, ctrl_h));
+    let stop_rect = if stop_w > 0.0 {
+        let stop_left = send_rect.left() - footer_spacing - stop_w;
+        Some(egui::Rect::from_min_size(
+            egui::pos2(stop_left, y),
+            egui::vec2(stop_w, ctrl_h),
+        ))
+    } else {
+        None
+    };
     let clip_rect = acp_composer_footer_clip_rect(footer_rect, footer_content_rect, welcome_center);
 
     AcpComposerFooterRects {
@@ -1021,6 +1057,7 @@ fn acp_composer_footer_widget_rects(
         plan_rect,
         text_rect,
         model_rect,
+        stop_rect,
         send_rect,
         clip_rect,
     }
@@ -23915,6 +23952,7 @@ impl AdeApp {
                     let is_running = acp_chat_session_is_running(session);
                     let session_ready = session.session_id.is_some()
                         && !matches!(session.status, crate::opencode_acp::AcpChatStatus::Starting);
+                    let can_stop = acp_composer_can_stop(is_running, session.session_id.is_some());
                     let input_editable = acp_composer_input_editable(is_running);
                     let action_controls_enabled =
                         acp_composer_action_controls_enabled(is_running, session_ready);
@@ -24016,11 +24054,12 @@ impl AdeApp {
                         acp_composer_model_label(session, &acp_runtime_defaults, &active_mode);
                     let model_label_width =
                         acp_composer_model_label_width(&capsule_ui, &model_label);
-                    let footer_rects = acp_composer_footer_widget_rects(
+                    let footer_rects = acp_composer_footer_widget_rects_with_stop(
                         footer_rect,
                         show_plan_pill,
                         welcome_center,
                         acp_composer_model_desired_width(model_label_width),
+                        can_stop,
                     );
                     let ctrl_h = ACP_COMPOSER_CONTROL_HEIGHT;
                     let mut footer_ui = capsule_ui.new_child(
@@ -24379,7 +24418,6 @@ impl AdeApp {
                         !session.attachments.is_empty(),
                         is_running,
                     );
-                    let can_stop = acp_composer_can_stop(is_running, session.session_id.is_some());
                     let send_button_state = acp_composer_send_button_state(can_send, can_stop);
 
                     let (up_pressed, down_pressed) = ui.input(|i| {
@@ -24443,44 +24481,27 @@ impl AdeApp {
                     let send_response = footer_ui.interact(
                         footer_rects.send_rect,
                         Id::new(("acp-composer-send-button", chat_id)),
-                        if matches!(
-                            send_button_state,
-                            AcpComposerSendButtonState::Send | AcpComposerSendButtonState::Stop
-                        ) {
+                        if send_button_state == AcpComposerSendButtonState::Send {
                             Sense::click()
                         } else {
                             Sense::hover()
                         },
                     );
-                    let send_response = if matches!(
-                        send_button_state,
-                        AcpComposerSendButtonState::Send | AcpComposerSendButtonState::Stop
-                    ) {
+                    let send_response = if send_button_state == AcpComposerSendButtonState::Send {
                         send_response.on_hover_cursor(egui::CursorIcon::PointingHand)
                     } else if !action_controls_enabled {
                         send_response.on_hover_cursor(egui::CursorIcon::NotAllowed)
                     } else {
                         send_response
                     };
-                    let send_response = if send_button_state == AcpComposerSendButtonState::Stop {
-                        send_response.on_hover_text("Stop OpenCode")
-                    } else {
-                        send_response
-                    };
                     let send_paint_rect = acp_composer_send_paint_rect(footer_rects.send_rect);
                     let send_fill = match send_button_state {
                         AcpComposerSendButtonState::Send => ACP_COMPOSER_SEND_ACTIVE_FILL,
-                        AcpComposerSendButtonState::Stop => Color32::from_rgb(80, 42, 42),
                         AcpComposerSendButtonState::Disabled => Color32::from_rgb(45, 45, 45),
                     };
                     let send_icon_color = match send_button_state {
                         AcpComposerSendButtonState::Send => Color32::from_rgb(20, 20, 20),
-                        AcpComposerSendButtonState::Stop => Color32::from_rgb(255, 190, 190),
                         AcpComposerSendButtonState::Disabled => ACP_COMPOSER_ICON_MUTED,
-                    };
-                    let send_icon = match send_button_state {
-                        AcpComposerSendButtonState::Stop => icons::X,
-                        _ => icons::SEND_HORIZONTAL,
                     };
                     footer_ui.painter().rect_filled(
                         send_paint_rect,
@@ -24490,7 +24511,7 @@ impl AdeApp {
                     footer_ui.painter().text(
                         send_paint_rect.center(),
                         egui::Align2::CENTER_CENTER,
-                        format!("{send_icon}"),
+                        format!("{}", icons::SEND_HORIZONTAL),
                         FontId::proportional(ACP_COMPOSER_SEND_ICON_SIZE),
                         send_icon_color,
                     );
@@ -24499,12 +24520,43 @@ impl AdeApp {
                             AcpComposerSendButtonState::Send => {
                                 submit_requested = true;
                             }
-                            AcpComposerSendButtonState::Stop => {
-                                Self::stop_acp_chat_session(session);
-                                acknowledge_acp_attention = true;
-                                ctx.request_repaint();
-                            }
                             AcpComposerSendButtonState::Disabled => {}
+                        }
+                    }
+                    if let Some(stop_rect) = footer_rects.stop_rect {
+                        let stop_response = footer_ui
+                            .interact(
+                                stop_rect,
+                                Id::new(("acp-composer-stop-button", chat_id)),
+                                if can_stop {
+                                    Sense::click()
+                                } else {
+                                    Sense::hover()
+                                },
+                            )
+                            .on_hover_cursor(if can_stop {
+                                egui::CursorIcon::PointingHand
+                            } else {
+                                egui::CursorIcon::NotAllowed
+                            })
+                            .on_hover_text("Stop OpenCode");
+                        let stop_paint_rect = acp_composer_send_paint_rect(stop_rect);
+                        footer_ui.painter().rect_filled(
+                            stop_paint_rect,
+                            stop_paint_rect.height() * 0.5,
+                            Color32::from_rgb(80, 42, 42),
+                        );
+                        footer_ui.painter().text(
+                            stop_paint_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            format!("{}", icons::X),
+                            FontId::proportional(ACP_COMPOSER_SEND_ICON_SIZE),
+                            Color32::from_rgb(255, 190, 190),
+                        );
+                        if stop_response.clicked() && can_stop {
+                            Self::stop_acp_chat_session(session);
+                            acknowledge_acp_attention = true;
+                            ctx.request_repaint();
                         }
                     }
                     if submit_requested {
@@ -30394,33 +30446,26 @@ impl eframe::App for AdeApp {
                             let acp_startup_mode_id =
                                 self.config.acp_startup_mode.as_mode_id().to_owned();
                             if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
-                                let is_running = session.is_running
-                                    || matches!(
-                                        session.status,
-                                        crate::opencode_acp::AcpChatStatus::Running
-                                    );
-                                if !is_running {
-                                    let current = session.active_mode_id_or(&acp_startup_mode_id);
-                                    let new_mode = if current == "plan" {
-                                        "build".to_owned()
-                                    } else {
-                                        "plan".to_owned()
-                                    };
-                                    if session.session_id.is_some() {
-                                        session.send_set_config_option("mode", &new_mode);
-                                    }
-                                    Self::set_local_acp_config_value(session, "mode", &new_mode);
-                                    session.selected_mode_id = Some(new_mode);
-                                    if session.session_id.is_some() {
-                                        Self::apply_acp_runtime_defaults_to_session(
-                                            session,
-                                            &acp_runtime_defaults,
-                                            false,
-                                            bind_model_to_mode,
-                                        );
-                                    }
-                                    ctx.request_repaint();
+                                let current = session.active_mode_id_or(&acp_startup_mode_id);
+                                let new_mode = if current == "plan" {
+                                    "build".to_owned()
+                                } else {
+                                    "plan".to_owned()
+                                };
+                                if session.session_id.is_some() {
+                                    session.send_set_config_option("mode", &new_mode);
                                 }
+                                Self::set_local_acp_config_value(session, "mode", &new_mode);
+                                session.selected_mode_id = Some(new_mode);
+                                if session.session_id.is_some() {
+                                    Self::apply_acp_runtime_defaults_to_session(
+                                        session,
+                                        &acp_runtime_defaults,
+                                        false,
+                                        bind_model_to_mode,
+                                    );
+                                }
+                                ctx.request_repaint();
                             }
                         }
                         // Filter out the Tab event so TextEdit doesn't get it
@@ -66577,11 +66622,12 @@ mod tests {
     }
 
     #[test]
-    fn acp_composer_can_send_while_waiting_but_not_running() {
+    fn acp_composer_can_send_while_waiting_or_running() {
         assert!(super::acp_composer_can_send("hello", false, false));
-        assert!(!super::acp_composer_can_send("hello", false, true));
+        assert!(super::acp_composer_can_send("hello", false, true));
         assert!(!super::acp_composer_can_send("   ", false, false));
         assert!(super::acp_composer_can_send("", true, false));
+        assert!(super::acp_composer_can_send("", true, true));
     }
 
     #[test]
@@ -66734,18 +66780,18 @@ mod tests {
     }
 
     #[test]
-    fn acp_composer_send_button_state_toggles_to_stop_when_running() {
+    fn acp_composer_send_button_state_stays_send_when_running() {
         assert_eq!(
             super::acp_composer_send_button_state(true, false),
             super::AcpComposerSendButtonState::Send
         );
         assert_eq!(
             super::acp_composer_send_button_state(false, true),
-            super::AcpComposerSendButtonState::Stop
+            super::AcpComposerSendButtonState::Disabled
         );
         assert_eq!(
             super::acp_composer_send_button_state(true, true),
-            super::AcpComposerSendButtonState::Stop
+            super::AcpComposerSendButtonState::Send
         );
         assert_eq!(
             super::acp_composer_send_button_state(false, false),
@@ -66859,17 +66905,17 @@ mod tests {
     #[test]
     fn acp_composer_input_stays_editable_while_waiting_for_session() {
         assert!(super::acp_composer_input_editable(false));
-        assert!(!super::acp_composer_input_editable(true));
+        assert!(super::acp_composer_input_editable(true));
     }
 
     #[test]
-    fn acp_composer_action_controls_enable_only_when_ready_and_idle() {
+    fn acp_composer_action_controls_enable_when_ready_even_if_running() {
         assert!(!super::acp_composer_action_controls_enabled(false, false));
         assert!(!super::acp_composer_action_controls_enabled(true, false));
-        assert!(!super::acp_composer_action_controls_enabled(true, true));
+        assert!(super::acp_composer_action_controls_enabled(true, true));
         assert!(super::acp_composer_action_controls_enabled(false, true));
         assert!(super::acp_composer_mode_toggle_enabled(false));
-        assert!(!super::acp_composer_mode_toggle_enabled(true));
+        assert!(super::acp_composer_mode_toggle_enabled(true));
         assert_eq!(
             super::acp_composer_disabled_control_cursor(false),
             Some(egui::CursorIcon::NotAllowed)
@@ -66932,6 +66978,65 @@ mod tests {
         let queue = &app.acp_chat_sessions.get(&42).unwrap().queue;
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0], queued_prompt);
+    }
+
+    #[test]
+    fn acp_composer_submit_to_running_chat_queues_without_rpc() {
+        let (mut app, _event_tx) = test_app_with_acp_channels([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        let (mut session, rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
+        session.is_running = true;
+        session.status = crate::opencode_acp::AcpChatStatus::Running;
+        session.selected_mode_id = Some("plan".to_owned());
+        super::AdeApp::set_local_acp_config_value(&mut session, "mode", "plan");
+        app.acp_chat_sessions.insert(42, session);
+
+        assert!(app.submit_acp_prompt_to_chat(42, "next task".to_owned(), Vec::new()));
+
+        assert!(rx.try_recv().is_err());
+        let session = app.acp_chat_sessions.get(&42).unwrap();
+        assert_eq!(session.queue.len(), 1);
+        assert_eq!(session.queue[0].draft_text, "next task");
+        assert_eq!(session.queue[0].prompt_text, "next task");
+        assert_eq!(session.queue[0].mode_id, "plan");
+        assert!(session.is_running);
+    }
+
+    #[test]
+    fn queued_acp_prompt_added_while_running_flushes_after_prompt_response() {
+        let ctx = egui::Context::default();
+        let (mut app, event_tx) = test_app_with_acp_channels([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        let (mut session, rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
+        session.is_running = true;
+        session.status = crate::opencode_acp::AcpChatStatus::Running;
+        session.selected_mode_id = Some("build".to_owned());
+        super::AdeApp::set_local_acp_config_value(&mut session, "mode", "build");
+        app.acp_chat_sessions.insert(42, session);
+
+        assert!(app.submit_acp_prompt_to_chat(42, "queued while running".to_owned(), Vec::new()));
+        assert!(rx.try_recv().is_err());
+
+        event_tx
+            .send(crate::opencode_acp::AcpChatEvent::PromptResponse {
+                chat_id: 42,
+                stop_reason: "done".to_owned(),
+            })
+            .unwrap();
+        app.process_acp_chat_events(&ctx);
+
+        let prompt_rpc = recv_acp_rpc_with_method(&rx, "session/prompt");
+        assert_eq!(
+            prompt_rpc["params"]["prompt"][0]["text"],
+            "queued while running"
+        );
+        let session = app.acp_chat_sessions.get(&42).unwrap();
+        assert!(session.queue.is_empty());
+        assert!(session.is_running);
     }
 
     #[test]
@@ -68179,6 +68284,65 @@ mod tests {
                 <= rects.send_rect.left() - super::ACP_COMPOSER_FOOTER_SPACING + 0.01,
             "model selector must not overlap or push the send button"
         );
+    }
+
+    #[test]
+    fn acp_composer_footer_widget_rects_place_stop_between_model_and_send() {
+        let footer_rect = egui::Rect::from_min_size(
+            egui::pos2(10.0, 20.0),
+            egui::vec2(720.0, super::ACP_COMPOSER_FOOTER_HEIGHT),
+        );
+        let rects = super::acp_composer_footer_widget_rects_with_stop(
+            footer_rect,
+            true,
+            false,
+            super::ACP_COMPOSER_MODEL_WIDTH_TARGET,
+            true,
+        );
+        let stop_rect = rects
+            .stop_rect
+            .expect("running composer should reserve stop");
+
+        assert!(
+            rects.model_rect.right()
+                <= stop_rect.left() - super::ACP_COMPOSER_FOOTER_SPACING + 0.01,
+            "model selector should stay before stop"
+        );
+        assert!(
+            stop_rect.right() <= rects.send_rect.left() - super::ACP_COMPOSER_FOOTER_SPACING + 0.01,
+            "stop should stay before send"
+        );
+        assert!(
+            (footer_rect.right() - rects.send_rect.right() - super::ACP_COMPOSER_SEND_RIGHT_INSET)
+                .abs()
+                < 0.01,
+            "send should keep its right inset when stop is visible"
+        );
+    }
+
+    #[test]
+    fn acp_composer_footer_widget_rects_keep_stop_and_send_inside_narrow_footer() {
+        let footer_rect = egui::Rect::from_min_size(
+            egui::pos2(10.0, 20.0),
+            egui::vec2(320.0, super::ACP_COMPOSER_FOOTER_HEIGHT),
+        );
+        let controls_rect = super::acp_composer_footer_control_rect(footer_rect);
+        let content_rect = super::acp_composer_footer_content_rect(controls_rect);
+        let rects = super::acp_composer_footer_widget_rects_with_stop(
+            footer_rect,
+            true,
+            false,
+            super::ACP_COMPOSER_MODEL_WIDTH_TARGET,
+            true,
+        );
+        let stop_rect = rects
+            .stop_rect
+            .expect("running composer should reserve stop");
+
+        assert!(stop_rect.left() >= content_rect.left() - 0.01);
+        assert!(stop_rect.right() <= rects.send_rect.left() + 0.01);
+        assert!(rects.send_rect.right() <= content_rect.right() + 0.01);
+        assert!(rects.model_rect.right() <= stop_rect.left() + 0.01);
     }
 
     #[test]
