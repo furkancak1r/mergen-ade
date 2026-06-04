@@ -653,12 +653,15 @@ fn ensure_acp_queued_prompt_id(
     }
 }
 
-const ACP_QUEUED_PROMPT_ROW_HEIGHT: f32 = 32.0;
-const ACP_QUEUED_PROMPT_ROW_GAP: f32 = 3.0;
-const ACP_QUEUED_PROMPT_HEADER_HEIGHT: f32 = 22.0;
+const ACP_QUEUED_PROMPT_ROW_HEIGHT: f32 = 26.0;
+const ACP_QUEUED_PROMPT_ROW_GAP: f32 = 2.0;
+const ACP_QUEUED_PROMPT_HEADER_HEIGHT: f32 = 18.0;
 const ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS: usize = 2;
-const ACP_QUEUED_PROMPT_PANEL_BOTTOM_GAP: f32 = 4.0;
-const ACP_QUEUED_PROMPT_META_SIZE: f32 = 11.0;
+const ACP_QUEUED_PROMPT_PANEL_BOTTOM_GAP: f32 = 3.0;
+const ACP_QUEUED_PROMPT_PANEL_INSET_X: f32 = 6.0;
+const ACP_QUEUED_PROMPT_ACTION_SIZE: f32 = 22.0;
+const ACP_QUEUED_PROMPT_ACTION_GAP: f32 = 3.0;
+const ACP_QUEUED_PROMPT_META_SIZE: f32 = 10.0;
 const ACP_QUEUED_PROMPT_PREVIEW_SIZE: f32 = 12.0;
 
 fn draw_acp_queued_prompt_row(
@@ -730,7 +733,6 @@ enum AcpQueuedPromptRowAction {
     RunNext(u64),
     Copy(u64),
     Edit(u64),
-    Restore(u64),
     Delete(u64),
 }
 
@@ -755,7 +757,7 @@ fn acp_queued_prompt_panel_height(session: &crate::opencode_acp::AcpChatSession)
     let rows = acp_queued_prompt_visible_rows(session);
     ACP_QUEUED_PROMPT_HEADER_HEIGHT
         + if rows > 0 {
-            ACP_QUEUED_PROMPT_ROW_GAP + rows as f32 * ACP_QUEUED_PROMPT_ROW_HEIGHT + 4.0
+            ACP_QUEUED_PROMPT_ROW_GAP + rows as f32 * ACP_QUEUED_PROMPT_ROW_HEIGHT + 2.0
         } else {
             0.0
         }
@@ -764,9 +766,10 @@ fn acp_queued_prompt_panel_height(session: &crate::opencode_acp::AcpChatSession)
 
 fn acp_queued_prompt_panel_content_rect(panel_rect: egui::Rect) -> egui::Rect {
     let bottom_gap = ACP_QUEUED_PROMPT_PANEL_BOTTOM_GAP.min(panel_rect.height().max(0.0));
+    let inset_x = ACP_QUEUED_PROMPT_PANEL_INSET_X.min(panel_rect.width().max(0.0) * 0.5);
     egui::Rect::from_min_max(
-        panel_rect.min,
-        egui::pos2(panel_rect.max.x, panel_rect.max.y - bottom_gap),
+        egui::pos2(panel_rect.min.x + inset_x, panel_rect.min.y),
+        egui::pos2(panel_rect.max.x - inset_x, panel_rect.max.y - bottom_gap),
     )
 }
 
@@ -841,6 +844,36 @@ fn remove_acp_queued_prompt_by_id(
     Some(session.queue.remove(index))
 }
 
+fn acp_queued_prompt_icon_button(ui: &mut Ui, icon: AppIcon, tooltip: &str) -> bool {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ACP_QUEUED_PROMPT_ACTION_SIZE, ACP_QUEUED_PROMPT_ACTION_SIZE),
+        Sense::click(),
+    );
+    let response = response
+        .on_hover_text(tooltip)
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect.shrink(1.0), 6.0, with_alpha(BTN_ICON_HOVER, 105));
+    }
+
+    let icon_color = if response.is_pointer_button_down_on() || response.hovered() {
+        TEXT_PRIMARY
+    } else {
+        with_alpha(TEXT_PRIMARY, 176)
+    };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        format!("{icon}"),
+        egui::FontId::proportional(12.0),
+        icon_color,
+    );
+
+    response.clicked()
+}
+
 fn draw_acp_queued_prompt_panel_row(
     ui: &mut egui::Ui,
     index: usize,
@@ -848,33 +881,51 @@ fn draw_acp_queued_prompt_panel_row(
 ) -> Option<AcpQueuedPromptRowAction> {
     let row_width = ui.available_width().max(0.0);
     let mut action = None;
-    let (row_rect, _) = ui.allocate_exact_size(
+    let (row_rect, row_response) = ui.allocate_exact_size(
         egui::vec2(row_width, ACP_QUEUED_PROMPT_ROW_HEIGHT),
         Sense::hover(),
     );
-    let mut row_ui = ui.new_child(
+
+    if ui.is_rect_visible(row_rect) && row_response.hovered() {
+        ui.painter().rect_filled(
+            row_rect.shrink2(egui::vec2(0.0, 1.0)),
+            5.0,
+            Color32::from_rgb(23, 23, 24),
+        );
+    }
+
+    let action_count = 3.0;
+    let action_width = ACP_QUEUED_PROMPT_ACTION_SIZE * action_count
+        + ACP_QUEUED_PROMPT_ACTION_GAP * (action_count - 1.0);
+    let action_right = (row_rect.right() - 2.0).max(row_rect.left());
+    let action_left = (action_right - action_width).max(row_rect.left());
+    let action_rect = egui::Rect::from_min_max(
+        egui::pos2(action_left, row_rect.top()),
+        egui::pos2(action_right, row_rect.bottom()),
+    );
+    let content_rect = egui::Rect::from_min_max(
+        row_rect.min,
+        egui::pos2(
+            (action_rect.left() - 6.0).max(row_rect.left()),
+            row_rect.bottom(),
+        ),
+    );
+
+    let mut content_ui = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(row_rect)
+            .max_rect(content_rect)
             .layout(Layout::left_to_right(Align::Center)),
     );
-    row_ui.set_clip_rect(row_rect.intersect(ui.clip_rect()));
-    if row_ui.is_rect_visible(row_rect) {
-        let fill = if index % 2 == 0 {
-            Color32::from_rgb(24, 24, 25)
-        } else {
-            Color32::from_rgb(20, 20, 21)
-        };
-        row_ui.painter().rect_filled(row_rect, 6.0, fill);
-    }
-    row_ui.spacing_mut().item_spacing.x = 8.0;
-    row_ui.add_space(8.0);
-    row_ui.label(
+    content_ui.set_clip_rect(content_rect.intersect(ui.clip_rect()));
+    content_ui.spacing_mut().item_spacing.x = 5.0;
+    content_ui.add_space(4.0);
+    content_ui.label(
         RichText::new(format!("{}.", index + 1))
             .size(ACP_QUEUED_PROMPT_META_SIZE)
             .color(TEXT_MUTED),
     );
     if let Some(mode_label) = acp_mode_ui_label(&queued_prompt.mode_id) {
-        row_ui.label(
+        content_ui.label(
             RichText::new(mode_label)
                 .size(ACP_QUEUED_PROMPT_META_SIZE)
                 .color(Color32::from_rgb(220, 160, 70)),
@@ -882,20 +933,24 @@ fn draw_acp_queued_prompt_panel_row(
     }
 
     let preview = acp_queued_prompt_preview(&queued_prompt.prompt_text);
-    let action_reserved = CONTROL_ROW_HEIGHT * 5.0 + 34.0;
-    let text_width = (row_ui.available_width() - action_reserved).max(72.0);
-    let (text_rect, label_response) = row_ui.allocate_exact_size(
+    let attachment_width = if queued_prompt.attachments.is_empty() {
+        0.0
+    } else {
+        38.0
+    };
+    let text_width = (content_ui.available_width() - attachment_width).max(24.0);
+    let (text_rect, label_response) = content_ui.allocate_exact_size(
         egui::vec2(text_width, ACP_QUEUED_PROMPT_ROW_HEIGHT),
         Sense::click(),
     );
-    if row_ui.is_rect_visible(text_rect) {
+    if content_ui.is_rect_visible(text_rect) {
         let galley = WidgetText::from(
             RichText::new(preview)
                 .size(ACP_QUEUED_PROMPT_PREVIEW_SIZE)
                 .color(TEXT_PRIMARY),
         )
         .into_galley(
-            &row_ui,
+            &content_ui,
             Some(TextWrapMode::Truncate),
             text_rect.width(),
             egui::TextStyle::Body,
@@ -904,7 +959,7 @@ fn draw_acp_queued_prompt_panel_row(
             text_rect.left(),
             row_rect.center().y - (galley.size().y * 0.5),
         );
-        row_ui.painter().galley(text_pos, galley, TEXT_PRIMARY);
+        content_ui.painter().galley(text_pos, galley, TEXT_PRIMARY);
     }
     let label_response =
         label_response.on_hover_text(capped_hover_text(&queued_prompt.prompt_text, 400));
@@ -912,61 +967,27 @@ fn draw_acp_queued_prompt_panel_row(
         action = Some(AcpQueuedPromptRowAction::Copy(queued_prompt.id));
     }
     if !queued_prompt.attachments.is_empty() {
-        row_ui.label(
+        content_ui.label(
             RichText::new(format!("{} file", queued_prompt.attachments.len()))
                 .size(ACP_QUEUED_PROMPT_META_SIZE)
                 .color(TEXT_MUTED),
         );
     }
-    row_ui.add_space(4.0);
-    if styled_icon_button(
-        &mut row_ui,
-        icons::ARROW_RIGHT,
-        BTN_SUBTLE,
-        BTN_BLUE_HOVER,
-        BTN_ICON_ACTIVE,
-        "Run next",
-    ) {
+
+    let mut action_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(action_rect)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    action_ui.set_clip_rect(action_rect.intersect(ui.clip_rect()));
+    action_ui.spacing_mut().item_spacing.x = ACP_QUEUED_PROMPT_ACTION_GAP;
+    if acp_queued_prompt_icon_button(&mut action_ui, icons::ARROW_RIGHT, "Run next") {
         action = Some(AcpQueuedPromptRowAction::RunNext(queued_prompt.id));
     }
-    if styled_icon_button(
-        &mut row_ui,
-        icons::COPY,
-        BTN_SUBTLE,
-        BTN_BLUE_HOVER,
-        BTN_ICON_ACTIVE,
-        "Copy prompt",
-    ) {
-        action = Some(AcpQueuedPromptRowAction::Copy(queued_prompt.id));
-    }
-    if styled_icon_button(
-        &mut row_ui,
-        icons::CODE,
-        BTN_SUBTLE,
-        BTN_TEAL_HOVER,
-        BTN_ICON_ACTIVE,
-        "Edit",
-    ) {
+    if acp_queued_prompt_icon_button(&mut action_ui, icons::PENCIL, "Edit") {
         action = Some(AcpQueuedPromptRowAction::Edit(queued_prompt.id));
     }
-    if styled_icon_button(
-        &mut row_ui,
-        icons::X,
-        BTN_SUBTLE,
-        BTN_RED_HOVER,
-        Color32::from_rgb(170, 50, 50),
-        "Restore to input",
-    ) {
-        action = Some(AcpQueuedPromptRowAction::Restore(queued_prompt.id));
-    }
-    if styled_icon_button(
-        &mut row_ui,
-        icons::TRASH,
-        BTN_SUBTLE,
-        BTN_RED_HOVER,
-        Color32::from_rgb(170, 50, 50),
-        "Delete",
-    ) {
+    if acp_queued_prompt_icon_button(&mut action_ui, icons::TRASH, "Delete") {
         action = Some(AcpQueuedPromptRowAction::Delete(queued_prompt.id));
     }
     action
@@ -999,14 +1020,9 @@ fn draw_acp_queued_prompt_panel(
         egui::vec2(content_rect.width(), ACP_QUEUED_PROMPT_HEADER_HEIGHT),
     );
     panel_ui.allocate_rect(header_rect, Sense::hover());
-    if panel_ui.is_rect_visible(header_rect) {
-        panel_ui
-            .painter()
-            .rect_filled(header_rect, 6.0, Color32::from_rgb(22, 22, 23));
-    }
     let mut header_ui = panel_ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(header_rect.shrink2(egui::vec2(8.0, 0.0)))
+            .max_rect(header_rect.shrink2(egui::vec2(2.0, 0.0)))
             .layout(Layout::left_to_right(Align::Center)),
     );
     header_ui.set_clip_rect(header_rect);
@@ -1036,7 +1052,7 @@ fn draw_acp_queued_prompt_panel(
     header_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if session.queue_draft_return.is_some() {
             if ui
-                .button(RichText::new("Cancel").small())
+                .add(egui::Button::new(RichText::new("Cancel").small()).frame(false))
                 .on_hover_text("Cancel queued message edit")
                 .clicked()
             {
@@ -1051,7 +1067,7 @@ fn draw_acp_queued_prompt_panel(
                 "Show"
             };
             if ui
-                .button(RichText::new(toggle_label).small())
+                .add(egui::Button::new(RichText::new(toggle_label).small()).frame(false))
                 .on_hover_text("Collapse or expand queued ACP messages")
                 .clicked()
             {
@@ -1170,14 +1186,6 @@ fn draw_acp_queued_prompt_panel(
                                     outcome.request_input_focus = true;
                                 }
                                 AcpQueuedPromptDraftEditResult::Missing => {}
-                            }
-                        }
-                        AcpQueuedPromptRowAction::Restore(id) => {
-                            if let Some(queued_prompt) = remove_acp_queued_prompt_by_id(session, id)
-                            {
-                                AdeApp::restore_acp_queued_prompt_to_draft(session, queued_prompt);
-                                outcome.request_input_focus = true;
-                                ui.ctx().request_repaint();
                             }
                         }
                         AcpQueuedPromptRowAction::Delete(id) => {
@@ -67293,8 +67301,9 @@ mod tests {
 
     #[test]
     fn acp_queued_prompt_row_uses_compact_height() {
-        assert!(super::ACP_QUEUED_PROMPT_HEADER_HEIGHT <= 24.0);
-        assert!(super::ACP_QUEUED_PROMPT_ROW_HEIGHT <= 32.0);
+        assert!(super::ACP_QUEUED_PROMPT_HEADER_HEIGHT <= 20.0);
+        assert!(super::ACP_QUEUED_PROMPT_ROW_HEIGHT <= 28.0);
+        assert!(super::ACP_QUEUED_PROMPT_ACTION_SIZE <= super::ACP_QUEUED_PROMPT_ROW_HEIGHT);
         assert_eq!(super::ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS, 2);
         assert!(super::ACP_QUEUED_PROMPT_PREVIEW_SIZE <= 12.0);
     }
