@@ -549,13 +549,8 @@ fn acp_composer_rects(
     }
 }
 
-fn acp_composer_can_send(
-    prompt_input: &str,
-    has_attachments: bool,
-    is_running: bool,
-    session_ready: bool,
-) -> bool {
-    (!prompt_input.trim().is_empty() || has_attachments) && !is_running && session_ready
+fn acp_composer_can_send(prompt_input: &str, has_attachments: bool, is_running: bool) -> bool {
+    (!prompt_input.trim().is_empty() || has_attachments) && !is_running
 }
 
 fn acp_composer_input_editable(is_running: bool) -> bool {
@@ -564,6 +559,32 @@ fn acp_composer_input_editable(is_running: bool) -> bool {
 
 fn acp_composer_action_controls_enabled(is_running: bool, session_ready: bool) -> bool {
     session_ready && !is_running
+}
+
+fn acp_composer_mode_toggle_enabled(is_running: bool) -> bool {
+    !is_running
+}
+
+fn acp_mode_ui_label(mode_id: &str) -> String {
+    if crate::opencode_acp::mode_is_plan(mode_id) {
+        "Plan".to_owned()
+    } else if mode_id == "build" {
+        "Normal".to_owned()
+    } else {
+        crate::opencode_acp::mode_display_name(mode_id)
+    }
+}
+
+fn acp_queued_prompt_preview(prompt_text: &str) -> String {
+    const MAX_CHARS: usize = 96;
+    let collapsed = prompt_text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = collapsed.chars();
+    let preview = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
 }
 
 fn acp_composer_slash_popup_height_for_controls(
@@ -595,18 +616,18 @@ fn acp_composer_control_response_cursor(response: egui::Response, enabled: bool)
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AcpComposerSubmit {
-    text: String,
-    attachments: Vec<String>,
-    prompt_text: String,
+    queued_prompt: crate::opencode_acp::AcpQueuedPrompt,
 }
 
 fn take_acp_composer_submit(
     session: &mut crate::opencode_acp::AcpChatSession,
+    mode_id: &str,
 ) -> Option<AcpComposerSubmit> {
     if session.prompt_input.trim().is_empty() && session.attachments.is_empty() {
         return None;
     }
-    let text = session.prompt_input.trim().to_owned();
+    let draft_text = session.prompt_input.clone();
+    let text = draft_text.trim().to_owned();
     let attachments = std::mem::take(&mut session.attachments);
     session.prompt_input.clear();
     let prompt_text = crate::opencode_acp::build_acp_prompt_text(&text, &attachments)
@@ -616,9 +637,12 @@ fn take_acp_composer_submit(
         None
     } else {
         Some(AcpComposerSubmit {
-            text,
-            attachments,
-            prompt_text,
+            queued_prompt: crate::opencode_acp::AcpQueuedPrompt {
+                draft_text,
+                attachments,
+                prompt_text,
+                mode_id: mode_id.to_owned(),
+            },
         })
     }
 }
@@ -10863,12 +10887,16 @@ impl AdeApp {
                         session.status = crate::opencode_acp::AcpChatStatus::Idle;
                         session.is_running = false;
                         session.updated_at = Instant::now();
-                        changed |= Self::apply_acp_runtime_defaults_to_session(
-                            session,
-                            &runtime_defaults,
-                            true,
-                        );
-                        queued_prompt_sent = Self::flush_queued_acp_prompts(session);
+                        if session.queue.is_empty() {
+                            changed |= Self::apply_acp_runtime_defaults_to_session(
+                                session,
+                                &runtime_defaults,
+                                true,
+                            );
+                        } else {
+                            queued_prompt_sent =
+                                Self::dispatch_next_queued_acp_prompt(session, &runtime_defaults);
+                        }
                     }
                     self.status_line = format!("OpenCode ACP {chat_id} session created");
                     changed |= queued_prompt_sent;
@@ -11035,16 +11063,21 @@ impl AdeApp {
                     chat_id,
                     stop_reason,
                 } => {
+                    let mut queued_prompt_sent = false;
                     if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
                         session.status = crate::opencode_acp::AcpChatStatus::Idle;
                         session.is_running = false;
                         Self::reset_acp_loop_guard(session);
                         session.updated_at = Instant::now();
+                        queued_prompt_sent =
+                            Self::dispatch_next_queued_acp_prompt(session, &runtime_defaults);
                     }
-                    self.mark_acp_terminal_manager_attention(
-                        chat_id,
-                        AcpTerminalManagerAttentionReason::TurnComplete,
-                    );
+                    if !queued_prompt_sent {
+                        self.mark_acp_terminal_manager_attention(
+                            chat_id,
+                            AcpTerminalManagerAttentionReason::TurnComplete,
+                        );
+                    }
                     self.status_line = format!("OpenCode ACP {chat_id} stopped: {stop_reason}");
                     changed = true;
                 }
@@ -11683,25 +11716,98 @@ impl AdeApp {
         Some(target_chat_id)
     }
 
-    fn flush_queued_acp_prompts(session: &mut crate::opencode_acp::AcpChatSession) -> bool {
-        if session.queue.is_empty() || session.session_id.is_none() {
+    fn restore_acp_queued_prompt_to_draft(
+        session: &mut crate::opencode_acp::AcpChatSession,
+        queued_prompt: crate::opencode_acp::AcpQueuedPrompt,
+    ) {
+        let restored = queued_prompt.draft_text;
+        if !restored.trim().is_empty() {
+            if session.prompt_input.trim().is_empty() {
+                session.prompt_input = restored;
+            } else {
+                session.prompt_input = format!("{restored}\n\n{}", session.prompt_input);
+            }
+        }
+        session.attachments.extend(queued_prompt.attachments);
+        session.updated_at = Instant::now();
+    }
+
+    fn acp_queued_prompt_from_parts(
+        draft_text: String,
+        attachments: Vec<String>,
+        mode_id: String,
+    ) -> Option<crate::opencode_acp::AcpQueuedPrompt> {
+        if draft_text.trim().is_empty() && attachments.is_empty() {
+            return None;
+        }
+        let text = draft_text.trim().to_owned();
+        let prompt_text = crate::opencode_acp::build_acp_prompt_text(&text, &attachments)
+            .trim()
+            .to_owned();
+        if prompt_text.is_empty() {
+            None
+        } else {
+            Some(crate::opencode_acp::AcpQueuedPrompt {
+                draft_text,
+                attachments,
+                prompt_text,
+                mode_id,
+            })
+        }
+    }
+
+    fn dispatch_acp_queued_prompt(
+        session: &mut crate::opencode_acp::AcpChatSession,
+        queued_prompt: crate::opencode_acp::AcpQueuedPrompt,
+        runtime_defaults: &crate::opencode_config::OpenCodeRuntimeDefaults,
+    ) -> bool {
+        if queued_prompt.prompt_text.trim().is_empty() || session.session_id.is_none() {
             return false;
         }
-        let queued_prompts = std::mem::take(&mut session.queue);
+        session.selected_mode_id = Some(queued_prompt.mode_id.clone());
+        Self::ensure_acp_config_option_value(session, "mode", &queued_prompt.mode_id);
+        Self::apply_acp_runtime_defaults_to_session(session, runtime_defaults, false);
+        Self::append_acp_user_prompt_state(session, &queued_prompt.prompt_text);
         session.is_running = true;
         session.status = crate::opencode_acp::AcpChatStatus::Running;
         session.updated_at = Instant::now();
-        for prompt_text in &queued_prompts {
-            session.send_prompt(prompt_text);
-        }
+        session.send_prompt(&queued_prompt.prompt_text);
         true
     }
 
-    fn submit_acp_prompt_to_chat(&mut self, chat_id: u64, prompt_text: String) -> bool {
-        let prompt_text = prompt_text.trim().to_owned();
-        if prompt_text.is_empty() {
+    fn dispatch_next_queued_acp_prompt(
+        session: &mut crate::opencode_acp::AcpChatSession,
+        runtime_defaults: &crate::opencode_config::OpenCodeRuntimeDefaults,
+    ) -> bool {
+        if session.queue.is_empty()
+            || session.session_id.is_none()
+            || session.is_running
+            || matches!(
+                session.status,
+                crate::opencode_acp::AcpChatStatus::Running
+                    | crate::opencode_acp::AcpChatStatus::Permission
+            )
+        {
             return false;
         }
+        let queued_prompt = session.queue.remove(0);
+        if Self::dispatch_acp_queued_prompt(session, queued_prompt.clone(), runtime_defaults) {
+            true
+        } else {
+            session.queue.insert(0, queued_prompt);
+            false
+        }
+    }
+
+    fn submit_acp_queued_prompt_to_chat(
+        &mut self,
+        chat_id: u64,
+        queued_prompt: crate::opencode_acp::AcpQueuedPrompt,
+    ) -> bool {
+        if queued_prompt.prompt_text.trim().is_empty() {
+            return false;
+        }
+        let prompt_title = queued_prompt.prompt_text.clone();
         let runtime_defaults = self.opencode_runtime_defaults();
         self.acknowledge_acp_terminal_manager_attention(chat_id);
         self.acp_pending_project_by_chat.remove(&chat_id);
@@ -11709,16 +11815,43 @@ impl AdeApp {
             return false;
         };
 
-        Self::append_acp_user_prompt_state(session, &prompt_text);
-        if session.session_id.is_some() {
-            Self::apply_acp_runtime_defaults_to_session(session, &runtime_defaults, false);
-            session.is_running = true;
-            session.status = crate::opencode_acp::AcpChatStatus::Running;
-            session.send_prompt(&prompt_text);
+        let can_dispatch_now = session.session_id.is_some()
+            && !session.is_running
+            && !matches!(
+                session.status,
+                crate::opencode_acp::AcpChatStatus::Running
+                    | crate::opencode_acp::AcpChatStatus::Permission
+            );
+        if can_dispatch_now {
+            Self::dispatch_acp_queued_prompt(session, queued_prompt, &runtime_defaults);
         } else {
-            session.queue.push(prompt_text);
+            session.title = acp_chat_title_from_prompt(&prompt_title);
+            session.queue.push(queued_prompt);
+            session.updated_at = Instant::now();
         }
         true
+    }
+
+    fn submit_acp_prompt_to_chat(
+        &mut self,
+        chat_id: u64,
+        draft_text: String,
+        attachments: Vec<String>,
+    ) -> bool {
+        let startup_mode = self.config.acp_startup_mode.as_mode_id();
+        let Some(mode_id) = self
+            .acp_chat_sessions
+            .get(&chat_id)
+            .map(|session| session.active_mode_id_or(startup_mode))
+        else {
+            return false;
+        };
+        let Some(queued_prompt) =
+            Self::acp_queued_prompt_from_parts(draft_text, attachments, mode_id)
+        else {
+            return false;
+        };
+        self.submit_acp_queued_prompt_to_chat(chat_id, queued_prompt)
     }
 
     fn submit_acp_welcome_prompt_to_acp(
@@ -11748,7 +11881,7 @@ impl AdeApp {
         self.active_acp_chat_by_project.insert(project_id, chat_id);
         self.active_acp_chat = Some(chat_id);
         self.reveal_project_in_foreground_terminal_manager(ctx, project_id);
-        let submitted = self.submit_acp_prompt_to_chat(chat_id, prompt_text);
+        let submitted = self.submit_acp_prompt_to_chat(chat_id, prompt_text, Vec::new());
         if submitted {
             ctx.request_repaint();
         }
@@ -11772,25 +11905,26 @@ impl AdeApp {
         ctx: &egui::Context,
         source_chat_id: u64,
         target_project_id: u64,
-        text: String,
-        attachments: Vec<String>,
+        queued_prompt: crate::opencode_acp::AcpQueuedPrompt,
     ) -> bool {
-        let prompt_text = crate::opencode_acp::build_acp_prompt_text(&text, &attachments)
-            .trim()
-            .to_owned();
-        if prompt_text.is_empty() || !self.projects.contains_key(&target_project_id) {
-            self.restore_acp_welcome_draft(source_chat_id, text, attachments);
+        if queued_prompt.prompt_text.trim().is_empty()
+            || !self.projects.contains_key(&target_project_id)
+        {
+            self.restore_acp_welcome_draft(
+                source_chat_id,
+                queued_prompt.draft_text,
+                queued_prompt.attachments,
+            );
             return false;
         }
 
-        let (source_project_id, can_change_project, selected_mode_id) = {
+        let (source_project_id, can_change_project) = {
             let Some(source_session) = self.acp_chat_sessions.get(&source_chat_id) else {
                 return false;
             };
             (
                 source_session.project_id,
                 Self::acp_chat_project_change_allowed(source_session),
-                source_session.selected_mode_id.clone(),
             )
         };
         let runtime_defaults = self.opencode_runtime_defaults();
@@ -11799,30 +11933,32 @@ impl AdeApp {
             source_chat_id
         } else {
             if !can_change_project {
-                self.restore_acp_welcome_draft(source_chat_id, text, attachments);
+                self.restore_acp_welcome_draft(
+                    source_chat_id,
+                    queued_prompt.draft_text,
+                    queued_prompt.attachments,
+                );
                 return false;
             }
             let Some(new_chat_id) =
                 self.spawn_new_visible_acp_chat_for_project(ctx, target_project_id)
             else {
-                self.restore_acp_welcome_draft(source_chat_id, text, attachments);
+                self.restore_acp_welcome_draft(
+                    source_chat_id,
+                    queued_prompt.draft_text,
+                    queued_prompt.attachments,
+                );
                 self.status_line = "OpenCode ACP hazırlanıyor...".to_owned();
                 ctx.request_repaint();
                 return false;
             };
             if let Some(new_session) = self.acp_chat_sessions.get_mut(&new_chat_id) {
-                new_session.selected_mode_id = selected_mode_id.clone();
-                if let Some(mode_id) = selected_mode_id.as_deref() {
-                    if new_session.session_id.is_some() {
-                        new_session.send_set_config_option("mode", mode_id);
-                        Self::set_local_acp_config_value(new_session, "mode", mode_id);
-                    }
+                new_session.selected_mode_id = Some(queued_prompt.mode_id.clone());
+                if new_session.session_id.is_some() {
+                    new_session.send_set_config_option("mode", &queued_prompt.mode_id);
+                    Self::set_local_acp_config_value(new_session, "mode", &queued_prompt.mode_id);
                 }
-                Self::apply_acp_runtime_defaults_to_session(
-                    new_session,
-                    &runtime_defaults,
-                    selected_mode_id.is_none(),
-                );
+                Self::apply_acp_runtime_defaults_to_session(new_session, &runtime_defaults, false);
             }
             new_chat_id
         };
@@ -11836,7 +11972,8 @@ impl AdeApp {
         self.note_selection_changed();
         self.reveal_project_in_foreground_terminal_manager(ctx, target_project_id);
 
-        let submitted = self.submit_acp_prompt_to_chat(target_chat_id, prompt_text);
+        let submitted =
+            self.submit_acp_queued_prompt_to_chat(target_chat_id, queued_prompt.clone());
         if submitted {
             if target_chat_id != source_chat_id {
                 self.kill_acp_chat(source_chat_id);
@@ -11846,7 +11983,11 @@ impl AdeApp {
             }
             ctx.request_repaint();
         } else {
-            self.restore_acp_welcome_draft(source_chat_id, text, attachments);
+            self.restore_acp_welcome_draft(
+                source_chat_id,
+                queued_prompt.draft_text,
+                queued_prompt.attachments,
+            );
         }
         submitted
     }
@@ -22864,7 +23005,7 @@ impl AdeApp {
     fn acp_shows_welcome_center(&self, chat_id: u64) -> bool {
         self.acp_chat_sessions
             .get(&chat_id)
-            .is_some_and(|s| s.messages.is_empty())
+            .is_some_and(|s| !acp_chat_has_started_state(s))
     }
 
     fn draw_acp_context_chips(&mut self, ui: &mut egui::Ui, chat_id: u64, project_id: u64) {
@@ -23197,15 +23338,28 @@ impl AdeApp {
                 let project_id = self.acp_effective_project_for_chat(chat_id).unwrap_or(0);
 
                 let composer_height = if let Some(session) = self.acp_chat_sessions.get(&chat_id) {
-                    let slash_commands = acp_slash_command_matches(
-                        &session.available_commands,
-                        &session.prompt_input,
-                    );
+                    let is_running = session.is_running
+                        || matches!(
+                            session.status,
+                            crate::opencode_acp::AcpChatStatus::Running
+                        );
+                    let session_ready = session.session_id.is_some()
+                        && !matches!(session.status, crate::opencode_acp::AcpChatStatus::Starting);
+                    let action_controls_enabled =
+                        acp_composer_action_controls_enabled(is_running, session_ready);
+                    let slash_commands = if action_controls_enabled {
+                        acp_slash_command_matches(&session.available_commands, &session.prompt_input)
+                    } else {
+                        Vec::new()
+                    };
                     acp_composer_height(
                         welcome_center,
                         !session.attachments.is_empty(),
                         session.pending_permission.is_some(),
-                        acp_slash_command_popup_height(slash_commands.len()),
+                        acp_composer_slash_popup_height_for_controls(
+                            slash_commands.len(),
+                            action_controls_enabled,
+                        ),
                     )
                 } else {
                     acp_composer_height(welcome_center, false, false, 0.0)
@@ -23380,7 +23534,7 @@ impl AdeApp {
                     .id_salt(("acp-chat-messages", chat_id))
                     .auto_shrink([false, false])
                     .show(&mut messages_ui, |ui| {
-                        if let Some(session) = self.acp_chat_sessions.get(&chat_id) {
+                        if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
                             for msg in &session.messages {
                                 match msg {
                                     crate::opencode_acp::AcpChatMessage::User { text } => {
@@ -23429,6 +23583,74 @@ impl AdeApp {
                                 }
                                 ui.add_space(4.0);
                             }
+                            let mut cancel_queued_index = None;
+                            for (index, queued_prompt) in session.queue.iter().enumerate() {
+                                let row_width = ui.available_width().max(0.0);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(row_width, 30.0),
+                                    Layout::left_to_right(Align::Center),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        ui.label(
+                                            RichText::new("Queued")
+                                                .small()
+                                                .strong()
+                                                .color(Color32::from_rgb(255, 200, 100)),
+                                        );
+                                        ui.label(
+                                            RichText::new(acp_mode_ui_label(&queued_prompt.mode_id))
+                                                .small()
+                                                .color(TEXT_MUTED),
+                                        );
+                                        let preview =
+                                            acp_queued_prompt_preview(&queued_prompt.prompt_text);
+                                        ui.add_sized(
+                                            egui::vec2(
+                                                (ui.available_width() - 82.0).max(60.0),
+                                                20.0,
+                                            ),
+                                            egui::Label::new(
+                                                RichText::new(preview)
+                                                    .small()
+                                                    .color(TEXT_PRIMARY),
+                                            )
+                                            .truncate(),
+                                        );
+                                        if !queued_prompt.attachments.is_empty() {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{} file",
+                                                    queued_prompt.attachments.len()
+                                                ))
+                                                .small()
+                                                .color(TEXT_MUTED),
+                                            );
+                                        }
+                                        if ui
+                                            .button(
+                                                RichText::new(format!("{}", icons::X))
+                                                    .size(11.0)
+                                                    .color(TEXT_MUTED),
+                                            )
+                                            .on_hover_text("Cancel queued message")
+                                            .clicked()
+                                        {
+                                            cancel_queued_index = Some(index);
+                                        }
+                                    },
+                                );
+                                ui.add_space(4.0);
+                            }
+                            if let Some(index) = cancel_queued_index {
+                                if index < session.queue.len() {
+                                    let queued_prompt = session.queue.remove(index);
+                                    Self::restore_acp_queued_prompt_to_draft(
+                                        session,
+                                        queued_prompt,
+                                    );
+                                    ctx.request_repaint();
+                                }
+                            }
                             let is_running = session.is_running
                                 || matches!(
                                     session.status,
@@ -23452,7 +23674,7 @@ impl AdeApp {
                                     );
                                 });
                                 ui.scroll_to_cursor(None);
-                            } else if session.messages.is_empty() {
+                            } else if session.messages.is_empty() && session.queue.is_empty() {
                                 ui.label(
                                     RichText::new("Send a message to start the conversation...")
                                         .color(TEXT_MUTED)
@@ -23474,7 +23696,15 @@ impl AdeApp {
                 let acp_favorite_models = self.config.opencode.acp_favorite_models.clone();
                 let acp_runtime_defaults = self.opencode_runtime_defaults();
                 let acp_startup_mode_id = self.config.acp_startup_mode.as_mode_id().to_owned();
-                let mut welcome_acp_submit: Option<(u64, u64, String, Vec<String>)> = None;
+                let mut welcome_acp_submit: Option<(
+                    u64,
+                    u64,
+                    crate::opencode_acp::AcpQueuedPrompt,
+                )> = None;
+                let mut chat_acp_submit: Option<(
+                    u64,
+                    crate::opencode_acp::AcpQueuedPrompt,
+                )> = None;
                 let mut acknowledge_acp_attention = false;
                 let acp_context_project_id = project_id;
                 if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
@@ -23485,6 +23715,7 @@ impl AdeApp {
                     let input_editable = acp_composer_input_editable(is_running);
                     let action_controls_enabled =
                         acp_composer_action_controls_enabled(is_running, session_ready);
+                    let mode_toggle_enabled = acp_composer_mode_toggle_enabled(is_running);
                     let draft = session.prompt_input.clone();
                     let slash_commands = if action_controls_enabled {
                         acp_slash_command_matches(&session.available_commands, &session.prompt_input)
@@ -23576,7 +23807,7 @@ impl AdeApp {
                     );
                     capsule_ui.allocate_rect(footer_rect, Sense::hover());
                     let active_mode = session.active_mode_id_or(&acp_startup_mode_id);
-                    let show_plan_pill = crate::opencode_acp::mode_is_plan(&active_mode);
+                    let show_plan_pill = true;
                     let model_label =
                         acp_composer_model_label(session, &acp_runtime_defaults, &active_mode);
                     let model_label_width =
@@ -23660,15 +23891,27 @@ impl AdeApp {
                             plan_rect,
                             footer_rect,
                         ));
-                        let pill_color = Color32::from_rgb(200, 140, 60);
-                        let pill_fill = Color32::from_rgb(40, 28, 16);
-                        let pill_stroke = Color32::from_rgb(140, 100, 40);
+                        let is_plan_mode = crate::opencode_acp::mode_is_plan(&active_mode);
+                        let pill_label = acp_mode_ui_label(&active_mode);
+                        let (pill_color, pill_fill, pill_stroke) = if is_plan_mode {
+                            (
+                                Color32::from_rgb(200, 140, 60),
+                                Color32::from_rgb(40, 28, 16),
+                                Color32::from_rgb(140, 100, 40),
+                            )
+                        } else {
+                            (
+                                Color32::from_rgb(180, 180, 180),
+                                Color32::from_rgb(34, 34, 34),
+                                Color32::from_rgb(70, 70, 70),
+                            )
+                        };
                         let pill_btn = plan_ui
-                            .add_enabled_ui(action_controls_enabled, |ui| {
+                            .add_enabled_ui(mode_toggle_enabled, |ui| {
                                 ui.add_sized(
                                     plan_rect.size(),
                                     egui::Button::new(
-                                        RichText::new("Plan").size(12.0).color(pill_color),
+                                        RichText::new(pill_label).size(12.0).color(pill_color),
                                     )
                                     .fill(pill_fill)
                                     .rounding(6.0)
@@ -23678,18 +23921,22 @@ impl AdeApp {
                             .inner;
                         let pill_btn = acp_composer_control_response_cursor(
                             pill_btn,
-                            action_controls_enabled,
+                            mode_toggle_enabled,
                         );
-                        if pill_btn.clicked() && action_controls_enabled {
-                            let new_mode = "build";
-                            session.send_set_config_option("mode", new_mode);
+                        if pill_btn.clicked() && mode_toggle_enabled {
+                            let new_mode = if is_plan_mode { "build" } else { "plan" };
+                            if session.session_id.is_some() {
+                                session.send_set_config_option("mode", new_mode);
+                            }
                             Self::set_local_acp_config_value(session, "mode", new_mode);
                             session.selected_mode_id = Some(new_mode.to_owned());
-                            Self::apply_acp_runtime_defaults_to_session(
-                                session,
-                                &acp_runtime_defaults,
-                                false,
-                            );
+                            if session.session_id.is_some() {
+                                Self::apply_acp_runtime_defaults_to_session(
+                                    session,
+                                    &acp_runtime_defaults,
+                                    false,
+                                );
+                            }
                         }
                     }
 
@@ -23924,7 +24171,6 @@ impl AdeApp {
                         &session.prompt_input,
                         !session.attachments.is_empty(),
                         is_running,
-                        session_ready,
                     );
 
                     let (up_pressed, down_pressed) = ui.input(|i| {
@@ -24028,22 +24274,14 @@ impl AdeApp {
                         submit_requested = true;
                     }
                     if submit_requested {
-                        if let Some(submit) = take_acp_composer_submit(session) {
+                        let submit_mode_id = session.active_mode_id_or(&acp_startup_mode_id);
+                        if let Some(submit) = take_acp_composer_submit(session, &submit_mode_id) {
                             if welcome_center {
                                 let target_project = acp_context_project_id;
                                 welcome_acp_submit =
-                                    Some((chat_id, target_project, submit.text, submit.attachments));
+                                    Some((chat_id, target_project, submit.queued_prompt));
                             } else {
-                                Self::apply_acp_runtime_defaults_to_session(
-                                    session,
-                                    &acp_runtime_defaults,
-                                    false,
-                                );
-                                Self::append_acp_user_prompt_state(session, &submit.prompt_text);
-                                session.is_running = true;
-                                session.status =
-                                    crate::opencode_acp::AcpChatStatus::Running;
-                                session.send_prompt(&submit.prompt_text);
+                                chat_acp_submit = Some((chat_id, submit.queued_prompt));
                                 acknowledge_acp_attention = true;
                                 ctx.request_repaint();
                             }
@@ -24148,13 +24386,15 @@ impl AdeApp {
                 if acknowledge_acp_attention {
                     self.acknowledge_acp_terminal_manager_attention(chat_id);
                 }
-                if let Some((source_chat, target_project, text, attachments)) = welcome_acp_submit {
+                if let Some((chat_id, queued_prompt)) = chat_acp_submit {
+                    self.submit_acp_queued_prompt_to_chat(chat_id, queued_prompt);
+                }
+                if let Some((source_chat, target_project, queued_prompt)) = welcome_acp_submit {
                     self.submit_acp_welcome_prompt_from_chat(
                         ctx,
                         source_chat,
                         target_project,
-                        text,
-                        attachments,
+                        queued_prompt,
                     );
                 }
 
@@ -29916,35 +30156,34 @@ impl eframe::App for AdeApp {
                     if tab_consumed {
                         if let Some(chat_id) = self.active_acp_chat {
                             let acp_runtime_defaults = self.opencode_runtime_defaults();
+                            let acp_startup_mode_id =
+                                self.config.acp_startup_mode.as_mode_id().to_owned();
                             if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
-                                if let Some(mode_opt) = session.config_option("mode") {
-                                    let current = &mode_opt.current_value;
+                                let is_running = session.is_running
+                                    || matches!(
+                                        session.status,
+                                        crate::opencode_acp::AcpChatStatus::Running
+                                    );
+                                if !is_running {
+                                    let current = session.active_mode_id_or(&acp_startup_mode_id);
                                     let new_mode = if current == "plan" {
-                                        mode_opt
-                                            .options
-                                            .iter()
-                                            .find(|e| e.value == "build")
-                                            .map(|e| e.value.clone())
+                                        "build".to_owned()
                                     } else {
-                                        mode_opt
-                                            .options
-                                            .iter()
-                                            .find(|e| e.value == "plan")
-                                            .map(|e| e.value.clone())
+                                        "plan".to_owned()
                                     };
-                                    if let Some(new_mode) = new_mode {
+                                    if session.session_id.is_some() {
                                         session.send_set_config_option("mode", &new_mode);
-                                        Self::set_local_acp_config_value(
-                                            session, "mode", &new_mode,
-                                        );
-                                        session.selected_mode_id = Some(new_mode);
+                                    }
+                                    Self::set_local_acp_config_value(session, "mode", &new_mode);
+                                    session.selected_mode_id = Some(new_mode);
+                                    if session.session_id.is_some() {
                                         Self::apply_acp_runtime_defaults_to_session(
                                             session,
                                             &acp_runtime_defaults,
                                             false,
                                         );
-                                        ctx.request_repaint();
                                     }
+                                    ctx.request_repaint();
                                 }
                             }
                         }
@@ -66102,12 +66341,11 @@ mod tests {
     }
 
     #[test]
-    fn acp_composer_can_send_requires_ready_session() {
-        assert!(!super::acp_composer_can_send("hello", false, false, false));
-        assert!(!super::acp_composer_can_send("hello", false, true, true));
-        assert!(!super::acp_composer_can_send("   ", false, false, true));
-        assert!(super::acp_composer_can_send("hello", false, false, true));
-        assert!(super::acp_composer_can_send("", true, false, true));
+    fn acp_composer_can_send_while_waiting_but_not_running() {
+        assert!(super::acp_composer_can_send("hello", false, false));
+        assert!(!super::acp_composer_can_send("hello", false, true));
+        assert!(!super::acp_composer_can_send("   ", false, false));
+        assert!(super::acp_composer_can_send("", true, false));
     }
 
     #[test]
@@ -66122,6 +66360,8 @@ mod tests {
         assert!(!super::acp_composer_action_controls_enabled(true, false));
         assert!(!super::acp_composer_action_controls_enabled(true, true));
         assert!(super::acp_composer_action_controls_enabled(false, true));
+        assert!(super::acp_composer_mode_toggle_enabled(false));
+        assert!(!super::acp_composer_mode_toggle_enabled(true));
         assert_eq!(
             super::acp_composer_disabled_control_cursor(false),
             Some(egui::CursorIcon::NotAllowed)
@@ -66148,14 +66388,19 @@ mod tests {
         session.prompt_input = "  hello  ".to_owned();
         session.attachments = vec!["C:/test/file.txt".to_owned()];
 
-        let submit = super::take_acp_composer_submit(&mut session).expect("composer submit");
+        let submit =
+            super::take_acp_composer_submit(&mut session, "plan").expect("composer submit");
 
-        assert_eq!(submit.text, "hello");
-        assert_eq!(submit.attachments, vec!["C:/test/file.txt".to_owned()]);
+        assert_eq!(submit.queued_prompt.draft_text, "  hello  ");
         assert_eq!(
-            submit.prompt_text,
+            submit.queued_prompt.attachments,
+            vec!["C:/test/file.txt".to_owned()]
+        );
+        assert_eq!(
+            submit.queued_prompt.prompt_text,
             "hello\n\nAttached file paths:\nC:/test/file.txt"
         );
+        assert_eq!(submit.queued_prompt.mode_id, "plan");
         assert!(session.prompt_input.is_empty());
         assert!(session.attachments.is_empty());
     }
@@ -66168,15 +66413,93 @@ mod tests {
         let (mut session, rx) = crate::opencode_acp::test_session_for_app(42, 7, None);
         session.prompt_input = "hello".to_owned();
         session.attachments = vec!["C:/test/file.txt".to_owned()];
-        let submit = super::take_acp_composer_submit(&mut session).expect("composer submit");
+        let submit =
+            super::take_acp_composer_submit(&mut session, "plan").expect("composer submit");
+        let queued_prompt = submit.queued_prompt.clone();
         app.acp_chat_sessions.insert(42, session);
 
-        assert!(app.submit_acp_prompt_to_chat(42, submit.prompt_text.clone()));
+        assert!(app.submit_acp_queued_prompt_to_chat(42, queued_prompt.clone()));
 
         assert!(rx.try_recv().is_err());
+        let queue = &app.acp_chat_sessions.get(&42).unwrap().queue;
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0], queued_prompt);
+    }
+
+    #[test]
+    fn queued_acp_prompts_dispatch_one_per_turn_with_captured_modes() {
+        let ctx = egui::Context::default();
+        let (mut app, event_tx) = test_app_with_acp_channels([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        let (mut session, rx) = crate::opencode_acp::test_session_for_app(42, 7, None);
+        session.selected_mode_id = Some("plan".to_owned());
+        super::AdeApp::set_local_acp_config_value(&mut session, "mode", "plan");
+        app.acp_chat_sessions.insert(42, session);
+
+        assert!(app.submit_acp_prompt_to_chat(42, "first".to_owned(), Vec::new()));
+        {
+            let session = app.acp_chat_sessions.get_mut(&42).unwrap();
+            session.selected_mode_id = Some("build".to_owned());
+            super::AdeApp::set_local_acp_config_value(session, "mode", "build");
+        }
+        assert!(app.submit_acp_prompt_to_chat(42, "second".to_owned(), Vec::new()));
+
+        let queue = &app.acp_chat_sessions.get(&42).unwrap().queue;
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].mode_id, "plan");
+        assert_eq!(queue[1].mode_id, "build");
+
+        event_tx
+            .send(crate::opencode_acp::AcpChatEvent::SessionCreated {
+                chat_id: 42,
+                session_id: "session-7".to_owned(),
+            })
+            .unwrap();
+        app.process_acp_chat_events(&ctx);
+
+        let first_mode_rpc = recv_acp_rpc_with_method(&rx, "session/set_config_option");
+        assert_eq!(first_mode_rpc["params"]["configId"], "mode");
+        assert_eq!(first_mode_rpc["params"]["value"], "plan");
+        let first_prompt_rpc = recv_acp_rpc_with_method(&rx, "session/prompt");
+        assert_eq!(first_prompt_rpc["params"]["prompt"][0]["text"], "first");
+        assert_eq!(app.acp_chat_sessions.get(&42).unwrap().queue.len(), 1);
+
+        event_tx
+            .send(crate::opencode_acp::AcpChatEvent::PromptResponse {
+                chat_id: 42,
+                stop_reason: "done".to_owned(),
+            })
+            .unwrap();
+        app.process_acp_chat_events(&ctx);
+
+        let second_mode_rpc = recv_acp_rpc_with_method(&rx, "session/set_config_option");
+        assert_eq!(second_mode_rpc["params"]["configId"], "mode");
+        assert_eq!(second_mode_rpc["params"]["value"], "build");
+        let second_prompt_rpc = recv_acp_rpc_with_method(&rx, "session/prompt");
+        assert_eq!(second_prompt_rpc["params"]["prompt"][0]["text"], "second");
+        assert!(app.acp_chat_sessions.get(&42).unwrap().queue.is_empty());
+    }
+
+    #[test]
+    fn cancelled_queued_acp_prompt_restores_without_losing_current_draft() {
+        let (mut session, _rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
+        session.prompt_input = "current draft".to_owned();
+        session.attachments = vec!["C:/current.txt".to_owned()];
+        let queued_prompt = crate::opencode_acp::AcpQueuedPrompt {
+            draft_text: "cancelled draft".to_owned(),
+            attachments: vec!["C:/cancelled.txt".to_owned()],
+            prompt_text: "cancelled draft".to_owned(),
+            mode_id: "plan".to_owned(),
+        };
+
+        super::AdeApp::restore_acp_queued_prompt_to_draft(&mut session, queued_prompt);
+
+        assert_eq!(session.prompt_input, "cancelled draft\n\ncurrent draft");
         assert_eq!(
-            app.acp_chat_sessions.get(&42).unwrap().queue,
-            vec![submit.prompt_text]
+            session.attachments,
+            vec!["C:/current.txt".to_owned(), "C:/cancelled.txt".to_owned()]
         );
     }
 
@@ -66630,8 +66953,12 @@ mod tests {
             &ctx,
             99,
             2,
-            "hello target".to_owned(),
-            Vec::new()
+            crate::opencode_acp::AcpQueuedPrompt {
+                draft_text: "hello target".to_owned(),
+                attachments: Vec::new(),
+                prompt_text: "hello target".to_owned(),
+                mode_id: "build".to_owned(),
+            }
         ));
 
         assert!(!app.acp_chat_sessions.contains_key(&42));
@@ -66931,10 +67258,10 @@ mod tests {
 
         assert!(app.submit_acp_welcome_prompt_to_acp(&ctx, 7, "queued".to_owned()));
         assert!(rx.try_recv().is_err());
-        assert_eq!(
-            app.acp_chat_sessions.get(&42).unwrap().queue,
-            vec!["queued".to_owned()]
-        );
+        let queue = &app.acp_chat_sessions.get(&42).unwrap().queue;
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].draft_text, "queued");
+        assert_eq!(queue[0].prompt_text, "queued");
 
         event_tx
             .send(crate::opencode_acp::AcpChatEvent::SessionCreated {

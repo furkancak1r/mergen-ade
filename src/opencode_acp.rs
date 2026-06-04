@@ -169,6 +169,14 @@ pub struct AcpCommand {
     pub description: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpQueuedPrompt {
+    pub draft_text: String,
+    pub attachments: Vec<String>,
+    pub prompt_text: String,
+    pub mode_id: String,
+}
+
 /// A single OpenCode ACP session with the OpenCode agent.
 #[derive(Debug)]
 pub struct AcpChatSession {
@@ -191,7 +199,7 @@ pub struct AcpChatSession {
     pub is_running: bool,
     pub show_thread_selector: bool,
     pub selected_mode_id: Option<String>,
-    pub queue: Vec<String>,
+    pub queue: Vec<AcpQueuedPrompt>,
     pub model_search_query: String,
     pub recent_inputs: Vec<String>,
     pub history_index: Option<usize>,

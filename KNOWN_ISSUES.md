@@ -3416,3 +3416,27 @@
   - Added regression tests for input editability, action-control readiness, disabled cursor, and slash popup gating.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, ACP composer tests
 - References: User clarification 2026-06-03
+
+---
+
+#### OpenCode ACP loading state submit ve mode queue eksikti {#acp-loading-submit-mode-queue}
+- Date: 2026-06-04
+- Context: User clarified that while ACP loads, they want to type, switch Plan/Normal per message, submit without waiting, continue working, and cancel queued messages back into the input.
+- Error signature:
+  1. Waiting-state submit was disabled even though `session/prompt` could be safely queued locally.
+  2. ACP queue stored only final prompt text, so queued messages could not preserve draft text, attachments, or per-message mode.
+- Symptoms/Impact:
+  - Users had to wait for `SessionCreated` before submitting the first prompt.
+  - Multiple loading-state prompts could not safely carry different modes such as first Plan, second Normal.
+  - A cancelled queued prompt could not restore the original draft and attachments.
+- Root cause:
+  - Readiness gating conflated UI submit with protocol RPC readiness, and queue data was under-modeled.
+- Resolution:
+  - Queue submissions locally while `sessionId` is missing, but keep protocol `session/prompt` blocked until session creation.
+  - Store queued prompt draft text, attachment paths, final prompt text, and mode id.
+  - Dispatch queued prompts one at a time, applying each prompt's mode before sending and waiting for `PromptResponse` before sending the next.
+  - Add queued prompt cancellation that restores text and attachments without overwriting an existing draft.
+- Prevent recurrence:
+  - Add regression tests for loading submit, per-message queued mode dispatch, one-prompt-per-turn flushing, and cancel restore behavior.
+- Files/Commands touched: `src/app.rs`, `src/opencode_acp.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo check`, ACP composer tests
+- References: User request 2026-06-04
