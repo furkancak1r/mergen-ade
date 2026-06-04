@@ -150,6 +150,7 @@ const SMART_INPUT_AUTO_DISPATCH_SETTLE_MS: u64 = 300;
 /// Settle duration after OpenCode slash commands that do not start work, such as /new.
 /// Keeps queued Smart Input tasks from racing the slash-menu confirmation Enters.
 const OPENCODE_NON_WORK_SLASH_SETTLE_MS: u64 = SHORTCUT_SECOND_ENTER_DELAY_MS * 2 + 100;
+const ACP_CANCEL_ERROR_SUPPRESSION_SECS: u64 = 3;
 const CURSOR_BLINK_STEP_SECS: f64 = 0.6;
 const TRANSIENT_TOAST_SECS: f64 = 1.75;
 const TRANSIENT_TOAST_MIN_WIDTH: f32 = 140.0;
@@ -11771,25 +11772,7 @@ impl AdeApp {
                     changed = true;
                 }
                 crate::opencode_acp::AcpChatEvent::Error { chat_id, message } => {
-                    self.acknowledge_acp_terminal_manager_attention(chat_id);
-                    if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
-                        session.status = crate::opencode_acp::AcpChatStatus::Error;
-                        Self::reset_acp_loop_guard(session);
-                        session
-                            .messages
-                            .push(crate::opencode_acp::AcpChatMessage::System {
-                                text: format!("Error: {message}"),
-                            });
-                        session.updated_at = Instant::now();
-                    }
-                    if self.acp_model_probe_chat == Some(chat_id) {
-                        self.acp_model_probe_chat = None;
-                    }
-                    self.acp_pending_project_by_chat.remove(&chat_id);
-                    self.acp_standby_chat_by_project
-                        .retain(|_, &mut id| id != chat_id);
-                    self.status_line = format!("OpenCode ACP {chat_id} error: {message}");
-                    changed = true;
+                    changed |= self.handle_acp_error_event(chat_id, message);
                 }
                 crate::opencode_acp::AcpChatEvent::Disconnected { chat_id } => {
                     self.acknowledge_acp_terminal_manager_attention(chat_id);
@@ -12096,8 +12079,116 @@ impl AdeApp {
         session.loop_limit_emitted = false;
     }
 
+    fn strip_ansi_control_sequences(text: &str) -> String {
+        let mut cleaned = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' {
+                if chars.peek().is_some_and(|next| *next == '[') {
+                    let _ = chars.next();
+                    for next in chars.by_ref() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            if ch.is_control() && ch != '\t' {
+                continue;
+            }
+            cleaned.push(ch);
+        }
+        cleaned
+    }
+
+    fn normalized_acp_error_text(message: &str) -> String {
+        Self::strip_ansi_control_sequences(message)
+            .trim()
+            .to_owned()
+    }
+
+    fn acp_cancel_error_reports_unsupported(message: &str) -> bool {
+        let lower = message.to_ascii_lowercase();
+        lower.contains("method not found") || lower.contains("-32601")
+    }
+
+    fn acp_cancel_error_line_is_noise(message: &str) -> bool {
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        Self::acp_cancel_error_reports_unsupported(trimmed)
+            || lower.contains("error handling notification")
+            || lower.contains("session/cancel")
+            || lower.contains("\"jsonrpc\"")
+            || lower.contains("\"method\"")
+            || lower.contains("\"params\"")
+            || lower.contains("\"sessionid\"")
+            || lower.contains("\"code\"")
+            || matches!(trimmed, "{" | "}" | "}," | "[" | "]" | "],")
+    }
+
+    fn suppress_acp_cancel_error_if_needed(
+        session: &mut crate::opencode_acp::AcpChatSession,
+        message: &str,
+    ) -> bool {
+        let Some(deadline) = session.cancel_error_suppression_until else {
+            return false;
+        };
+        let now = Instant::now();
+        if now > deadline {
+            session.cancel_error_suppression_until = None;
+            return false;
+        }
+
+        let normalized = Self::normalized_acp_error_text(message);
+        if !Self::acp_cancel_error_line_is_noise(&normalized) {
+            return false;
+        }
+        if Self::acp_cancel_error_reports_unsupported(&normalized) {
+            session.cancel_unsupported = true;
+        }
+        true
+    }
+
+    fn handle_acp_error_event(&mut self, chat_id: u64, message: String) -> bool {
+        if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+            if Self::suppress_acp_cancel_error_if_needed(session, &message) {
+                return true;
+            }
+        }
+
+        self.acknowledge_acp_terminal_manager_attention(chat_id);
+        if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+            session.status = crate::opencode_acp::AcpChatStatus::Error;
+            Self::reset_acp_loop_guard(session);
+            session
+                .messages
+                .push(crate::opencode_acp::AcpChatMessage::System {
+                    text: format!("Error: {message}"),
+                });
+            session.updated_at = Instant::now();
+        }
+        if self.acp_model_probe_chat == Some(chat_id) {
+            self.acp_model_probe_chat = None;
+        }
+        self.acp_pending_project_by_chat.remove(&chat_id);
+        self.acp_standby_chat_by_project
+            .retain(|_, &mut id| id != chat_id);
+        self.status_line = format!("OpenCode ACP {chat_id} error: {message}");
+        true
+    }
+
     fn stop_acp_chat_session(session: &mut crate::opencode_acp::AcpChatSession) {
-        session.send_cancel();
+        if session.cancel_unsupported {
+            session.cancel_error_suppression_until = None;
+        } else {
+            session.send_cancel();
+            session.cancel_error_suppression_until =
+                Some(Instant::now() + Duration::from_secs(ACP_CANCEL_ERROR_SUPPRESSION_SECS));
+        }
         session.is_running = false;
         session.status = crate::opencode_acp::AcpChatStatus::Idle;
         Self::reset_acp_loop_guard(session);
@@ -67437,6 +67528,102 @@ mod tests {
         assert_eq!(session.tool_calls_this_turn, 0);
         assert!(!session.loop_warning_emitted);
         assert!(!session.loop_limit_emitted);
+    }
+
+    #[test]
+    fn acp_cancel_error_filter_suppresses_ansi_method_not_found_lines() {
+        let (mut session, _rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
+        session.cancel_error_suppression_until =
+            Some(Instant::now() + Duration::from_secs(super::ACP_CANCEL_ERROR_SUPPRESSION_SECS));
+
+        assert!(super::AdeApp::suppress_acp_cancel_error_if_needed(
+            &mut session,
+            "\u{1b}[31m\"message\": \"Method not found\": session/cancel\u{1b}[0m"
+        ));
+
+        assert!(session.cancel_unsupported);
+    }
+
+    #[test]
+    fn acp_cancel_error_filter_does_not_hide_unrelated_errors() {
+        let (mut session, _rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
+        session.cancel_error_suppression_until =
+            Some(Instant::now() + Duration::from_secs(super::ACP_CANCEL_ERROR_SUPPRESSION_SECS));
+
+        assert!(!super::AdeApp::suppress_acp_cancel_error_if_needed(
+            &mut session,
+            "Authentication failed: missing OpenCode token"
+        ));
+        assert!(!session.cancel_unsupported);
+    }
+
+    #[test]
+    fn acp_cancel_error_event_keeps_session_idle_without_system_error() {
+        let mut app = test_app(vec![], None);
+        let (mut session, _rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
+        session.status = crate::opencode_acp::AcpChatStatus::Idle;
+        session.cancel_error_suppression_until =
+            Some(Instant::now() + Duration::from_secs(super::ACP_CANCEL_ERROR_SUPPRESSION_SECS));
+        app.acp_chat_sessions.insert(42, session);
+
+        assert!(app.handle_acp_error_event(42, "\u{1b}[31m\"code\": -32601,\u{1b}[0m".to_owned()));
+
+        let session = app.acp_chat_sessions.get(&42).unwrap();
+        assert!(matches!(
+            session.status,
+            crate::opencode_acp::AcpChatStatus::Idle
+        ));
+        assert!(session.messages.is_empty());
+        assert!(session.cancel_unsupported);
+    }
+
+    #[test]
+    fn acp_error_event_still_surfaces_regular_stderr_errors() {
+        let mut app = test_app(vec![], None);
+        let (session, _rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
+        app.acp_chat_sessions.insert(42, session);
+
+        assert!(app.handle_acp_error_event(42, "Authentication failed".to_owned()));
+
+        let session = app.acp_chat_sessions.get(&42).unwrap();
+        assert!(matches!(
+            session.status,
+            crate::opencode_acp::AcpChatStatus::Error
+        ));
+        assert!(session.messages.iter().any(|message| matches!(
+            message,
+            crate::opencode_acp::AcpChatMessage::System { text }
+                if text == "Error: Authentication failed"
+        )));
+    }
+
+    #[test]
+    fn stop_acp_chat_session_skips_cancel_rpc_after_unsupported_error() {
+        let (mut session, rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
+
+        super::AdeApp::stop_acp_chat_session(&mut session);
+        let first_raw = rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .expect("first stop should send cancel RPC");
+        let first: serde_json::Value = serde_json::from_str(&first_raw).unwrap();
+        assert_eq!(first["method"], "session/cancel");
+
+        assert!(super::AdeApp::suppress_acp_cancel_error_if_needed(
+            &mut session,
+            "\"message\": \"Method not found\": session/cancel"
+        ));
+        assert!(session.cancel_unsupported);
+
+        super::AdeApp::stop_acp_chat_session(&mut session);
+        assert!(
+            rx.try_recv().is_err(),
+            "unsupported cancel should not resend RPC"
+        );
     }
 
     #[test]
