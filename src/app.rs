@@ -582,6 +582,16 @@ fn acp_chat_session_can_stop(session: &crate::opencode_acp::AcpChatSession) -> b
     )
 }
 
+fn acp_chat_session_can_dispatch_prompt(session: &crate::opencode_acp::AcpChatSession) -> bool {
+    session.session_id.is_some()
+        && !session.is_running
+        && !matches!(
+            session.status,
+            crate::opencode_acp::AcpChatStatus::Running
+                | crate::opencode_acp::AcpChatStatus::Permission
+        )
+}
+
 fn acp_composer_input_editable(_is_running: bool) -> bool {
     true
 }
@@ -616,8 +626,38 @@ fn acp_queued_prompt_preview(prompt_text: &str) -> String {
     }
 }
 
+fn next_acp_queued_prompt_id(session: &mut crate::opencode_acp::AcpChatSession) -> u64 {
+    let mut id = session.next_queued_prompt_id.max(1);
+    for _ in 0..=session.queue.len() {
+        if !session.queue.iter().any(|existing| existing.id == id) {
+            break;
+        }
+        id = id.saturating_add(1).max(1);
+    }
+    session.next_queued_prompt_id = id.saturating_add(1).max(1);
+    id
+}
+
+fn ensure_acp_queued_prompt_id(
+    session: &mut crate::opencode_acp::AcpChatSession,
+    queued_prompt: &mut crate::opencode_acp::AcpQueuedPrompt,
+) {
+    let id_conflicts = queued_prompt.id == 0
+        || queued_prompt.id >= session.next_queued_prompt_id
+        || session
+            .queue
+            .iter()
+            .any(|existing| existing.id == queued_prompt.id);
+    if id_conflicts {
+        queued_prompt.id = next_acp_queued_prompt_id(session);
+    }
+}
+
 const ACP_QUEUED_PROMPT_ROW_HEIGHT: f32 = 46.0;
 const ACP_QUEUED_PROMPT_ROW_GAP: f32 = 6.0;
+const ACP_QUEUED_PROMPT_HEADER_HEIGHT: f32 = 28.0;
+const ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS: usize = 4;
+const ACP_QUEUED_PROMPT_PANEL_BOTTOM_GAP: f32 = 6.0;
 const ACP_QUEUED_PROMPT_META_SIZE: f32 = 12.0;
 const ACP_QUEUED_PROMPT_PREVIEW_SIZE: f32 = 14.0;
 
@@ -683,6 +723,545 @@ fn draw_acp_queued_prompt_row(
         },
     )
     .inner
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcpQueuedPromptRowAction {
+    RunNext(u64),
+    Copy(u64),
+    Edit(u64),
+    Save(u64),
+    CancelEdit,
+    Restore(u64),
+    Delete(u64),
+}
+
+#[derive(Debug, Default)]
+struct AcpQueuedPromptPanelOutcome {
+    request_input_focus: bool,
+}
+
+fn acp_queued_prompt_visible_rows(session: &crate::opencode_acp::AcpChatSession) -> usize {
+    if session.queue_expanded {
+        session.queue.len().min(ACP_QUEUED_PROMPT_MAX_VISIBLE_ROWS)
+    } else {
+        0
+    }
+}
+
+fn acp_queued_prompt_panel_height(session: &crate::opencode_acp::AcpChatSession) -> f32 {
+    if session.queue.is_empty() {
+        return 0.0;
+    }
+    let rows = acp_queued_prompt_visible_rows(session);
+    ACP_QUEUED_PROMPT_HEADER_HEIGHT
+        + if rows > 0 {
+            ACP_QUEUED_PROMPT_ROW_GAP + rows as f32 * ACP_QUEUED_PROMPT_ROW_HEIGHT + 4.0
+        } else {
+            0.0
+        }
+        + ACP_QUEUED_PROMPT_PANEL_BOTTOM_GAP
+}
+
+fn acp_queued_prompt_panel_content_rect(panel_rect: egui::Rect) -> egui::Rect {
+    let bottom_gap = ACP_QUEUED_PROMPT_PANEL_BOTTOM_GAP.min(panel_rect.height().max(0.0));
+    egui::Rect::from_min_max(
+        panel_rect.min,
+        egui::pos2(panel_rect.max.x, panel_rect.max.y - bottom_gap),
+    )
+}
+
+fn clear_acp_queued_prompt_edit(session: &mut crate::opencode_acp::AcpChatSession) {
+    session.queue_editing_id = None;
+    session.queue_edit_draft.clear();
+    session.queue_edit_attachments.clear();
+}
+
+fn start_acp_queued_prompt_edit(
+    session: &mut crate::opencode_acp::AcpChatSession,
+    prompt_id: u64,
+) -> bool {
+    let Some(queued_prompt) = session.queue.iter().find(|prompt| prompt.id == prompt_id) else {
+        return false;
+    };
+    session.queue_editing_id = Some(prompt_id);
+    session.queue_edit_draft = queued_prompt.draft_text.clone();
+    session.queue_edit_attachments = queued_prompt.attachments.clone();
+    true
+}
+
+fn save_acp_queued_prompt_edit(
+    session: &mut crate::opencode_acp::AcpChatSession,
+    prompt_id: u64,
+) -> bool {
+    if session.queue_editing_id != Some(prompt_id) {
+        return false;
+    }
+    let prompt_text = crate::opencode_acp::build_acp_prompt_text(
+        session.queue_edit_draft.trim(),
+        &session.queue_edit_attachments,
+    )
+    .trim()
+    .to_owned();
+    if prompt_text.is_empty() {
+        return false;
+    }
+    let Some(queued_prompt) = session
+        .queue
+        .iter_mut()
+        .find(|prompt| prompt.id == prompt_id)
+    else {
+        clear_acp_queued_prompt_edit(session);
+        return false;
+    };
+    queued_prompt.draft_text = session.queue_edit_draft.clone();
+    queued_prompt.attachments = session.queue_edit_attachments.clone();
+    queued_prompt.prompt_text = prompt_text;
+    clear_acp_queued_prompt_edit(session);
+    session.updated_at = Instant::now();
+    true
+}
+
+fn remove_acp_queued_prompt_by_id(
+    session: &mut crate::opencode_acp::AcpChatSession,
+    prompt_id: u64,
+) -> Option<crate::opencode_acp::AcpQueuedPrompt> {
+    let index = session
+        .queue
+        .iter()
+        .position(|queued_prompt| queued_prompt.id == prompt_id)?;
+    if session.queue_editing_id == Some(prompt_id) {
+        clear_acp_queued_prompt_edit(session);
+    }
+    session.updated_at = Instant::now();
+    Some(session.queue.remove(index))
+}
+
+fn draw_acp_queue_attachment_chips(ui: &mut Ui, attachments: &mut Vec<String>) -> bool {
+    let mut removed = Vec::new();
+    for (index, path) in attachments.iter().enumerate() {
+        let file_name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path);
+        let chip = ui.add(
+            egui::Button::new(
+                RichText::new(format!(
+                    "{} {}",
+                    icons::FOLDER,
+                    capped_hover_text(file_name, 20)
+                ))
+                .size(11.0)
+                .color(Color32::from_rgb(180, 180, 180)),
+            )
+            .fill(Color32::from_rgb(40, 40, 40))
+            .rounding(4.0)
+            .stroke(Stroke::new(1.0, Color32::from_rgb(90, 90, 90)))
+            .small(),
+        );
+        if chip.clicked() {
+            removed.push(index);
+        }
+    }
+    for index in removed.iter().rev() {
+        attachments.remove(*index);
+    }
+    !removed.is_empty()
+}
+
+fn draw_acp_queued_prompt_panel_row(
+    ui: &mut egui::Ui,
+    chat_id: u64,
+    index: usize,
+    queued_prompt: &crate::opencode_acp::AcpQueuedPrompt,
+    is_editing: bool,
+    edit_draft: &mut String,
+    edit_attachments: &mut Vec<String>,
+) -> Option<AcpQueuedPromptRowAction> {
+    let row_width = ui.available_width().max(0.0);
+    let mut action = None;
+    let (row_rect, _) = ui.allocate_exact_size(
+        egui::vec2(row_width, ACP_QUEUED_PROMPT_ROW_HEIGHT),
+        Sense::hover(),
+    );
+    let mut row_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(row_rect)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    row_ui.set_clip_rect(row_rect.intersect(ui.clip_rect()));
+    if row_ui.is_rect_visible(row_rect) {
+        let fill = if is_editing {
+            Color32::from_rgb(34, 30, 24)
+        } else if index % 2 == 0 {
+            Color32::from_rgb(24, 24, 25)
+        } else {
+            Color32::from_rgb(20, 20, 21)
+        };
+        row_ui.painter().rect_filled(row_rect, 6.0, fill);
+    }
+    row_ui.spacing_mut().item_spacing.x = 8.0;
+    row_ui.add_space(8.0);
+    row_ui.label(
+        RichText::new(format!("{}.", index + 1))
+            .size(ACP_QUEUED_PROMPT_META_SIZE)
+            .color(TEXT_MUTED),
+    );
+    if let Some(mode_label) = acp_mode_ui_label(&queued_prompt.mode_id) {
+        row_ui.label(
+            RichText::new(mode_label)
+                .size(ACP_QUEUED_PROMPT_META_SIZE)
+                .color(Color32::from_rgb(220, 160, 70)),
+        );
+    }
+
+    if is_editing {
+        let actions_width = 72.0;
+        let chip_width = if edit_attachments.is_empty() {
+            0.0
+        } else {
+            112.0
+        };
+        let text_width = (row_ui.available_width() - actions_width - chip_width).max(80.0);
+        let edit_id = Id::new(("acp-queued-prompt-edit", chat_id, queued_prompt.id));
+        let edit_response = row_ui.add_sized(
+            egui::vec2(text_width, 26.0),
+            egui::TextEdit::singleline(edit_draft)
+                .id(edit_id)
+                .hint_text("Edit queued message")
+                .vertical_align(Align::Center),
+        );
+        if edit_response.changed() {
+            row_ui.ctx().request_repaint();
+        }
+        if !edit_attachments.is_empty() {
+            let chip_rect = egui::Rect::from_min_size(
+                row_ui.cursor().min,
+                egui::vec2(chip_width, ACP_QUEUED_PROMPT_ROW_HEIGHT),
+            );
+            let mut chip_ui = row_ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(chip_rect)
+                    .layout(Layout::left_to_right(Align::Center)),
+            );
+            chip_ui.set_clip_rect(chip_rect.intersect(row_rect));
+            egui::ScrollArea::horizontal()
+                .id_salt(("acp-queued-edit-attachments", chat_id, queued_prompt.id))
+                .max_width(chip_width)
+                .show(&mut chip_ui, |ui| {
+                    if draw_acp_queue_attachment_chips(ui, edit_attachments) {
+                        ui.ctx().request_repaint();
+                    }
+                });
+            row_ui.allocate_rect(chip_rect, Sense::hover());
+        }
+        if styled_icon_button(
+            &mut row_ui,
+            icons::CHECK_CIRCLE,
+            BTN_SUBTLE,
+            BTN_TEAL_HOVER,
+            BTN_ICON_ACTIVE,
+            "Save",
+        ) {
+            action = Some(AcpQueuedPromptRowAction::Save(queued_prompt.id));
+        }
+        if styled_icon_button(
+            &mut row_ui,
+            icons::X,
+            BTN_SUBTLE,
+            BTN_RED_HOVER,
+            Color32::from_rgb(170, 50, 50),
+            "Cancel edit",
+        ) {
+            action = Some(AcpQueuedPromptRowAction::CancelEdit);
+        }
+        return action;
+    }
+
+    let preview = acp_queued_prompt_preview(&queued_prompt.prompt_text);
+    let action_reserved = CONTROL_ROW_HEIGHT * 5.0 + 48.0;
+    let text_width = (row_ui.available_width() - action_reserved).max(72.0);
+    let (text_rect, label_response) = row_ui.allocate_exact_size(
+        egui::vec2(text_width, ACP_QUEUED_PROMPT_ROW_HEIGHT),
+        Sense::click(),
+    );
+    if row_ui.is_rect_visible(text_rect) {
+        let galley = WidgetText::from(
+            RichText::new(preview)
+                .size(ACP_QUEUED_PROMPT_PREVIEW_SIZE)
+                .color(TEXT_PRIMARY),
+        )
+        .into_galley(
+            &row_ui,
+            Some(TextWrapMode::Truncate),
+            text_rect.width(),
+            egui::TextStyle::Body,
+        );
+        let text_pos = egui::pos2(
+            text_rect.left(),
+            row_rect.center().y - (galley.size().y * 0.5),
+        );
+        row_ui.painter().galley(text_pos, galley, TEXT_PRIMARY);
+    }
+    let label_response =
+        label_response.on_hover_text(capped_hover_text(&queued_prompt.prompt_text, 400));
+    if label_response.clicked() {
+        action = Some(AcpQueuedPromptRowAction::Copy(queued_prompt.id));
+    }
+    if !queued_prompt.attachments.is_empty() {
+        row_ui.label(
+            RichText::new(format!("{} file", queued_prompt.attachments.len()))
+                .size(ACP_QUEUED_PROMPT_META_SIZE)
+                .color(TEXT_MUTED),
+        );
+    }
+    row_ui.add_space(4.0);
+    if styled_icon_button(
+        &mut row_ui,
+        icons::ARROW_RIGHT,
+        BTN_SUBTLE,
+        BTN_BLUE_HOVER,
+        BTN_ICON_ACTIVE,
+        "Run next",
+    ) {
+        action = Some(AcpQueuedPromptRowAction::RunNext(queued_prompt.id));
+    }
+    if styled_icon_button(
+        &mut row_ui,
+        icons::COPY,
+        BTN_SUBTLE,
+        BTN_BLUE_HOVER,
+        BTN_ICON_ACTIVE,
+        "Copy prompt",
+    ) {
+        action = Some(AcpQueuedPromptRowAction::Copy(queued_prompt.id));
+    }
+    if styled_icon_button(
+        &mut row_ui,
+        icons::CODE,
+        BTN_SUBTLE,
+        BTN_TEAL_HOVER,
+        BTN_ICON_ACTIVE,
+        "Edit",
+    ) {
+        action = Some(AcpQueuedPromptRowAction::Edit(queued_prompt.id));
+    }
+    if styled_icon_button(
+        &mut row_ui,
+        icons::X,
+        BTN_SUBTLE,
+        BTN_RED_HOVER,
+        Color32::from_rgb(170, 50, 50),
+        "Restore to input",
+    ) {
+        action = Some(AcpQueuedPromptRowAction::Restore(queued_prompt.id));
+    }
+    if styled_icon_button(
+        &mut row_ui,
+        icons::TRASH,
+        BTN_SUBTLE,
+        BTN_RED_HOVER,
+        Color32::from_rgb(170, 50, 50),
+        "Delete",
+    ) {
+        action = Some(AcpQueuedPromptRowAction::Delete(queued_prompt.id));
+    }
+    action
+}
+
+fn draw_acp_queued_prompt_panel(
+    ui: &mut egui::Ui,
+    chat_id: u64,
+    panel_rect: egui::Rect,
+    session: &mut crate::opencode_acp::AcpChatSession,
+    runtime_defaults: &crate::opencode_config::OpenCodeRuntimeDefaults,
+    bind_model_to_mode: bool,
+) -> AcpQueuedPromptPanelOutcome {
+    let mut outcome = AcpQueuedPromptPanelOutcome::default();
+    if session.queue.is_empty() {
+        clear_acp_queued_prompt_edit(session);
+        return outcome;
+    }
+
+    ui.allocate_rect(panel_rect, Sense::hover());
+    let content_rect = acp_queued_prompt_panel_content_rect(panel_rect);
+    let mut panel_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(content_rect)
+            .layout(Layout::top_down(Align::Min)),
+    );
+    panel_ui.set_clip_rect(content_rect);
+
+    let header_rect = egui::Rect::from_min_size(
+        content_rect.min,
+        egui::vec2(content_rect.width(), ACP_QUEUED_PROMPT_HEADER_HEIGHT),
+    );
+    panel_ui.allocate_rect(header_rect, Sense::hover());
+    if panel_ui.is_rect_visible(header_rect) {
+        panel_ui
+            .painter()
+            .rect_filled(header_rect, 6.0, Color32::from_rgb(22, 22, 23));
+    }
+    let mut header_ui = panel_ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(header_rect.shrink2(egui::vec2(8.0, 0.0)))
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    header_ui.set_clip_rect(header_rect);
+    header_ui.label(
+        RichText::new(format!("Queued {}", session.queue.len()))
+            .small()
+            .strong()
+            .color(Color32::from_rgb(255, 200, 100)),
+    );
+    let plan_count = session
+        .queue
+        .iter()
+        .filter(|queued_prompt| crate::opencode_acp::mode_is_plan(&queued_prompt.mode_id))
+        .count();
+    if plan_count > 0 {
+        header_ui.label(
+            RichText::new(format!("{plan_count} Plan"))
+                .small()
+                .color(TEXT_MUTED),
+        );
+    }
+    header_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        let toggle_label = if session.queue_expanded {
+            "Hide"
+        } else {
+            "Show"
+        };
+        if ui
+            .button(RichText::new(toggle_label).small())
+            .on_hover_text("Collapse or expand queued ACP messages")
+            .clicked()
+        {
+            session.queue_expanded = !session.queue_expanded;
+            outcome.request_input_focus = true;
+            ui.ctx().request_repaint();
+        }
+    });
+
+    if !session.queue_expanded {
+        return outcome;
+    }
+
+    let rows_height =
+        content_rect.height() - ACP_QUEUED_PROMPT_HEADER_HEIGHT - ACP_QUEUED_PROMPT_ROW_GAP;
+    if rows_height <= 0.0 {
+        return outcome;
+    }
+    let rows_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            content_rect.left(),
+            content_rect.top() + ACP_QUEUED_PROMPT_HEADER_HEIGHT + ACP_QUEUED_PROMPT_ROW_GAP,
+        ),
+        egui::vec2(content_rect.width(), rows_height),
+    );
+    panel_ui.allocate_rect(rows_rect, Sense::hover());
+    let mut rows_ui = panel_ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rows_rect)
+            .layout(Layout::top_down(Align::Min)),
+    );
+    rows_ui.set_clip_rect(rows_rect);
+    let should_scroll_to_end = session.queue_scroll_to_end;
+    session.queue_scroll_to_end = false;
+    egui::ScrollArea::vertical()
+        .id_salt(("acp-queued-prompts", chat_id))
+        .max_height(rows_rect.height())
+        .auto_shrink([false, false])
+        .stick_to_bottom(should_scroll_to_end)
+        .show(&mut rows_ui, |ui| {
+            ui.set_min_width(rows_rect.width());
+            let ids = session
+                .queue
+                .iter()
+                .map(|queued_prompt| queued_prompt.id)
+                .collect::<Vec<_>>();
+            for prompt_id in ids {
+                let Some(index) = session
+                    .queue
+                    .iter()
+                    .position(|queued_prompt| queued_prompt.id == prompt_id)
+                else {
+                    continue;
+                };
+                let queued_prompt = session.queue[index].clone();
+                let row_action = draw_acp_queued_prompt_panel_row(
+                    ui,
+                    chat_id,
+                    index,
+                    &queued_prompt,
+                    session.queue_editing_id == Some(prompt_id),
+                    &mut session.queue_edit_draft,
+                    &mut session.queue_edit_attachments,
+                );
+                if let Some(row_action) = row_action {
+                    match row_action {
+                        AcpQueuedPromptRowAction::RunNext(id) => {
+                            if let Some(mut queued_prompt) =
+                                remove_acp_queued_prompt_by_id(session, id)
+                            {
+                                ensure_acp_queued_prompt_id(session, &mut queued_prompt);
+                                if acp_chat_session_can_dispatch_prompt(session) {
+                                    AdeApp::dispatch_acp_queued_prompt(
+                                        session,
+                                        queued_prompt,
+                                        runtime_defaults,
+                                        bind_model_to_mode,
+                                    );
+                                } else {
+                                    session.queue.insert(0, queued_prompt);
+                                }
+                                outcome.request_input_focus = true;
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                        AcpQueuedPromptRowAction::Copy(id) => {
+                            if let Some(queued_prompt) =
+                                session.queue.iter().find(|prompt| prompt.id == id)
+                            {
+                                ui.ctx().copy_text(queued_prompt.prompt_text.clone());
+                                outcome.request_input_focus = true;
+                            }
+                        }
+                        AcpQueuedPromptRowAction::Edit(id) => {
+                            if start_acp_queued_prompt_edit(session, id) {
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                        AcpQueuedPromptRowAction::Save(id) => {
+                            if save_acp_queued_prompt_edit(session, id) {
+                                outcome.request_input_focus = true;
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                        AcpQueuedPromptRowAction::CancelEdit => {
+                            clear_acp_queued_prompt_edit(session);
+                            outcome.request_input_focus = true;
+                            ui.ctx().request_repaint();
+                        }
+                        AcpQueuedPromptRowAction::Restore(id) => {
+                            if let Some(queued_prompt) = remove_acp_queued_prompt_by_id(session, id)
+                            {
+                                AdeApp::restore_acp_queued_prompt_to_draft(session, queued_prompt);
+                                outcome.request_input_focus = true;
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                        AcpQueuedPromptRowAction::Delete(id) => {
+                            if remove_acp_queued_prompt_by_id(session, id).is_some() {
+                                outcome.request_input_focus = true;
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    outcome
 }
 
 fn acp_event_is_plain_escape_press(event: &egui::Event) -> bool {
@@ -762,8 +1341,10 @@ fn take_acp_composer_submit(
     if prompt_text.is_empty() {
         None
     } else {
+        let id = next_acp_queued_prompt_id(session);
         Some(AcpComposerSubmit {
             queued_prompt: crate::opencode_acp::AcpQueuedPrompt {
+                id,
                 draft_text,
                 attachments,
                 prompt_text,
@@ -3172,6 +3753,8 @@ pub struct AdeApp {
     acp_chat_events_rx: Receiver<crate::opencode_acp::AcpChatEvent>,
     /// Currently active OpenCode ACP session ID (replaces terminal grid in main area).
     active_acp_chat: Option<u64>,
+    /// ACP chat whose composer input should reclaim focus on the next render frame.
+    acp_focus_input_chat_next_frame: Option<u64>,
     /// Hidden ACP session opened only to load model options in Settings.
     acp_model_probe_chat: Option<u64>,
     /// Pre-warmed hidden ACP session per project (consumed on "New Chat").
@@ -5918,6 +6501,7 @@ impl AdeApp {
             acp_chat_events_tx,
             acp_chat_events_rx,
             active_acp_chat: None,
+            acp_focus_input_chat_next_frame: None,
             acp_model_probe_chat: None,
             acp_standby_chat_by_project: BTreeMap::new(),
             acp_standby_retry_after_by_project: BTreeMap::new(),
@@ -11969,6 +12553,11 @@ impl AdeApp {
         session: &mut crate::opencode_acp::AcpChatSession,
         queued_prompt: crate::opencode_acp::AcpQueuedPrompt,
     ) {
+        if session.queue_editing_id == Some(queued_prompt.id) {
+            session.queue_editing_id = None;
+            session.queue_edit_draft.clear();
+            session.queue_edit_attachments.clear();
+        }
         let restored = queued_prompt.draft_text;
         if !restored.trim().is_empty() {
             if session.prompt_input.trim().is_empty() {
@@ -11982,6 +12571,7 @@ impl AdeApp {
     }
 
     fn acp_queued_prompt_from_parts(
+        id: u64,
         draft_text: String,
         attachments: Vec<String>,
         mode_id: String,
@@ -11997,6 +12587,7 @@ impl AdeApp {
             None
         } else {
             Some(crate::opencode_acp::AcpQueuedPrompt {
+                id,
                 draft_text,
                 attachments,
                 prompt_text,
@@ -12065,6 +12656,7 @@ impl AdeApp {
         chat_id: u64,
         queued_prompt: crate::opencode_acp::AcpQueuedPrompt,
     ) -> bool {
+        let mut queued_prompt = queued_prompt;
         if queued_prompt.prompt_text.trim().is_empty() {
             return false;
         }
@@ -12076,14 +12668,9 @@ impl AdeApp {
         let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) else {
             return false;
         };
+        ensure_acp_queued_prompt_id(session, &mut queued_prompt);
 
-        let can_dispatch_now = session.session_id.is_some()
-            && !session.is_running
-            && !matches!(
-                session.status,
-                crate::opencode_acp::AcpChatStatus::Running
-                    | crate::opencode_acp::AcpChatStatus::Permission
-            );
+        let can_dispatch_now = acp_chat_session_can_dispatch_prompt(session);
         if can_dispatch_now {
             Self::dispatch_acp_queued_prompt(
                 session,
@@ -12094,6 +12681,7 @@ impl AdeApp {
         } else {
             session.title = acp_chat_title_from_prompt(&prompt_title);
             session.queue.push(queued_prompt);
+            session.queue_scroll_to_end = true;
             session.updated_at = Instant::now();
         }
         true
@@ -12106,16 +12694,14 @@ impl AdeApp {
         attachments: Vec<String>,
     ) -> bool {
         let startup_mode = self.config.acp_startup_mode.as_mode_id();
-        let Some(mode_id) = self
-            .acp_chat_sessions
-            .get(&chat_id)
-            .map(|session| session.active_mode_id_or(startup_mode))
-        else {
-            return false;
-        };
-        let Some(queued_prompt) =
-            Self::acp_queued_prompt_from_parts(draft_text, attachments, mode_id)
-        else {
+        let Some(queued_prompt) = ({
+            let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) else {
+                return false;
+            };
+            let mode_id = session.active_mode_id_or(startup_mode).to_owned();
+            let id = next_acp_queued_prompt_id(session);
+            Self::acp_queued_prompt_from_parts(id, draft_text, attachments, mode_id)
+        }) else {
             return false;
         };
         self.submit_acp_queued_prompt_to_chat(chat_id, queued_prompt)
@@ -12165,6 +12751,11 @@ impl AdeApp {
         if session.attachments.is_empty() {
             session.attachments = attachments;
         }
+    }
+
+    fn request_acp_composer_input_focus_next_frame(&mut self, ctx: &egui::Context, chat_id: u64) {
+        self.acp_focus_input_chat_next_frame = Some(chat_id);
+        ctx.request_repaint();
     }
 
     fn submit_acp_welcome_prompt_from_chat(
@@ -12355,6 +12946,9 @@ impl AdeApp {
             .retain(|_, &mut id| id != chat_id);
         if self.active_acp_chat == Some(chat_id) {
             self.active_acp_chat = None;
+        }
+        if self.acp_focus_input_chat_next_frame == Some(chat_id) {
+            self.acp_focus_input_chat_next_frame = None;
         }
         if self.acp_model_probe_chat == Some(chat_id) {
             self.acp_model_probe_chat = None;
@@ -23666,7 +24260,8 @@ impl AdeApp {
                     } else {
                         Vec::new()
                     };
-                    acp_composer_height(
+                    acp_queued_prompt_panel_height(session)
+                        + acp_composer_height(
                         welcome_center,
                         !session.attachments.is_empty(),
                         session.pending_permission.is_some(),
@@ -23879,23 +24474,6 @@ impl AdeApp {
                                 }
                                 ui.add_space(4.0);
                             }
-                            let mut cancel_queued_index = None;
-                            for (index, queued_prompt) in session.queue.iter().enumerate() {
-                                if draw_acp_queued_prompt_row(ui, index, queued_prompt) {
-                                    cancel_queued_index = Some(index);
-                                }
-                                ui.add_space(ACP_QUEUED_PROMPT_ROW_GAP);
-                            }
-                            if let Some(index) = cancel_queued_index {
-                                if index < session.queue.len() {
-                                    let queued_prompt = session.queue.remove(index);
-                                    Self::restore_acp_queued_prompt_to_draft(
-                                        session,
-                                        queued_prompt,
-                                    );
-                                    ctx.request_repaint();
-                                }
-                            }
                             let is_running = acp_chat_session_is_running(session);
                             if is_running {
                                 let thinking_text = {
@@ -23947,8 +24525,12 @@ impl AdeApp {
                     crate::opencode_acp::AcpQueuedPrompt,
                 )> = None;
                 let mut acknowledge_acp_attention = false;
+                let focus_input_this_frame =
+                    self.acp_focus_input_chat_next_frame == Some(chat_id);
+                let mut clear_acp_focus_input_request = false;
                 let acp_context_project_id = project_id;
                 if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+                    let mut request_current_input_focus = focus_input_this_frame;
                     let is_running = acp_chat_session_is_running(session);
                     let session_ready = session.session_id.is_some()
                         && !matches!(session.status, crate::opencode_acp::AcpChatStatus::Starting);
@@ -23967,9 +24549,41 @@ impl AdeApp {
                         slash_commands.len(),
                         action_controls_enabled,
                     );
+                    let queue_panel_height =
+                        acp_queued_prompt_panel_height(session).min(composer_rect.height());
+                    let (queue_panel_rect, composer_body_rect) = if queue_panel_height > 0.0 {
+                        let queue_panel_rect = egui::Rect::from_min_size(
+                            composer_rect.min,
+                            egui::vec2(composer_rect.width(), queue_panel_height),
+                        );
+                        let body_top = (composer_rect.top() + queue_panel_height)
+                            .min(composer_rect.bottom());
+                        (
+                            Some(queue_panel_rect),
+                            egui::Rect::from_min_max(
+                                egui::pos2(composer_rect.left(), body_top),
+                                composer_rect.max,
+                            ),
+                        )
+                    } else {
+                        (None, composer_rect)
+                    };
+                    if let Some(queue_panel_rect) = queue_panel_rect {
+                        let outcome = draw_acp_queued_prompt_panel(
+                            &mut composer_ui,
+                            chat_id,
+                            queue_panel_rect,
+                            session,
+                            &acp_runtime_defaults,
+                            self.config.opencode.acp_bind_model_to_mode,
+                        );
+                        if outcome.request_input_focus {
+                            request_current_input_focus = true;
+                        }
+                    }
 
                     let composer_rects = acp_composer_rects(
-                        composer_rect,
+                        composer_body_rect,
                         welcome_center,
                         !session.attachments.is_empty(),
                         session.pending_permission.is_some(),
@@ -24116,9 +24730,7 @@ impl AdeApp {
                                         &session.prompt_input,
                                         &added_paths,
                                     );
-                                ctx.memory_mut(|m| {
-                                    m.request_focus(egui::Id::new("acp-composer-input"))
-                                });
+                                request_current_input_focus = true;
                             }
                             ctx.request_repaint();
                         }
@@ -24562,6 +25174,7 @@ impl AdeApp {
                     if submit_requested {
                         let submit_mode_id = session.active_mode_id_or(&acp_startup_mode_id);
                         if let Some(submit) = take_acp_composer_submit(session, &submit_mode_id) {
+                            request_current_input_focus = true;
                             if welcome_center {
                                 let target_project = acp_context_project_id;
                                 welcome_acp_submit =
@@ -24572,6 +25185,14 @@ impl AdeApp {
                                 ctx.request_repaint();
                             }
                         }
+                    }
+
+                    if request_current_input_focus {
+                        ctx.memory_mut(|m| m.request_focus(response.id));
+                        if focus_input_this_frame {
+                            clear_acp_focus_input_request = true;
+                        }
+                        ctx.request_repaint();
                     }
 
                     if !session.attachments.is_empty() {
@@ -24669,19 +25290,32 @@ impl AdeApp {
                         ctx.request_repaint();
                     }
                 }
+                if clear_acp_focus_input_request
+                    && self.acp_focus_input_chat_next_frame == Some(chat_id)
+                {
+                    self.acp_focus_input_chat_next_frame = None;
+                }
                 if acknowledge_acp_attention {
                     self.acknowledge_acp_terminal_manager_attention(chat_id);
                 }
                 if let Some((chat_id, queued_prompt)) = chat_acp_submit {
-                    self.submit_acp_queued_prompt_to_chat(chat_id, queued_prompt);
+                    if self.submit_acp_queued_prompt_to_chat(chat_id, queued_prompt) {
+                        self.request_acp_composer_input_focus_next_frame(ctx, chat_id);
+                    }
                 }
                 if let Some((source_chat, target_project, queued_prompt)) = welcome_acp_submit {
-                    self.submit_acp_welcome_prompt_from_chat(
+                    let submitted = self.submit_acp_welcome_prompt_from_chat(
                         ctx,
                         source_chat,
                         target_project,
                         queued_prompt,
                     );
+                    let focus_chat = if submitted {
+                        self.active_acp_chat.unwrap_or(source_chat)
+                    } else {
+                        source_chat
+                    };
+                    self.request_acp_composer_input_focus_next_frame(ctx, focus_chat);
                 }
 
                 if !welcome_center && status_row_height > 0.0 {
@@ -49806,6 +50440,7 @@ mod tests {
             acp_chat_events_tx: crossbeam_channel::unbounded().0,
             acp_chat_events_rx: crossbeam_channel::unbounded().1,
             active_acp_chat: None,
+            acp_focus_input_chat_next_frame: None,
             acp_model_probe_chat: None,
             acp_standby_chat_by_project: BTreeMap::new(),
             acp_standby_retry_after_by_project: BTreeMap::new(),
@@ -66678,6 +67313,7 @@ mod tests {
         ctx.set_fonts(egui::FontDefinitions::default());
 
         let queued_prompt = crate::opencode_acp::AcpQueuedPrompt {
+            id: 1,
             draft_text: "hi".to_owned(),
             attachments: Vec::new(),
             prompt_text: "hi".to_owned(),
@@ -66738,6 +67374,7 @@ mod tests {
         ctx.set_fonts(egui::FontDefinitions::default());
 
         let queued_prompt = crate::opencode_acp::AcpQueuedPrompt {
+            id: 1,
             draft_text: "normal prompt".to_owned(),
             attachments: Vec::new(),
             prompt_text: "normal prompt".to_owned(),
@@ -66960,6 +67597,132 @@ mod tests {
     }
 
     #[test]
+    fn acp_composer_submit_assigns_unique_queue_ids() {
+        let (mut session, _rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
+
+        session.prompt_input = "first".to_owned();
+        let first = super::take_acp_composer_submit(&mut session, "plan").expect("first submit");
+        session.prompt_input = "second".to_owned();
+        let second = super::take_acp_composer_submit(&mut session, "build").expect("second submit");
+
+        assert_eq!(first.queued_prompt.id, 1);
+        assert_eq!(second.queued_prompt.id, 2);
+        assert_eq!(session.next_queued_prompt_id, 3);
+    }
+
+    #[test]
+    fn acp_queued_prompt_id_skips_existing_queue_ids() {
+        let (mut session, _rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
+        session.queue.push(crate::opencode_acp::AcpQueuedPrompt {
+            id: 1,
+            draft_text: "queued".to_owned(),
+            attachments: Vec::new(),
+            prompt_text: "queued".to_owned(),
+            mode_id: "build".to_owned(),
+        });
+
+        assert_eq!(super::next_acp_queued_prompt_id(&mut session), 2);
+        assert_eq!(session.next_queued_prompt_id, 3);
+    }
+
+    #[test]
+    fn acp_queued_prompt_panel_defaults_open_and_collapses_to_header() {
+        let (mut session, _rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
+        session.queue.push(crate::opencode_acp::AcpQueuedPrompt {
+            id: 1,
+            draft_text: "queued".to_owned(),
+            attachments: Vec::new(),
+            prompt_text: "queued".to_owned(),
+            mode_id: "plan".to_owned(),
+        });
+
+        let open_height = super::acp_queued_prompt_panel_height(&session);
+        session.queue_expanded = false;
+        let collapsed_height = super::acp_queued_prompt_panel_height(&session);
+
+        assert!(open_height > collapsed_height);
+        assert!(
+            collapsed_height
+                >= super::ACP_QUEUED_PROMPT_HEADER_HEIGHT
+                    + super::ACP_QUEUED_PROMPT_PANEL_BOTTOM_GAP
+        );
+    }
+
+    #[test]
+    fn acp_queued_prompt_edit_save_rebuilds_prompt_and_preserves_mode() {
+        let (mut session, _rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
+        session.queue.push(crate::opencode_acp::AcpQueuedPrompt {
+            id: 1,
+            draft_text: "old".to_owned(),
+            attachments: Vec::new(),
+            prompt_text: "old".to_owned(),
+            mode_id: "plan".to_owned(),
+        });
+
+        assert!(super::start_acp_queued_prompt_edit(&mut session, 1));
+        session.queue_edit_draft = "  changed  ".to_owned();
+        session.queue_edit_attachments = vec!["C:/test/file.txt".to_owned()];
+        assert!(super::save_acp_queued_prompt_edit(&mut session, 1));
+
+        let queued = &session.queue[0];
+        assert_eq!(queued.draft_text, "  changed  ");
+        assert_eq!(queued.mode_id, "plan");
+        assert_eq!(
+            queued.prompt_text,
+            "changed\n\nAttached file paths:\nC:/test/file.txt"
+        );
+        assert_eq!(session.queue_editing_id, None);
+    }
+
+    #[test]
+    fn acp_welcome_submit_schedules_input_focus_after_send() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+        let (mut app, _event_tx) = test_app_with_acp_channels([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        let (mut session, rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
+        session.prompt_input = "hello".to_owned();
+        app.acp_chat_sessions.insert(42, session);
+        app.acp_chat_ids_by_project.entry(7).or_default().push(42);
+        app.active_acp_chat = Some(42);
+        app.active_acp_chat_by_project.insert(7, 42);
+        app.selected_project = Some(7);
+        app.acp_focus_input_chat_next_frame = Some(42);
+
+        let mut first_frame = egui::RawInput::default();
+        first_frame.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1200.0, 800.0),
+        ));
+        let _ = ctx.run(first_frame, |ctx| app.draw_acp_chat_panel(ctx, 42));
+        assert_eq!(app.acp_focus_input_chat_next_frame, None);
+
+        let mut enter_frame = egui::RawInput::default();
+        enter_frame.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1200.0, 800.0),
+        ));
+        enter_frame.events = vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        let _ = ctx.run(enter_frame, |ctx| app.draw_acp_chat_panel(ctx, 42));
+
+        assert_eq!(app.acp_focus_input_chat_next_frame, Some(42));
+        let prompt_rpc = recv_acp_rpc_with_method(&rx, "session/prompt");
+        assert_eq!(prompt_rpc["params"]["prompt"][0]["text"], "hello");
+    }
+
+    #[test]
     fn acp_composer_submit_to_unready_chat_queues_without_rpc() {
         let (mut app, _event_tx) = test_app_with_acp_channels([], None);
         app.projects
@@ -67165,6 +67928,7 @@ mod tests {
         session.prompt_input = "current draft".to_owned();
         session.attachments = vec!["C:/current.txt".to_owned()];
         let queued_prompt = crate::opencode_acp::AcpQueuedPrompt {
+            id: 1,
             draft_text: "cancelled draft".to_owned(),
             attachments: vec!["C:/cancelled.txt".to_owned()],
             prompt_text: "cancelled draft".to_owned(),
@@ -67631,6 +68395,7 @@ mod tests {
             99,
             2,
             crate::opencode_acp::AcpQueuedPrompt {
+                id: 1,
                 draft_text: "hello target".to_owned(),
                 attachments: Vec::new(),
                 prompt_text: "hello target".to_owned(),
