@@ -178,6 +178,12 @@ pub struct AcpQueuedPrompt {
     pub mode_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpQueueDraftReturn {
+    pub index: usize,
+    pub original_prompt: AcpQueuedPrompt,
+}
+
 /// A single OpenCode ACP session with the OpenCode agent.
 #[derive(Debug)]
 pub struct AcpChatSession {
@@ -203,9 +209,7 @@ pub struct AcpChatSession {
     pub queue: Vec<AcpQueuedPrompt>,
     pub next_queued_prompt_id: u64,
     pub queue_expanded: bool,
-    pub queue_editing_id: Option<u64>,
-    pub queue_edit_draft: String,
-    pub queue_edit_attachments: Vec<String>,
+    pub queue_draft_return: Option<AcpQueueDraftReturn>,
     pub queue_scroll_to_end: bool,
     pub model_search_query: String,
     pub recent_inputs: Vec<String>,
@@ -392,9 +396,7 @@ pub(crate) fn test_session_for_app(
             queue: Vec::new(),
             next_queued_prompt_id: 1,
             queue_expanded: true,
-            queue_editing_id: None,
-            queue_edit_draft: String::new(),
-            queue_edit_attachments: Vec::new(),
+            queue_draft_return: None,
             queue_scroll_to_end: false,
             model_search_query: String::new(),
             recent_inputs: Vec::new(),
@@ -638,9 +640,7 @@ pub fn spawn_opencode_acp(
         queue: Vec::new(),
         next_queued_prompt_id: 1,
         queue_expanded: true,
-        queue_editing_id: None,
-        queue_edit_draft: String::new(),
-        queue_edit_attachments: Vec::new(),
+        queue_draft_return: None,
         queue_scroll_to_end: false,
         show_thread_selector: false,
         selected_mode_id: Some(startup_mode_id),
@@ -1076,9 +1076,7 @@ mod tests {
             queue: Vec::new(),
             next_queued_prompt_id: 1,
             queue_expanded: true,
-            queue_editing_id: None,
-            queue_edit_draft: String::new(),
-            queue_edit_attachments: Vec::new(),
+            queue_draft_return: None,
             queue_scroll_to_end: false,
             tool_calls_this_turn: 0,
             loop_warning_emitted: false,
@@ -1109,9 +1107,7 @@ mod tests {
             queue: Vec::new(),
             next_queued_prompt_id: 1,
             queue_expanded: true,
-            queue_editing_id: None,
-            queue_edit_draft: String::new(),
-            queue_edit_attachments: Vec::new(),
+            queue_draft_return: None,
             queue_scroll_to_end: false,
             messages: Vec::new(),
             pending_permission: None,
