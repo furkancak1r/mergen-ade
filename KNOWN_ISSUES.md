@@ -3505,3 +3505,25 @@
   - Add regression tests for hidden build/default labels in helper output, composer footer layout, and queued row rendering.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, ACP composer tests
 - References: User request 2026-06-04
+
+---
+
+#### OpenCode ACP mode degisince model otomatik baglanmiyordu {#acp-mode-model-binding}
+- Date: 2026-06-04
+- Context: User requested a Settings checkbox so Plan mode can use ChatGPT/OpenAI while default/build mode can use Kimi, with the checkbox enabled by default.
+- Error signature:
+  1. ACP mode changes and queued prompts could switch `mode` without switching the corresponding `model`.
+  2. Users had to manually change the model after toggling Plan/default mode.
+- Symptoms/Impact:
+  - A Plan prompt could stay on the build model, or a build prompt could stay on the plan model.
+  - The intended workflow of planning with one model and applying with another required extra waiting and manual model changes.
+- Root cause:
+  - ACP mode and model selection were treated as separate session config options without a persisted binding policy.
+- Resolution:
+  - Added default-on `OpenCodeModelConfig::acp_bind_model_to_mode` and Settings > OpenCode `Bind ACP model to mode`.
+  - When enabled, ACP mode changes apply `plan_model`/`plan_effort` for Plan and the active build model slot for Build before prompts are sent.
+  - When disabled, mode changes preserve the user's manually selected ACP model/effort.
+- Prevent recurrence:
+  - Add regression tests for binding disabled preservation and queued per-message model selection.
+- Files/Commands touched: `src/models.rs`, `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, ACP/model config tests
+- References: User request 2026-06-04

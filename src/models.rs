@@ -511,6 +511,7 @@ pub const DEFAULT_OPENCODE_BUILD_STEPS_LIMIT: u32 = 32;
 pub const DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS: u64 = 600_000;
 pub const DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS: u64 = 120_000;
 pub const DEFAULT_OPENCODE_KIMI_STRICT_PERMISSIONS: bool = true;
+pub const DEFAULT_OPENCODE_ACP_BIND_MODEL_TO_MODE: bool = true;
 
 /// OpenCode model configuration with two switchable slots and ACP favorites.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -532,6 +533,9 @@ pub struct OpenCodeModelConfig {
     /// Cached known ACP models from recent sessions (value + display name).
     #[serde(default)]
     pub acp_known_models: Vec<OpenCodeAcpModelEntry>,
+    /// Whether ACP mode changes should automatically switch to the mode's configured model.
+    #[serde(default = "default_opencode_acp_bind_model_to_mode")]
+    pub acp_bind_model_to_mode: bool,
     /// Whether Mergen writes OpenCode safety settings for long tool loops.
     #[serde(default = "default_opencode_loop_protection_enabled")]
     pub loop_protection_enabled: bool,
@@ -559,6 +563,7 @@ impl Default for OpenCodeModelConfig {
             active_build_model_slot: "a".to_owned(),
             acp_favorite_models: Vec::new(),
             acp_known_models: Vec::new(),
+            acp_bind_model_to_mode: DEFAULT_OPENCODE_ACP_BIND_MODEL_TO_MODE,
             loop_protection_enabled: DEFAULT_OPENCODE_LOOP_PROTECTION_ENABLED,
             build_steps_limit: DEFAULT_OPENCODE_BUILD_STEPS_LIMIT,
             fireworks_timeout_ms: DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS,
@@ -586,6 +591,10 @@ fn default_opencode_fireworks_chunk_timeout_ms() -> u64 {
 
 fn default_opencode_kimi_strict_permissions() -> bool {
     DEFAULT_OPENCODE_KIMI_STRICT_PERMISSIONS
+}
+
+fn default_opencode_acp_bind_model_to_mode() -> bool {
+    DEFAULT_OPENCODE_ACP_BIND_MODEL_TO_MODE
 }
 
 impl OpenCodeModelConfig {
@@ -1376,6 +1385,7 @@ mod tests {
                 "custom/model-a".to_owned(),
                 "Custom Model A".to_owned(),
             )],
+            acp_bind_model_to_mode: false,
             loop_protection_enabled: false,
             build_steps_limit: 12,
             fireworks_timeout_ms: 700_000,
@@ -1395,6 +1405,7 @@ mod tests {
         assert_eq!(deserialized.acp_known_models.len(), 1);
         assert_eq!(deserialized.acp_known_models[0].value, "custom/model-a");
         assert_eq!(deserialized.acp_known_models[0].name, "Custom Model A");
+        assert!(!deserialized.acp_bind_model_to_mode);
         assert!(!deserialized.loop_protection_enabled);
         assert_eq!(deserialized.build_steps_limit, 12);
         assert_eq!(deserialized.fireworks_timeout_ms, 700_000);
@@ -1415,6 +1426,7 @@ mod tests {
         let config: OpenCodeModelConfig = serde_json::from_str(raw).unwrap();
 
         assert!(config.loop_protection_enabled);
+        assert!(config.acp_bind_model_to_mode);
         assert_eq!(
             config.effective_build_steps_limit(),
             DEFAULT_OPENCODE_BUILD_STEPS_LIMIT

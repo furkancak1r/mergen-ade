@@ -10995,6 +10995,7 @@ impl AdeApp {
         let mut known_models_changed = false;
         let mut probe_to_kill: Option<u64> = None;
         let runtime_defaults = self.opencode_runtime_defaults();
+        let bind_acp_model_to_mode = self.config.opencode.acp_bind_model_to_mode;
         while let Ok(event) = self.acp_chat_events_rx.try_recv() {
             match event {
                 crate::opencode_acp::AcpChatEvent::Connected { chat_id } => {
@@ -11021,10 +11022,14 @@ impl AdeApp {
                                 session,
                                 &runtime_defaults,
                                 true,
+                                bind_acp_model_to_mode,
                             );
                         } else {
-                            queued_prompt_sent =
-                                Self::dispatch_next_queued_acp_prompt(session, &runtime_defaults);
+                            queued_prompt_sent = Self::dispatch_next_queued_acp_prompt(
+                                session,
+                                &runtime_defaults,
+                                bind_acp_model_to_mode,
+                            );
                         }
                     }
                     self.status_line = format!("OpenCode ACP {chat_id} session created");
@@ -11133,6 +11138,7 @@ impl AdeApp {
                             session,
                             &runtime_defaults,
                             false,
+                            bind_acp_model_to_mode,
                         );
                     }
                     changed = true;
@@ -11173,6 +11179,7 @@ impl AdeApp {
                             session,
                             &runtime_defaults,
                             enforce_startup_mode,
+                            bind_acp_model_to_mode,
                         );
                         session.updated_at = Instant::now();
                     }
@@ -11198,8 +11205,11 @@ impl AdeApp {
                         session.is_running = false;
                         Self::reset_acp_loop_guard(session);
                         session.updated_at = Instant::now();
-                        queued_prompt_sent =
-                            Self::dispatch_next_queued_acp_prompt(session, &runtime_defaults);
+                        queued_prompt_sent = Self::dispatch_next_queued_acp_prompt(
+                            session,
+                            &runtime_defaults,
+                            bind_acp_model_to_mode,
+                        );
                     }
                     if !queued_prompt_sent {
                         self.mark_acp_terminal_manager_attention(
@@ -11682,6 +11692,7 @@ impl AdeApp {
         session: &mut crate::opencode_acp::AcpChatSession,
         defaults: &crate::opencode_config::OpenCodeRuntimeDefaults,
         enforce_mode: bool,
+        bind_model_to_mode: bool,
     ) -> bool {
         if session.session_id.is_none() {
             return false;
@@ -11691,6 +11702,10 @@ impl AdeApp {
             changed |=
                 Self::ensure_acp_config_option_value(session, "mode", &defaults.default_agent);
             session.selected_mode_id = Some(defaults.default_agent.clone());
+        }
+
+        if !bind_model_to_mode {
+            return changed;
         }
 
         let active_mode = session.active_mode_id_or(&defaults.default_agent);
@@ -11712,8 +11727,31 @@ impl AdeApp {
         defaults: &crate::opencode_config::OpenCodeRuntimeDefaults,
     ) {
         let mut changed = false;
+        let bind_model_to_mode = self.config.opencode.acp_bind_model_to_mode;
         for session in self.acp_chat_sessions.values_mut() {
-            changed |= Self::apply_acp_runtime_defaults_to_session(session, defaults, true);
+            changed |= Self::apply_acp_runtime_defaults_to_session(
+                session,
+                defaults,
+                true,
+                bind_model_to_mode,
+            );
+        }
+        if changed {
+            ctx.request_repaint();
+        }
+    }
+
+    fn apply_acp_mode_model_binding_to_live_chats(
+        &mut self,
+        ctx: &egui::Context,
+        defaults: &crate::opencode_config::OpenCodeRuntimeDefaults,
+    ) {
+        if !self.config.opencode.acp_bind_model_to_mode {
+            return;
+        }
+        let mut changed = false;
+        for session in self.acp_chat_sessions.values_mut() {
+            changed |= Self::apply_acp_runtime_defaults_to_session(session, defaults, false, true);
         }
         if changed {
             ctx.request_repaint();
@@ -11934,13 +11972,19 @@ impl AdeApp {
         session: &mut crate::opencode_acp::AcpChatSession,
         queued_prompt: crate::opencode_acp::AcpQueuedPrompt,
         runtime_defaults: &crate::opencode_config::OpenCodeRuntimeDefaults,
+        bind_model_to_mode: bool,
     ) -> bool {
         if queued_prompt.prompt_text.trim().is_empty() || session.session_id.is_none() {
             return false;
         }
         session.selected_mode_id = Some(queued_prompt.mode_id.clone());
         Self::ensure_acp_config_option_value(session, "mode", &queued_prompt.mode_id);
-        Self::apply_acp_runtime_defaults_to_session(session, runtime_defaults, false);
+        Self::apply_acp_runtime_defaults_to_session(
+            session,
+            runtime_defaults,
+            false,
+            bind_model_to_mode,
+        );
         Self::append_acp_user_prompt_state(session, &queued_prompt.prompt_text);
         session.is_running = true;
         session.status = crate::opencode_acp::AcpChatStatus::Running;
@@ -11952,6 +11996,7 @@ impl AdeApp {
     fn dispatch_next_queued_acp_prompt(
         session: &mut crate::opencode_acp::AcpChatSession,
         runtime_defaults: &crate::opencode_config::OpenCodeRuntimeDefaults,
+        bind_model_to_mode: bool,
     ) -> bool {
         if session.queue.is_empty()
             || session.session_id.is_none()
@@ -11965,7 +12010,12 @@ impl AdeApp {
             return false;
         }
         let queued_prompt = session.queue.remove(0);
-        if Self::dispatch_acp_queued_prompt(session, queued_prompt.clone(), runtime_defaults) {
+        if Self::dispatch_acp_queued_prompt(
+            session,
+            queued_prompt.clone(),
+            runtime_defaults,
+            bind_model_to_mode,
+        ) {
             true
         } else {
             session.queue.insert(0, queued_prompt);
@@ -11983,6 +12033,7 @@ impl AdeApp {
         }
         let prompt_title = queued_prompt.prompt_text.clone();
         let runtime_defaults = self.opencode_runtime_defaults();
+        let bind_model_to_mode = self.config.opencode.acp_bind_model_to_mode;
         self.acknowledge_acp_terminal_manager_attention(chat_id);
         self.acp_pending_project_by_chat.remove(&chat_id);
         let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) else {
@@ -11997,7 +12048,12 @@ impl AdeApp {
                     | crate::opencode_acp::AcpChatStatus::Permission
             );
         if can_dispatch_now {
-            Self::dispatch_acp_queued_prompt(session, queued_prompt, &runtime_defaults);
+            Self::dispatch_acp_queued_prompt(
+                session,
+                queued_prompt,
+                &runtime_defaults,
+                bind_model_to_mode,
+            );
         } else {
             session.title = acp_chat_title_from_prompt(&prompt_title);
             session.queue.push(queued_prompt);
@@ -12102,6 +12158,7 @@ impl AdeApp {
             )
         };
         let runtime_defaults = self.opencode_runtime_defaults();
+        let bind_model_to_mode = self.config.opencode.acp_bind_model_to_mode;
 
         let target_chat_id = if source_project_id == target_project_id {
             source_chat_id
@@ -12132,7 +12189,12 @@ impl AdeApp {
                     new_session.send_set_config_option("mode", &queued_prompt.mode_id);
                     Self::set_local_acp_config_value(new_session, "mode", &queued_prompt.mode_id);
                 }
-                Self::apply_acp_runtime_defaults_to_session(new_session, &runtime_defaults, false);
+                Self::apply_acp_runtime_defaults_to_session(
+                    new_session,
+                    &runtime_defaults,
+                    false,
+                    bind_model_to_mode,
+                );
             }
             new_chat_id
         };
@@ -18757,6 +18819,45 @@ impl AdeApp {
         );
         ui.add_space(12.0);
 
+        let mut apply_binding_to_live_chats = false;
+        show_bounded_settings_card(
+            ui,
+            card_width,
+            AppIcon::ChatText,
+            "ACP Mode Model Binding",
+            "When enabled, changing ACP Plan/Build mode also switches to that mode's configured model.",
+            |ui| {
+                let was_enabled = self.config.opencode.acp_bind_model_to_mode;
+                if ui
+                    .checkbox(
+                        &mut self.config.opencode.acp_bind_model_to_mode,
+                        "Bind ACP model to mode",
+                    )
+                    .changed()
+                {
+                    changes.note_opencode_change();
+                    apply_binding_to_live_chats =
+                        self.config.opencode.acp_bind_model_to_mode && !was_enabled;
+                }
+
+                ui.add_space(6.0);
+                settings_copyable_label(
+                    ui,
+                    RichText::new(
+                        "Plan uses the Plan model/effort. Build uses the active build model slot.",
+                    )
+                    .small()
+                    .color(TEXT_MUTED),
+                    "Plan uses the Plan model/effort. Build uses the active build model slot.",
+                );
+            },
+        );
+        if apply_binding_to_live_chats {
+            let defaults = self.opencode_runtime_defaults();
+            self.apply_acp_mode_model_binding_to_live_chats(ctx, &defaults);
+        }
+        ui.add_space(12.0);
+
         show_bounded_settings_card(
             ui,
             card_width,
@@ -24040,6 +24141,7 @@ impl AdeApp {
                                     session,
                                     &acp_runtime_defaults,
                                     false,
+                                    self.config.opencode.acp_bind_model_to_mode,
                                 );
                             }
                         }
@@ -30288,6 +30390,7 @@ impl eframe::App for AdeApp {
                     if tab_consumed {
                         if let Some(chat_id) = self.active_acp_chat {
                             let acp_runtime_defaults = self.opencode_runtime_defaults();
+                            let bind_model_to_mode = self.config.opencode.acp_bind_model_to_mode;
                             let acp_startup_mode_id =
                                 self.config.acp_startup_mode.as_mode_id().to_owned();
                             if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
@@ -30313,6 +30416,7 @@ impl eframe::App for AdeApp {
                                             session,
                                             &acp_runtime_defaults,
                                             false,
+                                            bind_model_to_mode,
                                         );
                                     }
                                     ctx.request_repaint();
@@ -66831,13 +66935,61 @@ mod tests {
     }
 
     #[test]
+    fn apply_acp_runtime_defaults_respects_model_binding_flag() {
+        let (mut session, rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
+        session.selected_mode_id = Some("plan".to_owned());
+        super::AdeApp::set_local_acp_config_value(&mut session, "mode", "plan");
+        super::AdeApp::set_local_acp_config_value(&mut session, "model", "manual/model");
+        super::AdeApp::set_local_acp_config_value(&mut session, "effort", "manual");
+        let defaults = crate::opencode_config::OpenCodeRuntimeDefaults::new(
+            "build/model",
+            "plan/model",
+            "xhigh",
+            "build",
+        );
+
+        assert!(!super::AdeApp::apply_acp_runtime_defaults_to_session(
+            &mut session,
+            &defaults,
+            false,
+            false,
+        ));
+        assert_eq!(
+            super::AdeApp::acp_current_config_value(&session, "model"),
+            Some("manual/model")
+        );
+        assert!(rx.try_recv().is_err());
+
+        assert!(super::AdeApp::apply_acp_runtime_defaults_to_session(
+            &mut session,
+            &defaults,
+            false,
+            true,
+        ));
+        let model_rpc = recv_next_acp_rpc(&rx);
+        assert_eq!(model_rpc["method"], "session/set_config_option");
+        assert_eq!(model_rpc["params"]["configId"], "model");
+        assert_eq!(model_rpc["params"]["value"], "plan/model");
+        let effort_rpc = recv_next_acp_rpc(&rx);
+        assert_eq!(effort_rpc["method"], "session/set_config_option");
+        assert_eq!(effort_rpc["params"]["configId"], "effort");
+        assert_eq!(effort_rpc["params"]["value"], "xhigh");
+    }
+
+    #[test]
     fn queued_acp_prompts_dispatch_one_per_turn_with_captured_modes() {
         let ctx = egui::Context::default();
         let (mut app, event_tx) = test_app_with_acp_channels([], None);
         app.projects
             .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        app.config.opencode.build_model_slot_a = "build/model".to_owned();
+        app.config.opencode.plan_model = "plan/model".to_owned();
+        app.config.opencode.plan_effort = "xhigh".to_owned();
         let (mut session, rx) = crate::opencode_acp::test_session_for_app(42, 7, None);
         session.selected_mode_id = Some("plan".to_owned());
+        super::AdeApp::set_local_acp_config_value(&mut session, "model", "manual/model");
+        super::AdeApp::set_local_acp_config_value(&mut session, "effort", "manual");
         super::AdeApp::set_local_acp_config_value(&mut session, "mode", "plan");
         app.acp_chat_sessions.insert(42, session);
 
@@ -66862,10 +67014,20 @@ mod tests {
             .unwrap();
         app.process_acp_chat_events(&ctx);
 
-        let first_mode_rpc = recv_acp_rpc_with_method(&rx, "session/set_config_option");
+        let first_mode_rpc = recv_next_acp_rpc(&rx);
+        assert_eq!(first_mode_rpc["method"], "session/set_config_option");
         assert_eq!(first_mode_rpc["params"]["configId"], "mode");
         assert_eq!(first_mode_rpc["params"]["value"], "plan");
-        let first_prompt_rpc = recv_acp_rpc_with_method(&rx, "session/prompt");
+        let first_model_rpc = recv_next_acp_rpc(&rx);
+        assert_eq!(first_model_rpc["method"], "session/set_config_option");
+        assert_eq!(first_model_rpc["params"]["configId"], "model");
+        assert_eq!(first_model_rpc["params"]["value"], "plan/model");
+        let first_effort_rpc = recv_next_acp_rpc(&rx);
+        assert_eq!(first_effort_rpc["method"], "session/set_config_option");
+        assert_eq!(first_effort_rpc["params"]["configId"], "effort");
+        assert_eq!(first_effort_rpc["params"]["value"], "xhigh");
+        let first_prompt_rpc = recv_next_acp_rpc(&rx);
+        assert_eq!(first_prompt_rpc["method"], "session/prompt");
         assert_eq!(first_prompt_rpc["params"]["prompt"][0]["text"], "first");
         assert_eq!(app.acp_chat_sessions.get(&42).unwrap().queue.len(), 1);
 
@@ -66877,10 +67039,16 @@ mod tests {
             .unwrap();
         app.process_acp_chat_events(&ctx);
 
-        let second_mode_rpc = recv_acp_rpc_with_method(&rx, "session/set_config_option");
+        let second_mode_rpc = recv_next_acp_rpc(&rx);
+        assert_eq!(second_mode_rpc["method"], "session/set_config_option");
         assert_eq!(second_mode_rpc["params"]["configId"], "mode");
         assert_eq!(second_mode_rpc["params"]["value"], "build");
-        let second_prompt_rpc = recv_acp_rpc_with_method(&rx, "session/prompt");
+        let second_model_rpc = recv_next_acp_rpc(&rx);
+        assert_eq!(second_model_rpc["method"], "session/set_config_option");
+        assert_eq!(second_model_rpc["params"]["configId"], "model");
+        assert_eq!(second_model_rpc["params"]["value"], "build/model");
+        let second_prompt_rpc = recv_next_acp_rpc(&rx);
+        assert_eq!(second_prompt_rpc["method"], "session/prompt");
         assert_eq!(second_prompt_rpc["params"]["prompt"][0]["text"], "second");
         assert!(app.acp_chat_sessions.get(&42).unwrap().queue.is_empty());
     }
