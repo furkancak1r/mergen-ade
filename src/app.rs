@@ -574,6 +574,17 @@ fn acp_composer_send_button_state(can_send: bool, can_stop: bool) -> AcpComposer
     }
 }
 
+fn acp_chat_session_is_running(session: &crate::opencode_acp::AcpChatSession) -> bool {
+    session.is_running || matches!(session.status, crate::opencode_acp::AcpChatStatus::Running)
+}
+
+fn acp_chat_session_can_stop(session: &crate::opencode_acp::AcpChatSession) -> bool {
+    acp_composer_can_stop(
+        acp_chat_session_is_running(session),
+        session.session_id.is_some(),
+    )
+}
+
 fn acp_composer_input_editable(is_running: bool) -> bool {
     !is_running
 }
@@ -586,13 +597,13 @@ fn acp_composer_mode_toggle_enabled(is_running: bool) -> bool {
     !is_running
 }
 
-fn acp_mode_ui_label(mode_id: &str) -> String {
+fn acp_mode_ui_label(mode_id: &str) -> Option<String> {
     if crate::opencode_acp::mode_is_plan(mode_id) {
-        "Plan".to_owned()
+        Some("Plan".to_owned())
     } else if mode_id == "build" {
-        "Normal".to_owned()
+        None
     } else {
-        crate::opencode_acp::mode_display_name(mode_id)
+        Some(crate::opencode_acp::mode_display_name(mode_id))
     }
 }
 
@@ -606,6 +617,103 @@ fn acp_queued_prompt_preview(prompt_text: &str) -> String {
     } else {
         preview
     }
+}
+
+const ACP_QUEUED_PROMPT_ROW_HEIGHT: f32 = 46.0;
+const ACP_QUEUED_PROMPT_ROW_GAP: f32 = 6.0;
+const ACP_QUEUED_PROMPT_META_SIZE: f32 = 12.0;
+const ACP_QUEUED_PROMPT_PREVIEW_SIZE: f32 = 14.0;
+
+fn draw_acp_queued_prompt_row(
+    ui: &mut egui::Ui,
+    index: usize,
+    queued_prompt: &crate::opencode_acp::AcpQueuedPrompt,
+) -> bool {
+    let row_width = ui.available_width().max(0.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(row_width, ACP_QUEUED_PROMPT_ROW_HEIGHT),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            let row_rect = ui.max_rect().shrink2(egui::vec2(0.0, 3.0));
+            if ui.is_rect_visible(row_rect) {
+                ui.painter()
+                    .rect_filled(row_rect, 6.0, Color32::from_rgb(18, 18, 18));
+            }
+            ui.spacing_mut().item_spacing.x = 10.0;
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new("Queued")
+                    .size(ACP_QUEUED_PROMPT_META_SIZE)
+                    .strong()
+                    .color(Color32::from_rgb(255, 200, 100)),
+            );
+            if let Some(mode_label) = acp_mode_ui_label(&queued_prompt.mode_id) {
+                ui.label(
+                    RichText::new(mode_label)
+                        .size(ACP_QUEUED_PROMPT_META_SIZE)
+                        .color(TEXT_MUTED),
+                );
+            }
+            let preview = acp_queued_prompt_preview(&queued_prompt.prompt_text);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(preview)
+                        .size(ACP_QUEUED_PROMPT_PREVIEW_SIZE)
+                        .color(TEXT_PRIMARY),
+                )
+                .truncate(),
+            );
+            if !queued_prompt.attachments.is_empty() {
+                ui.label(
+                    RichText::new(format!("{} file", queued_prompt.attachments.len()))
+                        .size(ACP_QUEUED_PROMPT_META_SIZE)
+                        .color(TEXT_MUTED),
+                );
+            }
+            ui.add_space(2.0);
+            ui.add(
+                egui::Button::new(
+                    RichText::new(format!("{}", icons::X))
+                        .size(12.0)
+                        .color(TEXT_MUTED),
+                )
+                .frame(false)
+                .min_size(egui::vec2(24.0, 24.0)),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(format!("Cancel queued message {}", index + 1))
+            .clicked()
+        },
+    )
+    .inner
+}
+
+fn acp_event_is_plain_escape_press(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key {
+            key: egui::Key::Escape,
+            pressed: true,
+            modifiers,
+            ..
+        } if modifiers.is_none()
+    )
+}
+
+fn partition_acp_stop_escape_events(events: Vec<egui::Event>) -> (bool, Vec<egui::Event>) {
+    let mut consumed_escape = false;
+    let remaining = events
+        .into_iter()
+        .filter(|event| {
+            if !consumed_escape && acp_event_is_plain_escape_press(event) {
+                consumed_escape = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    (consumed_escape, remaining)
 }
 
 fn acp_composer_slash_popup_height_for_controls(
@@ -11456,6 +11564,43 @@ impl AdeApp {
         session.status = crate::opencode_acp::AcpChatStatus::Idle;
         Self::reset_acp_loop_guard(session);
         session.updated_at = Instant::now();
+    }
+
+    fn stop_acp_chat_on_escape(&mut self, ctx: &egui::Context, chat_id: u64) -> bool {
+        if self.show_settings_popup
+            || self.show_exit_confirm_popup
+            || self.foreground_message_popup_open.is_some()
+            || self.show_create_worktree_popup
+            || ctx.memory(|mem| mem.any_popup_open())
+            || ctx.is_context_menu_open()
+        {
+            return false;
+        }
+
+        if !self
+            .acp_chat_sessions
+            .get(&chat_id)
+            .is_some_and(acp_chat_session_can_stop)
+        {
+            return false;
+        }
+
+        let escape_pressed = ctx.input_mut(|input| {
+            let events = std::mem::take(&mut input.events);
+            let (pressed, remaining_events) = partition_acp_stop_escape_events(events);
+            input.events = remaining_events;
+            pressed
+        });
+        if !escape_pressed {
+            return false;
+        }
+
+        if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
+            Self::stop_acp_chat_session(session);
+        }
+        self.acknowledge_acp_terminal_manager_attention(chat_id);
+        ctx.request_repaint();
+        true
     }
 
     fn note_acp_tool_call_activity(session: &mut crate::opencode_acp::AcpChatSession) {
@@ -23356,6 +23501,8 @@ impl AdeApp {
     }
 
     fn draw_acp_chat_panel(&mut self, ctx: &egui::Context, chat_id: u64) {
+        self.stop_acp_chat_on_escape(ctx, chat_id);
+
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(APP_BG))
             .show(ctx, |ui| {
@@ -23596,61 +23743,10 @@ impl AdeApp {
                             }
                             let mut cancel_queued_index = None;
                             for (index, queued_prompt) in session.queue.iter().enumerate() {
-                                let row_width = ui.available_width().max(0.0);
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(row_width, 30.0),
-                                    Layout::left_to_right(Align::Center),
-                                    |ui| {
-                                        ui.spacing_mut().item_spacing.x = 8.0;
-                                        ui.label(
-                                            RichText::new("Queued")
-                                                .small()
-                                                .strong()
-                                                .color(Color32::from_rgb(255, 200, 100)),
-                                        );
-                                        ui.label(
-                                            RichText::new(acp_mode_ui_label(&queued_prompt.mode_id))
-                                                .small()
-                                                .color(TEXT_MUTED),
-                                        );
-                                        let preview =
-                                            acp_queued_prompt_preview(&queued_prompt.prompt_text);
-                                        ui.add_sized(
-                                            egui::vec2(
-                                                (ui.available_width() - 82.0).max(60.0),
-                                                20.0,
-                                            ),
-                                            egui::Label::new(
-                                                RichText::new(preview)
-                                                    .small()
-                                                    .color(TEXT_PRIMARY),
-                                            )
-                                            .truncate(),
-                                        );
-                                        if !queued_prompt.attachments.is_empty() {
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "{} file",
-                                                    queued_prompt.attachments.len()
-                                                ))
-                                                .small()
-                                                .color(TEXT_MUTED),
-                                            );
-                                        }
-                                        if ui
-                                            .button(
-                                                RichText::new(format!("{}", icons::X))
-                                                    .size(11.0)
-                                                    .color(TEXT_MUTED),
-                                            )
-                                            .on_hover_text("Cancel queued message")
-                                            .clicked()
-                                        {
-                                            cancel_queued_index = Some(index);
-                                        }
-                                    },
-                                );
-                                ui.add_space(4.0);
+                                if draw_acp_queued_prompt_row(ui, index, queued_prompt) {
+                                    cancel_queued_index = Some(index);
+                                }
+                                ui.add_space(ACP_QUEUED_PROMPT_ROW_GAP);
                             }
                             if let Some(index) = cancel_queued_index {
                                 if index < session.queue.len() {
@@ -23662,11 +23758,7 @@ impl AdeApp {
                                     ctx.request_repaint();
                                 }
                             }
-                            let is_running = session.is_running
-                                || matches!(
-                                    session.status,
-                                    crate::opencode_acp::AcpChatStatus::Running
-                                );
+                            let is_running = acp_chat_session_is_running(session);
                             if is_running {
                                 let thinking_text = {
                                     let t = ctx.input(|i| i.time);
@@ -23719,8 +23811,7 @@ impl AdeApp {
                 let mut acknowledge_acp_attention = false;
                 let acp_context_project_id = project_id;
                 if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
-                    let is_running = session.is_running
-                        || matches!(session.status, crate::opencode_acp::AcpChatStatus::Running);
+                    let is_running = acp_chat_session_is_running(session);
                     let session_ready = session.session_id.is_some()
                         && !matches!(session.status, crate::opencode_acp::AcpChatStatus::Starting);
                     let input_editable = acp_composer_input_editable(is_running);
@@ -23818,7 +23909,8 @@ impl AdeApp {
                     );
                     capsule_ui.allocate_rect(footer_rect, Sense::hover());
                     let active_mode = session.active_mode_id_or(&acp_startup_mode_id);
-                    let show_plan_pill = true;
+                    let visible_mode_label = acp_mode_ui_label(&active_mode);
+                    let show_plan_pill = visible_mode_label.is_some();
                     let model_label =
                         acp_composer_model_label(session, &acp_runtime_defaults, &active_mode);
                     let model_label_width =
@@ -23903,7 +23995,9 @@ impl AdeApp {
                             footer_rect,
                         ));
                         let is_plan_mode = crate::opencode_acp::mode_is_plan(&active_mode);
-                        let pill_label = acp_mode_ui_label(&active_mode);
+                        let pill_label = visible_mode_label
+                            .as_deref()
+                            .expect("visible mode label should exist when pill rect is present");
                         let (pill_color, pill_fill, pill_stroke) = if is_plan_mode {
                             (
                                 Color32::from_rgb(200, 140, 60),
@@ -66387,6 +66481,155 @@ mod tests {
     }
 
     #[test]
+    fn acp_mode_ui_label_hides_default_build_mode() {
+        assert_eq!(super::acp_mode_ui_label("plan").as_deref(), Some("Plan"));
+        assert!(super::acp_mode_ui_label("build").is_none());
+        assert_eq!(
+            super::acp_mode_ui_label("review").as_deref(),
+            Some("review")
+        );
+    }
+
+    #[test]
+    fn acp_composer_build_mode_does_not_reserve_mode_pill() {
+        let footer_rect = egui::Rect::from_min_size(
+            egui::pos2(10.0, 20.0),
+            egui::vec2(520.0, super::ACP_COMPOSER_FOOTER_HEIGHT),
+        );
+        let show_plan_pill = super::acp_mode_ui_label("build").is_some();
+        let rects = super::acp_composer_footer_widget_rects(
+            footer_rect,
+            show_plan_pill,
+            false,
+            super::ACP_COMPOSER_MODEL_WIDTH_TARGET,
+        );
+
+        assert!(rects.plan_rect.is_none());
+        let text_rect = rects
+            .text_rect
+            .expect("chat footer should include text input");
+        assert!(
+            text_rect.left() <= rects.plus_rect.right() + super::ACP_COMPOSER_FOOTER_SPACING + 0.01,
+            "build mode should not leave an empty Normal pill gap"
+        );
+    }
+
+    #[test]
+    fn acp_queued_prompt_row_uses_readable_height() {
+        assert!(super::ACP_QUEUED_PROMPT_ROW_HEIGHT >= 44.0);
+        assert!(super::ACP_QUEUED_PROMPT_PREVIEW_SIZE >= 14.0);
+    }
+
+    #[test]
+    fn acp_queued_prompt_row_renders_preview_near_metadata() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let queued_prompt = crate::opencode_acp::AcpQueuedPrompt {
+            draft_text: "hi".to_owned(),
+            attachments: Vec::new(),
+            prompt_text: "hi".to_owned(),
+            mode_id: "plan".to_owned(),
+        };
+        let mut raw_input = RawInput::default();
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1200.0, 160.0),
+        ));
+
+        let output = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none())
+                .show(ctx, |ui| {
+                    ui.set_min_width(1200.0);
+                    assert!(!super::draw_acp_queued_prompt_row(ui, 0, &queued_prompt));
+                });
+        });
+
+        let mut queued_rect = None;
+        let mut preview_rect = None;
+        for shape in output.shapes {
+            let egui::epaint::Shape::Text(text_shape) = shape.shape else {
+                continue;
+            };
+            let rect = egui::Rect::from_min_size(text_shape.pos, text_shape.galley.size());
+            match text_shape.galley.text() {
+                "Queued" => queued_rect = Some(rect),
+                "hi" => preview_rect = Some(rect),
+                _ => {}
+            }
+        }
+
+        let queued_rect = queued_rect.expect("Queued label should render");
+        let preview_rect = preview_rect.expect("queued prompt preview should render");
+        assert!(
+            preview_rect.left() < 220.0,
+            "preview should stay left-aligned near metadata, got left={}",
+            preview_rect.left()
+        );
+        assert!(
+            preview_rect.left() > queued_rect.right(),
+            "preview should render after the Queued label"
+        );
+        assert!(
+            preview_rect.height() >= 13.0,
+            "preview should use readable text, got height={}",
+            preview_rect.height()
+        );
+    }
+
+    #[test]
+    fn acp_queued_prompt_row_hides_build_mode_label() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let queued_prompt = crate::opencode_acp::AcpQueuedPrompt {
+            draft_text: "normal prompt".to_owned(),
+            attachments: Vec::new(),
+            prompt_text: "normal prompt".to_owned(),
+            mode_id: "build".to_owned(),
+        };
+        let mut raw_input = RawInput::default();
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(600.0, 160.0),
+        ));
+
+        let output = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none())
+                .show(ctx, |ui| {
+                    ui.set_min_width(600.0);
+                    assert!(!super::draw_acp_queued_prompt_row(ui, 0, &queued_prompt));
+                });
+        });
+
+        let rendered_text: Vec<String> = output
+            .shapes
+            .into_iter()
+            .filter_map(|shape| {
+                if let egui::epaint::Shape::Text(text_shape) = shape.shape {
+                    Some(text_shape.galley.text().to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert!(rendered_text.iter().any(|text| text == "Queued"));
+        assert!(rendered_text.iter().any(|text| text == "normal prompt"));
+        assert!(
+            !rendered_text.iter().any(|text| text == "Normal"),
+            "build mode must not render Normal text in queued rows: {:?}",
+            rendered_text
+        );
+    }
+
+    #[test]
     fn acp_composer_send_button_state_toggles_to_stop_when_running() {
         assert_eq!(
             super::acp_composer_send_button_state(true, false),
@@ -66435,6 +66678,78 @@ mod tests {
         assert_eq!(session.tool_calls_this_turn, 0);
         assert!(!session.loop_warning_emitted);
         assert!(!session.loop_limit_emitted);
+    }
+
+    #[test]
+    fn acp_stop_escape_events_consume_only_plain_escape() {
+        let (pressed, remaining) =
+            super::partition_acp_stop_escape_events(vec![test_plain_key_event(Key::Escape)]);
+        assert!(pressed);
+        assert!(remaining.is_empty());
+
+        let modified_escape = Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        };
+        let (pressed, remaining) = super::partition_acp_stop_escape_events(vec![
+            modified_escape.clone(),
+            Event::Text("x".to_owned()),
+        ]);
+        assert!(!pressed);
+        assert_eq!(
+            remaining,
+            vec![modified_escape, Event::Text("x".to_owned())]
+        );
+    }
+
+    #[test]
+    fn stop_acp_chat_on_escape_sends_cancel_and_marks_idle() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        let mut app = test_app(vec![], None);
+        let (mut session, rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
+        session.is_running = true;
+        session.status = crate::opencode_acp::AcpChatStatus::Running;
+        app.acp_chat_sessions.insert(42, session);
+        app.mark_acp_terminal_manager_attention(
+            42,
+            AcpTerminalManagerAttentionReason::TurnComplete,
+        );
+
+        let mut raw_input = RawInput::default();
+        raw_input.events = vec![
+            test_plain_key_event(Key::Escape),
+            Event::Text("kept".to_owned()),
+        ];
+        let _ = ctx.run(raw_input, |ctx| {
+            assert!(app.stop_acp_chat_on_escape(ctx, 42));
+        });
+
+        let raw = rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .expect("cancel RPC should be sent");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["method"], "session/cancel");
+        assert_eq!(parsed["params"]["sessionId"], "session-7");
+        let session = app.acp_chat_sessions.get(&42).unwrap();
+        assert!(!session.is_running);
+        assert!(matches!(
+            session.status,
+            crate::opencode_acp::AcpChatStatus::Idle
+        ));
+        assert!(!app.acp_terminal_manager_attention_by_chat.contains_key(&42));
+        assert_eq!(
+            ctx.input(|input| input.events.clone()),
+            vec![Event::Text("kept".to_owned())]
+        );
     }
 
     #[test]

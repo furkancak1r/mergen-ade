@@ -3462,3 +3462,46 @@
   - Added regression tests for send/stop state selection and cancel RPC/state cleanup.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, ACP composer tests
 - References: User request 2026-06-04
+
+---
+
+#### OpenCode ACP queued mesajı küçük ve ESC stop kısayolu eksikti {#acp-queued-row-escape-stop}
+- Date: 2026-06-04
+- Context: User reported that locally queued ACP messages looked absurdly tiny in the chat area, and requested that pressing `Esc` stop the AI response.
+- Error signature:
+  1. Queued prompt rows used a 30px slot and `.small()` preview text, making short prompts look visually lost in wide chat panes.
+  2. Running ACP cancellation was available only through the composer stop button, not through a keyboard Escape path.
+- Symptoms/Impact:
+  - Queued messages were hard to scan and appeared detached from the left-side status/mode metadata.
+  - Users could not quickly stop a running ACP response with the standard Escape muscle memory.
+- Root cause:
+  - Queued row rendering reused tiny metadata-style text for the actual prompt preview.
+  - ACP panel input handling did not consume plain `Esc` for the active running chat.
+- Resolution:
+  - Render queued ACP prompts as 44px+ left-aligned rows with normal-size preview text.
+  - Route plain `Esc` through the same `session/cancel` stop helper as the composer stop button, while preserving popup/modal/context-menu Escape behavior.
+- Prevent recurrence:
+  - Add regression tests for queued row readable sizing/left alignment and plain Escape cancel event consumption/RPC state cleanup.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, ACP composer tests
+- References: User request 2026-06-04
+
+---
+
+#### OpenCode ACP default mode UI'da Normal yazıyordu {#acp-build-mode-no-visible-label}
+- Date: 2026-06-04
+- Context: User clarified that normal/default ACP mode must not write any mode text into the UI.
+- Error signature:
+  1. The internal `build` mode was mapped to a visible `Normal` label.
+  2. Composer and queued-message rows could render `Normal` even though default mode should be visually silent.
+- Symptoms/Impact:
+  - The composer looked busier than intended in the default state.
+  - Queued build-mode prompts displayed mode text that the user explicitly did not want in the UI.
+- Root cause:
+  - UI label generation treated `build` as a visible user-facing mode instead of an internal/default absence of mode label.
+- Resolution:
+  - Treat `build` mode as having no visible ACP UI label.
+  - Render the composer mode pill and queued row mode metadata only when a visible label exists, such as `Plan`.
+- Prevent recurrence:
+  - Add regression tests for hidden build/default labels in helper output, composer footer layout, and queued row rendering.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, ACP composer tests
+- References: User request 2026-06-04
