@@ -553,6 +553,27 @@ fn acp_composer_can_send(prompt_input: &str, has_attachments: bool, is_running: 
     (!prompt_input.trim().is_empty() || has_attachments) && !is_running
 }
 
+fn acp_composer_can_stop(is_running: bool, session_ready: bool) -> bool {
+    is_running && session_ready
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcpComposerSendButtonState {
+    Send,
+    Stop,
+    Disabled,
+}
+
+fn acp_composer_send_button_state(can_send: bool, can_stop: bool) -> AcpComposerSendButtonState {
+    if can_stop {
+        AcpComposerSendButtonState::Stop
+    } else if can_send {
+        AcpComposerSendButtonState::Send
+    } else {
+        AcpComposerSendButtonState::Disabled
+    }
+}
+
 fn acp_composer_input_editable(is_running: bool) -> bool {
     !is_running
 }
@@ -11427,6 +11448,14 @@ impl AdeApp {
         session.tool_calls_this_turn = 0;
         session.loop_warning_emitted = false;
         session.loop_limit_emitted = false;
+    }
+
+    fn stop_acp_chat_session(session: &mut crate::opencode_acp::AcpChatSession) {
+        session.send_cancel();
+        session.is_running = false;
+        session.status = crate::opencode_acp::AcpChatStatus::Idle;
+        Self::reset_acp_loop_guard(session);
+        session.updated_at = Instant::now();
     }
 
     fn note_acp_tool_call_activity(session: &mut crate::opencode_acp::AcpChatSession) {
@@ -23504,24 +23533,6 @@ impl AdeApp {
                     };
                     header_ui.label(RichText::new(status_text).size(12.0).color(status_color));
                 }
-                header_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if let Some(session) = self.acp_chat_sessions.get(&chat_id) {
-                        let is_running = session.is_running
-                            || matches!(
-                                session.status,
-                                crate::opencode_acp::AcpChatStatus::Running
-                            );
-                        if is_running {
-                            if ui.button(format!("{} Cancel", icons::X)).clicked() {
-                                if let Some(s) = self.acp_chat_sessions.get_mut(&chat_id) {
-                                    s.send_cancel();
-                                    s.is_running = false;
-                                    s.status = crate::opencode_acp::AcpChatStatus::Idle;
-                                }
-                            }
-                        }
-                    }
-                });
                 ui.allocate_rect(header_rect, Sense::hover());
 
                 let mut messages_ui = ui.new_child(
@@ -24172,6 +24183,8 @@ impl AdeApp {
                         !session.attachments.is_empty(),
                         is_running,
                     );
+                    let can_stop = acp_composer_can_stop(is_running, session.session_id.is_some());
+                    let send_button_state = acp_composer_send_button_state(can_send, can_stop);
 
                     let (up_pressed, down_pressed) = ui.input(|i| {
                         let mut up = false;
@@ -24234,29 +24247,44 @@ impl AdeApp {
                     let send_response = footer_ui.interact(
                         footer_rects.send_rect,
                         Id::new(("acp-composer-send-button", chat_id)),
-                        if can_send {
+                        if matches!(
+                            send_button_state,
+                            AcpComposerSendButtonState::Send | AcpComposerSendButtonState::Stop
+                        ) {
                             Sense::click()
                         } else {
                             Sense::hover()
                         },
                     );
-                    let send_response = if can_send {
+                    let send_response = if matches!(
+                        send_button_state,
+                        AcpComposerSendButtonState::Send | AcpComposerSendButtonState::Stop
+                    ) {
                         send_response.on_hover_cursor(egui::CursorIcon::PointingHand)
                     } else if !action_controls_enabled {
                         send_response.on_hover_cursor(egui::CursorIcon::NotAllowed)
                     } else {
                         send_response
                     };
-                    let send_paint_rect = acp_composer_send_paint_rect(footer_rects.send_rect);
-                    let send_fill = if can_send {
-                        ACP_COMPOSER_SEND_ACTIVE_FILL
+                    let send_response = if send_button_state == AcpComposerSendButtonState::Stop {
+                        send_response.on_hover_text("Stop OpenCode")
                     } else {
-                        Color32::from_rgb(45, 45, 45)
+                        send_response
                     };
-                    let send_icon_color = if can_send {
-                        Color32::from_rgb(20, 20, 20)
-                    } else {
-                        ACP_COMPOSER_ICON_MUTED
+                    let send_paint_rect = acp_composer_send_paint_rect(footer_rects.send_rect);
+                    let send_fill = match send_button_state {
+                        AcpComposerSendButtonState::Send => ACP_COMPOSER_SEND_ACTIVE_FILL,
+                        AcpComposerSendButtonState::Stop => Color32::from_rgb(80, 42, 42),
+                        AcpComposerSendButtonState::Disabled => Color32::from_rgb(45, 45, 45),
+                    };
+                    let send_icon_color = match send_button_state {
+                        AcpComposerSendButtonState::Send => Color32::from_rgb(20, 20, 20),
+                        AcpComposerSendButtonState::Stop => Color32::from_rgb(255, 190, 190),
+                        AcpComposerSendButtonState::Disabled => ACP_COMPOSER_ICON_MUTED,
+                    };
+                    let send_icon = match send_button_state {
+                        AcpComposerSendButtonState::Stop => icons::X,
+                        _ => icons::SEND_HORIZONTAL,
                     };
                     footer_ui.painter().rect_filled(
                         send_paint_rect,
@@ -24266,12 +24294,22 @@ impl AdeApp {
                     footer_ui.painter().text(
                         send_paint_rect.center(),
                         egui::Align2::CENTER_CENTER,
-                        format!("{}", icons::SEND_HORIZONTAL),
+                        format!("{send_icon}"),
                         FontId::proportional(ACP_COMPOSER_SEND_ICON_SIZE),
                         send_icon_color,
                     );
-                    if send_response.clicked() && can_send {
-                        submit_requested = true;
+                    if send_response.clicked() {
+                        match send_button_state {
+                            AcpComposerSendButtonState::Send => {
+                                submit_requested = true;
+                            }
+                            AcpComposerSendButtonState::Stop => {
+                                Self::stop_acp_chat_session(session);
+                                acknowledge_acp_attention = true;
+                                ctx.request_repaint();
+                            }
+                            AcpComposerSendButtonState::Disabled => {}
+                        }
                     }
                     if submit_requested {
                         let submit_mode_id = session.active_mode_id_or(&acp_startup_mode_id);
@@ -66346,6 +66384,57 @@ mod tests {
         assert!(!super::acp_composer_can_send("hello", false, true));
         assert!(!super::acp_composer_can_send("   ", false, false));
         assert!(super::acp_composer_can_send("", true, false));
+    }
+
+    #[test]
+    fn acp_composer_send_button_state_toggles_to_stop_when_running() {
+        assert_eq!(
+            super::acp_composer_send_button_state(true, false),
+            super::AcpComposerSendButtonState::Send
+        );
+        assert_eq!(
+            super::acp_composer_send_button_state(false, true),
+            super::AcpComposerSendButtonState::Stop
+        );
+        assert_eq!(
+            super::acp_composer_send_button_state(true, true),
+            super::AcpComposerSendButtonState::Stop
+        );
+        assert_eq!(
+            super::acp_composer_send_button_state(false, false),
+            super::AcpComposerSendButtonState::Disabled
+        );
+        assert!(super::acp_composer_can_stop(true, true));
+        assert!(!super::acp_composer_can_stop(true, false));
+        assert!(!super::acp_composer_can_stop(false, true));
+    }
+
+    #[test]
+    fn stop_acp_chat_session_sends_cancel_and_marks_idle() {
+        let (mut session, rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
+        session.is_running = true;
+        session.status = crate::opencode_acp::AcpChatStatus::Running;
+        session.tool_calls_this_turn = 3;
+        session.loop_warning_emitted = true;
+        session.loop_limit_emitted = true;
+
+        super::AdeApp::stop_acp_chat_session(&mut session);
+
+        let raw = rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .expect("cancel RPC should be sent");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["method"], "session/cancel");
+        assert_eq!(parsed["params"]["sessionId"], "session-7");
+        assert!(!session.is_running);
+        assert!(matches!(
+            session.status,
+            crate::opencode_acp::AcpChatStatus::Idle
+        ));
+        assert_eq!(session.tool_calls_this_turn, 0);
+        assert!(!session.loop_warning_emitted);
+        assert!(!session.loop_limit_emitted);
     }
 
     #[test]

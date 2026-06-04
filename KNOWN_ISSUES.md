@@ -3440,3 +3440,25 @@
   - Add regression tests for loading submit, per-message queued mode dispatch, one-prompt-per-turn flushing, and cancel restore behavior.
 - Files/Commands touched: `src/app.rs`, `src/opencode_acp.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo check`, ACP composer tests
 - References: User request 2026-06-04
+
+---
+
+#### OpenCode ACP running cancel ayrı header butonu olarak kalıyordu {#acp-composer-send-stop-toggle}
+- Date: 2026-06-04
+- Context: User requested that the running-state Cancel action should not appear in the top-right header; the composer send button should toggle into a stop button instead.
+- Error signature:
+  1. ACP header rendered a separate `Cancel` button while the session was running.
+  2. Composer send button stayed disabled-looking during running state instead of becoming the stop action.
+- Symptoms/Impact:
+  - The running-state action moved away from the primary composer control, making the UX feel inconsistent after sending.
+  - Users expected the send affordance to become the stop affordance, matching common chat/composer behavior.
+- Root cause:
+  - Stop/cancel was implemented in the header independently from composer button state.
+- Resolution:
+  - Removed the running-only ACP header Cancel button.
+  - Added composer send button state (`Send`, `Stop`, `Disabled`) so running sessions show an `X` stop button in the same circular control.
+  - Routed stop through `session/cancel`, cleared local running state, reset ACP loop guard state, and kept queued prompts intact.
+- Prevent recurrence:
+  - Added regression tests for send/stop state selection and cancel RPC/state cleanup.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, ACP composer tests
+- References: User request 2026-06-04
