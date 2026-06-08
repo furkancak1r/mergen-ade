@@ -23,3 +23,13 @@ Desktop.ini
 
 # Logs
 *.log
+
+# Node.js
+node_modules/
+package-lock.json
+
+# Electron build artifacts
+out/
+dist-electron/
+renderer/dist/
+renderer/renderer/
