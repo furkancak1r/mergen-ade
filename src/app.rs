@@ -29242,9 +29242,6 @@ impl AdeApp {
                                 width
                             };
 
-                            let ai_badge = AiBadgeModel::from_terminal(terminal);
-                            draw_terminal_status_badges(ui, &ai_badge);
-
                             // Draw launcher icon for running AI CLI before title
                             if launcher_icon_key.is_some() {
                                 let size = 16.0f32;
