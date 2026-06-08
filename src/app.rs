@@ -308,6 +308,7 @@ const CREATE_WORKTREE_BRANCH_INPUT_ID: &str = "create-worktree-branch-input";
 const CREATE_WORKTREE_BASE_BRANCH_INPUT_ID: &str = "create-worktree-base-branch-input";
 const CREATE_WORKTREE_PATH_INPUT_ID: &str = "create-worktree-path-input";
 const SOURCE_CONTROL_SEARCH_INPUT_ID: &str = "source-control-search-input";
+const ACP_COMPOSER_INPUT_ID: &str = "acp-composer-input";
 const SMART_INPUT_MIN_FOOTER_HEIGHT: f32 = 132.0;
 const SMART_INPUT_BASE_FOOTER_HEIGHT: f32 = 128.0;
 const SMART_INPUT_TASK_ROW_HEIGHT: f32 = 28.0;
@@ -11885,20 +11886,36 @@ impl AdeApp {
                     options,
                     tool_call,
                 } => {
+                    let auto_approve =
+                        self.config.opencode.acp_auto_approve_permissions && !options.is_empty();
+                    let tool_title = tool_call.title.clone();
+                    let request_id_for_auto = request_id.clone();
                     if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
-                        session.status = crate::opencode_acp::AcpChatStatus::Permission;
-                        session.pending_permission =
-                            Some(crate::opencode_acp::AcpPendingPermission {
-                                request_id,
-                                options,
-                                tool_call,
-                            });
+                        if auto_approve {
+                            let first_option_id = options[0].option_id.clone();
+                            session
+                                .send_permission_response(&request_id_for_auto, &first_option_id);
+                            session.status = crate::opencode_acp::AcpChatStatus::Running;
+                            session.pending_permission = None;
+                            self.status_line =
+                                format!("Auto-approved ACP permission: {}", tool_title);
+                        } else {
+                            session.status = crate::opencode_acp::AcpChatStatus::Permission;
+                            session.pending_permission =
+                                Some(crate::opencode_acp::AcpPendingPermission {
+                                    request_id,
+                                    options,
+                                    tool_call,
+                                });
+                        }
                         session.updated_at = Instant::now();
                     }
-                    self.mark_acp_terminal_manager_attention(
-                        chat_id,
-                        AcpTerminalManagerAttentionReason::Permission,
-                    );
+                    if !auto_approve {
+                        self.mark_acp_terminal_manager_attention(
+                            chat_id,
+                            AcpTerminalManagerAttentionReason::Permission,
+                        );
+                    }
                     changed = true;
                 }
                 crate::opencode_acp::AcpChatEvent::Error { chat_id, message } => {
@@ -13880,6 +13897,10 @@ impl AdeApp {
     }
 
     fn active_terminal_accepts_input(&self) -> Option<u64> {
+        // When ACP chat is visible, terminal does not accept keyboard input.
+        if self.active_acp_chat.is_some() {
+            return None;
+        }
         let active_terminal_id = if self.config.ui.multi_terminal_view_enabled {
             self.active_terminal?
         } else {
@@ -13921,6 +13942,10 @@ impl AdeApp {
 
     fn smart_input_question_custom_input_id(terminal_id: u64) -> Id {
         Id::new((SMART_INPUT_QUESTION_CUSTOM_INPUT_ID, terminal_id))
+    }
+
+    fn acp_composer_input_id(chat_id: u64) -> Id {
+        Id::new((ACP_COMPOSER_INPUT_ID, chat_id))
     }
 
     fn opencode_question_choice_count(question: &OpenCodeQuestionInfo) -> usize {
@@ -14178,6 +14203,10 @@ impl AdeApp {
         &self,
         ctx: &egui::Context,
     ) -> Option<SmartInputSubmitRequest> {
+        // When ACP chat is visible, Smart Input is not the active input surface.
+        if self.active_acp_chat.is_some() {
+            return None;
+        }
         for (terminal_id, terminal) in &self.terminals {
             if !Self::terminal_smart_input_visible(terminal) {
                 continue;
@@ -14202,6 +14231,10 @@ impl AdeApp {
     }
 
     fn active_smart_input_draft_request(&self) -> Option<SmartInputSubmitRequest> {
+        // When ACP chat is visible, Smart Input is not the active input surface.
+        if self.active_acp_chat.is_some() {
+            return None;
+        }
         let terminal_id = self
             .active_terminal
             .or_else(|| self.single_terminal_id_for_main())?;
@@ -14244,6 +14277,23 @@ impl AdeApp {
             || ctx.memory(|mem| mem.any_popup_open())
             || ctx.is_context_menu_open()
         {
+            ctx.memory_mut(|mem| {
+                for (terminal_id, terminal) in &self.terminals {
+                    mem.surrender_focus(Self::smart_input_draft_input_id(*terminal_id));
+                    if let Some(task_id) = terminal.smart_input.editing_task_id {
+                        mem.surrender_focus(Self::smart_input_task_edit_input_id(
+                            *terminal_id,
+                            task_id,
+                        ));
+                    }
+                    mem.surrender_focus(Self::smart_input_question_custom_input_id(*terminal_id));
+                }
+            });
+            return;
+        }
+        // ACP chat panel visible — surrender Smart Input focus so typed text
+        // goes to the ACP composer, not the hidden terminal's Smart Input.
+        if self.active_acp_chat.is_some() {
             ctx.memory_mut(|mem| {
                 for (terminal_id, terminal) in &self.terminals {
                     mem.surrender_focus(Self::smart_input_draft_input_id(*terminal_id));
@@ -14348,9 +14398,20 @@ impl AdeApp {
         }
 
         // Browser URL input focus check
-        self.selected_project.is_some_and(|project_id| {
+        if self.selected_project.is_some_and(|project_id| {
             ctx.memory(|mem| mem.has_focus(Self::browser_url_input_id(project_id)))
-        })
+        }) {
+            return true;
+        }
+
+        // ACP composer input focus check
+        if let Some(chat_id) = self.active_acp_chat {
+            if ctx.memory(|mem| mem.has_focus(Self::acp_composer_input_id(chat_id))) {
+                return true;
+            }
+        }
+
+        false
     }
 
     fn create_worktree_branch_input_id() -> Id {
@@ -14426,6 +14487,12 @@ impl AdeApp {
         if self.active_opencode_question_terminal_id().is_some() {
             return true;
         }
+        // ACP composer input focus check (for any active chat)
+        if let Some(chat_id) = self.active_acp_chat {
+            if ctx.memory(|mem| mem.has_focus(Self::acp_composer_input_id(chat_id))) {
+                return true;
+            }
+        }
         false
     }
 
@@ -14458,6 +14525,10 @@ impl AdeApp {
                     ));
                 }
                 mem.surrender_focus(Self::smart_input_question_custom_input_id(*terminal_id));
+            }
+            // Surrender ACP composer input focus for all active chats
+            for chat_id in self.acp_chat_sessions.keys() {
+                mem.surrender_focus(Self::acp_composer_input_id(*chat_id));
             }
         });
     }
@@ -16802,6 +16873,13 @@ impl AdeApp {
             self.file_editor.hide();
         }
 
+        // Hide ACP chat panel when selecting a terminal so the terminal grid becomes visible.
+        // The per-project chat mapping is preserved so the user can switch back later.
+        if terminal_id.is_some() && self.active_acp_chat.is_some() {
+            self.active_acp_chat = None;
+            self.acp_focus_input_chat_next_frame = None;
+        }
+
         // Sync selected_project with the active terminal's project
         // This ensures browser panel and other project-scoped UI follows the active terminal
         if let Some(terminal_id) = terminal_id {
@@ -16831,6 +16909,13 @@ impl AdeApp {
                         .remove(&project_id);
                 }
             }
+        }
+
+        // note_selection_changed may restore ACP for the newly selected project.
+        // Since the user explicitly activated a terminal, keep ACP hidden.
+        if terminal_id.is_some() && self.active_acp_chat.is_some() {
+            self.active_acp_chat = None;
+            self.acp_focus_input_chat_next_frame = None;
         }
 
         let design_inspect_binding = terminal_id.and_then(|terminal_id| {
@@ -19712,6 +19797,37 @@ impl AdeApp {
             let defaults = self.opencode_runtime_defaults();
             self.apply_acp_mode_model_binding_to_live_chats(ctx, &defaults);
         }
+        ui.add_space(12.0);
+
+        show_bounded_settings_card(
+            ui,
+            card_width,
+            AppIcon::Shield,
+            "ACP Auto-Approve Permissions",
+            "Automatically approve ACP permission requests without manual interaction.",
+            |ui| {
+                if ui
+                    .checkbox(
+                        &mut self.config.opencode.acp_auto_approve_permissions,
+                        "Auto-approve ACP permissions",
+                    )
+                    .changed()
+                {
+                    changes.note_opencode_change();
+                }
+
+                ui.add_space(6.0);
+                settings_copyable_label(
+                    ui,
+                    RichText::new(
+                        "When enabled, the first option in each permission request is selected automatically.",
+                    )
+                    .small()
+                    .color(TEXT_MUTED),
+                    "When enabled, the first option in each permission request is selected automatically.",
+                );
+            },
+        );
         ui.add_space(12.0);
 
         show_bounded_settings_card(
@@ -24921,7 +25037,7 @@ impl AdeApp {
                     );
                     text_ui.set_clip_rect(input_text_rect);
                     let text_edit = egui::TextEdit::multiline(&mut session.prompt_input)
-                        .id_salt("acp-composer-input")
+                        .id(Self::acp_composer_input_id(chat_id))
                         .desired_rows(1)
                         .desired_width(input_text_rect.width())
                         .hint_text(hint_text)
@@ -69360,6 +69476,92 @@ mod tests {
     }
 
     #[test]
+    fn acp_permission_request_auto_approves_when_enabled() {
+        let ctx = egui::Context::default();
+        let (mut app, event_tx) = test_app_with_acp_channels([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        insert_visible_test_acp_chat(&mut app, 42, 7, crate::opencode_acp::AcpChatStatus::Running);
+        app.config.opencode.acp_auto_approve_permissions = true;
+
+        event_tx
+            .send(crate::opencode_acp::AcpChatEvent::PermissionRequest {
+                chat_id: 42,
+                request_id: "req-auto".to_owned(),
+                options: vec![
+                    crate::opencode_acp::AcpPermissionOption {
+                        option_id: "allow".to_owned(),
+                        name: "Allow".to_owned(),
+                        kind: "allow".to_owned(),
+                    },
+                    crate::opencode_acp::AcpPermissionOption {
+                        option_id: "deny".to_owned(),
+                        name: "Deny".to_owned(),
+                        kind: "deny".to_owned(),
+                    },
+                ],
+                tool_call: crate::opencode_acp::AcpToolCallBrief {
+                    tool_call_id: "tool-1".to_owned(),
+                    title: "Edit file".to_owned(),
+                    kind: "edit".to_owned(),
+                },
+            })
+            .unwrap();
+        app.process_acp_chat_events(&ctx);
+
+        let session = app.acp_chat_sessions.get(&42).unwrap();
+        assert!(matches!(
+            session.status,
+            crate::opencode_acp::AcpChatStatus::Running
+        ));
+        assert!(session.pending_permission.is_none());
+        assert!(
+            app.status_line.contains("Auto-approved"),
+            "status_line should mention auto-approval: {}",
+            app.status_line
+        );
+    }
+
+    #[test]
+    fn acp_permission_request_manual_when_disabled() {
+        let ctx = egui::Context::default();
+        let (mut app, event_tx) = test_app_with_acp_channels([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        insert_visible_test_acp_chat(&mut app, 42, 7, crate::opencode_acp::AcpChatStatus::Running);
+        app.config.opencode.acp_auto_approve_permissions = false;
+
+        event_tx
+            .send(crate::opencode_acp::AcpChatEvent::PermissionRequest {
+                chat_id: 42,
+                request_id: "req-manual".to_owned(),
+                options: vec![crate::opencode_acp::AcpPermissionOption {
+                    option_id: "allow".to_owned(),
+                    name: "Allow".to_owned(),
+                    kind: "allow".to_owned(),
+                }],
+                tool_call: crate::opencode_acp::AcpToolCallBrief {
+                    tool_call_id: "tool-1".to_owned(),
+                    title: "Edit file".to_owned(),
+                    kind: "edit".to_owned(),
+                },
+            })
+            .unwrap();
+        app.process_acp_chat_events(&ctx);
+
+        let session = app.acp_chat_sessions.get(&42).unwrap();
+        assert!(matches!(
+            session.status,
+            crate::opencode_acp::AcpChatStatus::Permission
+        ));
+        assert!(session.pending_permission.is_some());
+        assert_eq!(
+            app.acp_terminal_manager_attention_by_chat.get(&42),
+            Some(&AcpTerminalManagerAttentionReason::Permission)
+        );
+    }
+
+    #[test]
     fn welcome_acp_submit_sends_session_prompt_without_terminal() {
         let ctx = egui::Context::default();
         let mut app = test_app([], None);
@@ -70227,6 +70429,134 @@ mod tests {
             })
             .collect();
         assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn set_active_terminal_hides_active_acp_but_preserves_chat_mapping() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        insert_visible_test_acp_chat(&mut app, 42, 7, crate::opencode_acp::AcpChatStatus::Idle);
+        app.active_acp_chat = Some(42);
+
+        app.set_active_terminal(&ctx, Some(1));
+
+        assert_eq!(app.active_acp_chat, None);
+        assert_eq!(app.acp_focus_input_chat_next_frame, None);
+        assert_eq!(app.active_acp_chat_by_project.get(&7), Some(&42));
+        assert_eq!(app.active_terminal, Some(1));
+    }
+
+    #[test]
+    fn active_acp_chat_blocks_terminal_input_capture() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        insert_visible_test_acp_chat(&mut app, 42, 7, crate::opencode_acp::AcpChatStatus::Idle);
+        app.active_acp_chat = Some(42);
+
+        assert_eq!(app.active_terminal_accepts_input(), None);
+    }
+
+    #[test]
+    fn ensure_smart_input_focus_yields_while_acp_visible() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::smart_input_draft_input_id(1));
+        });
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        insert_visible_test_acp_chat(&mut app, 42, 7, crate::opencode_acp::AcpChatStatus::Idle);
+        app.active_acp_chat = Some(42);
+
+        app.ensure_smart_input_focus(&ctx);
+
+        assert!(
+            !ctx.memory(|mem| mem.has_focus(AdeApp::smart_input_draft_input_id(1))),
+            "Smart Input must surrender focus when ACP is visible"
+        );
+    }
+
+    #[test]
+    fn raw_input_hook_leaves_text_for_acp_when_opencode_terminal_exists() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        insert_visible_test_acp_chat(&mut app, 42, 7, crate::opencode_acp::AcpChatStatus::Idle);
+        app.active_acp_chat = Some(42);
+
+        let mut raw_input = RawInput {
+            events: vec![egui::Event::Text("hello".to_owned())],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        // Text event should remain for egui UI (ACP composer), not be consumed by terminal
+        assert!(
+            raw_input
+                .events
+                .iter()
+                .any(|e| matches!(e, egui::Event::Text(t) if t == "hello")),
+            "text event should remain for ACP composer"
+        );
+        assert!(app.buffered_terminal_input.is_empty());
+    }
+
+    #[test]
+    fn text_input_focus_detects_acp_composer_input() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+        let (mut app, _tx) = test_app_with_acp_channels([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        let (mut session, _rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-7".to_owned()));
+        session.prompt_input = "draft".to_owned();
+        app.acp_chat_sessions.insert(42, session);
+        app.acp_chat_ids_by_project.entry(7).or_default().push(42);
+        app.active_acp_chat = Some(42);
+        app.active_acp_chat_by_project.insert(7, 42);
+        app.selected_project = Some(7);
+
+        let mut raw_input = egui::RawInput::default();
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1200.0, 800.0),
+        ));
+        let _ = ctx.run(raw_input, |ctx| app.draw_acp_chat_panel(ctx, 42));
+
+        // Focus the ACP composer input
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::acp_composer_input_id(42));
+        });
+
+        assert!(app.text_input_has_focus(&ctx));
+        assert!(app.text_input_has_focus_extended(&ctx));
+    }
+
+    #[test]
+    fn smart_input_requests_return_none_while_acp_visible() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::smart_input_draft_input_id(1));
+        });
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        insert_visible_test_acp_chat(&mut app, 42, 7, crate::opencode_acp::AcpChatStatus::Idle);
+        app.active_acp_chat = Some(42);
+
+        assert_eq!(app.focused_smart_input_submit_request(&ctx), None);
+        assert_eq!(app.active_smart_input_draft_request(), None);
     }
 
     #[test]

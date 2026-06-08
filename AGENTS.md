@@ -657,6 +657,14 @@ If `cargo` is not on PATH in PowerShell, use:
   - Config-level project records via `repair_mojibake_in_projects`
 - **Non-UTF-8 path segments**: `repair_mojibake_path` converts `PathBuf` to `String` via `to_string_lossy()`, replacing non-UTF-8 segments with `U+FFFD`. This is a known limitation unlikely to matter in practice (Windows paths with NTFS are generally UTF-16 clean).
 
+## OpenCode ACP and Terminal Coexistence
+- **ACP chat panel replaces the terminal grid in main area**: When `active_acp_chat` is `Some`, `draw_main_area()` renders the ACP chat panel instead of the terminal tile grid. The per-project chat mapping (`active_acp_chat_by_project`) is preserved so the user can switch back later.
+- **Terminal selection hides ACP panel**: `set_active_terminal()` clears `active_acp_chat` and `acp_focus_input_chat_next_frame` whenever a terminal is activated (including re-selecting the same terminal). This ensures the terminal grid becomes visible. `note_selection_changed()` may restore ACP via `restore_active_acp_for_selected_project()`, so `set_active_terminal()` clears ACP again after the project sync block.
+- **ACP visible blocks terminal keyboard capture**: `active_terminal_accepts_input()` returns `None` when `active_acp_chat.is_some()`. This prevents terminal PTY input, shortcuts, and Smart Input from intercepting keystrokes while the ACP composer is active.
+- **Smart Input yields focus while ACP is visible**: `ensure_smart_input_focus()` surrenders Smart Input focus for all terminals when `active_acp_chat.is_some()`. `focused_smart_input_submit_request()` and `active_smart_input_draft_request()` also return `None` in this state.
+- **ACP composer input is a recognized text input**: The ACP composer `TextEdit` uses a chat-id-based stable ID (`acp_composer_input_id`). Both `text_input_has_focus()` and `text_input_has_focus_extended()` detect this ID, and `surrender_ui_text_focus()` clears it when switching to a terminal.
+- **Switching back to ACP**: Clicking an ACP row in Terminal Manager calls `activate_acp_chat_from_terminal_manager()`, which sets `active_acp_chat`, clears `active_terminal`, and hides the file editor. The main area then returns to the ACP chat panel.
+
 ## Cross-Tool Project Configuration
 - When a project is used in both Mergen and Zed, keep terminal commands in sync.
 - Mergen `ProjectRecord::saved_messages` should be mirrored as `.zed/tasks.json` entries so the same commands are available in Zed's task picker.

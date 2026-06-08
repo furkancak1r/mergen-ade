@@ -512,6 +512,7 @@ pub const DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS: u64 = 600_000;
 pub const DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS: u64 = 120_000;
 pub const DEFAULT_OPENCODE_KIMI_STRICT_PERMISSIONS: bool = true;
 pub const DEFAULT_OPENCODE_ACP_BIND_MODEL_TO_MODE: bool = true;
+pub const DEFAULT_OPENCODE_ACP_AUTO_APPROVE_PERMISSIONS: bool = false;
 
 /// OpenCode model configuration with two switchable slots and ACP favorites.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -551,6 +552,9 @@ pub struct OpenCodeModelConfig {
     /// Use stricter build permissions for Kimi-family models.
     #[serde(default = "default_opencode_kimi_strict_permissions")]
     pub kimi_strict_permissions: bool,
+    /// Automatically approve ACP permission requests without user interaction.
+    #[serde(default = "default_opencode_acp_auto_approve_permissions")]
+    pub acp_auto_approve_permissions: bool,
 }
 
 impl Default for OpenCodeModelConfig {
@@ -569,6 +573,7 @@ impl Default for OpenCodeModelConfig {
             fireworks_timeout_ms: DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS,
             fireworks_chunk_timeout_ms: DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS,
             kimi_strict_permissions: DEFAULT_OPENCODE_KIMI_STRICT_PERMISSIONS,
+            acp_auto_approve_permissions: DEFAULT_OPENCODE_ACP_AUTO_APPROVE_PERMISSIONS,
         };
         config.ensure_configured_models_are_favorites();
         config
@@ -597,6 +602,10 @@ fn default_opencode_kimi_strict_permissions() -> bool {
 
 fn default_opencode_acp_bind_model_to_mode() -> bool {
     DEFAULT_OPENCODE_ACP_BIND_MODEL_TO_MODE
+}
+
+fn default_opencode_acp_auto_approve_permissions() -> bool {
+    DEFAULT_OPENCODE_ACP_AUTO_APPROVE_PERMISSIONS
 }
 
 impl OpenCodeModelConfig {
@@ -1444,6 +1453,7 @@ mod tests {
             fireworks_timeout_ms: 700_000,
             fireworks_chunk_timeout_ms: 180_000,
             kimi_strict_permissions: false,
+            acp_auto_approve_permissions: false,
         };
 
         let serialized = serde_json::to_string(&original).unwrap();

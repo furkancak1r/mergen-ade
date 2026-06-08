@@ -1,0 +1,157 @@
+- generic [ref=e2]:
+  - banner [ref=e3]:
+    - generic [ref=e4]:
+      - generic [ref=e5]: M
+      - generic [ref=e6]: Mergen ADE Cockpit
+    - generic [ref=e7]:
+      - img [ref=e8]
+      - generic [ref=e10]: C:\Users\furkan\Projects\storefront
+      - generic [ref=e11]: /
+      - generic [ref=e12]: feat/browser-checkout
+    - generic [ref=e13]:
+      - generic [ref=e14]: OpenCode ACP Idle
+      - button "Bildirimler" [ref=e16] [cursor=pointer]:
+        - img [ref=e17]
+      - button "Ayarlar" [ref=e20] [cursor=pointer]:
+        - img [ref=e21]
+  - generic [ref=e24]:
+    - navigation "Ana gezinme" [ref=e25]:
+      - button "Cockpit" [ref=e26] [cursor=pointer]:
+        - img [ref=e27]
+      - button "Browser" [ref=e32] [cursor=pointer]:
+        - img [ref=e33]
+      - button "Diff" [ref=e38] [cursor=pointer]:
+        - img [ref=e39]
+      - button "Loglar" [ref=e46] [cursor=pointer]:
+        - img [ref=e47]
+      - button "Raw terminal" [ref=e49] [cursor=pointer]:
+        - img [ref=e50]
+    - complementary [ref=e53]:
+      - generic [ref=e54]:
+        - generic [ref=e55]:
+          - generic [ref=e56]: Project
+          - generic [ref=e57]:
+            - img [ref=e58]
+            - generic [ref=e61]:
+              - generic [ref=e62]: storefront-web
+              - generic [ref=e63]: main + 1 worktree
+        - generic [ref=e64]:
+          - generic [ref=e65]:
+            - text: Engines
+            - generic [ref=e66]: Ready
+          - generic [ref=e67]:
+            - generic [ref=e68] [cursor=pointer]:
+              - generic [ref=e69]:
+                - generic [ref=e70]: ChatGPT Planner
+                - generic [ref=e71]: Plan
+              - generic [ref=e72]: Scope, acceptance, reviewer prompt
+            - generic [ref=e73] [cursor=pointer]:
+              - generic [ref=e74]:
+                - generic [ref=e75]: OpenCode Build
+                - generic [ref=e76]: ACP
+              - generic [ref=e77]: Edits, commands, MCP tools
+            - generic [ref=e78] [cursor=pointer]:
+              - generic [ref=e79]:
+                - generic [ref=e80]: Browser MCP
+                - generic [ref=e81]: Live
+              - generic [ref=e82]: Clicks, screenshots, assertions
+        - generic [ref=e83]:
+          - generic [ref=e84]: Prompt
+          - generic [ref=e85]:
+            - textbox [ref=e86]: Checkout sayfasında kupon alanı mobilde kayıyor. Browser ile doğrula, minimal CSS düzeltmesi yap, test çalıştır.
+            - generic [ref=e87]:
+              - generic [ref=e88]:
+                - button "Plan" [ref=e89] [cursor=pointer]
+                - button "Build" [ref=e90] [cursor=pointer]
+              - button "Gönder" [ref=e91] [cursor=pointer]:
+                - img [ref=e92]
+    - main [ref=e94]:
+      - region "Akış" [ref=e95]:
+        - button "1 Plan 3 bounded tasks, 2 checks" [ref=e96] [cursor=pointer]:
+          - generic [ref=e97]: "1"
+          - generic [ref=e98]: Plan 3 bounded tasks, 2 checks
+          - img [ref=e99]
+        - button "2 Run Browser assertion running" [ref=e101] [cursor=pointer]:
+          - generic [ref=e102]: "2"
+          - generic [ref=e103]: Run Browser assertion running
+          - img [ref=e104]
+        - button "3 Review Diff, tests, decision" [ref=e106] [cursor=pointer]:
+          - generic [ref=e107]: "3"
+          - generic [ref=e108]: Review Diff, tests, decision
+          - img [ref=e109]
+      - generic [ref=e114]:
+        - generic [ref=e115]:
+          - generic [ref=e116]:
+            - img [ref=e117]
+            - generic [ref=e122]: Controlled Browser
+          - generic [ref=e123]:
+            - button "Geri" [ref=e124] [cursor=pointer]:
+              - img [ref=e125]
+            - button "Yenile" [ref=e127] [cursor=pointer]:
+              - img [ref=e128]
+            - button "Screenshot" [ref=e131] [cursor=pointer]:
+              - img [ref=e132]
+        - generic [ref=e135]:
+          - generic [ref=e136]:
+            - generic [ref=e141]: http://localhost:5173/checkout?coupon=MERGEN20
+            - generic [ref=e142]: AI control
+          - generic [ref=e143]:
+            - generic [ref=e144]:
+              - generic [ref=e145]: Northline Store
+              - generic [ref=e146]:
+                - generic [ref=e147]: Cart
+                - generic [ref=e148]: Checkout
+                - generic [ref=e149]: Account
+            - generic [ref=e150]:
+              - generic [ref=e151]:
+                - heading "Fast checkout with verified coupon state." [level=1] [ref=e152]
+                - paragraph [ref=e153]: Coupon row remains aligned at 390px viewport after the agent patches the layout and reloads the page.
+                - generic [ref=e154]:
+                  - button "Pay $128.00" [ref=e155]
+                  - button "Apply coupon" [ref=e156]
+              - generic [ref=e159]:
+                - generic [ref=e160]: Order Summary
+                - generic [ref=e161]:
+                  - generic [ref=e162]:
+                    - generic [ref=e163]: "3"
+                    - text: items
+                  - generic [ref=e164]:
+                    - generic [ref=e165]: 20%
+                    - text: coupon
+                  - generic [ref=e166]:
+                    - generic [ref=e167]: $128
+                    - text: total
+                  - generic [ref=e168]:
+                    - generic [ref=e169]: "0"
+                    - text: layout shifts
+      - generic [ref=e170]:
+        - generic [ref=e171]:
+          - generic [ref=e172]:
+            - text: Browser Timeline
+            - generic [ref=e173]: Live
+          - generic [ref=e174]:
+            - generic [ref=e175]:
+              - img [ref=e177]
+              - generic [ref=e179]:
+                - generic [ref=e180]: navigate /checkout
+                - generic [ref=e181]: viewport 390 x 844, coupon prefilled
+              - generic [ref=e182]: ok
+            - generic [ref=e183]:
+              - img [ref=e185]
+              - generic [ref=e191]:
+                - generic [ref=e192]: click Apply coupon
+                - generic [ref=e193]: assert button remains visible
+              - generic [ref=e194]: ok
+            - generic [ref=e195]:
+              - img [ref=e197]
+              - generic [ref=e200]:
+                - generic [ref=e201]: screenshot compare
+                - generic [ref=e202]: 0 layout shifts above threshold
+              - generic [ref=e203]: new
+        - generic [ref=e204]:
+          - generic [ref=e205]:
+            - text: Command Output
+            - generic [ref=e206]:
+              - button "Summary" [ref=e207] [cursor=pointer]
+              - button "Raw" [ref=e208] [cursor=pointer]
+          - generic [ref=e210]: "opencode acp: connected planner: generated 3 bounded tasks task 2/3: patch checkout responsive coupon row browser: reload http://localhost:5173/checkout browser: assert no horizontal overflow at 390px waiting: permission to run npm run test:checkout"

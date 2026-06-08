@@ -2,6 +2,40 @@
   
 ---
 
+#### OpenCode terminal + ACP aynı anda açıkken klavye/focus çakışması {#opencode-terminal-acp-focus-collision}
+- Date: 2026-06-08
+- Context: User reported that when both an OpenCode terminal and OpenCode ACP are open simultaneously, they "collide" — the user cannot switch between them, and cannot type anything into the ACP area.
+- Error signature:
+  1. `draw_main_area()` always renders the ACP chat panel when `active_acp_chat` is `Some`, even if the user clicks a terminal in Terminal Manager.
+  2. `set_active_terminal()` did not clear `active_acp_chat`, so the terminal grid never became visible after switching.
+  3. `active_terminal_accepts_input()` still returned the active terminal while ACP was visible, causing terminal keyboard capture to steal keystrokes from the ACP composer.
+  4. `ensure_smart_input_focus()` auto-focused the terminal's Smart Input draft even when ACP was visible, stealing focus from the ACP composer.
+  5. The ACP composer `TextEdit` was not registered as a recognized text input in `text_input_has_focus[_extended]()`, so attention routing and shortcut buffering did not yield to the ACP composer.
+- Symptoms/Impact:
+  1. User could not type into the ACP composer because keystrokes were routed to the hidden terminal's Smart Input or PTY.
+  2. Clicking a terminal row in Terminal Manager did not hide the ACP panel; the main area stayed on ACP.
+  3. The two OpenCode surfaces (terminal TUI + ACP panel) appeared to "fight" for keyboard input.
+- Root cause:
+  - ACP visibility state (`active_acp_chat`) was not being cleared when the user explicitly selected a terminal.
+  - Terminal input capture and Smart Input focus logic had no awareness of the ACP panel's visibility.
+  - The ACP composer input lacked a stable egui ID and was not included in the app's text-input focus detection.
+- Resolution:
+  - `set_active_terminal()` now clears `active_acp_chat` and `acp_focus_input_chat_next_frame` whenever a terminal is activated, and clears them again after `note_selection_changed()` to prevent `restore_active_acp_for_selected_project()` from resurrecting the ACP panel.
+  - `active_terminal_accepts_input()` returns `None` when `active_acp_chat.is_some()`.
+  - `ensure_smart_input_focus()` surrenders all Smart Input focus and returns early when ACP is visible.
+  - `focused_smart_input_submit_request()` and `active_smart_input_draft_request()` return `None` while ACP is visible.
+  - Added `acp_composer_input_id(chat_id)` stable ID and wired it into the ACP composer `TextEdit`.
+  - `text_input_has_focus()` and `text_input_has_focus_extended()` now detect the ACP composer input.
+  - `surrender_ui_text_focus()` surrenders ACP composer focus for all active chats.
+  - Added 6 regression tests covering terminal activation, input capture blocking, Smart Input yielding, raw input hook behavior, focus detection, and Smart Input request suppression.
+- Prevent recurrence:
+  - Updated AGENTS.md with the "OpenCode ACP and Terminal Coexistence" guideline documenting the visibility/focus invariants.
+  - Recorded this entry in KNOWN_ISSUES.md.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`, `cargo build --release --target x86_64-pc-windows-msvc`
+- References: User request 2026-06-08
+
+---
+
 #### Codex CLI update 0.134.0 -> 0.136.0 with stale process cleanup {#codex-update-0.136.0}
 - Date: 2026-06-03
 - Context: User requested updating Codex CLI from 0.134.0 to 0.136.0 and killing any running Codex processes to prevent file-lock conflicts during installation.
