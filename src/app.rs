@@ -2465,6 +2465,7 @@ enum OpenCodeLoopActivity {
 enum ClaudeStatusSource {
     TerminalTitle,
     Hook,
+    PromptSubmit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4225,6 +4226,8 @@ struct TerminalEntry {
     claude_last_title_working_at: Option<Instant>,
     claude_last_title_idle_at: Option<Instant>,
     claude_last_permission_at: Option<Instant>,
+    /// Smart Input settle guard: when we last submitted a prompt via Smart Input
+    claude_prompt_submit_since: Option<Instant>,
 }
 
 /// Phase of a pending background rerun to handle Windows batch confirmation prompts.
@@ -4728,7 +4731,10 @@ fn ai_badge_visual(
                 }
                 None => {
                     // No normalized status - use pending flag to decide
-                    if codex_attention_pending || opencode_attention_pending || claude_attention_pending {
+                    if codex_attention_pending
+                        || opencode_attention_pending
+                        || claude_attention_pending
+                    {
                         Some(AiBadgeVisual::Pulse(Color32::from_rgb(200, 200, 200)))
                     } else {
                         Some(AiBadgeVisual::Solid(Color32::from_rgb(170, 170, 170)))
@@ -7267,6 +7273,7 @@ impl AdeApp {
             claude_last_title_working_at: None,
             claude_last_title_idle_at: None,
             claude_last_permission_at: None,
+            claude_prompt_submit_since: None,
         };
 
         self.terminals.insert(terminal_id, entry);
@@ -8896,6 +8903,7 @@ impl AdeApp {
         entry.claude_last_title_working_at = None;
         entry.claude_last_title_idle_at = None;
         entry.claude_last_permission_at = None;
+        entry.claude_prompt_submit_since = None;
         entry.dirty = true;
         changed
     }
@@ -9473,6 +9481,11 @@ impl AdeApp {
                 entry.claude_last_title_working_at = Some(now);
                 entry.claude_normalized_status = Some(ClaudeTransportStatus::Working);
             }
+            (AiCliStatus::Running, ClaudeStatusSource::PromptSubmit) => {
+                entry.claude_normalized_status = Some(ClaudeTransportStatus::Working);
+                entry.claude_running_since = Some(now);
+                entry.claude_prompt_submit_since = Some(now);
+            }
             (AiCliStatus::Attention, ClaudeStatusSource::TerminalTitle) => {
                 // Infer normalized status from title context
                 if attention_reason == Some(ClaudeAttentionReason::PermissionAsked) {
@@ -9562,7 +9575,7 @@ impl AdeApp {
             if let Some(ClaudeTransportStatus::Idle | ClaudeTransportStatus::Permission) =
                 entry.claude_normalized_status
             {
-                if !entry.claude_attention_pending {
+                if !entry.claude_attention_pending && !Self::is_stale_claude_completion(entry) {
                     entry.claude_attention_pending = true;
                     changed = true;
                 }
@@ -17776,6 +17789,7 @@ impl AdeApp {
         let mut submitted_codex_prompt = false;
         let mut submitted_opencode_prompt = false;
         let mut submitted_opencode_non_work_slash = false;
+        let mut submitted_claude_prompt = false;
         let mut committed_codex_reply = false;
         let opencode_non_work_slash = Self::is_opencode_non_work_slash_command(message);
         let destination_title = {
@@ -17832,6 +17846,9 @@ impl AdeApp {
                 } else {
                     submitted_opencode_prompt = true;
                 }
+            }
+            if terminal.ai_session.tool == Some(AiCliTool::Claude) && has_non_empty_line {
+                submitted_claude_prompt = true;
             }
 
             if options.set_visible_in_main {
@@ -17930,6 +17947,14 @@ impl AdeApp {
                 None,
             );
         }
+        if submitted_claude_prompt {
+            let _ = self.apply_claude_status(
+                terminal_id,
+                AiCliStatus::Running,
+                ClaudeStatusSource::PromptSubmit,
+                None,
+            );
+        }
         true
     }
 
@@ -18003,8 +18028,10 @@ impl AdeApp {
     fn terminal_smart_input_visible(terminal: &TerminalEntry) -> bool {
         terminal.kind == TerminalKind::Foreground
             && !terminal.exited
-            && terminal.ai_session.tool == Some(AiCliTool::OpenCode)
-            && terminal.opencode_session_active
+            && ((terminal.ai_session.tool == Some(AiCliTool::OpenCode)
+                && terminal.opencode_session_active)
+                || (terminal.ai_session.tool == Some(AiCliTool::Claude)
+                    && terminal.claude_session_active))
     }
 
     fn is_opencode_non_work_slash_command(text: &str) -> bool {
@@ -18075,6 +18102,17 @@ impl AdeApp {
         })
     }
 
+    /// Returns true if an incoming Claude Idle/Permission signal should be
+    /// suppressed because it arrived during the Smart Input post-submit settle
+    /// window. Any completion-like Idle that arrives while a freshly dispatched
+    /// prompt is still within the settle window is treated as stale (from the
+    /// previous turn) and must not overwrite the Working state.
+    fn is_stale_claude_completion(entry: &TerminalEntry) -> bool {
+        entry.claude_prompt_submit_since.is_some_and(|submit_at| {
+            submit_at.elapsed() < Duration::from_millis(SMART_INPUT_AUTO_DISPATCH_SETTLE_MS)
+        })
+    }
+
     fn smart_input_auto_dispatch_ready(terminal: &TerminalEntry) -> bool {
         if !Self::terminal_smart_input_visible(terminal) {
             return false;
@@ -18085,37 +18123,58 @@ impl AdeApp {
         if terminal.smart_input.dragging_task_id.is_some() {
             return false;
         }
-        if terminal.opencode_pending_question.is_some() {
-            return false;
+        // OpenCode path
+        if terminal.ai_session.tool == Some(AiCliTool::OpenCode) {
+            if terminal.opencode_pending_question.is_some() {
+                return false;
+            }
+            if !terminal.opencode_session_active {
+                return false;
+            }
+            if terminal
+                .opencode_non_work_slash_settle_until
+                .is_some_and(|until| Instant::now() < until)
+            {
+                return false;
+            }
+            if terminal.opencode_normalized_status != Some(OpenCodeTransportStatus::Idle) {
+                return false;
+            }
+            if terminal.opencode_attention_reason != Some(OpenCodeAttentionReason::TurnComplete) {
+                return false;
+            }
+            let prompt_fresh = terminal
+                .opencode_prompt_submit_since
+                .is_some_and(|submit_at| {
+                    submit_at.elapsed() < Duration::from_millis(SMART_INPUT_AUTO_DISPATCH_SETTLE_MS)
+                });
+            if prompt_fresh {
+                return false;
+            }
+            return true;
         }
-        if !terminal.opencode_session_active {
-            return false;
+        // Claude path
+        if terminal.ai_session.tool == Some(AiCliTool::Claude) {
+            if !terminal.claude_session_active {
+                return false;
+            }
+            if terminal.claude_normalized_status != Some(ClaudeTransportStatus::Idle) {
+                return false;
+            }
+            if !terminal.claude_attention_pending {
+                return false;
+            }
+            let prompt_fresh = terminal
+                .claude_prompt_submit_since
+                .is_some_and(|submit_at| {
+                    submit_at.elapsed() < Duration::from_millis(SMART_INPUT_AUTO_DISPATCH_SETTLE_MS)
+                });
+            if prompt_fresh {
+                return false;
+            }
+            return true;
         }
-        if terminal
-            .opencode_non_work_slash_settle_until
-            .is_some_and(|until| Instant::now() < until)
-        {
-            return false;
-        }
-        if terminal.opencode_normalized_status != Some(OpenCodeTransportStatus::Idle) {
-            return false;
-        }
-        if terminal.opencode_attention_reason != Some(OpenCodeAttentionReason::TurnComplete) {
-            return false;
-        }
-        // Settle guard: after a recent prompt submit, wait briefly before accepting
-        // Idle as a genuine turn-complete for the next queued task. This prevents stale
-        // delayed Idle events from the previous turn from immediately triggering
-        // back-to-back dispatch.
-        let prompt_fresh = terminal
-            .opencode_prompt_submit_since
-            .is_some_and(|submit_at| {
-                submit_at.elapsed() < Duration::from_millis(SMART_INPUT_AUTO_DISPATCH_SETTLE_MS)
-            });
-        if prompt_fresh {
-            return false;
-        }
-        true
+        false
     }
 
     fn process_smart_input_queues(&mut self, ctx: &egui::Context) {
@@ -18147,6 +18206,15 @@ impl AdeApp {
                 }
             }
             if !text.trim().is_empty() {
+                let tool_label = self
+                    .terminals
+                    .get(&terminal_id)
+                    .and_then(|t| t.ai_session.tool)
+                    .map(|tool| match tool {
+                        AiCliTool::Claude => "Claude",
+                        _ => "OpenCode",
+                    })
+                    .unwrap_or("AI");
                 if self.submit_prompt_to_terminal(
                     ctx,
                     terminal_id,
@@ -18156,7 +18224,7 @@ impl AdeApp {
                     if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                         let _ = terminal.smart_input.remove_task(task_id);
                     }
-                    self.status_line = "Smart Input sent queued OpenCode task".to_owned();
+                    self.status_line = format!("Smart Input sent queued {tool_label} task");
                 }
             } else if !attachments.is_empty() {
                 if self.submit_smart_input_attachment_only(
@@ -34946,6 +35014,29 @@ fn smart_input_status_text(terminal: &TerminalEntry) -> (&'static str, Color32) 
         );
     }
 
+    if terminal.ai_session.tool == Some(AiCliTool::Claude) {
+        return match terminal.claude_normalized_status {
+            Some(ClaudeTransportStatus::Working) => {
+                ("Claude working - queued tasks wait", TEXT_MUTED)
+            }
+            Some(ClaudeTransportStatus::Permission) => (
+                "Claude needs input - queue paused",
+                Color32::from_rgb(220, 170, 60),
+            ),
+            Some(ClaudeTransportStatus::Idle) => {
+                if terminal.claude_attention_pending {
+                    (
+                        "Ready - next queued task will run",
+                        Color32::from_rgb(90, 185, 90),
+                    )
+                } else {
+                    ("Claude idle", TEXT_MUTED)
+                }
+            }
+            None => ("Claude session starting", TEXT_MUTED),
+        };
+    }
+
     match terminal.opencode_normalized_status {
         Some(OpenCodeTransportStatus::Working) => {
             ("OpenCode working - queued tasks wait", TEXT_MUTED)
@@ -50441,6 +50532,7 @@ mod tests {
             claude_last_title_working_at: None,
             claude_last_title_idle_at: None,
             claude_last_permission_at: None,
+            claude_prompt_submit_since: None,
         }
     }
 
@@ -64991,6 +65083,132 @@ mod tests {
         );
 
         assert_eq!(app.pending_second_enter.len(), 1);
+    }
+
+    // Claude Code Smart Input tests
+    #[test]
+    fn terminal_smart_input_visible_true_for_claude_session() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let terminal = app.terminals.get_mut(&1).unwrap();
+        terminal.ai_session.tool = Some(AiCliTool::Claude);
+        terminal.claude_session_active = true;
+        assert!(AdeApp::terminal_smart_input_visible(terminal));
+    }
+
+    #[test]
+    fn terminal_smart_input_visible_false_for_claude_inactive() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let terminal = app.terminals.get_mut(&1).unwrap();
+        terminal.ai_session.tool = Some(AiCliTool::Claude);
+        terminal.claude_session_active = false;
+        assert!(!AdeApp::terminal_smart_input_visible(terminal));
+    }
+
+    #[test]
+    fn smart_input_status_text_claude_working() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.ai_session.tool = Some(AiCliTool::Claude);
+        terminal.claude_normalized_status = Some(ClaudeTransportStatus::Working);
+        let (text, color) = super::smart_input_status_text(&terminal);
+        assert_eq!(text, "Claude working - queued tasks wait");
+        assert_eq!(color, super::TEXT_MUTED);
+    }
+
+    #[test]
+    fn smart_input_status_text_claude_idle_ready() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.ai_session.tool = Some(AiCliTool::Claude);
+        terminal.claude_normalized_status = Some(ClaudeTransportStatus::Idle);
+        terminal.claude_attention_pending = true;
+        let (text, color) = super::smart_input_status_text(&terminal);
+        assert_eq!(text, "Ready - next queued task will run");
+        assert_eq!(color, Color32::from_rgb(90, 185, 90));
+    }
+
+    #[test]
+    fn smart_input_status_text_claude_permission() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.ai_session.tool = Some(AiCliTool::Claude);
+        terminal.claude_normalized_status = Some(ClaudeTransportStatus::Permission);
+        let (text, color) = super::smart_input_status_text(&terminal);
+        assert_eq!(text, "Claude needs input - queue paused");
+        assert_eq!(color, Color32::from_rgb(220, 170, 60));
+    }
+
+    #[test]
+    fn smart_input_auto_dispatch_ready_true_for_claude_idle_with_attention_pending() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.kind = TerminalKind::Foreground;
+        terminal.ai_session.tool = Some(AiCliTool::Claude);
+        terminal.claude_session_active = true;
+        terminal.claude_normalized_status = Some(ClaudeTransportStatus::Idle);
+        terminal.claude_attention_pending = true;
+        terminal.smart_input.tasks.push(SmartInputTask {
+            id: 1,
+            text: "test".to_owned(),
+            attachments: Vec::new(),
+        });
+        assert!(AdeApp::smart_input_auto_dispatch_ready(&terminal));
+    }
+
+    #[test]
+    fn smart_input_auto_dispatch_ready_false_for_claude_working() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.kind = TerminalKind::Foreground;
+        terminal.ai_session.tool = Some(AiCliTool::Claude);
+        terminal.claude_session_active = true;
+        terminal.claude_normalized_status = Some(ClaudeTransportStatus::Working);
+        terminal.smart_input.tasks.push(SmartInputTask {
+            id: 1,
+            text: "test".to_owned(),
+            attachments: Vec::new(),
+        });
+        assert!(!AdeApp::smart_input_auto_dispatch_ready(&terminal));
+    }
+
+    #[test]
+    fn smart_input_auto_dispatch_ready_false_for_claude_idle_no_attention() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.kind = TerminalKind::Foreground;
+        terminal.ai_session.tool = Some(AiCliTool::Claude);
+        terminal.claude_session_active = true;
+        terminal.claude_normalized_status = Some(ClaudeTransportStatus::Idle);
+        terminal.claude_attention_pending = false;
+        terminal.smart_input.tasks.push(SmartInputTask {
+            id: 1,
+            text: "test".to_owned(),
+            attachments: Vec::new(),
+        });
+        assert!(!AdeApp::smart_input_auto_dispatch_ready(&terminal));
+    }
+
+    #[test]
+    fn smart_input_auto_dispatch_ready_false_for_claude_fresh_prompt() {
+        let mut terminal = test_terminal_entry(1, 7);
+        terminal.kind = TerminalKind::Foreground;
+        terminal.ai_session.tool = Some(AiCliTool::Claude);
+        terminal.claude_session_active = true;
+        terminal.claude_normalized_status = Some(ClaudeTransportStatus::Idle);
+        terminal.claude_attention_pending = true;
+        terminal.claude_prompt_submit_since = Some(Instant::now());
+        terminal.smart_input.tasks.push(SmartInputTask {
+            id: 1,
+            text: "test".to_owned(),
+            attachments: Vec::new(),
+        });
+        assert!(!AdeApp::smart_input_auto_dispatch_ready(&terminal));
+    }
+
+    #[test]
+    fn clear_claude_state_clears_prompt_submit_since() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        let terminal = app.terminals.get_mut(&1).unwrap();
+        terminal.ai_session.tool = Some(AiCliTool::Claude);
+        terminal.claude_normalized_status = Some(ClaudeTransportStatus::Working);
+        terminal.claude_prompt_submit_since = Some(Instant::now());
+        app.clear_claude_state(1);
+        let terminal = app.terminals.get(&1).unwrap();
+        assert!(terminal.claude_prompt_submit_since.is_none());
     }
 
     #[test]
