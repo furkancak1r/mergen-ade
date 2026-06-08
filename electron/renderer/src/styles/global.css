@@ -1,0 +1,123 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: #0c0c0c;
+  color: #c8c8c8;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  font-size: 13px;
+  line-height: 1.4;
+  overflow: hidden;
+}
+
+#root {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+}
+
+.app-container {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.activity-rail {
+  width: 48px;
+  background: #161616;
+  border-right: 1px solid #222;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 8px;
+  gap: 4px;
+}
+
+.rail-btn {
+  width: 40px;
+  height: 40px;
+  background: transparent;
+  border: none;
+  color: #888;
+  font-size: 10px;
+  cursor: pointer;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, color 0.15s;
+}
+
+.rail-btn:hover {
+  background: #222;
+  color: #ccc;
+}
+
+.rail-btn.active {
+  background: #1f1f1f;
+  color: #eee;
+}
+
+.main-area {
+  flex: 1;
+  display: flex;
+  background: #0c0c0c;
+  overflow: hidden;
+}
+
+.tile-grid {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.tile-cell {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #0c0c0c;
+}
+
+.terminal-pane {
+  width: 100%;
+  height: 100%;
+}
+
+.terminal-pane .xterm {
+  height: 100%;
+}
+
+.main-area-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  color: #666;
+}
+
+.sidebar {
+  background: #141414;
+}
+
+.resize-handle {
+  background: #2d2d2d;
+  flex-shrink: 0;
+}
+
+.resize-handle:hover {
+  background: #0078d4;
+}
+
+.dir-row:hover {
+  background: #1a1a1a !important;
+}
+
+.project-explorer,
+.terminal-manager {
+  background: #141414;
+}
