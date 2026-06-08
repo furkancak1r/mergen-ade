@@ -4217,6 +4217,8 @@ struct TerminalEntry {
     /// This preserves Orca-compatible semantics through the state machine
     claude_normalized_status: Option<ClaudeTransportStatus>,
     claude_attention_reason: Option<ClaudeAttentionReason>,
+    /// Pending attention flag for pulse/unread semantics (Orca-compatible)
+    claude_attention_pending: bool,
     /// When we last entered Running state (from title detection)
     claude_running_since: Option<Instant>,
     /// Evidence-based timestamps for Claude state resolution
@@ -4536,6 +4538,11 @@ struct AiBadgeModel {
     /// OpenCode attention reason for badge visibility decisions
     /// Used to hide badge for TurnComplete after acknowledge, keep for interactive reasons
     opencode_attention_reason: Option<OpenCodeAttentionReason>,
+    /// Pending attention flag for pulse/unread semantics (Orca-compatible)
+    /// True when user needs to acknowledge attention (shown as pulse)
+    claude_attention_pending: bool,
+    /// Claude attention reason for badge visibility decisions
+    claude_attention_reason: Option<ClaudeAttentionReason>,
     tooltip_lines: Vec<String>,
 }
 
@@ -4561,6 +4568,8 @@ impl AiBadgeModel {
             codex_attention_reason: terminal.codex_attention_reason,
             opencode_attention_pending: terminal.opencode_attention_pending,
             opencode_attention_reason: terminal.opencode_attention_reason,
+            claude_attention_pending: terminal.claude_attention_pending,
+            claude_attention_reason: terminal.claude_attention_reason,
             tooltip_lines,
         }
     }
@@ -4626,6 +4635,8 @@ fn ai_badge_visual(
     codex_attention_reason: Option<CodexAttentionReason>,
     opencode_attention_pending: bool,
     opencode_attention_reason: Option<OpenCodeAttentionReason>,
+    claude_attention_pending: bool,
+    _claude_attention_reason: Option<ClaudeAttentionReason>,
 ) -> Option<AiBadgeVisual> {
     match status {
         AiCliStatus::Inactive => None,
@@ -4666,14 +4677,14 @@ fn ai_badge_visual(
                         Some(AiBadgeVisual::Spinner(Color32::from_rgb(170, 170, 170)))
                     }
                     ClaudeTransportStatus::Permission => {
-                        if codex_attention_pending {
+                        if claude_attention_pending {
                             Some(AiBadgeVisual::Pulse(Color32::from_rgb(210, 170, 80)))
                         } else {
                             Some(AiBadgeVisual::Solid(Color32::from_rgb(210, 170, 80)))
                         }
                     }
                     ClaudeTransportStatus::Idle => {
-                        if codex_attention_pending {
+                        if claude_attention_pending {
                             Some(AiBadgeVisual::Pulse(Color32::from_rgb(90, 185, 90)))
                         } else {
                             Some(AiBadgeVisual::Solid(Color32::from_rgb(90, 185, 90)))
@@ -4717,7 +4728,7 @@ fn ai_badge_visual(
                 }
                 None => {
                     // No normalized status - use pending flag to decide
-                    if codex_attention_pending || opencode_attention_pending {
+                    if codex_attention_pending || opencode_attention_pending || claude_attention_pending {
                         Some(AiBadgeVisual::Pulse(Color32::from_rgb(200, 200, 200)))
                     } else {
                         Some(AiBadgeVisual::Solid(Color32::from_rgb(170, 170, 170)))
@@ -4955,6 +4966,8 @@ fn draw_ai_badge(ui: &mut Ui, badge: &AiBadgeModel) -> egui::Response {
         badge.codex_attention_reason,
         badge.opencode_attention_pending,
         badge.opencode_attention_reason,
+        badge.claude_attention_pending,
+        badge.claude_attention_reason,
     ) else {
         return ui.allocate_at_least(egui::vec2(0.0, 0.0), Sense::hover()).1;
     };
@@ -4999,6 +5012,8 @@ fn draw_terminal_status_badges(ui: &mut Ui, ai_badge: &AiBadgeModel) -> Terminal
         ai_badge.codex_attention_reason,
         ai_badge.opencode_attention_pending,
         ai_badge.opencode_attention_reason,
+        ai_badge.claude_attention_pending,
+        ai_badge.claude_attention_reason,
     );
 
     // Draw badge if visual is available
@@ -7247,6 +7262,7 @@ impl AdeApp {
             claude_session_active: false,
             claude_normalized_status: None,
             claude_attention_reason: None,
+            claude_attention_pending: false,
             claude_running_since: None,
             claude_last_title_working_at: None,
             claude_last_title_idle_at: None,
@@ -7379,6 +7395,7 @@ impl AdeApp {
             || entry.factory_droid_session_active
             || entry.codex_session_active
             || entry.opencode_session_active
+            || entry.claude_session_active
     }
 
     fn launch_command_stem(line: &str) -> Option<&str> {
@@ -9448,6 +9465,7 @@ impl AdeApp {
 
         let now = Instant::now();
         let mut changed = false;
+        let previous_normalized_status = entry.claude_normalized_status;
 
         // Record evidence timestamps for state resolution
         match (status, source) {
@@ -9520,12 +9538,34 @@ impl AdeApp {
                 if entry.claude_attention_reason.take().is_some() {
                     changed = true;
                 }
+                // Clear pending attention when transitioning to running
+                if entry.claude_attention_pending {
+                    entry.claude_attention_pending = false;
+                    changed = true;
+                }
             }
             AiCliStatus::Inactive => {
                 if entry.claude_attention_reason.take().is_some() {
                     changed = true;
                 }
                 entry.claude_normalized_status = None;
+                // Clear pending attention when transitioning to inactive
+                if entry.claude_attention_pending {
+                    entry.claude_attention_pending = false;
+                    changed = true;
+                }
+            }
+        }
+
+        // Trigger pending attention on working->idle/permission transition
+        if previous_normalized_status == Some(ClaudeTransportStatus::Working) {
+            if let Some(ClaudeTransportStatus::Idle | ClaudeTransportStatus::Permission) =
+                entry.claude_normalized_status
+            {
+                if !entry.claude_attention_pending {
+                    entry.claude_attention_pending = true;
+                    changed = true;
+                }
             }
         }
 
@@ -17057,6 +17097,10 @@ impl AdeApp {
         if entry.claude_attention_reason.take().is_some() {
             changed = true;
         }
+        if entry.claude_attention_pending {
+            entry.claude_attention_pending = false;
+            changed = true;
+        }
         // Note: We do NOT clear claude_normalized_status or timestamps here.
         // The semantic status (Idle/Permission) and timestamps persist for
         // logo visibility and state tracking. Only the attention reason is
@@ -23586,6 +23630,8 @@ impl AdeApp {
                                     terminal_data.ai_badge.codex_attention_reason,
                                     terminal_data.ai_badge.opencode_attention_pending,
                                     terminal_data.ai_badge.opencode_attention_reason,
+                                    terminal_data.ai_badge.claude_attention_pending,
+                                    terminal_data.ai_badge.claude_attention_reason,
                                 )
                                 .map(|_| draw_ai_badge(ui, &terminal_data.ai_badge));
                                 if ai_response.is_some() {
@@ -47849,6 +47895,8 @@ mod tests {
             badge.codex_attention_reason,
             badge.opencode_attention_pending,
             badge.opencode_attention_reason,
+            badge.claude_attention_pending,
+            badge.claude_attention_reason,
         );
         assert_eq!(visual, None);
     }
@@ -48529,6 +48577,8 @@ mod tests {
             badge.codex_attention_reason,
             badge.opencode_attention_pending,
             badge.opencode_attention_reason,
+            badge.claude_attention_pending,
+            badge.claude_attention_reason,
         );
         assert_eq!(
             visual,
@@ -48589,6 +48639,8 @@ mod tests {
             badge.codex_attention_reason,
             badge.opencode_attention_pending,
             badge.opencode_attention_reason,
+            badge.claude_attention_pending,
+            badge.claude_attention_reason,
         );
         assert_eq!(
             visual,
@@ -48933,6 +48985,8 @@ mod tests {
             badge.codex_attention_reason,
             badge.opencode_attention_pending,
             badge.opencode_attention_reason,
+            badge.claude_attention_pending,
+            badge.claude_attention_reason,
         );
         assert_eq!(
             visual, None,
@@ -48971,6 +49025,8 @@ mod tests {
             badge.codex_attention_reason,
             badge.opencode_attention_pending,
             badge.opencode_attention_reason,
+            badge.claude_attention_pending,
+            badge.claude_attention_reason,
         );
         assert_eq!(
             visual,
@@ -49010,6 +49066,8 @@ mod tests {
             badge.codex_attention_reason,
             badge.opencode_attention_pending,
             badge.opencode_attention_reason,
+            badge.claude_attention_pending,
+            badge.claude_attention_reason,
         );
         assert_eq!(
             visual,
@@ -49159,6 +49217,8 @@ mod tests {
             initial_badge.codex_attention_reason,
             initial_badge.opencode_attention_pending,
             initial_badge.opencode_attention_reason,
+            initial_badge.claude_attention_pending,
+            initial_badge.claude_attention_reason,
         );
         assert_eq!(
             initial_visual,
@@ -49188,6 +49248,8 @@ mod tests {
             badge.codex_attention_reason,
             badge.opencode_attention_pending,
             badge.opencode_attention_reason,
+            badge.claude_attention_pending,
+            badge.claude_attention_reason,
         );
         assert_eq!(
             visual, None,
@@ -49227,6 +49289,8 @@ mod tests {
             badge.codex_attention_reason,
             badge.opencode_attention_pending,
             badge.opencode_attention_reason,
+            badge.claude_attention_pending,
+            badge.claude_attention_reason,
         );
         assert_eq!(
             visual,
@@ -50372,6 +50436,7 @@ mod tests {
             claude_session_active: false,
             claude_normalized_status: None,
             claude_attention_reason: None,
+            claude_attention_pending: false,
             claude_running_since: None,
             claude_last_title_working_at: None,
             claude_last_title_idle_at: None,
@@ -53630,6 +53695,8 @@ mod tests {
                 false,
                 None,
                 false,
+                None,
+                false,
                 None
             ),
             Some(AiBadgeVisual::Spinner(Color32::from_rgb(170, 170, 170)))
@@ -53643,6 +53710,8 @@ mod tests {
                 false,
                 None,
                 true,
+                None,
+                false,
                 None
             ),
             Some(AiBadgeVisual::Pulse(Color32::from_rgb(200, 200, 200)))
@@ -53657,6 +53726,8 @@ mod tests {
                 false,
                 None,
                 false,
+                None,
+                false,
                 None
             ),
             Some(AiBadgeVisual::Solid(Color32::from_rgb(170, 170, 170)))
@@ -53666,6 +53737,8 @@ mod tests {
                 AiCliStatus::Inactive,
                 None,
                 None,
+                None,
+                false,
                 None,
                 false,
                 None,
@@ -53685,6 +53758,8 @@ mod tests {
                 true,
                 Some(CodexAttentionReason::UserInputRequested),
                 false,
+                None,
+                false,
                 None
             ),
             Some(AiBadgeVisual::Pulse(Color32::from_rgb(210, 170, 80)))
@@ -53698,6 +53773,8 @@ mod tests {
                 false,
                 Some(CodexAttentionReason::TurnComplete),
                 false,
+                None,
+                false,
                 None
             ),
             None
@@ -53710,6 +53787,8 @@ mod tests {
                 None,
                 false,
                 Some(CodexAttentionReason::ExecutionError),
+                false,
+                None,
                 false,
                 None
             ),
@@ -53728,6 +53807,8 @@ mod tests {
                 false,
                 None,
                 true,
+                None,
+                false,
                 None
             ),
             Some(AiBadgeVisual::Pulse(Color32::from_rgb(210, 170, 80)))
@@ -53738,6 +53819,8 @@ mod tests {
                 AiCliStatus::Attention,
                 None,
                 Some(OpenCodeTransportStatus::Permission),
+                None,
+                false,
                 None,
                 false,
                 None,
@@ -53756,7 +53839,9 @@ mod tests {
                 false,
                 None,
                 true,
-                Some(OpenCodeAttentionReason::TurnComplete)
+                Some(OpenCodeAttentionReason::TurnComplete),
+                false,
+                None
             ),
             Some(AiBadgeVisual::Pulse(Color32::from_rgb(90, 185, 90)))
         );
@@ -53770,7 +53855,9 @@ mod tests {
                 false,
                 None,
                 false,
-                Some(OpenCodeAttentionReason::TurnComplete)
+                Some(OpenCodeAttentionReason::TurnComplete),
+                false,
+                None
             ),
             None
         );
@@ -53784,7 +53871,9 @@ mod tests {
                 false,
                 None,
                 false,
-                Some(OpenCodeAttentionReason::PermissionAsked)
+                Some(OpenCodeAttentionReason::PermissionAsked),
+                false,
+                None
             ),
             Some(AiBadgeVisual::Solid(Color32::from_rgb(210, 170, 80)))
         );
@@ -53798,7 +53887,9 @@ mod tests {
                 false,
                 None,
                 false,
-                Some(OpenCodeAttentionReason::QuestionAsked)
+                Some(OpenCodeAttentionReason::QuestionAsked),
+                false,
+                None
             ),
             Some(AiBadgeVisual::Solid(Color32::from_rgb(210, 170, 80)))
         );
@@ -53812,22 +53903,26 @@ mod tests {
                 false,
                 None,
                 false,
+                None,
+                false,
                 None
             ),
             Some(AiBadgeVisual::Spinner(Color32::from_rgb(170, 170, 170)))
         );
 
         // With Claude normalized status (takes precedence over OpenCode)
-        // Claude Permission + pending=true -> pulse (uses codex_attention_pending)
+        // Claude Permission + pending=true -> pulse
         assert_eq!(
             ai_badge_visual(
                 AiCliStatus::Attention,
                 None,
                 Some(OpenCodeTransportStatus::Idle),
                 Some(ClaudeTransportStatus::Permission),
-                true, // codex_attention_pending used for Claude
+                false,
                 None,
                 false,
+                None,
+                true,
                 None
             ),
             Some(AiBadgeVisual::Pulse(Color32::from_rgb(210, 170, 80)))
@@ -53838,6 +53933,8 @@ mod tests {
                 None,
                 None,
                 Some(ClaudeTransportStatus::Idle),
+                false,
+                None,
                 false,
                 None,
                 false,
@@ -53892,6 +53989,8 @@ mod tests {
             codex_attention_reason: None,
             opencode_attention_pending: false,
             opencode_attention_reason: None,
+            claude_attention_pending: false,
+            claude_attention_reason: None,
             tooltip_lines: vec!["Factory Droid - Working...".to_string()],
         };
         let attention_badge = AiBadgeModel {
@@ -53904,6 +54003,8 @@ mod tests {
             codex_attention_reason: None,
             opencode_attention_pending: true,
             opencode_attention_reason: None,
+            claude_attention_pending: false,
+            claude_attention_reason: None,
             tooltip_lines: vec!["Factory Droid - Waiting for you...".to_string()],
         };
         let inactive_badge = AiBadgeModel {
@@ -53916,6 +54017,8 @@ mod tests {
             codex_attention_reason: None,
             opencode_attention_pending: false,
             opencode_attention_reason: None,
+            claude_attention_pending: false,
+            claude_attention_reason: None,
             tooltip_lines: vec!["Factory Droid - Idle".to_string()],
         };
 
@@ -53950,6 +54053,8 @@ mod tests {
             codex_attention_reason: None,
             opencode_attention_pending: false,
             opencode_attention_reason: None,
+            claude_attention_pending: false,
+            claude_attention_reason: None,
             tooltip_lines: vec!["Factory Droid - Working...".to_string()],
         };
 
@@ -54538,6 +54643,8 @@ mod tests {
             codex_attention_reason: None,
             opencode_attention_pending: false,
             opencode_attention_reason: None,
+            claude_attention_pending: false,
+            claude_attention_reason: None,
             tooltip_lines: vec!["Factory Droid - Idle".to_string()],
         };
 

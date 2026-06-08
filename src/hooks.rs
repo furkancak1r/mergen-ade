@@ -384,6 +384,11 @@ pub fn detect_claude_status_from_title(title: &str) -> Option<ClaudeTransportSta
         }
     }
 
+    // Also recognize "cc" as a Claude Code launcher alias
+    if title.to_lowercase() == "cc" || title.to_lowercase().starts_with("cc ") {
+        return Some(ClaudeTransportStatus::Idle);
+    }
+
     None
 }
 
@@ -406,6 +411,10 @@ pub fn is_claude_agent_title(title: &str) -> bool {
     }
     // Permission/action-required Claude titles can omit the usual prefixes
     if title.to_lowercase().starts_with("claude") {
+        return true;
+    }
+    // Also recognize "cc" as a Claude Code launcher alias
+    if title.to_lowercase() == "cc" || title.to_lowercase().starts_with("cc ") {
         return true;
     }
 
@@ -1716,6 +1725,23 @@ mod tests {
     }
 
     #[test]
+    fn detect_claude_status_cc_alias_defaults_to_idle() {
+        // "cc" launcher alias without status indicators = idle
+        assert_eq!(
+            detect_claude_status_from_title("cc"),
+            Some(ClaudeTransportStatus::Idle)
+        );
+        assert_eq!(
+            detect_claude_status_from_title("CC"),
+            Some(ClaudeTransportStatus::Idle)
+        );
+        assert_eq!(
+            detect_claude_status_from_title("cc my task"),
+            Some(ClaudeTransportStatus::Idle)
+        );
+    }
+
+    #[test]
     fn is_claude_agent_title_detects_claude_patterns() {
         assert!(is_claude_agent_title("✳ User acknowledgment"));
         assert!(is_claude_agent_title("⠂ Claude Code"));
@@ -1723,6 +1749,13 @@ mod tests {
         assert!(is_claude_agent_title("* claude"));
         assert!(is_claude_agent_title("claude ready"));
         assert!(is_claude_agent_title("Claude Code - action required"));
+    }
+
+    #[test]
+    fn is_claude_agent_title_detects_cc_alias() {
+        assert!(is_claude_agent_title("cc"));
+        assert!(is_claude_agent_title("cc my task"));
+        assert!(is_claude_agent_title("CC"));
     }
 
     #[test]
