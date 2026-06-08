@@ -41,9 +41,7 @@ fn line_is_noise(lower: &str) -> bool {
         "cancel",
         "? for help",
     ];
-    NOISE_MARKERS
-        .iter()
-        .any(|marker| lower.contains(marker))
+    NOISE_MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
 pub fn extract_thought_window(snapshot: &TerminalSnapshot) -> Option<String> {
@@ -142,10 +140,7 @@ pub fn detect_repetitive_thought_pattern(samples: &[String]) -> bool {
     }
     if normalized.len() >= THOUGHT_REPEAT_THRESHOLD {
         let latest = normalized.last().expect("normalized len checked");
-        let repeat_count = normalized
-            .iter()
-            .filter(|sample| sample == &latest)
-            .count();
+        let repeat_count = normalized.iter().filter(|sample| sample == &latest).count();
         if repeat_count >= THOUGHT_REPEAT_THRESHOLD {
             return true;
         }
@@ -159,7 +154,9 @@ pub fn push_thought_sample(samples: &mut VecDeque<String>, sample: String) {
     if normalize_thought_sample(&sample).len() < THOUGHT_MIN_SAMPLE_LEN {
         return;
     }
-    if samples.back().is_some_and(|previous| !thought_sample_changed_enough(Some(previous), &sample))
+    if samples
+        .back()
+        .is_some_and(|previous| !thought_sample_changed_enough(Some(previous), &sample))
     {
         return;
     }
@@ -180,8 +177,7 @@ pub fn thought_loop_cleared(samples: &[String]) -> bool {
     }
     let left = normalized.get(normalized.len() - 2).expect("len checked");
     let right = normalized.last().expect("len checked");
-    left != right
-        && consecutive_prefix_overlap_ratio(left, right) < THOUGHT_PREFIX_OVERLAP_RATIO
+    left != right && consecutive_prefix_overlap_ratio(left, right) < THOUGHT_PREFIX_OVERLAP_RATIO
 }
 
 #[cfg(test)]
@@ -254,11 +250,8 @@ mod tests {
 
     #[test]
     fn extract_thought_window_filters_ui_noise() {
-        let snapshot = snapshot_with_lines(&[
-            "turn complete",
-            "HOOKS Stop",
-            &long_thought("gamma"),
-        ]);
+        let snapshot =
+            snapshot_with_lines(&["turn complete", "HOOKS Stop", &long_thought("gamma")]);
         let window = extract_thought_window(&snapshot).expect("thought window");
         assert!(window.contains("gamma"));
         assert!(!window.to_ascii_lowercase().contains("turn complete"));

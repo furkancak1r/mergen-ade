@@ -1,5 +1,10 @@
 # Fixes
 
+## Smart Input soru kartı kaldırıldı (2026-06-08)
+
+- Wrong: OpenCode soruları Smart Input footer kartı + hook answer bridge ile yanıtlanıyordu
+- Correct: Soru kartı, pending question state ve `/answer` bridge kaldırıldı; `QuestionAsked` attention + terminal TUI klavye yönlendirmesi korundu
+
 ## Smart Input Kimi thought-loop guard (2026-06-08)
 
 - Wrong: After Done auto-dispatch could send the next queued task while Kimi K2.6 was stuck in a repetitive thinking loop that briefly reported Idle/TurnComplete

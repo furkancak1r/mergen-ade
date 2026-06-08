@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -15,14 +15,6 @@ pub const MERGEN_OPENCODE_TERMINAL_ID_ENV_VAR: &str = "MERGEN_OPENCODE_TERMINAL_
 pub const OPENCODE_CONFIG_DIR_ENV_VAR: &str = "OPENCODE_CONFIG_DIR";
 pub const MERGEN_OPENCODE_PLUGIN_FILE: &str = "mergen-opencode-status.js";
 
-/// Answer payload for an OpenCode question that Mergen Smart Input will submit.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct OpenCodeQuestionAnswer {
-    pub request_id: String,
-    pub answers: Vec<Vec<String>>,
-    pub rejected: bool,
-}
-
 /// Shared state for the hook service tracking last status per terminal
 #[derive(Debug, Default)]
 struct HookServiceState {
@@ -30,8 +22,6 @@ struct HookServiceState {
     /// Normalized status per terminal (Orca-compatible: working | idle | permission)
     last_status_by_terminal: HashMap<u64, OpenCodeTransportStatus>,
     pending_events: Vec<OpenCodeNotifyInboxEvent>,
-    /// Answers queued by Mergen Smart Input, keyed by terminal id (FIFO).
-    pending_answers: HashMap<u64, VecDeque<OpenCodeQuestionAnswer>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +41,6 @@ impl HookServiceState {
             token,
             last_status_by_terminal: HashMap::new(),
             pending_events: Vec::new(),
-            pending_answers: HashMap::new(),
         }
     }
 
@@ -128,37 +117,6 @@ impl HookServiceState {
     fn drain_pending_events(&mut self) -> Vec<OpenCodeNotifyInboxEvent> {
         std::mem::take(&mut self.pending_events)
     }
-
-    fn store_answer(&mut self, terminal_id: u64, answer: OpenCodeQuestionAnswer) {
-        self.pending_answers
-            .entry(terminal_id)
-            .or_default()
-            .push_back(answer);
-    }
-
-    /// Peek at the next answer without removing it (non-destructive).
-    fn peek_answer(&self, terminal_id: u64) -> Option<OpenCodeQuestionAnswer> {
-        self.pending_answers
-            .get(&terminal_id)
-            .and_then(|answers| answers.front().cloned())
-    }
-
-    /// Acknowledge (remove) the front answer after successful delivery.
-    fn ack_answer(&mut self, terminal_id: u64) -> bool {
-        let removed = if let Some(answers) = self.pending_answers.get_mut(&terminal_id) {
-            answers.pop_front().is_some()
-        } else {
-            false
-        };
-        if self
-            .pending_answers
-            .get(&terminal_id)
-            .is_some_and(|a| a.is_empty())
-        {
-            self.pending_answers.remove(&terminal_id);
-        }
-        removed
-    }
 }
 
 /// OpenCode Hook Service implementing the Orca-style HTTP hook model
@@ -200,21 +158,6 @@ impl OpenCodeHookService {
     /// Get and clear pending status events since last check
     pub fn drain_pending_events(&self) -> Vec<OpenCodeNotifyInboxEvent> {
         self.state.lock().unwrap().drain_pending_events()
-    }
-
-    /// Queue an answer for the plugin to consume.
-    pub fn store_answer(&self, terminal_id: u64, answer: OpenCodeQuestionAnswer) {
-        self.state.lock().unwrap().store_answer(terminal_id, answer);
-    }
-
-    /// Peek at the next answer without removing it.
-    pub fn peek_answer(&self, terminal_id: u64) -> Option<OpenCodeQuestionAnswer> {
-        self.state.lock().unwrap().peek_answer(terminal_id)
-    }
-
-    /// Acknowledge (remove) the front answer after successful delivery.
-    pub fn ack_answer(&self, terminal_id: u64) -> bool {
-        self.state.lock().unwrap().ack_answer(terminal_id)
     }
 
     /// Get the port the service is listening on (test-only)
@@ -386,35 +329,6 @@ impl OpenCodeHookService {
             return Ok(());
         }
 
-        if method == "GET" && path == "/answer" {
-            let answer = state.lock().unwrap().peek_answer(terminal_id);
-            if let Some(answer) = answer {
-                let body = match serde_json::to_string(&answer) {
-                    Ok(json) => json,
-                    Err(_) => {
-                        Self::write_response(&mut stream, 500, "Internal Server Error")?;
-                        return Ok(());
-                    }
-                };
-                Self::write_json_response(&mut stream, 200, &body)?;
-            } else {
-                Self::write_response(&mut stream, 204, "No Content")?;
-            }
-
-            return Ok(());
-        }
-
-        if method == "POST" && path == "/answer/ack" {
-            let acked = state.lock().unwrap().ack_answer(terminal_id);
-            if acked {
-                Self::write_response(&mut stream, 204, "No Content")?;
-            } else {
-                Self::write_response(&mut stream, 410, "Gone")?;
-            }
-
-            return Ok(());
-        }
-
         Self::write_response(&mut stream, 404, "Not Found")?;
         Ok(())
     }
@@ -545,18 +459,11 @@ impl Drop for OpenCodeHookService {
 /// Generate the OpenCode plugin JavaScript source
 pub fn get_opencode_plugin_source() -> String {
     r#"const HOOK_PATH = "/hook";
-const ANSWER_PATH = "/answer";
 const sessionParents = new Map();
-const pendingQuestions = new Map();
 
 function getHookUrl() {
   const port = process.env.MERGEN_OPENCODE_HOOK_PORT;
   return port ? `http://127.0.0.1:${port}${HOOK_PATH}` : null;
-}
-
-function getAnswerUrl() {
-  const port = process.env.MERGEN_OPENCODE_HOOK_PORT;
-  return port ? `http://127.0.0.1:${port}${ANSWER_PATH}` : null;
 }
 
 function getStatusType(event) {
@@ -653,80 +560,7 @@ async function postStatus(status, event) {
   }
 }
 
-const ackedAnswers = new Set();
-
-async function ackAnswer(requestId) {
-  const url = getAnswerUrl();
-  const token = process.env.MERGEN_OPENCODE_HOOK_TOKEN;
-  const terminalId = process.env.MERGEN_OPENCODE_TERMINAL_ID;
-  if (!url || !token || !terminalId || !requestId) return;
-  try {
-    await fetch(`${url}/ack`, {
-      method: "POST",
-      headers: {
-        "X-Mergen-Token": token,
-        "X-Mergen-OpenCode-Terminal-Id": terminalId,
-      },
-    });
-  } catch {
-    // ignore ack errors
-  }
-}
-
-async function pollForAnswers(client) {
-  const url = getAnswerUrl();
-  const token = process.env.MERGEN_OPENCODE_HOOK_TOKEN;
-  const terminalId = process.env.MERGEN_OPENCODE_TERMINAL_ID;
-  if (!url || !token || !terminalId) return;
-
-  // Feature-detect OpenCode SDK question APIs
-  const canReply = typeof client?.question?.reply === "function";
-  const canReject = typeof client?.question?.reject === "function";
-  if (!canReply && !canReject) return;
-
-  try {
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
-        "X-Mergen-Token": token,
-        "X-Mergen-OpenCode-Terminal-Id": terminalId,
-      },
-    });
-    if (res.status === 200) {
-      const answer = await res.json();
-      // pendingQuestions tracks prompts observed by this plugin instance, but
-      // answer delivery must not depend on that volatile UI event cache.
-      if (answer?.request_id && !ackedAnswers.has(answer.request_id)) {
-        let delivered = false;
-        try {
-          if (answer.rejected && canReject) {
-            await client.question.reject({ requestID: answer.request_id });
-            delivered = true;
-          } else if (canReply) {
-            await client.question.reply({
-              requestID: answer.request_id,
-              answers: answer.answers,
-            });
-            delivered = true;
-          }
-        } catch {
-          // Delivery failed; leave answer on server queue for retry
-        }
-        if (delivered) {
-          ackedAnswers.add(answer.request_id);
-          pendingQuestions.delete(answer.request_id);
-          await ackAnswer(answer.request_id);
-        }
-      }
-    }
-  } catch {
-    // ignore polling errors
-  }
-}
-
-export const MergenOpenCodeStatusPlugin = async ({ client }) => {
-  const pollInterval = setInterval(() => pollForAnswers(client), 500);
-
+export const MergenOpenCodeStatusPlugin = async () => {
   return {
     event: async ({ event }) => {
       if (!event?.type) return;
@@ -742,16 +576,7 @@ export const MergenOpenCodeStatusPlugin = async ({ client }) => {
         return;
       }
 
-      // Question asked (user input needed) - also maps to permission state
       if (event.type === "question.asked") {
-        const props = event.properties || event;
-        const requestID = props?.id;
-        if (requestID) {
-          pendingQuestions.set(requestID, {
-            sessionID: props.sessionID,
-            questions: props.questions,
-          });
-        }
         await postStatus("permission", event);
         return;
       }
@@ -785,10 +610,6 @@ export const MergenOpenCodeStatusPlugin = async ({ client }) => {
           await postStatus("idle", event);
         }
       }
-    },
-
-    dispose: () => {
-      clearInterval(pollInterval);
     },
   };
 };
@@ -1047,89 +868,6 @@ mod tests {
         assert!(source.contains("if (event?.type)"));
         assert!(source.contains("type: event.type"));
         assert!(source.contains("properties: event.properties"));
-    }
-
-    #[test]
-    fn hook_service_answer_peek_returns_stored_answer() {
-        let mut state = HookServiceState::new("token".to_owned());
-        let answer = OpenCodeQuestionAnswer {
-            request_id: "req-42".to_owned(),
-            answers: vec![vec!["Option A".to_owned()]],
-            rejected: false,
-        };
-        state.store_answer(7, answer.clone());
-
-        // Peek should return the answer without removing it
-        let peeked = state.peek_answer(7);
-        assert!(peeked.is_some());
-        let peeked = peeked.unwrap();
-        assert_eq!(peeked.request_id, "req-42");
-        assert_eq!(peeked.answers, vec![vec!["Option A".to_owned()]]);
-        assert!(!peeked.rejected);
-
-        // Second peek should still return the same answer
-        let peeked2 = state.peek_answer(7);
-        assert!(peeked2.is_some());
-        assert_eq!(peeked2.unwrap().request_id, "req-42");
-
-        // Ack should remove it
-        assert!(state.ack_answer(7));
-        assert!(state.peek_answer(7).is_none());
-    }
-
-    #[test]
-    fn hook_service_answer_peek_returns_none_when_empty() {
-        let state = HookServiceState::new("token".to_owned());
-        assert!(state.peek_answer(7).is_none());
-    }
-
-    #[test]
-    fn hook_service_answer_fifo_ordering() {
-        let mut state = HookServiceState::new("token".to_owned());
-        state.store_answer(
-            7,
-            OpenCodeQuestionAnswer {
-                request_id: "req-1".to_owned(),
-                answers: vec![vec!["A".to_owned()]],
-                rejected: false,
-            },
-        );
-        state.store_answer(
-            7,
-            OpenCodeQuestionAnswer {
-                request_id: "req-2".to_owned(),
-                answers: vec![vec!["B".to_owned()]],
-                rejected: false,
-            },
-        );
-
-        assert_eq!(state.peek_answer(7).unwrap().request_id, "req-1");
-        state.ack_answer(7);
-        assert_eq!(state.peek_answer(7).unwrap().request_id, "req-2");
-        state.ack_answer(7);
-        assert!(state.peek_answer(7).is_none());
-    }
-
-    #[test]
-    fn plugin_answer_polling_does_not_require_seen_pending_question() {
-        let source = get_opencode_plugin_source();
-
-        assert!(
-            source.contains("if (answer?.request_id && !ackedAnswers.has(answer.request_id))"),
-            "plugin should deliver queued answers by request id without requiring cached question metadata"
-        );
-        assert!(
-            !source.contains("pendingQuestions.has(answer.request_id) &&"),
-            "pendingQuestions cache must not block Smart Input answer delivery"
-        );
-        assert!(
-            source.contains("pendingQuestions.delete(answer.request_id);"),
-            "successful delivery should still clean pending question metadata"
-        );
-        assert!(
-            source.contains("await ackAnswer(answer.request_id);"),
-            "successful delivery should still acknowledge the server queue"
-        );
     }
 
     #[test]
