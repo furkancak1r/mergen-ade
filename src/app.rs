@@ -11785,9 +11785,6 @@ impl AdeApp {
                     }
                     self.status_line = format!("OpenCode ACP {chat_id} session created");
                     changed |= queued_prompt_sent;
-                    if self.maybe_promote_standby_to_active(ctx, chat_id) {
-                        changed = true;
-                    }
                 }
                 crate::opencode_acp::AcpChatEvent::AgentMessageChunk { chat_id, text } => {
                     if let Some(session) = self.acp_chat_sessions.get_mut(&chat_id) {
@@ -12209,36 +12206,6 @@ impl AdeApp {
         self.active_acp_chat = Some(chat_id);
         self.status_line = format!("Started OpenCode ACP for {project_name}");
         self.reveal_project_in_foreground_terminal_manager(ctx, project_id);
-    }
-
-    fn maybe_promote_standby_to_active(&mut self, ctx: &egui::Context, chat_id: u64) -> bool {
-        let session = match self.acp_chat_sessions.get(&chat_id) {
-            Some(s) => s,
-            None => return false,
-        };
-        let project_id = session.project_id;
-        if self.acp_standby_chat_by_project.get(&project_id) != Some(&chat_id) {
-            return false;
-        }
-        if !self.projects.contains_key(&project_id) {
-            self.acp_standby_chat_by_project.remove(&project_id);
-            self.kill_acp_chat(chat_id);
-            return false;
-        }
-        if !self.selected_project_allows_acp_auto_promotion(project_id) {
-            return false;
-        }
-        if !Self::acp_session_is_warm(session) {
-            return false;
-        }
-        if self.project_has_visible_acp_chats(project_id) {
-            return false;
-        }
-        self.acp_standby_chat_by_project.remove(&project_id);
-        self.clear_acp_standby_retry(project_id);
-        self.register_active_acp_chat(ctx, project_id, chat_id);
-        self.ensure_acp_standby_for_project(project_id);
-        true
     }
 
     fn promote_standby_to_active_if_present(
@@ -31562,7 +31529,7 @@ impl eframe::App for AdeApp {
                 return;
             }
 
-            // OpenCode ACP mode toggle shortcut (default Tab when OpenCode ACP is active)
+            // OpenCode ACP mode toggle shortcut (default Tab when OpenCode ACP composer is focused)
             if self.active_acp_chat.is_some()
                 && self.config.acp_mode_toggle_shortcut.enabled
                 && !self.show_settings_popup
@@ -31571,6 +31538,9 @@ impl eframe::App for AdeApp {
                 && !self.show_create_worktree_popup
                 && !ctx.memory(|mem| mem.any_popup_open())
                 && !ctx.is_context_menu_open()
+                && self.active_acp_chat.map_or(false, |chat_id| {
+                    ctx.memory(|mem| mem.has_focus(Self::acp_composer_input_id(chat_id)))
+                })
             {
                 let shortcut = &self.config.acp_mode_toggle_shortcut;
                 let key_matches = shortcut.key.eq_ignore_ascii_case("Tab");
@@ -36103,7 +36073,6 @@ fn draw_smart_input_footer(
                                 );
                                 row_ui.painter().galley(index_pos, index_galley, TEXT_MUTED);
                             }
-
                             // Mode badge for queued task (clickable to toggle)
                             let task_mode = state.tasks[index].mode;
                             let (badge_color, badge_fill, badge_stroke) =
@@ -69114,6 +69083,28 @@ mod tests {
         app.acp_standby_chat_by_project.insert(project_id, chat_id);
     }
 
+    #[test]
+    fn standby_session_created_does_not_auto_promote() {
+        let ctx = egui::Context::default();
+        let (mut app, event_tx) = test_app_with_acp_channels([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        insert_standby_test_acp_chat(&mut app, 42, 7);
+        app.selected_project = Some(7);
+
+        event_tx
+            .send(crate::opencode_acp::AcpChatEvent::SessionCreated {
+                chat_id: 42,
+                session_id: "session-42".to_owned(),
+            })
+            .unwrap();
+        app.process_acp_chat_events(&ctx);
+
+        assert_eq!(app.active_acp_chat, None);
+        assert!(!app.acp_chat_ids_by_project.contains_key(&7));
+        assert!(app.acp_standby_chat_by_project.contains_key(&7));
+    }
+
     fn terminal_manager_project_group_is_open(ctx: &egui::Context, project_id: u64) -> bool {
         egui::collapsing_header::CollapsingState::load_with_default_open(
             ctx,
@@ -69182,59 +69173,6 @@ mod tests {
             TerminalManagerFilter::Foreground
         );
         assert!(terminal_manager_project_group_is_open(&ctx, 1));
-    }
-
-    #[test]
-    fn standby_auto_promotion_reveals_foreground_terminal_manager() {
-        let ctx = egui::Context::default();
-        let mut app = test_app([], None);
-        app.projects
-            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
-        insert_standby_test_acp_chat(&mut app, 42, 7);
-        app.selected_project = Some(7);
-        app.config.ui.show_project_explorer = false;
-        app.config.ui.left_sidebar_tab = LeftSidebarTab::Directory;
-        app.config.ui.terminal_manager_filter = TerminalManagerFilter::Background;
-
-        assert!(app.maybe_promote_standby_to_active(&ctx, 42));
-
-        assert_eq!(app.active_acp_chat, Some(42));
-        assert_eq!(
-            app.config.ui.left_sidebar_tab,
-            LeftSidebarTab::TerminalManager
-        );
-        assert_eq!(
-            app.config.ui.terminal_manager_filter,
-            TerminalManagerFilter::Foreground
-        );
-        assert!(terminal_manager_project_group_is_open(&ctx, 7));
-    }
-
-    #[test]
-    fn unselected_standby_promotion_does_not_reveal_terminal_manager() {
-        let ctx = egui::Context::default();
-        let mut app = test_app([], None);
-        app.projects
-            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
-        app.projects
-            .insert(8, test_project(8, "Other", "C:/other", &[], &[]));
-        insert_standby_test_acp_chat(&mut app, 42, 7);
-        app.selected_project = Some(8);
-        app.config.ui.show_project_explorer = false;
-        app.config.ui.left_sidebar_tab = LeftSidebarTab::Directory;
-        app.config.ui.terminal_manager_filter = TerminalManagerFilter::Background;
-        set_terminal_manager_project_group_open(&ctx, 7, false);
-
-        assert!(!app.maybe_promote_standby_to_active(&ctx, 42));
-
-        assert!(!app.config.ui.show_project_explorer);
-        assert_eq!(app.config.ui.left_sidebar_tab, LeftSidebarTab::Directory);
-        assert_eq!(
-            app.config.ui.terminal_manager_filter,
-            TerminalManagerFilter::Background
-        );
-        assert_eq!(app.active_acp_chat, None);
-        assert!(!terminal_manager_project_group_is_open(&ctx, 7));
     }
 
     #[test]
@@ -69554,34 +69492,6 @@ mod tests {
         let target = app.acp_chat_sessions.get(&99).unwrap();
         assert_eq!(target.project_id, 2);
         assert_eq!(target.title, "hello target");
-    }
-
-    #[test]
-    fn switched_project_consumes_target_standby_before_auto_promotion() {
-        let ctx = egui::Context::default();
-        let mut app = test_app([], None);
-        app.projects
-            .insert(1, test_project(1, "One", "C:/one", &[], &[]));
-        app.projects
-            .insert(2, test_project(2, "Two", "C:/two", &[], &[]));
-        insert_visible_test_acp_chat(&mut app, 42, 1, crate::opencode_acp::AcpChatStatus::Idle);
-        insert_standby_test_acp_chat(&mut app, 99, 2);
-        app.active_acp_chat = Some(42);
-
-        assert_eq!(
-            app.move_unstarted_acp_chat_to_project(&ctx, 42, 2),
-            Some(99)
-        );
-
-        assert!(!app.maybe_promote_standby_to_active(&ctx, 99));
-        assert!(!app.acp_chat_sessions.contains_key(&42));
-        assert_eq!(app.active_acp_chat, Some(99));
-        assert_eq!(app.active_acp_chat_by_project.get(&2), Some(&99));
-        assert!(!app.acp_standby_chat_by_project.contains_key(&2));
-        assert_eq!(
-            app.terminal_manager_count_for_project_kind(2, TerminalKind::Foreground),
-            1
-        );
     }
 
     #[test]
@@ -70941,6 +70851,40 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, egui::Event::Text(t) if t == "hello")),
             "text event should remain for ACP composer"
+        );
+        assert!(app.buffered_terminal_input.is_empty());
+    }
+
+    #[test]
+    fn raw_input_hook_acp_mode_toggle_only_when_composer_focused() {
+        use egui::{Context, Event, Key, Modifiers, RawInput};
+
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        insert_visible_test_acp_chat(&mut app, 42, 7, crate::opencode_acp::AcpChatStatus::Idle);
+        app.active_acp_chat = Some(42);
+        app.active_acp_chat_by_project.insert(7, 42);
+        app.selected_project = Some(7);
+
+        let plain_tab = Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::default(),
+        };
+        let mut raw_input = RawInput {
+            events: vec![plain_tab.clone()],
+            ..RawInput::default()
+        };
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(
+            raw_input.events.iter().any(|e| matches!(e, Event::Key { key: Key::Tab, .. })),
+            "Tab should remain when ACP composer is not focused"
         );
         assert!(app.buffered_terminal_input.is_empty());
     }
