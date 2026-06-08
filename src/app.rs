@@ -2593,6 +2593,42 @@ struct SmartInputAttachment {
     path: String,
 }
 
+/// Mode for a Smart Input task: Build (default) or Plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmartInputMode {
+    Build,
+    Plan,
+}
+
+impl SmartInputMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            SmartInputMode::Build => "build",
+            SmartInputMode::Plan => "plan",
+        }
+    }
+
+    fn toggle(&self) -> Self {
+        match self {
+            SmartInputMode::Build => SmartInputMode::Plan,
+            SmartInputMode::Plan => SmartInputMode::Build,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            SmartInputMode::Build => "Build",
+            SmartInputMode::Plan => "Plan",
+        }
+    }
+}
+
+impl Default for SmartInputMode {
+    fn default() -> Self {
+        SmartInputMode::Build
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OpenCodeQuestionOption {
     label: String,
@@ -2615,6 +2651,7 @@ struct SmartInputTask {
     id: u64,
     text: String,
     attachments: Vec<SmartInputAttachment>,
+    mode: SmartInputMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2635,12 +2672,16 @@ struct SmartInputState {
     draft: String,
     draft_attachments: Vec<SmartInputAttachment>,
     draft_return_target: Option<SmartInputDraftReturnTarget>,
+    /// Current mode for the draft; new tasks capture this mode on enqueue.
+    draft_mode: SmartInputMode,
     expanded: bool,
     tasks: Vec<SmartInputTask>,
     next_task_id: u64,
     editing_task_id: Option<u64>,
     edit_draft: String,
     edit_attachments: Vec<SmartInputAttachment>,
+    /// Mode of the task being edited; saved back to the task on save_edit.
+    edit_mode: SmartInputMode,
     dragging_task_id: Option<u64>,
     drag_hover_index: Option<usize>,
     user_height: Option<f32>,
@@ -2653,6 +2694,8 @@ struct SmartInputState {
     history_nav_stash: String,
     /// Original draft attachments saved before entering history navigation.
     history_nav_stash_attachments: Vec<SmartInputAttachment>,
+    /// Original draft mode saved before entering history navigation.
+    history_nav_stash_mode: SmartInputMode,
     /// Next attachment ID counter (shared across draft/queued/edit)
     next_attachment_id: u64,
     /// Stored selection range for draft context menu (preserved before right-click collapses it).
@@ -2674,12 +2717,14 @@ impl Default for SmartInputState {
             draft: String::new(),
             draft_attachments: Vec::new(),
             draft_return_target: None,
+            draft_mode: SmartInputMode::default(),
             expanded: true,
             tasks: Vec::new(),
             next_task_id: 1,
             editing_task_id: None,
             edit_draft: String::new(),
             edit_attachments: Vec::new(),
+            edit_mode: SmartInputMode::default(),
             dragging_task_id: None,
             drag_hover_index: None,
             user_height: None,
@@ -2687,6 +2732,7 @@ impl Default for SmartInputState {
             history_nav_index: None,
             history_nav_stash: String::new(),
             history_nav_stash_attachments: Vec::new(),
+            history_nav_stash_mode: SmartInputMode::default(),
             next_attachment_id: 1,
             draft_context_menu_selection_range: None,
             draft_context_menu_was_open: false,
@@ -2712,10 +2758,12 @@ impl SmartInputState {
             id
         };
         let attachments = std::mem::take(&mut self.draft_attachments);
+        let mode = self.draft_mode;
         let task = SmartInputTask {
             id,
             text: self.draft.clone(),
             attachments,
+            mode,
         };
         if let Some(target) = return_target {
             let insert_index = target.index.min(self.tasks.len());
@@ -2747,6 +2795,7 @@ impl SmartInputState {
         let task = self.tasks.remove(index);
         self.draft = task.text;
         self.draft_attachments = task.attachments;
+        self.draft_mode = task.mode;
         self.draft_return_target = Some(SmartInputDraftReturnTarget { index, task_id });
         self.history_nav_reset();
         self.draft_context_menu_selection_range = None;
@@ -2806,10 +2855,12 @@ impl SmartInputState {
         };
         let text = task.text.clone();
         let attachments = task.attachments.clone();
+        let mode = task.mode;
         self.clear_drag_for_task(task_id);
         self.editing_task_id = Some(task_id);
         self.edit_draft = text;
         self.edit_attachments = attachments;
+        self.edit_mode = mode;
         self.edit_context_menu_selection_range = None;
         self.edit_context_menu_was_open = false;
         true
@@ -2824,6 +2875,7 @@ impl SmartInputState {
         };
         task.text = self.edit_draft.clone();
         task.attachments = std::mem::take(&mut self.edit_attachments);
+        task.mode = self.edit_mode;
         self.cancel_edit();
         true
     }
@@ -2843,6 +2895,7 @@ impl SmartInputState {
             id,
             text: command,
             attachments: Vec::new(),
+            mode: self.draft_mode,
         });
         self.queue_scroll_to_end = true;
     }
@@ -2871,6 +2924,7 @@ impl SmartInputState {
         if self.history_nav_index.is_none() {
             self.history_nav_stash = self.draft.clone();
             self.history_nav_stash_attachments = self.draft_attachments.clone();
+            self.history_nav_stash_mode = self.draft_mode;
             self.history_nav_index = Some(0);
         } else {
             let current = self.history_nav_index.unwrap();
@@ -2899,6 +2953,15 @@ impl SmartInputState {
                 } else {
                     Vec::new()
                 };
+                self.draft_mode = if index < queued_tasks.len() {
+                    let rev_index = queued_tasks.len() - 1 - index;
+                    queued_tasks
+                        .get(rev_index)
+                        .map(|t| t.mode)
+                        .unwrap_or_default()
+                } else {
+                    SmartInputMode::default()
+                };
             }
         }
     }
@@ -2920,6 +2983,7 @@ impl SmartInputState {
         if current == 0 {
             self.draft = self.history_nav_stash.clone();
             self.draft_attachments = std::mem::take(&mut self.history_nav_stash_attachments);
+            self.draft_mode = self.history_nav_stash_mode;
             self.history_nav_index = None;
         } else {
             let new_index = current - 1;
@@ -2944,6 +3008,15 @@ impl SmartInputState {
                 } else {
                     Vec::new()
                 };
+                self.draft_mode = if new_index < queued_tasks.len() {
+                    let rev_index = queued_tasks.len() - 1 - new_index;
+                    queued_tasks
+                        .get(rev_index)
+                        .map(|t| t.mode)
+                        .unwrap_or_default()
+                } else {
+                    SmartInputMode::default()
+                };
             }
         }
     }
@@ -2953,6 +3026,7 @@ impl SmartInputState {
         self.history_nav_index = None;
         self.history_nav_stash.clear();
         self.history_nav_stash_attachments.clear();
+        self.history_nav_stash_mode = SmartInputMode::default();
     }
 }
 
@@ -4189,6 +4263,15 @@ struct TerminalEntry {
     opencode_retry_statuses_this_turn: usize,
     opencode_loop_warning_emitted: bool,
     opencode_loop_limit_emitted: bool,
+    /// Last known OpenCode TUI mode ("build" or "plan") as observed by Mergen.
+    /// Used by Smart Input to decide whether a mode switch is needed before dispatch.
+    opencode_last_known_mode: Option<String>,
+    /// When a mode switch Tab was sent to the terminal but the new mode has not yet
+    /// been observed. Stores the target mode string. Blocks Smart Input dispatch until
+    /// the mode is confirmed or a settle timeout passes.
+    opencode_pending_mode_switch: Option<String>,
+    /// When the pending mode switch was sent; used for settle timing.
+    opencode_pending_mode_switch_since: Option<Instant>,
     /// Pending attention flag for pulse/unread semantics (Orca-compatible)
     /// True when user needs to acknowledge attention (idle/permission after working)
     /// Cleared on terminal focus or keyboard input
@@ -7257,6 +7340,9 @@ impl AdeApp {
             opencode_retry_statuses_this_turn: 0,
             opencode_loop_warning_emitted: false,
             opencode_loop_limit_emitted: false,
+            opencode_last_known_mode: None,
+            opencode_pending_mode_switch: None,
+            opencode_pending_mode_switch_since: None,
             opencode_attention_pending: false,
             opencode_pending_question: None,
             opencode_question_selected: Vec::new(),
@@ -8855,7 +8941,9 @@ impl AdeApp {
             || entry.opencode_attention_reason.is_some()
             || entry.opencode_prompt_submit_since.is_some()
             || entry.opencode_running_since.is_some()
-            || entry.opencode_non_work_slash_settle_until.is_some();
+            || entry.opencode_non_work_slash_settle_until.is_some()
+            || entry.opencode_last_known_mode.is_some()
+            || entry.opencode_pending_mode_switch.is_some();
 
         if entry.ai_session.tool == Some(AiCliTool::OpenCode) {
             entry.ai_session = AiCliSession::default();
@@ -8873,6 +8961,9 @@ impl AdeApp {
         entry.opencode_prompt_submit_since = None;
         entry.opencode_running_since = None;
         entry.opencode_non_work_slash_settle_until = None;
+        entry.opencode_last_known_mode = None;
+        entry.opencode_pending_mode_switch = None;
+        entry.opencode_pending_mode_switch_since = None;
         Self::clear_opencode_pending_question_state(entry);
         entry.dirty = true;
         changed
@@ -12110,10 +12201,10 @@ impl AdeApp {
             .get(&project_id)
             .map(|p| p.name.as_str())
             .unwrap_or("project");
-        self.acp_chat_ids_by_project
-            .entry(project_id)
-            .or_default()
-            .push(chat_id);
+        let entry = self.acp_chat_ids_by_project.entry(project_id).or_default();
+        if !entry.contains(&chat_id) {
+            entry.push(chat_id);
+        }
         self.active_acp_chat_by_project.insert(project_id, chat_id);
         self.active_acp_chat = Some(chat_id);
         self.status_line = format!("Started OpenCode ACP for {project_name}");
@@ -12408,6 +12499,41 @@ impl AdeApp {
 
     fn acp_chat_project_change_allowed(session: &crate::opencode_acp::AcpChatSession) -> bool {
         !Self::acp_chat_has_started(session)
+    }
+
+    /// Returns a display title for the given chat, disambiguating multiple unstarted chats
+    /// in the same project with numeric suffixes (e.g. "OpenCode ACP", "OpenCode ACP 2").
+    fn acp_chat_display_title_for_ui(&self, chat_id: u64) -> String {
+        let session = match self.acp_chat_sessions.get(&chat_id) {
+            Some(s) => s,
+            None => return "OpenCode ACP".to_owned(),
+        };
+        let base = acp_chat_display_title(session);
+        if acp_chat_has_started_state(session) {
+            return base;
+        }
+        let project_id = self
+            .acp_effective_project_for_chat(chat_id)
+            .unwrap_or(session.project_id);
+        if let Some(chat_ids) = self.acp_chat_ids_by_project.get(&project_id) {
+            let unstarted: Vec<u64> = chat_ids
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    self.acp_chat_sessions
+                        .get(&id)
+                        .is_some_and(|s| !acp_chat_has_started_state(s))
+                })
+                .collect();
+            if unstarted.len() > 1 {
+                if let Some(pos) = unstarted.iter().position(|&id| id == chat_id) {
+                    if pos > 0 {
+                        return format!("{base} {}", pos + 1);
+                    }
+                }
+            }
+        }
+        base
     }
 
     fn acp_current_config_value<'a>(
@@ -13049,19 +13175,6 @@ impl AdeApp {
         if !force_new {
             if let Some(chat_ids) = self.acp_chat_ids_by_project.get(&project_id) {
                 if let Some(&last_chat_id) = chat_ids.last() {
-                    if self
-                        .acp_chat_sessions
-                        .get(&last_chat_id)
-                        .is_some_and(Self::acp_session_is_warm)
-                    {
-                        self.active_acp_chat_by_project
-                            .insert(project_id, last_chat_id);
-                        self.active_acp_chat = Some(last_chat_id);
-                        self.status_line = format!("Switched to OpenCode ACP for {project_name}");
-                        self.reveal_project_in_foreground_terminal_manager(ctx, project_id);
-                        self.ensure_acp_standby_for_project(project_id);
-                        return Some(last_chat_id);
-                    }
                     if self.acp_chat_sessions.contains_key(&last_chat_id) {
                         self.active_acp_chat_by_project
                             .insert(project_id, last_chat_id);
@@ -13083,35 +13196,26 @@ impl AdeApp {
             self.status_line = "OpenCode hazırlanıyor...".to_owned();
             return None;
         }
+        // force_new: always create a fresh visible chat, never reuse an existing one.
         if let Some(chat_id) = self.promote_standby_to_active_if_present(ctx, project_id) {
             return Some(chat_id);
         }
-        if let Some(chat_ids) = self.acp_chat_ids_by_project.get(&project_id) {
-            if let Some(&last_chat_id) = chat_ids.last() {
-                if self
-                    .acp_chat_sessions
-                    .get(&last_chat_id)
-                    .is_some_and(Self::acp_session_is_warm)
-                {
-                    self.active_acp_chat_by_project
-                        .insert(project_id, last_chat_id);
-                    self.active_acp_chat = Some(last_chat_id);
-                    self.status_line = format!("Switched to OpenCode ACP for {project_name}");
-                    self.reveal_project_in_foreground_terminal_manager(ctx, project_id);
-                    self.ensure_acp_standby_for_project(project_id);
-                    return Some(last_chat_id);
-                }
+        let project_path = self.projects.get(&project_id)?.path.clone();
+        match self.spawn_acp_process(project_id, project_path) {
+            Ok(chat_id) => {
+                self.register_active_acp_chat(ctx, project_id, chat_id);
+                self.ensure_acp_standby_for_project(project_id);
+                Some(chat_id)
+            }
+            Err(err) => {
+                self.status_line = format!("OpenCode ACP başlatılamadı: {err}");
+                None
             }
         }
-        self.ensure_acp_standby_for_project(project_id);
-        if let Some(chat_id) = self.promote_standby_to_active_if_present(ctx, project_id) {
-            return Some(chat_id);
-        }
-        self.status_line = "OpenCode hazırlanıyor...".to_owned();
-        None
     }
 
     fn kill_acp_chat(&mut self, chat_id: u64) {
+        let project_id = self.acp_effective_project_for_chat(chat_id);
         if let Some(session) = self.acp_chat_sessions.remove(&chat_id) {
             let _ = session.send_cancel();
             if let Some(ref service) = self.browser_mcp_service {
@@ -13128,7 +13232,22 @@ impl AdeApp {
         self.acp_standby_chat_by_project
             .retain(|_, &mut id| id != chat_id);
         if self.active_acp_chat == Some(chat_id) {
-            self.active_acp_chat = None;
+            // If the project still has other visible chats, activate the most recent one.
+            if let Some(project_id) = project_id {
+                if let Some(chat_ids) = self.acp_chat_ids_by_project.get(&project_id) {
+                    if let Some(&other_chat_id) = chat_ids.last() {
+                        self.active_acp_chat = Some(other_chat_id);
+                        self.active_acp_chat_by_project
+                            .insert(project_id, other_chat_id);
+                    } else {
+                        self.active_acp_chat = None;
+                    }
+                } else {
+                    self.active_acp_chat = None;
+                }
+            } else {
+                self.active_acp_chat = None;
+            }
         }
         if self.acp_focus_input_chat_next_frame == Some(chat_id) {
             self.acp_focus_input_chat_next_frame = None;
@@ -13972,6 +14091,14 @@ impl AdeApp {
         had_question
     }
 
+    /// Send raw input bytes to the terminal PTY so that OpenCode TUI questions
+    /// receive the same keystrokes that the Smart Input UI processes.
+    fn send_opencode_question_terminal_input(terminal: &mut TerminalEntry, bytes: Vec<u8>) {
+        if !terminal.exited {
+            terminal.runtime.send_bytes(bytes);
+        }
+    }
+
     fn normalize_opencode_question_focus_index(entry: &mut TerminalEntry) {
         let Some(question) = entry.opencode_pending_question.as_ref() else {
             entry.opencode_question_focus_index = 0;
@@ -14146,7 +14273,14 @@ impl AdeApp {
                     handled = match key {
                         Key::ArrowDown | Key::ArrowRight if !custom_focused => {
                             if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
-                                if Self::move_opencode_question_focus(terminal, 1) {
+                                let changed = Self::move_opencode_question_focus(terminal, 1);
+                                let seq = if matches!(key, Key::ArrowRight) {
+                                    vec![0x1b, b'[', b'C']
+                                } else {
+                                    vec![0x1b, b'[', b'B']
+                                };
+                                Self::send_opencode_question_terminal_input(terminal, seq);
+                                if changed {
                                     ctx.request_repaint();
                                 }
                             }
@@ -14154,7 +14288,14 @@ impl AdeApp {
                         }
                         Key::ArrowUp | Key::ArrowLeft if !custom_focused => {
                             if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
-                                if Self::move_opencode_question_focus(terminal, -1) {
+                                let changed = Self::move_opencode_question_focus(terminal, -1);
+                                let seq = if matches!(key, Key::ArrowLeft) {
+                                    vec![0x1b, b'[', b'D']
+                                } else {
+                                    vec![0x1b, b'[', b'A']
+                                };
+                                Self::send_opencode_question_terminal_input(terminal, seq);
+                                if changed {
                                     ctx.request_repaint();
                                 }
                             }
@@ -14164,7 +14305,14 @@ impl AdeApp {
                             ctx.memory_mut(|mem| mem.surrender_focus(custom_id));
                             if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                                 let delta = if matches!(key, Key::ArrowDown) { 1 } else { -1 };
-                                if Self::move_opencode_question_focus(terminal, delta) {
+                                let changed = Self::move_opencode_question_focus(terminal, delta);
+                                let seq = if delta.is_positive() {
+                                    vec![0x1b, b'[', b'B']
+                                } else {
+                                    vec![0x1b, b'[', b'A']
+                                };
+                                Self::send_opencode_question_terminal_input(terminal, seq);
+                                if changed {
                                     ctx.request_repaint();
                                 }
                             }
@@ -14176,7 +14324,9 @@ impl AdeApp {
                         }
                         Key::Space if !custom_focused => {
                             if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
-                                if Self::select_focused_opencode_question_choice(terminal) {
+                                let changed = Self::select_focused_opencode_question_choice(terminal);
+                                Self::send_opencode_question_terminal_input(terminal, vec![b' ']);
+                                if changed {
                                     ctx.request_repaint();
                                 }
                             }
@@ -18370,36 +18520,52 @@ impl AdeApp {
     }
 
     fn submit_opencode_question_answer(&mut self, terminal_id: u64) {
-        let Some(terminal) = self.terminals.get(&terminal_id) else {
-            return;
-        };
-        let Some(ref question) = terminal.opencode_pending_question else {
-            return;
-        };
+        let (answer, send_custom_text) = {
+            let Some(terminal) = self.terminals.get(&terminal_id) else {
+                return;
+            };
+            let Some(ref question) = terminal.opencode_pending_question else {
+                return;
+            };
 
-        let mut answers: Vec<Vec<String>> = Vec::new();
-        let focused_custom = Self::opencode_question_custom_choice_index(question)
-            == Some(terminal.opencode_question_focus_index);
-        if focused_custom && question.custom && !terminal.opencode_question_custom.is_empty() {
-            answers.push(vec![terminal.opencode_question_custom.clone()]);
-        } else if !terminal.opencode_question_selected.is_empty() {
-            answers.push(terminal.opencode_question_selected.clone());
-        } else if question.custom && !terminal.opencode_question_custom.is_empty() {
-            answers.push(vec![terminal.opencode_question_custom.clone()]);
-        }
+            let mut answers: Vec<Vec<String>> = Vec::new();
+            let focused_custom = Self::opencode_question_custom_choice_index(question)
+                == Some(terminal.opencode_question_focus_index);
+            if focused_custom && question.custom && !terminal.opencode_question_custom.is_empty() {
+                answers.push(vec![terminal.opencode_question_custom.clone()]);
+            } else if !terminal.opencode_question_selected.is_empty() {
+                answers.push(terminal.opencode_question_selected.clone());
+            } else if question.custom && !terminal.opencode_question_custom.is_empty() {
+                answers.push(vec![terminal.opencode_question_custom.clone()]);
+            }
 
-        let request_id = question.request_id.clone();
-        let answer = OpenCodeQuestionAnswer {
-            request_id,
-            answers,
-            rejected: false,
+            let request_id = question.request_id.clone();
+            let answer = OpenCodeQuestionAnswer {
+                request_id,
+                answers,
+                rejected: false,
+            };
+
+            let send_custom_text = focused_custom
+                && question.custom
+                && !terminal.opencode_question_custom.is_empty();
+            (answer, send_custom_text)
         };
 
         if let Some(ref hook_service) = self.opencode_hook_service {
             hook_service.store_answer(terminal_id, answer);
         }
 
+        // Send the answer to the terminal TUI as well so OpenCode receives it
+        // even when the hook bridge plugin cannot deliver.
         if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+            if send_custom_text {
+                let text = terminal.opencode_question_custom.clone();
+                Self::send_opencode_question_terminal_input(terminal, text.into_bytes());
+                Self::send_opencode_question_terminal_input(terminal, vec![b'\r']);
+            } else {
+                Self::send_opencode_question_terminal_input(terminal, vec![b'\r']);
+            }
             Self::clear_opencode_pending_question_state(terminal);
         }
 
@@ -18432,7 +18598,10 @@ impl AdeApp {
             hook_service.store_answer(terminal_id, answer);
         }
 
+        // Send Escape to the terminal TUI so OpenCode receives the rejection
+        // even when the hook bridge plugin cannot deliver.
         if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+            Self::send_opencode_question_terminal_input(terminal, vec![0x1b]);
             Self::clear_opencode_pending_question_state(terminal);
         }
 
@@ -23525,7 +23694,14 @@ impl AdeApp {
                 project_id: self
                     .acp_effective_project_for_chat(chat_id)
                     .unwrap_or(session.project_id),
-                title: acp_terminal_manager_row_label(session),
+                title: if acp_chat_has_started_state(session) {
+                    format!(
+                        "OpenCode ACP - {}",
+                        self.acp_chat_display_title_for_ui(chat_id)
+                    )
+                } else {
+                    self.acp_chat_display_title_for_ui(chat_id)
+                },
                 status: session.status,
                 attention_reason: self
                     .acp_terminal_manager_attention_by_chat
@@ -24717,10 +24893,10 @@ impl AdeApp {
                 thread_ui.spacing_mut().item_spacing.x = 8.0;
                 if let Some(chat_ids) = self.acp_chat_ids_by_project.get(&project_id).cloned() {
                     for cid in chat_ids {
-                        if let Some(session) = self.acp_chat_sessions.get(&cid) {
+                        if let Some(_session) = self.acp_chat_sessions.get(&cid) {
                             let is_active = cid == chat_id;
                             let label =
-                                format!("{} {}", icons::CHAT_TEXT, acp_chat_display_title(session));
+                                format!("{} {}", icons::CHAT_TEXT, self.acp_chat_display_title_for_ui(cid));
                             let btn = thread_ui.add(
                                 egui::Button::new(
                                     RichText::new(label).size(12.0).color(if is_active {
@@ -31275,8 +31451,10 @@ impl eframe::App for AdeApp {
                 events = remaining_events;
             }
 
-            // Smart Input Tab passthrough: plain Tab is forwarded to the terminal
-            // while Smart Input keeps focus so egui focus traversal is skipped.
+            // Smart Input Tab: plain Tab toggles draft mode while Smart Input keeps focus.
+            // This lets users queue tasks in alternating Plan/Build modes without leaving
+            // the Smart Input draft. The mode change is local to Mergen; the actual TUI
+            // mode switch happens just-in-time when the task is dispatched.
             if let Some(request) = self.focused_smart_input_submit_request(ctx) {
                 let terminal_id = match request {
                     SmartInputSubmitRequest::Draft { terminal_id } => terminal_id,
@@ -31308,11 +31486,8 @@ impl eframe::App for AdeApp {
                 if tab_pressed {
                     if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                         if Self::terminal_smart_input_visible(terminal) {
-                            Self::clear_terminal_selection(terminal);
-                            reset_terminal_prompt_scroll_anchor(terminal);
-                            terminal.runtime.send_bytes(vec![b'\t']);
-                            reset_opencode_manual_scroll_detached(terminal);
-                            terminal.dirty = true;
+                            terminal.smart_input.draft_mode =
+                                terminal.smart_input.draft_mode.toggle();
                             ctx.request_repaint();
                         }
                     }
@@ -35475,6 +35650,38 @@ fn draw_smart_input_footer(
                         .strong()
                         .color(TEXT_PRIMARY),
                 );
+                // Draft mode pill
+                let draft_mode = terminal.smart_input.draft_mode;
+                let (pill_color, pill_fill, pill_stroke) = if draft_mode == SmartInputMode::Plan {
+                    (
+                        Color32::from_rgb(200, 140, 60),
+                        Color32::from_rgb(40, 28, 16),
+                        Color32::from_rgb(140, 100, 40),
+                    )
+                } else {
+                    (
+                        Color32::from_rgb(180, 180, 180),
+                        Color32::from_rgb(34, 34, 34),
+                        Color32::from_rgb(70, 70, 70),
+                    )
+                };
+                let pill_btn = ui
+                    .add_sized(
+                        egui::vec2(44.0, 18.0),
+                        egui::Button::new(
+                            RichText::new(draft_mode.label())
+                                .size(11.0)
+                                .color(pill_color),
+                        )
+                        .fill(pill_fill)
+                        .rounding(6.0)
+                        .stroke(Stroke::new(1.0, pill_stroke)),
+                    )
+                    .on_hover_text("Click or press Tab to toggle draft mode");
+                if pill_btn.clicked() {
+                    terminal.smart_input.draft_mode = terminal.smart_input.draft_mode.toggle();
+                    action.request_keyboard_focus(SmartInputFocusTarget::Draft);
+                }
                 if has_queued_tasks {
                     ui.add_space(6.0);
                     ui.label(RichText::new(status_text).small().color(status_color));
@@ -35592,8 +35799,31 @@ fn draw_smart_input_footer(
                                 }
                             });
                             if row_response.clicked() {
+                                let old_focus = terminal.opencode_question_focus_index;
+                                let delta = index as isize - old_focus as isize;
+                                if delta > 0 {
+                                    for _ in 0..delta {
+                                        AdeApp::send_opencode_question_terminal_input(
+                                            terminal,
+                                            vec![0x1b, b'[', b'B'],
+                                        );
+                                    }
+                                } else if delta < 0 {
+                                    for _ in 0..(-delta) {
+                                        AdeApp::send_opencode_question_terminal_input(
+                                            terminal,
+                                            vec![0x1b, b'[', b'A'],
+                                        );
+                                    }
+                                }
                                 terminal.opencode_question_focus_index = index;
                                 AdeApp::select_focused_opencode_question_choice(terminal);
+                                if question.multiple {
+                                    AdeApp::send_opencode_question_terminal_input(
+                                        terminal,
+                                        vec![b' '],
+                                    );
+                                }
                                 action.request_keyboard_focus(SmartInputFocusTarget::Draft);
                             }
                         }
@@ -35643,6 +35873,23 @@ fn draw_smart_input_footer(
                                     .color(TEXT_PRIMARY),
                             );
                             if row_response.clicked() {
+                                let old_focus = terminal.opencode_question_focus_index;
+                                let delta = index as isize - old_focus as isize;
+                                if delta > 0 {
+                                    for _ in 0..delta {
+                                        AdeApp::send_opencode_question_terminal_input(
+                                            terminal,
+                                            vec![0x1b, b'[', b'B'],
+                                        );
+                                    }
+                                } else if delta < 0 {
+                                    for _ in 0..(-delta) {
+                                        AdeApp::send_opencode_question_terminal_input(
+                                            terminal,
+                                            vec![0x1b, b'[', b'A'],
+                                        );
+                                    }
+                                }
                                 terminal.opencode_question_focus_index = index;
                                 terminal.opencode_question_selected.clear();
                                 action.request_keyboard_focus(
@@ -35855,6 +36102,63 @@ fn draw_smart_input_footer(
                                     row_rect.center().y - (index_galley.size().y * 0.5),
                                 );
                                 row_ui.painter().galley(index_pos, index_galley, TEXT_MUTED);
+                            }
+
+                            // Mode badge for queued task (clickable to toggle)
+                            let task_mode = state.tasks[index].mode;
+                            let (badge_color, badge_fill, badge_stroke) =
+                                if task_mode == SmartInputMode::Plan {
+                                    (
+                                        Color32::from_rgb(200, 140, 60),
+                                        Color32::from_rgb(40, 28, 16),
+                                        Color32::from_rgb(140, 100, 40),
+                                    )
+                                } else {
+                                    (
+                                        Color32::from_rgb(180, 180, 180),
+                                        Color32::from_rgb(34, 34, 34),
+                                        Color32::from_rgb(70, 70, 70),
+                                    )
+                                };
+                            let badge_width = 36.0f32;
+                            let (badge_rect, badge_response) = row_ui.allocate_exact_size(
+                                egui::vec2(badge_width, SMART_INPUT_TASK_ROW_HEIGHT),
+                                Sense::click(),
+                            );
+                            if row_ui.is_rect_visible(badge_rect) {
+                                row_ui.painter().rect_filled(
+                                    badge_rect.shrink2(egui::vec2(2.0, 6.0)),
+                                    4.0,
+                                    badge_fill,
+                                );
+                                row_ui.painter().rect_stroke(
+                                    badge_rect.shrink2(egui::vec2(2.0, 6.0)),
+                                    4.0,
+                                    Stroke::new(1.0, badge_stroke),
+                                );
+                                let badge_galley = WidgetText::from(
+                                    RichText::new(task_mode.label())
+                                        .size(10.0)
+                                        .color(badge_color),
+                                )
+                                .into_galley(
+                                    &row_ui,
+                                    Some(TextWrapMode::Truncate),
+                                    badge_rect.width() - 4.0,
+                                    egui::TextStyle::Body,
+                                );
+                                let badge_pos = egui::pos2(
+                                    badge_rect.left() + 2.0,
+                                    row_rect.center().y - (badge_galley.size().y * 0.5),
+                                );
+                                row_ui.painter().galley(badge_pos, badge_galley, badge_color);
+                            }
+                            if badge_response.clicked() {
+                                state.tasks[index].mode = state.tasks[index].mode.toggle();
+                                action.request_keyboard_focus(SmartInputFocusTarget::Draft);
+                            }
+                            if badge_response.hovered() {
+                                row_ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                             }
 
                             if is_editing {
@@ -39478,7 +39782,7 @@ mod tests {
         NativeImagePasteTarget, OpenCodeAttentionReason, OpenCodeQuestionInfo,
         OpenCodeQuestionOption, OpenCodeStatusSource, OpenCodeTransportStatus, OsNotificationKind,
         PendingConfigChanges, PendingOsNotification, PendingRerunPhase, PendingTerminalLinkClick,
-        SettingsSection, SmartInputAttachment, SmartInputState, SmartInputSubmitRequest,
+        SettingsSection, SmartInputAttachment, SmartInputMode, SmartInputState, SmartInputSubmitRequest,
         SmartInputTask, SourceControlBadgeState, SourceControlFile, SourceControlRefreshState,
         SourceControlSnapshot, TerminalCursorOverlay, TerminalEntry,
         TerminalManagerDiffSummaryVisual, TerminalNavigationDirection, TerminalNavigationShortcut,
@@ -50627,6 +50931,9 @@ mod tests {
             opencode_retry_statuses_this_turn: 0,
             opencode_loop_warning_emitted: false,
             opencode_loop_limit_emitted: false,
+            opencode_last_known_mode: None,
+            opencode_pending_mode_switch: None,
+            opencode_pending_mode_switch_since: None,
             opencode_attention_pending: false,
             opencode_pending_question: None,
             opencode_question_selected: Vec::new(),
@@ -64010,6 +64317,7 @@ mod tests {
                 id: 1,
                 text: "queued".to_owned(),
                 attachments: Vec::new(),
+                mode: SmartInputMode::Build,
             });
 
         app.process_smart_input_queues(&ctx);
@@ -64071,6 +64379,7 @@ mod tests {
                 id: 1,
                 text: "must stay queued".to_owned(),
                 attachments: Vec::new(),
+                mode: SmartInputMode::Build,
             });
         }
 
@@ -64682,6 +64991,7 @@ mod tests {
             id: 1,
             text: "task".to_owned(),
             attachments: Vec::new(),
+            mode: SmartInputMode::Build,
         });
         state.start_edit(1);
         state.edit_context_menu_selection_range = Some(egui::text::CCursorRange::two(
@@ -64703,6 +65013,7 @@ mod tests {
             id: 1,
             text: "task".to_owned(),
             attachments: Vec::new(),
+            mode: SmartInputMode::Build,
         });
         state.edit_context_menu_selection_range = Some(egui::text::CCursorRange::two(
             egui::text::CCursor::new(0),
@@ -65260,6 +65571,7 @@ mod tests {
             id: 1,
             text: "test".to_owned(),
             attachments: Vec::new(),
+            mode: SmartInputMode::Build,
         });
         assert!(AdeApp::smart_input_auto_dispatch_ready(&terminal));
     }
@@ -65275,6 +65587,7 @@ mod tests {
             id: 1,
             text: "test".to_owned(),
             attachments: Vec::new(),
+            mode: SmartInputMode::Build,
         });
         assert!(!AdeApp::smart_input_auto_dispatch_ready(&terminal));
     }
@@ -65291,6 +65604,7 @@ mod tests {
             id: 1,
             text: "test".to_owned(),
             attachments: Vec::new(),
+            mode: SmartInputMode::Build,
         });
         assert!(!AdeApp::smart_input_auto_dispatch_ready(&terminal));
     }
@@ -65308,6 +65622,7 @@ mod tests {
             id: 1,
             text: "test".to_owned(),
             attachments: Vec::new(),
+            mode: SmartInputMode::Build,
         });
         assert!(!AdeApp::smart_input_auto_dispatch_ready(&terminal));
     }
@@ -66823,11 +67138,13 @@ mod tests {
             id: 1,
             text: "queued task one".to_owned(),
             attachments: Vec::new(),
+            mode: SmartInputMode::Build,
         });
         terminal.smart_input.tasks.push(SmartInputTask {
             id: 2,
             text: "queued task two".to_owned(),
             attachments: Vec::new(),
+            mode: SmartInputMode::Build,
         });
         terminal.recent_inputs.push_front("recent input".to_owned());
 
@@ -69343,6 +69660,124 @@ mod tests {
             app.terminal_manager_live_count_for_project_kind(2, TerminalKind::Foreground),
             1
         );
+    }
+
+    #[test]
+    fn force_new_acp_creates_distinct_visible_chat_for_same_project() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        insert_visible_test_acp_chat(&mut app, 42, 7, crate::opencode_acp::AcpChatStatus::Idle);
+        app.active_acp_chat = Some(42);
+        app.active_acp_chat_by_project.insert(7, 42);
+        app.next_acp_chat_id = 100;
+
+        // Simulate a new chat request with force_new=true by directly spawning a new process.
+        // Since we can't spawn a real process in tests, we manually register a second chat.
+        let (session_two, _rx) =
+            crate::opencode_acp::test_session_for_app(99, 7, Some("session-99".to_owned()));
+        app.acp_chat_sessions.insert(99, session_two);
+        app.register_active_acp_chat(&ctx, 7, 99);
+
+        assert_eq!(app.acp_chat_ids_by_project.get(&7).unwrap().len(), 2);
+        assert!(app.acp_chat_ids_by_project.get(&7).unwrap().contains(&42));
+        assert!(app.acp_chat_ids_by_project.get(&7).unwrap().contains(&99));
+        assert_eq!(app.active_acp_chat, Some(99));
+        assert_eq!(app.active_acp_chat_by_project.get(&7), Some(&99));
+    }
+
+    #[test]
+    fn register_active_acp_chat_deduplicates_chat_ids() {
+        let ctx = egui::Context::default();
+        let mut app = test_app([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        let (session, _rx) =
+            crate::opencode_acp::test_session_for_app(42, 7, Some("session-42".to_owned()));
+        app.acp_chat_sessions.insert(42, session);
+
+        app.register_active_acp_chat(&ctx, 7, 42);
+        app.register_active_acp_chat(&ctx, 7, 42);
+
+        assert_eq!(app.acp_chat_ids_by_project.get(&7).unwrap().len(), 1);
+        assert_eq!(app.acp_chat_ids_by_project.get(&7).unwrap()[0], 42);
+    }
+
+    #[test]
+    fn closing_active_acp_selects_remaining_project_chat() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        insert_visible_test_acp_chat(&mut app, 42, 7, crate::opencode_acp::AcpChatStatus::Idle);
+        insert_visible_test_acp_chat(&mut app, 99, 7, crate::opencode_acp::AcpChatStatus::Idle);
+        app.active_acp_chat = Some(42);
+        app.active_acp_chat_by_project.insert(7, 42);
+
+        app.kill_acp_chat(42);
+
+        assert!(!app.acp_chat_sessions.contains_key(&42));
+        assert_eq!(app.active_acp_chat, Some(99));
+        assert_eq!(app.active_acp_chat_by_project.get(&7), Some(&99));
+    }
+
+    #[test]
+    fn closing_last_acp_clears_active_chat() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        insert_visible_test_acp_chat(&mut app, 42, 7, crate::opencode_acp::AcpChatStatus::Idle);
+        app.active_acp_chat = Some(42);
+        app.active_acp_chat_by_project.insert(7, 42);
+
+        app.kill_acp_chat(42);
+
+        assert!(!app.acp_chat_sessions.contains_key(&42));
+        assert_eq!(app.active_acp_chat, None);
+        assert!(!app.active_acp_chat_by_project.contains_key(&7));
+    }
+
+    #[test]
+    fn terminal_manager_counts_multiple_acp_chats_for_same_project() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        insert_visible_test_acp_chat(&mut app, 42, 7, crate::opencode_acp::AcpChatStatus::Idle);
+        insert_visible_test_acp_chat(&mut app, 99, 7, crate::opencode_acp::AcpChatStatus::Idle);
+
+        assert_eq!(
+            app.terminal_manager_count_for_project_kind(7, TerminalKind::Foreground),
+            2
+        );
+        assert_eq!(app.acp_terminal_manager_chat_count_for_project(7), 2);
+    }
+
+    #[test]
+    fn unstarted_chat_titles_disambiguate_in_same_project() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        insert_visible_test_acp_chat(&mut app, 42, 7, crate::opencode_acp::AcpChatStatus::Idle);
+        insert_visible_test_acp_chat(&mut app, 99, 7, crate::opencode_acp::AcpChatStatus::Idle);
+
+        assert_eq!(app.acp_chat_display_title_for_ui(42), "OpenCode ACP");
+        assert_eq!(app.acp_chat_display_title_for_ui(99), "OpenCode ACP 2");
+    }
+
+    #[test]
+    fn started_chat_title_skips_disambiguation() {
+        let mut app = test_app([], None);
+        app.projects
+            .insert(7, test_project(7, "ACP", "C:/acp", &[], &[]));
+        insert_visible_test_acp_chat(&mut app, 42, 7, crate::opencode_acp::AcpChatStatus::Idle);
+        {
+            let session = app.acp_chat_sessions.get_mut(&42).unwrap();
+            AdeApp::append_acp_user_prompt_state(session, "first prompt");
+        }
+        insert_visible_test_acp_chat(&mut app, 99, 7, crate::opencode_acp::AcpChatStatus::Idle);
+
+        assert_eq!(app.acp_chat_display_title_for_ui(42), "first prompt");
+        assert_eq!(app.acp_chat_display_title_for_ui(99), "OpenCode ACP");
     }
 
     #[test]

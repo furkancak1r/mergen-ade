@@ -510,9 +510,9 @@ pub const DEFAULT_OPENCODE_LOOP_PROTECTION_ENABLED: bool = true;
 pub const DEFAULT_OPENCODE_BUILD_STEPS_LIMIT: u32 = 32;
 pub const DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS: u64 = 600_000;
 pub const DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS: u64 = 120_000;
-pub const DEFAULT_OPENCODE_KIMI_STRICT_PERMISSIONS: bool = true;
 pub const DEFAULT_OPENCODE_ACP_BIND_MODEL_TO_MODE: bool = true;
 pub const DEFAULT_OPENCODE_ACP_AUTO_APPROVE_PERMISSIONS: bool = false;
+pub const DEFAULT_OPENCODE_KIMI_STRICT_PERMISSIONS: bool = true;
 
 /// OpenCode model configuration with two switchable slots and ACP favorites.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -549,12 +549,14 @@ pub struct OpenCodeModelConfig {
     /// Fireworks streamed chunk timeout in milliseconds.
     #[serde(default = "default_opencode_fireworks_chunk_timeout_ms")]
     pub fireworks_chunk_timeout_ms: u64,
-    /// Use stricter build permissions for Kimi-family models.
-    #[serde(default = "default_opencode_kimi_strict_permissions")]
-    pub kimi_strict_permissions: bool,
     /// Automatically approve ACP permission requests without user interaction.
     #[serde(default = "default_opencode_acp_auto_approve_permissions")]
     pub acp_auto_approve_permissions: bool,
+    /// When enabled (default), write restrictive build permissions for Kimi-family
+    /// models into the terminal runtime opencode.json. When disabled, write permissive
+    /// permissions so OpenCode build mode does not prompt for approval.
+    #[serde(default = "default_opencode_kimi_strict_permissions")]
+    pub kimi_strict_permissions: bool,
 }
 
 impl Default for OpenCodeModelConfig {
@@ -572,8 +574,8 @@ impl Default for OpenCodeModelConfig {
             build_steps_limit: DEFAULT_OPENCODE_BUILD_STEPS_LIMIT,
             fireworks_timeout_ms: DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS,
             fireworks_chunk_timeout_ms: DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS,
-            kimi_strict_permissions: DEFAULT_OPENCODE_KIMI_STRICT_PERMISSIONS,
             acp_auto_approve_permissions: DEFAULT_OPENCODE_ACP_AUTO_APPROVE_PERMISSIONS,
+            kimi_strict_permissions: DEFAULT_OPENCODE_KIMI_STRICT_PERMISSIONS,
         };
         config.ensure_configured_models_are_favorites();
         config
@@ -596,16 +598,16 @@ fn default_opencode_fireworks_chunk_timeout_ms() -> u64 {
     DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS
 }
 
-fn default_opencode_kimi_strict_permissions() -> bool {
-    DEFAULT_OPENCODE_KIMI_STRICT_PERMISSIONS
-}
-
 fn default_opencode_acp_bind_model_to_mode() -> bool {
     DEFAULT_OPENCODE_ACP_BIND_MODEL_TO_MODE
 }
 
 fn default_opencode_acp_auto_approve_permissions() -> bool {
     DEFAULT_OPENCODE_ACP_AUTO_APPROVE_PERMISSIONS
+}
+
+fn default_opencode_kimi_strict_permissions() -> bool {
+    DEFAULT_OPENCODE_KIMI_STRICT_PERMISSIONS
 }
 
 impl OpenCodeModelConfig {
@@ -1396,7 +1398,6 @@ mod tests {
             config.fireworks_chunk_timeout_ms,
             DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS
         );
-        assert!(config.kimi_strict_permissions);
         assert!(config.is_acp_model_favorite(&config.build_model_slot_a));
         assert!(config.is_acp_model_favorite(&config.build_model_slot_b));
         assert!(config.is_acp_model_favorite(config.effective_plan_model()));
@@ -1450,9 +1451,9 @@ mod tests {
             acp_bind_model_to_mode: false,
             loop_protection_enabled: false,
             build_steps_limit: 12,
+            kimi_strict_permissions: false,
             fireworks_timeout_ms: 700_000,
             fireworks_chunk_timeout_ms: 180_000,
-            kimi_strict_permissions: false,
             acp_auto_approve_permissions: false,
         };
 
@@ -1473,7 +1474,6 @@ mod tests {
         assert_eq!(deserialized.build_steps_limit, 12);
         assert_eq!(deserialized.fireworks_timeout_ms, 700_000);
         assert_eq!(deserialized.fireworks_chunk_timeout_ms, 180_000);
-        assert!(!deserialized.kimi_strict_permissions);
     }
 
     #[test]
@@ -1502,7 +1502,6 @@ mod tests {
             config.effective_fireworks_chunk_timeout_ms(),
             DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS
         );
-        assert!(config.kimi_strict_permissions);
     }
 
     #[test]

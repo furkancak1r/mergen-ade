@@ -2,6 +2,31 @@
   
 ---
 
+#### OpenCode terminal build mode izin sorma (Strict Kimi permissions) {#opencode-build-permissions-ask}
+- Date: 2026-06-08
+- Context: User reported that OpenCode build mode inside a Mergen terminal asks for permission approvals even though they want full automatic permission.
+- Error signature:
+  1. Mergen config had `kimi_strict_permissions = true` (default).
+  2. The active build model was a Kimi-family model (`fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo`).
+  3. Mergen's runtime config generator (`apply_build_agent_safety`) only wrote restrictive `ask`/`deny` permissions when strict mode was on, and wrote nothing when strict mode was off, leaving the runtime config ambiguous and dependent on OpenCode's global config merging behavior.
+- Symptoms/Impact:
+  1. OpenCode build mode prompted for `edit`, `bash`, and other tool approvals on every turn.
+  2. Disabling "Strict Kimi permissions" in Settings did not guarantee permissive behavior because the runtime config omitted explicit `allow` rules.
+- Root cause:
+  - `apply_build_agent_safety` had an `if` branch for strict mode but no `else` branch for permissive mode. When strict was off, only `doom_loop: allow` was written; all other permissions were left unset in the runtime config.
+- Resolution:
+  - Added an `else` branch in `apply_build_agent_safety` that explicitly writes permissive permissions (`* = allow`, `edit = allow`, `task = allow`, `external_directory = allow`, `bash = allow`) when `kimi_strict_permissions` is disabled or the build model is not Kimi.
+  - Added regression tests:
+    - `runtime_defaults_patch_uses_permissive_permissions_when_kimi_strict_is_false`
+    - `write_terminal_runtime_config_with_defaults_uses_permissive_permissions_when_strict_off`
+- Prevent recurrence:
+  - Updated AGENTS.md with the "OpenCode build permissions must be explicit in runtime configs" guideline.
+  - Recorded this entry in KNOWN_ISSUES.md.
+- Files/Commands touched: `src/opencode_config.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-08
+
+---
+
 #### OpenCode terminal + ACP aynı anda açıkken klavye/focus çakışması {#opencode-terminal-acp-focus-collision}
 - Date: 2026-06-08
 - Context: User reported that when both an OpenCode terminal and OpenCode ACP are open simultaneously, they "collide" — the user cannot switch between them, and cannot type anything into the ACP area.

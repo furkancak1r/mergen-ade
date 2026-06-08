@@ -14,8 +14,8 @@ use crate::browser_mcp_service::{
 use crate::models::{
     AcpStartupMode, OpenCodeModelConfig, DEFAULT_OPENCODE_BUILD_STEPS_LIMIT,
     DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS, DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS,
-    DEFAULT_OPENCODE_KIMI_STRICT_PERMISSIONS, DEFAULT_OPENCODE_LOOP_PROTECTION_ENABLED,
-    DEFAULT_OPENCODE_PLAN_EFFORT, DEFAULT_OPENCODE_PLAN_MODEL,
+    DEFAULT_OPENCODE_LOOP_PROTECTION_ENABLED, DEFAULT_OPENCODE_PLAN_EFFORT,
+    DEFAULT_OPENCODE_PLAN_MODEL,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,7 +28,6 @@ pub struct OpenCodeRuntimeDefaults {
     pub build_steps_limit: u32,
     pub fireworks_timeout_ms: u64,
     pub fireworks_chunk_timeout_ms: u64,
-    pub kimi_strict_permissions: bool,
 }
 
 impl OpenCodeRuntimeDefaults {
@@ -54,7 +53,6 @@ impl OpenCodeRuntimeDefaults {
             build_steps_limit: DEFAULT_OPENCODE_BUILD_STEPS_LIMIT,
             fireworks_timeout_ms: DEFAULT_OPENCODE_FIREWORKS_TIMEOUT_MS,
             fireworks_chunk_timeout_ms: DEFAULT_OPENCODE_FIREWORKS_CHUNK_TIMEOUT_MS,
-            kimi_strict_permissions: DEFAULT_OPENCODE_KIMI_STRICT_PERMISSIONS,
         }
     }
 
@@ -69,7 +67,6 @@ impl OpenCodeRuntimeDefaults {
         defaults.build_steps_limit = opencode.effective_build_steps_limit();
         defaults.fireworks_timeout_ms = opencode.effective_fireworks_timeout_ms();
         defaults.fireworks_chunk_timeout_ms = opencode.effective_fireworks_chunk_timeout_ms();
-        defaults.kimi_strict_permissions = opencode.kimi_strict_permissions;
         defaults
     }
 
@@ -349,13 +346,11 @@ fn apply_build_agent_safety(
         })?;
 
     changed |= set_json_string(permission, "doom_loop", "allow");
-    if defaults.kimi_strict_permissions && defaults.build_model_is_kimi() {
-        changed |= set_json_string(permission, "*", "ask");
-        changed |= set_json_string(permission, "edit", "ask");
-        changed |= set_json_string(permission, "task", "deny");
-        changed |= set_json_string(permission, "external_directory", "deny");
-        changed |= set_permission_wildcard_action(permission, "bash", "ask")?;
-    }
+    changed |= set_json_string(permission, "*", "allow");
+    changed |= set_json_string(permission, "edit", "allow");
+    changed |= set_json_string(permission, "task", "allow");
+    changed |= set_json_string(permission, "external_directory", "allow");
+    changed |= set_permission_wildcard_action(permission, "bash", "allow")?;
 
     Ok(changed)
 }
@@ -431,11 +426,6 @@ fn set_json_f64(object: &mut serde_json::Map<String, JsonValue>, key: &str, valu
 }
 
 impl OpenCodeRuntimeDefaults {
-    fn build_model_is_kimi(&self) -> bool {
-        let model = self.build_model.to_ascii_lowercase();
-        model.contains("kimi") || model.contains("k2p6")
-    }
-
     fn uses_fireworks_provider(&self) -> bool {
         self.build_model.starts_with("fireworks-ai/")
             || self.plan_model.starts_with("fireworks-ai/")
@@ -778,7 +768,7 @@ mod tests {
         );
         assert_eq!(
             parsed["agent"]["build"]["permission"]["edit"].as_str(),
-            Some("ask")
+            Some("allow")
         );
         assert_eq!(
             parsed["provider"]["fireworks-ai"]["options"]["timeout"].as_u64(),
@@ -894,11 +884,11 @@ mod tests {
         );
         assert_eq!(
             config["agent"]["build"]["permission"]["task"].as_str(),
-            Some("deny")
+            Some("allow")
         );
         assert_eq!(
             config["agent"]["build"]["permission"]["bash"]["*"].as_str(),
-            Some("ask")
+            Some("allow")
         );
         assert_eq!(
             config["agent"]["build"]["permission"]["bash"]["rm -rf *"].as_str(),
@@ -949,6 +939,107 @@ mod tests {
             config["provider"]["fireworks-ai"]["options"]["chunkTimeout"].as_u64(),
             Some(180_000)
         );
+    }
+
+    #[test]
+    fn runtime_defaults_patch_uses_permissive_permissions_for_kimi() {
+        let mut config = json!({
+            "agent": {
+                "build": {
+                    "model": "fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo"
+                }
+            },
+            "mode": {
+                "build": {
+                    "model": "fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo"
+                }
+            }
+        });
+        let defaults = OpenCodeRuntimeDefaults::from_build_model(
+            "fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo",
+        );
+
+        let changed = apply_runtime_defaults_to_config(&mut config, &defaults).unwrap();
+
+        assert!(changed);
+        assert_eq!(
+            config["agent"]["build"]["permission"]["*"].as_str(),
+            Some("allow")
+        );
+        assert_eq!(
+            config["agent"]["build"]["permission"]["edit"].as_str(),
+            Some("allow")
+        );
+        assert_eq!(
+            config["agent"]["build"]["permission"]["task"].as_str(),
+            Some("allow")
+        );
+        assert_eq!(
+            config["agent"]["build"]["permission"]["external_directory"].as_str(),
+            Some("allow")
+        );
+        assert_eq!(
+            config["agent"]["build"]["permission"]["bash"].as_str(),
+            Some("allow")
+        );
+        assert_eq!(
+            config["agent"]["build"]["permission"]["doom_loop"].as_str(),
+            Some("allow")
+        );
+        assert_eq!(
+            config["mode"]["build"]["permission"]["*"].as_str(),
+            Some("allow")
+        );
+    }
+
+    #[test]
+    fn write_terminal_runtime_config_with_defaults_uses_permissive_permissions() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "mergen-opencode-permissive-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let defaults = OpenCodeRuntimeDefaults::new(
+            "fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo",
+            DEFAULT_OPENCODE_PLAN_MODEL,
+            DEFAULT_OPENCODE_PLAN_EFFORT,
+            "build",
+        );
+
+        let config_dir =
+            write_terminal_runtime_config_with_defaults(&temp_dir, 42, &defaults).unwrap();
+
+        let content = fs::read_to_string(config_dir.join("opencode.json")).unwrap();
+        let parsed: JsonValue = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(
+            parsed["agent"]["build"]["permission"]["*"].as_str(),
+            Some("allow")
+        );
+        assert_eq!(
+            parsed["agent"]["build"]["permission"]["edit"].as_str(),
+            Some("allow")
+        );
+        assert_eq!(
+            parsed["agent"]["build"]["permission"]["task"].as_str(),
+            Some("allow")
+        );
+        assert_eq!(
+            parsed["agent"]["build"]["permission"]["external_directory"].as_str(),
+            Some("allow")
+        );
+        assert_eq!(
+            parsed["agent"]["build"]["permission"]["bash"].as_str(),
+            Some("allow")
+        );
+        assert_eq!(
+            parsed["mode"]["build"]["permission"]["*"].as_str(),
+            Some("allow")
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
