@@ -147,6 +147,7 @@ const OPENCODE_TERMINAL_LOOP_LIMIT_TOOL_CALLS: usize =
 /// Prevents stale delayed Idle events from the previous turn from immediately triggering
 /// back-to-back dispatch of the next queued task.
 const SMART_INPUT_AUTO_DISPATCH_SETTLE_MS: u64 = 300;
+const OPENCODE_MODE_SWITCH_SETTLE_MS: u64 = 250;
 /// Settle duration after OpenCode slash commands that do not start work, such as /new.
 /// Keeps queued Smart Input tasks from racing the slash-menu confirmation Enters.
 const OPENCODE_NON_WORK_SLASH_SETTLE_MS: u64 = SHORTCUT_SECOND_ENTER_DELAY_MS * 2 + 100;
@@ -9080,6 +9081,10 @@ impl AdeApp {
         }
         if !entry.opencode_session_active {
             entry.opencode_session_active = true;
+            if entry.opencode_last_known_mode.is_none() {
+                entry.opencode_last_known_mode =
+                    Some(self.config.acp_startup_mode.as_mode_id().to_owned());
+            }
             changed = true;
         }
         if entry.opencode_process_identity != Some(identity) {
@@ -18315,6 +18320,74 @@ impl AdeApp {
         })
     }
 
+    fn opencode_effective_mode(terminal: &TerminalEntry, fallback: &str) -> String {
+        terminal
+            .opencode_last_known_mode
+            .clone()
+            .unwrap_or_else(|| fallback.to_owned())
+    }
+
+    fn opencode_toggle_mode_id(mode: &str) -> String {
+        if crate::opencode_acp::mode_is_plan(mode) {
+            "build".to_owned()
+        } else {
+            "plan".to_owned()
+        }
+    }
+
+    fn opencode_mode_switch_settled(terminal: &TerminalEntry) -> bool {
+        terminal
+            .opencode_pending_mode_switch_since
+            .is_some_and(|since| {
+                since.elapsed() >= Duration::from_millis(OPENCODE_MODE_SWITCH_SETTLE_MS)
+            })
+    }
+
+    fn note_opencode_last_known_mode(terminal: &mut TerminalEntry, mode: SmartInputMode) {
+        terminal.opencode_last_known_mode = Some(mode.as_str().to_owned());
+        terminal.opencode_pending_mode_switch = None;
+        terminal.opencode_pending_mode_switch_since = None;
+    }
+
+    fn smart_input_prepare_opencode_mode(
+        &mut self,
+        terminal_id: u64,
+        target_mode: SmartInputMode,
+    ) -> bool {
+        let fallback = self.config.acp_startup_mode.as_mode_id();
+        let target = target_mode.as_str();
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+        if terminal.ai_session.tool != Some(AiCliTool::OpenCode) {
+            return true;
+        }
+
+        if let Some(pending) = terminal.opencode_pending_mode_switch.clone() {
+            if Self::opencode_mode_switch_settled(terminal) {
+                terminal.opencode_last_known_mode = Some(target.to_owned());
+                terminal.opencode_pending_mode_switch = None;
+                terminal.opencode_pending_mode_switch_since = None;
+                return true;
+            }
+            return false;
+        }
+
+        let current = Self::opencode_effective_mode(terminal, fallback);
+        if current == target {
+            return true;
+        }
+
+        if let Some(tab_bytes) = Self::key_to_terminal_bytes(Key::Tab, egui::Modifiers::NONE) {
+            Self::send_opencode_question_terminal_input(terminal, tab_bytes);
+        }
+        let toggled = Self::opencode_toggle_mode_id(&current);
+        terminal.opencode_pending_mode_switch = Some(target.to_owned());
+        terminal.opencode_pending_mode_switch_since = Some(Instant::now());
+        terminal.opencode_last_known_mode = Some(toggled);
+        false
+    }
+
     fn smart_input_auto_dispatch_ready(terminal: &TerminalEntry) -> bool {
         if !Self::terminal_smart_input_visible(terminal) {
             return false;
@@ -18389,6 +18462,7 @@ impl AdeApp {
                         (
                             *terminal_id,
                             task.id,
+                            task.mode,
                             task.text.clone(),
                             task.attachments.clone(),
                         )
@@ -18398,7 +18472,10 @@ impl AdeApp {
             .flatten()
             .collect::<Vec<_>>();
 
-        for (terminal_id, task_id, text, attachments) in ready {
+        for (terminal_id, task_id, task_mode, text, attachments) in ready {
+            if !self.smart_input_prepare_opencode_mode(terminal_id, task_mode) {
+                continue;
+            }
             // Send image attachments first as bracketed paste paths
             if !attachments.is_empty() {
                 for att in &attachments {
@@ -18424,6 +18501,7 @@ impl AdeApp {
                     TerminalPromptSubmitOptions::smart_auto(),
                 ) {
                     if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                        Self::note_opencode_last_known_mode(terminal, task_mode);
                         let _ = terminal.smart_input.remove_task(task_id);
                     }
                     self.status_line = format!("Smart Input sent queued {tool_label} task");
@@ -18435,6 +18513,7 @@ impl AdeApp {
                     TerminalPromptSubmitOptions::smart_auto(),
                 ) {
                     if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                        Self::note_opencode_last_known_mode(terminal, task_mode);
                         let _ = terminal.smart_input.remove_task(task_id);
                     }
                     self.status_line = "Smart Input sent queued image task".to_owned();
@@ -18599,16 +18678,23 @@ impl AdeApp {
         }
 
         if let Some((task_id, attachments)) = action.send_task_now {
-            let Some((text, _)) = self.terminals.get(&terminal_id).and_then(|terminal| {
+            let Some((text, task_mode, _)) = self.terminals.get(&terminal_id).and_then(|terminal| {
                 terminal
                     .smart_input
                     .tasks
                     .iter()
                     .find(|task| task.id == task_id)
-                    .map(|task| (task.text.clone(), task.attachments.clone()))
+                    .map(|task| (task.text.clone(), task.mode, task.attachments.clone()))
             }) else {
                 return;
             };
+            if !self.smart_input_prepare_opencode_mode(terminal_id, task_mode) {
+                self.status_line = format!(
+                    "Smart Input switching OpenCode to {} mode",
+                    task_mode.label()
+                );
+                return;
+            }
             // Send image attachments first
             if !attachments.is_empty() {
                 for att in &attachments {
@@ -18625,6 +18711,7 @@ impl AdeApp {
                     TerminalPromptSubmitOptions::smart_manual(),
                 ) {
                     if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                        Self::note_opencode_last_known_mode(terminal, task_mode);
                         let _ = terminal.smart_input.remove_task(task_id);
                     }
                     self.status_line = "Smart Input sent queued task now".to_owned();
@@ -18636,6 +18723,7 @@ impl AdeApp {
                     TerminalPromptSubmitOptions::smart_manual(),
                 ) {
                     if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                        Self::note_opencode_last_known_mode(terminal, task_mode);
                         let _ = terminal.smart_input.remove_task(task_id);
                     }
                     self.status_line = "Smart Input sent image task now".to_owned();

@@ -1,5 +1,10 @@
 # Fixes
 
+## Smart Input queued task mode switch (2026-06-08)
+
+- Wrong: `process_smart_input_queues` ignored `task.mode`; prompts sent in current OpenCode TUI mode (Plan)
+- Correct: `smart_input_prepare_opencode_mode` sends Tab to TUI when task mode differs, waits 250ms settle, then dispatches
+
 ## ACP welcome layout (2026-06-02)
 
 - Wrong: composer always bottom-aligned with thread/header chrome
