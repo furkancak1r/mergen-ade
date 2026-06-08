@@ -1,5 +1,10 @@
 # Fixes
 
+## Smart Input Kimi thought-loop guard (2026-06-08)
+
+- Wrong: After Done auto-dispatch could send the next queued task while Kimi K2.6 was stuck in a repetitive thinking loop that briefly reported Idle/TurnComplete
+- Correct: `opencode_thinking_guard` samples terminal snapshot thought windows; `smart_input_auto_dispatch_ready_for_terminal` blocks auto-dispatch when repetitive pattern or `opencode_loop_limit_emitted`; manual Send Now unchanged
+
 ## Smart Input queued task mode switch (2026-06-08)
 
 - Wrong: `process_smart_input_queues` ignored `task.mode`; prompts sent in current OpenCode TUI mode (Plan)

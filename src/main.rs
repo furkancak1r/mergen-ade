@@ -40,6 +40,7 @@ mod opencode;
 mod opencode_acp;
 mod opencode_config;
 mod opencode_hook_service;
+mod opencode_thinking_guard;
 mod path_utils;
 mod terminal;
 mod title;

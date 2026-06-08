@@ -72,6 +72,10 @@ use crate::opencode::{
     OPENCODE_TURN_COMPLETE_EVENT,
 };
 use crate::opencode_hook_service::{OpenCodeHookService, OpenCodeQuestionAnswer};
+use crate::opencode_thinking_guard::{
+    detect_repetitive_thought_pattern, extract_thought_window, push_thought_sample,
+    thought_loop_cleared, THOUGHT_SAMPLE_INTERVAL_MS,
+};
 use crate::terminal::{
     try_terminal_selection_snapshot, try_terminal_snapshots, TerminalColor, TerminalCursor,
     TerminalCursorShape, TerminalDimensions, TerminalRuntime, TerminalSelectionLine,
@@ -4264,6 +4268,9 @@ struct TerminalEntry {
     opencode_retry_statuses_this_turn: usize,
     opencode_loop_warning_emitted: bool,
     opencode_loop_limit_emitted: bool,
+    opencode_thought_samples: VecDeque<String>,
+    opencode_thought_loop_blocked: bool,
+    opencode_last_thought_sample_at: Option<Instant>,
     /// Last known OpenCode TUI mode ("build" or "plan") as observed by Mergen.
     /// Used by Smart Input to decide whether a mode switch is needed before dispatch.
     opencode_last_known_mode: Option<String>,
@@ -7341,6 +7348,9 @@ impl AdeApp {
             opencode_retry_statuses_this_turn: 0,
             opencode_loop_warning_emitted: false,
             opencode_loop_limit_emitted: false,
+            opencode_thought_samples: VecDeque::new(),
+            opencode_thought_loop_blocked: false,
+            opencode_last_thought_sample_at: None,
             opencode_last_known_mode: None,
             opencode_pending_mode_switch: None,
             opencode_pending_mode_switch_since: None,
@@ -11150,12 +11160,91 @@ impl AdeApp {
         let changed = entry.opencode_tool_calls_this_turn != 0
             || entry.opencode_retry_statuses_this_turn != 0
             || entry.opencode_loop_warning_emitted
-            || entry.opencode_loop_limit_emitted;
+            || entry.opencode_loop_limit_emitted
+            || entry.opencode_thought_loop_blocked
+            || !entry.opencode_thought_samples.is_empty()
+            || entry.opencode_last_thought_sample_at.is_some();
         entry.opencode_tool_calls_this_turn = 0;
         entry.opencode_retry_statuses_this_turn = 0;
         entry.opencode_loop_warning_emitted = false;
         entry.opencode_loop_limit_emitted = false;
+        entry.opencode_thought_samples.clear();
+        entry.opencode_thought_loop_blocked = false;
+        entry.opencode_last_thought_sample_at = None;
         changed
+    }
+
+    fn opencode_thought_loop_protection_active(&self) -> bool {
+        self.config.opencode.loop_protection_enabled
+            && opencode_model_has_kimi_loop_risk(self.config.opencode.active_build_model())
+    }
+
+    fn note_opencode_thought_sample(&mut self, terminal_id: u64) {
+        if !self.opencode_thought_loop_protection_active() {
+            return;
+        }
+        let Some(entry) = self.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        if entry.ai_session.tool != Some(AiCliTool::OpenCode)
+            || !entry.opencode_session_active
+            || entry.opencode_normalized_status != Some(OpenCodeTransportStatus::Working)
+        {
+            return;
+        }
+        let now = Instant::now();
+        if entry.opencode_last_thought_sample_at.is_some_and(|last| {
+            last.elapsed() < Duration::from_millis(THOUGHT_SAMPLE_INTERVAL_MS)
+        }) {
+            return;
+        }
+        let Some(sample) = extract_thought_window(&entry.render_cache) else {
+            return;
+        };
+        entry.opencode_last_thought_sample_at = Some(now);
+        push_thought_sample(&mut entry.opencode_thought_samples, sample);
+        let samples: Vec<String> = entry
+            .opencode_thought_samples
+            .iter()
+            .cloned()
+            .collect();
+        let repetitive = detect_repetitive_thought_pattern(&samples);
+        if repetitive {
+            entry.opencode_thought_loop_blocked = true;
+            self.status_line =
+                "Smart Input bekliyor: Kimi düşünme döngüsü algılandı".to_owned();
+        } else if entry.opencode_thought_loop_blocked && thought_loop_cleared(&samples) {
+            entry.opencode_thought_loop_blocked = false;
+        }
+    }
+
+    fn smart_input_thought_loop_blocks_dispatch(&self, terminal: &TerminalEntry) -> bool {
+        if !self.opencode_thought_loop_protection_active() {
+            return false;
+        }
+        if terminal.ai_session.tool != Some(AiCliTool::OpenCode) {
+            return false;
+        }
+        if terminal.opencode_loop_limit_emitted || terminal.opencode_thought_loop_blocked {
+            return true;
+        }
+        let Some(sample) = extract_thought_window(&terminal.render_cache) else {
+            return false;
+        };
+        let mut samples = terminal
+            .opencode_thought_samples
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        samples.push(sample);
+        detect_repetitive_thought_pattern(&samples)
+    }
+
+    fn smart_input_auto_dispatch_ready_for_terminal(&self, terminal: &TerminalEntry) -> bool {
+        if !Self::smart_input_auto_dispatch_ready(terminal) {
+            return false;
+        }
+        !self.smart_input_thought_loop_blocks_dispatch(terminal)
     }
 
     fn note_opencode_tool_activity(&mut self, terminal_id: u64) -> bool {
@@ -18457,7 +18546,8 @@ impl AdeApp {
             .terminals
             .iter()
             .filter_map(|(terminal_id, terminal)| {
-                Self::smart_input_auto_dispatch_ready(terminal).then(|| {
+                self.smart_input_auto_dispatch_ready_for_terminal(terminal)
+                    .then(|| {
                     terminal.smart_input.tasks.first().map(|task| {
                         (
                             *terminal_id,
@@ -29536,6 +29626,7 @@ impl AdeApp {
             paste_requested,
             link_to_open,
             smart_input_action,
+            thought_sample_after_snapshot,
         ) = {
             let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
                 return;
@@ -29548,6 +29639,7 @@ impl AdeApp {
             let mut paste_requested = false;
             let mut link_to_open = None;
             let mut smart_input_action = SmartInputPaneAction::default();
+            let mut thought_sample_after_snapshot = false;
             let header_chrome = terminal_header_chrome(is_active);
             let pane_width = pane_size.x.max(96.0);
             let pane_height = pane_size.y.max(124.0);
@@ -29827,6 +29919,7 @@ impl AdeApp {
                         // Atomic snapshot pair: when selection exists, both snapshots come from
                         // the same locked state so copy/link hit-testing matches the rendered frame.
                         Self::apply_terminal_snapshot(terminal, snapshot, selection_snapshot);
+                        thought_sample_after_snapshot = true;
                         self.snapshot_budget_count += 1;
                         // Reset backoff on successful snapshot
                         self.terminal_refresh_backoff_ms = TERMINAL_FALLBACK_REFRESH_MS;
@@ -30399,8 +30492,13 @@ impl AdeApp {
                 paste_requested,
                 link_to_open,
                 smart_input_action,
+                thought_sample_after_snapshot,
             )
         };
+
+        if thought_sample_after_snapshot {
+            self.note_opencode_thought_sample(terminal_id);
+        }
 
         if close_requested {
             self.close_terminal(ui.ctx(), terminal_id);
@@ -35381,6 +35479,13 @@ fn smart_input_status_text(terminal: &TerminalEntry) -> (&'static str, Color32) 
             }
             None => ("Claude session starting", TEXT_MUTED),
         };
+    }
+
+    if terminal.opencode_thought_loop_blocked {
+        return (
+            "Kimi düşünme döngüsü - kuyruk bekliyor",
+            Color32::from_rgb(220, 170, 60),
+        );
     }
 
     match terminal.opencode_normalized_status {
@@ -50988,6 +51093,9 @@ mod tests {
             opencode_retry_statuses_this_turn: 0,
             opencode_loop_warning_emitted: false,
             opencode_loop_limit_emitted: false,
+            opencode_thought_samples: VecDeque::new(),
+            opencode_thought_loop_blocked: false,
+            opencode_last_thought_sample_at: None,
             opencode_last_known_mode: None,
             opencode_pending_mode_switch: None,
             opencode_pending_mode_switch_since: None,
@@ -65682,6 +65790,134 @@ mod tests {
             mode: SmartInputMode::Build,
         });
         assert!(!AdeApp::smart_input_auto_dispatch_ready(&terminal));
+    }
+
+    fn test_long_thought_line(prefix: &str) -> String {
+        format!(
+            "{prefix} I need to reconsider the same approach and keep evaluating the options carefully before proceeding with the next implementation step."
+        )
+    }
+
+    fn test_thought_snapshot(lines: &[String]) -> TerminalSnapshot {
+        TerminalSnapshot {
+            lines: lines
+                .iter()
+                .map(|text| TerminalStyledLine {
+                    runs: vec![TerminalStyledRun {
+                        text: text.clone(),
+                        style: test_terminal_style(),
+                        column: 0,
+                        display_width: text.chars().count().max(1),
+                    }],
+                })
+                .collect(),
+            cursor: None,
+            cursor_line: None,
+        }
+    }
+
+    fn seed_opencode_thought_loop_blocked(app: &mut AdeApp, terminal_id: u64) {
+        seed_opencode_attention(app, terminal_id, OpenCodeAttentionReason::TurnComplete);
+        app.config.opencode.loop_protection_enabled = true;
+        let sample = test_long_thought_line("loop");
+        let Some(terminal) = app.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        terminal.opencode_thought_loop_blocked = true;
+        terminal.opencode_last_known_mode = Some("build".to_owned());
+        terminal.opencode_thought_samples = VecDeque::from([
+            sample.clone(),
+            sample.clone(),
+            sample,
+        ]);
+        terminal.render_cache = test_thought_snapshot(&[
+            test_long_thought_line("loop"),
+        ]);
+        terminal.smart_input.tasks.push(SmartInputTask {
+            id: 1,
+            text: "queued".to_owned(),
+            attachments: Vec::new(),
+            mode: SmartInputMode::Build,
+        });
+    }
+
+    #[test]
+    fn smart_input_auto_dispatch_ready_false_when_thought_loop_blocked() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        seed_opencode_thought_loop_blocked(&mut app, 1);
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(AdeApp::smart_input_auto_dispatch_ready(terminal));
+        assert!(!app.smart_input_auto_dispatch_ready_for_terminal(terminal));
+    }
+
+    #[test]
+    fn process_smart_input_queues_skips_dispatch_when_thought_loop_blocked() {
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        seed_opencode_thought_loop_blocked(&mut app, 1);
+
+        app.process_smart_input_queues(&ctx);
+        capture.drain();
+
+        assert!(capture.bytes().is_empty());
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.smart_input.tasks.len(), 1);
+        assert_eq!(terminal.smart_input.tasks[0].text, "queued");
+    }
+
+    #[test]
+    fn thought_loop_guard_resets_on_prompt_submit() {
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_thought_loop_blocked(&mut app, 1);
+        let _ = app.apply_opencode_transport_status(
+            1,
+            OpenCodeTransportStatus::Working,
+            OpenCodeStatusSource::PromptSubmit,
+            None,
+        );
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(!terminal.opencode_thought_loop_blocked);
+        assert!(terminal.opencode_thought_samples.is_empty());
+    }
+
+    #[test]
+    fn manual_send_task_now_still_works_when_thought_loop_blocked() {
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        seed_opencode_thought_loop_blocked(&mut app, 1);
+        let task_id = app
+            .terminals
+            .get(&1)
+            .expect("terminal 1")
+            .smart_input
+            .tasks[0]
+            .id;
+
+        app.handle_smart_input_pane_action(
+            &ctx,
+            1,
+            super::SmartInputPaneAction {
+                send_task_now: Some((task_id, Vec::new())),
+                ..super::SmartInputPaneAction::default()
+            },
+        );
+        capture.drain();
+
+        assert_eq!(capture.bytes(), b"\x1b[200~queued\x1b[201~\r".to_vec());
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(terminal.smart_input.tasks.is_empty());
     }
 
     #[test]
