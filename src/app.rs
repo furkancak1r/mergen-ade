@@ -347,6 +347,9 @@ const ACP_COMPOSER_ICON_MUTED: Color32 = Color32::from_rgb(190, 190, 190);
 const ACP_COMPOSER_SEND_ACTIVE_FILL: Color32 = Color32::from_rgb(230, 230, 230);
 const ACP_COMPOSER_SEND_PAINT_INSET: f32 = 2.0;
 const ACP_COMPOSER_SEND_ICON_SIZE: f32 = 16.0;
+const SMART_INPUT_MODE_SELECTOR_WIDTH: f32 = 50.0;
+const SMART_INPUT_MODE_SELECTOR_HEIGHT: f32 = 22.0;
+const SMART_INPUT_MODE_SELECTOR_GAP: f32 = 6.0;
 const ACP_COMPOSER_ATTACHMENT_ROW_HEIGHT: f32 = 24.0;
 const ACP_COMPOSER_BELOW_CAPSULE_GAP: f32 = 4.0;
 const ACP_COMPOSER_PERMISSION_CARD_HEIGHT: f32 = 60.0;
@@ -35322,46 +35325,6 @@ fn draw_smart_input_footer(
                         .strong()
                         .color(TEXT_PRIMARY),
                 );
-                if show_opencode_mode_ui {
-                    let draft_mode = terminal.smart_input.draft_mode;
-                    let (pill_color, pill_fill, pill_stroke) =
-                        if draft_mode == SmartInputMode::Plan {
-                            (
-                                Color32::from_rgb(200, 140, 60),
-                                Color32::from_rgb(40, 28, 16),
-                                Color32::from_rgb(140, 100, 40),
-                            )
-                        } else {
-                            (
-                                Color32::from_rgb(180, 180, 180),
-                                Color32::from_rgb(34, 34, 34),
-                                Color32::from_rgb(70, 70, 70),
-                            )
-                        };
-                    let (pill_rect, pill_response) = ui.allocate_exact_size(
-                        egui::vec2(44.0, 18.0),
-                        egui::Sense::click(),
-                    );
-                    paint_smart_input_mode_chip(
-                        ui,
-                        pill_rect,
-                        draft_mode.label(),
-                        11.0,
-                        pill_color,
-                        pill_fill,
-                        Stroke::new(1.0, pill_stroke),
-                        6.0,
-                    );
-                    let pill_btn = pill_response
-                        .on_hover_text("Click or press Tab to toggle draft mode");
-                    if pill_btn.clicked() {
-                        terminal.smart_input.draft_mode = terminal.smart_input.draft_mode.toggle();
-                        action.request_keyboard_focus(SmartInputFocusTarget::Draft);
-                    }
-                    if pill_btn.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                }
                 if has_queued_tasks {
                     ui.add_space(6.0);
                     ui.label(RichText::new(status_text).small().color(status_color));
@@ -35913,7 +35876,106 @@ fn draw_smart_input_footer(
             ui.horizontal(|ui| {
                 let draft_id = AdeApp::smart_input_draft_input_id(terminal_id);
                 let input_height = smart_input_draft_height(state);
-                let input_width = (ui.available_width() - 44.0).max(120.0);
+                let mode_selector_reserved = if show_opencode_mode_ui {
+                    SMART_INPUT_MODE_SELECTOR_WIDTH + SMART_INPUT_MODE_SELECTOR_GAP
+                } else {
+                    0.0
+                };
+                let input_width =
+                    (ui.available_width() - mode_selector_reserved - 44.0).max(120.0);
+                if show_opencode_mode_ui {
+                    let draft_mode = state.draft_mode;
+                    let (selector_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(
+                            SMART_INPUT_MODE_SELECTOR_WIDTH,
+                            SMART_INPUT_MODE_SELECTOR_HEIGHT,
+                        ),
+                        egui::Sense::hover(),
+                    );
+                    let half_width = selector_rect.width() / 2.0;
+                    let build_rect = egui::Rect::from_min_size(
+                        selector_rect.min,
+                        egui::vec2(half_width, selector_rect.height()),
+                    );
+                    let plan_rect = egui::Rect::from_min_size(
+                        egui::pos2(selector_rect.min.x + half_width, selector_rect.min.y),
+                        egui::vec2(half_width, selector_rect.height()),
+                    );
+                    let build_active = draft_mode == SmartInputMode::Build;
+                    let plan_active = draft_mode == SmartInputMode::Plan;
+                    paint_smart_input_mode_chip(
+                        ui,
+                        build_rect,
+                        "Build",
+                        10.0,
+                        if build_active {
+                            Color32::from_rgb(180, 180, 180)
+                        } else {
+                            Color32::from_rgb(120, 120, 120)
+                        },
+                        if build_active {
+                            Color32::from_rgb(34, 34, 34)
+                        } else {
+                            Color32::from_rgb(26, 26, 26)
+                        },
+                        Stroke::new(
+                            1.0,
+                            if build_active {
+                                Color32::from_rgb(70, 70, 70)
+                            } else {
+                                Color32::from_rgb(45, 45, 45)
+                            },
+                        ),
+                        6.0,
+                    );
+                    paint_smart_input_mode_chip(
+                        ui,
+                        plan_rect,
+                        "Plan",
+                        10.0,
+                        if plan_active {
+                            Color32::from_rgb(200, 140, 60)
+                        } else {
+                            Color32::from_rgb(120, 120, 120)
+                        },
+                        if plan_active {
+                            Color32::from_rgb(40, 28, 16)
+                        } else {
+                            Color32::from_rgb(26, 26, 26)
+                        },
+                        Stroke::new(
+                            1.0,
+                            if plan_active {
+                                Color32::from_rgb(140, 100, 40)
+                            } else {
+                                Color32::from_rgb(45, 45, 45)
+                            },
+                        ),
+                        6.0,
+                    );
+                    let build_response = ui.interact(
+                        build_rect,
+                        ui.id().with("smart_input_build_mode"),
+                        egui::Sense::click(),
+                    );
+                    let plan_response = ui.interact(
+                        plan_rect,
+                        ui.id().with("smart_input_plan_mode"),
+                        egui::Sense::click(),
+                    );
+                    if build_response.clicked() && !build_active {
+                        state.draft_mode = SmartInputMode::Build;
+                        action.request_keyboard_focus(SmartInputFocusTarget::Draft);
+                    }
+                    if plan_response.clicked() && !plan_active {
+                        state.draft_mode = SmartInputMode::Plan;
+                        action.request_keyboard_focus(SmartInputFocusTarget::Draft);
+                    }
+                    if build_response.hovered() || plan_response.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    ui.add_space(SMART_INPUT_MODE_SELECTOR_GAP);
+                }
                 // Preserve selection before right-click collapses it
                 let secondary_pressed = ui.ctx().input(|input| input.pointer.secondary_pressed());
                 let pre_click_range = egui::text_edit::TextEditState::load(ui.ctx(), draft_id)
@@ -65234,6 +65296,93 @@ mod tests {
                 .any(|text| text == "Build" || text == "Plan"),
             "Claude Smart Input must not render OpenCode mode pills: {:?}",
             rendered_text
+        );
+    }
+
+    #[test]
+    fn smart_input_mode_selector_in_draft_area_for_opencode() {
+        use egui::{Context, RawInput};
+
+        let ctx = Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+
+        let mut raw_input = RawInput::default();
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(520.0, 420.0),
+        ));
+        let output = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let footer_size = egui::vec2(520.0, 220.0);
+                let pane_height = 420.0;
+                let line_height = 18.0;
+                let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+                let _ = super::draw_smart_input_footer(
+                    ui,
+                    terminal,
+                    footer_size,
+                    pane_height,
+                    line_height,
+                );
+            });
+        });
+
+        let rendered_text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::epaint::Shape::Text(text_shape) = &shape.shape {
+                    Some(text_shape.galley.text().to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            rendered_text.iter().any(|text| text == "Build"),
+            "draft area should render Build mode selector: {:?}",
+            rendered_text
+        );
+        assert!(
+            rendered_text.iter().any(|text| text == "Plan"),
+            "draft area should render Plan mode selector: {:?}",
+            rendered_text
+        );
+
+        // Verify the text shapes are near each other (side-by-side selector)
+        let build_shape = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::epaint::Shape::Text(text_shape) = &shape.shape {
+                    (text_shape.galley.text() == "Build").then(|| text_shape.pos)
+                } else {
+                    None
+                }
+            })
+            .next()
+            .expect("Build text shape should exist");
+        let plan_shape = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::epaint::Shape::Text(text_shape) = &shape.shape {
+                    (text_shape.galley.text() == "Plan").then(|| text_shape.pos)
+                } else {
+                    None
+                }
+            })
+            .next()
+            .expect("Plan text shape should exist");
+        let x_distance = (plan_shape.x - build_shape.x).abs();
+        assert!(
+            x_distance < 60.0,
+            "Build and Plan text should be close together in the selector (distance={})",
+            x_distance
         );
     }
 

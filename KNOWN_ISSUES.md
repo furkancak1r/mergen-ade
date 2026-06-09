@@ -3697,3 +3697,18 @@
   - Recorded this entry in KNOWN_ISSUES.md.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-06-09
+
+#### Smart Input mode selector moved from header to draft area {#smart-input-mode-selector-moved}
+- Date: 2026-06-09
+- Context: User requested moving the OpenCode `Build/Plan` mode selector from the Smart Input header row into the left side of the draft input area for better visual hierarchy and compactness.
+- Changes:
+  - Added constants `SMART_INPUT_MODE_SELECTOR_WIDTH`, `SMART_INPUT_MODE_SELECTOR_HEIGHT`, and `SMART_INPUT_MODE_SELECTOR_GAP` near other Smart Input constants.
+  - Removed the single mode pill from the header row in `draw_smart_input_footer()`.
+  - Added a two-segment `[Build | Plan]` mode selector inside the draft `ui.horizontal` layout, before the TextEdit.
+  - Active mode uses the same highlight colors as the previous header pill (orange for Plan, white/grey for Build); inactive mode uses muted colors.
+  - Clicking a segment sets `draft_mode` and requests keyboard focus on the draft.
+  - TextEdit width is reduced by `mode_selector_reserved` when the selector is visible so the layout remains balanced.
+  - Updated `AGENTS.md` Smart Input guideline to note the new draft-area location.
+  - Added regression test `smart_input_mode_selector_in_draft_area_for_opencode` verifying both labels render and are positioned near each other.
+  - Existing tests `smart_input_footer_hides_mode_pill_for_claude` and `smart_input_footer_omits_global_mode_buttons_and_shows_queue_count` continue to pass.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
