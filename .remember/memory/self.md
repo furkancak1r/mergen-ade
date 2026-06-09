@@ -5,6 +5,11 @@
 - Wrong: OpenCode soruları Smart Input footer kartı + hook answer bridge ile yanıtlanıyordu
 - Correct: Soru kartı, pending question state ve `/answer` bridge kaldırıldı; `QuestionAsked` attention + terminal TUI klavye yönlendirmesi korundu
 
+## Claude Smart Input parity (2026-06-08)
+
+- Wrong: Build/Plan pill ve Tab mode toggle tüm Smart Input terminallerinde görünüyordu
+- Correct: `terminal_smart_input_is_opencode` / `terminal_smart_input_is_claude` ile UI ve Tab ayrımı; Claude kuyruk/auto-dispatch aynı, soru kartı yok, Tab PTY passthrough
+
 ## Smart Input Kimi thought-loop guard (2026-06-08)
 
 - Wrong: After Done auto-dispatch could send the next queued task while Kimi K2.6 was stuck in a repetitive thinking loop that briefly reported Idle/TurnComplete
