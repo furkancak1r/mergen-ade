@@ -18001,6 +18001,7 @@ impl AdeApp {
 
     fn smart_input_prepare_opencode_mode(
         &mut self,
+        ctx: &egui::Context,
         terminal_id: u64,
         target_mode: SmartInputMode,
     ) -> bool {
@@ -18015,18 +18016,28 @@ impl AdeApp {
 
         if let Some(pending) = terminal.opencode_pending_mode_switch.clone() {
             if Self::opencode_mode_switch_settled(terminal) {
-                terminal.opencode_last_known_mode = Some(target.to_owned());
+                // Settle completed: record the actual mode we reached, not the target.
+                terminal.opencode_last_known_mode = Some(pending.clone());
                 terminal.opencode_pending_mode_switch = None;
                 terminal.opencode_pending_mode_switch_since = None;
-                return true;
+                if pending == target {
+                    return true;
+                }
+                // Settled mode is different from target; fall through to send another Tab.
+            } else {
+                return false;
             }
-            return false;
         }
 
         let current = Self::opencode_effective_mode(terminal, fallback);
         if current == target {
             return true;
         }
+
+        // Clear stale delayed confirmation Enters before sending a mode switch Tab,
+        // so they don't accidentally confirm the old prompt or interfere with the TUI.
+        self.pending_second_enter
+            .retain(|(tid, _)| *tid != terminal_id);
 
         if let Some(tab_bytes) = Self::key_to_terminal_bytes(Key::Tab, egui::Modifiers::NONE) {
             Self::send_terminal_raw_input(terminal, tab_bytes);
@@ -18035,6 +18046,7 @@ impl AdeApp {
         terminal.opencode_pending_mode_switch = Some(target.to_owned());
         terminal.opencode_pending_mode_switch_since = Some(Instant::now());
         terminal.opencode_last_known_mode = Some(toggled);
+        ctx.request_repaint_after(Duration::from_millis(OPENCODE_MODE_SWITCH_SETTLE_MS));
         false
     }
 
@@ -18121,7 +18133,7 @@ impl AdeApp {
             .collect::<Vec<_>>();
 
         for (terminal_id, task_id, task_mode, text, attachments) in ready {
-            if !self.smart_input_prepare_opencode_mode(terminal_id, task_mode) {
+            if !self.smart_input_prepare_opencode_mode(ctx, terminal_id, task_mode) {
                 continue;
             }
             // Send image attachments first as bracketed paste paths
@@ -18241,7 +18253,7 @@ impl AdeApp {
             else {
                 return;
             };
-            if !self.smart_input_prepare_opencode_mode(terminal_id, task_mode) {
+            if !self.smart_input_prepare_opencode_mode(ctx, terminal_id, task_mode) {
                 self.status_line = format!(
                     "Smart Input switching OpenCode to {} mode",
                     task_mode.label()
@@ -39172,14 +39184,15 @@ mod tests {
         BROWSER_SCREENSHOT_REQUEST_PREFIX, CODEX_NOTIFY_POLL_MS, CODEX_PROCESS_POLL_MS,
         CODEX_RUNNING_GRACE_MS, CODEX_STOP_SETTLE_MS, CODEX_TRAILING_OUTPUT_GRACE_MS,
         DESIGN_INSPECT_DELIVERY_DEDUPE_MS, DESIGN_INSPECT_TARGET_SWITCH_QUIET_MS,
-        DIRECTORY_INDEX_CHANNEL_CAPACITY, FACTORY_DROID_HOOK_POLL_MS, OPENCODE_PROCESS_POLL_MS,
-        OPENCODE_RUNNING_GRACE_MS, OPENCODE_TRAILING_OUTPUT_GRACE_MS,
-        PENDING_RERUN_BATCH_CONFIRM_SETTLE_MS, PENDING_RERUN_BATCH_PROMPT_WAIT_MS,
-        PENDING_RERUN_SETTLE_MS, SMART_INPUT_AUTO_DISPATCH_SETTLE_MS,
-        SMART_INPUT_BASE_FOOTER_HEIGHT, SOURCE_CONTROL_CHANNEL_CAPACITY,
-        SOURCE_CONTROL_TOOLTIP_FILE_LIMIT, TERMINAL_COPY_FEEDBACK_TEXT,
-        TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS, TERMINAL_OUTPUT_BG,
-        TRANSIENT_TOAST_MAX_WIDTH, TRANSIENT_TOAST_MIN_WIDTH, TRANSIENT_TOAST_SECS,
+        DIRECTORY_INDEX_CHANNEL_CAPACITY, FACTORY_DROID_HOOK_POLL_MS,
+        OPENCODE_MODE_SWITCH_SETTLE_MS, OPENCODE_PROCESS_POLL_MS, OPENCODE_RUNNING_GRACE_MS,
+        OPENCODE_TRAILING_OUTPUT_GRACE_MS, PENDING_RERUN_BATCH_CONFIRM_SETTLE_MS,
+        PENDING_RERUN_BATCH_PROMPT_WAIT_MS, PENDING_RERUN_SETTLE_MS,
+        SMART_INPUT_AUTO_DISPATCH_SETTLE_MS, SMART_INPUT_BASE_FOOTER_HEIGHT,
+        SOURCE_CONTROL_CHANNEL_CAPACITY, SOURCE_CONTROL_TOOLTIP_FILE_LIMIT,
+        TERMINAL_COPY_FEEDBACK_TEXT, TERMINAL_EVENT_QUEUE_CAPACITY, TERMINAL_FALLBACK_REFRESH_MS,
+        TERMINAL_OUTPUT_BG, TRANSIENT_TOAST_MAX_WIDTH, TRANSIENT_TOAST_MIN_WIDTH,
+        TRANSIENT_TOAST_SECS,
     };
     use crate::browser_video::BrowserVideoEncodeResult;
     use crate::codex::{CodexEnableOutcome, CodexIntegrationStatus, CodexNotifyInboxEvent};
@@ -63438,6 +63451,143 @@ mod tests {
         assert_eq!(smart_input.tasks[0].text, "echo test");
         assert!(smart_input.draft.is_empty());
         assert!(app.smart_input_submit_pending.is_none());
+    }
+
+    #[test]
+    fn smart_input_settled_pending_target_mismatch_sends_second_tab() {
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            // Simulate a stale pending switch to Build that has already settled.
+            terminal.opencode_last_known_mode = Some("plan".to_owned());
+            terminal.opencode_pending_mode_switch = Some("build".to_owned());
+            terminal.opencode_pending_mode_switch_since =
+                Some(Instant::now() - Duration::from_millis(OPENCODE_MODE_SWITCH_SETTLE_MS + 10));
+        }
+
+        // Call directly to verify the mode-prepare logic.
+        let result = app.smart_input_prepare_opencode_mode(&ctx, 1, SmartInputMode::Plan);
+        capture.drain();
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        // The settled pending was "build", but because target is "plan", the function
+        // sends a new Tab and sets last_known_mode to the target ("plan").
+        assert_eq!(
+            terminal.opencode_last_known_mode,
+            Some("plan".to_owned()),
+            "must set last_known_mode to target after sending a new Tab"
+        );
+        assert_eq!(
+            terminal.opencode_pending_mode_switch,
+            Some("plan".to_owned()),
+            "new pending mode switch should be the target"
+        );
+        // A new Tab must be sent because actual mode (build) != target (plan).
+        assert_eq!(
+            capture.bytes(),
+            b"\t".to_vec(),
+            "must send second Tab when settled mode differs from target"
+        );
+        // Should return false because mode switch is pending.
+        assert!(!result, "should return false when sending another Tab");
+    }
+
+    #[test]
+    fn smart_input_mode_switch_clears_stale_delayed_enters() {
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.opencode_last_known_mode = Some("plan".to_owned());
+            terminal.smart_input.tasks.push(SmartInputTask {
+                id: 1,
+                text: "build task".to_owned(),
+                attachments: Vec::new(),
+                mode: SmartInputMode::Build,
+            });
+        }
+        // Inject stale delayed Enters for this terminal.
+        app.pending_second_enter
+            .push((1, Instant::now() + Duration::from_millis(100)));
+
+        app.process_smart_input_queues(&ctx);
+        capture.drain();
+
+        // The stale delayed Enter should be cleared before the Tab is sent.
+        assert!(
+            app.pending_second_enter.iter().all(|(tid, _)| *tid != 1),
+            "stale delayed Enters must be cleared before mode switch Tab"
+        );
+        assert_eq!(
+            capture.bytes(),
+            b"\t".to_vec(),
+            "mode switch Tab should be sent"
+        );
+    }
+
+    #[test]
+    fn smart_input_plan_to_build_dispatches_tab_then_prompt_after_settle() {
+        let ctx = egui::Context::default();
+        let (runtime, capture) = test_terminal_runtime_with_capture();
+        runtime.advance_terminal_bytes_for_test(b"\x1b[?2004h");
+        let mut app = test_app_with_ai_hooks(
+            [(1, test_terminal_entry_with_runtime(1, 7, runtime))],
+            Some(1),
+        );
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.opencode_last_known_mode = Some("plan".to_owned());
+            terminal.smart_input.draft = "build task".to_owned();
+            terminal.smart_input.draft_mode = SmartInputMode::Build;
+            terminal.smart_input.enqueue_draft();
+        }
+
+        // First dispatch: should send Tab, not prompt.
+        app.process_smart_input_queues(&ctx);
+        capture.drain();
+        assert_eq!(
+            capture.bytes(),
+            b"\t".to_vec(),
+            "first dispatch should send Tab to switch mode"
+        );
+        capture.clear();
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert_eq!(terminal.smart_input.tasks.len(), 1);
+        assert_eq!(
+            terminal.opencode_pending_mode_switch,
+            Some("build".to_owned())
+        );
+
+        // Fast-forward settle window.
+        {
+            let terminal = app.terminals.get_mut(&1).expect("terminal 1");
+            terminal.opencode_pending_mode_switch_since =
+                Some(Instant::now() - Duration::from_millis(OPENCODE_MODE_SWITCH_SETTLE_MS + 10));
+        }
+
+        // Second dispatch: should send prompt after mode switch settles.
+        app.process_smart_input_queues(&ctx);
+        capture.drain();
+        assert_eq!(
+            capture.bytes(),
+            b"\x1b[200~build task\x1b[201~\r".to_vec(),
+            "second dispatch should send prompt after mode switch settles"
+        );
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(terminal.smart_input.tasks.is_empty());
+        assert_eq!(terminal.opencode_last_known_mode, Some("build".to_owned()));
     }
 
     #[test]

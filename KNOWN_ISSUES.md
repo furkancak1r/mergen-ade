@@ -3633,3 +3633,37 @@
   - Recorded this entry in KNOWN_ISSUES.md.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
 - References: User request 2026-06-09
+
+---
+
+#### Smart Input Build/Plan mode switch not working — stale state and delayed Enter interference {#smart-input-mode-switch-bug}
+- Date: 2026-06-09
+- Context: User reported that when an OpenCode terminal is in Plan mode and a queued Smart Input task is in Build mode, the prompt does not switch to Build mode and continues running in Plan mode ("terminalde plan mode var sıradaki mesaj build mode ama değişmiyor builde, plandan devam ediyor").
+- Error signature:
+  1. `smart_input_prepare_opencode_mode` checked `if let Some(pending) = terminal.opencode_pending_mode_switch.clone()` but never used the `pending` value when it was settled. It unconditionally set `opencode_last_known_mode = Some(target.to_owned())` instead of `Some(pending.clone())`, causing the recorded mode to drift from the actual TUI state.
+  2. When a stale pending switch settled to a mode different from the current task's target, the function returned `true` immediately instead of sending another `Tab` to reach the correct mode.
+  3. Old delayed confirmation Enters (`pending_second_enter`) from previously dispatched tasks were not cleared before sending the mode-switch `Tab`. An old Enter could arrive while OpenCode's TUI was in the mode-selection state, causing the wrong prompt to be confirmed or preventing the agent switch from taking effect.
+  4. `smart_input_prepare_opencode_mode` did not request a repaint after setting a pending mode switch, so the prompt dispatch could stall until unrelated input triggered a frame.
+- Symptoms/Impact:
+  1. Queued tasks in a different mode than the current OpenCode TUI mode were submitted without a proper mode switch, causing the AI to run in the wrong agent (e.g., a Build task running in Plan mode).
+  2. Stale delayed Enters interfered with the mode switch, making the behavior appear random or consistently broken.
+  3. After a failed mode switch, `opencode_last_known_mode` became permanently out of sync with the actual TUI, so subsequent tasks in the same mode also skipped the Tab switch.
+- Root cause:
+  - `smart_input_prepare_opencode_mode` had a logic bug where the settled `pending` value was read but not used for updating `last_known_mode`.
+  - No cleanup of stale `pending_second_enter` was performed before sending the `Tab` keystroke.
+  - No `request_repaint_after` was issued when the function entered a pending state, so the settle timeout could be missed.
+- Resolution:
+  - Changed `smart_input_prepare_opencode_mode` to record `opencode_last_known_mode = Some(pending.clone())` when the pending switch settles. If the settled mode differs from the task target, it now falls through to send another `Tab` instead of returning `true` prematurely.
+  - Added `self.pending_second_enter.retain(|(tid, _)| *tid != terminal_id)` before sending the mode-switch `Tab` to prevent stale confirmation Enters from interfering.
+  - Added `ctx.request_repaint_after(Duration::from_millis(OPENCODE_MODE_SWITCH_SETTLE_MS))` after setting the pending state so the prompt dispatch resumes promptly after the settle window.
+  - Added `ctx` parameter to `smart_input_prepare_opencode_mode` so it can schedule repaints.
+  - Updated both callers (`process_smart_input_queues` and `handle_smart_input_pane_action`) to pass `ctx`.
+  - Added regression tests:
+    - `smart_input_settled_pending_target_mismatch_sends_second_tab` — verifies settled pending mismatch triggers a second Tab.
+    - `smart_input_mode_switch_clears_stale_delayed_enters` — verifies stale delayed Enters are drained before Tab.
+    - `smart_input_plan_to_build_dispatches_tab_then_prompt_after_settle` — end-to-end test for Plan → Build dispatch.
+- Prevent recurrence:
+  - Updated AGENTS.md with two new Smart Input guidelines: "Smart Input mode switch must clear stale delayed confirmation Enters before sending Tab" and "Smart Input mode switch must record the actual settled mode, not the task target".
+  - Recorded this entry in KNOWN_ISSUES.md.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-09
