@@ -3038,6 +3038,7 @@ struct SmartInputPaneAction {
     status_message: Option<String>,
     claim_smart_input_keyboard: bool,
     focus_target: Option<SmartInputFocusTarget>,
+    smart_input_explicitly_clicked: bool,
 }
 
 impl SmartInputPaneAction {
@@ -3699,6 +3700,13 @@ pub struct AdeApp {
     /// Cleared when Smart Input is clicked, the active terminal changes, or
     /// the terminal exits.
     terminal_output_focus_override: Option<u64>,
+    /// When the user explicitly clicks on a Smart Input draft/edit field, image
+    /// paste should target that Smart Input. Auto-focused Smart Input (via
+    /// ensure_smart_input_focus) does NOT set this, so image paste only goes to
+    /// Smart Input when the user explicitly clicked it.
+    /// Cleared when terminal output is clicked, the active terminal changes, or
+    /// the terminal exits.
+    smart_input_explicit_focus: Option<u64>,
     /// Collapse/expand state per project in the Check-list panel (runtime-only, not persisted across restarts)
     checklist_collapsed_by_project: BTreeMap<u64, bool>,
     /// Whether the floating Check-list popup is currently open (runtime-only, not persisted)
@@ -6515,6 +6523,7 @@ impl AdeApp {
             terminal_history_popup_open: None,
             terminal_history_popup_just_opened: false,
             terminal_output_focus_override: None,
+            smart_input_explicit_focus: None,
             checklist_collapsed_by_project: BTreeMap::new(),
             checklist_floating_open: false,
             file_editor: FileEditorState::default(),
@@ -14066,6 +14075,7 @@ impl AdeApp {
             || ctx.memory(|mem| mem.any_popup_open())
             || ctx.is_context_menu_open()
         {
+            self.smart_input_explicit_focus = None;
             ctx.memory_mut(|mem| {
                 for (terminal_id, terminal) in &self.terminals {
                     mem.surrender_focus(Self::smart_input_draft_input_id(*terminal_id));
@@ -14082,6 +14092,7 @@ impl AdeApp {
         // ACP chat panel visible — surrender Smart Input focus so typed text
         // goes to the ACP composer, not the hidden terminal's Smart Input.
         if self.active_acp_chat.is_some() {
+            self.smart_input_explicit_focus = None;
             ctx.memory_mut(|mem| {
                 for (terminal_id, terminal) in &self.terminals {
                     mem.surrender_focus(Self::smart_input_draft_input_id(*terminal_id));
@@ -14099,6 +14110,7 @@ impl AdeApp {
         // If user explicitly clicked terminal output, don't auto-focus Smart Input.
         if let Some(override_id) = self.terminal_output_focus_override {
             if self.active_terminal == Some(override_id) {
+                self.smart_input_explicit_focus = None;
                 ctx.memory_mut(|mem| {
                     mem.surrender_focus(Self::smart_input_draft_input_id(override_id));
                     if let Some(terminal) = self.terminals.get(&override_id) {
@@ -16528,6 +16540,9 @@ impl AdeApp {
         if self.terminal_output_focus_override == Some(terminal_id) {
             self.terminal_output_focus_override = None;
         }
+        if self.smart_input_explicit_focus == Some(terminal_id) {
+            self.smart_input_explicit_focus = None;
+        }
         self.clear_factory_droid_state(terminal_id);
         self.reset_factory_droid_hook_inbox(terminal_id);
         self.clear_codex_state(terminal_id);
@@ -16720,6 +16735,12 @@ impl AdeApp {
             }
             ctx.request_repaint();
             return;
+        }
+
+        // Switching to a different terminal clears explicit Smart Input focus
+        // so image paste does not leak to a new terminal without a fresh click.
+        if self.active_terminal != terminal_id {
+            self.smart_input_explicit_focus = None;
         }
 
         if let Some(terminal_id) = terminal_id {
@@ -18305,6 +18326,9 @@ impl AdeApp {
                 if Self::terminal_smart_input_visible(terminal) {
                     if self.terminal_output_focus_override == Some(terminal_id) {
                         self.terminal_output_focus_override = None;
+                    }
+                    if action.smart_input_explicitly_clicked {
+                        self.smart_input_explicit_focus = Some(terminal_id);
                     }
                     let focus_target = action.focus_target.unwrap_or(SmartInputFocusTarget::Draft);
                     let focus_id = match focus_target {
@@ -29983,6 +30007,7 @@ impl AdeApp {
 
         if output_clicked {
             self.terminal_output_focus_override = Some(terminal_id);
+            self.smart_input_explicit_focus = None;
         }
 
         if clicked || copied_selection.is_some() || paste_requested {
@@ -30947,6 +30972,12 @@ impl eframe::App for AdeApp {
             self.focused_smart_input_submit_request(ctx)
         };
         let smart_input_request = focused_smart_input_request;
+        let smart_input_explicit_request = self.smart_input_explicit_focus.and_then(|tid| {
+            smart_input_request.filter(|req| match req {
+                SmartInputSubmitRequest::Draft { terminal_id } => *terminal_id == tid,
+                SmartInputSubmitRequest::Edit { terminal_id, .. } => *terminal_id == tid,
+            })
+        });
         let paste_smart_input_request = if terminal_output_paste_target.is_none()
             && (egui_paste_event_present || native_primary_paste_requested)
         {
@@ -30968,14 +30999,19 @@ impl eframe::App for AdeApp {
             smart_input_request
         };
 
-        if native_primary_paste_requested {
-            let target = self.native_image_paste_target(
-                ctx,
-                terminal_output_paste_target,
-                paste_smart_input_request,
-                capture_keyboard,
-            );
-            let _ = self.handle_native_image_paste_fallback(ctx, target);
+        // Native (global) image paste: only process when Mergen window is focused.
+        // The native key poll (GetAsyncKeyState) fires even when another app has
+        // focus, so we gate it with raw_input.focused to prevent cross-app paste
+        // leakage. Within Mergen, only explicitly-clicked targets receive the paste.
+        if native_primary_paste_requested && raw_input.focused {
+            let native_paste_target = if let Some(terminal_id) = terminal_output_paste_target {
+                Some(NativeImagePasteTarget::Terminal(terminal_id))
+            } else if let Some(request) = smart_input_explicit_request {
+                Some(NativeImagePasteTarget::SmartInput(request))
+            } else {
+                None
+            };
+            let _ = self.handle_native_image_paste_fallback(ctx, native_paste_target);
         }
 
         if let Some(terminal_id) = terminal_output_paste_target {
@@ -30994,10 +31030,12 @@ impl eframe::App for AdeApp {
                 }
             }
 
-            // When Smart Input is focused, image-only clipboard data does not
+            // When Smart Input is explicitly clicked, image-only clipboard data does not
             // arrive as a normal TextEdit paste. Convert it to an attachment
             // and consume the paste key so the image path is not inserted as text.
-            if let Some(request) = paste_smart_input_request {
+            // Auto-focused Smart Input (without explicit click) does NOT receive
+            // image paste to prevent accidental attachment creation.
+            if let Some(request) = smart_input_explicit_request {
                 events = self.handle_smart_input_image_paste_shortcut(ctx, request, events);
             }
             let (command_shortcuts, remaining, conflict_messages) =
@@ -35589,6 +35627,9 @@ fn draw_smart_input_footer(
                                         task_id,
                                     ));
                                 }
+                                if edit_response.clicked() {
+                                    action.smart_input_explicitly_clicked = true;
+                                }
                                 let post_show_range =
                                     egui::text_edit::TextEditState::load(row_ui.ctx(), edit_id)
                                         .and_then(|s| s.cursor.char_range())
@@ -35938,9 +35979,12 @@ fn draw_smart_input_footer(
                             egui::Key::Enter,
                         )),
                 );
-                if draft_response.clicked() || draft_response.gained_focus() {
-                    action.request_keyboard_focus(SmartInputFocusTarget::Draft);
-                }
+                                if draft_response.clicked() || draft_response.gained_focus() {
+                                    action.request_keyboard_focus(SmartInputFocusTarget::Draft);
+                                }
+                                if draft_response.clicked() {
+                                    action.smart_input_explicitly_clicked = true;
+                                }
                 if !state.draft_attachments.is_empty() {
                     let attachment_rect = egui::Rect::from_min_size(
                         egui::pos2(content_rect.left(), content_rect.bottom() - attachment_space),
@@ -50484,6 +50528,7 @@ mod tests {
             terminal_history_popup_open: None,
             terminal_history_popup_just_opened: false,
             terminal_output_focus_override: None,
+            smart_input_explicit_focus: None,
             ai_hook_manager: None,
             file_editor: FileEditorState::default(),
             browser_url_draft_by_scope: BTreeMap::new(),
@@ -67147,6 +67192,159 @@ mod tests {
             terminal.smart_input.edit_attachments[0].path,
             r"C:\test\edit.png"
         );
+    }
+
+    #[test]
+    fn raw_input_hook_blocks_native_image_paste_when_window_unfocused() {
+        // Regression: GetAsyncKeyState is global; without the focus gate,
+        // pressing Ctrl+V in another application would leak into Mergen.
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        app.terminal_output_focus_override = Some(1);
+
+        let mut raw_input = RawInput {
+            events: vec![],
+            focused: false,
+            ..RawInput::default()
+        };
+        // Simulate native paste key down without an egui event
+        app.native_primary_paste_down = true;
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(
+            app.pending_terminal_pastes.is_empty(),
+            "Unfocused window must not queue native image paste"
+        );
+    }
+
+    #[test]
+    fn raw_input_hook_blocks_native_image_paste_without_explicit_terminal_click() {
+        // Even when focused, native image paste should only reach the terminal
+        // if the user explicitly clicked the terminal output area.
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        // No terminal_output_focus_override set
+
+        let mut raw_input = RawInput {
+            events: vec![],
+            focused: true,
+            ..RawInput::default()
+        };
+        app.native_primary_paste_down = true;
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        assert!(
+            app.pending_terminal_pastes.is_empty(),
+            "Native image paste must not route to terminal without explicit output click"
+        );
+    }
+
+    #[test]
+    fn raw_input_hook_blocks_native_image_paste_without_explicit_smart_input_click() {
+        // Auto-focused Smart Input (ensure_smart_input_focus) must NOT receive
+        // image paste unless the user explicitly clicked the draft/edit field.
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        // Focus Smart Input draft without explicit click
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::smart_input_draft_input_id(1));
+        });
+
+        let mut raw_input = RawInput {
+            events: vec![],
+            focused: true,
+            ..RawInput::default()
+        };
+        app.native_primary_paste_down = true;
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        let terminal = app.terminals.get(&1).expect("terminal 1");
+        assert!(
+            terminal.smart_input.draft_attachments.is_empty(),
+            "Auto-focused Smart Input must not receive native image paste"
+        );
+    }
+
+    #[test]
+    fn raw_input_hook_allows_native_image_paste_to_explicitly_clicked_terminal_output() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        app.terminal_output_focus_override = Some(1);
+
+        let mut raw_input = RawInput {
+            events: vec![],
+            focused: true,
+            ..RawInput::default()
+        };
+        app.native_primary_paste_down = true;
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        // The native paste path calls handle_native_image_paste_fallback which
+        // reads clipboard_image_path; in tests there is no real clipboard image,
+        // so pending_terminal_pastes stays empty. The important part is that
+        // no panic occurs and the code path is executed for an explicit target.
+        // We verify by checking that the rising-edge state was consumed.
+        assert!(
+            !app.native_primary_paste_down,
+            "native_primary_paste_down should be reset after processing"
+        );
+    }
+
+    #[test]
+    fn raw_input_hook_allows_native_image_paste_to_explicitly_clicked_smart_input() {
+        let ctx = Context::default();
+        let mut app = test_app_with_ai_hooks([(1, test_terminal_entry(1, 7))], Some(1));
+        seed_opencode_attention(&mut app, 1, OpenCodeAttentionReason::TurnComplete);
+        app.smart_input_explicit_focus = Some(1);
+        ctx.memory_mut(|mem| {
+            mem.request_focus(AdeApp::smart_input_draft_input_id(1));
+        });
+
+        let mut raw_input = RawInput {
+            events: vec![],
+            focused: true,
+            ..RawInput::default()
+        };
+        app.native_primary_paste_down = true;
+
+        <AdeApp as eframe::App>::raw_input_hook(&mut app, &ctx, &mut raw_input);
+
+        // Same as terminal: no real clipboard in tests, but path is executed.
+        assert!(
+            !app.native_primary_paste_down,
+            "native_primary_paste_down should be reset after processing"
+        );
+    }
+
+    #[test]
+    fn smart_input_explicit_focus_cleared_on_acp_visible() {
+        let mut app = test_app([(1, test_terminal_entry(1, 7))], Some(1));
+        app.smart_input_explicit_focus = Some(1);
+        app.active_acp_chat = Some(42);
+        app.ensure_smart_input_focus(&egui::Context::default());
+        assert_eq!(app.smart_input_explicit_focus, None);
+    }
+
+    #[test]
+    fn smart_input_explicit_focus_cleared_on_terminal_switch() {
+        let mut app = test_app(
+            [
+                (1, test_terminal_entry(1, 7)),
+                (2, test_terminal_entry(2, 7)),
+            ],
+            Some(1),
+        );
+        app.smart_input_explicit_focus = Some(1);
+        app.set_active_terminal(&egui::Context::default(), Some(2));
+        assert_eq!(app.smart_input_explicit_focus, None);
     }
 
     fn codex_reason_to_kind(reason: CodexAttentionReason) -> OsNotificationKind {

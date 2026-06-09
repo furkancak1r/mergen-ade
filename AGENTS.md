@@ -561,6 +561,12 @@ If `cargo` is not on PATH in PowerShell, use:
 - **Clipboard image path normalization must reject control characters and produce terminal-safe paths.**
 - **CF_HDROP handle must be used directly without GlobalLock.** The handle returned by `GetClipboardData(CF_HDROP)` is an `HDROP` handle; pass it directly to `DragQueryFileW`. Do not call `GlobalLock` on it - that returns a pointer to `DROPFILES`, not an `HDROP` handle.
 - **Clipboard close must be guaranteed on all return paths.** Use a scope guard or RAII pattern to ensure `CloseClipboard()` is called after successful `OpenClipboard()`, even on early returns or errors.
+- **Native (global key poll) image paste must be gated by `raw_input.focused`.** `GetAsyncKeyState` (Windows) is global and fires even when another app has focus. `raw_input_hook` must check `raw_input.focused` before processing `native_primary_paste_requested` image paste to prevent cross-app paste leakage.
+- **Image paste must only route to explicitly-clicked targets.** Within Mergen, native image paste must not use `capture_keyboard` fallback or auto-focus heuristics:
+  - Terminal output: only paste when `terminal_output_focus_override` is set (user explicitly clicked the output pane).
+  - Smart Input: only paste when `smart_input_explicit_focus` is set (user explicitly clicked the draft or edit field). Auto-focused Smart Input (via `ensure_smart_input_focus`) does NOT set this flag.
+- **`smart_input_explicit_focus` must be cleared on every focus-switching event.** Clear it when: terminal output is clicked, active terminal changes, terminal closes, any popup/modal opens, ACP chat becomes visible, or `terminal_output_focus_override` is active. This prevents stale explicit-focus state from leaking image paste to the wrong terminal.
+- **Explicit-click detection uses `SmartInputPaneAction`.** `draw_smart_input_footer` sets `action.smart_input_explicitly_clicked = true` when the draft or edit `TextEdit` is clicked. `handle_smart_input_pane_action` writes this into `app.smart_input_explicit_focus`.
 
 ## Resizable Panel Guidelines
 - **Side panels should be horizontally resizable.** Project Explorer, Check-list, and Browser panels should allow mouse-driven width resizing while keeping full-height SidePanel behavior.

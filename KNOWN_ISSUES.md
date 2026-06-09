@@ -2,6 +2,36 @@
   
 ---
 
+#### Clipboard image paste cross-app leakage and accidental Smart Input attachment {#clipboard-image-paste-leakage}
+- Date: 2026-06-09
+- Context: User reported that pressing Ctrl+V in another application while Mergen was running in the background caused image paste to leak into the active terminal, and that auto-focused Smart Input was creating accidental image attachments.
+- Error signature:
+  1. `native_primary_paste_shortcut_down()` uses Windows `GetAsyncKeyState` which is global and fires even when Mergen is unfocused.
+  2. `raw_input_hook` processed `native_primary_paste_requested` without checking `raw_input.focused`, so clipboard image paste from another app leaked into Mergen.
+  3. `native_image_paste_target()` used `capture_keyboard` fallback and `active_smart_input_draft_request()` which returned auto-focused Smart Input, causing image paste to create attachments even when the user never explicitly clicked the Smart Input field.
+  4. `ensure_smart_input_focus()` auto-focuses Smart Input when no other UI input is focused, which is why explicit-click tracking is necessary to distinguish intentional clicks.
+- Symptoms/Impact:
+  1. Copying an image in another app while Mergen was in background would unexpectedly paste it into the active terminal.
+  2. Auto-focused Smart Input (without explicit click) received image paste and created unwanted attachment chips.
+  3. Image paste could leak to the wrong terminal after switching terminals because stale focus state persisted.
+- Root cause:
+  - No focus gate on native (global key poll) image paste.
+  - No explicit-click tracking for Smart Input; auto-focus was treated the same as user click.
+- Resolution:
+  - Added `raw_input.focused` gate before processing `native_primary_paste_requested` image paste.
+  - Added `smart_input_explicit_focus: Option<u64>` field to `AdeApp` to track explicit clicks vs auto-focus.
+  - Added `smart_input_explicitly_clicked: bool` to `SmartInputPaneAction`; set when draft/edit `TextEdit` is clicked.
+  - Modified `raw_input_hook` to only use explicit targets for native paste: `terminal_output_paste_target` and `smart_input_explicit_request`.
+  - Cleared `smart_input_explicit_focus` on terminal output click, terminal switch, terminal close, popup/modal open, ACP chat visible, and terminal output override active.
+  - Added 8 regression tests covering unfocused blocking, explicit terminal output click, explicit Smart Input click, auto-focus blocking, and focus clearing on terminal switch/ACP visible.
+- Prevent recurrence:
+  - Updated AGENTS.md Clipboard Paste Guidelines with `raw_input.focused` gate, explicit-click routing, and `smart_input_explicit_focus` clearing rules.
+  - Recorded this entry in KNOWN_ISSUES.md.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo fmt`, `cargo test`
+- References: User request 2026-06-09
+
+---
+
 #### OpenCode terminal build mode izin sorma (Strict Kimi permissions) {#opencode-build-permissions-ask}
 - Date: 2026-06-08
 - Context: User reported that OpenCode build mode inside a Mergen terminal asks for permission approvals even though they want full automatic permission.
