@@ -35209,6 +35209,36 @@ fn smart_input_safe_min_footer_height(state: &SmartInputState) -> f32 {
     }
 }
 
+/// Paints a Smart Input mode chip (Build/Plan) with centered text.
+fn paint_smart_input_mode_chip(
+    ui: &mut Ui,
+    rect: egui::Rect,
+    label: &str,
+    font_size: f32,
+    text_color: Color32,
+    fill: Color32,
+    stroke: Stroke,
+    rounding: f32,
+) {
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    ui.painter().rect_filled(rect, rounding, fill);
+    ui.painter().rect_stroke(rect, rounding, stroke);
+    let galley = WidgetText::from(RichText::new(label).size(font_size).color(text_color))
+        .into_galley(
+            ui,
+            Some(TextWrapMode::Truncate),
+            rect.width(),
+            egui::TextStyle::Body,
+        );
+    let text_pos = egui::pos2(
+        rect.center().x - (galley.size().x * 0.5),
+        rect.center().y - (galley.size().y * 0.5),
+    );
+    ui.painter().galley(text_pos, galley, Color32::WHITE);
+}
+
 fn draw_smart_input_footer(
     ui: &mut Ui,
     terminal: &mut TerminalEntry,
@@ -35258,22 +35288,28 @@ fn draw_smart_input_footer(
                                 Color32::from_rgb(70, 70, 70),
                             )
                         };
-                    let pill_btn = ui
-                        .add_sized(
-                            egui::vec2(44.0, 18.0),
-                            egui::Button::new(
-                                RichText::new(draft_mode.label())
-                                    .size(11.0)
-                                    .color(pill_color),
-                            )
-                            .fill(pill_fill)
-                            .rounding(6.0)
-                            .stroke(Stroke::new(1.0, pill_stroke)),
-                        )
+                    let (pill_rect, pill_response) = ui.allocate_exact_size(
+                        egui::vec2(44.0, 18.0),
+                        egui::Sense::click(),
+                    );
+                    paint_smart_input_mode_chip(
+                        ui,
+                        pill_rect,
+                        draft_mode.label(),
+                        11.0,
+                        pill_color,
+                        pill_fill,
+                        Stroke::new(1.0, pill_stroke),
+                        6.0,
+                    );
+                    let pill_btn = pill_response
                         .on_hover_text("Click or press Tab to toggle draft mode");
                     if pill_btn.clicked() {
                         terminal.smart_input.draft_mode = terminal.smart_input.draft_mode.toggle();
                         action.request_keyboard_focus(SmartInputFocusTarget::Draft);
+                    }
+                    if pill_btn.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
                 }
                 if has_queued_tasks {
@@ -35490,32 +35526,17 @@ fn draw_smart_input_footer(
                                     Sense::click(),
                                 );
                                 if row_ui.is_rect_visible(badge_rect) {
-                                    row_ui.painter().rect_filled(
-                                        badge_rect.shrink2(egui::vec2(2.0, 6.0)),
-                                        4.0,
+                                    let visual_rect = badge_rect.shrink2(egui::vec2(2.0, 6.0));
+                                    paint_smart_input_mode_chip(
+                                        &mut row_ui,
+                                        visual_rect,
+                                        task_mode.label(),
+                                        10.0,
+                                        badge_color,
                                         badge_fill,
-                                    );
-                                    row_ui.painter().rect_stroke(
-                                        badge_rect.shrink2(egui::vec2(2.0, 6.0)),
-                                        4.0,
                                         Stroke::new(1.0, badge_stroke),
+                                        4.0,
                                     );
-                                    let badge_galley = WidgetText::from(
-                                        RichText::new(task_mode.label())
-                                            .size(10.0)
-                                            .color(badge_color),
-                                    )
-                                    .into_galley(
-                                        &row_ui,
-                                        Some(TextWrapMode::Truncate),
-                                        badge_rect.width() - 4.0,
-                                        egui::TextStyle::Body,
-                                    );
-                                    let badge_pos = egui::pos2(
-                                        badge_rect.left() + 2.0,
-                                        row_rect.center().y - (badge_galley.size().y * 0.5),
-                                    );
-                                    row_ui.painter().galley(badge_pos, badge_galley, badge_color);
                                 }
                                 if badge_response.clicked() {
                                     state.tasks[index].mode = state.tasks[index].mode.toggle();
@@ -65018,6 +65039,64 @@ mod tests {
                 .any(|text| text == "Build" || text == "Plan"),
             "Claude Smart Input must not render OpenCode mode pills: {:?}",
             rendered_text
+        );
+    }
+
+    #[test]
+    fn smart_input_mode_chip_text_is_centered() {
+        use egui::{pos2, vec2, Color32, Context, FontDefinitions, RawInput, Rect, Stroke};
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::default());
+        let mut raw_input = RawInput::default();
+        raw_input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 200.0)));
+        let output = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = Rect::from_min_size(pos2(10.0, 10.0), vec2(44.0, 18.0));
+                super::paint_smart_input_mode_chip(
+                    ui,
+                    rect,
+                    "Build",
+                    11.0,
+                    Color32::from_rgb(180, 180, 180),
+                    Color32::from_rgb(34, 34, 34),
+                    Stroke::new(1.0, Color32::from_rgb(70, 70, 70)),
+                    6.0,
+                );
+            });
+        });
+        let mut text_center = None;
+        let mut rect_center = None;
+        for clipped in &output.shapes {
+            match &clipped.shape {
+                egui::epaint::Shape::Text(text) => {
+                    text_center = Some(text.pos + text.galley.size() * 0.5);
+                }
+                egui::epaint::Shape::Rect(r) => {
+                    if r.fill != Color32::TRANSPARENT {
+                        rect_center = Some(r.rect.center());
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(text_center.is_some(), "Text shape should be rendered");
+        assert!(
+            rect_center.is_some(),
+            "Filled rect shape should be rendered"
+        );
+        let tc = text_center.unwrap();
+        let rc = rect_center.unwrap();
+        assert!(
+            (tc.x - rc.x).abs() < 1.0,
+            "Text should be horizontally centered: text_center.x={}, rect_center.x={}",
+            tc.x,
+            rc.x
+        );
+        assert!(
+            (tc.y - rc.y).abs() < 1.0,
+            "Text should be vertically centered: text_center.y={}, rect_center.y={}",
+            tc.y,
+            rc.y
         );
     }
 

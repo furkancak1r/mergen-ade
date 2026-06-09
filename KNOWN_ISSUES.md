@@ -3609,3 +3609,27 @@
   - Add regression tests for running-state helper enablement, separate stop/send footer layout, running submit queueing, and post-response queue flush.
 - Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, ACP composer tests
 - References: User request 2026-06-04
+
+---
+
+#### Smart Input Build/Plan mode chip text not centered {#smart-input-mode-chip-center}
+- Date: 2026-06-09
+- Context: User reported that the "Build" text inside the Smart Input mode pill and the queued-task mode badge was not centered inside the chip rectangle.
+- Error signature:
+  1. The header draft mode pill used `egui::Button`, which centers text internally but the overall layout could still appear slightly off due to mixed baselines with the icon label.
+  2. The queued-task mode badge used `badge_rect.left() + 2.0` for the text position, producing a left-aligned label inside the chip.
+- Symptoms/Impact:
+  - The "Build" / "Plan" text looked visually off-center, especially in the queue badge.
+- Root cause:
+  - The queue badge text was manually positioned with a fixed left margin instead of computing the center.
+  - The header pill relied on `Button`'s internal layout rather than an explicit centered painter.
+- Resolution:
+  - Introduced `paint_smart_input_mode_chip` helper that draws the chip fill/stroke and positions the text at `rect.center() - galley.size() * 0.5` for exact horizontal and vertical centering.
+  - Replaced the header draft mode pill `Button` with `allocate_exact_size + paint_smart_input_mode_chip`.
+  - Replaced the queue badge manual drawing with `paint_smart_input_mode_chip`.
+  - Added regression test `smart_input_mode_chip_text_is_centered` verifying text position against the chip rect center.
+- Prevent recurrence:
+  - Updated AGENTS.md: added "Smart Input mode chip text must be centered" guideline.
+  - Recorded this entry in KNOWN_ISSUES.md.
+- Files/Commands touched: `src/app.rs`, `AGENTS.md`, `KNOWN_ISSUES.md`, `cargo test`, `cargo fmt`
+- References: User request 2026-06-09
