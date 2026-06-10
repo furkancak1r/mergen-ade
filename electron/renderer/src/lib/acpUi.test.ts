@@ -15,6 +15,8 @@ import {
   shouldShowAcpWelcome,
   slashCommandHint,
   slashCommandHints,
+  slashCommandItems,
+  slashCommandItemsForInput,
 } from './acpUi';
 
 describe('acpUi', () => {
@@ -115,5 +117,40 @@ describe('acpUi', () => {
     expect(slashCommandHints(commands, '')).toEqual(['/init', '/apply', '/review']);
     expect(slashCommandHints(commands, 'bu')).toEqual(['/apply']);
     expect(slashCommandHints(commands, 're')).toEqual(['/review']);
+  });
+
+  it('builds slash command popup items with descriptions', () => {
+    const commands = [
+      { id: 'init', name: 'Initialize', description: 'Create project memory' },
+      { id: 'apply', name: 'Build Apply', description: 'Apply a plan' },
+    ];
+
+    expect(slashCommandItems(commands, '')).toEqual([
+      { hint: '/init', description: 'Create project memory' },
+      { hint: '/apply', description: 'Apply a plan' },
+    ]);
+  });
+
+  it('deduplicates and limits slash command popup items', () => {
+    const commands = [
+      { id: 'init', name: 'Initialize' },
+      { id: '/init', name: 'Duplicate init' },
+      { id: 'review', name: 'Review' },
+      { id: 'apply', name: 'Apply' },
+    ];
+
+    expect(slashCommandItems(commands, '', 2)).toEqual([
+      { hint: '/init', description: '' },
+      { hint: '/review', description: '' },
+    ]);
+  });
+
+  it('shows slash command items only for slash-prefixed composer input', () => {
+    const commands = [{ id: 'init', name: 'Initialize', description: 'Create project memory' }];
+    expect(slashCommandItemsForInput(commands, '')).toEqual([]);
+    expect(slashCommandItemsForInput(commands, 'init')).toEqual([]);
+    expect(slashCommandItemsForInput(commands, '/')).toEqual([
+      { hint: '/init', description: 'Create project memory' },
+    ]);
   });
 });

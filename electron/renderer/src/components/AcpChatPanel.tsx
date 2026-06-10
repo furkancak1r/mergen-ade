@@ -11,7 +11,8 @@ import {
   optionValues,
   queuedPromptPreview,
   shouldShowAcpWelcome,
-  slashCommandHints,
+  slashCommandItemsForInput,
+  type AcpSlashCommandItem,
 } from '../lib/acpUi';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: any[]) => void) => () => void } }).mergenApi;
@@ -56,7 +57,7 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   const [selectedOptions, setSelectedOptions] = useState<string[]>([]);
   const [customAnswer, setCustomAnswer] = useState('');
   const [questionAnswers, setQuestionAnswers] = useState<Record<number, string>>({});
-  const [slashHints, setSlashHints] = useState<string[]>([]);
+  const [slashCommandItemsState, setSlashCommandItemsState] = useState<AcpSlashCommandItem[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modeDropdownRef = useRef<HTMLDivElement>(null);
@@ -149,7 +150,10 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
         clearPendingInteraction();
       }
       if (event.type === 'commands' && event.commands) {
-        setSlashHints(slashCommandHints(event.commands, ''));
+        setSlashCommandItemsState((prev) => {
+          const next = slashCommandItemsForInput(event.commands, inputRef.current?.value ?? '');
+          return next.length === prev.length && next.every((item, index) => item.hint === prev[index]?.hint && item.description === prev[index]?.description) ? prev : next;
+        });
         return;
       }
     });
@@ -167,12 +171,11 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
   // Update slash hints when input changes
   useEffect(() => {
     if (!input.startsWith('/')) {
-      setSlashHints([]);
+      setSlashCommandItemsState([]);
       return;
     }
     const availableCommands = session?.availableCommands ?? [];
-    const query = input.slice(1).toLowerCase();
-    setSlashHints(slashCommandHints(availableCommands, query));
+    setSlashCommandItemsState(slashCommandItemsForInput(availableCommands, input));
   }, [input, session?.availableCommands]);
 
   useEffect(() => {
@@ -405,20 +408,26 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
       {/* Composer area */}
       <div style={{ padding: '8px 12px', borderTop: '1px solid #222', flexShrink: 0 }}>
         {/* Slash hints above input */}
-        {slashHints.length > 0 && (
-          <div style={{ display: 'flex', gap: 4, marginBottom: 6, flexWrap: 'wrap' }}>
-            {slashHints.map((hint, i) => (
+        {slashCommandItemsState.length > 0 && (
+          <div style={slashCommandPopupStyle}>
+            <div style={{ fontSize: 11, color: '#777', marginBottom: 4 }}>Commands:</div>
+            <div style={{ maxHeight: 168, overflowY: 'auto' }}>
+              {slashCommandItemsState.map((item, i) => (
               <button
                 key={i}
                 onClick={() => {
-                  setInput(hint + ' ');
+                  setInput(item.hint + ' ');
                   inputRef.current?.focus();
                 }}
-                style={{ fontSize: 11, color: '#888', background: '#1a1a1a', border: '1px solid #333', borderRadius: 4, padding: '2px 8px', cursor: 'pointer' }}
+                style={slashCommandRowStyle}
               >
-                {hint}
+                <span style={{ color: '#6fb4ff', fontWeight: 600, flexShrink: 0 }}>{item.hint}</span>
+                {item.description && (
+                  <span style={{ color: '#888', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.description}</span>
+                )}
               </button>
-            ))}
+              ))}
+            </div>
           </div>
         )}
 
@@ -766,4 +775,28 @@ const queuedPromptActionStyle: React.CSSProperties = {
   alignItems: 'center',
   justifyContent: 'center',
   flexShrink: 0,
+};
+
+const slashCommandPopupStyle: React.CSSProperties = {
+  marginBottom: 6,
+  borderRadius: 8,
+  border: '1px solid #303030',
+  background: '#121212',
+  padding: '6px 10px',
+  boxSizing: 'border-box',
+};
+
+const slashCommandRowStyle: React.CSSProperties = {
+  width: '100%',
+  minHeight: 28,
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  border: 'none',
+  background: 'transparent',
+  color: '#ccc',
+  fontSize: 12,
+  padding: '3px 0',
+  cursor: 'pointer',
+  textAlign: 'left',
 };

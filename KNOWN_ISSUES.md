@@ -5226,3 +5226,164 @@
   - Keep plan-file outcome updates in main-process helpers and add renderer-triggered UI verification coverage before changing hook completion behavior.
 - Files/Commands touched: `electron/main/claudeCodexHook.ts`, `electron/main/claudeCodexHook.test.ts`, `electron/main/ipcHandlers.ts`, `electron/shared/claudeCodexHook.ts`, `electron/shared/types.ts`, `electron/renderer/src/App.tsx`, `KNOWN_ISSUES.md`
 - References: Original Rust `try_queue_claude_codex_ui_verification`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron Browser URL worktree ailesi fallback'i eksikti {#electron-browser-url-worktree-family-fallback-parity}
+- Date: 2026-06-11
+- Context: Rust keeps Browser URLs synchronized across a project root and its worktrees, and Claude Code Codex hook UI verification falls back from the active Browser URL to the project-family last URL.
+- Error signature:
+  1. Electron persisted `browserLastUrl` only on the project whose Browser scope emitted `browser:urlChanged`.
+  2. Worktree UI verification could miss a root-project Browser URL even when the Rust app would reuse it.
+  3. Clearing a Browser URL already used family logic, but setting and lookup did not share that same rule.
+- Symptoms/Impact:
+  - Claude Code Codex hook UI verification could report "no browser URL is known" for a worktree even though the root project or sibling worktree had a usable Browser URL.
+  - Browser URL persistence behavior drifted from Rust's project-family model.
+- Root cause:
+  - Electron kept project-scope Browser URL selection inline in `App.tsx` and lacked a shared Browser project-family helper matching Rust's `browser_last_url_for_project_family` / `set_browser_last_url_for_project_family` flow.
+- Resolution:
+  - Added shared Browser scope helpers for project-family membership, root-first last URL fallback, active tab lookup, and project-family URL set/clear.
+  - Updated Browser URL persistence to write the observed URL to the whole root/worktree family.
+  - Updated Claude Code Codex hook UI verification to resolve URLs through active visible scope, family project tabs, and root-first family last URL fallback.
+  - Added regression tests for target visible active tabs, family active tab fallback, root-first persisted fallback, unrelated project isolation, and family set/clear.
+- Prevent recurrence:
+  - Keep Browser URL set, clear, and lookup behavior in the shared helper so worktree parity cannot drift between normal Browser use and hook UI verification.
+- Files/Commands touched: `electron/renderer/src/lib/browserScope.ts`, `electron/renderer/src/lib/browserScope.test.ts`, `electron/renderer/src/App.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `browser_last_url_for_project_family`, `set_browser_last_url_for_project_family`, `try_queue_claude_codex_ui_verification`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP slash komut popup'i Rust gorunumunden gerideydi {#electron-acp-slash-command-popup-parity}
+- Date: 2026-06-11
+- Context: Rust renders ACP slash commands as a compact popup above the composer with a `Commands:` header, command name, and description rows.
+- Error signature:
+  1. Electron reduced slash command matches to plain string pills.
+  2. Command descriptions from `available_commands_update` were discarded before rendering.
+  3. The slash UI was less resilient to malformed command payloads than the shared helper path could be.
+- Symptoms/Impact:
+  - Typing `/` in the ACP composer produced a visually different and less informative UI than Rust.
+  - Users could not scan command descriptions before selecting a slash command.
+- Root cause:
+  - Electron exposed only `slashCommandHints()` as strings and kept popup rendering inline in `AcpChatPanel`.
+- Resolution:
+  - Added `slashCommandItems()` with normalized hint text, description preservation, dedupe, limit, and malformed payload filtering.
+  - Updated the ACP composer to show a Rust-style `Commands:` popup with full-width command rows and descriptions.
+  - Added regression tests for description preservation, dedupe, limit behavior, and existing hint filtering.
+- Prevent recurrence:
+  - Keep ACP slash command normalization in `acpUi.ts` and cover both malformed server payloads and visual item metadata in tests.
+- Files/Commands touched: `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `acp_slash_command_matches`, `draw_acp_slash_command_popup`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP cancel ve request id protokol paritesi eksikti {#electron-acp-cancel-request-id-protocol-parity}
+- Date: 2026-06-11
+- Context: Rust uses monotonic ACP JSON-RPC request ids and sends `session/cancel` as a notification without an `id`, while suppressing known cancel-specific ACP noise.
+- Error signature:
+  1. Electron generated ACP request ids with `Date.now()`, allowing duplicate ids during same-millisecond bursts.
+  2. Electron sent `session/cancel` as a request with an `id`, unlike Rust's notification format.
+  3. `Got response to unknown request 0` and cancel `Method not found: session/cancel` noise could be surfaced as confusing raw transport text.
+- Symptoms/Impact:
+  - OpenCode ACP could emit stale/unknown response warnings after user actions such as Stop or question/permission response.
+  - Cancel-related protocol noise risked turning a usable session into an error state.
+- Root cause:
+  - Electron's ACP service kept request id generation and cancel message construction inline instead of sharing Rust-equivalent protocol helpers.
+- Resolution:
+  - Added a monotonic ACP request-id generator.
+  - Added an id-less `session/cancel` JSON-RPC notification builder and used it from `cancelAcpPrompt`.
+  - Added cancel-noise and stale unknown-response classifiers, suppressing cancel noise during the post-Stop grace window and normalizing stale response warnings into readable non-fatal messages.
+  - Added protocol regression tests for monotonic ids, cancel notification shape, cancel noise classification, and stale-response warning normalization.
+- Prevent recurrence:
+  - Keep ACP JSON-RPC message shapes in `shared/acpProtocol.ts` and test protocol helpers before changing `acpService.ts`.
+- Files/Commands touched: `electron/shared/acpProtocol.ts`, `electron/main/acpService.ts`, `electron/renderer/src/lib/acpProtocol.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `NEXT_REQUEST_ID`, `AcpChatSession::send_cancel`, `handle_acp_error_event`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP slash popup komut event'iyle kendiliginden aciliyordu {#electron-acp-slash-popup-input-gating-parity}
+- Date: 2026-06-11
+- Context: Rust derives ACP slash popup visibility from the current composer input each frame; available command updates alone do not open the popup unless the prompt starts with `/`.
+- Error signature:
+  1. Electron populated slash popup state directly when `available_commands_update` arrived.
+  2. The popup could appear even when the composer input was empty or did not start with `/`.
+- Symptoms/Impact:
+  - A background ACP command refresh could make the composer show command UI unexpectedly.
+  - This increased the chance that `/`-adjacent ACP UI updates looked like a broken or black panel instead of a controlled popup.
+- Root cause:
+  - Slash popup state was event-driven rather than derived from both available commands and current input.
+- Resolution:
+  - Added `slashCommandItemsForInput()` to gate slash command items on slash-prefixed input.
+  - Updated `AcpChatPanel` to use the same helper from both `commands` events and input changes.
+  - Added regression coverage for empty/non-slash input.
+- Prevent recurrence:
+  - Keep slash popup visibility derived from composer input and use the shared helper for future ACP command UI changes.
+- Files/Commands touched: `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust `acp_slash_command_matches`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP render hatasi tam siyah panele dusuyordu {#electron-acp-render-error-boundary-parity}
+- Date: 2026-06-11
+- Context: ACP UI rendering can fail after malformed or unexpected protocol/UI data. Rust keeps ACP failures inside the chat panel/status flow instead of replacing the whole area with an unstructured black surface.
+- Error signature:
+  1. Electron `AcpErrorBoundary` rendered a bare full-height dark fallback with only an error line and close button.
+  2. There was no retry path to recover the ACP panel after transient render state changed.
+  3. The fallback did not preserve the ACP header/status visual structure.
+- Symptoms/Impact:
+  - A slash-popup or ACP question render exception could look like the ACP screen went black.
+  - Users had to close the ACP panel instead of retrying the render.
+- Root cause:
+  - The error boundary fallback was implemented as a generic block, not as an ACP panel state.
+- Resolution:
+  - Reworked the fallback to preserve an ACP-style header, centered error panel, status row, close action, and `Retry ACP panel` action.
+  - Added a stable error message helper and regression tests for fallback message/state behavior.
+- Prevent recurrence:
+  - Keep render failures as structured ACP panel states, and add tests for fallback text/state before modifying ACP composer or question rendering.
+- Files/Commands touched: `electron/renderer/src/components/AcpErrorBoundary.tsx`, `electron/renderer/src/components/AcpErrorBoundary.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `handle_acp_error_event`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP unsupported cancel durumunu hatirlamiyordu {#electron-acp-cancel-unsupported-state-parity}
+- Date: 2026-06-11
+- Context: Rust marks ACP cancel as unsupported after `Method not found` / `-32601` cancel noise and skips future cancel RPCs for that session.
+- Error signature:
+  1. Electron suppressed cancel noise but did not remember that `session/cancel` was unsupported.
+  2. Later Stop attempts could resend the same unsupported notification and produce repeated transport noise.
+- Symptoms/Impact:
+  - Users could see repeated ACP cancel warnings/noise across multiple Stop attempts in the same session.
+  - Electron behavior drifted from Rust's quieter post-detection lifecycle.
+- Root cause:
+  - Electron had only a short cancel grace window and no session-level `cancelUnsupported` flag.
+- Resolution:
+  - Added `isAcpCancelUnsupported()` protocol helper.
+  - Stored `cancelUnsupported` on ACP sessions when unsupported cancel noise is observed.
+  - Skipped sending future `session/cancel` notifications when the current session already proved cancel unsupported, while still clearing local pending state and returning to idle.
+  - Added protocol regression coverage for unsupported-vs-generic cancel noise classification.
+- Prevent recurrence:
+  - Keep cancel capability state session-scoped in the ACP service and distinguish unsupported errors from generic cancel stderr noise.
+- Files/Commands touched: `electron/shared/acpProtocol.ts`, `electron/main/acpService.ts`, `electron/renderer/src/lib/acpProtocol.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `suppress_acp_cancel_error_if_needed`, `stop_acp_chat_session`, Electron parity goal 2026-06-11
+
+---
+
+#### Electron ACP JSON-RPC error response'larini fazla fatal sayiyordu {#electron-acp-json-rpc-error-warning-parity}
+- Date: 2026-06-11
+- Context: Rust treats ACP error events as non-fatal warnings when a session already exists or is still starting, unless the error is an `ACP JSON parse error`.
+- Error signature:
+  1. Electron marked every JSON-RPC `error` response as session `error`.
+  2. Non-parse ACP errors could clear pending interactions and stop the ACP activity lifecycle even when Rust would keep the session alive.
+- Symptoms/Impact:
+  - Recoverable ACP transport/server warnings could make the Electron ACP panel look broken.
+  - Queued prompts and active permission/question state could be cleared too aggressively.
+- Root cause:
+  - Electron's `handleAcpLine()` error path lacked Rust's `is_fatal = message.contains("ACP JSON parse error")` gating.
+- Resolution:
+  - Added `isAcpJsonParseError()` and `isAcpErrorFatalForSession()` protocol helpers.
+  - Updated JSON-RPC error handling to broadcast non-fatal warnings when `sessionId` exists or status is `starting`.
+  - Preserved fatal behavior for ACP JSON parse errors and pre-session non-starting errors.
+  - Added regression tests for fatal/non-fatal classification.
+- Prevent recurrence:
+  - Keep ACP fatality rules in shared protocol helpers and cover session-state combinations in tests before changing main-process error handling.
+- Files/Commands touched: `electron/shared/acpProtocol.ts`, `electron/main/acpService.ts`, `electron/renderer/src/lib/acpProtocol.test.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `handle_acp_error_event`, Electron parity goal 2026-06-11

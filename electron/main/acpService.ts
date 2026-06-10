@@ -5,9 +5,16 @@ import { BrowserWindow } from 'electron';
 import type { AcpChatSession, AcpConfigOption, AcpAvailableCommand, AcpChatMessage, OpenCodeModelConfig } from '../shared/types';
 import { activeBuildModel, effectivePlanModel, effectivePlanEffort, mergeAcpKnownModels } from '../shared/types';
 import {
+  acpUnknownResponseWarningText,
+  buildAcpCancelNotification,
   buildAcpPermissionResponse,
   buildAcpQuestionResponse,
+  createAcpRequestIdGenerator,
   firstAutoApproveOptionId,
+  isAcpCancelNoise,
+  isAcpCancelUnsupported,
+  isAcpErrorFatalForSession,
+  isAcpUnknownResponseWarning,
   isJsonRpcId,
   permissionRequestIdFromRpc,
   stripAnsi,
@@ -48,11 +55,13 @@ interface AcpSession {
   queuedPrompts: { text: string; attachments: string[]; modeId: string; finalPromptText: string }[];
   partialStderr?: string;
   cancelGraceUntil?: number;
+  cancelUnsupported?: boolean;
   pendingInteractions: Map<string, AcpPendingInteraction>;
   nextInteractionId: number;
 }
 
 const sessions = new Map<string, AcpSession>();
+const nextAcpRequestId = createAcpRequestIdGenerator();
 
 // Standby pool: per-project warmed session
 interface AcpStandbyEntry {
@@ -74,7 +83,7 @@ function broadcast(channel: string, ...args: unknown[]) {
 }
 
 function sendRpc(session: AcpSession, method: string, params: unknown): void {
-  const req = { jsonrpc: '2.0', id: Date.now(), method, params };
+  const req = { jsonrpc: '2.0', id: nextAcpRequestId(), method, params };
   sendRawRpc(session, req);
 }
 
@@ -198,15 +207,20 @@ export async function spawnAcpChat(opts: { projectId: number; cwd: string; mcpSe
       const now = Date.now();
       if (session.cancelGraceUntil && now < session.cancelGraceUntil) {
         // Suppress cancel-specific stderr noise
-        if (rawText.includes('Method not found') || rawText.includes('session/cancel') || rawText.includes('-32601')) {
+        if (isAcpCancelNoise(rawText)) {
+          if (isAcpCancelUnsupported(rawText)) {
+            session.cancelUnsupported = true;
+          }
           return;
         }
       }
       if (!text) return;
       session.partialStderr = (session.partialStderr || '') + text + '\n';
-      const prefix = text.includes('Got response to unknown request') ? 'ACP warning' : 'ACP stderr';
-      appendAcpSystemMessage(session, `${prefix}: ${text}`);
-      broadcast('acp:event', chatId, { type: prefix === 'ACP warning' ? 'warning' : 'stderr', text });
+      const staleResponseWarning = isAcpUnknownResponseWarning(text);
+      const prefix = staleResponseWarning ? 'ACP warning' : 'ACP stderr';
+      const message = staleResponseWarning ? acpUnknownResponseWarningText(text) : text;
+      appendAcpSystemMessage(session, `${prefix}: ${message}`);
+      broadcast('acp:event', chatId, { type: staleResponseWarning ? 'warning' : 'stderr', text: message });
     });
 
     proc.on('exit', (code) => {
@@ -256,9 +270,27 @@ function handleAcpLine(session: AcpSession, line: string): void {
 
     // Handle JSON-RPC error responses first
     if (error) {
+      const text = (error.message as string) || JSON.stringify(error);
+      const now = Date.now();
+      if (session.cancelGraceUntil && now < session.cancelGraceUntil && isAcpCancelNoise(text)) {
+        if (isAcpCancelUnsupported(text)) {
+          session.cancelUnsupported = true;
+        }
+        return;
+      }
+      if (isAcpUnknownResponseWarning(text)) {
+        const message = acpUnknownResponseWarningText(text);
+        appendAcpSystemMessage(session, `ACP warning: ${message}`);
+        broadcast('acp:event', session.chatId, { type: 'warning', text: message });
+        return;
+      }
+      if (!isAcpErrorFatalForSession(text, Boolean(session.sessionId), session.status)) {
+        appendAcpSystemMessage(session, `ACP warning: ${text}`);
+        broadcast('acp:event', session.chatId, { type: 'warning', text });
+        return;
+      }
       session.status = 'error';
       clearPendingInteractions(session);
-      const text = (error.message as string) || JSON.stringify(error);
       appendAcpSystemMessage(session, `ACP error: ${text}`);
       broadcast('acp:event', session.chatId, { type: 'error', text: `ACP error: ${text}` });
       return;
@@ -602,7 +634,9 @@ export function cancelAcpPrompt(chatId: string): void {
 
   session.cancelGraceUntil = Date.now() + 2000;
   clearPendingInteractions(session);
-  sendRpc(session, 'session/cancel', { sessionId: session.sessionId });
+  if (!session.cancelUnsupported) {
+    sendRawRpc(session, buildAcpCancelNotification(session.sessionId));
+  }
   session.status = 'idle';
   updateAcpStandbyStatus(session.chatId, 'idle');
   broadcast('acp:event', chatId, { type: 'cancelled', queuedPrompts: session.queuedPrompts.length });

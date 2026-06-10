@@ -15,7 +15,13 @@ import { BrowserPanel } from './components/BrowserPanel';
 import { SettingsPopup } from './components/SettingsPopup';
 import { InputHistory } from './components/InputHistory';
 import { usePty } from './hooks/usePty';
-import { activeBrowserScope as resolveActiveBrowserScope, scopeKeyString } from './lib/browserScope';
+import {
+  activeBrowserScope as resolveActiveBrowserScope,
+  browserUrlForProjectFamily,
+  scopeKeyString,
+  withBrowserLastUrlForProjectFamily,
+  withoutBrowserLastUrlForProjectFamily,
+} from './lib/browserScope';
 import { nextAcpActivityState, type AcpEventLike } from './lib/acpUi';
 import type { SmartInputModeId } from './lib/smartInputMode';
 import { shouldShowSmartInputFooter } from './lib/smartInput';
@@ -273,15 +279,10 @@ function App() {
     const unsub = api.on('browser:urlChanged', (scope: BrowserScopeKey, url: string) => {
       if (!config) return;
       if (scope.type !== BrowserScopeKeyType.Project) return;
-      const project = config.projects.find((p) => p.id === scope.projectId);
-      if (!project) return;
-      if (project.browserLastUrl === url) return;
       setConfig((prev) => {
         if (!prev) return prev;
-        const projects = prev.projects.map((p) =>
-          p.id === scope.projectId ? { ...p, browserLastUrl: url } : p
-        );
-        return { ...prev, projects };
+        const projects = withBrowserLastUrlForProjectFamily(prev.projects, scope.projectId, url);
+        return projects === prev.projects ? prev : { ...prev, projects };
       });
     });
     return () => { unsub(); };
@@ -401,19 +402,8 @@ function App() {
   const clearProjectBrowserLastUrl = useCallback((projectId: number) => {
     setConfig((prev) => {
       if (!prev) return prev;
-      const target = prev.projects.find((project) => project.id === projectId);
-      if (!target) return prev;
-      const rootPath = target.repoRoot ?? target.path;
-      let changed = false;
-      const projects = prev.projects.map((project) => {
-        const projectRoot = project.repoRoot ?? project.path;
-        const sameFamily = project.id === projectId || project.path === rootPath || projectRoot === rootPath;
-        if (!sameFamily || !project.browserLastUrl) return project;
-        changed = true;
-        const { browserLastUrl: _browserLastUrl, ...rest } = project;
-        return rest;
-      });
-      return changed ? { ...prev, projects } : prev;
+      const projects = withoutBrowserLastUrlForProjectFamily(prev.projects, projectId);
+      return projects === prev.projects ? prev : { ...prev, projects };
     });
   }, []);
 
@@ -922,12 +912,15 @@ function App() {
   }, [config, pty, terminals]);
 
   const browserUrlForProject = useCallback((project: ProjectRecord): string | undefined => {
-    const scope = { type: BrowserScopeKeyType.Project, projectId: project.id } as BrowserScopeKey;
-    const tabs = browserTabsByScope.get(scopeKeyString(scope)) ?? [];
-    const activeTabId = browserActiveTabByScope.get(scopeKeyString(scope));
-    const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? tabs.find((tab) => tab.url);
-    return activeTab?.url || project.browserLastUrl;
-  }, [browserActiveTabByScope, browserTabsByScope]);
+    if (!config) return undefined;
+    return browserUrlForProjectFamily(
+      project,
+      config.projects,
+      browserTabsByScope,
+      browserActiveTabByScope,
+      browserPanelVisibleScopeByProject,
+    );
+  }, [browserActiveTabByScope, browserPanelVisibleScopeByProject, browserTabsByScope, config]);
 
   const queueClaudeCodexUiVerification = useCallback((project: ProjectRecord, planPath: string, uiChangedFiles: string[]) => {
     if (uiChangedFiles.length === 0) {

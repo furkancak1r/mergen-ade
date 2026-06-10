@@ -15,6 +15,12 @@ export interface AcpActivityState {
 export interface AcpCommandLike {
   id?: unknown;
   name?: unknown;
+  description?: unknown;
+}
+
+export interface AcpSlashCommandItem {
+  hint: string;
+  description: string;
 }
 
 export const OPENCODE_ACP_LABEL = 'OpenCode ACP';
@@ -103,10 +109,10 @@ export function slashCommandHint(command: AcpCommandLike): string | undefined {
   return `/${token}`;
 }
 
-export function slashCommandHints(commands: unknown, query: string, limit = 6): string[] {
+export function slashCommandItems(commands: unknown, query: string, limit = 6): AcpSlashCommandItem[] {
   if (!Array.isArray(commands)) return [];
   const normalizedQuery = query.trim().replace(/^\/+/, '').toLowerCase();
-  const hints: string[] = [];
+  const items: AcpSlashCommandItem[] = [];
   const seen = new Set<string>();
 
   for (const command of commands) {
@@ -123,9 +129,22 @@ export function slashCommandHints(commands: unknown, query: string, limit = 6): 
     if (seen.has(hint)) continue;
 
     seen.add(hint);
-    hints.push(hint);
-    if (hints.length >= limit) break;
+    items.push({
+      hint,
+      description: commandText(candidate.description),
+    });
+    if (items.length >= limit) break;
   }
 
-  return hints;
+  return items;
+}
+
+export function slashCommandHints(commands: unknown, query: string, limit = 6): string[] {
+  return slashCommandItems(commands, query, limit).map((item) => item.hint);
+}
+
+export function slashCommandItemsForInput(commands: unknown, input: string, limit = 6): AcpSlashCommandItem[] {
+  const query = input.trim();
+  if (!query.startsWith('/')) return [];
+  return slashCommandItems(commands, query.slice(1), limit);
 }
