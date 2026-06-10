@@ -7390,7 +7390,10 @@ impl AdeApp {
             }
 
             let launch_command = if launcher.builtin == Some(BuiltinLauncherKind::Claude) {
-                Self::sanitized_claude_launch_command(shell, launcher.bypass_permissions)
+                Self::sanitized_claude_launch_command(
+                    shell,
+                    launcher.bypass_permissions_effective(),
+                )
             } else {
                 launcher.launch_command.clone()
             };
@@ -19233,11 +19236,17 @@ impl AdeApp {
                                     );
                                     row_changed |= enabled_response.changed();
 
+                                    let mut bypass_val = launcher.bypass_permissions.unwrap_or(
+                                        launcher.builtin == Some(BuiltinLauncherKind::Claude),
+                                    );
                                     let bypass_response = ui.checkbox(
-                                        &mut launcher.bypass_permissions,
+                                        &mut bypass_val,
                                         "Bypass permissions",
                                     );
-                                    row_changed |= bypass_response.changed();
+                                    if bypass_response.changed() {
+                                        launcher.bypass_permissions = Some(bypass_val);
+                                        row_changed = true;
+                                    }
 
                                     if !is_builtin {
                                         ui.add_space(12.0);
@@ -19428,7 +19437,7 @@ impl AdeApp {
                                     launch_command: launch_command.to_owned(),
                                     enabled: true,
                                     icon_key: self.launcher_draft.icon_key,
-                                    bypass_permissions: false,
+                                    bypass_permissions: Some(false),
                                 });
                                 self.launcher_draft = LauncherDraftState::default();
                                 changes.note_launchers_change();
@@ -42820,7 +42829,7 @@ mod tests {
             launch_command: "opencode".to_owned(),
             enabled: true,
             icon_key: LauncherIconKey::OpenCode,
-            bypass_permissions: false,
+            bypass_permissions: Some(false),
         }];
 
         // Simulate hovering over the launcher row text area
@@ -42882,7 +42891,7 @@ mod tests {
             launch_command: "opencode".to_owned(),
             enabled: true,
             icon_key: LauncherIconKey::OpenCode,
-            bypass_permissions: false,
+            bypass_permissions: Some(false),
         }];
 
         let idle_output =
@@ -42921,7 +42930,7 @@ mod tests {
             launch_command: "opencode".to_owned(),
             enabled: true,
             icon_key: LauncherIconKey::OpenCode,
-            bypass_permissions: false,
+            bypass_permissions: Some(false),
         }];
 
         let output = draw_foreground_launcher_menu_in_test_ui(
@@ -43031,7 +43040,7 @@ mod tests {
                 .to_owned(),
             enabled: true,
             icon_key: LauncherIconKey::OpenCode,
-            bypass_permissions: false,
+            bypass_permissions: Some(false),
         }];
 
         let output =
@@ -43068,7 +43077,7 @@ mod tests {
             launch_command: "opencode".to_owned(),
             enabled: true,
             icon_key: LauncherIconKey::OpenCode,
-            bypass_permissions: false,
+            bypass_permissions: Some(false),
         }];
 
         let output =
@@ -43110,7 +43119,7 @@ mod tests {
             launch_command: "opencode".to_owned(),
             enabled: true,
             icon_key: LauncherIconKey::OpenCode,
-            bypass_permissions: false,
+            bypass_permissions: Some(false),
         }];
 
         let output = draw_open_foreground_launcher_popup_in_test_ui(&ctx, &launchers);
@@ -43161,7 +43170,7 @@ mod tests {
                 launch_command: "opencode".to_owned(),
                 enabled: true,
                 icon_key: LauncherIconKey::OpenCode,
-                bypass_permissions: false,
+                bypass_permissions: Some(false),
             },
             LauncherEntry {
                 id: "codex".to_owned(),
@@ -43170,7 +43179,7 @@ mod tests {
                 launch_command: "codex".to_owned(),
                 enabled: true,
                 icon_key: LauncherIconKey::Codex,
-                bypass_permissions: false,
+                bypass_permissions: Some(false),
             },
             LauncherEntry {
                 id: "droid".to_owned(),
@@ -43179,7 +43188,7 @@ mod tests {
                 launch_command: "droid".to_owned(),
                 enabled: true,
                 icon_key: LauncherIconKey::Droid,
-                bypass_permissions: false,
+                bypass_permissions: Some(false),
             },
             LauncherEntry {
                 id: "claude".to_owned(),
@@ -43188,7 +43197,7 @@ mod tests {
                 launch_command: "claude".to_owned(),
                 enabled: true,
                 icon_key: LauncherIconKey::Claude,
-                bypass_permissions: false,
+                bypass_permissions: Some(false),
             },
         ];
 

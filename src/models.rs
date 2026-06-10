@@ -187,7 +187,7 @@ pub struct LauncherEntry {
     pub enabled: bool,
     pub icon_key: LauncherIconKey,
     #[serde(default)]
-    pub bypass_permissions: bool,
+    pub bypass_permissions: Option<bool>,
 }
 
 impl LauncherEntry {
@@ -199,8 +199,13 @@ impl LauncherEntry {
             launch_command: kind.default_launch_command().to_owned(),
             enabled: true,
             icon_key: kind.icon_key(),
-            bypass_permissions: false,
+            bypass_permissions: Some(kind == BuiltinLauncherKind::Claude),
         }
+    }
+
+    pub fn bypass_permissions_effective(&self) -> bool {
+        self.bypass_permissions
+            .unwrap_or_else(|| self.builtin == Some(BuiltinLauncherKind::Claude))
     }
 }
 
@@ -1375,7 +1380,7 @@ mod tests {
             launch_command: "my-cli".to_owned(),
             enabled: true,
             icon_key: LauncherIconKey::Rocket,
-            bypass_permissions: false,
+            bypass_permissions: Some(false),
         }];
 
         normalize_launcher_entries(&mut launchers);
@@ -1384,6 +1389,78 @@ mod tests {
         assert_eq!(launchers[0].builtin, Some(BuiltinLauncherKind::OpenCode));
         assert_eq!(launchers[4].builtin, None);
         assert_eq!(launchers[4].display_name, "Custom");
+    }
+
+    #[test]
+    fn normalize_launcher_entries_preserves_bypass_permissions_none_for_builtins() {
+        let mut launchers = vec![LauncherEntry {
+            id: "claude".to_owned(),
+            builtin: Some(BuiltinLauncherKind::Claude),
+            display_name: "Claude".to_owned(),
+            launch_command: "claude".to_owned(),
+            enabled: true,
+            icon_key: LauncherIconKey::Claude,
+            bypass_permissions: None,
+        }];
+
+        normalize_launcher_entries(&mut launchers);
+
+        let claude = launchers
+            .iter()
+            .find(|l| l.builtin == Some(BuiltinLauncherKind::Claude))
+            .unwrap();
+        assert_eq!(claude.bypass_permissions, None);
+        assert!(
+            claude.bypass_permissions_effective(),
+            "Claude should default to bypass permissions when field is None (old config)"
+        );
+    }
+
+    #[test]
+    fn normalize_launcher_entries_keeps_explicit_bypass_permissions_false() {
+        let mut launchers = vec![LauncherEntry {
+            id: "claude".to_owned(),
+            builtin: Some(BuiltinLauncherKind::Claude),
+            display_name: "Claude".to_owned(),
+            launch_command: "claude".to_owned(),
+            enabled: true,
+            icon_key: LauncherIconKey::Claude,
+            bypass_permissions: Some(false),
+        }];
+
+        normalize_launcher_entries(&mut launchers);
+
+        let claude = launchers
+            .iter()
+            .find(|l| l.builtin == Some(BuiltinLauncherKind::Claude))
+            .unwrap();
+        assert_eq!(claude.bypass_permissions, Some(false));
+        assert!(
+            !claude.bypass_permissions_effective(),
+            "explicit false should be respected"
+        );
+    }
+
+    #[test]
+    fn normalize_launcher_entries_keeps_explicit_bypass_permissions_true() {
+        let mut launchers = vec![LauncherEntry {
+            id: "claude".to_owned(),
+            builtin: Some(BuiltinLauncherKind::Claude),
+            display_name: "Claude".to_owned(),
+            launch_command: "claude".to_owned(),
+            enabled: true,
+            icon_key: LauncherIconKey::Claude,
+            bypass_permissions: Some(true),
+        }];
+
+        normalize_launcher_entries(&mut launchers);
+
+        let claude = launchers
+            .iter()
+            .find(|l| l.builtin == Some(BuiltinLauncherKind::Claude))
+            .unwrap();
+        assert_eq!(claude.bypass_permissions, Some(true));
+        assert!(claude.bypass_permissions_effective());
     }
 
     #[test]
