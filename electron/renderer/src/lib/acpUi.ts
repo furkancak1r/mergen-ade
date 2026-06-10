@@ -71,6 +71,27 @@ export function acpModeUiLabel(modeId: string | undefined): string | undefined {
   return modeId;
 }
 
+export function queuedPromptPreview(prompt: { text?: string; finalPromptText?: string; attachments?: unknown[] }): string {
+  const directText = prompt.text?.trim();
+  if (directText) return directText;
+  const finalText = prompt.finalPromptText?.trim();
+  if (finalText) return finalText;
+  return (prompt.attachments?.length ?? 0) > 0 ? '(Attachment)' : '(Empty prompt)';
+}
+
+export function moveQueuedPromptToFront<T>(queue: readonly T[], index: number): T[] {
+  if (!Number.isInteger(index) || index < 0 || index >= queue.length) return [...queue];
+  const next = [...queue];
+  const [item] = next.splice(index, 1);
+  next.unshift(item);
+  return next;
+}
+
+export function removeQueuedPromptAt<T>(queue: readonly T[], index: number): T[] {
+  if (!Number.isInteger(index) || index < 0 || index >= queue.length) return [...queue];
+  return queue.filter((_, itemIndex) => itemIndex !== index);
+}
+
 function commandText(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }

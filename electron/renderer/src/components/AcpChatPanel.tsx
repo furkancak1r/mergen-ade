@@ -9,6 +9,7 @@ import {
   openCodeAcpPanelTitle,
   openCodeAcpWelcomeText,
   optionValues,
+  queuedPromptPreview,
   shouldShowAcpWelcome,
   slashCommandHints,
 } from '../lib/acpUi';
@@ -324,6 +325,21 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
     if (accepted) clearPendingInteraction();
   };
 
+  const runQueuedPromptNext = useCallback(async (index: number) => {
+    const accepted = await api.invoke('acp:queueRunNext', { chatId, index }) as boolean;
+    if (accepted) await refreshSession();
+  }, [chatId, refreshSession]);
+
+  const deleteQueuedPrompt = useCallback(async (index: number) => {
+    const accepted = await api.invoke('acp:queueDelete', { chatId, index }) as boolean;
+    if (accepted) await refreshSession();
+  }, [chatId, refreshSession]);
+
+  const copyQueuedPrompt = useCallback(async (prompt: QueuedAcpPrompt) => {
+    const text = prompt.finalPromptText.trim() || prompt.text.trim() || queuedPromptPreview(prompt);
+    await api.invoke('clipboard:writeText', text);
+  }, []);
+
   const pendingQuestionSubmitEnabled = (() => {
     if (!pendingQuestion) return false;
     if (pendingQuestion.kind !== 'question') {
@@ -374,7 +390,14 @@ export const AcpChatPanel: React.FC<AcpChatPanelProps> = ({ project, chatId, con
       {session?.queuedPrompts && session.queuedPrompts?.length > 0 && (
         <div style={{ padding: '4px 12px', flexShrink: 0 }}>
           {session.queuedPrompts.map((qp, i) => (
-            <QueuedPromptRow key={i} prompt={qp} />
+            <QueuedPromptRow
+              key={i}
+              index={i}
+              prompt={qp}
+              onRunNext={runQueuedPromptNext}
+              onCopy={copyQueuedPrompt}
+              onDelete={deleteQueuedPrompt}
+            />
           ))}
         </div>
       )}
@@ -680,15 +703,67 @@ const MessageBubble: React.FC<{ message: AcpChatMessage }> = ({ message }) => {
   );
 };
 
-const QueuedPromptRow: React.FC<{ prompt: QueuedAcpPrompt }> = ({ prompt }) => {
+const QueuedPromptRow: React.FC<{
+  index: number;
+  prompt: QueuedAcpPrompt;
+  onRunNext: (index: number) => void;
+  onCopy: (prompt: QueuedAcpPrompt) => void;
+  onDelete: (index: number) => void;
+}> = ({ index, prompt, onRunNext, onCopy, onDelete }) => {
   const modeLabel = acpModeUiLabel(prompt.modeId);
+  const preview = queuedPromptPreview(prompt);
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: '#1a1a1a', borderRadius: 8, marginBottom: 4, fontSize: 12, color: '#888' }}>
-      <span style={{ color: '#666', fontWeight: 600 }}>Queued</span>
-      <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{prompt.text || prompt.finalPromptText}</span>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, minHeight: 44, padding: '8px 10px', background: '#1a1a1a', borderRadius: 8, marginBottom: 4, fontSize: 12, color: '#888' }}>
+      <span style={{ color: '#666', fontWeight: 600, flexShrink: 0 }}>Queued</span>
+      <button
+        onClick={() => onCopy(prompt)}
+        title="Copy queued prompt"
+        style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left', background: 'transparent', border: 'none', color: '#b4b4b4', font: 'inherit', padding: 0, cursor: 'copy' }}
+      >
+        {preview}
+      </button>
       {modeLabel && (
-        <span style={{ fontSize: 10, color: '#666', background: '#222', padding: '2px 6px', borderRadius: 3 }}>{modeLabel}</span>
+        <span style={{ fontSize: 10, color: '#666', background: '#222', padding: '2px 6px', borderRadius: 3, flexShrink: 0 }}>{modeLabel}</span>
       )}
+      {prompt.attachments.length > 0 && (
+        <span style={{ fontSize: 10, color: '#666', background: '#222', padding: '2px 6px', borderRadius: 3, flexShrink: 0 }}>+{prompt.attachments.length}</span>
+      )}
+      <button
+        onClick={() => onRunNext(index)}
+        title="Run next"
+        style={queuedPromptActionStyle}
+      >
+        ⇧
+      </button>
+      <button
+        onClick={() => onCopy(prompt)}
+        title="Copy"
+        style={queuedPromptActionStyle}
+      >
+        ⧉
+      </button>
+      <button
+        onClick={() => onDelete(index)}
+        title="Delete"
+        style={{ ...queuedPromptActionStyle, color: '#b98787' }}
+      >
+        ✕
+      </button>
     </div>
   );
+};
+
+const queuedPromptActionStyle: React.CSSProperties = {
+  width: 24,
+  height: 24,
+  borderRadius: '50%',
+  border: '1px solid #303030',
+  background: 'transparent',
+  color: '#888',
+  cursor: 'pointer',
+  fontSize: 12,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  flexShrink: 0,
 };

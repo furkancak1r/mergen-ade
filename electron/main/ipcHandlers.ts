@@ -5,7 +5,7 @@ import path from 'path';
 import { loadConfig, saveConfig, loadHistory, saveHistory, repairMojibakePath } from './config';
 import { createTerminal, writeTerminal, resizeTerminal, killTerminal, getTerminalState } from './pty';
 import { discoverWorktrees, createWorktree, removeWorktree, getGitStatus, getGitDiffSummary } from './worktree';
-import { spawnAcpChat, sendAcpPrompt, cancelAcpPrompt, setAcpConfigOption, sendAcpPermissionResponse, sendAcpQuestionResponse, getAcpSession, killAcpChat, warmAcpStandby, getAcpStandby, clearAcpStandby, promoteAcpStandby, clearAllAcpStandby } from './acpService';
+import { spawnAcpChat, sendAcpPrompt, cancelAcpPrompt, setAcpConfigOption, sendAcpPermissionResponse, sendAcpQuestionResponse, getAcpSession, runAcpQueuedPromptNext, deleteAcpQueuedPrompt, killAcpChat, warmAcpStandby, getAcpStandby, clearAcpStandby, promoteAcpStandby, clearAllAcpStandby } from './acpService';
 import { submitAnswer } from './hookService';
 import {
   createBrowserView,
@@ -173,6 +173,12 @@ export function registerIpcHandlers() {
   });
   ipcMain.handle('acp:getSession', async (_event, chatId: string) => {
     return getAcpSession(chatId);
+  });
+  ipcMain.handle('acp:queueRunNext', async (_event, opts: { chatId: string; index: number }) => {
+    return runAcpQueuedPromptNext(opts.chatId, opts.index);
+  });
+  ipcMain.handle('acp:queueDelete', async (_event, opts: { chatId: string; index: number }) => {
+    return deleteAcpQueuedPrompt(opts.chatId, opts.index);
   });
   ipcMain.handle('acp:kill', async (_event, chatId: string) => {
     killAcpChat(chatId);

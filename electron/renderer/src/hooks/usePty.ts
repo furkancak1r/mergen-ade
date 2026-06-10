@@ -1,8 +1,8 @@
 import { useEffect, useRef, useCallback } from 'react';
-import type { TerminalKind, ShellKind, AiHookEvent, AiCliTool, SmartInputState, SmartInputAttachment, OpenCodeQuestion } from '../../../shared/types';
-import { AiCliStatus as AiCliStatusEnum } from '../../../shared/types';
+import type { TerminalKind, ShellKind, AiHookEvent, AiCliTool, AiCliAttentionKind, SmartInputState, SmartInputAttachment, OpenCodeQuestion } from '../../../shared/types';
 import type { SmartInputModeId } from '../lib/smartInputMode';
 import { normalizeSmartInputModeId, shouldSendOpenCodeModeToggle } from '../lib/smartInputMode';
+import { canAutoDispatchClaude } from '../lib/smartInput';
 
 const SMART_INPUT_AUTO_DISPATCH_SETTLE_MS = 300;
 const OPENCODE_RUNNING_GRACE_MS = 2000;
@@ -24,6 +24,7 @@ export interface TerminalInstance {
   aiTool?: AiCliTool;
   aiStatus: string;
   aiStatusReason?: string;
+  aiAttentionKind?: AiCliAttentionKind;
   opencodeSessionActive: boolean;
   opencodeTransportStatus?: string;
   opencodeAttentionReason?: string;
@@ -247,6 +248,7 @@ export function usePty() {
       t.aiTool = event.tool;
       t.aiStatus = event.status;
       t.aiStatusReason = event.reason;
+      t.aiAttentionKind = event.attentionKind;
       if (event.tool === 'opencode') {
         const isWorking = event.status === 'running' || event.status === 'attention';
         if (isWorking) {
@@ -303,6 +305,7 @@ export function usePty() {
         }
         if (event.status === 'running') {
           // Clear pending question on Working transition
+          t.aiAttentionKind = undefined;
           t.opencodePendingQuestion = undefined;
           t.opencodeQuestionSelectedOptions = [];
           t.opencodeQuestionCustomText = '';
@@ -347,6 +350,9 @@ export function usePty() {
       if (event.tool === 'droid') {
         const isWorking = event.status === 'running' || event.status === 'attention';
         if (isWorking) t.opencodeSessionActive = true;
+      }
+      if (event.tool === 'claude' && event.status === 'running') {
+        t.aiAttentionKind = undefined;
       }
       notify();
     });
@@ -424,16 +430,17 @@ export function usePty() {
         }
 
         if (t.kind !== 'foreground') continue;
-        if (t.aiTool !== 'opencode') continue;
-        if (!t.opencodeSessionActive) continue;
-        if (t.opencodePendingQuestion) continue;
+        const isOpenCodeSmartInput = t.aiTool === 'opencode' && t.opencodeSessionActive;
+        const isClaudeSmartInput = t.aiTool === 'claude' && (t.aiStatus === 'running' || t.aiStatus === 'attention');
+        if (!isOpenCodeSmartInput && !isClaudeSmartInput) continue;
+        if (isOpenCodeSmartInput && t.opencodePendingQuestion) continue;
         if (t.smartInputState.queue.length === 0) continue;
 
         // Kimi thought-loop guard blocks auto-dispatch only
-        if (t.opencodeThoughtLoopBlocked || t.opencodeLoopLimitEmitted) continue;
+        if (isOpenCodeSmartInput && (t.opencodeThoughtLoopBlocked || t.opencodeLoopLimitEmitted)) continue;
 
         // Stale Working recovery: clear stale Working if no hook event for 6s
-        if (t.opencodeTransportStatus === 'Working') {
+        if (isOpenCodeSmartInput && t.opencodeTransportStatus === 'Working') {
           const lastHook = t.opencodeLastHookEventSince ?? 0;
           if (now - lastHook > OPENCODE_RUNNING_GRACE_MS * 3) {
             t.opencodeTransportStatus = 'Idle';
@@ -441,15 +448,18 @@ export function usePty() {
           }
         }
 
-        // Check auto-dispatch conditions
-        // Auto-dispatch only when Idle AND the last attention reason was TurnComplete
-        const isIdle = t.opencodeTransportStatus === 'Idle';
-        const hasTurnComplete = t.opencodeAttentionReason === 'turn_complete';
-        if (!isIdle || !hasTurnComplete) continue;
+        if (isOpenCodeSmartInput) {
+          // Auto-dispatch only when Idle AND the last attention reason was TurnComplete
+          const isIdle = t.opencodeTransportStatus === 'Idle';
+          const hasTurnComplete = t.opencodeAttentionReason === 'turn_complete';
+          if (!isIdle || !hasTurnComplete) continue;
 
-        // Settle guard: suppress stale Idle within 300ms of prompt submit
-        const submitSince = t.opencodePromptSubmitSince ?? 0;
-        if (now - submitSince < SMART_INPUT_AUTO_DISPATCH_SETTLE_MS) continue;
+          // Settle guard: suppress stale Idle within 300ms of prompt submit
+          const submitSince = t.opencodePromptSubmitSince ?? 0;
+          if (now - submitSince < SMART_INPUT_AUTO_DISPATCH_SETTLE_MS) continue;
+        } else if (!canAutoDispatchClaude(t.smartInputState.queue, t.aiStatus, t.aiAttentionKind, t.opencodePromptSubmitSince, now)) {
+          continue;
+        }
 
         // Auto-dispatch the next task
         const task = t.smartInputState.queue[0];
@@ -459,7 +469,12 @@ export function usePty() {
           queue: nextQueue,
         };
         t.opencodePromptSubmitSince = now;
-        t.opencodeTransportStatus = 'Working';
+        if (isOpenCodeSmartInput) {
+          t.opencodeTransportStatus = 'Working';
+        } else {
+          t.aiStatus = 'running';
+          t.aiAttentionKind = undefined;
+        }
 
         // Clear previous delayed enters
         t.pendingDelayedEnters = [];
@@ -533,7 +548,13 @@ export function usePty() {
 
     // Track prompt submit for settle guard
     t.opencodePromptSubmitSince = now;
-    t.opencodeTransportStatus = 'Working';
+    if (t.aiTool === 'opencode') {
+      t.opencodeTransportStatus = 'Working';
+    }
+    if (t.aiTool === 'claude') {
+      t.aiStatus = 'running';
+      t.aiAttentionKind = undefined;
+    }
 
     // Clear previous delayed enters
     t.pendingDelayedEnters = [];
@@ -558,7 +579,13 @@ export function usePty() {
 
     // Track prompt submit for settle guard
     t.opencodePromptSubmitSince = now;
-    t.opencodeTransportStatus = 'Working';
+    if (t.aiTool === 'opencode') {
+      t.opencodeTransportStatus = 'Working';
+    }
+    if (t.aiTool === 'claude') {
+      t.aiStatus = 'running';
+      t.aiAttentionKind = undefined;
+    }
 
     // Clear previous delayed enters
     t.pendingDelayedEnters = [];

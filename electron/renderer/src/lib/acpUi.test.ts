@@ -6,9 +6,12 @@ import {
   actionControlsEnabled,
   acpModeUiLabel,
   hasConfigSelectorOptions,
+  moveQueuedPromptToFront,
   nextAcpActivityState,
   openCodeAcpPanelTitle,
   openCodeAcpWelcomeText,
+  queuedPromptPreview,
+  removeQueuedPromptAt,
   shouldShowAcpWelcome,
   slashCommandHint,
   slashCommandHints,
@@ -66,6 +69,28 @@ describe('acpUi', () => {
     expect(acpModeUiLabel('build')).toBeUndefined();
     expect(acpModeUiLabel(undefined)).toBeUndefined();
     expect(acpModeUiLabel('custom')).toBe('custom');
+  });
+
+  it('uses Rust-style ACP queued prompt previews', () => {
+    expect(queuedPromptPreview({ text: '  Build this  ', finalPromptText: 'ignored' })).toBe('Build this');
+    expect(queuedPromptPreview({ text: '', finalPromptText: 'Attached file paths:\n- a.png' })).toBe('Attached file paths:\n- a.png');
+    expect(queuedPromptPreview({ attachments: ['a.png'] })).toBe('(Attachment)');
+    expect(queuedPromptPreview({})).toBe('(Empty prompt)');
+  });
+
+  it('moves queued ACP prompts to the front by index without mutating the queue', () => {
+    const queue = ['first', 'second', 'third'];
+    expect(moveQueuedPromptToFront(queue, 2)).toEqual(['third', 'first', 'second']);
+    expect(queue).toEqual(['first', 'second', 'third']);
+    expect(moveQueuedPromptToFront(queue, -1)).toEqual(queue);
+    expect(moveQueuedPromptToFront(queue, 3)).toEqual(queue);
+  });
+
+  it('removes queued ACP prompts by index without mutating the queue', () => {
+    const queue = ['first', 'second', 'third'];
+    expect(removeQueuedPromptAt(queue, 1)).toEqual(['first', 'third']);
+    expect(queue).toEqual(['first', 'second', 'third']);
+    expect(removeQueuedPromptAt(queue, 99)).toEqual(queue);
   });
 
   it('normalizes slash command hints from id or name', () => {

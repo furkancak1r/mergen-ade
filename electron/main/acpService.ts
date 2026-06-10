@@ -532,6 +532,42 @@ function flushNextQueuedPrompt(session: AcpSession): void {
   broadcast('acp:event', session.chatId, { type: 'promptSent', text: fullText, queuedPrompts: session.queuedPrompts.length });
 }
 
+function isValidQueueIndex(session: AcpSession, index: number): boolean {
+  return Number.isInteger(index) && index >= 0 && index < session.queuedPrompts.length;
+}
+
+function broadcastQueueUpdated(session: AcpSession): void {
+  broadcast('acp:event', session.chatId, {
+    type: 'queueUpdated',
+    count: session.queuedPrompts.length,
+    queuedPrompts: session.queuedPrompts.length,
+  });
+}
+
+export function runAcpQueuedPromptNext(chatId: string, index: number): boolean {
+  const session = sessions.get(chatId);
+  if (!session || !isValidQueueIndex(session, index)) return false;
+
+  const [prompt] = session.queuedPrompts.splice(index, 1);
+  session.queuedPrompts.unshift(prompt);
+  broadcastQueueUpdated(session);
+
+  if (session.status === 'idle') {
+    flushNextQueuedPrompt(session);
+  }
+
+  return true;
+}
+
+export function deleteAcpQueuedPrompt(chatId: string, index: number): boolean {
+  const session = sessions.get(chatId);
+  if (!session || !isValidQueueIndex(session, index)) return false;
+
+  session.queuedPrompts.splice(index, 1);
+  broadcastQueueUpdated(session);
+  return true;
+}
+
 export function sendAcpPrompt(chatId: string, promptText: string, attachments: string[], modeId?: string): void {
   const session = sessions.get(chatId);
   if (!session) return;

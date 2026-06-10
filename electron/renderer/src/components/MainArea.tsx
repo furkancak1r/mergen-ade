@@ -6,6 +6,7 @@ import type { TerminalInstance } from '../hooks/usePty';
 import type { SmartInputState, SmartInputAttachment, OpenCodeQuestion } from '../../../shared/types';
 import { AiCliTool as AiCliToolEnum } from '../../../shared/types';
 import type { SmartInputModeId } from '../lib/smartInputMode';
+import { shouldShowSmartInputFooter } from '../lib/smartInput';
 
 interface MainAreaProps {
   terminals: TerminalInstance[];
@@ -91,7 +92,8 @@ export const MainArea: React.FC<MainAreaProps> = ({ terminals, activeTerminalId,
     >
       {terminals.map((t) => {
         const isActive = t.id === activeTerminalId;
-        const showSmartInput = t.kind === 'foreground' && t.aiTool === AiCliToolEnum.OpenCode && t.opencodeSessionActive;
+        const showSmartInput = shouldShowSmartInputFooter(t.kind, t.aiTool, t.aiStatus, t.opencodeSessionActive);
+        const modeControlsVisible = t.aiTool === AiCliToolEnum.OpenCode;
         return (
           <div key={t.id} className="tile-cell" style={{ minHeight: 0, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
             <div style={{ flex: 1, minHeight: 0 }}>
@@ -109,6 +111,7 @@ export const MainArea: React.FC<MainAreaProps> = ({ terminals, activeTerminalId,
                 onSendToTerminal={(terminalId, text, attachments, modeId) => onSendToTerminal(terminalId, text, attachments, modeId)}
                 onUpdateQuestionState={(updates) => onUpdateQuestionState?.(t.id, updates)}
                 onClearTerminalOutputFocusOverride={() => onClearTerminalOutputFocusOverride?.(t.id)}
+                modeControlsVisible={modeControlsVisible}
                 disabled={disabled}
               />
             )}

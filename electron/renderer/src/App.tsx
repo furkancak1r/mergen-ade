@@ -17,6 +17,7 @@ import { usePty } from './hooks/usePty';
 import { activeBrowserScope as resolveActiveBrowserScope, scopeKeyString } from './lib/browserScope';
 import { nextAcpActivityState, type AcpEventLike } from './lib/acpUi';
 import type { SmartInputModeId } from './lib/smartInputMode';
+import { shouldShowSmartInputFooter } from './lib/smartInput';
 import { terminalWheelEnabled } from './lib/terminalWheel';
 import {
   normalizeTerminalManagerStartupState,
@@ -931,7 +932,7 @@ function App() {
   useEffect(() => {
     const activeTerminal = activeTerminals.find((t) => t.id === activeTerminalId);
     if (!activeTerminal) return;
-    const showSmartInput = activeTerminal.kind === 'foreground' && activeTerminal.aiTool === 'opencode' && activeTerminal.opencodeSessionActive;
+    const showSmartInput = shouldShowSmartInputFooter(activeTerminal.kind, activeTerminal.aiTool, activeTerminal.aiStatus, activeTerminal.opencodeSessionActive);
     if (!showSmartInput) return;
     if (activeTerminal.terminalOutputFocusOverride) return;
     if (activeAcpChat) return;

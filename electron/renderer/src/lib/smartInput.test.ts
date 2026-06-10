@@ -2,8 +2,10 @@ import { describe, it, expect } from 'vitest';
 import {
   isStaleOpencodeCompletion,
   canAutoDispatch,
+  canAutoDispatchClaude,
   smartInputFooterHeight,
   selectionEdgeAutoscrollDelta,
+  shouldShowSmartInputFooter,
   SMART_INPUT_AUTO_DISPATCH_SETTLE_MS,
 } from './smartInput';
 
@@ -119,6 +121,42 @@ describe('smartInput', () => {
         now,
       );
       expect(result).toBe(false);
+    });
+  });
+
+  describe('canAutoDispatchClaude', () => {
+    it('allows Claude queue dispatch on turn-complete attention', () => {
+      expect(canAutoDispatchClaude(
+        [{ text: 'task', attachments: [] }],
+        'attention',
+        'turn_complete',
+        undefined,
+        Date.now(),
+      )).toBe(true);
+    });
+
+    it('blocks Claude queue dispatch for running, permission, empty queue, and settle guard', () => {
+      const queue = [{ text: 'task', attachments: [] }];
+      const now = Date.now();
+      expect(canAutoDispatchClaude(queue, 'running', undefined, undefined, now)).toBe(false);
+      expect(canAutoDispatchClaude(queue, 'attention', 'permission', undefined, now)).toBe(false);
+      expect(canAutoDispatchClaude([], 'attention', 'turn_complete', undefined, now)).toBe(false);
+      expect(canAutoDispatchClaude(queue, 'attention', 'turn_complete', now - 100, now)).toBe(false);
+    });
+  });
+
+  describe('shouldShowSmartInputFooter', () => {
+    it('shows Smart Input for active OpenCode and Claude foreground terminals', () => {
+      expect(shouldShowSmartInputFooter('foreground', 'opencode', 'running', true)).toBe(true);
+      expect(shouldShowSmartInputFooter('foreground', 'claude', 'running', false)).toBe(true);
+      expect(shouldShowSmartInputFooter('foreground', 'claude', 'attention', false)).toBe(true);
+    });
+
+    it('hides Smart Input for inactive/background terminals and inactive OpenCode sessions', () => {
+      expect(shouldShowSmartInputFooter('background', 'claude', 'attention', false)).toBe(false);
+      expect(shouldShowSmartInputFooter('foreground', 'claude', 'inactive', false)).toBe(false);
+      expect(shouldShowSmartInputFooter('foreground', 'opencode', 'attention', false)).toBe(false);
+      expect(shouldShowSmartInputFooter('foreground', 'codex', 'attention', false)).toBe(false);
     });
   });
 

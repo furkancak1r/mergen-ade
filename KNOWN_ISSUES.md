@@ -5036,3 +5036,72 @@
   - Keep ACP mode display formatting in `acpUi.ts` and cover plan/build/custom labels in `acpUi.test.ts`.
 - Files/Commands touched: `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, `KNOWN_ISSUES.md`
 - References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron ACP queued rows aksiyonsuzdu {#electron-acp-queued-row-actions-parity}
+- Date: 2026-06-10
+- Context: Rust ACP queued prompt rows expose compact actions for running a queued prompt next, copying the queued prompt text, and deleting a queued prompt. Electron displayed queued rows as passive status rows.
+- Error signature:
+  1. Queued ACP prompts could not be reordered from the visible row.
+  2. Users could not delete a stale queued ACP prompt without waiting for queue execution.
+  3. Copying queued prompt text required manual selection instead of the Rust row affordance.
+- Symptoms/Impact:
+  - Electron ACP was less usable during long-running turns with multiple queued prompts.
+  - The queue UI looked similar to Rust after earlier visual work, but missed the row-level controls users expect from the original panel.
+- Root cause:
+  - The Electron ACP service exposed only enqueue/flush behavior and no typed queue mutation IPC.
+- Resolution:
+  - Added typed IPC for `acp:queueRunNext` and `acp:queueDelete`.
+  - Added main-process queue mutation helpers that validate queue indexes, broadcast queue count updates, and flush immediately when the session is idle.
+  - Added compact queued row actions for run-next, copy, and delete, plus tested preview/reorder/remove helpers.
+- Prevent recurrence:
+  - ACP queue UI changes should keep row-level actions in sync with Rust: run next, copy, and delete at minimum.
+- Files/Commands touched: `electron/main/acpService.ts`, `electron/main/ipcHandlers.ts`, `electron/shared/types.ts`, `electron/renderer/src/components/AcpChatPanel.tsx`, `electron/renderer/src/lib/acpUi.ts`, `electron/renderer/src/lib/acpUi.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Claude title algisi Rust Orca durumlarini ayirmiyordu {#electron-claude-title-status-parity}
+- Date: 2026-06-10
+- Context: Rust detects Claude Code terminal titles with Orca-compatible `Working`, `Idle`, and `Permission` semantics. Electron only checked whether the title contained `claude`/`orca` and always reported Claude as running.
+- Error signature:
+  1. Claude idle titles such as `✳ ...` did not produce an attention/turn-complete state.
+  2. Claude permission titles were not distinguished from ordinary running work.
+  3. PTY-originated `hook:status` events were sent as `(terminalId, event)` even though renderer listeners expect a single event payload.
+- Symptoms/Impact:
+  - Terminal Manager badges and OS notifications could stay in a running state after Claude had become idle or needed input.
+  - Title-based Claude detection from the PTY path could be ignored by renderer listeners because of the IPC payload shape mismatch.
+- Root cause:
+  - The Electron PTY title parser used a simple substring check instead of the Rust Orca-compatible title parser and reused the PTY data broadcast helper for `hook:status`.
+- Resolution:
+  - Added a shared Claude title parser and hook-event mapper matching the Rust status patterns.
+  - Updated PTY title parsing to emit `running`, `attention/turn_complete`, or `attention/permission` based on the parsed Claude title.
+  - Sent PTY-originated `hook:status` events with the typed single-event payload expected by the renderer.
+- Prevent recurrence:
+  - Keep Claude title parsing in the shared helper and cover new title conventions in `claudeTitle.test.ts` before changing PTY detection.
+- Files/Commands touched: `electron/shared/claudeTitle.ts`, `electron/shared/claudeTitle.test.ts`, `electron/main/pty.ts`, `KNOWN_ISSUES.md`
+- References: Original Rust `detect_claude_status_from_title`, Electron parity goal 2026-06-10
+
+---
+
+#### Electron Smart Input Claude oturumlarinda acilmiyordu {#electron-claude-smart-input-parity}
+- Date: 2026-06-11
+- Context: Rust shows Smart Input for Claude Code foreground sessions and auto-dispatches queued tasks when Claude returns to an idle/turn-complete title state. Electron only showed Smart Input for active OpenCode sessions.
+- Error signature:
+  1. A foreground Claude terminal detected from title updates did not show the Smart Input footer.
+  2. Queued Smart Input tasks could not auto-dispatch after Claude became idle.
+  3. Claude Smart Input would have shown OpenCode-specific Build/Plan mode controls if reused directly.
+- Symptoms/Impact:
+  - Claude foreground workflows missed the Rust Smart Input queue experience.
+  - Users had to type directly into the terminal or use saved messages instead of the same queue/after-done flow available in Rust.
+- Root cause:
+  - Electron coupled Smart Input visibility and auto-dispatch to `opencodeSessionActive` instead of checking supported AI tools separately.
+- Resolution:
+  - Added shared Smart Input helpers for footer visibility and Claude turn-complete dispatch readiness.
+  - Reused the existing Smart Input footer for Claude foreground terminals while hiding OpenCode-specific mode controls.
+  - Extended the renderer PTY state machine so Claude `attention/turn_complete` title events flush one queued task, while `attention/permission` keeps the queue paused.
+- Prevent recurrence:
+  - Keep Smart Input tool support in shared helper functions and test OpenCode/Claude visibility plus Claude dispatch gating.
+- Files/Commands touched: `electron/renderer/src/lib/smartInput.ts`, `electron/renderer/src/lib/smartInput.test.ts`, `electron/renderer/src/components/MainArea.tsx`, `electron/renderer/src/components/SmartInputFooter.tsx`, `electron/renderer/src/hooks/usePty.ts`, `electron/renderer/src/App.tsx`, `KNOWN_ISSUES.md`
+- References: Original Rust Claude Smart Input behavior, Electron parity goal 2026-06-11

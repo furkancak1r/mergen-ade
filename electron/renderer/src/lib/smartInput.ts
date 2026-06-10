@@ -39,6 +39,31 @@ export function canAutoDispatch(
   return true;
 }
 
+export function canAutoDispatchClaude(
+  queue: SmartInputTask[],
+  aiStatus: string,
+  aiAttentionKind: string | undefined,
+  promptSubmitSince: number | undefined,
+  now: number,
+): boolean {
+  if (queue.length === 0) return false;
+  if (aiStatus !== 'attention' || aiAttentionKind !== 'turn_complete') return false;
+  if (isStaleOpencodeCompletion(promptSubmitSince, now)) return false;
+  return true;
+}
+
+export function shouldShowSmartInputFooter(
+  terminalKind: string,
+  aiTool: string | undefined,
+  aiStatus: string | undefined,
+  opencodeSessionActive: boolean,
+): boolean {
+  if (terminalKind !== 'foreground') return false;
+  if (aiTool === 'opencode') return opencodeSessionActive;
+  if (aiTool === 'claude') return aiStatus === 'running' || aiStatus === 'attention';
+  return false;
+}
+
 export function smartInputFooterHeight(
   visibleTaskRows: number,
   expanded: boolean,

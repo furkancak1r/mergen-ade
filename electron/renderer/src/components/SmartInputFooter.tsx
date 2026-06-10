@@ -18,6 +18,7 @@ interface SmartInputFooterProps {
   onSendToTerminal: (terminalId: number, text: string, attachments: SmartInputAttachment[], modeId: SmartInputModeId) => void;
   onUpdateQuestionState?: (updates: { focusIndex?: number; selectedOptions?: string[]; customText?: string }) => void;
   onClearTerminalOutputFocusOverride?: () => void;
+  modeControlsVisible?: boolean;
   disabled?: boolean;
 }
 
@@ -32,6 +33,7 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
   onSendToTerminal,
   onUpdateQuestionState,
   onClearTerminalOutputFocusOverride,
+  modeControlsVisible = true,
   disabled = false,
 }) => {
   const [deliveryMode, setDeliveryMode] = useState<'now' | 'after'>('now');
@@ -51,7 +53,7 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
     const task: SmartInputTask = {
       text: state.draftText.trim(),
       attachments: [...state.draftAttachments],
-      modeId: draftMode,
+      modeId: modeControlsVisible ? draftMode : 'build',
       afterDone: deliveryMode === 'after',
     };
     onUpdateState({
@@ -60,13 +62,13 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
       draftText: '',
       draftAttachments: [],
     });
-  }, [state, draftMode, deliveryMode, onUpdateState]);
+  }, [state, draftMode, deliveryMode, modeControlsVisible, onUpdateState]);
 
   const sendNow = useCallback(() => {
     if (!state.draftText.trim() && state.draftAttachments.length === 0) return;
-    onSendToTerminal(terminalId, state.draftText.trim(), state.draftAttachments, draftMode);
+    onSendToTerminal(terminalId, state.draftText.trim(), state.draftAttachments, modeControlsVisible ? draftMode : 'build');
     onUpdateState({ ...state, draftText: '', draftAttachments: [] });
-  }, [state, terminalId, draftMode, onSendToTerminal, onUpdateState]);
+  }, [state, terminalId, draftMode, modeControlsVisible, onSendToTerminal, onUpdateState]);
 
   const removeTask = useCallback((index: number) => {
     const queue = state.queue.filter((_, i) => i !== index);
@@ -437,7 +439,7 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
                   >
                     <span style={{ color: '#666', cursor: 'grab' }}>⋮⋮</span>
                     <span style={{ color: '#666' }}>{i + 1}.</span>
-                    {smartInputModeLabel(task.modeId) && (
+                    {modeControlsVisible && smartInputModeLabel(task.modeId) && (
                       <span style={{ color: '#dcb43c', fontSize: 10, border: '1px solid #5d4722', borderRadius: 3, padding: '1px 4px', background: '#281c10' }}>
                         {smartInputModeLabel(task.modeId)}
                       </span>
@@ -601,43 +603,45 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
           )}
 
           <div style={{ display: 'flex', gap: 6, alignItems: 'flex-end' }}>
-            <div
-              title="Tab toggles Build/Plan"
-              style={{
-                width: 58,
-                height: 24,
-                display: 'grid',
-                gridTemplateColumns: '1fr 1fr',
-                border: '1px solid #333',
-                borderRadius: 6,
-                overflow: 'hidden',
-                background: '#141414',
-                flexShrink: 0,
-                marginBottom: 4,
-              }}
-            >
-              {(['build', 'plan'] as SmartInputModeId[]).map((candidate) => {
-                const active = draftMode === candidate;
-                const plan = candidate === 'plan';
-                return (
-                  <button
-                    key={candidate}
-                    onClick={() => setDraftMode(candidate)}
-                    style={{
-                      border: 'none',
-                      borderRight: candidate === 'build' ? '1px solid #333' : 'none',
-                      background: active ? (plan ? '#281c10' : '#222') : '#141414',
-                      color: active ? (plan ? '#dcb43c' : '#d6d6d6') : '#777',
-                      fontSize: 9,
-                      padding: 0,
-                      cursor: 'pointer',
-                    }}
-                  >
-                    {plan ? 'Plan' : 'Build'}
-                  </button>
-                );
-              })}
-            </div>
+            {modeControlsVisible && (
+              <div
+                title="Tab toggles Build/Plan"
+                style={{
+                  width: 58,
+                  height: 24,
+                  display: 'grid',
+                  gridTemplateColumns: '1fr 1fr',
+                  border: '1px solid #333',
+                  borderRadius: 6,
+                  overflow: 'hidden',
+                  background: '#141414',
+                  flexShrink: 0,
+                  marginBottom: 4,
+                }}
+              >
+                {(['build', 'plan'] as SmartInputModeId[]).map((candidate) => {
+                  const active = draftMode === candidate;
+                  const plan = candidate === 'plan';
+                  return (
+                    <button
+                      key={candidate}
+                      onClick={() => setDraftMode(candidate)}
+                      style={{
+                        border: 'none',
+                        borderRight: candidate === 'build' ? '1px solid #333' : 'none',
+                        background: active ? (plan ? '#281c10' : '#222') : '#141414',
+                        color: active ? (plan ? '#dcb43c' : '#d6d6d6') : '#777',
+                        fontSize: 9,
+                        padding: 0,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      {plan ? 'Plan' : 'Build'}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
             <textarea
               ref={draftRef}
               data-smart-input={terminalId}
@@ -658,6 +662,7 @@ export const SmartInputFooter: React.FC<SmartInputFooterProps> = ({
                 }
                 if (e.key === 'Tab' && !e.ctrlKey && !e.altKey && !e.metaKey) {
                   e.preventDefault();
+                  if (!modeControlsVisible) return;
                   if (e.shiftKey) {
                     // Shift+Tab blocked to prevent reverse focus traversal
                     return;

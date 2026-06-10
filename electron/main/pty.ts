@@ -1,7 +1,8 @@
 import { spawn, type IPty } from 'node-pty';
 import { BrowserWindow } from 'electron';
-import type { TerminalKind, ShellKind } from '../shared/types';
-import { ANTHROPIC_ENV_VARS_TO_REMOVE, ShellKindCommand } from '../shared/types';
+import type { AiHookEvent, TerminalKind, ShellKind } from '../shared/types';
+import { AiCliStatus, AiCliTool, ANTHROPIC_ENV_VARS_TO_REMOVE, ShellKindCommand } from '../shared/types';
+import { claudeTitleHookEvent } from '../shared/claudeTitle';
 import { normalizeWindowsVerbatimPath } from './config';
 import { getBrowserMcpToken, getHookServicePort } from './hookService';
 import {
@@ -137,33 +138,26 @@ export function createTerminal(opts: PtyCreateOptions): number {
     while ((match = oscPattern.exec(oscBuffer)) !== null) {
       const title = (match[2] || match[4] || '').trim();
       if (title) {
-        // Detect Claude Code or Orca in title
-        const lowerTitle = title.toLowerCase();
-        if (lowerTitle.includes('claude') || lowerTitle.includes('orca')) {
+        const claudeEvent = claudeTitleHookEvent(id, title);
+        if (claudeEvent) {
           const s = sessions.get(id);
           if (s) {
-            s.aiTool = 'claude';
-            s.aiStatus = 'running';
+            s.aiTool = AiCliTool.Claude;
+            s.aiStatus = claudeEvent.status;
             s.aiStatusReason = title;
           }
-          broadcast('hook:status', id, {
-            terminalId: id,
-            tool: 'claude',
-            status: 'running',
-            reason: title,
-            eventKind: 'title.update',
-          });
+          broadcastHookStatus(claudeEvent);
         } else {
           // If previously detected as Claude and now title doesn't match, mark inactive
           const s = sessions.get(id);
-          if (s && s.aiTool === 'claude') {
+          if (s && s.aiTool === AiCliTool.Claude) {
             s.aiTool = undefined;
-            s.aiStatus = 'inactive';
+            s.aiStatus = AiCliStatus.Inactive;
             s.aiStatusReason = title;
-            broadcast('hook:status', id, {
+            broadcastHookStatus({
               terminalId: id,
-              tool: 'claude',
-              status: 'inactive',
+              tool: AiCliTool.Claude,
+              status: AiCliStatus.Inactive,
               reason: title,
               eventKind: 'title.update',
             });
@@ -277,6 +271,14 @@ function broadcast(channel: string, terminalId: number, data: unknown) {
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.isDestroyed()) {
       win.webContents.send(channel, terminalId, data);
+    }
+  }
+}
+
+function broadcastHookStatus(event: AiHookEvent) {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) {
+      win.webContents.send('hook:status', event);
     }
   }
 }
