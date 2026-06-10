@@ -79,13 +79,19 @@ export function createTerminal(opts: PtyCreateOptions): number {
     Object.assign(env, opts.env);
   }
 
-  const pty = spawn(shellCommand, shellArgs, {
-    name: 'xterm-color',
-    cols: opts.cols,
-    rows: opts.rows,
-    cwd: normalizeWindowsVerbatimPath(opts.cwd),
-    env,
-  });
+  let pty: IPty;
+  try {
+    pty = spawn(shellCommand, shellArgs, {
+      name: 'xterm-color',
+      cols: opts.cols,
+      rows: opts.rows,
+      cwd: normalizeWindowsVerbatimPath(opts.cwd),
+      env,
+    });
+  } catch (err) {
+    console.error('Failed to spawn PTY:', err);
+    throw err;
+  }
 
   const session: TerminalSession = {
     id,
@@ -183,7 +189,7 @@ export function writeTerminal(terminalId: number, data: string): void {
   // Filter out bracketed paste, CSI, and OSC sequences from input history
   const textForHistory = data
     .replace(/\x1b\[200~[\s\S]*?\x1b\[201~/g, '') // bracketed paste
-    .replace(/\x1b\[[0-9;]*[A-Za-z]/g, '') // CSI sequences (arrow keys, etc.)
+    .replace(/\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]/g, '') // CSI sequences (ECMA-48: catches SGR mouse, arrow keys, etc.)
     .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, ''); // OSC sequences
   let recentInputsChanged = false;
   let titleChanged = false;

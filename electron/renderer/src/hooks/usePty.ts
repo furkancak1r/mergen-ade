@@ -78,7 +78,9 @@ export function usePty() {
     kind: TerminalKind;
     env?: Record<string, string>;
   }) => {
+    console.log('[usePty] createTerminal called', opts);
     const id = await api.invoke('pty:create', opts) as number;
+    console.log('[usePty] createTerminal received id', id);
     const t: TerminalInstance = {
       id,
       projectId: opts.projectId,

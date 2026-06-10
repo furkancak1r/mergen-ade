@@ -223,6 +223,15 @@ export const SettingsPopup: React.FC<SettingsPopupProps> = ({ config, onSave, on
                   <option value="selected_project">Selected project only</option>
                 </select>
               </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <input
+                  type="checkbox"
+                  checked={draft.ui.multiTerminalViewEnabled}
+                  onChange={(e) => updateUi({ multiTerminalViewEnabled: e.target.checked })}
+                  id="multiTerminalView"
+                />
+                <label htmlFor="multiTerminalView" style={{ fontSize: 12, color: '#ccc' }}>Show multiple terminals in grid (tile view)</label>
+              </div>
               <div>
                 <div style={{ fontSize: 12, fontWeight: 600, color: '#eee', marginBottom: 8 }}>Default Shell</div>
                 <select

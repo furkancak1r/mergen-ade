@@ -234,7 +234,7 @@ export function generateOpencodeRuntimeConfig(cwd: string, opts: {
     }
   }
 
-  const permissions: Record<string, string> | undefined = opts.kimiStrictPermissions
+  const permission: Record<string, string> | undefined = opts.kimiStrictPermissions
     ? { '*': 'ask', 'edit': 'ask', 'task/external_directory': 'deny', 'bash': 'ask' }
     : opts.kimiStrictPermissions === false
       ? { '*': 'allow', 'edit': 'allow', 'task/external_directory': 'allow', 'bash': 'allow' }
@@ -254,8 +254,15 @@ export function generateOpencodeRuntimeConfig(cwd: string, opts: {
     mcpServers,
   };
 
-  if (permissions) {
-    config.permissions = permissions;
+  if (permission) {
+    (config.agent as Record<string, unknown>).build = {
+      ...((config.agent as Record<string, unknown>).build as Record<string, unknown>),
+      permission,
+    };
+    (config.mode as Record<string, unknown>).build = {
+      ...((config.mode as Record<string, unknown>).build as Record<string, unknown>),
+      permission,
+    };
   }
 
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');
@@ -273,7 +280,7 @@ export function generateOpencodeTerminalConfig(cwd: string, opts: {
   const configPath = [cwd, '.opencode', 'opencode.json'].join(path.sep);
   fs.mkdirSync(path.dirname(configPath), { recursive: true });
 
-  const permissions: Record<string, string> = opts.kimiStrictPermissions
+  const permission: Record<string, string> = opts.kimiStrictPermissions
     ? { '*': 'ask', 'edit': 'ask', 'task/external_directory': 'deny', 'bash': 'ask' }
     : { '*': 'allow', 'edit': 'allow', 'task/external_directory': 'allow', 'bash': 'allow' };
 
@@ -281,14 +288,15 @@ export function generateOpencodeTerminalConfig(cwd: string, opts: {
     agent: {
       build: {
         model: opts.model || 'sonnet',
+        permission,
       },
     },
     mode: {
       build: {
         model: opts.model || 'sonnet',
+        permission,
       },
     },
-    permissions,
   };
 
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');

@@ -247,6 +247,10 @@ function App() {
     return true;
   });
 
+  const mainAreaTerminals = config?.ui.multiTerminalViewEnabled
+    ? activeTerminals
+    : activeTerminals.filter((t) => t.id === activeTerminalId);
+
   const shortcutMatchesEvent = useCallback((shortcut: TerminalShortcutEntry, e: KeyboardEvent): boolean => {
     if (shortcut.key !== e.key) return false;
     const onMac = navigator.platform.toLowerCase().includes('mac');
@@ -456,16 +460,22 @@ function App() {
     if (!config) return 0;
     const project = config.projects.find((p) => p.id === projectId);
     const cwd = project?.path ?? process.cwd();
-    const id = await pty.createTerminal({
-      shell: config.defaultShell,
-      cwd,
-      cols: 80,
-      rows: 24,
-      projectId,
-      kind,
-    });
-    setActiveTerminalId(id);
-    return id;
+    try {
+      const id = await pty.createTerminal({
+        shell: config.defaultShell,
+        cwd,
+        cols: 80,
+        rows: 24,
+        projectId,
+        kind,
+      });
+      setActiveTerminalId(id);
+      return id;
+    } catch (err) {
+      console.error('Terminal spawn failed:', err);
+      alert('Terminal spawn failed: ' + (err instanceof Error ? err.message : String(err)));
+      return 0;
+    }
   }, [config, pty]);
 
   const killTerminal = useCallback((id: number) => {
@@ -893,7 +903,7 @@ function App() {
           />
         ) : (
           <MainArea
-            terminals={activeTerminals}
+            terminals={mainAreaTerminals}
             activeTerminalId={activeTerminalId}
             onTerminalClick={activateTerminal}
             width={mainSize.width}

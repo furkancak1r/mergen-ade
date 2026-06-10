@@ -180,37 +180,12 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectI
       }
     };
 
-    // Wheel forwarding: when OpenCode is active and mouse reporting is on,
-    // forward wheel events directly to the terminal PTY so OpenCode TUI scrolls naturally.
-    // When OpenCode is inactive, wheel events stay for xterm.js scrollback.
-    const handleWheel = (e: WheelEvent) => {
-      if (!wheelEnabled) return;
-      if (!isOpenCodeActiveRef.current) return;
-      if (!containerRef.current?.contains(e.target as Node)) return;
-      // Only forward when mouse is over the terminal and a modifier is not held
-      if (e.ctrlKey || e.altKey || e.metaKey) return;
-      // Only forward when mouse reporting is actually enabled (DECSET 1000/1002/1006)
-      if (!mouseReportingEnabledRef.current) return;
-      // Convert wheel delta to xterm.js mouse sequences
-      const button = e.deltaY < 0 ? 64 : 65; // 64 = scroll up, 65 = scroll down
-      const x = e.offsetX + 1;
-      const y = e.offsetY + 1;
-      const cx = String.fromCharCode(Math.min(x, 255));
-      const cy = String.fromCharCode(Math.min(y, 255));
-      const seq = `\x1b[M${String.fromCharCode(button + 32)}${cx}${cy}`;
-      api.invoke('pty:write', terminalId, seq);
-      e.preventDefault();
-    };
-
-    containerRef.current?.addEventListener('wheel', handleWheel, { passive: false });
-
     document.addEventListener('mousedown', handleMouseDown);
     document.addEventListener('mousemove', handleMouseMove);
     document.addEventListener('mouseup', handleMouseUp);
 
     return () => {
       viewport?.removeEventListener('scroll', handleScroll);
-      containerRef.current?.removeEventListener('wheel', handleWheel);
       document.removeEventListener('mousedown', handleMouseDown);
       document.removeEventListener('mousemove', handleMouseMove);
       document.removeEventListener('mouseup', handleMouseUp);
@@ -219,6 +194,30 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({ terminalId, projectI
       term.dispose();
     };
   }, [terminalId]);
+
+  // Wheel forwarding: only attach when OpenCode is active and mouse reporting is on.
+  // When inactive, xterm.js handles scroll natively without interference.
+  useEffect(() => {
+    if (!containerRef.current || !isOpenCodeActive || !wheelEnabled) return;
+    const handleWheel = (e: WheelEvent) => {
+      if (!containerRef.current?.contains(e.target as Node)) return;
+      if (e.ctrlKey || e.altKey || e.metaKey) return;
+      if (!mouseReportingEnabledRef.current) return;
+      const button = e.deltaY < 0 ? 64 : 65;
+      const x = e.offsetX + 1;
+      const y = e.offsetY + 1;
+      const cx = String.fromCharCode(Math.min(x, 255));
+      const cy = String.fromCharCode(Math.min(y, 255));
+      const seq = `\x1b[M${String.fromCharCode(button + 32)}${cx}${cy}`;
+      api.invoke('pty:write', terminalId, seq);
+      e.preventDefault();
+    };
+    const container = containerRef.current;
+    container.addEventListener('wheel', handleWheel, { passive: false });
+    return () => {
+      container.removeEventListener('wheel', handleWheel);
+    };
+  }, [isOpenCodeActive, terminalId, wheelEnabled]);
 
   useEffect(() => {
     if (!containerRef.current || !termRef.current || !fitRef.current) return;

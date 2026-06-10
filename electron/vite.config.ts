@@ -13,6 +13,12 @@ export default defineConfig({
         },
         vite: {
           build: {
+            lib: {
+              fileName: 'main',
+            },
+            commonjsOptions: {
+              ignoreDynamicRequires: (id) => id.endsWith('.node'),
+            },
             rollupOptions: {
               external: ['node-pty'],
             },
@@ -21,6 +27,13 @@ export default defineConfig({
       },
       {
         entry: '../preload/index.ts',
+        vite: {
+          build: {
+            lib: {
+              fileName: 'preload',
+            },
+          },
+        },
       },
     ]),
   ],
