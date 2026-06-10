@@ -175,6 +175,12 @@ export enum LeftSidebarTab {
   InputHistory = 'input_history',
 }
 
+export enum TerminalInputHistoryFilter {
+  Foreground = 'foreground',
+  Background = 'background',
+  All = 'all',
+}
+
 export const defaultProjectExplorerWidth = 352;
 export const defaultChecklistPanelWidth = 352;
 export const defaultBrowserPanelWidth = 520;
@@ -560,6 +566,7 @@ export enum AiCliAttentionKind {
   TurnComplete = 'turn_complete',
   SessionError = 'session_error',
   UserInputRequested = 'user_input_requested',
+  PlanModePrompt = 'plan_mode_prompt',
 }
 
 export interface AiHookEvent {
@@ -570,6 +577,7 @@ export interface AiHookEvent {
   attentionKind?: AiCliAttentionKind;
   rawJson?: string;
   eventKind?: string;
+  question?: OpenCodeQuestion;
 }
 
 export interface AiHooksManager {
@@ -695,6 +703,7 @@ export interface SourceControlSnapshot {
   error?: string;
   files: SourceControlFile[];
   worktrees: GitWorktreeInfo[];
+  branch?: string;
   lastUpdated?: number;
 }
 
@@ -794,6 +803,7 @@ export interface IpcChannels {
   'pty:write': (terminalId: number, data: string) => Promise<void>;
   'pty:resize': (terminalId: number, cols: number, rows: number) => Promise<void>;
   'pty:kill': (terminalId: number, signal?: string) => Promise<void>;
+  'pty:getState': (terminalId: number) => Promise<{ pendingLineForTitle: string; pendingInputForHistory: string; recentInputs: string[]; title: string; aiStatus: string; aiStatusReason?: string } | undefined>;
   'pty:data': (terminalId: number, data: string) => void;
   'pty:exit': (terminalId: number, exitCode: number) => void;
 
@@ -806,13 +816,22 @@ export interface IpcChannels {
 
   // Hooks
   'hook:status': (event: AiHookEvent) => void;
+  'hook:answer': (answer: { requestId: string; answers: string[]; rejected: boolean }) => Promise<void>;
 
   // ACP
   'acp:spawn': (opts: { projectId: number; cwd: string; mcpServers: string[] }) => Promise<string>;
-  'acp:send': (opts: { sessionId: string; promptText: string; attachments: string[] }) => Promise<void>;
-  'acp:cancel': (sessionId: string) => Promise<void>;
-  'acp:setConfigOption': (opts: { sessionId: string; configId: string; value: string }) => Promise<void>;
-  'acp:event': (sessionId: string, event: unknown) => void;
+  'acp:send': (opts: { chatId: string; promptText: string; attachments: string[]; modeId?: string }) => Promise<void>;
+  'acp:cancel': (chatId: string) => Promise<void>;
+  'acp:setConfigOption': (opts: { chatId: string; configId: string; value: string }) => Promise<void>;
+  'acp:permissionResponse': (opts: { chatId: string; requestId: string | number; answers: string[]; rejected: boolean }) => Promise<void>;
+  'acp:getSession': (chatId: string) => Promise<AcpChatSession | undefined>;
+  'acp:event': (chatId: string, event: unknown) => void;
+  'acp:standby:warm': (projectId: number, cwd: string) => Promise<void>;
+  'acp:standby:get': (projectId: number) => Promise<AcpStandbyEntry | undefined>;
+  'acp:standby:clear': (projectId: number) => Promise<void>;
+  'acp:standby:promote': (projectId: number, visibleChatId: string) => Promise<AcpStandbyEntry | undefined>;
+  'acp:standby:clearAll': () => Promise<void>;
+  'acp:kill': (chatId: string) => Promise<void>;
 
   // Browser
   'browser:navigate': (opts: { scope: BrowserScopeKey; url: string }) => Promise<void>;
@@ -830,14 +849,28 @@ export interface IpcChannels {
   'browser:addTab': (scope: BrowserScopeKey, url?: string) => Promise<string>;
   'browser:closeTab': (opts: { scope: BrowserScopeKey; tabId: string }) => Promise<void>;
   'browser:switchTab': (opts: { scope: BrowserScopeKey; tabId: string }) => Promise<void>;
+  'browser:hideAll': () => Promise<void>;
+  'browser:showAll': () => Promise<void>;
+  'browser:showActive': (scope: BrowserScopeKey) => Promise<void>;
+  'browser:destroyInstance': (scope: BrowserScopeKey) => Promise<void>;
+
+  // OpenCode config
+  'opencode:generateTerminalConfig': (opts: { cwd: string; model?: string; effort?: string; kimiStrictPermissions?: boolean }) => Promise<string>;
+  'opencode:generateRuntimeConfig': (opts: { cwd: string; model?: string; effort?: string; mcpServers?: string[]; kimiStrictPermissions?: boolean }) => Promise<string>;
 
   // Browser MCP
   'browserMcp:request': (req: BrowserMcpRequest) => Promise<BrowserMcpResponse>;
+  'browserMcp:spawn': (opts: { sessionId: string; scope: BrowserScopeKey }) => Promise<string>;
+  'browserMcp:execute': (opts: { sessionId: string; method: string; params: unknown }) => Promise<unknown>;
+  'browserMcp:kill': (sessionId: string) => Promise<void>;
+  'browserMcp:getCommand': () => Promise<string[]>;
+  'browserMcp:prepareScope': (terminalId: number, projectId: number) => Promise<BrowserScopeKey>;
 
   // OS
   'notify:show': (payload: OsNotificationPayload) => void;
   'window:closeRequest': () => void;
   'window:focused': (focused: boolean) => void;
+  'window:confirmClose': (confirmed: boolean) => Promise<void>;
 
   // Dialog
   'dialog:showOpen': (opts: { title?: string; defaultPath?: string; buttonLabel?: string; filters?: { name: string; extensions: string[] }[]; properties?: ('openFile' | 'openDirectory' | 'multiSelections')[] }) => Promise<string[] | undefined>;
@@ -846,6 +879,7 @@ export interface IpcChannels {
   // Clipboard
   'clipboard:readText': () => Promise<string>;
   'clipboard:readImage': () => Promise<{ path?: string; dataUrl?: string } | undefined>;
+  'clipboard:readFilePaths': () => Promise<string[] | undefined>;
   'clipboard:writeText': (text: string) => Promise<void>;
 
   // Shell / External
@@ -871,7 +905,7 @@ export interface BrowserMcpAuthScope {
   sessionId: string;
 }
 
-export type IpcInvokeChannel = keyof Pick<IpcChannels, 'config:load' | 'config:save' | 'history:load' | 'history:save' | 'pty:create' | 'pty:write' | 'pty:resize' | 'pty:kill' | 'fs:readDir' | 'fs:readFile' | 'fs:writeFile' | 'fs:exists' | 'fs:stat' | 'acp:spawn' | 'acp:send' | 'acp:cancel' | 'acp:setConfigOption' | 'browser:navigate' | 'browser:syncBounds' | 'browser:hide' | 'browser:show' | 'browser:goBack' | 'browser:goForward' | 'browser:reload' | 'browser:executeJs' | 'browser:screenshot' | 'browser:designInspect' | 'browser:addTab' | 'browser:closeTab' | 'browser:switchTab' | 'browserMcp:request' | 'dialog:showOpen' | 'dialog:showSave' | 'clipboard:readText' | 'clipboard:readImage' | 'clipboard:writeText' | 'shell:openExternal'>;
+export type IpcInvokeChannel = keyof Pick<IpcChannels, 'config:load' | 'config:save' | 'history:load' | 'history:save' | 'pty:create' | 'pty:write' | 'pty:resize' | 'pty:kill' | 'pty:getState' | 'fs:readDir' | 'fs:readFile' | 'fs:writeFile' | 'fs:exists' | 'fs:stat' | 'acp:spawn' | 'acp:send' | 'acp:cancel' | 'acp:setConfigOption' | 'acp:permissionResponse' | 'acp:getSession' | 'acp:kill' | 'acp:standby:warm' | 'acp:standby:get' | 'acp:standby:clear' | 'acp:standby:promote' | 'acp:standby:clearAll' | 'hook:answer' | 'browser:navigate' | 'browser:syncBounds' | 'browser:hide' | 'browser:show' | 'browser:hideAll' | 'browser:showAll' | 'browser:showActive' | 'browser:destroyInstance' | 'browser:goBack' | 'browser:goForward' | 'browser:reload' | 'browser:executeJs' | 'browser:screenshot' | 'browser:designInspect' | 'browser:addTab' | 'browser:closeTab' | 'browser:switchTab' | 'browserMcp:request' | 'browserMcp:spawn' | 'browserMcp:execute' | 'browserMcp:kill' | 'browserMcp:getCommand' | 'browserMcp:prepareScope' | 'opencode:generateTerminalConfig' | 'opencode:generateRuntimeConfig' | 'dialog:showOpen' | 'dialog:showSave' | 'clipboard:readText' | 'clipboard:readImage' | 'clipboard:readFilePaths' | 'clipboard:writeText' | 'shell:openExternal' | 'window:confirmClose'>;
 
 export type IpcSendChannel = keyof Pick<IpcChannels, 'pty:data' | 'pty:exit' | 'hook:status' | 'acp:event' | 'browser:urlChanged' | 'browser:designElementClicked' | 'notify:show' | 'window:closeRequest' | 'window:focused'>;
 

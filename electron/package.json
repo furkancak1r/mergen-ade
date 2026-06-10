@@ -39,12 +39,10 @@
       "buildResources": "build"
     },
     "files": [
-      "main/**/*",
-      "preload/**/*",
       "renderer/dist/**/*",
       "renderer/dist-electron/**/*",
-      "shared/**/*",
       "assets/**/*",
+      "build/**/*",
       "package.json"
     ],
     "win": {

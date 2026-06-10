@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import { parse as parseToml } from '@iarna/toml';
 import type { AppConfig, AppHistory, ProjectRecord, TerminalShortcutEntry, LauncherEntry } from '../shared/types';
-import { BuiltinLauncherKind, LauncherIconKey, ShellKind, AcpStartupMode, defaultAppConfig, defaultTerminalShortcuts, defaultLaunchers, defaultOpenCodeModelConfig, APP_CONFIG_VERSION, DEFAULT_OPENCODE_BUILD_MODEL, DEFAULT_OPENCODE_PLAN_MODEL, DEFAULT_OPENCODE_PLAN_EFFORT, ensureConfiguredModelsAreFavorites } from '../shared/types';
+import { BuiltinLauncherKind, LauncherIconKey, ShellKind, AcpStartupMode, defaultAppConfig, defaultTerminalShortcuts, defaultLaunchers, defaultOpenCodeModelConfig, defaultAcpModeToggleShortcut, defaultOsNotificationConfig, APP_CONFIG_VERSION, DEFAULT_OPENCODE_BUILD_MODEL, DEFAULT_OPENCODE_PLAN_MODEL, DEFAULT_OPENCODE_PLAN_EFFORT, ensureConfiguredModelsAreFavorites } from '../shared/types';
 
 const QUALIFIER = 'com';
 const ORGANIZATION = 'Mergen';
@@ -75,6 +75,8 @@ export function loadConfigWithStatus(): { config: AppConfig; repaired: boolean }
       const text = fs.readFileSync(legacyPath, 'utf-8');
       const parsed = parseToml(text) as unknown as AppConfig;
       const config = normalizeConfig(parsed);
+      // Save migrated config to JSON immediately so legacy TOML is retired
+      saveConfig(config);
       const repaired = true;
       return { config, repaired };
     } catch {
@@ -209,7 +211,82 @@ function normalizeConfig(config: AppConfig): AppConfig {
     }
   }
 
+  // Mojibake repair for project names and paths
+  for (const project of config.projects ?? []) {
+    const repairedName = repairMojibake(project.name);
+    if (repairedName !== project.name) {
+      project.name = repairedName;
+      changed = true;
+    }
+    const repairedPath = repairMojibake(project.path);
+    if (repairedPath !== project.path) {
+      project.path = repairedPath;
+      changed = true;
+    }
+  }
+
+  // Sanitize legacy browser_panel_expanded (always false)
+  if (config.ui && config.ui.browserPanelExpanded !== false) {
+    config.ui.browserPanelExpanded = false;
+    changed = true;
+  }
+
+  // Ensure acp_mode_toggle_shortcut exists
+  if (!config.acpModeToggleShortcut) {
+    config.acpModeToggleShortcut = defaultAcpModeToggleShortcut();
+    changed = true;
+  }
+
+  // Ensure notifications config exists
+  if (!config.notifications) {
+    config.notifications = defaultOsNotificationConfig();
+    changed = true;
+  }
+
+  // Ensure foreground_saved_messages exists on all projects
+  for (const project of config.projects ?? []) {
+    if (!project.foregroundSavedMessages) {
+      project.foregroundSavedMessages = [];
+      changed = true;
+    }
+  }
+
   return config;
+}
+
+function repairMojibake(text: string): string {
+  // If text contains any code points outside CP1252 range (0-255), it's already UTF-8
+  let hasNonCp1252 = false;
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) > 255) {
+      hasNonCp1252 = true;
+      break;
+    }
+  }
+  if (hasNonCp1252) return text;
+
+  let current = text;
+  for (let round = 0; round < 5; round++) {
+    const bytes = new Uint8Array(current.length);
+    for (let i = 0; i < current.length; i++) {
+      bytes[i] = current.charCodeAt(i) < 256 ? current.charCodeAt(i) : 0x3F;
+    }
+    try {
+      const repaired = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      if (repaired === current) break;
+      current = repaired;
+    } catch {
+      break;
+    }
+  }
+  return current;
+}
+
+export async function repairMojibakePath(path: string, existsFn: (p: string) => Promise<boolean>): Promise<string> {
+  const repaired = repairMojibake(path);
+  if (repaired === path) return path;
+  const ok = await existsFn(repaired);
+  return ok ? repaired : path;
 }
 
 export function normalizeWindowsVerbatimPath(p: string): string {

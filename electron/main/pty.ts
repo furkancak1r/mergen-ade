@@ -3,6 +3,7 @@ import { BrowserWindow } from 'electron';
 import type { TerminalKind, ShellKind } from '../shared/types';
 import { ANTHROPIC_ENV_VARS_TO_REMOVE, ShellKindCommand } from '../shared/types';
 import { normalizeWindowsVerbatimPath } from './config';
+import { getHookServicePort } from './hookService';
 
 export interface PtyCreateOptions {
   shell: ShellKind;
@@ -33,6 +34,20 @@ export interface TerminalSession {
   aiStatusReason?: string;
   opencodeSessionActive: boolean;
   terminalOutputFocusOverride: boolean;
+  opencodeLastHookEventSince?: number;
+}
+
+export function getTerminalState(terminalId: number): Pick<TerminalSession, 'pendingLineForTitle' | 'pendingInputForHistory' | 'recentInputs' | 'title' | 'aiStatus' | 'aiStatusReason'> | undefined {
+  const s = sessions.get(terminalId);
+  if (!s) return undefined;
+  return {
+    pendingLineForTitle: s.pendingLineForTitle,
+    pendingInputForHistory: s.pendingInputForHistory,
+    recentInputs: s.recentInputs,
+    title: s.title,
+    aiStatus: s.aiStatus,
+    aiStatusReason: s.aiStatusReason,
+  };
 }
 
 let nextId = 1;
@@ -53,6 +68,12 @@ export function createTerminal(opts: PtyCreateOptions): number {
   const env: Record<string, string> = { ...process.env as Record<string, string> };
   for (const key of ANTHROPIC_ENV_VARS_TO_REMOVE) {
     delete env[key];
+  }
+  // Set Mergen-specific env vars for hook plugin integration
+  env['MERGEN_TERMINAL_ID'] = String(id);
+  const hookPort = getHookServicePort();
+  if (hookPort) {
+    env['MERGEN_HOOK_PORT'] = String(hookPort);
   }
   if (opts.env) {
     Object.assign(env, opts.env);
@@ -86,22 +107,64 @@ export function createTerminal(opts: PtyCreateOptions): number {
 
   sessions.set(id, session);
 
+  // OSC sequence parsing for Claude Code title detection
+  let oscBuffer = '';
   pty.onData((data) => {
-    // Update pending buffers for title/history tracking
-    for (const ch of data) {
-      const code = ch.charCodeAt(0);
-      if (ch === '\r' || ch === '\n') {
-        session.pendingLineForTitle = '';
-      } else if (code >= 0x20 && code !== 0x7f) {
-        session.pendingLineForTitle += ch;
-        if (session.pendingLineForTitle.length > 512) {
-          session.pendingLineForTitle = session.pendingLineForTitle.slice(-512);
+    // PTY output does not affect user input history buffers
+    broadcast('pty:data', id, data);
+
+    // Parse OSC 0/1/2 sequences for title changes (Claude Code detection)
+    oscBuffer += data;
+    // Process complete OSC sequences: ESC ] <num> ; <text> BEL  or  ESC ] <num> ; <text> ESC \
+    const oscPattern = /\x1b\](0|1|2);([^\x07\x1b]*)\x07|\x1b\](0|1|2);([^\x07\x1b]*)\x1b\\/g;
+    let match: RegExpExecArray | null;
+    while ((match = oscPattern.exec(oscBuffer)) !== null) {
+      const title = (match[2] || match[4] || '').trim();
+      if (title) {
+        // Detect Claude Code or Orca in title
+        const lowerTitle = title.toLowerCase();
+        if (lowerTitle.includes('claude') || lowerTitle.includes('orca')) {
+          const s = sessions.get(id);
+          if (s) {
+            s.aiTool = 'claude';
+            s.aiStatus = 'running';
+            s.aiStatusReason = title;
+          }
+          broadcast('hook:status', id, {
+            terminalId: id,
+            tool: 'claude',
+            status: 'running',
+            reason: title,
+            eventKind: 'title.update',
+          });
+        } else {
+          // If previously detected as Claude and now title doesn't match, mark inactive
+          const s = sessions.get(id);
+          if (s && s.aiTool === 'claude') {
+            s.aiTool = undefined;
+            s.aiStatus = 'inactive';
+            s.aiStatusReason = title;
+            broadcast('hook:status', id, {
+              terminalId: id,
+              tool: 'claude',
+              status: 'inactive',
+              reason: title,
+              eventKind: 'title.update',
+            });
+          }
         }
       }
     }
-    session.pendingInputForHistory += data;
-
-    broadcast('pty:data', id, data);
+    // Trim processed buffer to avoid unbounded growth
+    const lastBell = oscBuffer.lastIndexOf('\x07');
+    const lastEsc = oscBuffer.lastIndexOf('\x1b');
+    const trimPos = Math.max(lastBell, lastEsc);
+    if (trimPos >= 0 && trimPos < oscBuffer.length - 1) {
+      oscBuffer = oscBuffer.slice(trimPos);
+    }
+    if (oscBuffer.length > 4096) {
+      oscBuffer = oscBuffer.slice(-1024);
+    }
   });
 
   pty.onExit(({ exitCode }) => {
@@ -117,22 +180,59 @@ export function writeTerminal(terminalId: number, data: string): void {
   if (!session) return;
 
   // Track backspace and printable chars for pending buffers
-  for (const ch of data) {
+  // Filter out bracketed paste, CSI, and OSC sequences from input history
+  const textForHistory = data
+    .replace(/\x1b\[200~[\s\S]*?\x1b\[201~/g, '') // bracketed paste
+    .replace(/\x1b\[[0-9;]*[A-Za-z]/g, '') // CSI sequences (arrow keys, etc.)
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, ''); // OSC sequences
+  let recentInputsChanged = false;
+  let titleChanged = false;
+  for (const ch of textForHistory) {
     if (ch === '\b' || ch === '\x7f') {
-      session.pendingLineForTitle = session.pendingLineForTitle.slice(0, -1);
-      session.pendingInputForHistory = session.pendingInputForHistory.slice(0, -1);
+      // Char-safe backspace using Array.from for surrogate pairs
+      const titleChars = Array.from(session.pendingLineForTitle);
+      titleChars.pop();
+      session.pendingLineForTitle = titleChars.join('');
+      const histChars = Array.from(session.pendingInputForHistory);
+      histChars.pop();
+      session.pendingInputForHistory = histChars.join('');
     } else {
-      session.pendingInputForHistory += ch;
       const code = ch.charCodeAt(0);
+      // Include printable chars, tabs, and newlines in history; skip other control chars
+      if (code >= 0x20 || ch === '\r' || ch === '\n' || ch === '\t') {
+        session.pendingInputForHistory += ch;
+      }
       if (ch === '\r' || ch === '\n') {
+        // On Enter, record history from full raw text and clear both buffers
+        const historyLine = session.pendingInputForHistory;
+        const trimmed = historyLine.trim();
+        if (trimmed && !trimmed.startsWith('/')) {
+          session.recentInputs.unshift(trimmed);
+          if (session.recentInputs.length > 20) {
+            session.recentInputs.pop();
+          }
+          recentInputsChanged = true;
+        }
         session.pendingLineForTitle = '';
+        session.pendingInputForHistory = '';
       } else if (code >= 0x20) {
         session.pendingLineForTitle += ch;
         if (session.pendingLineForTitle.length > 512) {
-          session.pendingLineForTitle = session.pendingLineForTitle.slice(-512);
+          // Char-safe truncation for title
+          const chars = Array.from(session.pendingLineForTitle);
+          session.pendingLineForTitle = chars.slice(-512).join('');
         }
+        titleChanged = true;
       }
     }
+  }
+
+  if (recentInputsChanged || titleChanged) {
+    session.title = session.pendingLineForTitle;
+    broadcast('pty:state', session.id, {
+      recentInputs: session.recentInputs,
+      title: session.title,
+    });
   }
 
   session.pty.write(data);

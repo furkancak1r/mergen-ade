@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import type { DirectoryNode, ProjectRecord } from '../../../shared/types';
+import { repairMojibakeDisplay } from '../lib/mojibake';
 
 const api = (window as unknown as { mergenApi: { invoke: (channel: string, ...args: unknown[]) => Promise<unknown>; on: (channel: string, cb: (...args: unknown[]) => void) => () => void } }).mergenApi;
 
@@ -30,6 +31,12 @@ function getFileIcon(name: string, isDirectory: boolean): string {
 
 function shouldDefer(name: string): boolean {
   return DEFERRED_DIRS.has(name.toLowerCase());
+}
+
+function joinPath(a: string, b: string): string {
+  const sep = a.includes('\\') || b.includes('\\') ? '\\' : '/';
+  const aTrimmed = a.replace(/[\\/]+$/, '');
+  return aTrimmed + sep + b;
 }
 
 function highlightMatch(text: string, query: string): React.ReactNode {
@@ -66,6 +73,7 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, selec
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const expandedRef = useRef<Set<string>>(new Set());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [searchLoading, setSearchLoading] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -77,11 +85,12 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, selec
     try {
       const entries = await api.invoke('fs:readDir', dirPath) as { name: string; isDirectory: boolean; isSymlink: boolean }[];
       return entries.map((e) => {
-        const fullPath = `${dirPath}/${e.name}`;
-        const isDir = e.isDirectory;
+        const fullPath = joinPath(dirPath, e.name);
+        const isDir = e.isDirectory && !e.isSymlink; // Symlinks are never treated as directories for descent
         const isDeferred = isDir && shouldDefer(e.name);
+        const repairedName = repairMojibakeDisplay(e.name);
         return {
-          name: e.name,
+          name: repairedName,
           path: fullPath,
           isDirectory: isDir,
           isDeferred: isDeferred,
@@ -128,6 +137,7 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, selec
   }, [project.path, project.name, loadDirectory]);
 
   const expandNode = useCallback(async (node: DirectoryNode) => {
+    if (node.isSymlink) return;
     if (!node.isDirectory || !node.isDeferred && node.children && node.children.length > 0) {
       expandedRef.current.add(node.path);
       setExpanded(new Set(expandedRef.current));
@@ -148,6 +158,96 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, selec
       return next;
     });
   }, [loadDirectory]);
+
+  // Progressive deferred loading for search with adaptive caps and hidden queue
+  useEffect(() => {
+    if (!debouncedQuery || !rootNode) {
+      setSearchLoading(false);
+      return;
+    }
+    // Use char count for Unicode-aware minimum query length
+    const charCount = Array.from(debouncedQuery).length;
+    if (charCount < 2) {
+      setSearchLoading(false);
+      return;
+    }
+    const q = debouncedQuery.toLowerCase();
+
+    // Find deferred directories that haven't been loaded yet
+    const deferredPaths: string[] = [];
+    function collectDeferred(node: DirectoryNode) {
+      if (node.isDeferred && !node.children) {
+        deferredPaths.push(node.path);
+      }
+      if (node.children) {
+        for (const child of node.children) collectDeferred(child);
+      }
+    }
+    collectDeferred(rootNode);
+
+    if (deferredPaths.length === 0) {
+      setSearchLoading(false);
+      return;
+    }
+
+    // Determine if any results are already visible to set adaptive cap
+    const hasVisibleResults = (() => {
+      function hasMatch(node: DirectoryNode): boolean {
+        if (node.name.toLowerCase().includes(q)) return true;
+        if (node.children) {
+          for (const child of node.children) {
+            if (hasMatch(child)) return true;
+          }
+        }
+        return false;
+      }
+      return hasMatch(rootNode);
+    })();
+
+    // Adaptive cap: aggressive (8) when no results yet, conservative (2) when results visible
+    const cap = hasVisibleResults ? 2 : 8;
+
+    setSearchLoading(true);
+    let cancelled = false;
+
+    async function loadDeferred() {
+      const batch = deferredPaths.slice(0, cap);
+      for (const dirPath of batch) {
+        if (cancelled) return;
+        const children = await loadDirectory(dirPath, false);
+        if (cancelled) return;
+        setRootNode((prev) => {
+          if (!prev) return prev;
+          const next = structuredClone(prev);
+          const target = findNode(next, dirPath);
+          if (target) {
+            target.children = children;
+            target.isDeferred = false;
+          }
+          return next;
+        });
+        // Only auto-expand if the directory name matches the query
+        const dirName = dirPath.split(/[\\/]/).pop() || '';
+        if (dirName.toLowerCase().includes(q)) {
+          expandedRef.current.add(dirPath);
+        }
+      }
+      setExpanded(new Set(expandedRef.current));
+      // If there are more deferred paths, schedule another load batch via state nudge
+      if (deferredPaths.length > cap) {
+        setTimeout(() => {
+          if (!cancelled) {
+            setDebouncedQuery((prev) => prev);
+          }
+        }, 50);
+      } else {
+        setSearchLoading(false);
+      }
+    }
+
+    loadDeferred();
+    return () => { cancelled = true; };
+  }, [debouncedQuery, rootNode, loadDirectory]);
 
   const collapseNode = useCallback((node: DirectoryNode) => {
     expandedRef.current.delete(node.path);
@@ -252,7 +352,7 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, selec
     <div className="project-explorer" style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
       <div style={{ padding: '8px 12px', borderBottom: '1px solid #222', display: 'flex', alignItems: 'center', gap: 8 }}>
         <span style={{ fontSize: 12, fontWeight: 600, color: '#eee', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-          {project.name}
+          {repairMojibakeDisplay(project.name)}
         </span>
       </div>
       <div style={{ padding: '6px 12px', borderBottom: '1px solid #222' }}>
@@ -282,7 +382,10 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({ project, selec
           <div style={{ padding: 12, color: '#c44', fontSize: 12 }}>Error: {error}</div>
         )}
         {filteredRoot && renderNode(filteredRoot, 0)}
-        {!loading && !error && filteredRoot === null && (
+        {!loading && !error && searchLoading && (
+          <div style={{ padding: 12, color: '#888', fontSize: 12 }}>Searching folders...</div>
+        )}
+        {!loading && !error && !searchLoading && filteredRoot === null && (
           <div style={{ padding: 12, color: '#888', fontSize: 12 }}>No matching files or folders.</div>
         )}
       </div>

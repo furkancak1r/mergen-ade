@@ -1,12 +1,26 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import type { ProjectRecord } from '../../../shared/types';
+
+const CHECKLIST_MESSAGE_MAX_HEIGHT = 120;
 
 interface ChecklistProps {
   projects: ProjectRecord[];
+  onRemoveItem?: (projectId: number, index: number) => void;
+  onClose?: () => void;
 }
 
-export const Checklist: React.FC<ChecklistProps> = ({ projects }) => {
+export const Checklist: React.FC<ChecklistProps> = ({ projects, onRemoveItem, onClose }) => {
   const [collapsed, setCollapsed] = useState<Set<number>>(new Set());
+  const [toast, setToast] = useState<{ text: string; id: number } | null>(null);
+  const toastIdRef = useRef(0);
+
+  const showToast = useCallback((text: string) => {
+    const id = ++toastIdRef.current;
+    setToast({ text, id });
+    setTimeout(() => {
+      setToast((prev) => (prev?.id === id ? null : prev));
+    }, 2000);
+  }, []);
 
   const toggleProject = useCallback((projectId: number) => {
     setCollapsed((prev) => {
@@ -23,12 +37,22 @@ export const Checklist: React.FC<ChecklistProps> = ({ projects }) => {
   const copyAll = useCallback((project: ProjectRecord) => {
     const text = project.checklist.join('\n\n');
     navigator.clipboard.writeText(text).catch(() => {});
+    showToast(`Copied ${project.checklist.length} item(s)`);
+  }, [showToast]);
+
+  const copyItem = useCallback((item: string) => {
+    navigator.clipboard.writeText(item).catch(() => {});
   }, []);
 
   return (
     <div style={{ position: 'fixed', bottom: 16, right: 16, width: 360, maxHeight: 500, background: '#141414', border: '1px solid #333', borderRadius: 8, display: 'flex', flexDirection: 'column', overflow: 'hidden', zIndex: 100 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', borderBottom: '1px solid #222' }}>
         <span style={{ fontSize: 12, fontWeight: 600, color: '#eee' }}>Checklist</span>
+        {onClose && (
+          <button onClick={onClose} style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 14 }}>
+            ✕
+          </button>
+        )}
       </div>
       <div style={{ flex: 1, overflow: 'auto', padding: '4px 0' }}>
         {projects.map((project) => (
@@ -54,9 +78,24 @@ export const Checklist: React.FC<ChecklistProps> = ({ projects }) => {
             {!collapsed.has(project.id) && (
               <div>
                 {project.checklist.map((item, i) => (
-                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '3px 12px 3px 24px' }}>
-                    <span style={{ fontSize: 11, color: '#aaa' }}>☐</span>
-                    <span style={{ fontSize: 11, color: '#aaa', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis' }}>{item}</span>
+                  <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 6, padding: '3px 12px 3px 24px' }}>
+                    <button
+                      onClick={() => onRemoveItem?.(project.id, i)}
+                      style={{ background: 'transparent', border: 'none', color: '#aaa', cursor: 'pointer', fontSize: 11, padding: 0, marginTop: 0 }}
+                      title="Remove"
+                    >
+                      ☐
+                    </button>
+                    <div style={{ flex: 1, maxHeight: CHECKLIST_MESSAGE_MAX_HEIGHT, overflow: 'auto' }}>
+                      <span style={{ fontSize: 11, color: '#aaa', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{item}</span>
+                    </div>
+                    <button
+                      onClick={() => copyItem(item)}
+                      style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 10, padding: 0, flexShrink: 0 }}
+                      title="Copy"
+                    >
+                      📋
+                    </button>
                   </div>
                 ))}
                 {project.checklist.length === 0 && (
@@ -70,6 +109,23 @@ export const Checklist: React.FC<ChecklistProps> = ({ projects }) => {
           <div style={{ padding: 12, color: '#888', fontSize: 12 }}>No projects with checklist items.</div>
         )}
       </div>
+      {toast && (
+        <div style={{
+          position: 'absolute',
+          bottom: 8,
+          left: '50%',
+          transform: 'translateX(-50%)',
+          background: '#1a1a1a',
+          border: '1px solid #333',
+          borderRadius: 4,
+          padding: '6px 12px',
+          fontSize: 11,
+          color: '#ccc',
+          zIndex: 10,
+        }}>
+          {toast.text}
+        </div>
+      )}
     </div>
   );
 };

@@ -1,5 +1,6 @@
 import { BrowserView, BrowserWindow } from 'electron';
 import type { BrowserScopeKey } from '../shared/types';
+import { BrowserScopeKeyType } from '../shared/types';
 import path from 'path';
 import fs from 'fs';
 
@@ -15,9 +16,10 @@ interface BrowserInstance {
 }
 
 const instances = new Map<string, BrowserInstance>();
+let activeScope: BrowserScopeKey | null = null;
 
 function scopeKey(scope: BrowserScopeKey): string {
-  if (scope.type === 'terminal') {
+  if (scope.type === BrowserScopeKeyType.Terminal) {
     return `t-${scope.projectId}-${scope.terminalId ?? 0}`;
   }
   return `p-${scope.projectId}`;
@@ -117,8 +119,11 @@ export function showBrowserView(scope: BrowserScopeKey): void {
   if (!win) return;
 
   if (instance.cachedVisible) return;
-
-  win.addBrowserView(instance.view);
+  // Guard against duplicate adds if native state drifted from cache
+  const alreadyAttached = win.getBrowserViews().some((v) => v === instance.view);
+  if (!alreadyAttached) {
+    win.addBrowserView(instance.view);
+  }
   instance.view.setBounds(instance.cachedBounds ?? { x: 0, y: 0, width: 0, height: 0 });
   instance.cachedVisible = true;
 }
@@ -188,12 +193,118 @@ export function browserScreenshot(scope: BrowserScopeKey, fullPage: boolean): Pr
   });
 }
 
+const DESIGN_INSPECT_SCRIPT_VERSION = '1.0';
+
+const designInspectScript = `
+(function() {
+  if (window.__mergenDesignInspect) return;
+  window.__mergenDesignInspect = {
+    version: '${DESIGN_INSPECT_SCRIPT_VERSION}',
+    enabled: false,
+    hovered: null,
+    overlay: null,
+    init: function() {
+      this.overlay = document.createElement('div');
+      this.overlay.style.cssText = 'position:fixed;pointer-events:none;z-index:999999;border:2px solid #0078d4;background:rgba(0,120,212,0.1);transition:none;';
+      document.body.appendChild(this.overlay);
+      document.addEventListener('click', this.onClick.bind(this), true);
+      document.addEventListener('mousemove', this.onMouseMove.bind(this), true);
+      document.addEventListener('mouseover', this.onMouseOver.bind(this), true);
+    },
+    onMouseOver: function(e) {
+      if (!this.enabled) return;
+      this.hovered = e.target;
+    },
+    onMouseMove: function(e) {
+      if (!this.enabled || !this.hovered) {
+        this.overlay.style.display = 'none';
+        return;
+      }
+      const rect = this.hovered.getBoundingClientRect();
+      this.overlay.style.display = 'block';
+      this.overlay.style.left = rect.left + 'px';
+      this.overlay.style.top = rect.top + 'px';
+      this.overlay.style.width = rect.width + 'px';
+      this.overlay.style.height = rect.height + 'px';
+    },
+    onClick: function(e) {
+      if (!this.enabled) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const el = e.target;
+      const rect = el.getBoundingClientRect();
+      const info = {
+        type: 'DesignElementClicked',
+        tagName: el.tagName,
+        id: el.id || '',
+        className: el.className || '',
+        text: (el.textContent || '').slice(0, 200),
+        rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+        href: el.href || '',
+        src: el.src || '',
+        pageUrl: window.location.href,
+      };
+      console.log('[mergen-design-inspect]' + JSON.stringify(info));
+    },
+    setEnabled: function(v) {
+      this.enabled = v;
+      if (!this.overlay) this.init();
+      this.overlay.style.display = 'none';
+    }
+  };
+  window.__mergenDesignInspect.init();
+})();
+`.trim();
+
 export function browserDesignInspect(scope: BrowserScopeKey, enabled: boolean): void {
   const instance = instances.get(scopeKey(scope));
   if (!instance) return;
   instance.designInspectEnabled = enabled;
-  // TODO: inject script to enable/disable inspect mode
+
+  const wc = instance.view.webContents;
+  if (wc.isLoadingMainFrame()) return;
+
+  // Inject the script if not already present
+  wc.executeJavaScript(designInspectScript).then(() => {
+    wc.executeJavaScript(`window.__mergenDesignInspect.setEnabled(${enabled})`).catch(() => {});
+  }).catch(() => {});
+
+  // Use console-message to capture design inspect clicks
+  if (enabled) {
+    // Prevent duplicate listeners if design inspect is toggled on repeatedly
+    const existingHandler = (instance as any).__designInspectHandler;
+    if (existingHandler) {
+      wc.removeListener('console-message', existingHandler);
+    }
+    const handler = (_event: Electron.Event, level: number, message: string, line: number, sourceId: string) => {
+      const prefix = '[mergen-design-inspect]';
+      if (message.includes(prefix)) {
+        try {
+          const json = message.slice(message.indexOf(prefix) + prefix.length);
+          const info = JSON.parse(json);
+          if (info && info.type === 'DesignElementClicked') {
+            const elementInfo = JSON.stringify(info);
+            broadcast('browser:designElementClicked', scope, elementInfo);
+            // Auto-disable after successful delivery
+            browserDesignInspect(scope, false);
+          }
+        } catch {
+          // ignore
+        }
+      }
+    };
+    wc.on('console-message', handler);
+    // Store handler on instance so it can be cleaned up later
+    (instance as any).__designInspectHandler = handler;
+  } else {
+    const handler = (instance as any).__designInspectHandler;
+    if (handler) {
+      wc.removeListener('console-message', handler);
+      (instance as any).__designInspectHandler = undefined;
+    }
+  }
 }
+
 
 export function browserAddTab(scope: BrowserScopeKey, url?: string): string {
   const instance = getBrowserInstance(scope) ?? createBrowserView(scope);
@@ -208,7 +319,8 @@ export function browserAddTab(scope: BrowserScopeKey, url?: string): string {
 }
 
 export function browserCloseTab(scope: BrowserScopeKey, tabId: string): void {
-  const instance = instances.get(scopeKey(scope));
+  const key = scopeKey(scope);
+  const instance = instances.get(key);
   if (!instance) return;
   instance.tabs = instance.tabs.filter((t) => t.id !== tabId);
   if (instance.activeTabId === tabId) {
@@ -219,7 +331,11 @@ export function browserCloseTab(scope: BrowserScopeKey, tabId: string): void {
         instance.view.webContents.loadURL(active.url);
       }
     } else {
+      // Last tab closed: clean up instance state and shut down WebView
       instance.view.webContents.loadURL('about:blank');
+      hideBrowserView(scope);
+      instance.view.webContents.close();
+      instances.delete(key);
     }
   }
 }
@@ -240,6 +356,7 @@ export function destroyBrowserInstance(scope: BrowserScopeKey): void {
   const key = scopeKey(scope);
   const instance = instances.get(key);
   if (instance) {
+    hideBrowserView(scope);
     instance.view.webContents.close();
     instances.delete(key);
   }
@@ -251,8 +368,19 @@ export function hideAllBrowserViews(): void {
   }
 }
 
+export function showAllBrowserViews(): void {
+  for (const instance of instances.values()) {
+    showBrowserView(instance.scope);
+  }
+}
+
+export function setActiveBrowserScope(scope: BrowserScopeKey): void {
+  activeScope = scope;
+}
+
 export function showActiveBrowserView(): void {
-  // TODO: called when modal closes; show the active scope
+  if (!activeScope) return;
+  showBrowserView(activeScope);
 }
 
 function broadcast(channel: string, ...args: unknown[]) {

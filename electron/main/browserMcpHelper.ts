@@ -73,46 +73,40 @@ async function handleLine(line: string, caps: string[]): Promise<void> {
   }
 }
 
-async function handleMethod(method: string, params: unknown, caps: string[]): Promise<unknown> {
-  // Minimal MCP tool stubs for browser automation
-  const p = (params as Record<string, unknown>) || {};
-  switch (method) {
-    case 'browser/navigate': {
-      const url = (p.url as string) || '';
-      return { success: true, url };
+const pending = new Map<string | number, (result: unknown) => void>();
+
+process.on('message', (msg: unknown) => {
+  if (msg && typeof msg === 'object') {
+    const m = msg as Record<string, unknown>;
+    if (m.type === 'browserMcpResponse' && m.id !== undefined) {
+      const resolve = pending.get(m.id as string | number);
+      if (resolve) {
+        pending.delete(m.id as string | number);
+        resolve(m.result);
+      }
     }
-    case 'browser/click': {
-      const selector = (p.selector as string) || '';
-      return { success: true, selector };
-    }
-    case 'browser/type': {
-      const selector = (p.selector as string) || '';
-      const text = (p.text as string) || '';
-      return { success: true, selector, text };
-    }
-    case 'browser/screenshot': {
-      return { success: true, dataUrl: '', cap: caps.includes('vision') };
-    }
-    case 'browser/getText': {
-      const selector = (p.selector as string) || '';
-      return { success: true, selector, text: '' };
-    }
-    case 'browser/close': {
-      return { success: true };
-    }
-    case 'browser/waitFor': {
-      const duration = (p.duration as number) || 1000;
-      await new Promise((resolve) => setTimeout(resolve, duration));
-      return { success: true, duration };
-    }
-    case 'initialize': {
-      return {
-        protocolVersion: '2024-11-05',
-        capabilities: {},
-        serverInfo: { name: 'mergen-browser-mcp', version: '1.0.0' },
-      };
-    }
-    default:
-      return { success: false, error: `Unknown method: ${method}` };
   }
+});
+
+async function handleMethod(method: string, params: unknown, caps: string[]): Promise<unknown> {
+  if (method === 'initialize') {
+    return {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      serverInfo: { name: 'mergen-browser-mcp', version: '1.0.0' },
+    };
+  }
+
+  const p = (params as Record<string, unknown>) || {};
+  const id = (p.__relayId as string | number) ?? Date.now() + Math.random();
+
+  return new Promise((resolve) => {
+    pending.set(id, resolve);
+    // Relay to parent process
+    if (process.send) {
+      process.send({ type: 'browserMcpRequest', id, method, params, caps });
+    } else {
+      resolve({ success: false, error: 'No IPC channel to main process' });
+    }
+  });
 }

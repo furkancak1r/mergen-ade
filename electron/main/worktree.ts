@@ -1,4 +1,6 @@
 import { spawn } from 'child_process';
+import fs from 'fs';
+import path from 'path';
 import type { GitWorktreeInfo } from '../shared/types';
 
 export function parseGitWorktreeList(output: string): GitWorktreeInfo[] {
@@ -76,18 +78,59 @@ export function discoverWorktrees(repoPath: string): Promise<GitWorktreeInfo[]> 
   });
 }
 
-export function createWorktree(repoPath: string, branch: string, path: string, baseBranch?: string): Promise<boolean> {
+export function createWorktree(repoPath: string, branch: string, wtPath: string, baseBranch?: string): Promise<boolean> {
   return new Promise((resolve) => {
-    const args = ['worktree', 'add', '-b', branch, path];
+    const args = ['worktree', 'add', '-b', branch, wtPath];
     if (baseBranch) {
       args.push(baseBranch);
     }
     const proc = spawn('git', args, { cwd: repoPath });
     proc.on('close', (code) => {
+      if (code === 0) {
+        // Copy root .env* files to new worktree so runtime commands work immediately
+        copyEnvFiles(repoPath, wtPath);
+      }
       resolve(code === 0);
     });
     proc.on('error', () => {
       resolve(false);
+    });
+  });
+}
+
+function copyEnvFiles(fromDir: string, toDir: string): void {
+  try {
+    const entries = fs.readdirSync(fromDir);
+    for (const entry of entries) {
+      if (entry.startsWith('.env')) {
+        const src = path.join(fromDir, entry);
+        const dest = path.join(toDir, entry);
+        const stat = fs.statSync(src);
+        if (stat.isFile()) {
+          fs.copyFileSync(src, dest);
+        }
+      }
+    }
+  } catch {
+    // ignore copy failures
+  }
+}
+
+export function cleanupOrphanWorktrees(
+  registeredPaths: string[],
+  repoPath: string,
+): Promise<string[]> {
+  return new Promise((resolve) => {
+    discoverWorktrees(repoPath).then((discovered) => {
+      const orphanPaths: string[] = [];
+      for (const registered of registeredPaths) {
+        const stillExists = discovered.some((d) => d.path === registered);
+        const pathOnDisk = fs.existsSync(registered);
+        if (!stillExists && !pathOnDisk) {
+          orphanPaths.push(registered);
+        }
+      }
+      resolve(orphanPaths);
     });
   });
 }

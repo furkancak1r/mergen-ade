@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Notification, dialog, shell, clipboard, nativeImage } from 'electron';
+import { app, BrowserWindow, ipcMain, Notification, dialog, shell, clipboard, nativeImage, Tray } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import { registerIpcHandlers } from './ipcHandlers';
@@ -69,21 +69,94 @@ function confirmClose(confirmed: boolean) {
   }
 }
 
-function showNotification(payload: { title: string; body: string }) {
-  if (!mainWindow) return;
-  const notification = new Notification({
-    title: payload.title,
-    body: payload.body,
-  });
-  notification.on('click', () => {
+// OS Notifications with tray icon and cooldown
+let tray: Tray | null = null;
+const lastNotificationByTerminal = new Map<string, number>();
+
+function ensureTray() {
+  if (tray) return;
+  // Create an empty transparent image for the tray icon
+  const icon = nativeImage.createEmpty();
+  tray = new Tray(icon);
+  tray.setToolTip('Mergen ADE');
+  tray.on('click', () => {
     if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
+      // Only restore if minimized; do not un-maximize a visible window
+      if (mainWindow.isMinimized()) {
+        mainWindow.restore();
+      }
+      mainWindow.show();
       mainWindow.focus();
     }
   });
-  notification.show();
-  if (!mainWindow.isFocused()) {
+}
+
+function showNotification(payload: {
+  terminalId: number;
+  tool: string;
+  kind: string;
+  title: string;
+  body: string;
+  onlyWhenUnfocused?: boolean;
+  cooldownSecs?: number;
+}): void {
+  if (!mainWindow) return;
+
+  const focused = mainWindow.isFocused();
+  if (payload.onlyWhenUnfocused && focused) {
+    return;
+  }
+
+  // Cooldown deduplication
+  const key = `${payload.terminalId}-${payload.tool}-${payload.kind}`;
+  const cooldownMs = (payload.cooldownSecs ?? 30) * 1000;
+  const last = lastNotificationByTerminal.get(key);
+  const now = Date.now();
+  if (last && now - last < cooldownMs) {
+    return;
+  }
+  lastNotificationByTerminal.set(key, now);
+
+  // Try tray balloon first on Windows
+  if (process.platform === 'win32') {
+    try {
+      ensureTray();
+      if (tray) {
+        tray.displayBalloon({
+          iconType: 'none',
+          title: payload.title,
+          content: payload.body,
+        });
+      }
+    } catch {
+      // Fallback to Notification API
+      const n = new Notification({ title: payload.title, body: payload.body });
+      n.show();
+    }
+  } else {
+    const n = new Notification({
+      title: payload.title,
+      body: payload.body,
+    });
+    n.on('click', () => {
+      if (mainWindow) {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.focus();
+      }
+    });
+    n.show();
+  }
+
+  // Flash frame fallback
+  if (!focused) {
     mainWindow.flashFrame(true);
+  }
+}
+
+function clearTray() {
+  if (tray) {
+    tray.destroy();
+    tray = null;
   }
 }
 
@@ -108,8 +181,18 @@ app.whenReady().then(() => {
   });
 });
 
+// Crash shield: catch unhandled errors and log without crashing
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection:', reason);
+});
+
 app.on('window-all-closed', () => {
   stopHookService();
+  clearTray();
   if (process.platform !== 'darwin') {
     app.quit();
   }
@@ -150,7 +233,10 @@ function dispatchCliMode() {
 }
 
 if (dispatchCliMode()) {
-  app.quit();
+  // Browser MCP helper runs as a long-lived child process; do not exit
+  if (process.argv[2] !== '--browser-mcp-helper') {
+    process.exit(0);
+  }
 }
 
 export { mainWindow };
