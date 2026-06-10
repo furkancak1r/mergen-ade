@@ -186,6 +186,8 @@ pub struct LauncherEntry {
     #[serde(default = "default_launcher_enabled")]
     pub enabled: bool,
     pub icon_key: LauncherIconKey,
+    #[serde(default)]
+    pub bypass_permissions: bool,
 }
 
 impl LauncherEntry {
@@ -197,6 +199,7 @@ impl LauncherEntry {
             launch_command: kind.default_launch_command().to_owned(),
             enabled: true,
             icon_key: kind.icon_key(),
+            bypass_permissions: false,
         }
     }
 }
@@ -235,6 +238,7 @@ pub fn normalize_launcher_entries(entries: &mut Vec<LauncherEntry>) {
                 },
                 enabled: existing.enabled,
                 icon_key: builtin.icon_key(),
+                bypass_permissions: existing.bypass_permissions,
             });
         } else {
             normalized.push(LauncherEntry::builtin(builtin));
@@ -262,6 +266,7 @@ pub fn normalize_launcher_entries(entries: &mut Vec<LauncherEntry>) {
             launch_command: entry.launch_command.clone(),
             enabled: entry.enabled,
             icon_key: entry.icon_key,
+            bypass_permissions: entry.bypass_permissions,
         });
     }
 
@@ -1370,6 +1375,7 @@ mod tests {
             launch_command: "my-cli".to_owned(),
             enabled: true,
             icon_key: LauncherIconKey::Rocket,
+            bypass_permissions: false,
         }];
 
         normalize_launcher_entries(&mut launchers);

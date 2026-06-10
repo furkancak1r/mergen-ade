@@ -7390,7 +7390,7 @@ impl AdeApp {
             }
 
             let launch_command = if launcher.builtin == Some(BuiltinLauncherKind::Claude) {
-                Self::sanitized_claude_launch_command(shell)
+                Self::sanitized_claude_launch_command(shell, launcher.bypass_permissions)
             } else {
                 launcher.launch_command.clone()
             };
@@ -18432,15 +18432,26 @@ impl AdeApp {
     /// Return a sanitized launch command for Claude that bypasses shell
     /// aliases/wrappers and clears stale Anthropic env vars before invoking
     /// the real npm-installed `claude.cmd`.
-    fn sanitized_claude_launch_command(shell: ShellKind) -> String {
+    fn sanitized_claude_launch_command(shell: ShellKind, bypass_permissions: bool) -> String {
+        let suffix = if bypass_permissions {
+            " --dangerously-skip-permissions"
+        } else {
+            ""
+        };
         match shell {
             ShellKind::PowerShell => {
-                "Remove-Item Env:ANTHROPIC_AUTH_TOKEN,Env:ANTHROPIC_API_KEY,Env:ANTHROPIC_BASE_URL,Env:ANTHROPIC_MODEL,Env:ANTHROPIC_SMALL_FAST_MODEL,Env:ANTHROPIC_DEFAULT_SONNET_MODEL,Env:ANTHROPIC_DEFAULT_HAIKU_MODEL,Env:ANTHROPIC_DEFAULT_OPUS_MODEL,Env:CLAUDE_CODE_SUBAGENT_MODEL -ErrorAction SilentlyContinue; & \"$env:APPDATA\\npm\\claude.cmd\"".to_owned()
+                format!(
+                    "Remove-Item Env:ANTHROPIC_AUTH_TOKEN,Env:ANTHROPIC_API_KEY,Env:ANTHROPIC_BASE_URL,Env:ANTHROPIC_MODEL,Env:ANTHROPIC_SMALL_FAST_MODEL,Env:ANTHROPIC_DEFAULT_SONNET_MODEL,Env:ANTHROPIC_DEFAULT_HAIKU_MODEL,Env:ANTHROPIC_DEFAULT_OPUS_MODEL,Env:CLAUDE_CODE_SUBAGENT_MODEL -ErrorAction SilentlyContinue; & \"$env:APPDATA\\npm\\claude.cmd\"{suffix}"
+                )
             }
             ShellKind::Cmd => {
-                "set ANTHROPIC_AUTH_TOKEN= & set ANTHROPIC_API_KEY= & set ANTHROPIC_BASE_URL= & set ANTHROPIC_MODEL= & set ANTHROPIC_SMALL_FAST_MODEL= & set ANTHROPIC_DEFAULT_SONNET_MODEL= & set ANTHROPIC_DEFAULT_HAIKU_MODEL= & set ANTHROPIC_DEFAULT_OPUS_MODEL= & set CLAUDE_CODE_SUBAGENT_MODEL= & \"%APPDATA%\\npm\\claude.cmd\"".to_owned()
+                format!(
+                    "set ANTHROPIC_AUTH_TOKEN= & set ANTHROPIC_API_KEY= & set ANTHROPIC_BASE_URL= & set ANTHROPIC_MODEL= & set ANTHROPIC_SMALL_FAST_MODEL= & set ANTHROPIC_DEFAULT_SONNET_MODEL= & set ANTHROPIC_DEFAULT_HAIKU_MODEL= & set ANTHROPIC_DEFAULT_OPUS_MODEL= & set CLAUDE_CODE_SUBAGENT_MODEL= & \"%APPDATA%\\npm\\claude.cmd\"{suffix}"
+                )
             }
-            ShellKind::Zsh => "claude".to_owned(),
+            ShellKind::Zsh => {
+                format!("claude{suffix}")
+            }
         }
     }
 
@@ -19222,6 +19233,12 @@ impl AdeApp {
                                     );
                                     row_changed |= enabled_response.changed();
 
+                                    let bypass_response = ui.checkbox(
+                                        &mut launcher.bypass_permissions,
+                                        "Bypass permissions",
+                                    );
+                                    row_changed |= bypass_response.changed();
+
                                     if !is_builtin {
                                         ui.add_space(12.0);
                                         egui::ComboBox::from_id_salt(("launcher-icon-key", &launcher.id))
@@ -19411,6 +19428,7 @@ impl AdeApp {
                                     launch_command: launch_command.to_owned(),
                                     enabled: true,
                                     icon_key: self.launcher_draft.icon_key,
+                                    bypass_permissions: false,
                                 });
                                 self.launcher_draft = LauncherDraftState::default();
                                 changes.note_launchers_change();
@@ -23579,12 +23597,16 @@ impl AdeApp {
                 let (row_label_width, row_actions_width) =
                     terminal_manager_row_widths(row_width, actions_width, section_gap);
                 let row_height = ui.spacing().interact_size.y.max(CONTROL_ROW_HEIGHT);
-                let (row_rect, row_response) =
+                let (row_rect, _row_response) =
                     ui.allocate_exact_size(egui::vec2(row_width, row_height), Sense::click());
                 row_rect_opt = Some(row_rect);
+                let row_hovered = ui
+                    .ctx()
+                    .input(|input| input.pointer.hover_pos())
+                    .is_some_and(|pos| row_rect.contains(pos));
 
                 // Tooltip on selection area (row without action buttons)
-                let row_chrome = terminal_manager_row_chrome(active, row_response.hovered());
+                let row_chrome = terminal_manager_row_chrome(active, row_hovered);
                 let selection_rect =
                     terminal_manager_row_selection_rect(row_rect, row_actions_width);
 
@@ -23703,13 +23725,14 @@ impl AdeApp {
                         .max_rect(actions_rect)
                         .layout(Layout::right_to_left(Align::Center)),
                     |ui| {
-                        if styled_icon_button(
+                        if styled_icon_button_with_visible(
                             ui,
                             icons::X,
                             BTN_RED,
                             BTN_RED_HOVER,
                             Color32::from_rgb(170, 50, 50),
                             "Close",
+                            row_hovered,
                         ) {
                             close_terminal = true;
                             action_clicked = true;
@@ -23726,11 +23749,12 @@ impl AdeApp {
                             } else {
                                 "Show in main area"
                             };
-                            if styled_icon_toggle(
+                            if styled_icon_toggle_with_visible(
                                 ui,
                                 terminal_data.in_main_view,
                                 visibility_icon,
                                 visibility_tooltip,
+                                row_hovered,
                             ) {
                                 visibility_changed = true;
                                 action_clicked = true;
@@ -23739,17 +23763,19 @@ impl AdeApp {
 
                         // Show different message menus based on terminal kind
                         if kind == TerminalKind::Background {
-                            let message_response = draw_terminal_saved_message_menu_button(
+                            let message_response = draw_terminal_saved_message_menu_button_visible(
                                 ui,
                                 &saved_messages,
                                 &mut send_message,
+                                row_hovered,
                             );
                             action_clicked |= message_response.clicked();
                         } else {
                             let (fg_send, fg_edit, fg_delete, fg_add) =
-                                draw_terminal_foreground_message_menu_button(
+                                draw_terminal_foreground_message_menu_button_visible(
                                     ui,
                                     &foreground_messages,
+                                    row_hovered,
                                 );
                             if fg_send.is_some() {
                                 send_message = fg_send;
@@ -23776,23 +23802,24 @@ impl AdeApp {
                             // Check if terminal has active work (AI Running status)
                             let is_running = terminal_data.ai_badge.status == AiCliStatus::Running;
 
-                            let rerun_button_response = with_minimal_button_chrome(ui, |ui| {
-                                let icon = if is_running {
-                                    icons::X // Show X (interrupt) when running
-                                } else {
-                                    icons::ARROW_CLOCKWISE // Show refresh when idle
-                                };
-                                let tooltip = if is_running {
-                                    "Stop running command (Ctrl+C)"
-                                } else if has_runnable_command {
-                                    "Interrupt and rerun last command"
-                                } else {
-                                    "No command to rerun"
-                                };
-                                ui.button(format!("{}", icon))
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                    .on_hover_text(tooltip)
-                            });
+                            let rerun_button_response =
+                                with_minimal_button_chrome_visible(ui, row_hovered, |ui| {
+                                    let icon = if is_running {
+                                        icons::X // Show X (interrupt) when running
+                                    } else {
+                                        icons::ARROW_CLOCKWISE // Show refresh when idle
+                                    };
+                                    let tooltip = if is_running {
+                                        "Stop running command (Ctrl+C)"
+                                    } else if has_runnable_command {
+                                        "Interrupt and rerun last command"
+                                    } else {
+                                        "No command to rerun"
+                                    };
+                                    ui.button(format!("{}", icon))
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .on_hover_text(tooltip)
+                                });
 
                             if rerun_button_response.clicked() && !terminal_data.exited {
                                 if is_running {
@@ -23819,15 +23846,16 @@ impl AdeApp {
                                     .is_empty();
                             let has_history = !terminal_data.exited
                                 && (has_runtime_history || has_persisted_history);
-                            let history_button_response = with_minimal_button_chrome(ui, |ui| {
-                                ui.button(format!("{}", icons::CLOCK))
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                    .on_hover_text(if has_history {
-                                        "Show input history"
-                                    } else {
-                                        "No history available"
-                                    })
-                            });
+                            let history_button_response =
+                                with_minimal_button_chrome_visible(ui, row_hovered, |ui| {
+                                    ui.button(format!("{}", icons::CLOCK))
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .on_hover_text(if has_history {
+                                            "Show input history"
+                                        } else {
+                                            "No history available"
+                                        })
+                                });
                             if has_history && history_button_response.clicked() {
                                 if self.terminal_history_popup_open == Some(terminal_data.id) {
                                     self.terminal_history_popup_open = None;
@@ -29321,10 +29349,16 @@ impl AdeApp {
                 } else {
                     0.0
                 };
+                let resize_handle_height = if smart_footer_height > 0.0 {
+                    SMART_INPUT_RESIZE_HANDLE_HEIGHT
+                } else {
+                    0.0
+                };
 
                 let raw_output_height = (pane_height
                     - TERMINAL_HEADER_HEIGHT
                     - TERMINAL_HEADER_GAP
+                    - resize_handle_height
                     - smart_footer_gap
                     - smart_footer_height)
                     .max(line_height * 2.0);
@@ -34935,35 +34969,66 @@ fn paint_minimal_combo_icon(
     ui.painter().line_segment([mid, bottom], stroke);
 }
 
-fn with_minimal_button_chrome<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+fn with_minimal_button_chrome_visible<R>(
+    ui: &mut Ui,
+    visible: bool,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> R {
     ui.scope(|ui| {
         let style = ui.style_mut();
         style.spacing.button_padding = egui::vec2(8.0, 5.0);
         let hover_fill = with_alpha(BTN_ICON_HOVER, 110);
 
-        style.visuals.widgets.inactive.bg_fill = Color32::TRANSPARENT;
-        style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
-        style.visuals.widgets.inactive.bg_stroke = Stroke::NONE;
-        style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, with_alpha(TEXT_PRIMARY, 190));
+        if visible {
+            style.visuals.widgets.inactive.bg_fill = Color32::TRANSPARENT;
+            style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+            style.visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+            style.visuals.widgets.inactive.fg_stroke =
+                Stroke::new(1.0, with_alpha(TEXT_PRIMARY, 190));
 
-        style.visuals.widgets.hovered.bg_fill = hover_fill;
-        style.visuals.widgets.hovered.weak_bg_fill = hover_fill;
-        style.visuals.widgets.hovered.bg_stroke = Stroke::NONE;
-        style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+            style.visuals.widgets.hovered.bg_fill = hover_fill;
+            style.visuals.widgets.hovered.weak_bg_fill = hover_fill;
+            style.visuals.widgets.hovered.bg_stroke = Stroke::NONE;
+            style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
 
-        style.visuals.widgets.active.bg_fill = Color32::TRANSPARENT;
-        style.visuals.widgets.active.weak_bg_fill = Color32::TRANSPARENT;
-        style.visuals.widgets.active.bg_stroke = Stroke::NONE;
-        style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+            style.visuals.widgets.active.bg_fill = Color32::TRANSPARENT;
+            style.visuals.widgets.active.weak_bg_fill = Color32::TRANSPARENT;
+            style.visuals.widgets.active.bg_stroke = Stroke::NONE;
+            style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
 
-        style.visuals.widgets.open.bg_fill = Color32::TRANSPARENT;
-        style.visuals.widgets.open.weak_bg_fill = Color32::TRANSPARENT;
-        style.visuals.widgets.open.bg_stroke = Stroke::NONE;
-        style.visuals.widgets.open.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+            style.visuals.widgets.open.bg_fill = Color32::TRANSPARENT;
+            style.visuals.widgets.open.weak_bg_fill = Color32::TRANSPARENT;
+            style.visuals.widgets.open.bg_stroke = Stroke::NONE;
+            style.visuals.widgets.open.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+        } else {
+            style.visuals.widgets.inactive.bg_fill = Color32::TRANSPARENT;
+            style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+            style.visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+            style.visuals.widgets.inactive.fg_stroke = Stroke::NONE;
+
+            style.visuals.widgets.hovered.bg_fill = Color32::TRANSPARENT;
+            style.visuals.widgets.hovered.weak_bg_fill = Color32::TRANSPARENT;
+            style.visuals.widgets.hovered.bg_stroke = Stroke::NONE;
+            style.visuals.widgets.hovered.fg_stroke = Stroke::NONE;
+
+            style.visuals.widgets.active.bg_fill = Color32::TRANSPARENT;
+            style.visuals.widgets.active.weak_bg_fill = Color32::TRANSPARENT;
+            style.visuals.widgets.active.bg_stroke = Stroke::NONE;
+            style.visuals.widgets.active.fg_stroke = Stroke::NONE;
+
+            style.visuals.widgets.open.bg_fill = Color32::TRANSPARENT;
+            style.visuals.widgets.open.weak_bg_fill = Color32::TRANSPARENT;
+            style.visuals.widgets.open.bg_stroke = Stroke::NONE;
+            style.visuals.widgets.open.fg_stroke = Stroke::NONE;
+        }
 
         add_contents(ui)
     })
     .inner
+}
+
+fn with_minimal_button_chrome<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    with_minimal_button_chrome_visible(ui, true, add_contents)
 }
 
 fn smart_input_status_text(terminal: &TerminalEntry) -> (&'static str, Color32) {
@@ -36232,9 +36297,66 @@ fn draw_terminal_saved_message_menu_button(
     response
 }
 
+fn draw_terminal_saved_message_menu_button_visible(
+    ui: &mut Ui,
+    saved_messages: &[String],
+    send_message: &mut Option<String>,
+    visible: bool,
+) -> egui::Response {
+    if visible {
+        draw_terminal_saved_message_menu_button(ui, saved_messages, send_message)
+    } else {
+        let response = with_minimal_button_chrome_visible(ui, false, |ui| {
+            ui.add_sized(
+                egui::vec2(TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH, CONTROL_ROW_HEIGHT),
+                egui::Button::new(format!("{}", icons::CHAT_TEXT))
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::NONE)
+                    .sense(Sense::hover()),
+            )
+        });
+        response
+            .on_hover_text("Send saved message")
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+}
+
 /// Draw the foreground message menu button with queue management.
 /// Returns (send_message, edit_index, delete_index, add_new_clicked)
+fn draw_terminal_foreground_message_menu_button_visible(
+    ui: &mut Ui,
+    foreground_messages: &[String],
+    visible: bool,
+) -> (Option<String>, Option<usize>, Option<usize>, bool) {
+    if visible {
+        draw_terminal_foreground_message_menu_button(ui, foreground_messages)
+    } else {
+        let icon_color = if foreground_messages.is_empty() {
+            with_alpha(TEXT_PRIMARY, 0)
+        } else {
+            Color32::TRANSPARENT
+        };
+        let _response = with_minimal_button_chrome_visible(ui, false, |ui| {
+            ui.add_sized(
+                egui::vec2(TERMINAL_MANAGER_MESSAGE_BUTTON_WIDTH, CONTROL_ROW_HEIGHT),
+                egui::Button::new(RichText::new(format!("{}", icons::CHAT_TEXT)).color(icon_color))
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::NONE)
+                    .sense(Sense::hover()),
+            )
+        });
+        (None, None, None, false)
+    }
+}
+
 fn draw_terminal_foreground_message_menu_button(
+    ui: &mut Ui,
+    foreground_messages: &[String],
+) -> (Option<String>, Option<usize>, Option<usize>, bool) {
+    draw_terminal_foreground_message_menu_button_inner(ui, foreground_messages)
+}
+
+fn draw_terminal_foreground_message_menu_button_inner(
     ui: &mut Ui,
     foreground_messages: &[String],
 ) -> (Option<String>, Option<usize>, Option<usize>, bool) {
@@ -36811,13 +36933,14 @@ fn draw_project_group_header(
     )
 }
 
-fn styled_icon_button(
+fn styled_icon_button_with_visible(
     ui: &mut Ui,
     icon: AppIcon,
     _bg: Color32,
     _hover_bg: Color32,
     _active_bg: Color32,
     tooltip: &str,
+    visible: bool,
 ) -> bool {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT),
@@ -36827,25 +36950,42 @@ fn styled_icon_button(
         .on_hover_text(tooltip)
         .on_hover_cursor(egui::CursorIcon::PointingHand);
 
-    if response.hovered() {
-        ui.painter()
-            .rect_filled(rect.shrink(2.0), 8.0, with_alpha(BTN_ICON_HOVER, 110));
+    if visible {
+        if response.hovered() {
+            ui.painter()
+                .rect_filled(rect.shrink(2.0), 8.0, with_alpha(BTN_ICON_HOVER, 110));
+        }
+
+        let icon_color = if response.is_pointer_button_down_on() || response.hovered() {
+            TEXT_PRIMARY
+        } else {
+            with_alpha(TEXT_PRIMARY, 178)
+        };
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{icon}"),
+            egui::FontId::proportional(14.0),
+            icon_color,
+        );
     }
 
-    let icon_color = if response.is_pointer_button_down_on() || response.hovered() {
-        TEXT_PRIMARY
+    if visible {
+        response.clicked()
     } else {
-        with_alpha(TEXT_PRIMARY, 178)
-    };
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        format!("{icon}"),
-        egui::FontId::proportional(14.0),
-        icon_color,
-    );
+        false
+    }
+}
 
-    response.clicked()
+fn styled_icon_button(
+    ui: &mut Ui,
+    icon: AppIcon,
+    _bg: Color32,
+    _hover_bg: Color32,
+    _active_bg: Color32,
+    tooltip: &str,
+) -> bool {
+    styled_icon_button_with_visible(ui, icon, _bg, _hover_bg, _active_bg, tooltip, true)
 }
 
 /// Browser toolbar icon button with tooltip shown centered above the button.
@@ -37411,11 +37551,12 @@ fn styled_launcher_menu_button(
     selected_action
 }
 
-fn activity_rail_icon_button(
+fn activity_rail_icon_button_with_visible(
     ui: &mut Ui,
     selected: bool,
     icon: AppIcon,
     tooltip: &str,
+    visible: bool,
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(CONTROL_ROW_HEIGHT, CONTROL_ROW_HEIGHT),
@@ -37425,25 +37566,36 @@ fn activity_rail_icon_button(
         .on_hover_text(tooltip)
         .on_hover_cursor(egui::CursorIcon::PointingHand);
 
-    if response.hovered() {
-        ui.painter()
-            .rect_filled(rect.shrink(1.0), 8.0, with_alpha(BTN_ICON_HOVER, 110));
+    if visible {
+        if response.hovered() {
+            ui.painter()
+                .rect_filled(rect.shrink(1.0), 8.0, with_alpha(BTN_ICON_HOVER, 110));
+        }
+
+        let icon_color = if selected || response.hovered() || response.is_pointer_button_down_on() {
+            TEXT_PRIMARY
+        } else {
+            with_alpha(TEXT_PRIMARY, 170)
+        };
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{icon}"),
+            egui::FontId::proportional(14.0),
+            icon_color,
+        );
     }
 
-    let icon_color = if selected || response.hovered() || response.is_pointer_button_down_on() {
-        TEXT_PRIMARY
-    } else {
-        with_alpha(TEXT_PRIMARY, 170)
-    };
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        format!("{icon}"),
-        egui::FontId::proportional(14.0),
-        icon_color,
-    );
-
     response
+}
+
+fn activity_rail_icon_button(
+    ui: &mut Ui,
+    selected: bool,
+    icon: AppIcon,
+    tooltip: &str,
+) -> egui::Response {
+    activity_rail_icon_button_with_visible(ui, selected, icon, tooltip, true)
 }
 
 fn paint_activity_rail_warning_badge(ui: &Ui, button_rect: egui::Rect) {
@@ -37454,8 +37606,23 @@ fn paint_activity_rail_warning_badge(ui: &Ui, button_rect: egui::Rect) {
         .circle_stroke(center, 4.0, Stroke::new(1.0, SURFACE_BG));
 }
 
+fn styled_icon_toggle_with_visible(
+    ui: &mut Ui,
+    selected: bool,
+    icon: AppIcon,
+    tooltip: &str,
+    visible: bool,
+) -> bool {
+    let response = activity_rail_icon_button_with_visible(ui, selected, icon, tooltip, visible);
+    if visible {
+        response.clicked()
+    } else {
+        false
+    }
+}
+
 fn styled_icon_toggle(ui: &mut Ui, selected: bool, icon: AppIcon, tooltip: &str) -> bool {
-    activity_rail_icon_button(ui, selected, icon, tooltip).clicked()
+    styled_icon_toggle_with_visible(ui, selected, icon, tooltip, true)
 }
 
 fn settings_surface_frame(fill: Color32, margin: f32) -> egui::Frame {
@@ -42653,6 +42820,7 @@ mod tests {
             launch_command: "opencode".to_owned(),
             enabled: true,
             icon_key: LauncherIconKey::OpenCode,
+            bypass_permissions: false,
         }];
 
         // Simulate hovering over the launcher row text area
@@ -42714,6 +42882,7 @@ mod tests {
             launch_command: "opencode".to_owned(),
             enabled: true,
             icon_key: LauncherIconKey::OpenCode,
+            bypass_permissions: false,
         }];
 
         let idle_output =
@@ -42752,6 +42921,7 @@ mod tests {
             launch_command: "opencode".to_owned(),
             enabled: true,
             icon_key: LauncherIconKey::OpenCode,
+            bypass_permissions: false,
         }];
 
         let output = draw_foreground_launcher_menu_in_test_ui(
@@ -42861,6 +43031,7 @@ mod tests {
                 .to_owned(),
             enabled: true,
             icon_key: LauncherIconKey::OpenCode,
+            bypass_permissions: false,
         }];
 
         let output =
@@ -42897,6 +43068,7 @@ mod tests {
             launch_command: "opencode".to_owned(),
             enabled: true,
             icon_key: LauncherIconKey::OpenCode,
+            bypass_permissions: false,
         }];
 
         let output =
@@ -42938,6 +43110,7 @@ mod tests {
             launch_command: "opencode".to_owned(),
             enabled: true,
             icon_key: LauncherIconKey::OpenCode,
+            bypass_permissions: false,
         }];
 
         let output = draw_open_foreground_launcher_popup_in_test_ui(&ctx, &launchers);
@@ -42988,6 +43161,7 @@ mod tests {
                 launch_command: "opencode".to_owned(),
                 enabled: true,
                 icon_key: LauncherIconKey::OpenCode,
+                bypass_permissions: false,
             },
             LauncherEntry {
                 id: "codex".to_owned(),
@@ -42996,6 +43170,7 @@ mod tests {
                 launch_command: "codex".to_owned(),
                 enabled: true,
                 icon_key: LauncherIconKey::Codex,
+                bypass_permissions: false,
             },
             LauncherEntry {
                 id: "droid".to_owned(),
@@ -43004,6 +43179,7 @@ mod tests {
                 launch_command: "droid".to_owned(),
                 enabled: true,
                 icon_key: LauncherIconKey::Droid,
+                bypass_permissions: false,
             },
             LauncherEntry {
                 id: "claude".to_owned(),
@@ -43012,6 +43188,7 @@ mod tests {
                 launch_command: "claude".to_owned(),
                 enabled: true,
                 icon_key: LauncherIconKey::Claude,
+                bypass_permissions: false,
             },
         ];
 
@@ -54124,7 +54301,7 @@ mod tests {
 
     #[test]
     fn sanitized_claude_launch_command_powershell_clears_env_and_calls_claude_cmd() {
-        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::PowerShell);
+        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::PowerShell, false);
         assert!(
             cmd.contains("Remove-Item Env:ANTHROPIC_AUTH_TOKEN"),
             "PowerShell command should clear ANTHROPIC_AUTH_TOKEN"
@@ -54137,7 +54314,7 @@ mod tests {
 
     #[test]
     fn sanitized_claude_launch_command_cmd_clears_env_and_calls_claude_cmd() {
-        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Cmd);
+        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Cmd, false);
         assert!(
             cmd.contains("set ANTHROPIC_AUTH_TOKEN="),
             "CMD command should clear ANTHROPIC_AUTH_TOKEN"
@@ -54150,8 +54327,32 @@ mod tests {
 
     #[test]
     fn sanitized_claude_launch_command_zsh_keeps_plain_claude() {
-        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Zsh);
+        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Zsh, false);
         assert_eq!(cmd, "claude");
+    }
+
+    #[test]
+    fn sanitized_claude_launch_command_powershell_appends_bypass_flag() {
+        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::PowerShell, true);
+        assert!(
+            cmd.contains(" --dangerously-skip-permissions"),
+            "PowerShell command should append bypass flag"
+        );
+    }
+
+    #[test]
+    fn sanitized_claude_launch_command_cmd_appends_bypass_flag() {
+        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Cmd, true);
+        assert!(
+            cmd.contains(" --dangerously-skip-permissions"),
+            "CMD command should append bypass flag"
+        );
+    }
+
+    #[test]
+    fn sanitized_claude_launch_command_zsh_appends_bypass_flag() {
+        let cmd = AdeApp::sanitized_claude_launch_command(ShellKind::Zsh, true);
+        assert_eq!(cmd, "claude --dangerously-skip-permissions");
     }
 
     // Tests for ai_cli_logo_key_for_terminal - logo visibility based on session liveness
