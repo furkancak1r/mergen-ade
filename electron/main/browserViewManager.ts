@@ -7,7 +7,7 @@ import fs from 'fs';
 interface BrowserInstance {
   view: BrowserView;
   scope: BrowserScopeKey;
-  tabs: { id: string; url: string; title?: string }[];
+  tabs: { id: string; url: string; title?: string; kind?: 'page' | 'recording' }[];
   activeTabId?: string;
   urlDraft: string;
   designInspectEnabled: boolean;
@@ -34,7 +34,13 @@ export function normalizeBrowserUrl(url: string): string {
   const trimmed = url.trim();
   if (!trimmed) return '';
   const lower = trimmed.toLowerCase();
-  if (lower.startsWith('http://') || lower.startsWith('https://')) {
+  if (
+    lower.startsWith('http://') ||
+    lower.startsWith('https://') ||
+    lower.startsWith('file://') ||
+    lower.startsWith('data:text/html') ||
+    lower === 'about:blank'
+  ) {
     return trimmed;
   }
   if (lower.startsWith('localhost') || lower.startsWith('127.0.0.1') || lower.startsWith('0.0.0.0') || lower.startsWith('[::1]')) {
@@ -310,14 +316,14 @@ export function browserDesignInspect(scope: BrowserScopeKey, enabled: boolean): 
 }
 
 
-export function browserAddTab(scope: BrowserScopeKey, url?: string): string {
+export function browserAddTab(scope: BrowserScopeKey, url?: string, title?: string, kind: 'page' | 'recording' = 'page'): string {
   const instance = getBrowserInstance(scope) ?? createBrowserView(scope);
   if (instance.tabs.length >= BROWSER_MAX_TABS_PER_SCOPE) {
     throw new Error(`Browser tab limit reached (${BROWSER_MAX_TABS_PER_SCOPE}). Close an existing tab before opening a new one.`);
   }
   const tabId = `tab-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   const normalized = url ? normalizeBrowserUrl(url) : '';
-  instance.tabs.push({ id: tabId, url: normalized });
+  instance.tabs.push({ id: tabId, url: normalized, title, kind });
   instance.activeTabId = tabId;
   if (normalized) {
     instance.view.webContents.loadURL(normalized);

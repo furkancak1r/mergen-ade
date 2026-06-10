@@ -3,7 +3,13 @@ import { BrowserWindow } from 'electron';
 import type { TerminalKind, ShellKind } from '../shared/types';
 import { ANTHROPIC_ENV_VARS_TO_REMOVE, ShellKindCommand } from '../shared/types';
 import { normalizeWindowsVerbatimPath } from './config';
-import { getHookServicePort } from './hookService';
+import { getBrowserMcpToken, getHookServicePort } from './hookService';
+import {
+  MERGEN_BROWSER_MCP_PORT_ENV_VAR,
+  MERGEN_BROWSER_MCP_PROJECT_ID_ENV_VAR,
+  MERGEN_BROWSER_MCP_TERMINAL_ID_ENV_VAR,
+  MERGEN_BROWSER_MCP_TOKEN_ENV_VAR,
+} from './browserMcpTools';
 
 export interface PtyCreateOptions {
   shell: ShellKind;
@@ -74,6 +80,10 @@ export function createTerminal(opts: PtyCreateOptions): number {
   const hookPort = getHookServicePort();
   if (hookPort) {
     env['MERGEN_HOOK_PORT'] = String(hookPort);
+    env[MERGEN_BROWSER_MCP_PORT_ENV_VAR] = String(hookPort);
+    env[MERGEN_BROWSER_MCP_TOKEN_ENV_VAR] = getBrowserMcpToken();
+    env[MERGEN_BROWSER_MCP_TERMINAL_ID_ENV_VAR] = String(id);
+    env[MERGEN_BROWSER_MCP_PROJECT_ID_ENV_VAR] = String(opts.projectId);
   }
   if (opts.env) {
     Object.assign(env, opts.env);

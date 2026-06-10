@@ -691,6 +691,7 @@ export interface BrowserTab {
   id: string;
   url: string;
   title?: string;
+  kind?: 'page' | 'recording';
 }
 
 export const BROWSER_MAX_TABS_PER_SCOPE = 5;
@@ -897,6 +898,7 @@ export interface IpcChannels {
   'browser:hide': (scope: BrowserScopeKey) => Promise<void>;
   'browser:show': (scope: BrowserScopeKey) => Promise<void>;
   'browser:urlChanged': (scope: BrowserScopeKey, url: string) => void;
+  'browser:tabOpened': (scope: BrowserScopeKey, tab: BrowserTab) => void;
   'browser:goBack': (scope: BrowserScopeKey) => Promise<void>;
   'browser:goForward': (scope: BrowserScopeKey) => Promise<void>;
   'browser:reload': (scope: BrowserScopeKey) => Promise<void>;
@@ -966,7 +968,7 @@ export interface BrowserMcpAuthScope {
 
 export type IpcInvokeChannel = keyof Pick<IpcChannels, 'config:load' | 'config:save' | 'history:load' | 'history:save' | 'diagnostics:get' | 'pty:create' | 'pty:write' | 'pty:resize' | 'pty:kill' | 'pty:getState' | 'fs:readDir' | 'fs:readFile' | 'fs:writeFile' | 'fs:exists' | 'fs:stat' | 'git:diffSummary' | 'git:status' | 'git:discoverWorktrees' | 'git:createWorktree' | 'git:removeWorktree' | 'git:copyEnvFiles' | 'acp:spawn' | 'acp:send' | 'acp:cancel' | 'acp:setConfigOption' | 'acp:permissionResponse' | 'acp:questionResponse' | 'acp:getSession' | 'acp:kill' | 'acp:standby:warm' | 'acp:standby:get' | 'acp:standby:clear' | 'acp:standby:promote' | 'acp:standby:clearAll' | 'hook:answer' | 'browser:navigate' | 'browser:syncBounds' | 'browser:hide' | 'browser:show' | 'browser:hideAll' | 'browser:showAll' | 'browser:showActive' | 'browser:destroyInstance' | 'browser:goBack' | 'browser:goForward' | 'browser:reload' | 'browser:executeJs' | 'browser:screenshot' | 'browser:designInspect' | 'browser:addTab' | 'browser:closeTab' | 'browser:switchTab' | 'browserMcp:spawn' | 'browserMcp:execute' | 'browserMcp:kill' | 'browserMcp:getCommand' | 'browserMcp:prepareScope' | 'opencode:generateTerminalConfig' | 'opencode:generateRuntimeConfig' | 'dialog:showOpen' | 'dialog:showSave' | 'clipboard:readText' | 'clipboard:readImage' | 'clipboard:readFilePaths' | 'clipboard:writeText' | 'shell:openExternal' | 'shell:openPath' | 'shell:showItemInFolder' | 'notify:show' | 'window:confirmClose'>;
 
-export type IpcSendChannel = keyof Pick<IpcChannels, 'pty:data' | 'pty:exit' | 'hook:status' | 'acp:event' | 'browser:urlChanged' | 'browser:designElementClicked' | 'window:closeRequest' | 'window:focused'>;
+export type IpcSendChannel = keyof Pick<IpcChannels, 'pty:data' | 'pty:exit' | 'hook:status' | 'acp:event' | 'browser:urlChanged' | 'browser:tabOpened' | 'browser:designElementClicked' | 'window:closeRequest' | 'window:focused'>;
 
 export interface WindowState {
   width: number;

@@ -4851,3 +4851,76 @@
   - Keep Directory no-match and context menu labels covered in `directoryTree.test.ts` when changing Project Explorer row actions.
 - Files/Commands touched: `electron/renderer/src/components/ProjectExplorer.tsx`, `electron/renderer/src/lib/directoryTree.ts`, `electron/renderer/src/lib/directoryTree.test.ts`, `KNOWN_ISSUES.md`
 - References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Browser MCP helper MCP protokolunu ilan etmiyordu {#electron-browser-mcp-helper-protocol-parity}
+- Date: 2026-06-10
+- Context: Rust's Browser MCP helper answers `initialize`, `tools/list`, and `tools/call`, advertises Rust-compatible `browser_*` tool names, and relays tool calls back to the running Mergen process through a local authenticated endpoint. Electron had BrowserView actions underneath, but the helper only relayed arbitrary methods through `process.send`, which is unavailable when OpenCode launches the MCP helper directly.
+- Error signature:
+  1. OpenCode-started `--browser-mcp-helper` could answer `initialize` but could not return a useful `tools/list`.
+  2. Direct helper calls had no parent IPC channel, so Browser MCP tools were effectively unavailable from normal OpenCode MCP startup.
+  3. Electron executor accepted early slash-style names like `browser/navigate` but not the Rust-compatible names such as `browser_navigate`, `browser_page_summary`, and `browser_take_screenshot`.
+- Symptoms/Impact:
+  - OpenCode could not discover or reliably call the embedded Mergen Browser tools from Electron, even though Browser navigation, screenshots, and DOM execution were implemented lower in the stack.
+- Root cause:
+  - The Electron helper implemented a process-child relay prototype instead of the Rust MCP server contract and lacked a local authenticated bridge reachable from OpenCode's helper child process.
+- Resolution:
+  - Added Browser MCP tool schema helpers with Rust-compatible names and capability filtering.
+  - Reworked the helper to answer `tools/list` / `tools/call`, format MCP text/image content, parse both `--caps=...` and `--caps ...`, and post tool calls to the running app.
+  - Added an authenticated `/browser-mcp` endpoint on the existing local hook TCP service and exported the same `MERGEN_BROWSER_MCP_*` env vars into terminal sessions.
+  - Expanded the Browser MCP executor to accept Rust-compatible tool names for navigation, tabs, page summaries, refs, clicks, typing, screenshots, evaluate, wait, highlight, and storage operations.
+- Prevent recurrence:
+  - Keep Browser MCP protocol helpers covered in `browserMcpTools.test.ts` and `browserMcpHelper.test.ts`.
+  - Keep OpenCode-launched helper scenarios in mind: `process.send` is only available for app-spawned helpers, not MCP helpers launched by a terminal process.
+- Files/Commands touched: `electron/main/browserMcpTools.ts`, `electron/main/browserMcpHelper.ts`, `electron/main/browserMcpService.ts`, `electron/main/hookService.ts`, `electron/main/pty.ts`, `electron/main/browserMcpTools.test.ts`, `electron/main/browserMcpHelper.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Browser MCP video recording araclari calismiyordu {#electron-browser-mcp-video-recording-parity}
+- Date: 2026-06-10
+- Context: Rust Browser MCP advertises `browser_start_video`, `browser_stop_video`, and `browser_video_chapter`, records visible Browser frames, saves the recording, and opens the saved video in a Browser tab. Electron's helper initially exposed the MCP protocol but still returned a not-implemented error for these video tools.
+- Error signature:
+  1. `browser_start_video`, `browser_stop_video`, and `browser_video_chapter` were not advertised by Electron `tools/list`.
+  2. Calling the video tools returned `Browser video recording is not implemented by Electron Browser MCP yet`.
+  3. Main-process Browser MCP tab creation was not mirrored into React tab state, so MCP-opened tabs could be invisible to the Browser panel UI.
+- Symptoms/Impact:
+  - OpenCode could not record embedded Browser interactions from Electron.
+  - Saved recording tabs could be loaded in the native BrowserView state without appearing in Electron's tab strip.
+- Root cause:
+  - The Electron Browser MCP port stopped at navigation/screenshot/DOM tools and did not carry over Rust's frame capture lifecycle.
+  - Browser tab state was split between the main BrowserView manager and renderer React state without a main-to-renderer tab-open event.
+- Resolution:
+  - Added video tool schemas to the vision capability.
+  - Implemented Browser MCP video state with frame capture at 10 FPS, chapter timestamps, stop-time encoding through Chromium `MediaRecorder`, WebM file output under the app browser recordings directory, and Browser tab opening for the saved file.
+  - Allowed programmatic BrowserView navigation to `file://` URLs for saved recording playback while leaving renderer URL input restrictions unchanged.
+  - Added `browser:tabOpened` IPC so Browser MCP-opened tabs are mirrored into renderer tabs, active tab state, URL draft, and visible Browser panel scope.
+- Prevent recurrence:
+  - Keep Browser MCP vision tool names covered in `browserMcpTools.test.ts`.
+  - When main-process Browser MCP opens/closes/switches tabs, keep renderer tab state in sync instead of mutating BrowserView state only.
+- Files/Commands touched: `electron/main/browserMcpTools.ts`, `electron/main/browserMcpService.ts`, `electron/main/browserMcpHelper.ts`, `electron/main/browserViewManager.ts`, `electron/main/browserMcpTools.test.ts`, `electron/shared/types.ts`, `electron/renderer/src/App.tsx`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10
+
+---
+
+#### Electron Browser MCP cookie araclari eksikti {#electron-browser-mcp-cookie-tool-parity}
+- Date: 2026-06-10
+- Context: Rust Browser MCP exposes cookie tools in the core tool set: `browser_cookie_list`, `browser_cookie_get`, `browser_cookie_set`, `browser_cookie_delete`, and `browser_cookie_clear`. Electron Browser MCP had navigation, DOM, storage, screenshots, and video recording, but still did not advertise or execute the cookie tool family.
+- Error signature:
+  1. `tools/list` did not include any `browser_cookie_*` tool.
+  2. OpenCode could not inspect, set, or clear embedded Browser cookies through the Electron MCP server.
+  3. Cookie parity tests only covered the Rust helper, not the Electron helper metadata.
+- Symptoms/Impact:
+  - Browser MCP sessions in Electron were less capable than the Rust reference for authenticated sites and stateful browser flows.
+- Root cause:
+  - The Electron port focused on DOM/session storage first and skipped Chromium session cookie APIs when copying the Rust tool surface.
+- Resolution:
+  - Added Rust-compatible cookie tool schemas to Electron Browser MCP core tools.
+  - Implemented cookie list/get/set/delete/clear through `webContents.session.cookies`, using explicit URL params or the active Browser page URL.
+  - Added regression coverage so the cookie tool family remains advertised and allowed.
+- Prevent recurrence:
+  - Keep Browser MCP core tool parity covered in `browserMcpTools.test.ts` when changing helper schemas.
+  - Prefer Electron session APIs for Browser state operations instead of DOM-only fallbacks when the Rust feature targets browser-level state.
+- Files/Commands touched: `electron/main/browserMcpTools.ts`, `electron/main/browserMcpService.ts`, `electron/main/browserMcpTools.test.ts`, `KNOWN_ISSUES.md`
+- References: Electron parity goal 2026-06-10

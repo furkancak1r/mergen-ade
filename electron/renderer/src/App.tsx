@@ -284,6 +284,44 @@ function App() {
     return () => { unsub(); };
   }, [config]);
 
+  // Browser MCP can open tabs from the main process; mirror those into renderer state.
+  useEffect(() => {
+    const unsub = api.on('browser:tabOpened', (scope: BrowserScopeKey, tab: BrowserTab) => {
+      if (config && !config.projects.some((project) => project.id === scope.projectId)) return;
+      const key = scopeKeyString(scope);
+      setBrowserTabsByScope((prev) => {
+        const current = prev.get(key) ?? [];
+        const nextTabs = current.some((existing) => existing.id === tab.id)
+          ? current.map((existing) => existing.id === tab.id ? { ...existing, ...tab } : existing)
+          : [...current, tab];
+        const copy = new Map(prev);
+        copy.set(key, nextTabs);
+        return copy;
+      });
+      setBrowserActiveTabByScope((prev) => {
+        const copy = new Map(prev);
+        copy.set(key, tab.id);
+        return copy;
+      });
+      setBrowserUrlDraftByScope((prev) => {
+        const copy = new Map(prev);
+        copy.set(key, tab.url);
+        return copy;
+      });
+      setBrowserOpenProjects((prev) => {
+        const next = new Set(prev);
+        next.add(scope.projectId);
+        return next;
+      });
+      setBrowserPanelVisibleScopeByProject((prev) => {
+        const copy = new Map(prev);
+        copy.set(scope.projectId, scope);
+        return copy;
+      });
+    });
+    return () => { unsub(); };
+  }, [config]);
+
   const clearProjectBrowserLastUrl = useCallback((projectId: number) => {
     setConfig((prev) => {
       if (!prev) return prev;

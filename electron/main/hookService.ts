@@ -1,10 +1,16 @@
 import { createServer, type Server, type Socket } from 'net';
+import crypto from 'crypto';
 import { BrowserWindow } from 'electron';
 import type { AiHookEvent, AiCliTool, AiCliStatus, AiCliAttentionKind } from '../shared/types';
 import { AiCliTool as AiCliToolEnum, AiCliStatus as AiCliStatusEnum, AiCliAttentionKind as AiCliAttentionKindEnum } from '../shared/types';
+import { MERGEN_BROWSER_MCP_ENDPOINT_PATH } from './browserMcpTools';
 
 let server: Server | null = null;
 let serverPort = 0;
+const browserMcpToken = crypto.randomBytes(24).toString('hex');
+
+type BrowserMcpHttpHandler = (body: Record<string, unknown>) => Promise<unknown> | unknown;
+let browserMcpHandler: BrowserMcpHttpHandler | null = null;
 
 const hooksDir = () => {
   const appData = process.env.APPDATA || require('path').join(require('os').homedir(), 'AppData', 'Roaming');
@@ -13,6 +19,14 @@ const hooksDir = () => {
 
 export function getHookServicePort(): number {
   return serverPort;
+}
+
+export function getBrowserMcpToken(): string {
+  return browserMcpToken;
+}
+
+export function registerBrowserMcpHandler(handler: BrowserMcpHttpHandler): void {
+  browserMcpHandler = handler;
 }
 
 export function getHookInboxDir(): string {
@@ -52,8 +66,8 @@ export function startHookService(): void {
       // Check if this looks like an HTTP request
       if (buffer.startsWith('GET ') || buffer.startsWith('POST ')) {
         // Wait for the full HTTP request to arrive before parsing
-        if (buffer.includes('\r\n\r\n')) {
-          handleHttpRequest(socket, buffer);
+        if (isHttpRequestComplete(buffer)) {
+          void handleHttpRequest(socket, buffer);
           buffer = '';
         }
         return;
@@ -84,7 +98,30 @@ export function startHookService(): void {
   });
 }
 
-function handleHttpRequest(socket: Socket, data: string): void {
+function isHttpRequestComplete(data: string): boolean {
+  const headerEnd = data.indexOf('\r\n\r\n');
+  if (headerEnd < 0) return false;
+  const headers = data.slice(0, headerEnd).split('\r\n');
+  const contentLengthHeader = headers.find((line) => line.toLowerCase().startsWith('content-length:'));
+  if (!contentLengthHeader) return true;
+  const contentLength = Number(contentLengthHeader.slice(contentLengthHeader.indexOf(':') + 1).trim());
+  if (!Number.isFinite(contentLength) || contentLength <= 0) return true;
+  return Buffer.byteLength(data.slice(headerEnd + 4)) >= contentLength;
+}
+
+function httpRequestBody(data: string): string {
+  const headerEnd = data.indexOf('\r\n\r\n');
+  if (headerEnd < 0) return '';
+  return data.slice(headerEnd + 4);
+}
+
+function writeJsonResponse(socket: Socket, status: number, bodyValue: unknown): void {
+  const body = JSON.stringify(bodyValue);
+  const reason = status === 200 ? 'OK' : status === 403 ? 'Forbidden' : status === 404 ? 'Not Found' : 'Internal Server Error';
+  socket.write(`HTTP/1.1 ${status} ${reason}\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+}
+
+async function handleHttpRequest(socket: Socket, data: string): Promise<void> {
   const lines = data.split('\r\n');
   const firstLine = lines[0];
   if (!firstLine) return;
@@ -94,16 +131,28 @@ function handleHttpRequest(socket: Socket, data: string): void {
   if (method === 'GET' && path === '/answer') {
     const answer = peekAnswer();
     if (answer) {
-      const body = JSON.stringify({ requestId: answer.requestId, answers: answer.answers, rejected: answer.rejected });
-      socket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+      writeJsonResponse(socket, 200, { requestId: answer.requestId, answers: answer.answers, rejected: answer.rejected });
     } else {
-      const body = JSON.stringify({});
-      socket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+      writeJsonResponse(socket, 200, {});
     }
   } else if (method === 'POST' && path === '/answer/ack') {
     ackAnswer();
-    const body = JSON.stringify({ ok: true });
-    socket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+    writeJsonResponse(socket, 200, { ok: true });
+  } else if (method === 'POST' && path === MERGEN_BROWSER_MCP_ENDPOINT_PATH) {
+    try {
+      const body = JSON.parse(httpRequestBody(data)) as Record<string, unknown>;
+      if (body.token !== browserMcpToken) {
+        writeJsonResponse(socket, 403, { ok: false, error: 'Invalid Browser MCP token' });
+      } else if (!browserMcpHandler) {
+        writeJsonResponse(socket, 500, { ok: false, error: 'Browser MCP handler is not registered' });
+      } else {
+        const result = await browserMcpHandler(body);
+        writeJsonResponse(socket, 200, { ok: true, result });
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      writeJsonResponse(socket, 500, { ok: false, error: message });
+    }
   } else {
     socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
   }
